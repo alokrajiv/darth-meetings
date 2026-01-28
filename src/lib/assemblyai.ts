@@ -50,11 +50,20 @@ export class AssemblyAIClient {
     return await this.client.files.upload(buffer);
   }
 
-  async submitTranscription(audioUrl: string): Promise<{ id: string; status: string }> {
-    const params = {
+  async submitTranscription(audioUrl: string, languageCode?: string): Promise<{ id: string; status: string }> {
+    const params: {
+      audio: string;
+      speaker_labels: boolean;
+      language_code?: string;
+    } = {
       audio: audioUrl,
       speaker_labels: true,
     };
+
+    if (languageCode) {
+      params.language_code = languageCode;
+    }
+
     const transcript = await this.client.transcripts.submit(params);
     return { id: transcript.id, status: transcript.status };
   }
@@ -98,9 +107,9 @@ export function formatDuration(seconds: number): string {
   }
 }
 
-export function formatTime(seconds: number): string {
-  // AssemblyAI returns time in seconds, not milliseconds
-  const totalSeconds = Math.floor(seconds);
+export function formatTime(milliseconds: number): string {
+  // AssemblyAI returns time in milliseconds
+  const totalSeconds = Math.floor(milliseconds / 1000);
   const minutes = Math.floor(totalSeconds / 60);
   const remainingSeconds = totalSeconds % 60;
   return `${minutes}:${remainingSeconds.toString().padStart(2, '0')}`;

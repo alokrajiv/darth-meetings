@@ -448,10 +448,26 @@ export default function TranscriptDetailPage({ params }: TranscriptDetailPagePro
 
         {/* Speaker Editor */}
         {transcript.utterances && transcript.utterances.length > 0 && (
-          <SpeakerEditor 
+          <SpeakerEditor
             transcriptId={transcript.id}
             utterances={transcript.utterances}
-            onMappingsUpdate={loadTranscript}
+            onMappingsUpdate={async () => {
+              // Only refresh speaker mappings, not the entire transcript
+              const mappings = await db.getSpeakerMappings(resolvedParams.id);
+              if (mappings) {
+                const speakerMap: {[key: string]: string} = {};
+                mappings.speakerLabels.forEach(mapping => {
+                  if (mapping.customName && !mapping.isSkipped) {
+                    speakerMap[mapping.originalSpeaker] = mapping.customName;
+                  } else if (mapping.isSkipped) {
+                    speakerMap[mapping.originalSpeaker] = `${mapping.originalSpeaker} (Skipped)`;
+                  } else {
+                    speakerMap[mapping.originalSpeaker] = mapping.originalSpeaker;
+                  }
+                });
+                setSpeakerMappings(speakerMap);
+              }
+            }}
           />
         )}
 
