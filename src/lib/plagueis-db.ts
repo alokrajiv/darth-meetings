@@ -3,29 +3,31 @@ import postgres from 'postgres';
 import { config } from '@/config';
 import { DB_POOL_CONFIG } from '@/lib/constants/database';
 
-// Reuse the Postgres connection across Next.js hot reloads in dev so we don't
-// leak handles every time a file changes.
+// Second Postgres handle pointing at the `darth_plagueis` database on the
+// same instance. We reuse the meeting_whisperer role, which has been granted
+// SELECT on darth_plagueis.ppl + darth_plagueis.emails. This connection is
+// READ-ONLY by design — don't add write operations.
+
 const ENABLE_HOT_RELOAD_DB_REUSE = process.env.HOT_RELOAD_DB_REUSE !== 'false';
 
 declare global {
   // eslint-disable-next-line no-var
-  var __mwHotReloadDbConnection: ReturnType<typeof postgres> | undefined;
+  var __mwHotReloadPlagueisConnection: ReturnType<typeof postgres> | undefined;
 }
 
-function createDatabaseConnection() {
-  console.log('[db] initialising Postgres connection', {
+function createPlagueisConnection() {
+  console.log('[plagueis-db] initialising read-only handle', {
     host: config.database.host,
-    database: config.database.database,
-    schema: config.database.schemas.MEETING_WHISPERER,
+    database: 'darth_plagueis',
   });
 
   return postgres({
     host: config.database.host,
     port: config.database.port,
-    database: config.database.database,
+    database: 'darth_plagueis',
     username: config.database.user,
     password: config.database.password,
-    max: DB_POOL_CONFIG.max,
+    max: 4,
     idle_timeout: DB_POOL_CONFIG.idleTimeoutMillis / 1000,
     max_lifetime: 60 * 5,
     connect_timeout: DB_POOL_CONFIG.connectionTimeoutMillis / 1000,
@@ -34,11 +36,10 @@ function createDatabaseConnection() {
   });
 }
 
-export const sql =
-  (ENABLE_HOT_RELOAD_DB_REUSE && global.__mwHotReloadDbConnection) || createDatabaseConnection();
+export const plagueisSql =
+  (ENABLE_HOT_RELOAD_DB_REUSE && global.__mwHotReloadPlagueisConnection) ||
+  createPlagueisConnection();
 
 if (ENABLE_HOT_RELOAD_DB_REUSE && config.env.isDevelopment) {
-  global.__mwHotReloadDbConnection = sql;
+  global.__mwHotReloadPlagueisConnection = plagueisSql;
 }
-
-export default sql;

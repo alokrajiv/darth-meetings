@@ -1,0 +1,278 @@
+import 'server-only';
+import { sql } from '@/lib/db';
+import { SCHEMAS } from '@/lib/constants/database';
+import type {
+  StoredTranscript,
+  TranscriptResponse,
+  TranscriptListRow,
+} from '@/lib/format';
+
+export type TranscriptRow = StoredTranscript;
+
+/**
+ * User-scoped CRUD for the transcripts table.
+ *
+ * Every function takes `userId` as its first argument and every WHERE
+ * clause enforces `user_id = ${userId}`. Do NOT add a function here that
+ * reads or writes transcripts without this constraint — that would break
+ * per-user ACL.
+ */
+
+const SCHEMA = SCHEMAS.MEETING_WHISPERER;
+
+export interface TranscriptInsert {
+  assemblyaiId: string;
+  originalFilename: string | null;
+  status: string;
+  languageCode?: string | null;
+  title?: string | null;
+  audioUrl?: string | null;
+}
+
+export interface TranscriptStatusUpdate {
+  status?: string;
+  completedAt?: Date | null;
+  duration?: number | null;
+  speakerCount?: number | null;
+  languageCode?: string | null;
+  audioUrl?: string | null;
+}
+
+export interface ImportedTranscriptInsert {
+  assemblyaiId: string;
+  originalFilename: string | null;
+  status: string;
+  duration: number | null;
+  speakerCount: number | null;
+  languageCode: string | null;
+  createdAt: Date | null;
+  completedAt: Date | null;
+  audioUrl: string | null;
+  importedContent: TranscriptResponse;
+}
+
+export async function listForUser(userId: string): Promise<TranscriptRow[]> {
+  const rows = await sql<TranscriptRow[]>`
+    SELECT *
+    FROM ${sql(SCHEMA)}.transcripts
+    WHERE user_id = ${userId}
+    ORDER BY created_at DESC
+  `;
+  return rows;
+}
+
+/**
+ * List every transcript visible to this user — ones they own plus ones
+ * shared with their email. Each row carries a computed `access` field.
+ *
+ * Skinny column set: the full `imported_content` JSONB is NOT selected
+ * because it can be tens of MB per row and the listing doesn't render it.
+ * Fetch the full payload via /api/transcripts/:id/content on the detail
+ * page instead.
+ *
+ * Owner identity (name/email) is not available here because we only have
+ * the owner's SSO user_id, not their email.
+ */
+export async function listVisibleToUser(
+  userId: string,
+  email: string
+): Promise<TranscriptListRow[]> {
+  const normEmail = email.trim().toLowerCase();
+  const rows = await sql<
+    Array<TranscriptListRow & { __access: 'owner' | 'edit' | 'read' }>
+  >`
+    SELECT t.id, t.user_id, t.assemblyai_id, t.original_filename, t.status,
+           t.created_at, t.completed_at, t.duration, t.speaker_count,
+           t.language_code, t.title, t.description, t.last_accessed,
+           t.source,
+           CASE
+             WHEN t.user_id = ${userId} THEN 'owner'
+             ELSE s.access
+           END AS "__access"
+    FROM ${sql(SCHEMA)}.transcripts t
+    LEFT JOIN ${sql(SCHEMA)}.transcript_shares s
+      ON s.transcript_id = t.id
+      AND s.shared_with_email = ${normEmail}
+    WHERE t.user_id = ${userId} OR s.id IS NOT NULL
+    ORDER BY t.created_at DESC
+  `;
+
+  return rows.map((r) => {
+    const { __access, ...rest } = r;
+    return {
+      ...rest,
+      access: __access,
+      owner_email: null,
+      owner_name: null,
+    };
+  });
+}
+
+export async function getForUser(
+  userId: string,
+  assemblyaiId: string
+): Promise<TranscriptRow | null> {
+  const rows = await sql<TranscriptRow[]>`
+    SELECT *
+    FROM ${sql(SCHEMA)}.transcripts
+    WHERE user_id = ${userId} AND assemblyai_id = ${assemblyaiId}
+    LIMIT 1
+  `;
+  return rows[0] ?? null;
+}
+
+export async function createForUser(
+  userId: string,
+  data: TranscriptInsert
+): Promise<TranscriptRow> {
+  const rows = await sql<TranscriptRow[]>`
+    INSERT INTO ${sql(SCHEMA)}.transcripts (
+      user_id, assemblyai_id, original_filename, status, language_code, title, audio_url, source
+    ) VALUES (
+      ${userId}, ${data.assemblyaiId}, ${data.originalFilename ?? null},
+      ${data.status}, ${data.languageCode ?? null}, ${data.title ?? null},
+      ${data.audioUrl ?? null}, 'uploaded'
+    )
+    ON CONFLICT (user_id, assemblyai_id) DO UPDATE
+      SET original_filename = EXCLUDED.original_filename,
+          status = EXCLUDED.status,
+          language_code = COALESCE(EXCLUDED.language_code, ${sql(SCHEMA)}.transcripts.language_code),
+          title = COALESCE(EXCLUDED.title, ${sql(SCHEMA)}.transcripts.title),
+          audio_url = COALESCE(EXCLUDED.audio_url, ${sql(SCHEMA)}.transcripts.audio_url)
+    RETURNING *
+  `;
+  return rows[0]!;
+}
+
+/**
+ * Insert an imported transcript with its frozen content. The user_id is the
+ * importing user — they own the imported copy. Other users importing the same
+ * AAI transcript get their own row (per-user ACL preserved).
+ */
+export async function createImportedForUser(
+  userId: string,
+  data: ImportedTranscriptInsert
+): Promise<TranscriptRow> {
+  const rows = await sql<TranscriptRow[]>`
+    INSERT INTO ${sql(SCHEMA)}.transcripts (
+      user_id, assemblyai_id, original_filename, status,
+      created_at, completed_at, duration, speaker_count, language_code,
+      audio_url, source, imported_content
+    ) VALUES (
+      ${userId}, ${data.assemblyaiId}, ${data.originalFilename ?? null}, ${data.status},
+      ${data.createdAt ?? sql`now()`}, ${data.completedAt ?? null},
+      ${data.duration ?? null}, ${data.speakerCount ?? null},
+      ${data.languageCode ?? null}, ${data.audioUrl ?? null}, 'imported',
+      ${sql.json(data.importedContent as unknown as never)}
+    )
+    ON CONFLICT (user_id, assemblyai_id) DO UPDATE
+      SET status = EXCLUDED.status,
+          created_at = COALESCE(EXCLUDED.created_at, ${sql(SCHEMA)}.transcripts.created_at),
+          duration = COALESCE(EXCLUDED.duration, ${sql(SCHEMA)}.transcripts.duration),
+          speaker_count = COALESCE(EXCLUDED.speaker_count, ${sql(SCHEMA)}.transcripts.speaker_count),
+          language_code = COALESCE(EXCLUDED.language_code, ${sql(SCHEMA)}.transcripts.language_code),
+          audio_url = COALESCE(EXCLUDED.audio_url, ${sql(SCHEMA)}.transcripts.audio_url),
+          imported_content = EXCLUDED.imported_content,
+          source = 'imported'
+    RETURNING *
+  `;
+  return rows[0]!;
+}
+
+/**
+ * Set the local audio path after we've successfully downloaded the bytes
+ * during an import. Stored as an absolute path on the server filesystem.
+ */
+export async function setLocalAudioPathForUser(
+  userId: string,
+  assemblyaiId: string,
+  localAudioPath: string
+): Promise<void> {
+  await sql`
+    UPDATE ${sql(SCHEMA)}.transcripts
+    SET local_audio_path = ${localAudioPath}
+    WHERE user_id = ${userId} AND assemblyai_id = ${assemblyaiId}
+  `;
+}
+
+/**
+ * Cache the full AAI transcript payload on the row. The `imported_content`
+ * column was originally added for the import flow (where the bytes are
+ * frozen at import time), but it doubles as a content cache for uploaded
+ * transcripts too — AAI content is immutable once `completed`, so once we
+ * fetch it once we never need to hit AAI for that row again. This makes the
+ * transcript detail page load almost entirely from Postgres.
+ */
+export async function setCachedContentForUser(
+  userId: string,
+  assemblyaiId: string,
+  content: TranscriptResponse
+): Promise<void> {
+  await sql`
+    UPDATE ${sql(SCHEMA)}.transcripts
+    SET imported_content = ${sql.json(content as unknown as never)}
+    WHERE user_id = ${userId} AND assemblyai_id = ${assemblyaiId}
+  `;
+}
+
+/** @deprecated use setCachedContentForUser — kept for the import flow's clarity */
+export const setImportedContentForUser = setCachedContentForUser;
+
+export async function updateStatusForUser(
+  userId: string,
+  assemblyaiId: string,
+  update: TranscriptStatusUpdate
+): Promise<TranscriptRow | null> {
+  const rows = await sql<TranscriptRow[]>`
+    UPDATE ${sql(SCHEMA)}.transcripts
+    SET
+      status = COALESCE(${update.status ?? null}, status),
+      completed_at = COALESCE(${update.completedAt ?? null}, completed_at),
+      duration = COALESCE(${update.duration ?? null}, duration),
+      speaker_count = COALESCE(${update.speakerCount ?? null}, speaker_count),
+      language_code = COALESCE(${update.languageCode ?? null}, language_code),
+      audio_url = COALESCE(${update.audioUrl ?? null}, audio_url)
+    WHERE user_id = ${userId} AND assemblyai_id = ${assemblyaiId}
+    RETURNING *
+  `;
+  return rows[0] ?? null;
+}
+
+export async function updateMetaForUser(
+  userId: string,
+  assemblyaiId: string,
+  meta: { title?: string | null; description?: string | null }
+): Promise<TranscriptRow | null> {
+  const rows = await sql<TranscriptRow[]>`
+    UPDATE ${sql(SCHEMA)}.transcripts
+    SET
+      title = COALESCE(${meta.title ?? null}, title),
+      description = COALESCE(${meta.description ?? null}, description)
+    WHERE user_id = ${userId} AND assemblyai_id = ${assemblyaiId}
+    RETURNING *
+  `;
+  return rows[0] ?? null;
+}
+
+export async function touchLastAccessedForUser(
+  userId: string,
+  assemblyaiId: string
+): Promise<void> {
+  await sql`
+    UPDATE ${sql(SCHEMA)}.transcripts
+    SET last_accessed = now()
+    WHERE user_id = ${userId} AND assemblyai_id = ${assemblyaiId}
+  `;
+}
+
+export async function deleteForUser(
+  userId: string,
+  assemblyaiId: string
+): Promise<boolean> {
+  const rows = await sql<{ id: number }[]>`
+    DELETE FROM ${sql(SCHEMA)}.transcripts
+    WHERE user_id = ${userId} AND assemblyai_id = ${assemblyaiId}
+    RETURNING id
+  `;
+  return rows.length > 0;
+}

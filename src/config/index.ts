@@ -1,0 +1,71 @@
+/**
+ * Application configuration.
+ *
+ * Env var access is **lazy** — nothing throws at import time, so `next build`
+ * runs fine on machines that don't have PG/AssemblyAI credentials. Missing
+ * vars surface at first actual use (the Postgres pool or AAI client), with a
+ * clear error at that point.
+ */
+
+import { SCHEMAS, DB_POOL_CONFIG } from '@/lib/constants/database';
+
+export const config = {
+  env: {
+    get nodeEnv() {
+      return process.env.NODE_ENV || 'development';
+    },
+    get schemaPrefix() {
+      return process.env.SCHEMA_PREFIX || 'prod';
+    },
+    get isDevelopment() {
+      return process.env.NODE_ENV === 'development';
+    },
+    get isProduction() {
+      return process.env.NODE_ENV === 'production';
+    },
+  },
+
+  auth: {
+    get loginDomain() {
+      return process.env.NEXT_PUBLIC_SSO_LOGIN_URL || 'https://login.trames.io';
+    },
+    get clonetrooperDomain() {
+      return process.env.CLONETROOPER_ENV_DOMAIN || 'https://login.trames.io';
+    },
+    get appName() {
+      return process.env.CLONETROOPER_ENV_APP_NAME || 'meeting-whisperer';
+    },
+    cookieName: 'trames-auth-session',
+  },
+
+  database: {
+    get host() {
+      return process.env.PGHOST || '';
+    },
+    get port() {
+      return parseInt(process.env.PGPORT || '5432', 10);
+    },
+    get database() {
+      return process.env.PGDATABASE || '';
+    },
+    get user() {
+      return process.env.PGUSER || '';
+    },
+    get password() {
+      return process.env.PGPASSWORD || '';
+    },
+    ssl: {
+      get enabled() {
+        return process.env.PGSSLMODE === 'require';
+      },
+    },
+    schemas: SCHEMAS,
+    poolConfig: DB_POOL_CONFIG,
+  },
+
+  assemblyai: {
+    get apiKey() {
+      return process.env.ASSEMBLYAI_API_KEY || '';
+    },
+  },
+} as const;

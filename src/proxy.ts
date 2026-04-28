@@ -1,0 +1,56 @@
+import { NextResponse } from 'next/server';
+import type { NextRequest } from 'next/server';
+
+/**
+ * Cookie presence check.
+ *
+ * We can't verify the JWT signature here — middleware runs on the Edge runtime
+ * and `jsonwebtoken` + `crypto.createPublicKey` aren't available. Full
+ * validation happens inside route handlers via `withAuth` / `getCurrentUser`.
+ */
+function hasSSOSession(request: NextRequest): boolean {
+  return !!request.cookies.get('trames-auth-session')?.value;
+}
+
+export async function proxy(request: NextRequest) {
+  const pathname = request.nextUrl.pathname;
+
+  // Public routes — no auth required
+  if (
+    pathname === '/login' ||
+    pathname.startsWith('/_next') ||
+    pathname.startsWith('/api/auth/') ||
+    pathname.startsWith('/api/public/') ||
+    pathname === '/favicon.ico'
+  ) {
+    return NextResponse.next();
+  }
+
+  // Protected API routes — 401 if no cookie
+  if (pathname.startsWith('/api/')) {
+    if (!hasSSOSession(request)) {
+      return NextResponse.json(
+        { error: 'Unauthorized - No session found' },
+        { status: 401 }
+      );
+    }
+    return NextResponse.next();
+  }
+
+  // Everything else (including `/` and `/transcript/[id]`) requires auth.
+  // Redirect to /login with a returnTo, which in turn will bounce to the SSO.
+  if (!hasSSOSession(request)) {
+    const loginUrl = new URL('/login', request.url);
+    const returnTo = request.nextUrl.pathname + request.nextUrl.search;
+    if (returnTo !== '/') {
+      loginUrl.searchParams.set('returnTo', returnTo);
+    }
+    return NextResponse.redirect(loginUrl);
+  }
+
+  return NextResponse.next();
+}
+
+export const config = {
+  matcher: ['/((?!_next/static|_next/image|favicon.ico).*)'],
+};

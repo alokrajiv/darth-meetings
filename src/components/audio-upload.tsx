@@ -5,14 +5,18 @@ import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
 import { Progress } from '@/components/ui/progress';
 import { Badge } from '@/components/ui/badge';
-import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter } from '@/components/ui/dialog';
+import {
+  Dialog,
+  DialogContent,
+  DialogHeader,
+  DialogTitle,
+  DialogFooter,
+} from '@/components/ui/dialog';
 import { Label } from '@/components/ui/label';
 import { Upload, FileAudio, X, CheckCircle, AlertCircle } from 'lucide-react';
-import { AssemblyAIClient } from '@/lib/assemblyai';
-import { db } from '@/lib/db';
+import type { StoredTranscript } from '@/lib/format';
 
 interface AudioUploadProps {
-  apiKey: string;
   onTranscriptCreated?: () => void;
 }
 
@@ -35,7 +39,9 @@ interface UploadStatus {
   error?: string;
 }
 
-export function AudioUpload({ apiKey, onTranscriptCreated }: AudioUploadProps) {
+const POLL_INTERVAL_MS = 3000;
+
+export function AudioUpload({ onTranscriptCreated }: AudioUploadProps) {
   const [uploads, setUploads] = useState<UploadStatus[]>([]);
   const [isDragging, setIsDragging] = useState(false);
   const [pendingFiles, setPendingFiles] = useState<File[]>([]);
@@ -51,158 +57,102 @@ export function AudioUpload({ apiKey, onTranscriptCreated }: AudioUploadProps) {
     return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
   };
 
-  const startUpload = useCallback(async (files: File[], languageCode: string) => {
-    for (const file of files) {
-      const uploadStatus: UploadStatus = {
-        file,
-        status: 'uploading',
-        progress: 0
-      };
+  const updateUpload = (file: File, patch: Partial<UploadStatus>) => {
+    setUploads((prev) =>
+      prev.map((u) => (u.file === file ? { ...u, ...patch } : u))
+    );
+  };
 
-      setUploads(prev => [...prev, uploadStatus]);
+  const pollUntilDone = async (file: File, transcriptId: string) => {
+    // Poll /api/transcripts/:id until status is final. The server refreshes
+    // against AssemblyAI on each GET.
+    // eslint-disable-next-line no-constant-condition
+    while (true) {
+      await new Promise((r) => setTimeout(r, POLL_INTERVAL_MS));
+      const res = await fetch(`/api/transcripts/${transcriptId}`);
+      if (!res.ok) {
+        throw new Error(`Status check failed: ${res.status}`);
+      }
+      const { transcript } = (await res.json()) as { transcript: StoredTranscript };
 
-      try {
-        await submitForTranscription(file, languageCode);
-      } catch (error) {
-        setUploads(prev => prev.map(upload =>
-          upload.file === file
-            ? { ...upload, status: 'error', error: error instanceof Error ? error.message : 'Upload failed' }
-            : upload
-        ));
+      let progress = 50;
+      switch (transcript.status) {
+        case 'queued':
+          progress = 60;
+          break;
+        case 'processing':
+          progress = 80;
+          break;
+        case 'completed':
+          progress = 100;
+          break;
+        case 'error':
+          progress = 0;
+          break;
+      }
+      updateUpload(file, { progress });
+
+      if (transcript.status === 'completed') {
+        updateUpload(file, { status: 'completed', progress: 100 });
+        onTranscriptCreated?.();
+        return;
+      }
+      if (transcript.status === 'error') {
+        updateUpload(file, { status: 'error', error: 'Transcription failed' });
+        return;
       }
     }
-  }, []); // eslint-disable-line react-hooks/exhaustive-deps
+  };
 
   const submitForTranscription = async (file: File, languageCode: string) => {
-    try {
-      const client = new AssemblyAIClient(apiKey);
+    updateUpload(file, { status: 'uploading', progress: 10 });
 
-      // Step 1: Upload file directly to AssemblyAI
-      setUploads(prev => prev.map(upload =>
-        upload.file === file ? { ...upload, progress: 10 } : upload
-      ));
+    const form = new FormData();
+    form.set('file', file);
+    if (languageCode) form.set('language_code', languageCode);
 
-      const buffer = await file.arrayBuffer();
-      const audioUrl = await client.uploadFile(Buffer.from(buffer));
-
-      // Step 2: Submit for transcription
-      setUploads(prev => prev.map(upload =>
-        upload.file === file
-          ? { ...upload, status: 'transcribing', progress: 30 }
-          : upload
-      ));
-
-      const transcript = await client.submitTranscription(audioUrl, languageCode || undefined);
-
-      setUploads(prev => prev.map(upload =>
-        upload.file === file
-          ? { ...upload, transcriptId: transcript.id, progress: 50 }
-          : upload
-      ));
-
-      // Save to local database immediately
-      await db.saveTranscriptHistory({
-        transcriptId: transcript.id,
-        originalFilename: file.name,
-        status: transcript.status,
-        createdAt: new Date(),
-        duration: 0, // Will be updated when completed
-        speakerCount: 0, // Will be updated when completed
-      });
-
-      // Step 3: Poll for completion
-      await pollTranscriptionStatus(transcript.id, file);
-
-    } catch (error) {
-      console.error('Transcription error:', error);
-      setUploads(prev => prev.map(upload =>
-        upload.file === file
-          ? {
-              ...upload,
-              status: 'error',
-              error: error instanceof Error ? error.message : 'Transcription failed'
-            }
-          : upload
-      ));
+    const res = await fetch('/api/transcripts', { method: 'POST', body: form });
+    if (!res.ok) {
+      const detail = await res.text().catch(() => res.statusText);
+      throw new Error(`Upload failed: ${detail || res.status}`);
     }
+    const { transcript } = (await res.json()) as { transcript: StoredTranscript };
+
+    updateUpload(file, {
+      status: 'transcribing',
+      progress: 50,
+      transcriptId: transcript.assemblyai_id,
+    });
+    // Surface to the parent right away so the newly queued row shows up in
+    // the list, even before it finishes transcribing.
+    onTranscriptCreated?.();
+
+    await pollUntilDone(file, transcript.assemblyai_id);
   };
 
-  const pollTranscriptionStatus = async (transcriptId: string, file: File) => {
-    const client = new AssemblyAIClient(apiKey);
+  const startUpload = useCallback(
+    async (files: File[], languageCode: string) => {
+      for (const file of files) {
+        const uploadStatus: UploadStatus = {
+          file,
+          status: 'uploading',
+          progress: 0,
+        };
+        setUploads((prev) => [...prev, uploadStatus]);
 
-    const checkStatus = async (): Promise<void> => {
-      try {
-        const transcript = await client.getTranscript(transcriptId);
-
-        // Map status to progress percentage
-        let progress = 50;
-        switch (transcript.status) {
-          case 'queued':
-            progress = 60;
-            break;
-          case 'processing':
-            progress = 80;
-            break;
-          case 'completed':
-            progress = 100;
-            break;
-          case 'error':
-            progress = 0;
-            break;
-        }
-
-        setUploads(prev => prev.map(upload =>
-          upload.file === file
-            ? { ...upload, progress: Math.max(upload.progress, progress) }
-            : upload
-        ));
-
-        if (transcript.status === 'completed') {
-          // Update database with final details
-          const createdDate = transcript.created ? new Date(transcript.created) : new Date();
-          await db.saveTranscriptHistory({
-            transcriptId: transcript.id,
-            originalFilename: file.name,
-            status: transcript.status,
-            createdAt: isNaN(createdDate.getTime()) ? new Date() : createdDate,
-            duration: transcript.audio_duration,
-            speakerCount: transcript.utterances ? new Set(transcript.utterances.map(u => u.speaker)).size : 0,
+        try {
+          await submitForTranscription(file, languageCode);
+        } catch (error) {
+          updateUpload(file, {
+            status: 'error',
+            error: error instanceof Error ? error.message : 'Upload failed',
           });
-
-          setUploads(prev => prev.map(upload =>
-            upload.file === file
-              ? { ...upload, status: 'completed', progress: 100 }
-              : upload
-          ));
-
-          if (onTranscriptCreated) {
-            onTranscriptCreated();
-          }
-        } else if (transcript.status === 'error') {
-          setUploads(prev => prev.map(upload =>
-            upload.file === file
-              ? { ...upload, status: 'error', error: transcript.error || 'Transcription failed' }
-              : upload
-          ));
-        } else {
-          // Continue polling
-          setTimeout(checkStatus, 3000);
         }
-      } catch (error) {
-        setUploads(prev => prev.map(upload =>
-          upload.file === file
-            ? {
-                ...upload,
-                status: 'error',
-                error: error instanceof Error ? error.message : 'Status check failed'
-              }
-            : upload
-        ));
       }
-    };
-
-    await checkStatus();
-  };
+    },
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    []
+  );
 
   const handleDragOver = useCallback((e: React.DragEvent) => {
     e.preventDefault();
@@ -215,34 +165,35 @@ export function AudioUpload({ apiKey, onTranscriptCreated }: AudioUploadProps) {
   }, []);
 
   const handleFilesSelected = useCallback((files: FileList) => {
-    const fileArray = Array.from(files);
-    setPendingFiles(fileArray);
+    setPendingFiles(Array.from(files));
     setSelectedLanguage('');
     setIsDialogOpen(true);
   }, []);
 
-  const handleDrop = useCallback((e: React.DragEvent) => {
-    e.preventDefault();
-    setIsDragging(false);
-
-    const files = e.dataTransfer.files;
-    if (files.length > 0) {
-      handleFilesSelected(files);
-    }
-  }, [handleFilesSelected]);
+  const handleDrop = useCallback(
+    (e: React.DragEvent) => {
+      e.preventDefault();
+      setIsDragging(false);
+      if (e.dataTransfer.files.length > 0) {
+        handleFilesSelected(e.dataTransfer.files);
+      }
+    },
+    [handleFilesSelected]
+  );
 
   const handleFileSelect = useCallback(() => {
     fileInputRef.current?.click();
   }, []);
 
-  const handleFileInputChange = useCallback((e: React.ChangeEvent<HTMLInputElement>) => {
-    const files = e.target.files;
-    if (files && files.length > 0) {
-      handleFilesSelected(files);
-    }
-    // Reset input value to allow selecting the same file again
-    e.target.value = '';
-  }, [handleFilesSelected]);
+  const handleFileInputChange = useCallback(
+    (e: React.ChangeEvent<HTMLInputElement>) => {
+      if (e.target.files && e.target.files.length > 0) {
+        handleFilesSelected(e.target.files);
+      }
+      e.target.value = '';
+    },
+    [handleFilesSelected]
+  );
 
   const handleConfirmUpload = () => {
     setIsDialogOpen(false);
@@ -257,7 +208,7 @@ export function AudioUpload({ apiKey, onTranscriptCreated }: AudioUploadProps) {
   };
 
   const removeUpload = (file: File) => {
-    setUploads(prev => prev.filter(upload => upload.file !== file));
+    setUploads((prev) => prev.filter((u) => u.file !== file));
   };
 
   const getStatusIcon = (status: UploadStatus['status']) => {
@@ -296,23 +247,18 @@ export function AudioUpload({ apiKey, onTranscriptCreated }: AudioUploadProps) {
           </CardTitle>
         </CardHeader>
         <CardContent className="space-y-4">
-          {/* Upload Area */}
           <div
             className={`border-2 border-dashed rounded-lg p-8 text-center transition-colors ${
-              isDragging
-                ? 'border-blue-500 bg-blue-50'
-                : 'border-gray-300 hover:border-gray-400'
+              isDragging ? 'border-blue-500 bg-blue-50' : 'border-gray-300 hover:border-gray-400'
             }`}
             onDragOver={handleDragOver}
             onDragLeave={handleDragLeave}
             onDrop={handleDrop}
           >
             <Upload className="h-12 w-12 mx-auto text-gray-400 mb-4" />
-            <p className="text-lg font-medium mb-2">
-              Drop files here or click to browse
-            </p>
+            <p className="text-lg font-medium mb-2">Drop files here or click to browse</p>
             <p className="text-sm text-muted-foreground mb-4">
-              Upload any audio or video file - we&apos;ll handle the rest
+              Upload any audio or video file — we&apos;ll handle the rest
             </p>
             <Button onClick={handleFileSelect} variant="outline">
               Select Files
@@ -326,7 +272,6 @@ export function AudioUpload({ apiKey, onTranscriptCreated }: AudioUploadProps) {
             />
           </div>
 
-          {/* Upload Queue */}
           {uploads.length > 0 && (
             <div className="space-y-3">
               <h4 className="font-medium">Upload Queue</h4>
@@ -341,15 +286,9 @@ export function AudioUpload({ apiKey, onTranscriptCreated }: AudioUploadProps) {
                       </Badge>
                     </div>
                     <div className="flex items-center gap-2">
-                      <span className="text-sm text-muted-foreground">
-                        {getStatusText(upload)}
-                      </span>
+                      <span className="text-sm text-muted-foreground">{getStatusText(upload)}</span>
                       {(upload.status === 'completed' || upload.status === 'error') && (
-                        <Button
-                          variant="ghost"
-                          size="sm"
-                          onClick={() => removeUpload(upload.file)}
-                        >
+                        <Button variant="ghost" size="sm" onClick={() => removeUpload(upload.file)}>
                           <X className="h-4 w-4" />
                         </Button>
                       )}
@@ -368,7 +307,6 @@ export function AudioUpload({ apiKey, onTranscriptCreated }: AudioUploadProps) {
         </CardContent>
       </Card>
 
-      {/* Language Selection Dialog */}
       <Dialog open={isDialogOpen} onOpenChange={setIsDialogOpen}>
         <DialogContent>
           <DialogHeader>
@@ -414,9 +352,7 @@ export function AudioUpload({ apiKey, onTranscriptCreated }: AudioUploadProps) {
             <Button variant="outline" onClick={handleCancelUpload}>
               Cancel
             </Button>
-            <Button onClick={handleConfirmUpload}>
-              Start Transcription
-            </Button>
+            <Button onClick={handleConfirmUpload}>Start Transcription</Button>
           </DialogFooter>
         </DialogContent>
       </Dialog>
