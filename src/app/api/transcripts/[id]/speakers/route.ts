@@ -1,6 +1,7 @@
 import { NextResponse } from 'next/server';
 import { withAuth } from '@/lib/auth/with-auth';
 import { resolveAccess } from '@/db-ops/transcript-access';
+import { logActivity } from '@/db-ops/transcript-activity';
 import {
   getForUser as getMappingsForUser,
   upsertForUser as upsertMappingsForUser,
@@ -74,5 +75,14 @@ export const PUT = withAuth(async ({ user, request }, { params }) => {
   }
 
   const row = await upsertMappingsForUser(access.ownerUserId, id, labels);
+
+  void logActivity({
+    transcriptId: access.row.id,
+    userId: user.userId,
+    email: user.email,
+    action: 'edit_speakers',
+    details: { count: labels.length },
+  });
+
   return NextResponse.json({ speakerLabels: row.speaker_labels });
 });

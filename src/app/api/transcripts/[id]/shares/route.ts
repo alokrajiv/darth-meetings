@@ -1,6 +1,7 @@
 import { NextResponse } from 'next/server';
 import { withAuth } from '@/lib/auth/with-auth';
 import { resolveAccess } from '@/db-ops/transcript-access';
+import { logActivity } from '@/db-ops/transcript-activity';
 import {
   addShare,
   listByTranscript,
@@ -84,6 +85,14 @@ export const POST = withAuth(async ({ user, request }, { params }) => {
     access: requestedAccess,
   });
 
+  void logActivity({
+    transcriptId: access.row.id,
+    userId: user.userId,
+    email: user.email,
+    action: 'share_add',
+    details: { withEmail: normalized, accessLevel: requestedAccess },
+  });
+
   return NextResponse.json({ share }, { status: 201 });
 });
 
@@ -119,6 +128,15 @@ export const PATCH = withAuth(async ({ user, request }, { params }) => {
   if (!share) {
     return NextResponse.json({ error: 'Share not found' }, { status: 404 });
   }
+
+  void logActivity({
+    transcriptId: access.row.id,
+    userId: user.userId,
+    email: user.email,
+    action: 'share_update',
+    details: { withEmail: email.toLowerCase(), accessLevel: requestedAccess },
+  });
+
   return NextResponse.json({ share });
 });
 
@@ -147,5 +165,14 @@ export const DELETE = withAuth(async ({ user, request }, { params }) => {
   if (!removed) {
     return NextResponse.json({ error: 'Share not found' }, { status: 404 });
   }
+
+  void logActivity({
+    transcriptId: access.row.id,
+    userId: user.userId,
+    email: user.email,
+    action: 'share_remove',
+    details: { withEmail: email.toLowerCase() },
+  });
+
   return NextResponse.json({ ok: true });
 });

@@ -1,6 +1,7 @@
 import { NextResponse } from 'next/server';
 import { withAuth } from '@/lib/auth/with-auth';
 import { resolveAccess } from '@/db-ops/transcript-access';
+import { logActivity } from '@/db-ops/transcript-activity';
 import {
   getForUser as getEditsForUser,
   upsertForUser as upsertEditsForUser,
@@ -81,6 +82,15 @@ export const PUT = withAuth(async ({ user, request }, { params }) => {
   }
 
   const row = await upsertEditsForUser(access.ownerUserId, id, map);
+
+  void logActivity({
+    transcriptId: access.row.id,
+    userId: user.userId,
+    email: user.email,
+    action: 'find_replace',
+    details: { entryCount: Object.keys(map).length },
+  });
+
   return NextResponse.json({ edits: row.edits });
 });
 
@@ -135,5 +145,14 @@ export const PATCH = withAuth(async ({ user, request }, { params }) => {
   }
 
   const row = await patchUtteranceForUser(access.ownerUserId, id, utteranceIndex, patch);
+
+  void logActivity({
+    transcriptId: access.row.id,
+    userId: user.userId,
+    email: user.email,
+    action: 'edit_text',
+    details: { utteranceIndex },
+  });
+
   return NextResponse.json({ edits: row.edits });
 });

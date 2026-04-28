@@ -7,6 +7,7 @@ import {
 } from '@/db-ops/transcripts';
 import { deleteForUser as deleteSpeakerMappingsForUser } from '@/db-ops/speaker-mappings';
 import { resolveAccess } from '@/db-ops/transcript-access';
+import { logActivity } from '@/db-ops/transcript-activity';
 import { deleteTranscript as aaiDelete } from '@/lib/server/assemblyai';
 import { refreshIfPending } from '@/lib/server/transcript-sync';
 
@@ -26,6 +27,14 @@ export const GET = withAuth(async ({ user }, { params }) => {
   }
   const refreshed = await refreshIfPending(access.ownerUserId, access.row);
   await touchLastAccessedForUser(access.ownerUserId, id);
+
+  void logActivity({
+    transcriptId: access.row.id,
+    userId: user.userId,
+    email: user.email,
+    action: 'view',
+  });
+
   return NextResponse.json({
     transcript: { ...refreshed, access: access.access, owner_email: null, owner_name: null },
   });
@@ -61,6 +70,17 @@ export const PATCH = withAuth(async ({ user, request }, { params }) => {
   const updated = await updateMetaForUser(access.ownerUserId, id, {
     title: typeof title === 'string' ? title : undefined,
     description: typeof description === 'string' ? description : undefined,
+  });
+
+  void logActivity({
+    transcriptId: access.row.id,
+    userId: user.userId,
+    email: user.email,
+    action: 'edit_meta',
+    details: {
+      changedTitle: typeof title === 'string',
+      changedDescription: typeof description === 'string',
+    },
   });
 
   return NextResponse.json({

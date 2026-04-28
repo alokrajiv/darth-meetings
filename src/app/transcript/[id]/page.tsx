@@ -8,7 +8,6 @@ import { Button } from '@/components/ui/button';
 import { Badge } from '@/components/ui/badge';
 import { Input } from '@/components/ui/input';
 import { Textarea } from '@/components/ui/textarea';
-import { Label } from '@/components/ui/label';
 import {
   formatDuration,
   formatTime,
@@ -25,6 +24,7 @@ import { FindReplacePanel } from '@/components/find-replace-panel';
 import { SpeakerSummaryPanel } from '@/components/speaker-summary-panel';
 import { ShareDialog } from '@/components/share-dialog';
 import { AddPersonDialog } from '@/components/add-person-dialog';
+import { ActivityBar } from '@/components/activity-bar';
 import type { PickerPerson } from '@/components/user-picker';
 import {
   Dialog,
@@ -42,8 +42,6 @@ import {
   RefreshCw,
   Download,
   Copy,
-  Edit,
-  Save,
   X,
   Search,
   Eye,
@@ -94,6 +92,8 @@ export default function TranscriptDetailPage({ params }: TranscriptDetailPagePro
   } | null>(null);
   const [copyStatus, setCopyStatus] = useState<'idle' | 'copied'>('idle');
   const [currentUserEmail, setCurrentUserEmail] = useState<string | null>(null);
+  const [activityTick, setActivityTick] = useState(0);
+  const bumpActivity = useCallback(() => setActivityTick((t) => t + 1), []);
   const [content, setContent] = useState<TranscriptResponse | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -106,7 +106,8 @@ export default function TranscriptDetailPage({ params }: TranscriptDetailPagePro
 
   const [title, setTitle] = useState<string>('');
   const [description, setDescription] = useState<string>('');
-  const [isEditingMeta, setIsEditingMeta] = useState(false);
+  const [editingTitle, setEditingTitle] = useState(false);
+  const [editingDescription, setEditingDescription] = useState(false);
   const [savingMeta, setSavingMeta] = useState(false);
 
   // --- audio player state ---
@@ -306,13 +307,14 @@ export default function TranscriptDetailPage({ params }: TranscriptDetailPagePro
         if (!res.ok) throw new Error(`PATCH failed (${res.status})`);
         const { edits } = (await res.json()) as { edits: TranscriptEditMap };
         setTranscriptEdits(edits ?? {});
+        bumpActivity();
       } catch (err) {
         console.error('Failed to save utterance edit:', err);
         alert('Failed to save edit. Reloading from server.');
         loadAll();
       }
     },
-    [content?.utterances, transcriptId, loadAll]
+    [content?.utterances, transcriptId, loadAll, bumpActivity]
   );
 
   /**
@@ -346,13 +348,14 @@ export default function TranscriptDetailPage({ params }: TranscriptDetailPagePro
         if (!res.ok) throw new Error(`PUT speakers failed (${res.status})`);
         const { speakerLabels: saved } = (await res.json()) as { speakerLabels: SpeakerLabel[] };
         setSpeakerLabels(saved);
+        bumpActivity();
       } catch (err) {
         console.error('Failed to save speaker:', err);
         alert('Failed to save speaker. Reloading from server.');
         loadAll();
       }
     },
-    [speakerLabels, transcriptId, loadAll]
+    [speakerLabels, transcriptId, loadAll, bumpActivity]
   );
 
   // --- find & replace: matches list, derived live from query + content + edits ---
@@ -467,6 +470,7 @@ export default function TranscriptDetailPage({ params }: TranscriptDetailPagePro
       if (!res.ok) throw new Error(`PATCH failed (${res.status})`);
       const { edits } = (await res.json()) as { edits: TranscriptEditMap };
       setTranscriptEdits(edits ?? {});
+      bumpActivity();
     } catch (err) {
       console.error('Failed to replace current:', err);
       alert('Failed to save replacement. Reloading from server.');
@@ -480,6 +484,7 @@ export default function TranscriptDetailPage({ params }: TranscriptDetailPagePro
     replaceWith,
     transcriptId,
     loadAll,
+    bumpActivity,
   ]);
 
   /**
@@ -529,12 +534,13 @@ export default function TranscriptDetailPage({ params }: TranscriptDetailPagePro
       if (!res.ok) throw new Error(`PUT failed (${res.status})`);
       const { edits } = (await res.json()) as { edits: TranscriptEditMap };
       setTranscriptEdits(edits ?? {});
+      bumpActivity();
     } catch (err) {
       console.error('Failed to replace all:', err);
       alert('Failed to save replacements. Reloading from server.');
       loadAll();
     }
-  }, [findMatches, content?.utterances, transcriptEdits, replaceWith, transcriptId, loadAll]);
+  }, [findMatches, content?.utterances, transcriptEdits, replaceWith, transcriptId, loadAll, bumpActivity]);
 
   // --- speaker-pick → add-to-access prompt (shared by summary panel + badge editor) ---
 
@@ -610,6 +616,7 @@ export default function TranscriptDetailPage({ params }: TranscriptDetailPagePro
         return next;
       });
       setPendingShare(null);
+      bumpActivity();
     } catch (err) {
       setSharingError(err instanceof Error ? err.message : 'Failed to share');
     } finally {
@@ -617,33 +624,66 @@ export default function TranscriptDetailPage({ params }: TranscriptDetailPagePro
     }
   };
 
-  // --- meta save (unchanged from before) ---
+  // --- meta save: separate persisters for title vs description so each can
+  // be edited inline without touching the other.
 
-  const handleSaveMeta = async () => {
-    try {
-      setSavingMeta(true);
-      const res = await fetch(`/api/transcripts/${transcriptId}`, {
-        method: 'PATCH',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ title, description }),
-      });
-      if (!res.ok) throw new Error(`PATCH failed (${res.status})`);
-      const { transcript } = (await res.json()) as { transcript: StoredTranscript };
-      setRow(transcript);
-      setIsEditingMeta(false);
-    } catch (err) {
-      console.error('Error saving metadata:', err);
-      alert('Failed to save title and description. Please try again.');
-    } finally {
-      setSavingMeta(false);
-    }
+  const persistMeta = useCallback(
+    async (patch: { title?: string; description?: string }) => {
+      try {
+        setSavingMeta(true);
+        const res = await fetch(`/api/transcripts/${transcriptId}`, {
+          method: 'PATCH',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(patch),
+        });
+        if (!res.ok) throw new Error(`PATCH failed (${res.status})`);
+        const { transcript } = (await res.json()) as { transcript: StoredTranscript };
+        setRow(transcript);
+        bumpActivity();
+      } catch (err) {
+        console.error('Error saving metadata:', err);
+        alert('Failed to save. Please try again.');
+      } finally {
+        setSavingMeta(false);
+      }
+    },
+    [transcriptId, bumpActivity]
+  );
+
+  const commitTitle = () => {
+    setEditingTitle(false);
+    const trimmed = title.trim();
+    if (trimmed === (row?.title ?? '')) return;
+    void persistMeta({ title: trimmed });
   };
 
-  const handleCancelEditMeta = () => {
+  const cancelTitle = () => {
     setTitle(row?.title || '');
-    setDescription(row?.description || '');
-    setIsEditingMeta(false);
+    setEditingTitle(false);
   };
+
+  const commitDescription = () => {
+    setEditingDescription(false);
+    const trimmed = description.trim();
+    if (trimmed === (row?.description ?? '')) return;
+    void persistMeta({ description: trimmed });
+  };
+
+  const cancelDescription = () => {
+    setDescription(row?.description || '');
+    setEditingDescription(false);
+  };
+
+  // Sync the browser tab title to the transcript title so multi-tab work
+  // is navigable. Reset on unmount so other pages don't inherit the title.
+  useEffect(() => {
+    const computed =
+      (row?.title?.trim()) || row?.original_filename || 'Untitled transcript';
+    document.title = `${computed} · Meeting Whisperer`;
+    return () => {
+      document.title = 'Meeting Whisperer';
+    };
+  }, [row?.title, row?.original_filename]);
 
   // --- formatters / markdown ---
 
@@ -860,15 +900,12 @@ export default function TranscriptDetailPage({ params }: TranscriptDetailPagePro
 
   return (
     <div className="container mx-auto px-4 py-8">
-      <div className="flex justify-between items-start mb-6 gap-4">
-        <div>
-          <Button variant="outline" onClick={() => router.push('/')} className="mb-4">
-            <ArrowLeft className="h-4 w-4 mr-2" />
-            Back to Transcripts
-          </Button>
-          <h1 className="text-3xl font-bold">Transcript Details</h1>
-          <p className="text-muted-foreground">ID: {row.assemblyai_id}</p>
-        </div>
+      {/* Header: back + compact toolbar */}
+      <div className="flex items-start justify-between gap-3 mb-4">
+        <Button variant="outline" size="sm" onClick={() => router.push('/')}>
+          <ArrowLeft className="h-4 w-4 mr-1.5" />
+          Back to Transcripts
+        </Button>
         <div className="flex flex-wrap items-center gap-2">
           {access !== 'owner' && (
             <Badge variant="outline" className="text-[10px]">
@@ -954,6 +991,68 @@ export default function TranscriptDetailPage({ params }: TranscriptDetailPagePro
         </div>
       </div>
 
+      {/* Title (inline editable) */}
+      <div className="mb-2">
+        {editingTitle && canEdit ? (
+          <Input
+            autoFocus
+            value={title}
+            placeholder={row.original_filename || 'Untitled transcript'}
+            disabled={savingMeta}
+            onChange={(e) => setTitle(e.target.value)}
+            onBlur={commitTitle}
+            onKeyDown={(e) => {
+              if (e.key === 'Enter') {
+                e.preventDefault();
+                (e.target as HTMLInputElement).blur();
+              } else if (e.key === 'Escape') {
+                e.preventDefault();
+                cancelTitle();
+              }
+            }}
+            className="!text-3xl !font-bold !h-auto !py-1 !px-1 -mx-1 border-dashed"
+          />
+        ) : (
+          <h1
+            onClick={() => canEdit && setEditingTitle(true)}
+            title={canEdit ? 'Click to edit title' : ''}
+            className={`text-3xl font-bold leading-tight rounded -mx-1 px-1 py-0.5 ${
+              canEdit ? 'cursor-text hover:bg-muted/40' : ''
+            } ${title.trim() ? '' : 'text-muted-foreground italic'}`}
+          >
+            {title.trim() || row.original_filename || 'Untitled transcript'}
+          </h1>
+        )}
+      </div>
+
+      {/* Slim stats row */}
+      <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-muted-foreground mb-3">
+        {getStatusBadge(row.status)}
+        <span className="text-muted-foreground/50">•</span>
+        <span>Created {safeFormatDate(row.created_at)}</span>
+        {row.duration && (
+          <>
+            <span className="text-muted-foreground/50">•</span>
+            <span>{formatDuration(row.duration)}</span>
+          </>
+        )}
+        {row.speaker_count != null && (
+          <>
+            <span className="text-muted-foreground/50">•</span>
+            <span>{row.speaker_count} speaker{row.speaker_count === 1 ? '' : 's'}</span>
+          </>
+        )}
+        <span className="text-muted-foreground/50">•</span>
+        <span className="font-mono text-[10px]" title={row.assemblyai_id}>
+          {row.assemblyai_id.slice(0, 8)}…
+        </span>
+      </div>
+
+      {/* Activity bar */}
+      <div className="mb-6">
+        <ActivityBar transcriptId={transcriptId} refreshSignal={activityTick} />
+      </div>
+
       <div className="grid gap-6">
         {/* Audio player — sticky so it stays visible while scrolling the transcript */}
         {row.status === 'completed' && audioAvailable && (
@@ -967,151 +1066,87 @@ export default function TranscriptDetailPage({ params }: TranscriptDetailPagePro
           </div>
         )}
 
-        {/* Title and Description */}
-        <Card>
-          <CardHeader>
-            <div className="flex justify-between items-center">
-              <CardTitle>Title &amp; Description</CardTitle>
-              {!isEditingMeta ? (
-                <Button
-                  variant="outline"
-                  size="sm"
-                  onClick={() => setIsEditingMeta(true)}
-                  disabled={!canEdit}
-                  title={canEdit ? 'Edit title and description' : 'Read-only access'}
+        {/* Description — click-to-edit, markdown rendered. */}
+        {(description || canEdit) && (
+          <Card>
+            <CardHeader className="pb-2">
+              <CardTitle className="text-sm font-semibold text-muted-foreground">
+                Notes
+              </CardTitle>
+            </CardHeader>
+            <CardContent>
+              {editingDescription && canEdit ? (
+                <Textarea
+                  autoFocus
+                  value={description}
+                  placeholder="Notes, attendees, action items… markdown supported."
+                  disabled={savingMeta}
+                  rows={Math.min(Math.max(description.split('\n').length + 1, 4), 20)}
+                  onChange={(e) => setDescription(e.target.value)}
+                  onBlur={commitDescription}
+                  onKeyDown={(e) => {
+                    if (e.key === 'Escape') {
+                      e.preventDefault();
+                      cancelDescription();
+                    }
+                  }}
+                  className="font-mono text-sm"
+                />
+              ) : description ? (
+                <div
+                  onClick={() => canEdit && setEditingDescription(true)}
+                  title={canEdit ? 'Click to edit' : ''}
+                  className={`markdown-body text-sm rounded ${
+                    canEdit ? 'cursor-text hover:bg-muted/30 px-1 -mx-1' : ''
+                  }`}
                 >
-                  <Edit className="h-4 w-4 mr-2" />
-                  Edit
-                </Button>
-              ) : (
-                <div className="flex gap-2">
-                  <Button
-                    variant="outline"
-                    size="sm"
-                    onClick={handleCancelEditMeta}
-                    disabled={savingMeta}
+                  <ReactMarkdown
+                    remarkPlugins={[remarkGfm]}
+                    components={{
+                      h1: ({ children }) => <h1 className="text-xl font-semibold mt-3 mb-2">{children}</h1>,
+                      h2: ({ children }) => <h2 className="text-lg font-semibold mt-3 mb-2">{children}</h2>,
+                      h3: ({ children }) => <h3 className="text-base font-semibold mt-3 mb-1.5">{children}</h3>,
+                      p: ({ children }) => <p className="leading-relaxed my-2">{children}</p>,
+                      ul: ({ children }) => <ul className="list-disc pl-5 my-2 space-y-1">{children}</ul>,
+                      ol: ({ children }) => <ol className="list-decimal pl-5 my-2 space-y-1">{children}</ol>,
+                      li: ({ children }) => <li className="leading-relaxed">{children}</li>,
+                      a: ({ href, children }) => (
+                        <a href={href} target="_blank" rel="noreferrer" className="text-blue-600 underline hover:text-blue-800">
+                          {children}
+                        </a>
+                      ),
+                      strong: ({ children }) => <strong className="font-semibold">{children}</strong>,
+                      em: ({ children }) => <em className="italic">{children}</em>,
+                      code: ({ children }) => <code className="rounded bg-muted px-1 py-0.5 font-mono text-[0.85em]">{children}</code>,
+                      pre: ({ children }) => <pre className="rounded-md bg-muted p-3 overflow-x-auto my-2 text-xs font-mono">{children}</pre>,
+                      blockquote: ({ children }) => (
+                        <blockquote className="border-l-4 border-muted pl-3 italic text-muted-foreground my-2">{children}</blockquote>
+                      ),
+                      hr: () => <hr className="my-3 border-muted" />,
+                      table: ({ children }) => (
+                        <div className="overflow-x-auto my-2">
+                          <table className="min-w-full border-collapse text-xs">{children}</table>
+                        </div>
+                      ),
+                      th: ({ children }) => <th className="border px-2 py-1 bg-muted text-left">{children}</th>,
+                      td: ({ children }) => <td className="border px-2 py-1">{children}</td>,
+                    }}
                   >
-                    <X className="h-4 w-4 mr-2" />
-                    Cancel
-                  </Button>
-                  <Button size="sm" onClick={handleSaveMeta} disabled={savingMeta}>
-                    <Save className="h-4 w-4 mr-2" />
-                    {savingMeta ? 'Saving...' : 'Save'}
-                  </Button>
+                    {description}
+                  </ReactMarkdown>
                 </div>
+              ) : (
+                <button
+                  type="button"
+                  onClick={() => setEditingDescription(true)}
+                  className="text-sm italic text-muted-foreground hover:text-foreground"
+                >
+                  + Add notes
+                </button>
               )}
-            </div>
-          </CardHeader>
-          <CardContent>
-            {isEditingMeta ? (
-              <div className="space-y-4">
-                <div className="space-y-2">
-                  <Label htmlFor="title">Title</Label>
-                  <Input
-                    id="title"
-                    placeholder="Enter a title for this transcript"
-                    value={title}
-                    onChange={(e) => setTitle(e.target.value)}
-                  />
-                </div>
-                <div className="space-y-2">
-                  <Label htmlFor="description">Description</Label>
-                  <Textarea
-                    id="description"
-                    placeholder="Enter a description (optional)"
-                    value={description}
-                    onChange={(e) => setDescription(e.target.value)}
-                    rows={3}
-                  />
-                </div>
-              </div>
-            ) : (
-              <div className="space-y-2">
-                {title ? (
-                  <div>
-                    <p className="text-sm text-muted-foreground">Title</p>
-                    <h3 className="text-lg font-medium">{title}</h3>
-                  </div>
-                ) : (
-                  <p className="text-muted-foreground text-sm">No title set</p>
-                )}
-                {description && (
-                  <div>
-                    <p className="text-sm text-muted-foreground">Description</p>
-                    <div className="markdown-body text-sm">
-                      <ReactMarkdown
-                        remarkPlugins={[remarkGfm]}
-                        components={{
-                          h1: ({ children }) => <h1 className="text-xl font-semibold mt-3 mb-2">{children}</h1>,
-                          h2: ({ children }) => <h2 className="text-lg font-semibold mt-3 mb-2">{children}</h2>,
-                          h3: ({ children }) => <h3 className="text-base font-semibold mt-3 mb-1.5">{children}</h3>,
-                          p: ({ children }) => <p className="leading-relaxed my-2">{children}</p>,
-                          ul: ({ children }) => <ul className="list-disc pl-5 my-2 space-y-1">{children}</ul>,
-                          ol: ({ children }) => <ol className="list-decimal pl-5 my-2 space-y-1">{children}</ol>,
-                          li: ({ children }) => <li className="leading-relaxed">{children}</li>,
-                          a: ({ href, children }) => (
-                            <a href={href} target="_blank" rel="noreferrer" className="text-blue-600 underline hover:text-blue-800">
-                              {children}
-                            </a>
-                          ),
-                          strong: ({ children }) => <strong className="font-semibold">{children}</strong>,
-                          em: ({ children }) => <em className="italic">{children}</em>,
-                          code: ({ children }) => <code className="rounded bg-muted px-1 py-0.5 font-mono text-[0.85em]">{children}</code>,
-                          pre: ({ children }) => <pre className="rounded-md bg-muted p-3 overflow-x-auto my-2 text-xs font-mono">{children}</pre>,
-                          blockquote: ({ children }) => (
-                            <blockquote className="border-l-4 border-muted pl-3 italic text-muted-foreground my-2">{children}</blockquote>
-                          ),
-                          hr: () => <hr className="my-3 border-muted" />,
-                          table: ({ children }) => (
-                            <div className="overflow-x-auto my-2">
-                              <table className="min-w-full border-collapse text-xs">{children}</table>
-                            </div>
-                          ),
-                          th: ({ children }) => <th className="border px-2 py-1 bg-muted text-left">{children}</th>,
-                          td: ({ children }) => <td className="border px-2 py-1">{children}</td>,
-                        }}
-                      >
-                        {description}
-                      </ReactMarkdown>
-                    </div>
-                  </div>
-                )}
-                {!title && !description && (
-                  <p className="text-muted-foreground text-sm">
-                    Click Edit to add a title and description for this transcript.
-                  </p>
-                )}
-              </div>
-            )}
-          </CardContent>
-        </Card>
-
-        {/* Transcript Info */}
-        <Card>
-          <CardHeader>
-            <CardTitle>Transcript Information</CardTitle>
-          </CardHeader>
-          <CardContent>
-            <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
-              <div>
-                <p className="text-sm text-muted-foreground">Status</p>
-                <div className="mt-1">{getStatusBadge(row.status)}</div>
-              </div>
-              <div>
-                <p className="text-sm text-muted-foreground">Created</p>
-                <p className="mt-1">{safeFormatDate(row.created_at)}</p>
-              </div>
-              <div>
-                <p className="text-sm text-muted-foreground">Duration</p>
-                <p className="mt-1">{row.duration ? formatDuration(row.duration) : 'N/A'}</p>
-              </div>
-              <div>
-                <p className="text-sm text-muted-foreground">Speakers</p>
-                <p className="mt-1">{row.speaker_count ?? 'N/A'}</p>
-              </div>
-            </div>
-          </CardContent>
-        </Card>
+            </CardContent>
+          </Card>
+        )}
 
         {/* Speakers — friendly name + description per speaker */}
         {viewMode === 'edited' && content?.utterances && content.utterances.length > 0 && (
@@ -1189,11 +1224,12 @@ export default function TranscriptDetailPage({ params }: TranscriptDetailPagePro
         onOpenChange={setShareOpen}
         transcriptId={transcriptId}
         callerAccess={access}
-        onSharesChanged={(shares) =>
+        onSharesChanged={(shares) => {
           setCollaboratorEmails(
             new Set(shares.map((s) => s.shared_with_email.toLowerCase()))
-          )
-        }
+          );
+          bumpActivity();
+        }}
       />
 
       <AddPersonDialog
