@@ -5,7 +5,8 @@ import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Textarea } from '@/components/ui/textarea';
 import { Badge } from '@/components/ui/badge';
 import { UserPicker, type PickerPerson } from '@/components/user-picker';
-import { ChevronDown, ChevronUp, Pencil, Users } from 'lucide-react';
+import { SpeakerPreviewDialog } from '@/components/speaker-preview-dialog';
+import { ChevronDown, ChevronUp, Headphones, Pencil, Users } from 'lucide-react';
 import type { SpeakerLabel } from '@/lib/format';
 import { defaultSpeakerLabel } from '@/lib/speaker-display';
 
@@ -30,6 +31,9 @@ interface SpeakerSummaryPanelProps {
   /** Called when the picker commits a custom *name* (no email) and the
    *  page should open the AddPersonDialog to promote it. */
   onRequestCreatePerson: (originalSpeaker: string, name: string) => void;
+  /** /api/transcripts/[id]/audio — used to play voice samples in the
+   *  preview dialog. If null, the preview button is hidden. */
+  audioSrc: string | null;
 }
 
 /**
@@ -45,7 +49,9 @@ export function SpeakerSummaryPanel({
   canEdit,
   onPickPerson,
   onRequestCreatePerson,
+  audioSrc,
 }: SpeakerSummaryPanelProps) {
+  const [previewSpeaker, setPreviewSpeaker] = useState<string | null>(null);
   const uniqueSpeakers = useMemo(
     () => Array.from(new Set(utterances.map((u) => u.speaker))).sort(),
     [utterances]
@@ -60,35 +66,49 @@ export function SpeakerSummaryPanel({
   }, [utterances]);
 
   return (
-    <Card>
-      <CardHeader className="pb-3">
-        <CardTitle className="flex items-center gap-2 text-base">
-          <Users className="h-4 w-4" />
-          Speakers
-          <Badge variant="outline" className="ml-1 text-[10px]">
-            {uniqueSpeakers.length}
-          </Badge>
-        </CardTitle>
-      </CardHeader>
-      <CardContent className="space-y-1.5 pb-3">
-        {uniqueSpeakers.map((speaker) => {
-          const mapping = speakerLabels.find((m) => m.originalSpeaker === speaker);
-          return (
-            <SpeakerRow
-              key={speaker}
-              originalSpeaker={speaker}
-              count={utteranceCounts[speaker] ?? 0}
-              initialName={mapping?.customName ?? ''}
-              initialDescription={mapping?.description ?? ''}
-              onSave={onSave}
-              onPickPerson={onPickPerson}
-              onRequestCreatePerson={onRequestCreatePerson}
-              canEdit={canEdit}
-            />
-          );
-        })}
-      </CardContent>
-    </Card>
+    <>
+      <Card>
+        <CardHeader className="pb-3">
+          <CardTitle className="flex items-center gap-2 text-base">
+            <Users className="h-4 w-4" />
+            Speakers
+            <Badge variant="outline" className="ml-1 text-[10px]">
+              {uniqueSpeakers.length}
+            </Badge>
+          </CardTitle>
+        </CardHeader>
+        <CardContent className="space-y-1.5 pb-3">
+          {uniqueSpeakers.map((speaker) => {
+            const mapping = speakerLabels.find((m) => m.originalSpeaker === speaker);
+            return (
+              <SpeakerRow
+                key={speaker}
+                originalSpeaker={speaker}
+                count={utteranceCounts[speaker] ?? 0}
+                initialName={mapping?.customName ?? ''}
+                initialDescription={mapping?.description ?? ''}
+                onSave={onSave}
+                onPickPerson={onPickPerson}
+                onRequestCreatePerson={onRequestCreatePerson}
+                onPreview={audioSrc ? () => setPreviewSpeaker(speaker) : null}
+                canEdit={canEdit}
+              />
+            );
+          })}
+        </CardContent>
+      </Card>
+
+      {audioSrc && previewSpeaker && (
+        <SpeakerPreviewDialog
+          open
+          onOpenChange={(v) => !v && setPreviewSpeaker(null)}
+          originalSpeaker={previewSpeaker}
+          utterances={utterances}
+          speakerLabels={speakerLabels}
+          audioSrc={audioSrc}
+        />
+      )}
+    </>
   );
 }
 
@@ -103,6 +123,8 @@ interface SpeakerRowProps {
   ) => void;
   onPickPerson: (person: PickerPerson) => void;
   onRequestCreatePerson: (originalSpeaker: string, name: string) => void;
+  /** Click → open the speaker-preview dialog. Null when audio isn't available. */
+  onPreview: (() => void) | null;
   canEdit: boolean;
 }
 
@@ -114,6 +136,7 @@ function SpeakerRow({
   onSave,
   onPickPerson,
   onRequestCreatePerson,
+  onPreview,
   canEdit,
 }: SpeakerRowProps) {
   const [name, setName] = useState(initialName);
@@ -188,6 +211,16 @@ function SpeakerRow({
             </button>
           )}
         </div>
+        {onPreview && (
+          <button
+            type="button"
+            onClick={onPreview}
+            className="flex shrink-0 items-center justify-center rounded p-1 text-muted-foreground hover:bg-muted hover:text-foreground transition-colors"
+            title="Preview voice — cycle through this speaker's distinctive moments"
+          >
+            <Headphones className="h-3.5 w-3.5" />
+          </button>
+        )}
         <button
           type="button"
           onClick={() => setExpanded((v) => !v)}

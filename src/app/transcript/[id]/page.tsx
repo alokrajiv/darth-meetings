@@ -1157,6 +1157,11 @@ export default function TranscriptDetailPage({ params }: TranscriptDetailPagePro
             canEdit={canEdit}
             onPickPerson={handlePickPerson}
             onRequestCreatePerson={handleRequestCreatePerson}
+            audioSrc={
+              row.status === 'completed' && audioAvailable
+                ? `/api/transcripts/${row.assemblyai_id}/audio`
+                : null
+            }
           />
         )}
 
