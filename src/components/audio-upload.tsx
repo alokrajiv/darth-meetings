@@ -41,6 +41,9 @@ interface UploadStatus {
 
 const POLL_INTERVAL_MS = 3000;
 
+// Keep in sync with `proxyClientMaxBodySize` in next.config.ts.
+const MAX_FILE_BYTES = 4 * 1024 * 1024 * 1024; // 4GB
+
 export function AudioUpload({ onTranscriptCreated }: AudioUploadProps) {
   const [uploads, setUploads] = useState<UploadStatus[]>([]);
   const [isDragging, setIsDragging] = useState(false);
@@ -66,7 +69,6 @@ export function AudioUpload({ onTranscriptCreated }: AudioUploadProps) {
   const pollUntilDone = async (file: File, transcriptId: string) => {
     // Poll /api/transcripts/:id until status is final. The server refreshes
     // against AssemblyAI on each GET.
-    // eslint-disable-next-line no-constant-condition
     while (true) {
       await new Promise((r) => setTimeout(r, POLL_INTERVAL_MS));
       const res = await fetch(`/api/transcripts/${transcriptId}`);
@@ -104,19 +106,59 @@ export function AudioUpload({ onTranscriptCreated }: AudioUploadProps) {
     }
   };
 
+  // Raw-body upload via XHR: the file IS the request body (the server
+  // streams it to disk — no multipart, no server-side buffering), and
+  // xhr.upload.onprogress gives real progress, which matters when a
+  // multi-GB file takes minutes to send.
+  const uploadFile = (file: File, languageCode: string): Promise<StoredTranscript> =>
+    new Promise((resolve, reject) => {
+      const xhr = new XMLHttpRequest();
+      const qs = languageCode
+        ? `?${new URLSearchParams({ language_code: languageCode })}`
+        : '';
+      xhr.open('POST', `/api/transcripts${qs}`);
+      xhr.setRequestHeader('content-type', file.type || 'application/octet-stream');
+      xhr.setRequestHeader('x-filename', encodeURIComponent(file.name));
+      xhr.upload.onprogress = (e) => {
+        if (e.lengthComputable && e.total > 0) {
+          // Upload owns the 0–50% band; transcription polling owns the rest.
+          updateUpload(file, { progress: Math.round((e.loaded / e.total) * 50) });
+        }
+      };
+      xhr.onload = () => {
+        if (xhr.status >= 200 && xhr.status < 300) {
+          try {
+            resolve(
+              (JSON.parse(xhr.responseText) as { transcript: StoredTranscript })
+                .transcript
+            );
+          } catch {
+            reject(new Error('Upload failed: invalid server response'));
+          }
+        } else {
+          let detail: string = xhr.responseText || String(xhr.status);
+          try {
+            detail = (JSON.parse(xhr.responseText) as { error?: string }).error ?? detail;
+          } catch {
+            // keep raw text
+          }
+          reject(new Error(`Upload failed: ${detail}`));
+        }
+      };
+      xhr.onerror = () => reject(new Error('Upload failed: network error'));
+      xhr.send(file);
+    });
+
   const submitForTranscription = async (file: File, languageCode: string) => {
-    updateUpload(file, { status: 'uploading', progress: 10 });
-
-    const form = new FormData();
-    form.set('file', file);
-    if (languageCode) form.set('language_code', languageCode);
-
-    const res = await fetch('/api/transcripts', { method: 'POST', body: form });
-    if (!res.ok) {
-      const detail = await res.text().catch(() => res.statusText);
-      throw new Error(`Upload failed: ${detail || res.status}`);
+    if (file.size > MAX_FILE_BYTES) {
+      throw new Error(
+        `File is ${formatFileSize(file.size)} — the upload limit is ${formatFileSize(MAX_FILE_BYTES)}`
+      );
     }
-    const { transcript } = (await res.json()) as { transcript: StoredTranscript };
+
+    updateUpload(file, { status: 'uploading', progress: 0 });
+
+    const transcript = await uploadFile(file, languageCode);
 
     updateUpload(file, {
       status: 'transcribing',
@@ -248,19 +290,21 @@ export function AudioUpload({ onTranscriptCreated }: AudioUploadProps) {
         </CardHeader>
         <CardContent className="space-y-4">
           <div
-            className={`border-2 border-dashed rounded-lg p-8 text-center transition-colors ${
+            className={`border-2 border-dashed rounded-lg p-4 sm:p-8 text-center transition-colors ${
               isDragging ? 'border-blue-500 bg-blue-50' : 'border-gray-300 hover:border-gray-400'
             }`}
             onDragOver={handleDragOver}
             onDragLeave={handleDragLeave}
             onDrop={handleDrop}
           >
-            <Upload className="h-12 w-12 mx-auto text-gray-400 mb-4" />
-            <p className="text-lg font-medium mb-2">Drop files here or click to browse</p>
-            <p className="text-sm text-muted-foreground mb-4">
+            <Upload className="h-8 w-8 sm:h-12 sm:w-12 mx-auto text-gray-400 mb-2 sm:mb-4" />
+            <p className="text-sm sm:text-lg font-medium mb-1 sm:mb-2">
+              Drop files here or click to browse
+            </p>
+            <p className="text-xs sm:text-sm text-muted-foreground mb-3 sm:mb-4">
               Upload any audio or video file — we&apos;ll handle the rest
             </p>
-            <Button onClick={handleFileSelect} variant="outline">
+            <Button onClick={handleFileSelect} variant="outline" size="sm">
               Select Files
             </Button>
             <input

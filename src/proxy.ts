@@ -52,5 +52,11 @@ export async function proxy(request: NextRequest) {
 }
 
 export const config = {
-  matcher: ['/((?!_next/static|_next/image|favicon.ico).*)'],
+  // `api/transcripts$` (the upload endpoint, exact match — subpaths still
+  // proxied) is excluded on purpose: when the proxy matches a route, Next
+  // buffers the whole request body in memory to enforce
+  // proxyClientMaxBodySize, which defeats the route's streaming upload and
+  // blows up RAM on multi-GB files. The route is still fully protected —
+  // withAuth verifies the session before the body is ever read.
+  matcher: ['/((?!api/transcripts$|_next/static|_next/image|favicon.ico).*)'],
 };

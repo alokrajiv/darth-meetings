@@ -26,9 +26,13 @@ function getClient(): AssemblyAI {
   return cachedClient;
 }
 
-export async function uploadFile(data: Buffer | Uint8Array): Promise<string> {
-  const buffer = data instanceof Buffer ? data : Buffer.from(data);
-  return await getClient().files.upload(buffer);
+/**
+ * Upload audio to AssemblyAI. Pass a local file path (string) whenever
+ * possible — the SDK streams it from disk via createReadStream, so multi-GB
+ * files never sit in memory. Buffers are still accepted for small payloads.
+ */
+export async function uploadFile(data: string | Buffer | Uint8Array): Promise<string> {
+  return await getClient().files.upload(data);
 }
 
 export interface SubmitOptions {

@@ -1,6 +1,10 @@
 import 'server-only';
 import path from 'node:path';
-import { promises as fsp } from 'node:fs';
+import { createWriteStream, promises as fsp } from 'node:fs';
+import { Readable, Transform } from 'node:stream';
+import { pipeline } from 'node:stream/promises';
+import type { ReadableStream as NodeWebReadableStream } from 'node:stream/web';
+import { randomUUID } from 'node:crypto';
 
 /**
  * Local audio storage on the server filesystem.
@@ -66,6 +70,52 @@ export async function saveAudioBytes(filename: string, data: Buffer | Uint8Array
   const abs = resolveAudioPath(filename);
   await fsp.writeFile(abs, data);
   return abs;
+}
+
+/**
+ * Stream an incoming request body straight to a temp file in the audio dir.
+ * Constant memory regardless of file size — this is the upload path for
+ * multi-GB recordings. The temp file lives in the audio dir itself so the
+ * later rename to its final name is atomic (same filesystem).
+ *
+ * Returns the temp filename (relative, like all stored filenames) and the
+ * byte count actually written.
+ */
+export async function saveAudioStreamToTemp(
+  stream: ReadableStream<Uint8Array>
+): Promise<{ tempFilename: string; bytes: number }> {
+  await ensureAudioDir();
+  const tempFilename = `upload-${randomUUID()}.part`;
+  const abs = resolveAudioPath(tempFilename);
+
+  let bytes = 0;
+  const counter = new Transform({
+    transform(chunk: Buffer, _enc, cb) {
+      bytes += chunk.length;
+      cb(null, chunk);
+    },
+  });
+
+  try {
+    await pipeline(
+      Readable.fromWeb(stream as unknown as NodeWebReadableStream<Uint8Array>),
+      counter,
+      createWriteStream(abs)
+    );
+  } catch (error) {
+    await deleteAudioFile(tempFilename);
+    throw error;
+  }
+
+  return { tempFilename, bytes };
+}
+
+/** Rename a stored audio file (e.g. temp upload → final AAI-id-based name). */
+export async function renameAudioFile(fromFilename: string, toFilename: string): Promise<string> {
+  const from = resolveAudioPath(fromFilename);
+  const to = resolveAudioPath(toFilename);
+  await fsp.rename(from, to);
+  return to;
 }
 
 export async function audioFileExists(filename: string): Promise<boolean> {

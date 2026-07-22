@@ -11,14 +11,23 @@ import {
   submitTranscription,
   getTranscript,
 } from '@/lib/server/assemblyai';
-import { audioFilename, saveAudioBytes } from '@/lib/server/audio-storage';
+import {
+  audioFilename,
+  deleteAudioFile,
+  renameAudioFile,
+  resolveAudioPath,
+  saveAudioBytes,
+  saveAudioStreamToTemp,
+} from '@/lib/server/audio-storage';
 import { getForUser as getUserVocab } from '@/db-ops/user-vocab';
 import { getCurrentPayload as getOrgVocabPayload } from '@/db-ops/org-vocab';
 import { mergeVocabs } from '@/lib/server/vocab-merge';
 
 export const runtime = 'nodejs';
-// Allow larger multipart bodies than the default — meeting audio is big.
-export const maxDuration = 300;
+// Handler wall-clock budget (only enforced on serverless hosts). Receiving a
+// multi-GB body over a slow uplink plus re-uploading it to AssemblyAI can
+// take a while.
+export const maxDuration = 900;
 
 /**
  * GET /api/transcripts
@@ -78,38 +87,87 @@ export const GET = withAuth(async ({ user }) => {
 
 /**
  * POST /api/transcripts
- * Multipart upload: `file` (required) + optional `language_code`.
- * Streams the file to AssemblyAI via the server and records a row scoped to
- * the current user. Returns the inserted row.
+ * Raw-body upload: the file bytes ARE the request body (streamed to disk,
+ * constant memory — this is how multi-GB recordings survive). Metadata rides
+ * alongside: `x-filename` header (URI-encoded) and `?language_code=` query
+ * param. A legacy multipart/form-data body (`file` + `language_code` fields)
+ * is still accepted for stale tabs, but that path buffers in memory — fine
+ * for small files only.
+ *
+ * Either way the bytes land in a temp file first, then go to AssemblyAI via
+ * the SDK's disk-streaming path, and finally get renamed to their permanent
+ * `<aai-id>.<ext>` name once the transcription is accepted.
  */
 export const POST = withAuth(async ({ user, request }) => {
-  let form: FormData;
-  try {
-    form = await request.formData();
-  } catch (error) {
-    return NextResponse.json(
-      { error: 'Invalid multipart body', detail: String(error) },
-      { status: 400 }
-    );
+  const contentType = request.headers.get('content-type') ?? '';
+
+  let tempFilename: string;
+  let originalFilename: string | null = null;
+  let languageCode: string | undefined;
+
+  if (contentType.includes('multipart/form-data')) {
+    // Legacy path — whole body in memory. Kept only so an already-open old
+    // client doesn't break; the shipped client sends raw bodies.
+    let form: FormData;
+    try {
+      form = await request.formData();
+    } catch (error) {
+      return NextResponse.json(
+        { error: 'Invalid multipart body', detail: String(error) },
+        { status: 400 }
+      );
+    }
+
+    const file = form.get('file');
+    if (!(file instanceof File)) {
+      return NextResponse.json({ error: 'Missing `file` field' }, { status: 400 });
+    }
+    const rawLang = form.get('language_code');
+    languageCode =
+      typeof rawLang === 'string' && rawLang.length > 0 ? rawLang : undefined;
+    originalFilename = file.name || null;
+
+    tempFilename = `upload-${crypto.randomUUID()}.part`;
+    await saveAudioBytes(tempFilename, Buffer.from(await file.arrayBuffer()));
+  } else {
+    if (!request.body) {
+      return NextResponse.json({ error: 'Empty request body' }, { status: 400 });
+    }
+
+    const rawName = request.headers.get('x-filename');
+    if (rawName) {
+      try {
+        originalFilename = decodeURIComponent(rawName);
+      } catch {
+        originalFilename = rawName;
+      }
+    }
+    const rawLang = request.nextUrl.searchParams.get('language_code');
+    languageCode = rawLang && rawLang.length > 0 ? rawLang : undefined;
+
+    let bytes: number;
+    try {
+      ({ tempFilename, bytes } = await saveAudioStreamToTemp(request.body));
+    } catch (error) {
+      console.error('[POST /api/transcripts] body stream failed:', error);
+      return NextResponse.json(
+        { error: 'Upload stream failed', detail: String(error) },
+        { status: 400 }
+      );
+    }
+    if (bytes === 0) {
+      await deleteAudioFile(tempFilename);
+      return NextResponse.json({ error: 'Empty request body' }, { status: 400 });
+    }
   }
-
-  const file = form.get('file');
-  if (!(file instanceof File)) {
-    return NextResponse.json({ error: 'Missing `file` field' }, { status: 400 });
-  }
-
-  const rawLang = form.get('language_code');
-  const languageCode =
-    typeof rawLang === 'string' && rawLang.length > 0 ? rawLang : undefined;
-
-  const arrayBuffer = await file.arrayBuffer();
-  const buffer = Buffer.from(arrayBuffer);
 
   let audioUrl: string;
   try {
-    audioUrl = await uploadFile(buffer);
+    // Path input → the SDK streams the file from disk.
+    audioUrl = await uploadFile(resolveAudioPath(tempFilename));
   } catch (error) {
     console.error('[POST /api/transcripts] AAI upload failed:', error);
+    await deleteAudioFile(tempFilename);
     return NextResponse.json(
       { error: 'Upload to AssemblyAI failed', detail: String(error) },
       { status: 502 }
@@ -140,6 +198,7 @@ export const POST = withAuth(async ({ user, request }) => {
     });
   } catch (error) {
     console.error('[POST /api/transcripts] AAI submit failed:', error);
+    await deleteAudioFile(tempFilename);
     return NextResponse.json(
       { error: 'Transcription submission failed', detail: String(error) },
       { status: 502 }
@@ -148,24 +207,26 @@ export const POST = withAuth(async ({ user, request }) => {
 
   const row = await createForUser(user.userId, {
     assemblyaiId: submitted.id,
-    originalFilename: file.name || null,
+    originalFilename,
     status: submitted.status,
     languageCode: languageCode ?? null,
     audioUrl: audioUrl,
   });
 
-  // Save our own copy of the audio. AAI deletes uploaded audio immediately
-  // after transcription, so their audio_url is useless for playback. We
-  // serve from disk via /api/transcripts/[id]/audio.
+  // Keep our own copy of the audio. AAI deletes uploaded audio immediately
+  // after transcription, so their audio_url is useless for playback. The
+  // bytes are already on disk as the temp file — just rename it to its
+  // permanent name. We serve it via /api/transcripts/[id]/audio.
   try {
-    const filename = audioFilename(submitted.id, file.name || null);
-    await saveAudioBytes(filename, buffer);
+    const filename = audioFilename(submitted.id, originalFilename);
+    await renameAudioFile(tempFilename, filename);
     await setLocalAudioPathForUser(user.userId, submitted.id, filename);
     row.local_audio_path = filename;
   } catch (error) {
     // Non-fatal: the transcription itself succeeded. Audio playback for this
     // row will fall back to (broken) remote URL until/unless we re-upload.
-    console.error('[POST /api/transcripts] local audio save failed:', error);
+    console.error('[POST /api/transcripts] local audio rename failed:', error);
+    await deleteAudioFile(tempFilename);
   }
 
   return NextResponse.json({ transcript: row }, { status: 201 });
