@@ -104,16 +104,24 @@ export async function ingestLocalAudio(
     throw new IngestError('aai-submit', 'Transcription submission failed', error);
   }
 
-  const row = await createForUser(userId, {
-    assemblyaiId: submitted.id,
-    originalFilename: opts.originalFilename,
-    status: submitted.status,
-    languageCode: opts.languageCode ?? null,
-    title: opts.title ?? null,
-    audioUrl: audioUrl,
-    driveFileId: opts.driveFileId ?? null,
-    gmeetContext: opts.gmeetContext ?? null,
-  });
+  let row: TranscriptRow;
+  try {
+    row = await createForUser(userId, {
+      assemblyaiId: submitted.id,
+      originalFilename: opts.originalFilename,
+      status: submitted.status,
+      languageCode: opts.languageCode ?? null,
+      title: opts.title ?? null,
+      audioUrl: audioUrl,
+      driveFileId: opts.driveFileId ?? null,
+      gmeetContext: opts.gmeetContext ?? null,
+    });
+  } catch (error) {
+    // Transcription was submitted but we lost the row — don't also leak the
+    // temp file on disk.
+    await deleteAudioFile(tempFilename);
+    throw error;
+  }
 
   // Keep our own copy of the audio. AAI deletes uploaded audio immediately
   // after transcription, so their audio_url is useless for playback. The

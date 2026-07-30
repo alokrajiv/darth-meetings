@@ -204,6 +204,11 @@ export function parseMeetTranscriptDoc(text: string): ParsedMeetTranscript {
   let inAttendees = false;
   let currentBlockMs = 0;
   let sawAnyTimestamp = false;
+  // Transcription restarts reset the clock to 00:00:00 mid-doc. Keep block
+  // times monotonic by offsetting each restarted segment past the previous
+  // one (assume the prior block ran its typical span).
+  let lastRawMs = -1;
+  let offsetMs = 0;
 
   for (const rawLine of lines) {
     const line = rawLine.trim();
@@ -235,8 +240,12 @@ export function parseMeetTranscriptDoc(text: string): ParsedMeetTranscript {
 
     const ts = TS_RE.exec(line);
     if (ts) {
-      currentBlockMs =
-        (Number(ts[1]) * 3600 + Number(ts[2]) * 60 + Number(ts[3])) * 1000;
+      const rawMs = (Number(ts[1]) * 3600 + Number(ts[2]) * 60 + Number(ts[3])) * 1000;
+      if (rawMs < lastRawMs) {
+        offsetMs = currentBlockMs + 5 * 60_000;
+      }
+      lastRawMs = rawMs;
+      currentBlockMs = rawMs + offsetMs;
       if (!blockStarts.includes(currentBlockMs)) blockStarts.push(currentBlockMs);
       sawAnyTimestamp = true;
       continue;

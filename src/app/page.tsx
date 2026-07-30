@@ -7,13 +7,15 @@ import { AudioUpload } from '@/components/audio-upload';
 import { LogoutButton } from '@/components/logout-button';
 import { ImportDialog } from '@/components/import-dialog';
 import { GmeetImportDialog } from '@/components/gmeet-import-dialog';
+import { TranscriptImportDialog } from '@/components/transcript-import-dialog';
 import { Button } from '@/components/ui/button';
-import { Settings, Download, Video } from 'lucide-react';
+import { Settings, Download, Video, FileUp } from 'lucide-react';
 
 export default function Home() {
   const [refreshTrigger, setRefreshTrigger] = useState(0);
   const [importOpen, setImportOpen] = useState(false);
   const [gmeetOpen, setGmeetOpen] = useState(false);
+  const [textImportOpen, setTextImportOpen] = useState(false);
 
   const handleTranscriptCreated = () => {
     setRefreshTrigger((prev) => prev + 1);
@@ -33,6 +35,11 @@ export default function Home() {
             <Video className="h-4 w-4 sm:mr-1" />
             <span className="hidden sm:inline">Import from Meet</span>
             <span className="sm:hidden">Meet</span>
+          </Button>
+          <Button variant="outline" size="sm" onClick={() => setTextImportOpen(true)} title="Import a transcript file (Teams, Zoom, VTT…)">
+            <FileUp className="h-4 w-4 sm:mr-1" />
+            <span className="hidden sm:inline">Import transcript</span>
+            <span className="sm:hidden">File</span>
           </Button>
           <Button variant="outline" size="sm" onClick={() => setImportOpen(true)} title="Import from AAI key">
             <Download className="h-4 w-4 sm:mr-1" />
@@ -62,6 +69,11 @@ export default function Home() {
       <GmeetImportDialog
         open={gmeetOpen}
         onClose={() => setGmeetOpen(false)}
+        onImported={handleTranscriptCreated}
+      />
+      <TranscriptImportDialog
+        open={textImportOpen}
+        onClose={() => setTextImportOpen(false)}
         onImported={handleTranscriptCreated}
       />
     </div>

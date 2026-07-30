@@ -1,6 +1,7 @@
 import 'server-only';
 import { getForUser } from '@/db-ops/transcripts';
 import { getContentCached } from '@/lib/server/auto-notes';
+import { suggestSpeakersFromMeet } from '@/lib/server/meet-align';
 import { suggestSpeakersForTranscript } from '@/lib/server/voiceprint';
 
 /**
@@ -39,6 +40,24 @@ export function onTranscriptCompleted(ownerUserId: string, assemblyaiId: string)
           full.local_audio_path,
           content
         ).catch((err) => console.warn('[post-completion] suggest failed:', err));
+
+        // Meet↔AAI alignment: when the import kept the Google Meet transcript
+        // as a sidecar ('both' mode), name diarized speakers by timeline
+        // overlap against Meet's named utterances. Runs after voiceprints —
+        // voice matches outrank overlap votes in the merge.
+        const meetT = full.gmeet_context?.meetTranscript;
+        if (
+          meetT?.utterances?.length &&
+          content?.utterances?.length &&
+          !full.assemblyai_id.startsWith('gmeet-')
+        ) {
+          await suggestSpeakersFromMeet(
+            ownerUserId,
+            full.assemblyai_id,
+            content,
+            meetT.utterances
+          ).catch((err) => console.warn('[post-completion] meet-align failed:', err));
+        }
       } catch (err) {
         console.warn('[post-completion] hook failed:', err);
       }
