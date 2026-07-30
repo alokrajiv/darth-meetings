@@ -13,6 +13,7 @@ import {
   getForUser as getMappingsForUser,
   setSuggestionsForUser,
 } from '@/db-ops/speaker-mappings';
+import { listByTranscript as listAttachments } from '@/db-ops/transcript-attachments';
 import type {
   SpeakerLabel,
   SpeakerSuggestionMap,
@@ -104,6 +105,50 @@ function buildSpeakerContext(
   }
   if (lines.length === 0) return 'Speaker identities: none known yet.\n\nTranscript follows:\n\n';
   return `Speaker identities established so far:\n${lines.join('\n')}\n\nTranscript follows:\n\n`;
+}
+
+/**
+ * "Attached context" block: files/text the team attached to this transcript.
+ * Grounds names, projects, and agenda items; the prompt makes clear the
+ * transcript stays the source of truth. Total context capped so a big deck
+ * can't crowd out the transcript itself.
+ */
+const MAX_CONTEXT_CHARS = 30_000;
+
+async function buildAttachmentContext(transcriptRowId: number): Promise<string> {
+  let attachments;
+  try {
+    attachments = await listAttachments(transcriptRowId);
+  } catch (err) {
+    console.warn('[auto-notes] attachment load failed (continuing without):', err);
+    return '';
+  }
+  if (attachments.length === 0) return '';
+
+  const parts: string[] = [];
+  let budget = MAX_CONTEXT_CHARS;
+  for (const a of attachments) {
+    const label =
+      a.kind === 'file'
+        ? `${a.title}${a.original_filename && a.original_filename !== a.title ? ` (${a.original_filename})` : ''}`
+        : a.title;
+    const who = a.added_by_email ? ` — added by ${a.added_by_email}` : '';
+    const text = (a.text_content ?? '').trim();
+    if (!text) {
+      parts.push(`--- ${label}${who} — content could not be extracted ---`);
+      continue;
+    }
+    if (budget <= 0) break;
+    const take = text.slice(0, budget);
+    budget -= take.length;
+    parts.push(`--- ${label}${who} ---\n${take}`);
+  }
+
+  return (
+    `Additional context attached by the team (agendas, decks, docs). Use it to ground names, projects, terminology, and agenda items in the notes — but the TRANSCRIPT remains the sole source of truth for what was actually said and decided; never present context material as something said in the meeting.\n\n` +
+    parts.join('\n\n') +
+    '\n\n'
+  );
 }
 
 function buildTranscriptText(
@@ -218,9 +263,12 @@ export async function generateAutoNotes(
     const existingSuggestions = mappings?.suggestions ?? {};
     const transcriptText = buildTranscriptText(content, labels);
     const speakerContext = buildSpeakerContext(labels, existingSuggestions);
+    const attachmentContext = await buildAttachmentContext(row.id);
 
     const started = Date.now();
-    const raw = await runClaude(PROMPT_HEADER + speakerContext + transcriptText);
+    const raw = await runClaude(
+      PROMPT_HEADER + attachmentContext + speakerContext + transcriptText
+    );
     console.log(
       `[auto-notes] ${assemblyaiId}: generated ${raw.length} chars in ${Math.round((Date.now() - started) / 1000)}s`
     );

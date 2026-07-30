@@ -206,6 +206,27 @@ export interface SpeakerSuggestion {
 
 export type SpeakerSuggestionMap = Record<string, SpeakerSuggestion>;
 
+/**
+ * "Attached context" on a transcript: a file (deck, PDF, doc) or
+ * typed/pasted text that collaborators add. Visible to everyone with access
+ * and injected into AI notes generation. `text_content` is the pasted text
+ * or the server's best-effort extraction from the file.
+ */
+export interface TranscriptAttachment {
+  id: number;
+  transcript_id: number;
+  added_by_user_id: string;
+  added_by_email: string | null;
+  kind: 'text' | 'file';
+  title: string;
+  text_content: string | null;
+  original_filename: string | null;
+  mime_type: string | null;
+  size_bytes: number | null;
+  extraction_status: 'ok' | 'none' | 'failed' | null;
+  created_at: string;
+}
+
 /** One AI-suggested topical section of the meeting. */
 export interface TranscriptSegment {
   title: string;
