@@ -15,6 +15,7 @@ import {
   getGoogleAccessToken,
   hasValidGoogleToken,
   invalidateGoogleToken,
+  switchGoogleAccount,
 } from '@/lib/google-token';
 import {
   AlertCircle,
@@ -1069,6 +1070,22 @@ export function GmeetImportDialog({ open, onClose, onImported }: GmeetImportDial
                 you can re-run diarization on any of them later).
               </p>
             )}
+            <button
+              type="button"
+              className="text-[11px] text-muted-foreground underline decoration-dotted underline-offset-2 hover:text-foreground"
+              disabled={busy}
+              onClick={async () => {
+                try {
+                  setBusy(true);
+                  await switchGoogleAccount();
+                  await loadEvents(date);
+                } catch {
+                  setBusy(false);
+                }
+              }}
+            >
+              Wrong calendar? Switch Google account
+            </button>
             {error && (
               <p className="text-xs text-destructive flex items-center gap-1">
                 <AlertCircle className="h-4 w-4" />

@@ -36,7 +36,7 @@ interface TokenResponse {
 }
 
 interface TokenClient {
-  requestAccessToken: (overrides?: { prompt?: string }) => void;
+  requestAccessToken: (overrides?: { prompt?: '' | 'consent' | 'select_account' }) => void;
 }
 
 declare global {
@@ -134,8 +134,10 @@ export function invalidateGoogleToken(): void {
   writeStoredToken(null);
 }
 
-export async function getGoogleAccessToken(): Promise<string> {
-  if (hasValidGoogleToken()) return cached!.token;
+export async function getGoogleAccessToken(
+  opts: { selectAccount?: boolean } = {}
+): Promise<string> {
+  if (!opts.selectAccount && hasValidGoogleToken()) return cached!.token;
 
   const clientId = process.env.NEXT_PUBLIC_GOOGLE_CLIENT_ID;
   if (!clientId) {
@@ -173,6 +175,16 @@ export async function getGoogleAccessToken(): Promise<string> {
         );
       },
     });
-    client.requestAccessToken();
+    client.requestAccessToken(opts.selectAccount ? { prompt: 'select_account' } : undefined);
   });
+}
+
+/**
+ * Force the Google account chooser and replace the cached token for the
+ * whole app. Most flows never need this — the session-cached token wins —
+ * but "wrong account" needs an exit.
+ */
+export async function switchGoogleAccount(): Promise<string> {
+  invalidateGoogleToken();
+  return getGoogleAccessToken({ selectAccount: true });
 }
