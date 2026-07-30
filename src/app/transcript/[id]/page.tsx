@@ -14,6 +14,7 @@ import {
   type StoredTranscript,
   type TranscriptResponse,
   type SpeakerLabel,
+  type SpeakerSuggestionMap,
   type TranscriptEditMap,
   type TranscriptAccess,
   type TranscriptShare,
@@ -25,6 +26,7 @@ import { SpeakerSummaryPanel } from '@/components/speaker-summary-panel';
 import { ShareDialog } from '@/components/share-dialog';
 import { AddPersonDialog } from '@/components/add-person-dialog';
 import { ActivityBar } from '@/components/activity-bar';
+import { TranscriptOutline } from '@/components/transcript-outline';
 import type { PickerPerson } from '@/components/user-picker';
 import {
   Dialog,
@@ -35,6 +37,7 @@ import {
   DialogTitle,
 } from '@/components/ui/dialog';
 import { defaultSpeakerLabel } from '@/lib/speaker-display';
+import { extractHeadings, makeSlugger } from '@/lib/markdown-headings';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import {
@@ -42,11 +45,15 @@ import {
   RefreshCw,
   Download,
   Copy,
+  ChevronDown,
+  ChevronUp,
   X,
   Search,
   Eye,
   Pencil,
   Users,
+  ListTree,
+  Sparkles,
 } from 'lucide-react';
 
 /**
@@ -102,7 +109,10 @@ export default function TranscriptDetailPage({ params }: TranscriptDetailPagePro
   const isOwner = access === 'owner';
 
   const [speakerLabels, setSpeakerLabels] = useState<SpeakerLabel[]>([]);
+  const [speakerSuggestions, setSpeakerSuggestions] = useState<SpeakerSuggestionMap>({});
   const [transcriptEdits, setTranscriptEdits] = useState<TranscriptEditMap>({});
+  const [generatingNotes, setGeneratingNotes] = useState(false);
+  const [notesStale, setNotesStale] = useState(false);
 
   const [title, setTitle] = useState<string>('');
   const [description, setDescription] = useState<string>('');
@@ -129,6 +139,25 @@ export default function TranscriptDetailPage({ params }: TranscriptDetailPagePro
     () => findUtteranceIndexAtMs(content?.utterances, currentTime * 1000),
     [content?.utterances, currentTime]
   );
+
+  /**
+   * Map utterance index → AI segment starting at that utterance, so the
+   * transcript body can render a section heading above it. Each segment
+   * anchors to the first utterance at/after its start time.
+   */
+  const segmentByUtterance = useMemo(() => {
+    const map = new Map<number, { title: string; start_ms: number }>();
+    const segs = row?.auto_segments;
+    const utterances = content?.utterances;
+    if (!segs?.length || !utterances?.length) return map;
+    let u = 0;
+    for (const seg of segs) {
+      while (u < utterances.length && utterances[u]!.start < seg.start_ms - 500) u++;
+      if (u >= utterances.length) break;
+      if (!map.has(u)) map.set(u, seg);
+    }
+    return map;
+  }, [row?.auto_segments, content?.utterances]);
 
   /**
    * Resolve a raw speaker key into the display name, applying speaker_mappings.
@@ -196,10 +225,12 @@ export default function TranscriptDetailPage({ params }: TranscriptDetailPagePro
       setDescription(transcript.description || '');
 
       if (speakersRes.ok) {
-        const { speakerLabels: labels } = (await speakersRes.json()) as {
+        const { speakerLabels: labels, suggestions } = (await speakersRes.json()) as {
           speakerLabels: SpeakerLabel[];
+          suggestions?: SpeakerSuggestionMap;
         };
         setSpeakerLabels(labels);
+        setSpeakerSuggestions(suggestions ?? {});
       }
 
       if (editsRes.ok) {
@@ -244,6 +275,85 @@ export default function TranscriptDetailPage({ params }: TranscriptDetailPagePro
       .catch(() => {});
   }, []);
 
+  // While AI notes are generating server-side, poll the row (and refresh
+  // speaker suggestions, which land just before the notes do).
+  useEffect(() => {
+    if (row?.auto_notes_status !== 'running') return;
+    const timer = setInterval(async () => {
+      try {
+        const res = await fetch(`/api/transcripts/${transcriptId}`);
+        if (!res.ok) return;
+        const { transcript } = (await res.json()) as { transcript: StoredTranscript };
+        setRow((prev) =>
+          prev
+            ? {
+                ...prev,
+                title: transcript.title,
+                auto_notes: transcript.auto_notes,
+                auto_notes_status: transcript.auto_notes_status,
+                auto_notes_error: transcript.auto_notes_error,
+                auto_notes_at: transcript.auto_notes_at,
+                auto_segments: transcript.auto_segments,
+              }
+            : prev
+        );
+        // Pick up a server-generated title, but never while the user is
+        // typing in the title field.
+        if (transcript.title && !editingTitle) {
+          setTitle((cur) => (cur.trim() ? cur : transcript.title!));
+        }
+        const spRes = await fetch(`/api/transcripts/${transcriptId}/speakers`);
+        if (spRes.ok) {
+          const { suggestions } = (await spRes.json()) as {
+            suggestions?: SpeakerSuggestionMap;
+          };
+          setSpeakerSuggestions(suggestions ?? {});
+        }
+      } catch {
+        // transient — keep polling
+      }
+    }, 5000);
+    return () => clearInterval(timer);
+  }, [row?.auto_notes_status, transcriptId, editingTitle]);
+
+  const [guessingSpeakers, setGuessingSpeakers] = useState(false);
+  const handleGuessSpeakers = useCallback(async () => {
+    if (guessingSpeakers) return;
+    setGuessingSpeakers(true);
+    try {
+      const res = await fetch(`/api/transcripts/${transcriptId}/speakers/suggest`, {
+        method: 'POST',
+      });
+      if (res.ok) {
+        const { suggestions } = (await res.json()) as {
+          suggestions: SpeakerSuggestionMap;
+        };
+        setSpeakerSuggestions(suggestions);
+      }
+    } finally {
+      setGuessingSpeakers(false);
+    }
+  }, [transcriptId, guessingSpeakers]);
+
+  const handleGenerateNotes = useCallback(async () => {
+    if (generatingNotes) return;
+    setGeneratingNotes(true);
+    try {
+      const res = await fetch(`/api/transcripts/${transcriptId}/notes`, {
+        method: 'POST',
+      });
+      if (res.ok) {
+        setRow((prev) =>
+          prev ? { ...prev, auto_notes_status: 'running', auto_notes_error: null } : prev
+        );
+        setNotesStale(false);
+        bumpActivity();
+      }
+    } finally {
+      setGeneratingNotes(false);
+    }
+  }, [transcriptId, generatingNotes, bumpActivity]);
+
   // ⌘F / Ctrl+F → toggle find-and-replace panel
   useEffect(() => {
     function onKey(e: KeyboardEvent) {
@@ -268,10 +378,218 @@ export default function TranscriptDetailPage({ params }: TranscriptDetailPagePro
     (idx: number) => {
       const u = content?.utterances?.[idx];
       if (!u) return;
-      playerRef.current?.seekToSeconds(u.start / 1000);
+      // Seek without touching play/pause: if audio was paused it stays
+      // paused; if it was playing it keeps playing from the new position.
+      playerRef.current?.seekOnly(u.start / 1000);
     },
     [content?.utterances]
   );
+
+  /**
+   * Jump from the outline rail: seek the audio player and scroll to the
+   * utterance whose interval contains the target seconds. Falls back to
+   * the transcript card header if the target is past the last utterance
+   * or the content hasn't loaded yet. Offsets for the sticky audio strip.
+   */
+  const handleOutlineJump = useCallback(
+    (seconds: number) => {
+      // seekOnly so playback state isn't toggled — paused stays paused,
+      // playing keeps playing from the new position.
+      playerRef.current?.seekOnly(seconds);
+
+      const ms = seconds * 1000;
+      const utterances = content?.utterances;
+      let targetIdx = -1;
+      if (utterances) {
+        for (let i = 0; i < utterances.length; i++) {
+          if (utterances[i]!.start > ms) break;
+          targetIdx = i;
+        }
+      }
+
+      const el =
+        targetIdx >= 0
+          ? document.querySelector<HTMLElement>(
+              `[data-utterance-index="${targetIdx}"]`
+            )
+          : document.getElementById('transcript');
+      if (!el) return;
+
+      // Account for the sticky audio player so the target lands below it
+      // rather than getting hidden underneath.
+      const rect = el.getBoundingClientRect();
+      const top = window.scrollY + rect.top - 120;
+      window.scrollTo({ top, behavior: 'smooth' });
+    },
+    [content?.utterances]
+  );
+
+  // Headings extracted from the description markdown — fed into the right-rail
+  // outline so users can jump straight to a sub-section of their notes.
+  const notesHeadings = useMemo(() => extractHeadings(description), [description]);
+
+  // Scroll-spy: highlight the active section in the outline rail as the
+  // user scrolls. Active = the last anchored element whose top has
+  // crossed the viewport offset (accounts for the sticky audio player).
+  const [activeAnchor, setActiveAnchor] = useState<string | null>(null);
+  // Scroll-derived "looking at" time used by the outline's transcript chunk
+  // markers. Updated as the user scrolls through the transcript itself
+  // (independent of audio playback so the outline reflects where you're
+  // *reading*, not where the playhead happens to be).
+  const [scrollDerivedTimeSec, setScrollDerivedTimeSec] = useState<number | null>(null);
+  useEffect(() => {
+    const ids: string[] = [];
+    if (description || canEdit) ids.push('notes');
+    for (const h of notesHeadings) ids.push(h.slug);
+    if (
+      viewMode === 'edited' &&
+      !!content?.utterances &&
+      content.utterances.length > 0
+    ) {
+      ids.push('speakers');
+    }
+    ids.push('transcript');
+    if (ids.length === 0) return;
+
+    let raf = 0;
+    const compute = () => {
+      raf = 0;
+      // 120px = approx height of the sticky audio player + breathing room.
+      // The "active" anchor is the last one whose top has scrolled past
+      // that line. Iterate in DOM order and capture the last match.
+      const line = 120;
+      let bestId: string | null = null;
+      for (const id of ids) {
+        const el = document.getElementById(id);
+        if (!el) continue;
+        const top = el.getBoundingClientRect().top;
+        if (top - line <= 0) bestId = id;
+        else break;
+      }
+      setActiveAnchor(bestId);
+    };
+
+    const onScroll = () => {
+      if (raf) return;
+      raf = requestAnimationFrame(compute);
+    };
+
+    // Run once after layout settles so the initial state is correct.
+    raf = requestAnimationFrame(compute);
+    window.addEventListener('scroll', onScroll, { passive: true });
+    return () => {
+      window.removeEventListener('scroll', onScroll);
+      if (raf) cancelAnimationFrame(raf);
+    };
+  }, [
+    notesHeadings,
+    description,
+    canEdit,
+    viewMode,
+    content?.utterances?.length,
+  ]);
+
+  // Track the topmost utterance currently scrolled past the sticky-audio
+  // line so the outline's time chunks reflect *reading* position, not just
+  // playback. Re-runs whenever the transcript's utterance count changes.
+  useEffect(() => {
+    const utterances = content?.utterances;
+    if (!utterances || utterances.length === 0) {
+      setScrollDerivedTimeSec(null);
+      return;
+    }
+
+    let raf = 0;
+    const compute = () => {
+      raf = 0;
+      const line = 140;
+      const els = document.querySelectorAll<HTMLElement>('[data-utterance-index]');
+      let bestStart = -1;
+      for (const el of els) {
+        const top = el.getBoundingClientRect().top;
+        if (top - line <= 0) {
+          const idx = parseInt(el.dataset.utteranceIndex ?? '-1', 10);
+          const u = utterances[idx];
+          if (u) bestStart = u.start;
+        } else {
+          break;
+        }
+      }
+      setScrollDerivedTimeSec(bestStart >= 0 ? bestStart / 1000 : null);
+    };
+
+    const onScroll = () => {
+      if (raf) return;
+      raf = requestAnimationFrame(compute);
+    };
+
+    raf = requestAnimationFrame(compute);
+    window.addEventListener('scroll', onScroll, { passive: true });
+    return () => {
+      window.removeEventListener('scroll', onScroll);
+      if (raf) cancelAnimationFrame(raf);
+    };
+  }, [content?.utterances?.length]);
+
+  /**
+   * Effective time for the outline's chunk highlighting. Prefer the
+   * scroll-derived time (where the user is *reading*) and fall back to the
+   * audio playhead only when the user has actually started playback —
+   * otherwise the chunk marker would always pin to "0:00" while reading
+   * Notes/Speakers above the transcript, which is misleading.
+   */
+  const outlineTimeSec: number | null =
+    scrollDerivedTimeSec != null
+      ? scrollDerivedTimeSec
+      : currentTime > 0.5
+        ? currentTime
+        : null;
+
+
+  // Collapsed state for the section cards. Persist per-transcript in
+  // localStorage so a user's preferred layout sticks across refreshes.
+  // Versioned so we can reset everyone's defaults when the rule changes
+  // (currently: all three sections open by default).
+  const collapsedKey = `mw:collapsed:v2:${transcriptId}`;
+  const [collapsedSections, setCollapsedSections] = useState<Record<string, boolean>>({});
+  useEffect(() => {
+    try {
+      const raw = window.localStorage.getItem(collapsedKey);
+      if (raw) setCollapsedSections(JSON.parse(raw));
+    } catch {
+      // ignore — corrupt localStorage shouldn't break the page
+    }
+  }, [collapsedKey]);
+  const toggleSection = useCallback(
+    (key: 'notes' | 'speakers' | 'transcript' | 'aiSummary') => {
+      setCollapsedSections((prev) => {
+        const next = { ...prev, [key]: !prev[key] };
+        try {
+          window.localStorage.setItem(collapsedKey, JSON.stringify(next));
+        } catch {
+          /* ignore quota errors */
+        }
+        return next;
+      });
+    },
+    [collapsedKey]
+  );
+
+  // Mobile-only: floating outline drawer + secondary-action overflow.
+  const [outlineOpenMobile, setOutlineOpenMobile] = useState(false);
+  const [downloadMenuOpen, setDownloadMenuOpen] = useState(false);
+  const downloadMenuRef = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    if (!downloadMenuOpen) return;
+    function onDown(e: MouseEvent) {
+      if (!downloadMenuRef.current) return;
+      if (!downloadMenuRef.current.contains(e.target as Node)) {
+        setDownloadMenuOpen(false);
+      }
+    }
+    document.addEventListener('mousedown', onDown);
+    return () => document.removeEventListener('mousedown', onDown);
+  }, [downloadMenuOpen]);
 
   const handleSaveText = useCallback(
     async (index: number, newText: string) => {
@@ -349,13 +667,16 @@ export default function TranscriptDetailPage({ params }: TranscriptDetailPagePro
         const { speakerLabels: saved } = (await res.json()) as { speakerLabels: SpeakerLabel[] };
         setSpeakerLabels(saved);
         bumpActivity();
+        // The AI summary was written with the old speaker names — offer a
+        // one-click rerun instead of silently going stale.
+        if (row?.auto_notes) setNotesStale(true);
       } catch (err) {
         console.error('Failed to save speaker:', err);
         alert('Failed to save speaker. Reloading from server.');
         loadAll();
       }
     },
-    [speakerLabels, transcriptId, loadAll, bumpActivity]
+    [speakerLabels, transcriptId, loadAll, bumpActivity, row?.auto_notes]
   );
 
   // --- find & replace: matches list, derived live from query + content + edits ---
@@ -553,9 +874,14 @@ export default function TranscriptDetailPage({ params }: TranscriptDetailPagePro
       if (currentUserEmail && picked === currentUserEmail) return;
       // Don't prompt for people who are already collaborators.
       if (collaboratorEmails.has(picked)) return;
+      // Only prompt for Trames-domain people; external speakers (customers,
+      // partners) get tagged without the share nudge.
+      const domain = picked.split('@')[1] ?? '';
+      if (!TRAMES_DOMAINS.includes(domain)) return;
       setPendingShare(person);
       setSharingError(null);
     },
+    // eslint-disable-next-line react-hooks/exhaustive-deps
     [isOwner, collaboratorEmails, currentUserEmail]
   );
 
@@ -565,6 +891,10 @@ export default function TranscriptDetailPage({ params }: TranscriptDetailPagePro
     },
     []
   );
+
+  // Only nudge to grant transcript access for people on Trames domains.
+  // External speakers (customers, partners) get tagged without the prompt.
+  const TRAMES_DOMAINS = ['trames.sg', 'trames-engineering.com'];
 
   const handlePersonCreated = useCallback(
     (person: PickerPerson) => {
@@ -906,10 +1236,13 @@ export default function TranscriptDetailPage({ params }: TranscriptDetailPagePro
           <ArrowLeft className="h-4 w-4 mr-1.5" />
           Back to Transcripts
         </Button>
-        <div className="flex flex-wrap items-center gap-2">
+        <div className="flex items-center gap-1.5 flex-wrap justify-end">
           {access !== 'owner' && (
             <Badge variant="outline" className="text-[10px]">
-              Shared — {access === 'edit' ? 'Editor' : 'Read-only'}
+              <span className="md:hidden">Shared</span>
+              <span className="hidden md:inline">
+                Shared — {access === 'edit' ? 'Editor' : 'Read-only'}
+              </span>
             </Badge>
           )}
           {/* Raw / Edited toggle */}
@@ -917,24 +1250,24 @@ export default function TranscriptDetailPage({ params }: TranscriptDetailPagePro
             <button
               type="button"
               onClick={() => setViewMode('raw')}
-              className={`flex items-center gap-1 rounded px-2.5 py-1 text-xs ${
+              className={`flex items-center gap-1 rounded px-2 py-1 text-xs ${
                 viewMode === 'raw' ? 'bg-muted font-medium' : 'text-muted-foreground'
               }`}
-              title="Show original AAI output, ignoring all edits"
+              title="Show original AAI output"
             >
               <Eye className="h-3 w-3" />
-              Raw
+              <span className="hidden sm:inline">Raw</span>
             </button>
             <button
               type="button"
               onClick={() => setViewMode('edited')}
-              className={`flex items-center gap-1 rounded px-2.5 py-1 text-xs ${
+              className={`flex items-center gap-1 rounded px-2 py-1 text-xs ${
                 viewMode === 'edited' ? 'bg-muted font-medium' : 'text-muted-foreground'
               }`}
-              title="Show edited view with text edits and speaker renames"
+              title="Show edited view"
             >
               <Pencil className="h-3 w-3" />
-              Edited
+              <span className="hidden sm:inline">Edited</span>
             </button>
           </div>
           <Button
@@ -943,8 +1276,8 @@ export default function TranscriptDetailPage({ params }: TranscriptDetailPagePro
             onClick={() => setShareOpen(true)}
             title="Share access with other people"
           >
-            <Users className="h-4 w-4 mr-1" />
-            Access
+            <Users className="h-4 w-4 md:mr-1" />
+            <span className="hidden md:inline">Access</span>
           </Button>
           <Button
             variant="outline"
@@ -953,8 +1286,8 @@ export default function TranscriptDetailPage({ params }: TranscriptDetailPagePro
             disabled={!content || !canEdit}
             title={canEdit ? 'Find and replace (⌘F)' : 'Read-only access'}
           >
-            <Search className="h-4 w-4 mr-1" />
-            Find &amp; replace
+            <Search className="h-4 w-4 md:mr-1" />
+            <span className="hidden md:inline">Find &amp; replace</span>
           </Button>
           <Button
             variant="outline"
@@ -963,30 +1296,52 @@ export default function TranscriptDetailPage({ params }: TranscriptDetailPagePro
             disabled={!content}
             title="Copy edited markdown to clipboard"
           >
-            <Copy className="h-4 w-4 mr-1" />
-            {copyStatus === 'copied' ? 'Copied!' : 'Copy markdown'}
+            <Copy className="h-4 w-4 md:mr-1" />
+            <span className="hidden md:inline">
+              {copyStatus === 'copied' ? 'Copied!' : 'Copy markdown'}
+            </span>
           </Button>
-          <Button
-            variant="outline"
-            size="sm"
-            onClick={() => downloadMarkdown('edited')}
-            disabled={!content}
-          >
-            <Download className="h-4 w-4 mr-1" />
-            Download edited
-          </Button>
-          <Button
-            variant="outline"
-            size="sm"
-            onClick={() => downloadMarkdown('raw')}
-            disabled={!content}
-          >
-            <Download className="h-4 w-4 mr-1" />
-            Download raw
-          </Button>
-          <Button onClick={loadAll} variant="outline" size="sm">
-            <RefreshCw className="h-4 w-4 mr-1" />
-            Refresh
+          {/* Download → dropdown (Edited / Raw) so the toolbar stays compact. */}
+          <div className="relative" ref={downloadMenuRef}>
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={() => setDownloadMenuOpen((v) => !v)}
+              disabled={!content}
+              title="Download as markdown"
+            >
+              <Download className="h-4 w-4 md:mr-1" />
+              <span className="hidden md:inline">Download</span>
+              <ChevronDown className="hidden md:inline h-3 w-3 ml-0.5" />
+            </Button>
+            {downloadMenuOpen && (
+              <div className="absolute right-0 top-full mt-1 z-50 min-w-[140px] rounded-md border bg-popover p-1 shadow-md">
+                <button
+                  type="button"
+                  onClick={() => {
+                    downloadMarkdown('edited');
+                    setDownloadMenuOpen(false);
+                  }}
+                  className="block w-full rounded px-3 py-1.5 text-left text-sm hover:bg-muted"
+                >
+                  Edited markdown
+                </button>
+                <button
+                  type="button"
+                  onClick={() => {
+                    downloadMarkdown('raw');
+                    setDownloadMenuOpen(false);
+                  }}
+                  className="block w-full rounded px-3 py-1.5 text-left text-sm hover:bg-muted"
+                >
+                  Raw markdown
+                </button>
+              </div>
+            )}
+          </div>
+          <Button onClick={loadAll} variant="outline" size="sm" title="Refresh">
+            <RefreshCw className="h-4 w-4 md:mr-1" />
+            <span className="hidden md:inline">Refresh</span>
           </Button>
         </div>
       </div>
@@ -1053,7 +1408,8 @@ export default function TranscriptDetailPage({ params }: TranscriptDetailPagePro
         <ActivityBar transcriptId={transcriptId} refreshSignal={activityTick} />
       </div>
 
-      <div className="grid gap-6">
+      <div className="lg:grid lg:grid-cols-[minmax(0,1fr)_220px] lg:gap-6">
+      <div className="grid gap-6 min-w-0">
         {/* Audio player — sticky so it stays visible while scrolling the transcript */}
         {row.status === 'completed' && audioAvailable && (
           <div className="sticky top-2 z-10 rounded-lg border bg-background/95 p-3 shadow-sm backdrop-blur">
@@ -1066,14 +1422,152 @@ export default function TranscriptDetailPage({ params }: TranscriptDetailPagePro
           </div>
         )}
 
+        {/* AI Summary — meeting notes generated by headless Claude on the server. */}
+        {row.status === 'completed' &&
+          (row.auto_notes || row.auto_notes_status || canEdit) && (
+          <Card id="ai-summary" className="scroll-mt-24">
+            <CardHeader className="pb-2">
+              <button
+                type="button"
+                onClick={() => toggleSection('aiSummary')}
+                className="flex w-full items-center justify-between text-left"
+                aria-expanded={!collapsedSections.aiSummary}
+              >
+                <CardTitle className="flex items-center gap-1.5 text-sm font-semibold text-muted-foreground">
+                  <Sparkles className="h-3.5 w-3.5 text-violet-500" />
+                  AI Summary
+                </CardTitle>
+                {collapsedSections.aiSummary ? (
+                  <ChevronDown className="h-4 w-4 text-muted-foreground" />
+                ) : (
+                  <ChevronUp className="h-4 w-4 text-muted-foreground" />
+                )}
+              </button>
+            </CardHeader>
+            {!collapsedSections.aiSummary && (
+              <CardContent>
+                {notesStale && row.auto_notes_status !== 'running' && canEdit && (
+                  <div className="mb-3 flex items-center justify-between gap-2 rounded-md border border-amber-300 bg-amber-50 px-3 py-2 text-xs text-amber-800 dark:border-amber-700 dark:bg-amber-950 dark:text-amber-200">
+                    <span>Speaker names changed — the summary still uses the old ones.</span>
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      className="h-6 shrink-0 text-[11px]"
+                      disabled={generatingNotes}
+                      onClick={handleGenerateNotes}
+                    >
+                      <RefreshCw className="mr-1 h-3 w-3" />
+                      Rerun summary
+                    </Button>
+                  </div>
+                )}
+                {row.auto_notes_status === 'running' ? (
+                  <div className="flex items-center gap-2 py-2 text-sm text-muted-foreground">
+                    <RefreshCw className="h-4 w-4 animate-spin" />
+                    Generating notes with Claude… this can take a few minutes.
+                  </div>
+                ) : row.auto_notes ? (
+                  <>
+                    <div className="markdown-body text-sm">
+                      <ReactMarkdown
+                        remarkPlugins={[remarkGfm]}
+                        components={{
+                          h1: ({ children }) => <h2 className="text-lg font-semibold mt-3 mb-2">{children}</h2>,
+                          h2: ({ children }) => <h2 className="text-base font-semibold mt-3 mb-1.5">{children}</h2>,
+                          h3: ({ children }) => <h3 className="text-sm font-semibold mt-2 mb-1">{children}</h3>,
+                          p: ({ children }) => <p className="leading-relaxed my-2">{children}</p>,
+                          ul: ({ children }) => <ul className="list-disc pl-5 my-2 space-y-1">{children}</ul>,
+                          ol: ({ children }) => <ol className="list-decimal pl-5 my-2 space-y-1">{children}</ol>,
+                          li: ({ children }) => <li className="leading-relaxed">{children}</li>,
+                          strong: ({ children }) => <strong className="font-semibold">{children}</strong>,
+                        }}
+                      >
+                        {row.auto_notes}
+                      </ReactMarkdown>
+                    </div>
+                    <div className="mt-3 flex items-center gap-2 border-t pt-2">
+                      <Button
+                        variant="ghost"
+                        size="sm"
+                        className="h-7 text-xs"
+                        onClick={() => navigator.clipboard.writeText(row.auto_notes ?? '')}
+                      >
+                        <Copy className="mr-1 h-3 w-3" />
+                        Copy
+                      </Button>
+                      {canEdit && (
+                        <Button
+                          variant="ghost"
+                          size="sm"
+                          className="h-7 text-xs"
+                          disabled={generatingNotes}
+                          onClick={handleGenerateNotes}
+                        >
+                          <RefreshCw className="mr-1 h-3 w-3" />
+                          Regenerate
+                        </Button>
+                      )}
+                      {row.auto_notes_at && (
+                        <span className="ml-auto text-[11px] text-muted-foreground">
+                          generated {formatDistanceToNow(new Date(row.auto_notes_at), { addSuffix: true })}
+                        </span>
+                      )}
+                    </div>
+                  </>
+                ) : row.auto_notes_status === 'error' ? (
+                  <div className="space-y-2 text-sm">
+                    <p className="text-red-600 dark:text-red-400">
+                      Notes generation failed: {row.auto_notes_error || 'unknown error'}
+                    </p>
+                    {canEdit && (
+                      <Button
+                        variant="outline"
+                        size="sm"
+                        disabled={generatingNotes}
+                        onClick={handleGenerateNotes}
+                      >
+                        <RefreshCw className="mr-1 h-3 w-3" />
+                        Retry
+                      </Button>
+                    )}
+                  </div>
+                ) : canEdit ? (
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    disabled={generatingNotes}
+                    onClick={handleGenerateNotes}
+                  >
+                    <Sparkles className="mr-1 h-3 w-3" />
+                    Generate notes with Claude
+                  </Button>
+                ) : null}
+              </CardContent>
+            )}
+          </Card>
+        )}
+
         {/* Description — click-to-edit, markdown rendered. */}
         {(description || canEdit) && (
-          <Card>
+          <Card id="notes" className="scroll-mt-24">
             <CardHeader className="pb-2">
-              <CardTitle className="text-sm font-semibold text-muted-foreground">
-                Notes
-              </CardTitle>
+              <button
+                type="button"
+                onClick={() => toggleSection('notes')}
+                className="flex w-full items-center justify-between text-left"
+                aria-expanded={!collapsedSections.notes}
+              >
+                <CardTitle className="text-sm font-semibold text-muted-foreground">
+                  Notes
+                </CardTitle>
+                {collapsedSections.notes ? (
+                  <ChevronDown className="h-4 w-4 text-muted-foreground" />
+                ) : (
+                  <ChevronUp className="h-4 w-4 text-muted-foreground" />
+                )}
+              </button>
             </CardHeader>
+            {!collapsedSections.notes && (
             <CardContent>
               {editingDescription && canEdit ? (
                 <Textarea
@@ -1100,12 +1594,26 @@ export default function TranscriptDetailPage({ params }: TranscriptDetailPagePro
                     canEdit ? 'cursor-text hover:bg-muted/30 px-1 -mx-1' : ''
                   }`}
                 >
+                  {(() => {
+                    // One slugger per render so duplicate-suffix counters match
+                    // the values produced by extractHeadings(description).
+                    const slug = makeSlugger();
+                    const headingText = (node: React.ReactNode): string => {
+                      if (typeof node === 'string' || typeof node === 'number') return String(node);
+                      if (Array.isArray(node)) return node.map(headingText).join('');
+                      if (node && typeof node === 'object' && 'props' in node) {
+                        const props = (node as { props?: { children?: React.ReactNode } }).props;
+                        return headingText(props?.children);
+                      }
+                      return '';
+                    };
+                    return (
                   <ReactMarkdown
                     remarkPlugins={[remarkGfm]}
                     components={{
-                      h1: ({ children }) => <h1 className="text-xl font-semibold mt-3 mb-2">{children}</h1>,
-                      h2: ({ children }) => <h2 className="text-lg font-semibold mt-3 mb-2">{children}</h2>,
-                      h3: ({ children }) => <h3 className="text-base font-semibold mt-3 mb-1.5">{children}</h3>,
+                      h1: ({ children }) => <h1 id={slug(headingText(children))} className="text-xl font-semibold mt-3 mb-2 scroll-mt-24">{children}</h1>,
+                      h2: ({ children }) => <h2 id={slug(headingText(children))} className="text-lg font-semibold mt-3 mb-2 scroll-mt-24">{children}</h2>,
+                      h3: ({ children }) => <h3 id={slug(headingText(children))} className="text-base font-semibold mt-3 mb-1.5 scroll-mt-24">{children}</h3>,
                       p: ({ children }) => <p className="leading-relaxed my-2">{children}</p>,
                       ul: ({ children }) => <ul className="list-disc pl-5 my-2 space-y-1">{children}</ul>,
                       ol: ({ children }) => <ol className="list-decimal pl-5 my-2 space-y-1">{children}</ol>,
@@ -1134,6 +1642,8 @@ export default function TranscriptDetailPage({ params }: TranscriptDetailPagePro
                   >
                     {description}
                   </ReactMarkdown>
+                    );
+                  })()}
                 </div>
               ) : (
                 <button
@@ -1145,43 +1655,75 @@ export default function TranscriptDetailPage({ params }: TranscriptDetailPagePro
                 </button>
               )}
             </CardContent>
+            )}
           </Card>
         )}
 
         {/* Speakers — friendly name + description per speaker */}
         {viewMode === 'edited' && content?.utterances && content.utterances.length > 0 && (
-          <SpeakerSummaryPanel
-            utterances={content.utterances}
-            speakerLabels={speakerLabels}
-            onSave={handleSaveSpeaker}
-            canEdit={canEdit}
-            onPickPerson={handlePickPerson}
-            onRequestCreatePerson={handleRequestCreatePerson}
-            audioSrc={
-              row.status === 'completed' && audioAvailable
-                ? `/api/transcripts/${row.assemblyai_id}/audio`
-                : null
-            }
-          />
+          <div id="speakers" className="scroll-mt-24">
+            <SpeakerSummaryPanel
+              utterances={content.utterances}
+              speakerLabels={speakerLabels}
+              onSave={handleSaveSpeaker}
+              canEdit={canEdit}
+              onPickPerson={handlePickPerson}
+              onRequestCreatePerson={handleRequestCreatePerson}
+              audioSrc={
+                row.status === 'completed' && audioAvailable
+                  ? `/api/transcripts/${row.assemblyai_id}/audio`
+                  : null
+              }
+              collapsed={!!collapsedSections.speakers}
+              onToggleCollapse={() => toggleSection('speakers')}
+              suggestions={speakerSuggestions}
+              onGuessNames={handleGuessSpeakers}
+              guessingNames={guessingSpeakers}
+            />
+          </div>
         )}
 
         {/* Transcript Content */}
-        <Card>
+        <Card id="transcript" className="scroll-mt-24">
           <CardHeader>
-            <CardTitle>
-              Transcript{' '}
-              <span className="text-xs font-normal text-muted-foreground">
-                ({viewMode === 'edited' ? 'edited view' : 'raw — read only'})
-              </span>
-            </CardTitle>
+            <button
+              type="button"
+              onClick={() => toggleSection('transcript')}
+              className="flex w-full items-center justify-between text-left"
+              aria-expanded={!collapsedSections.transcript}
+            >
+              <CardTitle>
+                Transcript{' '}
+                <span className="text-xs font-normal text-muted-foreground">
+                  ({viewMode === 'edited' ? 'edited view' : 'raw — read only'})
+                </span>
+              </CardTitle>
+              {collapsedSections.transcript ? (
+                <ChevronDown className="h-4 w-4 text-muted-foreground" />
+              ) : (
+                <ChevronUp className="h-4 w-4 text-muted-foreground" />
+              )}
+            </button>
           </CardHeader>
+          {!collapsedSections.transcript && (
           <CardContent>
             {row.status === 'completed' && content ? (
               <div className="space-y-2">
                 {content.utterances && content.utterances.length > 0 ? (
                   content.utterances.map((utterance, index) => (
+                    <div key={index}>
+                      {viewMode === 'edited' && segmentByUtterance.has(index) && (
+                        <div className="flex items-center gap-2 pt-4 pb-1">
+                          <span className="font-mono text-[10px] text-muted-foreground">
+                            {formatTime(segmentByUtterance.get(index)!.start_ms)}
+                          </span>
+                          <h4 className="text-sm font-semibold text-foreground">
+                            {segmentByUtterance.get(index)!.title}
+                          </h4>
+                          <div className="h-px flex-1 bg-border" />
+                        </div>
+                      )}
                     <EditableUtterance
-                      key={index}
                       index={index}
                       utterance={utterance}
                       displayText={displayTextFor(index)}
@@ -1208,6 +1750,7 @@ export default function TranscriptDetailPage({ params }: TranscriptDetailPagePro
                             }
                       }
                     />
+                    </div>
                   ))
                 ) : (
                   <p className="text-muted-foreground">
@@ -1221,8 +1764,67 @@ export default function TranscriptDetailPage({ params }: TranscriptDetailPagePro
               </p>
             )}
           </CardContent>
+          )}
         </Card>
       </div>
+
+      <aside className="hidden lg:block">
+        <div className="sticky top-4">
+          <TranscriptOutline
+            durationSec={row.duration ?? null}
+            hasNotes={!!description || canEdit}
+            hasSpeakers={
+              viewMode === 'edited' &&
+              !!content?.utterances &&
+              content.utterances.length > 0
+            }
+            notesHeadings={notesHeadings}
+            currentTimeSec={outlineTimeSec}
+            onJumpToSeconds={handleOutlineJump}
+            activeAnchor={activeAnchor}
+            segments={row.auto_segments}
+          />
+        </div>
+      </aside>
+      </div>
+
+      {/* Mobile / tablet outline FAB — opens the same outline in a dialog. */}
+      <button
+        type="button"
+        onClick={() => setOutlineOpenMobile(true)}
+        className="lg:hidden fixed bottom-4 right-4 z-40 flex items-center gap-1.5 rounded-full border bg-background shadow-md px-4 py-2.5 text-xs font-medium text-foreground hover:bg-muted"
+        aria-label="Open outline"
+      >
+        <ListTree className="h-4 w-4" />
+        Outline
+      </button>
+
+      <Dialog open={outlineOpenMobile} onOpenChange={setOutlineOpenMobile}>
+        <DialogContent className="max-w-sm">
+          <DialogHeader>
+            <DialogTitle>Outline</DialogTitle>
+          </DialogHeader>
+          <div onClick={() => setOutlineOpenMobile(false)}>
+            <TranscriptOutline
+              durationSec={row.duration ?? null}
+              hasNotes={!!description || canEdit}
+              hasSpeakers={
+                viewMode === 'edited' &&
+                !!content?.utterances &&
+                content.utterances.length > 0
+              }
+              notesHeadings={notesHeadings}
+              currentTimeSec={outlineTimeSec}
+              onJumpToSeconds={(s) => {
+                handleOutlineJump(s);
+                setOutlineOpenMobile(false);
+              }}
+              activeAnchor={activeAnchor}
+              segments={row.auto_segments}
+            />
+          </div>
+        </DialogContent>
+      </Dialog>
 
       <ShareDialog
         open={shareOpen}

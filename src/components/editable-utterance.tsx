@@ -5,6 +5,7 @@ import { Badge } from '@/components/ui/badge';
 import { formatTime, type SpeakerLabel } from '@/lib/format';
 import { SpeakerBadgeEditor } from '@/components/speaker-badge-editor';
 import type { PickerPerson } from '@/components/user-picker';
+import { Pencil } from 'lucide-react';
 
 interface Utterance {
   text: string;
@@ -135,16 +136,49 @@ export function EditableUtterance({
     return out;
   }
 
+  // The whole row is the click target so the hover-highlighted area is
+  // also the clickable seek surface. Action elements (timestamp button,
+  // speaker badge, pencil icons, edit textarea) stop propagation so they
+  // keep their own behaviors.
+  const handleRowClick = (e: React.MouseEvent) => {
+    if (isEditingText) return;
+    // Don't hijack a real text-selection drag or keyboard-modified click.
+    if (e.detail === 0) return;
+    const sel = typeof window !== 'undefined' ? window.getSelection() : null;
+    if (sel && !sel.isCollapsed) return;
+    onSeek(index);
+  };
+
+  const handleRowDoubleClick = (e: React.MouseEvent) => {
+    if (!canEdit || isEditingText) return;
+    e.preventDefault();
+    setIsEditingText(true);
+  };
+
   return (
     <div
       data-utterance-index={index}
+      onClick={handleRowClick}
+      onDoubleClick={handleRowDoubleClick}
       className={`group rounded-md border-l-4 pl-4 py-2 transition-colors ${
+        isEditingText ? '' : 'cursor-pointer'
+      } ${
         isActive
           ? 'border-blue-500 bg-blue-50'
           : 'border-blue-200 hover:bg-muted/40'
       }`}
+      title={
+        isEditingText
+          ? ''
+          : canEdit
+            ? 'Click to seek · double-click or pencil icon to edit'
+            : 'Click to seek'
+      }
     >
-      <div className="flex items-center gap-2 mb-1">
+      <div
+        className="flex items-center gap-2 mb-1"
+        onDoubleClick={(e) => e.stopPropagation()}
+      >
         <SpeakerBadgeEditor
           originalSpeaker={utterance.speaker}
           speakerLabels={speakerLabels}
@@ -155,9 +189,12 @@ export function EditableUtterance({
         />
         <button
           type="button"
-          onClick={() => onSeek(index)}
+          onClick={(e) => {
+            e.stopPropagation();
+            onSeek(index);
+          }}
           className="text-sm text-muted-foreground hover:text-foreground hover:underline"
-          title="Click to seek audio to this moment"
+          title="Seek audio to this moment"
         >
           {formatTime(utterance.start)}
         </button>
@@ -165,6 +202,20 @@ export function EditableUtterance({
           <Badge variant="secondary" className="text-[10px] uppercase tracking-wide">
             edited
           </Badge>
+        )}
+        {canEdit && !isEditingText && (
+          <button
+            type="button"
+            onClick={(e) => {
+              e.stopPropagation();
+              setIsEditingText(true);
+            }}
+            className="ml-auto rounded p-1 text-muted-foreground opacity-0 transition-opacity hover:bg-muted hover:text-foreground group-hover:opacity-100"
+            title="Edit text"
+            aria-label="Edit utterance text"
+          >
+            <Pencil className="h-3 w-3" />
+          </button>
         )}
       </div>
       {isEditingText && canEdit ? (
@@ -176,6 +227,7 @@ export function EditableUtterance({
             autoResize(e.target);
           }}
           onBlur={commitText}
+          onClick={(e) => e.stopPropagation()}
           onKeyDown={(e) => {
             if (e.key === 'Enter' && !e.shiftKey) {
               e.preventDefault();
@@ -189,13 +241,7 @@ export function EditableUtterance({
           className="w-full resize-none rounded-md border bg-background p-2 text-sm focus:outline-none focus:ring-2 focus:ring-ring"
         />
       ) : (
-        <p
-          onClick={() => canEdit && setIsEditingText(true)}
-          className={`text-sm rounded-md px-1 -mx-1 ${
-            canEdit ? 'cursor-text hover:bg-muted/30' : ''
-          }`}
-          title={canEdit ? 'Click to edit' : 'Read-only'}
-        >
+        <p className="text-sm rounded-md px-1 -mx-1">
           {highlights && highlights.length > 0
             ? renderHighlightedText(displayText, highlights)
             : displayText}

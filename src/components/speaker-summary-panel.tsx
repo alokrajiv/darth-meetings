@@ -1,13 +1,12 @@
 'use client';
 
-import { useMemo, useState, useEffect } from 'react';
+import { useMemo, useState } from 'react';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
-import { Textarea } from '@/components/ui/textarea';
 import { Badge } from '@/components/ui/badge';
-import { UserPicker, type PickerPerson } from '@/components/user-picker';
+import { type PickerPerson } from '@/components/user-picker';
 import { SpeakerPreviewDialog } from '@/components/speaker-preview-dialog';
-import { ChevronDown, ChevronUp, Headphones, Pencil, Users } from 'lucide-react';
-import type { SpeakerLabel } from '@/lib/format';
+import { ChevronDown, ChevronUp, Pencil, Sparkles, Users } from 'lucide-react';
+import type { SpeakerLabel, SpeakerSuggestionMap } from '@/lib/format';
 import { defaultSpeakerLabel } from '@/lib/speaker-display';
 
 interface Utterance {
@@ -24,23 +23,28 @@ interface SpeakerSummaryPanelProps {
     originalSpeaker: string,
     patch: { customName?: string; description?: string }
   ) => void;
-  /** Disables all editing when false. */
+  /** Disables editing when false (the Edit button is hidden). */
   canEdit: boolean;
-  /** Called when the picker commits a real Trames / custom person. */
+  /** Forwarded into the preview/edit dialog for the add-to-access flow. */
   onPickPerson: (person: PickerPerson) => void;
-  /** Called when the picker commits a custom *name* (no email) and the
-   *  page should open the AddPersonDialog to promote it. */
   onRequestCreatePerson: (originalSpeaker: string, name: string) => void;
-  /** /api/transcripts/[id]/audio — used to play voice samples in the
-   *  preview dialog. If null, the preview button is hidden. */
+  /** /api/transcripts/[id]/audio — voice samples in the dialog. Null = no audio. */
   audioSrc: string | null;
+  /** Optional collapse state — when set, the card header becomes a toggle. */
+  collapsed?: boolean;
+  onToggleCollapse?: () => void;
+  /** Voiceprint auto-detection results keyed by original speaker. */
+  suggestions?: SpeakerSuggestionMap;
+  /** Run voiceprint matching on demand ("Guess names" button). */
+  onGuessNames?: () => void;
+  guessingNames?: boolean;
 }
 
 /**
- * Top-of-page Speakers card. Single-line rows by default — the name picker
- * occupies the main column, with a chevron on the right to reveal an
- * optional description textarea. Descriptions that already have content are
- * expanded on load so you don't lose track of them.
+ * Top-of-page Speakers card. Each speaker is a single line: label badge,
+ * line count, name (display), and one "Edit" button. Edit opens the
+ * speaker dialog where you cycle speakers, hear their distinctive moments,
+ * and set names + context — all consolidated there.
  */
 export function SpeakerSummaryPanel({
   utterances,
@@ -50,8 +54,13 @@ export function SpeakerSummaryPanel({
   onPickPerson,
   onRequestCreatePerson,
   audioSrc,
+  collapsed,
+  onToggleCollapse,
+  suggestions,
+  onGuessNames,
+  guessingNames,
 }: SpeakerSummaryPanelProps) {
-  const [previewSpeaker, setPreviewSpeaker] = useState<string | null>(null);
+  const [editSpeaker, setEditSpeaker] = useState<string | null>(null);
   const uniqueSpeakers = useMemo(
     () => Array.from(new Set(utterances.map((u) => u.speaker))).sort(),
     [utterances]
@@ -65,191 +74,164 @@ export function SpeakerSummaryPanel({
     return counts;
   }, [utterances]);
 
+  const titleNode = (
+    <CardTitle className="flex items-center gap-2 text-base">
+      <Users className="h-4 w-4" />
+      Speakers
+      <Badge variant="outline" className="ml-1 text-[10px]">
+        {uniqueSpeakers.length}
+      </Badge>
+    </CardTitle>
+  );
+
   return (
     <>
       <Card>
         <CardHeader className="pb-3">
-          <CardTitle className="flex items-center gap-2 text-base">
-            <Users className="h-4 w-4" />
-            Speakers
-            <Badge variant="outline" className="ml-1 text-[10px]">
-              {uniqueSpeakers.length}
-            </Badge>
-          </CardTitle>
+          {onToggleCollapse ? (
+            <button
+              type="button"
+              onClick={onToggleCollapse}
+              aria-expanded={!collapsed}
+              className="flex w-full items-center justify-between text-left"
+            >
+              {titleNode}
+              {collapsed ? (
+                <ChevronDown className="h-4 w-4 text-muted-foreground" />
+              ) : (
+                <ChevronUp className="h-4 w-4 text-muted-foreground" />
+              )}
+            </button>
+          ) : (
+            titleNode
+          )}
         </CardHeader>
-        <CardContent className="space-y-1.5 pb-3">
-          {uniqueSpeakers.map((speaker) => {
-            const mapping = speakerLabels.find((m) => m.originalSpeaker === speaker);
-            return (
-              <SpeakerRow
-                key={speaker}
-                originalSpeaker={speaker}
-                count={utteranceCounts[speaker] ?? 0}
-                initialName={mapping?.customName ?? ''}
-                initialDescription={mapping?.description ?? ''}
-                onSave={onSave}
-                onPickPerson={onPickPerson}
-                onRequestCreatePerson={onRequestCreatePerson}
-                onPreview={audioSrc ? () => setPreviewSpeaker(speaker) : null}
-                canEdit={canEdit}
-              />
-            );
-          })}
-        </CardContent>
+        {!collapsed && (
+          <CardContent className="space-y-1.5 pb-3">
+            {canEdit && onGuessNames && (
+              <div className="flex justify-end pb-1">
+                <button
+                  type="button"
+                  onClick={onGuessNames}
+                  disabled={guessingNames}
+                  title="Match each voice against known people (local voiceprints — no AI call)"
+                  className="flex items-center gap-1 rounded border border-violet-300 px-2 py-1 text-[11px] text-violet-700 hover:bg-violet-50 disabled:opacity-50 dark:border-violet-700 dark:text-violet-300 dark:hover:bg-violet-950 transition-colors"
+                >
+                  <Sparkles className={`h-3 w-3 ${guessingNames ? 'animate-pulse' : ''}`} />
+                  {guessingNames ? 'Listening…' : 'Guess names'}
+                </button>
+              </div>
+            )}
+            {uniqueSpeakers.map((speaker) => {
+              const mapping = speakerLabels.find((m) => m.originalSpeaker === speaker);
+              const name = mapping?.customName?.trim() ?? '';
+              const description = mapping?.description?.trim() ?? '';
+              const displayName = name || `Unnamed · ${defaultSpeakerLabel(speaker)}`;
+              return (
+                <div key={speaker} className="rounded-md border bg-card px-2 py-1.5">
+                  <div className="flex items-center gap-2">
+                    <Badge variant="outline" className="shrink-0">
+                      {defaultSpeakerLabel(speaker)}
+                    </Badge>
+                    <span className="shrink-0 text-[11px] text-muted-foreground">
+                      {(utteranceCounts[speaker] ?? 0)} line
+                      {(utteranceCounts[speaker] ?? 0) === 1 ? '' : 's'}
+                    </span>
+                    <div
+                      className={`min-w-0 flex-1 truncate text-sm ${
+                        name ? '' : 'text-muted-foreground italic'
+                      }`}
+                      onDoubleClick={() => canEdit && setEditSpeaker(speaker)}
+                      title={canEdit ? 'Double-click to edit' : ''}
+                    >
+                      {displayName}
+                    </div>
+                    {canEdit && (
+                      <button
+                        type="button"
+                        onClick={() => setEditSpeaker(speaker)}
+                        className="flex shrink-0 items-center gap-1 rounded px-2 py-1 text-[11px] text-muted-foreground hover:bg-muted hover:text-foreground transition-colors"
+                        title="Edit name & context (and preview this voice)"
+                      >
+                        <Pencil className="h-3 w-3" />
+                        Edit
+                      </button>
+                    )}
+                  </div>
+                  {description && (
+                    <p
+                      onDoubleClick={() => canEdit && setEditSpeaker(speaker)}
+                      className="pt-1 text-xs text-muted-foreground whitespace-pre-wrap"
+                      title={canEdit ? 'Double-click to edit' : ''}
+                    >
+                      {description}
+                    </p>
+                  )}
+                  {/* Auto-detected identity — only while the speaker is unnamed. */}
+                  {!name && suggestions?.[speaker] && (() => {
+                    const s = suggestions[speaker]!;
+                    const isVoice = s.source !== 'context';
+                    return (
+                      <div className="flex flex-wrap items-center gap-2 pt-1">
+                        <span
+                          className="flex items-center gap-1 text-xs text-violet-600 dark:text-violet-400"
+                          title={!isVoice && s.evidence ? `Evidence: ${s.evidence}` : undefined}
+                        >
+                          <Sparkles className="h-3 w-3" />
+                          {isVoice ? 'Sounds like' : 'Transcript suggests'}{' '}
+                          <strong>{s.name}</strong>
+                          {isVoice ? (
+                            <span className="text-muted-foreground">
+                              ({Math.round(s.confidence * 100)}% voice match)
+                            </span>
+                          ) : (
+                            <span className="text-muted-foreground">(from context)</span>
+                          )}
+                        </span>
+                        {canEdit && (
+                          <>
+                            <button
+                              type="button"
+                              onClick={() => onSave(speaker, { customName: s.name })}
+                              className="rounded border border-violet-300 px-1.5 py-0.5 text-[11px] text-violet-700 hover:bg-violet-50 dark:border-violet-700 dark:text-violet-300 dark:hover:bg-violet-950 transition-colors"
+                            >
+                              Confirm
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() => onRequestCreatePerson(speaker, s.name)}
+                              title="Confirm and add this person to the people directory"
+                              className="rounded border px-1.5 py-0.5 text-[11px] text-muted-foreground hover:bg-muted hover:text-foreground transition-colors"
+                            >
+                              + Add person
+                            </button>
+                          </>
+                        )}
+                      </div>
+                    );
+                  })()}
+                </div>
+              );
+            })}
+          </CardContent>
+        )}
       </Card>
 
-      {audioSrc && previewSpeaker && (
+      {editSpeaker && (
         <SpeakerPreviewDialog
           open
-          onOpenChange={(v) => !v && setPreviewSpeaker(null)}
-          originalSpeaker={previewSpeaker}
+          onOpenChange={(v) => !v && setEditSpeaker(null)}
+          initialSpeaker={editSpeaker}
+          speakers={uniqueSpeakers}
           utterances={utterances}
           speakerLabels={speakerLabels}
           audioSrc={audioSrc}
+          canEdit={canEdit}
+          onSave={onSave}
+          onPickPerson={onPickPerson}
+          onRequestCreatePerson={onRequestCreatePerson}
         />
       )}
     </>
-  );
-}
-
-interface SpeakerRowProps {
-  originalSpeaker: string;
-  count: number;
-  initialName: string;
-  initialDescription: string;
-  onSave: (
-    originalSpeaker: string,
-    patch: { customName?: string; description?: string }
-  ) => void;
-  onPickPerson: (person: PickerPerson) => void;
-  onRequestCreatePerson: (originalSpeaker: string, name: string) => void;
-  /** Click → open the speaker-preview dialog. Null when audio isn't available. */
-  onPreview: (() => void) | null;
-  canEdit: boolean;
-}
-
-function SpeakerRow({
-  originalSpeaker,
-  count,
-  initialName,
-  initialDescription,
-  onSave,
-  onPickPerson,
-  onRequestCreatePerson,
-  onPreview,
-  canEdit,
-}: SpeakerRowProps) {
-  const [name, setName] = useState(initialName);
-  const [description, setDescription] = useState(initialDescription);
-  const [editingName, setEditingName] = useState(false);
-  const [expanded, setExpanded] = useState(initialDescription.trim().length > 0);
-
-  useEffect(() => {
-    setName(initialName);
-  }, [initialName]);
-  useEffect(() => {
-    setDescription(initialDescription);
-    if (initialDescription.trim().length > 0) setExpanded(true);
-  }, [initialDescription]);
-
-  const commitDescription = () => {
-    if (description === initialDescription) return;
-    onSave(originalSpeaker, { description: description.trim() });
-  };
-
-  const commitName = (newName: string) => {
-    const trimmed = newName.trim();
-    setName(trimmed);
-    setEditingName(false);
-    if (trimmed === initialName) return;
-    onSave(originalSpeaker, { customName: trimmed });
-  };
-
-  const displayName = name.trim() || `Unnamed · ${defaultSpeakerLabel(originalSpeaker)}`;
-
-  return (
-    <div className="rounded-md border bg-card px-2 py-1.5">
-      <div className="flex items-center gap-2">
-        <Badge variant="outline" className="shrink-0">
-          {defaultSpeakerLabel(originalSpeaker)}
-        </Badge>
-        <span className="shrink-0 text-[11px] text-muted-foreground">
-          {count} line{count === 1 ? '' : 's'}
-        </span>
-        <div className="min-w-0 flex-1">
-          {editingName && canEdit ? (
-            <UserPicker
-              mode="freeform"
-              compact
-              initialValue={name}
-              placeholder="Search by name or email…"
-              onSelect={(sel) => {
-                if (sel.type === 'person') {
-                  commitName(sel.person.name);
-                  onPickPerson(sel.person);
-                }
-              }}
-              onCustomSubmit={(text) => {
-                setEditingName(false);
-                onRequestCreatePerson(originalSpeaker, text);
-              }}
-              onCancel={() => setEditingName(false)}
-            />
-          ) : (
-            <button
-              type="button"
-              onClick={() => canEdit && setEditingName(true)}
-              className={`flex w-full items-center gap-1.5 rounded-md px-2 py-1 text-left text-sm ${
-                canEdit ? 'hover:bg-muted/50' : 'cursor-default'
-              } ${name.trim() ? '' : 'text-muted-foreground italic'}`}
-              title={canEdit ? 'Click to edit' : 'Read-only'}
-            >
-              <span className="truncate">{displayName}</span>
-              {canEdit && (
-                <Pencil className="h-3 w-3 ml-auto text-muted-foreground/60" />
-              )}
-            </button>
-          )}
-        </div>
-        {onPreview && (
-          <button
-            type="button"
-            onClick={onPreview}
-            className="flex shrink-0 items-center justify-center rounded p-1 text-muted-foreground hover:bg-muted hover:text-foreground transition-colors"
-            title="Preview voice — cycle through this speaker's distinctive moments"
-          >
-            <Headphones className="h-3.5 w-3.5" />
-          </button>
-        )}
-        <button
-          type="button"
-          onClick={() => setExpanded((v) => !v)}
-          className="flex shrink-0 items-center gap-1 rounded px-1.5 py-1 text-[11px] text-muted-foreground hover:text-foreground"
-          title={expanded ? 'Hide context' : 'Add context'}
-        >
-          {expanded ? (
-            <ChevronUp className="h-3.5 w-3.5" />
-          ) : (
-            <>
-              <span>Context</span>
-              <ChevronDown className="h-3.5 w-3.5" />
-            </>
-          )}
-        </button>
-      </div>
-      {expanded && (
-        <div className="pt-1.5">
-          <Textarea
-            value={description}
-            placeholder="Role, voice, background, anything that helps you tell them apart…"
-            rows={2}
-            readOnly={!canEdit}
-            className="text-xs"
-            onChange={(e) => setDescription(e.target.value)}
-            onBlur={commitDescription}
-          />
-        </div>
-      )}
-    </div>
   );
 }

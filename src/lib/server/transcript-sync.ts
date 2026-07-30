@@ -4,6 +4,7 @@ import {
   updateStatusForUser,
   type TranscriptRow,
 } from '@/db-ops/transcripts';
+import { onTranscriptCompleted } from '@/lib/server/post-completion';
 
 /**
  * If the stored row is still queued/processing, fetch the latest state from
@@ -31,6 +32,13 @@ export async function refreshIfPending(
       speakerCount,
       languageCode: aai.language_code ?? null,
     });
+
+    // First observation of the completed state → kick off auto-notes and
+    // voiceprint speaker suggestions (fire-and-forget).
+    if (aai.status === 'completed') {
+      onTranscriptCompleted(userId, row.assemblyai_id);
+    }
+
     return updated ?? row;
   } catch (error) {
     console.warn('[transcript-sync] refresh failed:', error);

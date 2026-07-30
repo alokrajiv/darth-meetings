@@ -5,6 +5,8 @@ import { forwardRef, useImperativeHandle, useRef } from 'react';
 export interface AudioPlayerHandle {
   /** Seek to a position (seconds) and start playing. */
   seekToSeconds: (seconds: number) => void;
+  /** Seek to a position (seconds) WITHOUT changing play/pause state. */
+  seekOnly: (seconds: number) => void;
   /** Pause without changing position. */
   pause: () => void;
   /** Whether audio is currently playing. */
@@ -43,6 +45,19 @@ export const AudioPlayer = forwardRef<AudioPlayerHandle, AudioPlayerProps>(
           el.currentTime = seconds;
           // Best-effort autoplay; browsers may block on first interaction.
           void el.play().catch(() => {});
+        },
+        seekOnly(seconds: number) {
+          const el = audioRef.current;
+          if (!el) return;
+          // Avoid clobbering currentTime before metadata is ready (some
+          // browsers throw INDEX_SIZE_ERR otherwise).
+          if (el.readyState >= 1) {
+            try {
+              el.currentTime = seconds;
+            } catch {
+              /* ignore */
+            }
+          }
         },
         pause() {
           audioRef.current?.pause();

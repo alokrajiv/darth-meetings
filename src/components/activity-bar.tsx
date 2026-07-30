@@ -29,7 +29,8 @@ export type ActivityAction =
   | 'edit_meta'
   | 'share_add'
   | 'share_update'
-  | 'share_remove';
+  | 'share_remove'
+  | 'generate_notes';
 
 export interface ActivityRow {
   id: number;
@@ -126,6 +127,8 @@ function actionVerb(row: ActivityRow): string {
       const d = row.details as { withEmail?: string } | null;
       return d?.withEmail ? `removed ${d.withEmail}` : 'removed a collaborator';
     }
+    case 'generate_notes':
+      return 'generated AI notes';
     default:
       return row.action;
   }
@@ -199,9 +202,47 @@ export function ActivityBar({ transcriptId, refreshSignal }: ActivityBarProps) {
     );
   }
 
-  const viewers = summary.recentViewers;
-  const stackedViewers = viewers.slice(0, 4);
-  const overflow = Math.max(viewers.length - stackedViewers.length, 0);
+  // Build a single deduped list of everyone who's touched the transcript —
+  // editors first (from events), then any pure viewers. Sorted by most
+  // recent activity so the freshest folks bubble to the front.
+  interface Person {
+    user_id: string;
+    user_email: string;
+    user_name: string | null;
+    lastAt: string;
+    /** What that person did most recently — for the tooltip. */
+    lastVerb: string;
+  }
+  const peopleMap = new Map<string, Person>();
+  for (const ev of summary.events) {
+    const existing = peopleMap.get(ev.user_id);
+    if (!existing) {
+      peopleMap.set(ev.user_id, {
+        user_id: ev.user_id,
+        user_email: ev.user_email,
+        user_name: ev.user_name,
+        lastAt: ev.at,
+        lastVerb: actionVerb(ev),
+      });
+    }
+  }
+  for (const v of summary.recentViewers) {
+    if (!peopleMap.has(v.user_id)) {
+      peopleMap.set(v.user_id, {
+        user_id: v.user_id,
+        user_email: v.user_email,
+        user_name: v.user_name,
+        lastAt: v.last_viewed_at,
+        lastVerb: 'viewed',
+      });
+    }
+  }
+  const people = Array.from(peopleMap.values()).sort(
+    (a, b) => new Date(b.lastAt).getTime() - new Date(a.lastAt).getTime()
+  );
+  const STACK_LIMIT = 5;
+  const stackedPeople = people.slice(0, STACK_LIMIT);
+  const overflow = Math.max(people.length - stackedPeople.length, 0);
 
   const lastEdit = summary.lastEdit;
   const lastEditName = lastEdit
@@ -216,16 +257,16 @@ export function ActivityBar({ transcriptId, refreshSignal }: ActivityBarProps) {
         className="inline-flex items-center gap-2 rounded-full border bg-background px-2 py-1 text-[11px] text-muted-foreground hover:bg-muted hover:text-foreground transition-colors"
         title="Show activity timeline"
       >
-        {stackedViewers.length > 0 && (
+        {stackedPeople.length > 0 && (
           <div className="flex -space-x-1.5">
-            {stackedViewers.map((v) => {
-              const n = displayName({ name: v.user_name, email: v.user_email });
+            {stackedPeople.map((p) => {
+              const n = displayName({ name: p.user_name, email: p.user_email });
               return (
                 <div
-                  key={v.user_id}
-                  title={`${n} · viewed ${relTime(v.last_viewed_at)}`}
+                  key={p.user_id}
+                  title={`${n} · ${p.lastVerb} ${relTime(p.lastAt)}`}
                   className={`flex h-5 w-5 items-center justify-center rounded-full ring-2 ring-background text-[9px] font-semibold ${colorFor(
-                    v.user_email
+                    p.user_email
                   )}`}
                 >
                   {initials(n)}
@@ -234,7 +275,7 @@ export function ActivityBar({ transcriptId, refreshSignal }: ActivityBarProps) {
             })}
             {overflow > 0 && (
               <div
-                title={`${overflow} more viewer${overflow === 1 ? '' : 's'}`}
+                title={`${overflow} more ${overflow === 1 ? 'person' : 'people'}`}
                 className="flex h-5 w-5 items-center justify-center rounded-full ring-2 ring-background bg-muted text-[9px] font-semibold text-muted-foreground"
               >
                 +{overflow}

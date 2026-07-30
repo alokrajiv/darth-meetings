@@ -190,15 +190,15 @@ export function TranscriptTable({ refreshTrigger }: TranscriptTableProps) {
   return (
     <Card>
       <CardHeader className="pb-3">
-        <div className="flex items-center justify-between gap-3">
+        <div className="flex flex-wrap items-center justify-between gap-2">
           <CardTitle className="text-base">Your Transcripts</CardTitle>
-          <div className="flex items-center gap-2">
+          <div className="flex items-center gap-2 flex-wrap">
             <div className="inline-flex rounded-md border bg-background p-0.5">
               {tabButton('all', 'All', counts.all)}
               {tabButton('mine', 'Mine', counts.mine)}
               {tabButton('shared', 'Shared', counts.shared)}
             </div>
-            <Button onClick={loadTranscripts} variant="outline" size="sm">
+            <Button onClick={loadTranscripts} variant="outline" size="sm" title="Refresh">
               <RefreshCw className="h-4 w-4" />
             </Button>
           </div>
@@ -217,11 +217,11 @@ export function TranscriptTable({ refreshTrigger }: TranscriptTableProps) {
           <Table>
             <TableHeader>
               <TableRow className="hover:bg-transparent">
-                <TableHead className="w-[40%]">Title</TableHead>
-                <TableHead className="w-[20%]">Created</TableHead>
-                <TableHead className="w-[15%]">Duration</TableHead>
-                <TableHead className="w-[15%]">Speakers</TableHead>
-                <TableHead className="w-[10%] text-right pr-4">&nbsp;</TableHead>
+                <TableHead>Title</TableHead>
+                <TableHead className="hidden md:table-cell w-[20%]">Created</TableHead>
+                <TableHead className="hidden sm:table-cell w-[15%]">Duration</TableHead>
+                <TableHead className="hidden lg:table-cell w-[12%]">Speakers</TableHead>
+                <TableHead className="w-[60px] text-right pr-4">&nbsp;</TableHead>
               </TableRow>
             </TableHeader>
             <TableBody>
@@ -238,11 +238,31 @@ export function TranscriptTable({ refreshTrigger }: TranscriptTableProps) {
                       <div className="flex items-center gap-2 min-w-0">
                         {statusBadge(t.status)}
                         <FileAudio className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
-                        <div className="min-w-0">
+                        <div className="min-w-0 flex-1">
                           <div className="truncate text-sm font-medium">{primary}</div>
                           {secondary && (
                             <div className="truncate text-[11px] text-muted-foreground">{secondary}</div>
                           )}
+                          {/* Inline meta visible only on small screens (where the
+                              dedicated columns are hidden). */}
+                          <div className="md:hidden mt-0.5 flex flex-wrap items-center gap-x-2 gap-y-0.5 text-[10px] text-muted-foreground">
+                            <span>{formatRelativeDate(t.created_at)}</span>
+                            {t.duration && (
+                              <>
+                                <span className="opacity-50">·</span>
+                                <span className="inline-flex items-center gap-0.5">
+                                  <Clock className="h-2.5 w-2.5" />
+                                  {formatDuration(t.duration)}
+                                </span>
+                              </>
+                            )}
+                            {t.speaker_count != null && (
+                              <>
+                                <span className="opacity-50">·</span>
+                                <span>{t.speaker_count} spkr</span>
+                              </>
+                            )}
+                          </div>
                         </div>
                         {accessBadge(t.access)}
                         {t.status !== 'completed' && (
@@ -252,10 +272,10 @@ export function TranscriptTable({ refreshTrigger }: TranscriptTableProps) {
                         )}
                       </div>
                     </TableCell>
-                    <TableCell className="py-2.5 text-xs text-muted-foreground">
+                    <TableCell className="hidden md:table-cell py-2.5 text-xs text-muted-foreground">
                       {formatRelativeDate(t.created_at)}
                     </TableCell>
-                    <TableCell className="py-2.5 text-xs text-muted-foreground">
+                    <TableCell className="hidden sm:table-cell py-2.5 text-xs text-muted-foreground">
                       {t.duration ? (
                         <span className="inline-flex items-center gap-1">
                           <Clock className="h-3 w-3" />
@@ -265,7 +285,7 @@ export function TranscriptTable({ refreshTrigger }: TranscriptTableProps) {
                         '—'
                       )}
                     </TableCell>
-                    <TableCell className="py-2.5 text-xs text-muted-foreground">
+                    <TableCell className="hidden lg:table-cell py-2.5 text-xs text-muted-foreground">
                       {t.speaker_count ?? '—'}
                     </TableCell>
                     <TableCell className="py-2.5 text-right pr-4">

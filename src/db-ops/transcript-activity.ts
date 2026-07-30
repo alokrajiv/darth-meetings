@@ -28,7 +28,8 @@ export type ActivityAction =
   | 'edit_meta'
   | 'share_add'
   | 'share_update'
-  | 'share_remove';
+  | 'share_remove'
+  | 'generate_notes';
 
 export interface ActivityRow {
   id: number;

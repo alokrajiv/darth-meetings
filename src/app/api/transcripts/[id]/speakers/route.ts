@@ -7,6 +7,8 @@ import {
   upsertForUser as upsertMappingsForUser,
   type SpeakerLabel,
 } from '@/db-ops/speaker-mappings';
+import { enrollFromTranscript } from '@/lib/server/voiceprint';
+import { getContentCached } from '@/lib/server/auto-notes';
 
 export const runtime = 'nodejs';
 
@@ -40,7 +42,10 @@ export const GET = withAuth(async ({ user }, { params }) => {
   }
 
   const row = await getMappingsForUser(access.ownerUserId, id);
-  return NextResponse.json({ speakerLabels: row?.speaker_labels ?? [] });
+  return NextResponse.json({
+    speakerLabels: row?.speaker_labels ?? [],
+    suggestions: row?.suggestions ?? {},
+  });
 });
 
 /**
@@ -75,6 +80,13 @@ export const PUT = withAuth(async ({ user, request }, { params }) => {
   }
 
   const row = await upsertMappingsForUser(access.ownerUserId, id, labels);
+
+  // Every confirmed name is free enrollment data: update that person's
+  // voiceprint from this meeting's audio (fire-and-forget, best-effort).
+  void (async () => {
+    const content = await getContentCached(access.ownerUserId, access.row);
+    await enrollFromTranscript(access.row.local_audio_path, content, labels);
+  })().catch((err) => console.warn('[speakers PUT] voiceprint enroll failed:', err));
 
   void logActivity({
     transcriptId: access.row.id,

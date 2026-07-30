@@ -1,7 +1,7 @@
 import 'server-only';
 import { sql } from '@/lib/db';
 import { SCHEMAS } from '@/lib/constants/database';
-import type { SpeakerLabel } from '@/lib/format';
+import type { SpeakerLabel, SpeakerSuggestionMap } from '@/lib/format';
 
 export type { SpeakerLabel };
 
@@ -19,6 +19,7 @@ export interface SpeakerMappingRow {
   user_id: string;
   assemblyai_id: string;
   speaker_labels: SpeakerLabel[];
+  suggestions: SpeakerSuggestionMap | null;
   created_at: string;
   updated_at: string;
 }
@@ -53,6 +54,27 @@ export async function upsertForUser(
     RETURNING *
   `;
   return rows[0]!;
+}
+
+/**
+ * Store voiceprint auto-detection results without touching speaker_labels.
+ * Called by the post-completion hook, which runs as the owner.
+ */
+export async function setSuggestionsForUser(
+  userId: string,
+  assemblyaiId: string,
+  suggestions: SpeakerSuggestionMap
+): Promise<void> {
+  await sql`
+    INSERT INTO ${sql(SCHEMA)}.speaker_mappings (
+      user_id, assemblyai_id, speaker_labels, suggestions
+    ) VALUES (
+      ${userId}, ${assemblyaiId}, '[]'::jsonb, ${sql.json(suggestions as unknown as never)}
+    )
+    ON CONFLICT (user_id, assemblyai_id) DO UPDATE
+      SET suggestions = EXCLUDED.suggestions,
+          updated_at = now()
+  `;
 }
 
 export async function deleteForUser(

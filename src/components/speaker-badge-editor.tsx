@@ -87,7 +87,15 @@ export function SpeakerBadgeEditor({
   }
 
   return (
-    <span className="inline-flex items-center gap-1">
+    <span
+      className="inline-flex items-center gap-1"
+      onDoubleClick={(e) => {
+        if (!canEdit) return;
+        e.stopPropagation();
+        setIsEditing(true);
+      }}
+      title={canEdit ? 'Double-click to edit speaker' : ''}
+    >
       <Badge variant="outline">{currentDisplay}</Badge>
       {mapping?.customName && (
         <span className="text-[10px] text-muted-foreground">
@@ -97,9 +105,13 @@ export function SpeakerBadgeEditor({
       {canEdit && (
         <button
           type="button"
-          onClick={() => setIsEditing(true)}
+          onClick={(e) => {
+            e.stopPropagation();
+            setIsEditing(true);
+          }}
           className="text-muted-foreground opacity-0 group-hover:opacity-100 transition-opacity hover:text-foreground"
           title="Edit speaker name"
+          aria-label="Edit speaker"
         >
           <Pencil className="h-3 w-3" />
         </button>

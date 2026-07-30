@@ -10,15 +10,19 @@ import {
 } from '@/components/ui/dialog';
 import { Button } from '@/components/ui/button';
 import { Badge } from '@/components/ui/badge';
+import { Input } from '@/components/ui/input';
+import { Textarea } from '@/components/ui/textarea';
 import {
   ChevronLeft,
   ChevronRight,
   Play,
   Pause,
   Headphones,
+  Pencil,
 } from 'lucide-react';
 import { formatTime, type SpeakerLabel } from '@/lib/format';
 import { defaultSpeakerLabel } from '@/lib/speaker-display';
+import { UserPicker, type PickerPerson } from '@/components/user-picker';
 
 interface Utterance {
   text: string;
@@ -28,44 +32,43 @@ interface Utterance {
 }
 
 interface PreviewSegment {
-  /** Index of the focus utterance (the long one by the target speaker). */
   focusIdx: number;
-  /** Indices included in this snippet (before-context + focus + after-context). */
   contextIdxs: number[];
 }
 
 interface SpeakerPreviewDialogProps {
   open: boolean;
   onOpenChange: (open: boolean) => void;
-  /** The raw AAI speaker key (A/B/C). */
-  originalSpeaker: string;
+  /** Speaker to start on (raw AAI key like "A"). */
+  initialSpeaker: string;
+  /** All unique speakers in the transcript, in display order. */
+  speakers: string[];
   utterances: Utterance[];
   speakerLabels: SpeakerLabel[];
-  /** /api/transcripts/[id]/audio */
-  audioSrc: string;
+  /** /api/transcripts/[id]/audio — null when the transcript has no playable
+   *  audio; the dialog still works for editing names + context. */
+  audioSrc: string | null;
+  canEdit: boolean;
+  onSave: (
+    originalSpeaker: string,
+    patch: { customName?: string; description?: string }
+  ) => void;
+  onPickPerson?: (person: PickerPerson) => void;
+  onRequestCreatePerson?: (originalSpeaker: string, name: string) => void;
 }
 
 const TOP_N_SEGMENTS = 5;
 const CONTEXT_BEFORE = 2;
 const CONTEXT_AFTER = 2;
 
-/**
- * Pick the speaker's longest N utterances by character length — those are
- * the moments where they actually said something distinctive. Each pick gets
- * ±2 turns of surrounding context so the user can hear who they're
- * responding to and the back-and-forth.
- */
 function buildSegments(utterances: Utterance[], speaker: string): PreviewSegment[] {
   const indexed = utterances
     .map((u, i) => ({ u, i }))
     .filter((x) => x.u.speaker === speaker);
-
-  // Sort by text length desc — longer = more distinctive content.
   indexed.sort((a, b) => b.u.text.length - a.u.text.length);
 
   const seenFocus = new Set<number>();
   const out: PreviewSegment[] = [];
-
   for (const { i } of indexed) {
     if (out.length >= TOP_N_SEGMENTS) break;
     if (seenFocus.has(i)) continue;
@@ -74,42 +77,85 @@ function buildSegments(utterances: Utterance[], speaker: string): PreviewSegment
     const contextIdxs: number[] = [];
     for (let j = start; j <= end; j++) contextIdxs.push(j);
     out.push({ focusIdx: i, contextIdxs });
-    // Avoid neighbouring picks that would render the same context twice.
     for (let j = start; j <= end; j++) seenFocus.add(j);
   }
-
   return out;
 }
 
+function fmtHMS(seconds: number): string {
+  const total = Math.max(0, Math.floor(seconds));
+  const h = Math.floor(total / 3600);
+  const m = Math.floor((total % 3600) / 60);
+  const s = total % 60;
+  if (h > 0) return `${h}:${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}`;
+  return `${m}:${String(s).padStart(2, '0')}`;
+}
+
+/**
+ * "Identify speaker" workspace. Cycle through every speaker, hear their
+ * most distinctive snippets, and set their name + context inline — all
+ * without leaving the dialog.
+ */
 export function SpeakerPreviewDialog({
   open,
   onOpenChange,
-  originalSpeaker,
+  initialSpeaker,
+  speakers,
   utterances,
   speakerLabels,
   audioSrc,
+  canEdit,
+  onSave,
+  onPickPerson,
+  onRequestCreatePerson,
 }: SpeakerPreviewDialogProps) {
-  const segments = useMemo(
-    () => buildSegments(utterances, originalSpeaker),
-    [utterances, originalSpeaker]
-  );
-
+  const [speaker, setSpeaker] = useState(initialSpeaker);
   const [cursor, setCursor] = useState(0);
   const [playing, setPlaying] = useState(false);
+  const [editingName, setEditingName] = useState(false);
   const audioRef = useRef<HTMLAudioElement>(null);
 
-  const mapping = speakerLabels.find((m) => m.originalSpeaker === originalSpeaker);
-  const displayName = mapping?.customName?.trim() || defaultSpeakerLabel(originalSpeaker);
-
-  // Reset to first segment whenever the dialog opens.
+  // Reset to the requested speaker each time the dialog opens.
   useEffect(() => {
     if (open) {
+      setSpeaker(initialSpeaker);
       setCursor(0);
+      setEditingName(false);
     } else {
       audioRef.current?.pause();
       setPlaying(false);
     }
-  }, [open]);
+  }, [open, initialSpeaker]);
+
+  const segments = useMemo(() => buildSegments(utterances, speaker), [utterances, speaker]);
+  const lineCount = useMemo(
+    () => utterances.filter((u) => u.speaker === speaker).length,
+    [utterances, speaker]
+  );
+
+  const mapping = speakerLabels.find((m) => m.originalSpeaker === speaker);
+  const displayName = mapping?.customName?.trim() || defaultSpeakerLabel(speaker);
+
+  // Local drafts for the editable name / description, synced from props.
+  const [nameDraft, setNameDraft] = useState(mapping?.customName ?? '');
+  const [descDraft, setDescDraft] = useState(mapping?.description ?? '');
+  useEffect(() => {
+    setNameDraft(mapping?.customName ?? '');
+    setDescDraft(mapping?.description ?? '');
+    setEditingName(false);
+  }, [speaker, mapping?.customName, mapping?.description]);
+
+  const speakerIdx = Math.max(0, speakers.indexOf(speaker));
+  const nextSpeaker = () => {
+    if (speakers.length < 2) return;
+    setSpeaker(speakers[(speakerIdx + 1) % speakers.length]!);
+    setCursor(0);
+  };
+  const prevSpeaker = () => {
+    if (speakers.length < 2) return;
+    setSpeaker(speakers[(speakerIdx - 1 + speakers.length) % speakers.length]!);
+    setCursor(0);
+  };
 
   const currentSegment = segments[cursor];
   const focusStartSec = useMemo(() => {
@@ -118,11 +164,6 @@ export function SpeakerPreviewDialog({
     return u ? u.start / 1000 : null;
   }, [currentSegment, utterances]);
 
-  /**
-   * Seek the inline audio to the snippet's focus start. Robust against the
-   * audio element not having metadata yet — falls back to a one-shot
-   * loadedmetadata listener and triggers `load()` to nudge it along.
-   */
   const seekToFocus = useCallback(() => {
     const audio = audioRef.current;
     if (!audio || focusStartSec == null) return;
@@ -130,7 +171,7 @@ export function SpeakerPreviewDialog({
       try {
         audio.currentTime = focusStartSec;
       } catch {
-        // ignore — readyState wasn't sufficient yet
+        /* readyState too low */
       }
     };
     if (audio.readyState >= 1) {
@@ -145,9 +186,6 @@ export function SpeakerPreviewDialog({
     }
   }, [focusStartSec]);
 
-  // Whenever the snippet changes (or the dialog opens), seek to the new
-  // focus. We don't auto-play — user explicitly clicks ▶ to avoid surprise
-  // audio.
   useEffect(() => {
     if (open) seekToFocus();
   }, [open, seekToFocus]);
@@ -156,8 +194,6 @@ export function SpeakerPreviewDialog({
     const audio = audioRef.current;
     if (!audio) return;
     if (audio.paused) {
-      // Always start the snippet from the focus utterance, even if the
-      // user previously scrubbed somewhere else with the native controls.
       seekToFocus();
       void audio.play();
     } else {
@@ -174,9 +210,25 @@ export function SpeakerPreviewDialog({
     if (audio.paused) void audio.play();
   };
 
-  const next = () => setCursor((c) => (c + 1) % Math.max(segments.length, 1));
-  const prev = () =>
+  const nextSnippet = () => setCursor((c) => (c + 1) % Math.max(segments.length, 1));
+  const prevSnippet = () =>
     setCursor((c) => (c - 1 + Math.max(segments.length, 1)) % Math.max(segments.length, 1));
+
+  const commitName = (value: string) => {
+    setEditingName(false);
+    const trimmed = value.trim();
+    setNameDraft(trimmed);
+    if (trimmed !== (mapping?.customName ?? '')) {
+      onSave(speaker, { customName: trimmed });
+    }
+  };
+
+  const commitDesc = () => {
+    const trimmed = descDraft.trim();
+    if (trimmed !== (mapping?.description ?? '')) {
+      onSave(speaker, { description: trimmed });
+    }
+  };
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
@@ -184,20 +236,110 @@ export function SpeakerPreviewDialog({
         <DialogHeader>
           <DialogTitle className="flex items-center gap-2">
             <Headphones className="h-4 w-4" />
-            Preview {displayName}
-            <Badge variant="outline" className="text-[10px]">
-              {defaultSpeakerLabel(originalSpeaker)}
-            </Badge>
+            Identify speakers
+            {speakers.length > 1 && (
+              <Badge variant="outline" className="text-[10px]">
+                {speakerIdx + 1} / {speakers.length}
+              </Badge>
+            )}
           </DialogTitle>
           <DialogDescription>
-            Cycle through this speaker&apos;s most distinctive moments to put
-            a voice to the label.
+            Cycle through each speaker, hear their distinctive moments, and
+            set their name + context — all from here.
           </DialogDescription>
         </DialogHeader>
 
-        {segments.length === 0 ? (
+        {/* Speaker selector */}
+        <div className="flex items-center justify-between gap-2 rounded-md border bg-muted/30 p-2">
+          <Button
+            variant="outline"
+            size="sm"
+            onClick={prevSpeaker}
+            disabled={speakers.length < 2}
+            title="Previous speaker"
+          >
+            <ChevronLeft className="h-4 w-4" />
+          </Button>
+          <div className="flex items-center gap-2 text-sm">
+            <Badge variant="default">{defaultSpeakerLabel(speaker)}</Badge>
+            <span className="font-medium">{displayName}</span>
+            <span className="text-xs text-muted-foreground">
+              {lineCount} line{lineCount === 1 ? '' : 's'}
+            </span>
+          </div>
+          <Button
+            variant="outline"
+            size="sm"
+            onClick={nextSpeaker}
+            disabled={speakers.length < 2}
+            title="Next speaker"
+          >
+            <ChevronRight className="h-4 w-4" />
+          </Button>
+        </div>
+
+        {/* Inline name + description editing */}
+        {canEdit && (
+          <div className="grid gap-2 sm:grid-cols-[1fr_2fr]">
+            <div>
+              {editingName ? (
+                <UserPicker
+                  mode="freeform"
+                  initialValue={nameDraft}
+                  placeholder="Name or email"
+                  onSelect={(sel) => {
+                    if (sel.type === 'person') {
+                      commitName(sel.person.name);
+                      onPickPerson?.(sel.person);
+                    }
+                  }}
+                  onCustomSubmit={(text) => {
+                    setEditingName(false);
+                    if (onRequestCreatePerson) {
+                      onRequestCreatePerson(speaker, text);
+                    } else {
+                      commitName(text);
+                    }
+                  }}
+                  onCancel={() => setEditingName(false)}
+                />
+              ) : (
+                <div
+                  onDoubleClick={() => setEditingName(true)}
+                  className="flex items-center gap-1.5 rounded-md border px-2 py-1.5 text-sm hover:bg-muted/40 cursor-default"
+                  title="Double-click to edit"
+                >
+                  <span className={`truncate flex-1 ${nameDraft.trim() ? '' : 'text-muted-foreground italic'}`}>
+                    {nameDraft.trim() || 'Set a name'}
+                  </span>
+                  <button
+                    type="button"
+                    onClick={() => setEditingName(true)}
+                    className="rounded p-1 text-muted-foreground/70 hover:bg-muted hover:text-foreground"
+                    title="Edit name"
+                  >
+                    <Pencil className="h-3 w-3" />
+                  </button>
+                </div>
+              )}
+            </div>
+            <Textarea
+              value={descDraft}
+              placeholder="Context (role, voice, who they are — optional)"
+              rows={2}
+              onChange={(e) => setDescDraft(e.target.value)}
+              onBlur={commitDesc}
+            />
+          </div>
+        )}
+
+        {!audioSrc ? (
+          <p className="py-4 text-center text-xs text-muted-foreground">
+            No playable audio for this transcript — name &amp; context editing only.
+          </p>
+        ) : segments.length === 0 ? (
           <p className="py-6 text-center text-sm text-muted-foreground">
-            No utterances by {displayName} found in this transcript.
+            No utterances by {displayName} in this transcript.
           </p>
         ) : (
           <>
@@ -205,7 +347,7 @@ export function SpeakerPreviewDialog({
               <Button
                 variant="outline"
                 size="sm"
-                onClick={prev}
+                onClick={prevSnippet}
                 disabled={segments.length < 2}
                 title="Previous snippet"
               >
@@ -217,7 +359,7 @@ export function SpeakerPreviewDialog({
               <Button
                 variant="outline"
                 size="sm"
-                onClick={next}
+                onClick={nextSnippet}
                 disabled={segments.length < 2}
                 title="Next snippet"
               >
@@ -226,7 +368,7 @@ export function SpeakerPreviewDialog({
             </div>
 
             <div className="rounded-md border bg-card p-3">
-              <div className="space-y-2 max-h-[55vh] min-h-[260px] overflow-y-auto">
+              <div className="space-y-2 max-h-[42vh] min-h-[200px] overflow-y-auto">
                 {currentSegment?.contextIdxs.map((idx) => {
                   const u = utterances[idx];
                   if (!u) return null;
@@ -239,23 +381,16 @@ export function SpeakerPreviewDialog({
                       type="button"
                       onClick={() => seekTo(idx)}
                       className={`block w-full rounded-md p-2 text-left transition-colors ${
-                        focus
-                          ? 'bg-amber-50 ring-1 ring-amber-200'
-                          : 'hover:bg-muted/50'
+                        focus ? 'bg-amber-50 ring-1 ring-amber-200' : 'hover:bg-muted/50'
                       }`}
                     >
                       <div className="flex items-baseline gap-2 text-xs text-muted-foreground mb-1">
-                        <Badge
-                          variant={focus ? 'default' : 'outline'}
-                          className="text-[10px]"
-                        >
+                        <Badge variant={focus ? 'default' : 'outline'} className="text-[10px]">
                           {name}
                         </Badge>
                         <span className="font-mono">{formatTime(u.start)}</span>
                       </div>
-                      <div className={`text-sm ${focus ? 'font-medium' : ''}`}>
-                        {u.text}
-                      </div>
+                      <div className={`text-sm ${focus ? 'font-medium' : ''}`}>{u.text}</div>
                     </button>
                   );
                 })}
@@ -269,22 +404,23 @@ export function SpeakerPreviewDialog({
                 onClick={togglePlay}
                 title={playing ? 'Pause' : 'Play snippet'}
               >
-                {playing ? (
-                  <Pause className="h-4 w-4" />
-                ) : (
-                  <Play className="h-4 w-4" />
-                )}
+                {playing ? <Pause className="h-4 w-4" /> : <Play className="h-4 w-4" />}
               </Button>
               <audio
                 ref={audioRef}
                 src={audioSrc}
-                preload="metadata"
+                preload="auto"
                 controls
                 className="h-9 flex-1"
                 onPlay={() => setPlaying(true)}
                 onPause={() => setPlaying(false)}
                 onEnded={() => setPlaying(false)}
               />
+              {focusStartSec != null && (
+                <span className="shrink-0 text-[11px] text-muted-foreground whitespace-nowrap">
+                  starts at <span className="font-mono">{fmtHMS(focusStartSec)}</span>
+                </span>
+              )}
             </div>
           </>
         )}
