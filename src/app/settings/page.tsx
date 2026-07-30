@@ -1,10 +1,10 @@
 'use client';
 
 import { useEffect, useState } from 'react';
-import { useRouter } from 'next/navigation';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
-import { ArrowLeft, RefreshCw } from 'lucide-react';
+import { RefreshCw } from 'lucide-react';
+import { AppHeader } from '@/components/app-header';
 import { VocabEditor } from '@/components/vocab-editor';
 import type { VocabPayload } from '@/lib/format';
 
@@ -15,7 +15,6 @@ interface OrgVocabMeta {
 }
 
 export default function SettingsPage() {
-  const router = useRouter();
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [userVocab, setUserVocab] = useState<VocabPayload | null>(null);
@@ -90,22 +89,19 @@ export default function SettingsPage() {
   };
 
   return (
-    <div className="container mx-auto px-4 py-8 max-w-4xl">
-      <div className="flex justify-between items-center mb-6">
-        <div>
-          <Button variant="outline" onClick={() => router.push('/')} className="mb-4">
-            <ArrowLeft className="h-4 w-4 mr-2" />
-            Back to Transcripts
-          </Button>
-          <h1 className="text-3xl font-bold">Settings</h1>
-          <p className="text-muted-foreground">
-            Key terms and custom spellings — applied at transcription time.
-          </p>
-        </div>
-        <Button variant="outline" size="sm" onClick={load}>
-          <RefreshCw className="h-4 w-4 mr-2" />
-          Refresh
+    <div className="min-h-screen">
+      <AppHeader breadcrumb={{ title: 'Settings' }}>
+        <Button variant="ghost" size="sm" className="h-8 w-8 p-0" onClick={load} title="Refresh">
+          <RefreshCw className="h-4 w-4" />
+          <span className="sr-only">Refresh</span>
         </Button>
+      </AppHeader>
+      <main className="mx-auto max-w-4xl px-6 py-6">
+      <div className="mb-5">
+        <h1 className="text-2xl font-semibold tracking-tight leading-tight">Settings</h1>
+        <p className="text-sm text-muted-foreground">
+          Key terms and custom spellings — applied at transcription time.
+        </p>
       </div>
 
       {loading && (
@@ -160,6 +156,7 @@ export default function SettingsPage() {
           />
         </div>
       )}
+      </main>
     </div>
   );
 }

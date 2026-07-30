@@ -11,6 +11,9 @@ interface RerunDiarizationButtonProps {
   gmeetContext: GmeetContext | null | undefined;
   /** Compact rendering for a quick-actions rail. */
   size?: 'sm' | 'default';
+  /** Button variant — e.g. 'ghost' to match a rail's justify-start recipe. */
+  variant?: 'outline' | 'ghost';
+  /** Applied directly to the Button so callers control width/alignment. */
   className?: string;
 }
 
@@ -29,6 +32,7 @@ export function RerunDiarizationButton({
   assemblyaiId,
   gmeetContext,
   size = 'sm',
+  variant = 'outline',
   className,
 }: RerunDiarizationButtonProps) {
   const [busy, setBusy] = useState(false);
@@ -89,16 +93,23 @@ export function RerunDiarizationButton({
   };
 
   return (
-    <span className={className}>
-      <Button variant="outline" size={size} onClick={() => void run()} disabled={busy} title="Fetch the recording from Drive and re-transcribe with voice-level speaker separation">
+    <>
+      <Button
+        variant={variant}
+        size={size}
+        className={className}
+        onClick={() => void run()}
+        disabled={busy}
+        title="Fetch the recording from Drive and re-transcribe with voice-level speaker separation"
+      >
         {busy ? (
-          <Loader2 className="h-4 w-4 mr-1.5 animate-spin" />
+          <Loader2 className="h-4 w-4 animate-spin text-muted-foreground" />
         ) : (
-          <AudioWaveform className="h-4 w-4 mr-1.5" />
+          <AudioWaveform className="h-4 w-4 text-muted-foreground" />
         )}
         {busy ? 'Fetching recording…' : 'Re-run diarization'}
       </Button>
-      {error && <span className="ml-2 text-xs text-red-500">{error}</span>}
-    </span>
+      {error && <p className="px-2 text-xs text-destructive">{error}</p>}
+    </>
   );
 }

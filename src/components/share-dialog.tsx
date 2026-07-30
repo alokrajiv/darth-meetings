@@ -1,6 +1,6 @@
 'use client';
 
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import {
   Dialog,
   DialogContent,
@@ -45,6 +45,16 @@ export function ShareDialog({
 
   const canManage = callerAccess === 'owner';
 
+  // Callers pass onSharesChanged inline; keeping it in loadShares' dep array
+  // would give the callback a fresh identity on every parent render, which
+  // re-fires the load effect, which calls onSharesChanged, which re-renders
+  // the parent — an infinite fetch loop that pins the dialog on "Loading…".
+  // Route it through a ref so the effect only depends on stable values.
+  const onSharesChangedRef = useRef(onSharesChanged);
+  useEffect(() => {
+    onSharesChangedRef.current = onSharesChanged;
+  });
+
   const loadShares = useCallback(async () => {
     try {
       setLoading(true);
@@ -55,13 +65,13 @@ export function ShareDialog({
       if (!res.ok) throw new Error(`Failed (${res.status})`);
       const { shares: rows } = (await res.json()) as { shares: TranscriptShare[] };
       setShares(rows);
-      onSharesChanged?.(rows);
+      onSharesChangedRef.current?.(rows);
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to load');
     } finally {
       setLoading(false);
     }
-  }, [transcriptId, onSharesChanged]);
+  }, [transcriptId]);
 
   useEffect(() => {
     if (open) loadShares();
@@ -130,12 +140,12 @@ export function ShareDialog({
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent className="max-w-lg">
+      <DialogContent className="sm:max-w-md rounded-xl shadow-[0_4px_16px_-2px_rgb(0_0_0/0.08),0_1px_2px_0_rgb(0_0_0/0.04)]">
         <DialogHeader>
-          <DialogTitle className="flex items-center gap-2">
-            <Users className="h-5 w-5" /> Access
+          <DialogTitle className="flex items-center gap-2 text-base font-semibold">
+            <Users className="h-4 w-4 text-muted-foreground" /> Access
           </DialogTitle>
-          <DialogDescription>
+          <DialogDescription className="text-[13px] leading-5">
             {canManage
               ? 'Share this transcript with other people in your organisation. Editors can edit text and speaker names; read-only collaborators can only view.'
               : 'People with access to this transcript. Only the owner can change sharing.'}
@@ -178,7 +188,7 @@ export function ShareDialog({
                 </button>
               </div>
             </div>
-            {error && <p className="text-xs text-red-600">{error}</p>}
+            {error && <p className="text-xs text-destructive">{error}</p>}
           </div>
         )}
 
@@ -225,7 +235,7 @@ export function ShareDialog({
                     <Button
                       variant="ghost"
                       size="sm"
-                      className="h-7 w-7 p-0 text-muted-foreground hover:text-red-600"
+                      className="h-7 w-7 p-0 text-muted-foreground hover:text-destructive"
                       onClick={() => handleRemove(s.shared_with_email)}
                       title="Remove"
                     >
@@ -243,7 +253,7 @@ export function ShareDialog({
         </div>
 
         <DialogFooter>
-          <Button variant="outline" onClick={() => onOpenChange(false)}>
+          <Button onClick={() => onOpenChange(false)}>
             <Check className="h-4 w-4 mr-1" /> Done
           </Button>
         </DialogFooter>

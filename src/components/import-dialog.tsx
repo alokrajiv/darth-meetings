@@ -149,9 +149,11 @@ export function ImportDialog({ open, onClose, onImported }: ImportDialogProps) {
 
   return (
     <Dialog open={open} onOpenChange={(o) => (!o ? handleClose() : null)}>
-      <DialogContent className="max-w-2xl">
+      <DialogContent className="sm:max-w-md rounded-xl shadow-[0_4px_16px_-2px_rgb(0_0_0/0.08),0_1px_2px_0_rgb(0_0_0/0.04)]">
         <DialogHeader>
-          <DialogTitle>Import from your AssemblyAI key</DialogTitle>
+          <DialogTitle className="text-base font-semibold">
+            Import from your AssemblyAI key
+          </DialogTitle>
         </DialogHeader>
 
         {step === 'enter-key' && (
@@ -187,7 +189,7 @@ export function ImportDialog({ open, onClose, onImported }: ImportDialogProps) {
               />
             </div>
             {error && (
-              <p className="text-sm text-red-500 flex items-center gap-1">
+              <p className="text-xs text-destructive flex items-center gap-1">
                 <AlertCircle className="h-4 w-4" />
                 {error}
               </p>
@@ -245,7 +247,7 @@ export function ImportDialog({ open, onClose, onImported }: ImportDialogProps) {
               )}
             </div>
             {error && (
-              <p className="text-sm text-red-500 flex items-center gap-1">
+              <p className="text-xs text-destructive flex items-center gap-1">
                 <AlertCircle className="h-4 w-4" />
                 {error}
               </p>
@@ -255,7 +257,7 @@ export function ImportDialog({ open, onClose, onImported }: ImportDialogProps) {
 
         {step === 'importing' && (
           <div className="py-8 text-center">
-            <Download className="h-10 w-10 animate-bounce mx-auto text-blue-500" />
+            <Download className="h-10 w-10 animate-bounce mx-auto text-primary" />
             <p className="mt-3 text-sm text-muted-foreground">
               Importing {selected.size} transcript{selected.size === 1 ? '' : 's'}...
             </p>
@@ -273,9 +275,9 @@ export function ImportDialog({ open, onClose, onImported }: ImportDialogProps) {
                 {results.map((r) => (
                   <li key={r.id} className="flex items-center gap-2 p-3 text-xs">
                     {r.ok ? (
-                      <CheckCircle2 className="h-4 w-4 text-green-500 shrink-0" />
+                      <CheckCircle2 className="h-4 w-4 text-status-ok shrink-0" />
                     ) : (
-                      <AlertCircle className="h-4 w-4 text-red-500 shrink-0" />
+                      <AlertCircle className="h-4 w-4 text-destructive shrink-0" />
                     )}
                     <span className="font-mono">{r.id.substring(0, 8)}…</span>
                     {r.ok && r.hasAudio && (
@@ -286,7 +288,7 @@ export function ImportDialog({ open, onClose, onImported }: ImportDialogProps) {
                     {r.ok && !r.hasAudio && (
                       <span className="text-muted-foreground">(no audio)</span>
                     )}
-                    {!r.ok && r.error && <span className="text-red-500">{r.error}</span>}
+                    {!r.ok && r.error && <span className="text-destructive">{r.error}</span>}
                   </li>
                 ))}
               </ul>
@@ -297,7 +299,7 @@ export function ImportDialog({ open, onClose, onImported }: ImportDialogProps) {
         <DialogFooter>
           {step === 'enter-key' && (
             <>
-              <Button variant="outline" onClick={handleClose} disabled={busy}>
+              <Button variant="ghost" onClick={handleClose} disabled={busy}>
                 Cancel
               </Button>
               <Button onClick={handleSearch} disabled={busy || apiKey.length < 8}>
@@ -308,7 +310,7 @@ export function ImportDialog({ open, onClose, onImported }: ImportDialogProps) {
           )}
           {step === 'pick' && (
             <>
-              <Button variant="outline" onClick={() => setStep('enter-key')} disabled={busy}>
+              <Button variant="ghost" onClick={() => setStep('enter-key')} disabled={busy}>
                 Back
               </Button>
               <Button onClick={handleImport} disabled={busy || selected.size === 0}>

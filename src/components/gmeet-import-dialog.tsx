@@ -884,9 +884,9 @@ export function GmeetImportDialog({ open, onClose, onImported }: GmeetImportDial
       {/* sm:max-w-2xl (not max-w-2xl): DialogContent ships sm:max-w-lg and
           twMerge only replaces within the same breakpoint group — a base
           max-w-2xl loses to it and the content overflows the 512px card. */}
-      <DialogContent className="sm:max-w-2xl">
+      <DialogContent className="sm:max-w-2xl rounded-xl shadow-[0_4px_16px_-2px_rgb(0_0_0/0.08),0_1px_2px_0_rgb(0_0_0/0.04)]">
         <DialogHeader>
-          <DialogTitle>Import from Google Meet</DialogTitle>
+          <DialogTitle className="text-base font-semibold">Import from Google Meet</DialogTitle>
         </DialogHeader>
 
         {step === 'connect' && (
@@ -900,7 +900,7 @@ export function GmeetImportDialog({ open, onClose, onImported }: GmeetImportDial
               </p>
             </div>
             {error && (
-              <p className="text-sm text-red-500 flex items-center gap-1">
+              <p className="text-xs text-destructive flex items-center gap-1">
                 <AlertCircle className="h-4 w-4" />
                 {error}
               </p>
@@ -1070,7 +1070,7 @@ export function GmeetImportDialog({ open, onClose, onImported }: GmeetImportDial
               </p>
             )}
             {error && (
-              <p className="text-sm text-red-500 flex items-center gap-1">
+              <p className="text-xs text-destructive flex items-center gap-1">
                 <AlertCircle className="h-4 w-4" />
                 {error}
               </p>
@@ -1091,20 +1091,20 @@ export function GmeetImportDialog({ open, onClose, onImported }: GmeetImportDial
                 {bulkResults.map((r) => (
                   <li key={r.rowId} className="flex items-center gap-2 p-3 text-xs">
                     {r.status === 'ok' && (
-                      <CheckCircle2 className="h-4 w-4 text-green-500 shrink-0" />
+                      <CheckCircle2 className="h-4 w-4 text-status-ok shrink-0" />
                     )}
                     {r.status === 'exists' && (
                       <CheckCircle2 className="h-4 w-4 text-muted-foreground shrink-0" />
                     )}
                     {r.status === 'error' && (
-                      <AlertCircle className="h-4 w-4 text-red-500 shrink-0" />
+                      <AlertCircle className="h-4 w-4 text-destructive shrink-0" />
                     )}
                     <span className="flex-1 min-w-0 truncate">{r.title}</span>
                     {r.status === 'exists' && (
                       <span className="text-muted-foreground shrink-0">already imported</span>
                     )}
                     {r.status === 'error' && (
-                      <span className="text-red-500 truncate max-w-[40%]">{r.detail}</span>
+                      <span className="text-destructive truncate max-w-[40%]">{r.detail}</span>
                     )}
                     {r.transcriptId && (
                       <a
@@ -1312,7 +1312,7 @@ export function GmeetImportDialog({ open, onClose, onImported }: GmeetImportDial
             </div>
 
             {error && (
-              <p className="text-sm text-red-500 flex items-center gap-1">
+              <p className="text-xs text-destructive flex items-center gap-1">
                 <AlertCircle className="h-4 w-4" />
                 {error}
               </p>
@@ -1322,7 +1322,7 @@ export function GmeetImportDialog({ open, onClose, onImported }: GmeetImportDial
 
         {step === 'importing' && (
           <div className="py-8 text-center">
-            <Download className="h-10 w-10 animate-bounce mx-auto text-blue-500" />
+            <Download className="h-10 w-10 animate-bounce mx-auto text-primary" />
             <p className="mt-3 text-sm text-muted-foreground">
               {mode === 'transcript'
                 ? 'Importing the Meet transcript…'
@@ -1333,7 +1333,7 @@ export function GmeetImportDialog({ open, onClose, onImported }: GmeetImportDial
 
         {step === 'done' && doneInfo && (
           <div className="py-6 text-center space-y-2">
-            <CheckCircle2 className="h-10 w-10 mx-auto text-green-500" />
+            <CheckCircle2 className="h-10 w-10 mx-auto text-status-ok" />
             <p className="text-sm font-medium">{doneInfo.title}</p>
             <p className="text-sm text-muted-foreground">
               {doneInfo.mode === 'transcript'
@@ -1352,7 +1352,7 @@ export function GmeetImportDialog({ open, onClose, onImported }: GmeetImportDial
         <DialogFooter>
           {step === 'connect' && (
             <>
-              <Button variant="outline" onClick={handleClose} disabled={busy}>
+              <Button variant="ghost" onClick={handleClose} disabled={busy}>
                 Cancel
               </Button>
               <Button onClick={connect} disabled={busy}>
@@ -1367,7 +1367,7 @@ export function GmeetImportDialog({ open, onClose, onImported }: GmeetImportDial
           )}
           {step === 'pick' && (
             <>
-              <Button variant="outline" onClick={handleClose}>
+              <Button variant="ghost" onClick={handleClose}>
                 Cancel
               </Button>
               {selected.size > 0 && (
@@ -1385,7 +1385,7 @@ export function GmeetImportDialog({ open, onClose, onImported }: GmeetImportDial
           )}
           {step === 'options' && (
             <>
-              <Button variant="outline" onClick={() => setStep('pick')} disabled={busy}>
+              <Button variant="ghost" onClick={() => setStep('pick')} disabled={busy}>
                 Back
               </Button>
               <Button

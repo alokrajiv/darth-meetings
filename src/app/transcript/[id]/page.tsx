@@ -28,6 +28,8 @@ import { ShareDialog } from '@/components/share-dialog';
 import { AddPersonDialog } from '@/components/add-person-dialog';
 import { ActivityBar } from '@/components/activity-bar';
 import { TranscriptOutline } from '@/components/transcript-outline';
+import { AppHeader } from '@/components/app-header';
+import { RerunDiarizationButton } from '@/components/rerun-diarization-button';
 import type { PickerPerson } from '@/components/user-picker';
 import {
   Dialog,
@@ -48,13 +50,17 @@ import {
   Copy,
   ChevronDown,
   ChevronUp,
-  X,
   Search,
   Eye,
   Pencil,
   Users,
   ListTree,
   Sparkles,
+  MoreHorizontal,
+  Video,
+  FileAudio,
+  FileText,
+  Headphones,
 } from 'lucide-react';
 
 /**
@@ -76,6 +82,9 @@ function findUtteranceIndexAtMs(
 }
 
 type ViewMode = 'raw' | 'edited';
+
+const FLOATING_SHADOW =
+  'shadow-[0_4px_16px_-2px_rgb(0_0_0/0.08),0_1px_2px_0_rgb(0_0_0/0.04)]';
 
 interface TranscriptDetailPageProps {
   params: Promise<{ id: string }>;
@@ -114,27 +123,6 @@ export default function TranscriptDetailPage({ params }: TranscriptDetailPagePro
   const [transcriptEdits, setTranscriptEdits] = useState<TranscriptEditMap>({});
   const [generatingNotes, setGeneratingNotes] = useState(false);
   const [notesStale, setNotesStale] = useState(false);
-
-  // One-time callout explaining that AI notes are now manual. Dismissed state
-  // lives in localStorage; read it in an effect so SSR never touches window.
-  const [showNotesExplainer, setShowNotesExplainer] = useState(false);
-  useEffect(() => {
-    try {
-      if (!window.localStorage.getItem('mw_notes_manual_explainer')) {
-        setShowNotesExplainer(true);
-      }
-    } catch {
-      // ignore — blocked storage shouldn't break the page
-    }
-  }, []);
-  const dismissNotesExplainer = useCallback(() => {
-    setShowNotesExplainer(false);
-    try {
-      window.localStorage.setItem('mw_notes_manual_explainer', '1');
-    } catch {
-      /* ignore quota errors */
-    }
-  }, []);
 
   const [title, setTitle] = useState<string>('');
   const [description, setDescription] = useState<string>('');
@@ -180,6 +168,21 @@ export default function TranscriptDetailPage({ params }: TranscriptDetailPagePro
     }
     return map;
   }, [row?.auto_segments, content?.utterances]);
+
+  /**
+   * The AI segment the playhead is currently inside — shown as a "Now: …"
+   * line on the sticky audio bar. Null before playback starts.
+   */
+  const nowSegment = useMemo(() => {
+    const segs = row?.auto_segments;
+    if (!segs?.length || currentTime <= 0) return null;
+    let cur: { title: string; start_ms: number } | null = null;
+    for (const seg of segs) {
+      if (seg.start_ms <= currentTime * 1000) cur = seg;
+      else break;
+    }
+    return cur;
+  }, [row?.auto_segments, currentTime]);
 
   /**
    * Resolve a raw speaker key into the display name, applying speaker_mappings.
@@ -440,7 +443,7 @@ export default function TranscriptDetailPage({ params }: TranscriptDetailPagePro
       // Account for the sticky audio player so the target lands below it
       // rather than getting hidden underneath.
       const rect = el.getBoundingClientRect();
-      const top = window.scrollY + rect.top - 120;
+      const top = window.scrollY + rect.top - 132;
       window.scrollTo({ top, behavior: 'smooth' });
     },
     [content?.utterances]
@@ -476,10 +479,10 @@ export default function TranscriptDetailPage({ params }: TranscriptDetailPagePro
     let raf = 0;
     const compute = () => {
       raf = 0;
-      // 120px = approx height of the sticky audio player + breathing room.
+      // 132px = approx height of the sticky audio player + breathing room.
       // The "active" anchor is the last one whose top has scrolled past
       // that line. Iterate in DOM order and capture the last match.
-      const line = 120;
+      const line = 132;
       let bestId: string | null = null;
       for (const id of ids) {
         const el = document.getElementById(id);
@@ -524,7 +527,7 @@ export default function TranscriptDetailPage({ params }: TranscriptDetailPagePro
     let raf = 0;
     const compute = () => {
       raf = 0;
-      const line = 140;
+      const line = 150;
       const els = document.querySelectorAll<HTMLElement>('[data-utterance-index]');
       let bestStart = -1;
       for (const el of els) {
@@ -597,10 +600,12 @@ export default function TranscriptDetailPage({ params }: TranscriptDetailPagePro
     [collapsedKey]
   );
 
-  // Mobile-only: floating outline drawer + secondary-action overflow.
+  // Mobile-only: floating outline drawer. Download popover state is shared
+  // between the rail and the mobile drawer (only one is interactive at a
+  // time — the ref re-attaches to whichever instance rendered last).
   const [outlineOpenMobile, setOutlineOpenMobile] = useState(false);
   const [downloadMenuOpen, setDownloadMenuOpen] = useState(false);
-  const downloadMenuRef = useRef<HTMLDivElement>(null);
+  const downloadMenuRef = useRef<HTMLDivElement | null>(null);
   useEffect(() => {
     if (!downloadMenuOpen) return;
     function onDown(e: MouseEvent) {
@@ -612,6 +617,22 @@ export default function TranscriptDetailPage({ params }: TranscriptDetailPagePro
     document.addEventListener('mousedown', onDown);
     return () => document.removeEventListener('mousedown', onDown);
   }, [downloadMenuOpen]);
+
+  // Toolbar ⋯ overflow popover (Refresh / downloads / copy-ID).
+  const [overflowMenuOpen, setOverflowMenuOpen] = useState(false);
+  const overflowMenuRef = useRef<HTMLDivElement | null>(null);
+  useEffect(() => {
+    if (!overflowMenuOpen) return;
+    function onDown(e: MouseEvent) {
+      if (!overflowMenuRef.current) return;
+      if (!overflowMenuRef.current.contains(e.target as Node)) {
+        setOverflowMenuOpen(false);
+      }
+    }
+    document.addEventListener('mousedown', onDown);
+    return () => document.removeEventListener('mousedown', onDown);
+  }, [overflowMenuOpen]);
+  const [idCopied, setIdCopied] = useState(false);
 
   const handleSaveText = useCallback(
     async (index: number, newText: string) => {
@@ -1067,6 +1088,25 @@ export default function TranscriptDetailPage({ params }: TranscriptDetailPagePro
     }
   };
 
+  /** Header meta date: "Jul 30, 2026 · 9:41 AM". */
+  const formatHeaderDate = (value: string | null): string => {
+    if (!value) return 'Unknown date';
+    try {
+      const date = new Date(value);
+      if (isNaN(date.getTime())) return 'Unknown date';
+      return `${date.toLocaleDateString('en-US', {
+        month: 'short',
+        day: 'numeric',
+        year: 'numeric',
+      })} · ${date.toLocaleTimeString('en-US', {
+        hour: 'numeric',
+        minute: '2-digit',
+      })}`;
+    } catch {
+      return 'Unknown date';
+    }
+  };
+
   /**
    * Generate markdown from the transcript. `mode` controls whether we use raw
    * AAI content as-is or the composed edited view (text edits + speaker
@@ -1170,788 +1210,962 @@ export default function TranscriptDetailPage({ params }: TranscriptDetailPagePro
     }
   };
 
-  const getStatusBadge = (status: string) => {
-    switch (status) {
-      case 'completed':
-        return <Badge variant="default" className="bg-green-100 text-green-800">Completed</Badge>;
-      case 'processing':
-        return <Badge variant="secondary">Processing</Badge>;
-      case 'queued':
-        return <Badge variant="outline">Queued</Badge>;
-      case 'error':
-        return <Badge variant="destructive">Error</Badge>;
-      default:
-        return <Badge variant="outline">{status}</Badge>;
-    }
-  };
-
   // --- early returns ---
 
   if (loading) {
     return (
-      <div className="container mx-auto px-4 py-8">
-        <Card>
-          <CardHeader>
-            <CardTitle>Loading Transcript...</CardTitle>
-          </CardHeader>
-          <CardContent>
-            <div className="flex items-center justify-center py-8">
-              <RefreshCw className="h-8 w-8 animate-spin text-muted-foreground" />
-            </div>
-          </CardContent>
-        </Card>
+      <div>
+        <AppHeader />
+        <div className="mx-auto max-w-[1200px] px-6 py-6">
+          <Card>
+            <CardHeader>
+              <CardTitle>Loading Transcript...</CardTitle>
+            </CardHeader>
+            <CardContent>
+              <div className="flex items-center justify-center py-8">
+                <RefreshCw className="h-8 w-8 animate-spin text-muted-foreground" />
+              </div>
+            </CardContent>
+          </Card>
+        </div>
       </div>
     );
   }
 
   if (error) {
     return (
-      <div className="container mx-auto px-4 py-8">
-        <Card>
-          <CardHeader>
-            <CardTitle>Error Loading Transcript</CardTitle>
-          </CardHeader>
-          <CardContent>
-            <p className="text-red-500 mb-4">{error}</p>
-            <div className="flex gap-2">
-              <Button onClick={loadAll} variant="outline">
-                <RefreshCw className="h-4 w-4 mr-2" />
-                Retry
-              </Button>
-              <Button onClick={() => router.push('/')} variant="outline">
-                <ArrowLeft className="h-4 w-4 mr-2" />
-                Back to List
-              </Button>
-            </div>
-          </CardContent>
-        </Card>
+      <div>
+        <AppHeader />
+        <div className="mx-auto max-w-[1200px] px-6 py-6">
+          <Card>
+            <CardHeader>
+              <CardTitle>Error Loading Transcript</CardTitle>
+            </CardHeader>
+            <CardContent>
+              <p className="text-destructive mb-4">{error}</p>
+              <div className="flex gap-2">
+                <Button onClick={loadAll} variant="outline">
+                  <RefreshCw className="h-4 w-4 mr-2" />
+                  Retry
+                </Button>
+                <Button onClick={() => router.push('/')} variant="outline">
+                  <ArrowLeft className="h-4 w-4 mr-2" />
+                  Back to List
+                </Button>
+              </div>
+            </CardContent>
+          </Card>
+        </div>
       </div>
     );
   }
 
   if (!row) {
     return (
-      <div className="container mx-auto px-4 py-8">
-        <Card>
-          <CardHeader>
-            <CardTitle>Transcript Not Found</CardTitle>
-          </CardHeader>
-          <CardContent>
-            <p className="text-muted-foreground mb-4">
-              The transcript you&apos;re looking for doesn&apos;t exist or couldn&apos;t be loaded.
-            </p>
-            <Button onClick={() => router.push('/')} variant="outline">
-              <ArrowLeft className="h-4 w-4 mr-2" />
-              Back to List
-            </Button>
-          </CardContent>
-        </Card>
+      <div>
+        <AppHeader />
+        <div className="mx-auto max-w-[1200px] px-6 py-6">
+          <Card>
+            <CardHeader>
+              <CardTitle>Transcript Not Found</CardTitle>
+            </CardHeader>
+            <CardContent>
+              <p className="text-muted-foreground mb-4">
+                The transcript you&apos;re looking for doesn&apos;t exist or couldn&apos;t be loaded.
+              </p>
+              <Button onClick={() => router.push('/')} variant="outline">
+                <ArrowLeft className="h-4 w-4 mr-2" />
+                Back to List
+              </Button>
+            </CardContent>
+          </Card>
+        </div>
       </div>
     );
   }
 
-  return (
-    <div className="container mx-auto px-4 py-8">
-      {/* Header: back + compact toolbar */}
-      <div className="flex items-start justify-between gap-3 mb-4">
-        <Button variant="outline" size="sm" onClick={() => router.push('/')}>
-          <ArrowLeft className="h-4 w-4 mr-1.5" />
-          Back to Transcripts
-        </Button>
-        <div className="flex items-center gap-1.5 flex-wrap justify-end">
-          {access !== 'owner' && (
-            <Badge variant="outline" className="text-[10px]">
-              <span className="md:hidden">Shared</span>
-              <span className="hidden md:inline">
-                Shared — {access === 'edit' ? 'Editor' : 'Read-only'}
-              </span>
-            </Badge>
-          )}
-          {/* Raw / Edited toggle */}
-          <div className="inline-flex rounded-md border bg-background p-0.5">
-            <button
-              type="button"
-              onClick={() => setViewMode('raw')}
-              className={`flex items-center gap-1 rounded px-2 py-1 text-xs ${
-                viewMode === 'raw' ? 'bg-muted font-medium' : 'text-muted-foreground'
-              }`}
-              title="Show original AAI output"
-            >
-              <Eye className="h-3 w-3" />
-              <span className="hidden sm:inline">Raw</span>
-            </button>
-            <button
-              type="button"
-              onClick={() => setViewMode('edited')}
-              className={`flex items-center gap-1 rounded px-2 py-1 text-xs ${
-                viewMode === 'edited' ? 'bg-muted font-medium' : 'text-muted-foreground'
-              }`}
-              title="Show edited view"
-            >
-              <Pencil className="h-3 w-3" />
-              <span className="hidden sm:inline">Edited</span>
-            </button>
-          </div>
+  const headerTitle = title.trim() || row.original_filename || 'Untitled transcript';
+  const notesGenerating = generatingNotes || row.auto_notes_status === 'running';
+
+  /**
+   * Quick-actions stack. Rendered in the desktop rail AND inside the mobile
+   * outline drawer — always via this function so each spot gets fresh
+   * elements (the download popover's outside-click ref re-attaches to the
+   * instance rendered last).
+   */
+  const renderQuickActions = (inDialog = false) => (
+    <div className="rounded-lg border bg-card p-3">
+      <div className="text-[11px] font-semibold uppercase tracking-wider text-muted-foreground">
+        Quick actions
+      </div>
+      <div className="mt-2 space-y-0.5">
+        {canEdit && (
           <Button
-            variant="outline"
+            variant="ghost"
             size="sm"
-            onClick={() => setShareOpen(true)}
-            title="Share access with other people"
+            className="h-8 w-full justify-start gap-2 text-[13px]"
+            disabled={notesGenerating || row.status !== 'completed'}
+            onClick={handleGenerateNotes}
           >
-            <Users className="h-4 w-4 md:mr-1" />
-            <span className="hidden md:inline">Access</span>
-          </Button>
-          <Button
-            variant="outline"
-            size="sm"
-            onClick={() => setFindReplaceOpen((v) => !v)}
-            disabled={!content || !canEdit}
-            title={canEdit ? 'Find and replace (⌘F)' : 'Read-only access'}
-          >
-            <Search className="h-4 w-4 md:mr-1" />
-            <span className="hidden md:inline">Find &amp; replace</span>
-          </Button>
-          <Button
-            variant="outline"
-            size="sm"
-            onClick={copyMarkdown}
-            disabled={!content}
-            title="Copy edited markdown to clipboard"
-          >
-            <Copy className="h-4 w-4 md:mr-1" />
-            <span className="hidden md:inline">
-              {copyStatus === 'copied' ? 'Copied!' : 'Copy markdown'}
-            </span>
-          </Button>
-          {/* Download → dropdown (Edited / Raw) so the toolbar stays compact. */}
-          <div className="relative" ref={downloadMenuRef}>
-            <Button
-              variant="outline"
-              size="sm"
-              onClick={() => setDownloadMenuOpen((v) => !v)}
-              disabled={!content}
-              title="Download as markdown"
-            >
-              <Download className="h-4 w-4 md:mr-1" />
-              <span className="hidden md:inline">Download</span>
-              <ChevronDown className="hidden md:inline h-3 w-3 ml-0.5" />
-            </Button>
-            {downloadMenuOpen && (
-              <div className="absolute right-0 top-full mt-1 z-50 min-w-[140px] rounded-md border bg-popover p-1 shadow-md">
-                <button
-                  type="button"
-                  onClick={() => {
-                    downloadMarkdown('edited');
-                    setDownloadMenuOpen(false);
-                  }}
-                  className="block w-full rounded px-3 py-1.5 text-left text-sm hover:bg-muted"
-                >
-                  Edited markdown
-                </button>
-                <button
-                  type="button"
-                  onClick={() => {
-                    downloadMarkdown('raw');
-                    setDownloadMenuOpen(false);
-                  }}
-                  className="block w-full rounded px-3 py-1.5 text-left text-sm hover:bg-muted"
-                >
-                  Raw markdown
-                </button>
-              </div>
+            {notesGenerating ? (
+              <RefreshCw className="h-4 w-4 animate-spin text-muted-foreground" />
+            ) : (
+              <Sparkles className="h-4 w-4 text-primary" />
             )}
-          </div>
-          <Button onClick={loadAll} variant="outline" size="sm" title="Refresh">
-            <RefreshCw className="h-4 w-4 md:mr-1" />
-            <span className="hidden md:inline">Refresh</span>
+            {row.auto_notes ? 'Regenerate summary' : 'Generate summary'}
           </Button>
-        </div>
-      </div>
-
-      {/* Title (inline editable) */}
-      <div className="mb-2">
-        {editingTitle && canEdit ? (
-          <Input
-            autoFocus
-            value={title}
-            placeholder={row.original_filename || 'Untitled transcript'}
-            disabled={savingMeta}
-            onChange={(e) => setTitle(e.target.value)}
-            onBlur={commitTitle}
-            onKeyDown={(e) => {
-              if (e.key === 'Enter') {
-                e.preventDefault();
-                (e.target as HTMLInputElement).blur();
-              } else if (e.key === 'Escape') {
-                e.preventDefault();
-                cancelTitle();
-              }
-            }}
-            className="!text-3xl !font-bold !h-auto !py-1 !px-1 -mx-1 border-dashed"
-          />
-        ) : (
-          <h1
-            onClick={() => canEdit && setEditingTitle(true)}
-            title={canEdit ? 'Click to edit title' : ''}
-            className={`text-3xl font-bold leading-tight rounded -mx-1 px-1 py-0.5 ${
-              canEdit ? 'cursor-text hover:bg-muted/40' : ''
-            } ${title.trim() ? '' : 'text-muted-foreground italic'}`}
+        )}
+        {canEdit && (content?.utterances?.length ?? 0) > 0 && (
+          <Button
+            variant="ghost"
+            size="sm"
+            className="h-8 w-full justify-start gap-2 text-[13px]"
+            disabled={guessingSpeakers}
+            onClick={handleGuessSpeakers}
+            title="Match each voice against known people (local voiceprints — no AI call)"
           >
-            {title.trim() || row.original_filename || 'Untitled transcript'}
-          </h1>
+            {guessingSpeakers ? (
+              <RefreshCw className="h-4 w-4 animate-spin text-muted-foreground" />
+            ) : (
+              <Users className="h-4 w-4 text-muted-foreground" />
+            )}
+            {guessingSpeakers ? 'Listening…' : 'Guess speaker names'}
+          </Button>
         )}
-      </div>
-
-      {/* Slim stats row */}
-      <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-muted-foreground mb-3">
-        {getStatusBadge(row.status)}
-        <span className="text-muted-foreground/50">•</span>
-        <span>Created {safeFormatDate(row.created_at)}</span>
-        {row.duration && (
-          <>
-            <span className="text-muted-foreground/50">•</span>
-            <span>{formatDuration(row.duration)}</span>
-          </>
-        )}
-        {row.speaker_count != null && (
-          <>
-            <span className="text-muted-foreground/50">•</span>
-            <span>{row.speaker_count} speaker{row.speaker_count === 1 ? '' : 's'}</span>
-          </>
-        )}
-        <span className="text-muted-foreground/50">•</span>
-        <span className="font-mono text-[10px]" title={row.assemblyai_id}>
-          {row.assemblyai_id.slice(0, 8)}…
-        </span>
-      </div>
-
-      {/* Activity bar */}
-      <div className="mb-6">
-        <ActivityBar transcriptId={transcriptId} refreshSignal={activityTick} />
-      </div>
-
-      <div className="lg:grid lg:grid-cols-[minmax(0,1fr)_220px] lg:gap-6">
-      <div className="grid gap-6 min-w-0">
-        {/* Audio player — sticky so it stays visible while scrolling the transcript */}
-        {row.status === 'completed' && audioAvailable && (
-          <div className="sticky top-2 z-10 rounded-lg border bg-background/95 p-3 shadow-sm backdrop-blur">
-            <AudioPlayer
-              ref={playerRef}
-              src={`/api/transcripts/${row.assemblyai_id}/audio`}
-              onTimeUpdate={setCurrentTime}
-              onError={() => setAudioAvailable(false)}
-            />
-          </div>
-        )}
-
-        {/* First-time explainer: notes generation is manual now. */}
-        {showNotesExplainer && canEdit && row.status === 'completed' && (
-          <div className="flex items-start justify-between gap-2 rounded-md border border-violet-300 bg-violet-50 px-3 py-2 text-xs text-violet-800 dark:border-violet-700 dark:bg-violet-950 dark:text-violet-200">
-            <span>
-              AI notes don&apos;t run automatically any more — attach context (decks,
-              agendas) below if you want, then hit Generate.
-            </span>
-            <button
-              type="button"
-              onClick={dismissNotesExplainer}
-              aria-label="Dismiss"
-              className="shrink-0 rounded p-0.5 hover:bg-violet-100 dark:hover:bg-violet-900"
-            >
-              <X className="h-3.5 w-3.5" />
-            </button>
-          </div>
-        )}
-
-        {/* Attached context — files & pasted text injected into AI notes. */}
-        <AttachmentPanel
-          transcriptId={row.assemblyai_id}
-          canEdit={canEdit}
-          onChanged={bumpActivity}
+        <RerunDiarizationButton
+          assemblyaiId={row.assemblyai_id}
+          gmeetContext={row.gmeet_context}
+          size="sm"
+          variant="ghost"
+          className="h-8 w-full justify-start gap-2 text-[13px]"
         />
-
-        {/* AI Summary — meeting notes generated by headless Claude on the server. */}
-        {row.status === 'completed' &&
-          (row.auto_notes || row.auto_notes_status || canEdit) && (
-          <Card id="ai-summary" className="scroll-mt-24">
-            <CardHeader className="pb-2">
+        <Button
+          variant="ghost"
+          size="sm"
+          className="h-8 w-full justify-start gap-2 text-[13px]"
+          disabled={!content}
+          onClick={copyMarkdown}
+          title="Copy edited markdown to clipboard"
+        >
+          <Copy className="h-4 w-4 text-muted-foreground" />
+          {copyStatus === 'copied' ? 'Copied' : 'Copy markdown'}
+        </Button>
+        <div
+          className="relative"
+          ref={(el) => {
+            downloadMenuRef.current = el;
+          }}
+        >
+          <Button
+            variant="ghost"
+            size="sm"
+            className="h-8 w-full justify-start gap-2 text-[13px]"
+            disabled={!content}
+            onClick={() => setDownloadMenuOpen((v) => !v)}
+            title="Download as markdown"
+          >
+            <Download className="h-4 w-4 text-muted-foreground" />
+            Download
+            <ChevronDown className="ml-auto h-3 w-3 text-muted-foreground" />
+          </Button>
+          {downloadMenuOpen && (
+            <div
+              className={`absolute z-50 min-w-[150px] rounded-md border bg-popover p-1 shadow-md ${
+                inDialog ? 'right-0 top-full mt-1' : 'right-full top-0 mr-1'
+              }`}
+            >
               <button
                 type="button"
-                onClick={() => toggleSection('aiSummary')}
-                className="flex w-full items-center justify-between text-left"
-                aria-expanded={!collapsedSections.aiSummary}
+                onClick={() => {
+                  downloadMarkdown('edited');
+                  setDownloadMenuOpen(false);
+                }}
+                className="block w-full rounded px-3 py-1.5 text-left text-sm hover:bg-muted"
               >
-                <CardTitle className="flex items-center gap-1.5 text-sm font-semibold text-muted-foreground">
-                  <Sparkles className="h-3.5 w-3.5 text-violet-500" />
-                  AI Summary
-                </CardTitle>
-                {collapsedSections.aiSummary ? (
-                  <ChevronDown className="h-4 w-4 text-muted-foreground" />
-                ) : (
-                  <ChevronUp className="h-4 w-4 text-muted-foreground" />
-                )}
+                Edited markdown
               </button>
-            </CardHeader>
-            {!collapsedSections.aiSummary && (
-              <CardContent>
-                {notesStale && row.auto_notes_status !== 'running' && canEdit && (
-                  <div className="mb-3 flex items-center justify-between gap-2 rounded-md border border-amber-300 bg-amber-50 px-3 py-2 text-xs text-amber-800 dark:border-amber-700 dark:bg-amber-950 dark:text-amber-200">
-                    <span>Speaker names changed — the summary still uses the old ones.</span>
-                    <Button
-                      variant="outline"
-                      size="sm"
-                      className="h-6 shrink-0 text-[11px]"
-                      disabled={generatingNotes}
-                      onClick={handleGenerateNotes}
-                    >
-                      <RefreshCw className="mr-1 h-3 w-3" />
-                      Rerun summary
-                    </Button>
-                  </div>
+              <button
+                type="button"
+                onClick={() => {
+                  downloadMarkdown('raw');
+                  setDownloadMenuOpen(false);
+                }}
+                className="block w-full rounded px-3 py-1.5 text-left text-sm hover:bg-muted"
+              >
+                Raw markdown
+              </button>
+            </div>
+          )}
+        </div>
+        {canEdit && (
+          <Button
+            variant="ghost"
+            size="sm"
+            className="h-8 w-full justify-start gap-2 text-[13px]"
+            disabled={!content}
+            onClick={() => setFindReplaceOpen((v) => !v)}
+            title="Find and replace (⌘F)"
+          >
+            <Search className="h-4 w-4 text-muted-foreground" />
+            Find &amp; replace
+            <kbd className="ml-auto rounded border bg-muted px-1 py-0.5 font-mono text-[10px] font-normal text-muted-foreground">
+              ⌘F
+            </kbd>
+          </Button>
+        )}
+        <Button
+          variant="ghost"
+          size="sm"
+          className="h-8 w-full justify-start gap-2 text-[13px]"
+          onClick={() => setShareOpen(true)}
+          title="Share access with other people"
+        >
+          <Users className="h-4 w-4 text-muted-foreground" />
+          Share
+        </Button>
+      </div>
+    </div>
+  );
+
+  return (
+    <div>
+      <AppHeader breadcrumb={{ title: headerTitle }}>
+        {access !== 'owner' && (
+          <Badge variant="outline" className="text-[10px]">
+            <span className="md:hidden">Shared</span>
+            <span className="hidden md:inline">
+              Shared — {access === 'edit' ? 'Editor' : 'Read-only'}
+            </span>
+          </Badge>
+        )}
+        {/* Raw / Edited toggle */}
+        <div className="inline-flex rounded-md bg-muted p-0.5">
+          <button
+            type="button"
+            onClick={() => setViewMode('raw')}
+            className={`flex items-center gap-1 rounded px-2 py-1 text-xs transition-colors ${
+              viewMode === 'raw'
+                ? 'bg-card font-medium shadow-[0_1px_2px_0_rgb(0_0_0/0.06)]'
+                : 'text-muted-foreground hover:text-foreground'
+            }`}
+            title="Show original AAI output"
+          >
+            <Eye className="h-3 w-3" />
+            <span className="hidden sm:inline">Raw</span>
+          </button>
+          <button
+            type="button"
+            onClick={() => setViewMode('edited')}
+            className={`flex items-center gap-1 rounded px-2 py-1 text-xs transition-colors ${
+              viewMode === 'edited'
+                ? 'bg-card font-medium shadow-[0_1px_2px_0_rgb(0_0_0/0.06)]'
+                : 'text-muted-foreground hover:text-foreground'
+            }`}
+            title="Show edited view"
+          >
+            <Pencil className="h-3 w-3" />
+            <span className="hidden sm:inline">Edited</span>
+          </button>
+        </div>
+        <Button
+          size="sm"
+          onClick={() => setShareOpen(true)}
+          title="Share access with other people"
+        >
+          <Users className="h-4 w-4" />
+          <span className="hidden md:inline">Share</span>
+        </Button>
+        {/* ⋯ overflow: refresh, downloads, transcript ID */}
+        <div className="relative" ref={overflowMenuRef}>
+          <Button
+            variant="ghost"
+            size="icon"
+            className="h-8 w-8"
+            onClick={() => setOverflowMenuOpen((v) => !v)}
+            title="More actions"
+            aria-label="More actions"
+          >
+            <MoreHorizontal className="h-4 w-4" />
+          </Button>
+          {overflowMenuOpen && (
+            <div
+              className={`absolute right-0 top-full z-50 mt-1 min-w-[220px] rounded-md border bg-popover p-1 ${FLOATING_SHADOW}`}
+            >
+              <button
+                type="button"
+                onClick={() => {
+                  loadAll();
+                  setOverflowMenuOpen(false);
+                }}
+                className="flex w-full items-center gap-2 rounded px-3 py-1.5 text-left text-sm hover:bg-muted"
+              >
+                <RefreshCw className="h-3.5 w-3.5 text-muted-foreground" />
+                Refresh
+              </button>
+              <button
+                type="button"
+                disabled={!content}
+                onClick={() => {
+                  downloadMarkdown('edited');
+                  setOverflowMenuOpen(false);
+                }}
+                className="flex w-full items-center gap-2 rounded px-3 py-1.5 text-left text-sm hover:bg-muted disabled:opacity-50"
+              >
+                <Download className="h-3.5 w-3.5 text-muted-foreground" />
+                Download edited markdown
+              </button>
+              <button
+                type="button"
+                disabled={!content}
+                onClick={() => {
+                  downloadMarkdown('raw');
+                  setOverflowMenuOpen(false);
+                }}
+                className="flex w-full items-center gap-2 rounded px-3 py-1.5 text-left text-sm hover:bg-muted disabled:opacity-50"
+              >
+                <Download className="h-3.5 w-3.5 text-muted-foreground" />
+                Download raw markdown
+              </button>
+              <div className="my-1 h-px bg-border" />
+              <button
+                type="button"
+                onClick={() => {
+                  try {
+                    void navigator.clipboard?.writeText(row.assemblyai_id);
+                  } catch {
+                    /* ignore */
+                  }
+                  setIdCopied(true);
+                  setTimeout(() => setIdCopied(false), 1500);
+                }}
+                className="flex w-full items-center gap-2 rounded px-3 py-1.5 text-left font-mono text-xs text-muted-foreground hover:bg-muted"
+                title={`Click to copy ${row.assemblyai_id}`}
+              >
+                ID: {row.assemblyai_id.slice(0, 12)}…
+                {idCopied && <span className="ml-auto font-sans">Copied</span>}
+              </button>
+            </div>
+          )}
+        </div>
+      </AppHeader>
+
+      <div className="mx-auto max-w-[1200px] px-6 py-6">
+        {/* Page header: title (inline editable) + meta row */}
+        <div className="mb-6">
+          {editingTitle && canEdit ? (
+            <Input
+              autoFocus
+              value={title}
+              placeholder={row.original_filename || 'Untitled transcript'}
+              disabled={savingMeta}
+              onChange={(e) => setTitle(e.target.value)}
+              onBlur={commitTitle}
+              onKeyDown={(e) => {
+                if (e.key === 'Enter') {
+                  e.preventDefault();
+                  (e.target as HTMLInputElement).blur();
+                } else if (e.key === 'Escape') {
+                  e.preventDefault();
+                  cancelTitle();
+                }
+              }}
+              className="!text-2xl !font-semibold !tracking-tight !h-auto !py-1 !px-1 -mx-1 border-dashed"
+            />
+          ) : (
+            <h1
+              onClick={() => canEdit && setEditingTitle(true)}
+              title={canEdit ? 'Click to edit title' : ''}
+              className={`text-2xl font-semibold tracking-tight leading-tight rounded -mx-1 px-1 py-0.5 ${
+                canEdit ? 'cursor-text hover:bg-muted/40' : ''
+              } ${title.trim() ? '' : 'text-muted-foreground italic'}`}
+            >
+              {title.trim() || row.original_filename || 'Untitled transcript'}
+            </h1>
+          )}
+
+          <div className="mt-1.5 flex flex-wrap items-center gap-x-2 gap-y-1 text-xs text-muted-foreground">
+            {row.status !== 'completed' &&
+              (row.status === 'error' ? (
+                <Badge variant="destructive">Failed</Badge>
+              ) : (
+                <Badge variant="secondary" className="gap-1">
+                  <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-status-busy" />
+                  Processing
+                </Badge>
+              ))}
+            <span className="inline-flex items-center gap-1 rounded-md bg-muted px-1.5 py-0.5 text-[11px]">
+              {row.assemblyai_id.startsWith('gmeet-') ? (
+                <>
+                  <Video className="h-3 w-3" />
+                  Google Meet
+                </>
+              ) : row.source === 'uploaded' ? (
+                <>
+                  <FileAudio className="h-3 w-3" />
+                  Upload
+                </>
+              ) : (
+                <>
+                  <FileText className="h-3 w-3" />
+                  Import
+                </>
+              )}
+            </span>
+            <span title={safeFormatDate(row.created_at)}>
+              {formatHeaderDate(row.created_at)}
+            </span>
+            {row.duration != null && (
+              <span className="font-mono text-[11px] tabular-nums">
+                {formatDuration(row.duration)}
+              </span>
+            )}
+            {row.speaker_count != null && (
+              <span>
+                {row.speaker_count} speaker{row.speaker_count === 1 ? '' : 's'}
+              </span>
+            )}
+            {row.language_code && <span className="uppercase">{row.language_code}</span>}
+            <div className="ml-auto">
+              <ActivityBar transcriptId={transcriptId} refreshSignal={activityTick} />
+            </div>
+          </div>
+        </div>
+
+        <div className="lg:grid lg:grid-cols-[minmax(0,1fr)_300px] lg:gap-8">
+          <div className="min-w-0 space-y-5">
+            {/* Audio player — sticky so it stays visible while scrolling the transcript */}
+            {row.status === 'completed' && audioAvailable && (
+              <div
+                className={`sticky top-[60px] z-30 -mx-1 rounded-lg border bg-card/95 px-3 py-2 backdrop-blur ${FLOATING_SHADOW}`}
+              >
+                <div className="mb-1 flex items-center justify-between text-[11px] text-muted-foreground">
+                  <span className="min-w-0 truncate">
+                    {nowSegment ? `Now: ${nowSegment.title}` : ''}
+                  </span>
+                </div>
+                <AudioPlayer
+                  ref={playerRef}
+                  className="h-10 w-full"
+                  src={`/api/transcripts/${row.assemblyai_id}/audio`}
+                  onTimeUpdate={setCurrentTime}
+                  onError={() => setAudioAvailable(false)}
+                />
+              </div>
+            )}
+
+            {/* Summary — meeting notes generated by headless Claude on the server. */}
+            {row.status === 'completed' &&
+              (row.auto_notes || row.auto_notes_status || canEdit) && (
+              <Card id="ai-summary" className="scroll-mt-36">
+                <CardHeader className="px-4 pt-3 pb-2">
+                  <button
+                    type="button"
+                    onClick={() => toggleSection('aiSummary')}
+                    className="flex w-full items-center gap-2 text-left"
+                    aria-expanded={!collapsedSections.aiSummary}
+                  >
+                    <Sparkles className="h-4 w-4 shrink-0 text-primary" />
+                    <span className="text-[13px] font-semibold">Summary</span>
+                    {collapsedSections.aiSummary ? (
+                      <ChevronDown className="ml-auto h-4 w-4 shrink-0 text-muted-foreground" />
+                    ) : (
+                      <ChevronUp className="ml-auto h-4 w-4 shrink-0 text-muted-foreground" />
+                    )}
+                  </button>
+                </CardHeader>
+                {!collapsedSections.aiSummary && (
+                  <CardContent className="px-4 pb-4">
+                    {notesStale && row.auto_notes_status !== 'running' && canEdit && (
+                      <div className="mb-3 flex items-center justify-between gap-2 rounded-md border bg-muted/60 px-3 py-2 text-xs">
+                        <span className="text-muted-foreground">
+                          Speaker names changed — the summary still uses the old ones.
+                        </span>
+                        <Button
+                          variant="ghost"
+                          size="sm"
+                          className="h-6 shrink-0 text-[11px] text-primary hover:text-primary"
+                          disabled={generatingNotes}
+                          onClick={handleGenerateNotes}
+                        >
+                          <RefreshCw className="h-3 w-3" />
+                          Rerun
+                        </Button>
+                      </div>
+                    )}
+                    {row.auto_notes_status === 'running' ? (
+                      <div className="space-y-2 py-2">
+                        {['90%', '100%', '80%', '95%', '60%'].map((w, i) => (
+                          <div
+                            key={i}
+                            className="h-3 animate-pulse rounded bg-muted"
+                            style={{ width: w }}
+                          />
+                        ))}
+                        <p className="pt-1 text-xs text-muted-foreground">
+                          Generating with Claude — usually 1–2 minutes.
+                        </p>
+                      </div>
+                    ) : row.auto_notes ? (
+                      <>
+                        <div className="markdown-body max-w-[75ch] text-sm">
+                          <ReactMarkdown
+                            remarkPlugins={[remarkGfm]}
+                            components={{
+                              h1: ({ children }) => <h2 className="text-[15px] font-semibold mt-4 mb-1.5">{children}</h2>,
+                              h2: ({ children }) => <h2 className="text-[15px] font-semibold mt-4 mb-1.5">{children}</h2>,
+                              h3: ({ children }) => <h3 className="text-sm font-semibold mt-3 mb-1">{children}</h3>,
+                              p: ({ children }) => <p className="leading-6 my-2">{children}</p>,
+                              ul: ({ children }) => <ul className="list-disc pl-5 my-2 space-y-1">{children}</ul>,
+                              ol: ({ children }) => <ol className="list-decimal pl-5 my-2 space-y-1">{children}</ol>,
+                              li: ({ children }) => <li className="leading-6">{children}</li>,
+                              strong: ({ children }) => <strong className="font-semibold">{children}</strong>,
+                            }}
+                          >
+                            {row.auto_notes}
+                          </ReactMarkdown>
+                        </div>
+                        <div className="mt-4 flex items-center gap-2 border-t pt-2.5">
+                          <Button
+                            variant="ghost"
+                            size="sm"
+                            className="h-7 text-xs"
+                            onClick={() => navigator.clipboard.writeText(row.auto_notes ?? '')}
+                          >
+                            <Copy className="h-3 w-3" />
+                            Copy
+                          </Button>
+                          {canEdit && (
+                            <Button
+                              variant="ghost"
+                              size="sm"
+                              className="h-7 text-xs"
+                              disabled={generatingNotes}
+                              onClick={handleGenerateNotes}
+                            >
+                              <RefreshCw className="h-3 w-3" />
+                              Regenerate
+                            </Button>
+                          )}
+                          {row.auto_notes_at && (
+                            <span className="ml-auto text-[11px] text-muted-foreground">
+                              generated {formatDistanceToNow(new Date(row.auto_notes_at), { addSuffix: true })}
+                            </span>
+                          )}
+                        </div>
+                      </>
+                    ) : row.auto_notes_status === 'error' ? (
+                      <div className="space-y-2 text-sm">
+                        <p className="text-destructive">
+                          Notes generation failed: {row.auto_notes_error || 'unknown error'}
+                        </p>
+                        {canEdit && (
+                          <Button
+                            variant="outline"
+                            size="sm"
+                            disabled={generatingNotes}
+                            onClick={handleGenerateNotes}
+                          >
+                            <RefreshCw className="h-3 w-3" />
+                            Retry
+                          </Button>
+                        )}
+                      </div>
+                    ) : canEdit ? (
+                      <div className="flex flex-col items-center py-6 text-center">
+                        <p className="text-sm text-muted-foreground">No summary yet.</p>
+                        <Button
+                          size="sm"
+                          className="mt-3"
+                          disabled={generatingNotes}
+                          onClick={handleGenerateNotes}
+                        >
+                          <Sparkles className="h-4 w-4" />
+                          Generate with Claude
+                        </Button>
+                        <p className="mt-2 text-xs text-muted-foreground">
+                          Tip: attach an agenda or deck in the right panel first — it
+                          sharpens the output.
+                        </p>
+                      </div>
+                    ) : null}
+                  </CardContent>
                 )}
-                {row.auto_notes_status === 'running' ? (
-                  <div className="flex items-center gap-2 py-2 text-sm text-muted-foreground">
-                    <RefreshCw className="h-4 w-4 animate-spin" />
-                    Generating notes with Claude… this can take a few minutes.
-                  </div>
-                ) : row.auto_notes ? (
-                  <>
-                    <div className="markdown-body text-sm">
+              </Card>
+            )}
+
+            {/* Description — click-to-edit, markdown rendered. */}
+            {(description || canEdit) && (
+              <Card id="notes" className="scroll-mt-36">
+                <CardHeader className="px-4 pt-3 pb-2">
+                  <button
+                    type="button"
+                    onClick={() => toggleSection('notes')}
+                    className="flex w-full items-center gap-2 text-left"
+                    aria-expanded={!collapsedSections.notes}
+                  >
+                    <FileText className="h-4 w-4 shrink-0 text-muted-foreground" />
+                    <span className="text-[13px] font-semibold">Notes</span>
+                    {collapsedSections.notes ? (
+                      <ChevronDown className="ml-auto h-4 w-4 shrink-0 text-muted-foreground" />
+                    ) : (
+                      <ChevronUp className="ml-auto h-4 w-4 shrink-0 text-muted-foreground" />
+                    )}
+                  </button>
+                </CardHeader>
+                {!collapsedSections.notes && (
+                <CardContent className="px-4 pb-4">
+                  {editingDescription && canEdit ? (
+                    <Textarea
+                      autoFocus
+                      value={description}
+                      placeholder="Notes, attendees, action items… markdown supported."
+                      disabled={savingMeta}
+                      rows={Math.min(Math.max(description.split('\n').length + 1, 4), 20)}
+                      onChange={(e) => setDescription(e.target.value)}
+                      onBlur={commitDescription}
+                      onKeyDown={(e) => {
+                        if (e.key === 'Escape') {
+                          e.preventDefault();
+                          cancelDescription();
+                        }
+                      }}
+                      className="font-mono text-sm"
+                    />
+                  ) : description ? (
+                    <div
+                      onClick={() => canEdit && setEditingDescription(true)}
+                      title={canEdit ? 'Click to edit' : ''}
+                      className={`markdown-body max-w-[75ch] text-sm rounded ${
+                        canEdit ? 'cursor-text hover:bg-muted/30 px-1 -mx-1' : ''
+                      }`}
+                    >
+                      {(() => {
+                        // One slugger per render so duplicate-suffix counters match
+                        // the values produced by extractHeadings(description).
+                        const slug = makeSlugger();
+                        const headingText = (node: React.ReactNode): string => {
+                          if (typeof node === 'string' || typeof node === 'number') return String(node);
+                          if (Array.isArray(node)) return node.map(headingText).join('');
+                          if (node && typeof node === 'object' && 'props' in node) {
+                            const props = (node as { props?: { children?: React.ReactNode } }).props;
+                            return headingText(props?.children);
+                          }
+                          return '';
+                        };
+                        return (
                       <ReactMarkdown
                         remarkPlugins={[remarkGfm]}
                         components={{
-                          h1: ({ children }) => <h2 className="text-lg font-semibold mt-3 mb-2">{children}</h2>,
-                          h2: ({ children }) => <h2 className="text-base font-semibold mt-3 mb-1.5">{children}</h2>,
-                          h3: ({ children }) => <h3 className="text-sm font-semibold mt-2 mb-1">{children}</h3>,
+                          h1: ({ children }) => <h1 id={slug(headingText(children))} className="text-xl font-semibold mt-3 mb-2 scroll-mt-36">{children}</h1>,
+                          h2: ({ children }) => <h2 id={slug(headingText(children))} className="text-lg font-semibold mt-3 mb-2 scroll-mt-36">{children}</h2>,
+                          h3: ({ children }) => <h3 id={slug(headingText(children))} className="text-base font-semibold mt-3 mb-1.5 scroll-mt-36">{children}</h3>,
                           p: ({ children }) => <p className="leading-relaxed my-2">{children}</p>,
                           ul: ({ children }) => <ul className="list-disc pl-5 my-2 space-y-1">{children}</ul>,
                           ol: ({ children }) => <ol className="list-decimal pl-5 my-2 space-y-1">{children}</ol>,
                           li: ({ children }) => <li className="leading-relaxed">{children}</li>,
+                          a: ({ href, children }) => (
+                            <a href={href} target="_blank" rel="noreferrer" className="text-primary underline hover:text-primary/80">
+                              {children}
+                            </a>
+                          ),
                           strong: ({ children }) => <strong className="font-semibold">{children}</strong>,
+                          em: ({ children }) => <em className="italic">{children}</em>,
+                          code: ({ children }) => <code className="rounded bg-muted px-1 py-0.5 font-mono text-[0.85em]">{children}</code>,
+                          pre: ({ children }) => <pre className="rounded-md bg-muted p-3 overflow-x-auto my-2 text-xs font-mono">{children}</pre>,
+                          blockquote: ({ children }) => (
+                            <blockquote className="border-l-4 border-muted pl-3 italic text-muted-foreground my-2">{children}</blockquote>
+                          ),
+                          hr: () => <hr className="my-3 border-muted" />,
+                          table: ({ children }) => (
+                            <div className="overflow-x-auto my-2">
+                              <table className="min-w-full border-collapse text-xs">{children}</table>
+                            </div>
+                          ),
+                          th: ({ children }) => <th className="border px-2 py-1 bg-muted text-left">{children}</th>,
+                          td: ({ children }) => <td className="border px-2 py-1">{children}</td>,
                         }}
                       >
-                        {row.auto_notes}
+                        {description}
                       </ReactMarkdown>
+                        );
+                      })()}
                     </div>
-                    <div className="mt-3 flex items-center gap-2 border-t pt-2">
-                      <Button
-                        variant="ghost"
-                        size="sm"
-                        className="h-7 text-xs"
-                        onClick={() => navigator.clipboard.writeText(row.auto_notes ?? '')}
-                      >
-                        <Copy className="mr-1 h-3 w-3" />
-                        Copy
-                      </Button>
-                      {canEdit && (
-                        <Button
-                          variant="ghost"
-                          size="sm"
-                          className="h-7 text-xs"
-                          disabled={generatingNotes}
-                          onClick={handleGenerateNotes}
-                        >
-                          <RefreshCw className="mr-1 h-3 w-3" />
-                          Regenerate
-                        </Button>
-                      )}
-                      {row.auto_notes_at && (
-                        <span className="ml-auto text-[11px] text-muted-foreground">
-                          generated {formatDistanceToNow(new Date(row.auto_notes_at), { addSuffix: true })}
-                        </span>
-                      )}
-                    </div>
-                  </>
-                ) : row.auto_notes_status === 'error' ? (
-                  <div className="space-y-2 text-sm">
-                    <p className="text-red-600 dark:text-red-400">
-                      Notes generation failed: {row.auto_notes_error || 'unknown error'}
-                    </p>
-                    {canEdit && (
-                      <Button
-                        variant="outline"
-                        size="sm"
-                        disabled={generatingNotes}
-                        onClick={handleGenerateNotes}
-                      >
-                        <RefreshCw className="mr-1 h-3 w-3" />
-                        Retry
-                      </Button>
-                    )}
-                  </div>
-                ) : canEdit ? (
-                  <Button
-                    variant="outline"
-                    size="sm"
-                    disabled={generatingNotes}
-                    onClick={handleGenerateNotes}
-                  >
-                    <Sparkles className="mr-1 h-3 w-3" />
-                    Generate notes with Claude
-                  </Button>
-                ) : null}
-              </CardContent>
-            )}
-          </Card>
-        )}
-
-        {/* Description — click-to-edit, markdown rendered. */}
-        {(description || canEdit) && (
-          <Card id="notes" className="scroll-mt-24">
-            <CardHeader className="pb-2">
-              <button
-                type="button"
-                onClick={() => toggleSection('notes')}
-                className="flex w-full items-center justify-between text-left"
-                aria-expanded={!collapsedSections.notes}
-              >
-                <CardTitle className="text-sm font-semibold text-muted-foreground">
-                  Notes
-                </CardTitle>
-                {collapsedSections.notes ? (
-                  <ChevronDown className="h-4 w-4 text-muted-foreground" />
-                ) : (
-                  <ChevronUp className="h-4 w-4 text-muted-foreground" />
+                  ) : (
+                    <button
+                      type="button"
+                      onClick={() => setEditingDescription(true)}
+                      className="w-full rounded-md border border-dashed px-3 py-2 text-left text-sm text-muted-foreground transition-colors hover:border-primary/40 hover:text-foreground"
+                    >
+                      + Add notes
+                    </button>
+                  )}
+                </CardContent>
                 )}
-              </button>
-            </CardHeader>
-            {!collapsedSections.notes && (
-            <CardContent>
-              {editingDescription && canEdit ? (
-                <Textarea
-                  autoFocus
-                  value={description}
-                  placeholder="Notes, attendees, action items… markdown supported."
-                  disabled={savingMeta}
-                  rows={Math.min(Math.max(description.split('\n').length + 1, 4), 20)}
-                  onChange={(e) => setDescription(e.target.value)}
-                  onBlur={commitDescription}
-                  onKeyDown={(e) => {
-                    if (e.key === 'Escape') {
-                      e.preventDefault();
-                      cancelDescription();
-                    }
-                  }}
-                  className="font-mono text-sm"
+              </Card>
+            )}
+
+            {/* Speakers — friendly name + description per speaker */}
+            {viewMode === 'edited' && content?.utterances && content.utterances.length > 0 && (
+              <div id="speakers" className="scroll-mt-36">
+                <SpeakerSummaryPanel
+                  utterances={content.utterances}
+                  speakerLabels={speakerLabels}
+                  onSave={handleSaveSpeaker}
+                  canEdit={canEdit}
+                  onPickPerson={handlePickPerson}
+                  onRequestCreatePerson={handleRequestCreatePerson}
+                  audioSrc={
+                    row.status === 'completed' && audioAvailable
+                      ? `/api/transcripts/${row.assemblyai_id}/audio`
+                      : null
+                  }
+                  collapsed={!!collapsedSections.speakers}
+                  onToggleCollapse={() => toggleSection('speakers')}
+                  suggestions={speakerSuggestions}
+                  onGuessNames={handleGuessSpeakers}
+                  guessingNames={guessingSpeakers}
                 />
-              ) : description ? (
-                <div
-                  onClick={() => canEdit && setEditingDescription(true)}
-                  title={canEdit ? 'Click to edit' : ''}
-                  className={`markdown-body text-sm rounded ${
-                    canEdit ? 'cursor-text hover:bg-muted/30 px-1 -mx-1' : ''
-                  }`}
-                >
-                  {(() => {
-                    // One slugger per render so duplicate-suffix counters match
-                    // the values produced by extractHeadings(description).
-                    const slug = makeSlugger();
-                    const headingText = (node: React.ReactNode): string => {
-                      if (typeof node === 'string' || typeof node === 'number') return String(node);
-                      if (Array.isArray(node)) return node.map(headingText).join('');
-                      if (node && typeof node === 'object' && 'props' in node) {
-                        const props = (node as { props?: { children?: React.ReactNode } }).props;
-                        return headingText(props?.children);
-                      }
-                      return '';
-                    };
-                    return (
-                  <ReactMarkdown
-                    remarkPlugins={[remarkGfm]}
-                    components={{
-                      h1: ({ children }) => <h1 id={slug(headingText(children))} className="text-xl font-semibold mt-3 mb-2 scroll-mt-24">{children}</h1>,
-                      h2: ({ children }) => <h2 id={slug(headingText(children))} className="text-lg font-semibold mt-3 mb-2 scroll-mt-24">{children}</h2>,
-                      h3: ({ children }) => <h3 id={slug(headingText(children))} className="text-base font-semibold mt-3 mb-1.5 scroll-mt-24">{children}</h3>,
-                      p: ({ children }) => <p className="leading-relaxed my-2">{children}</p>,
-                      ul: ({ children }) => <ul className="list-disc pl-5 my-2 space-y-1">{children}</ul>,
-                      ol: ({ children }) => <ol className="list-decimal pl-5 my-2 space-y-1">{children}</ol>,
-                      li: ({ children }) => <li className="leading-relaxed">{children}</li>,
-                      a: ({ href, children }) => (
-                        <a href={href} target="_blank" rel="noreferrer" className="text-blue-600 underline hover:text-blue-800">
-                          {children}
-                        </a>
-                      ),
-                      strong: ({ children }) => <strong className="font-semibold">{children}</strong>,
-                      em: ({ children }) => <em className="italic">{children}</em>,
-                      code: ({ children }) => <code className="rounded bg-muted px-1 py-0.5 font-mono text-[0.85em]">{children}</code>,
-                      pre: ({ children }) => <pre className="rounded-md bg-muted p-3 overflow-x-auto my-2 text-xs font-mono">{children}</pre>,
-                      blockquote: ({ children }) => (
-                        <blockquote className="border-l-4 border-muted pl-3 italic text-muted-foreground my-2">{children}</blockquote>
-                      ),
-                      hr: () => <hr className="my-3 border-muted" />,
-                      table: ({ children }) => (
-                        <div className="overflow-x-auto my-2">
-                          <table className="min-w-full border-collapse text-xs">{children}</table>
-                        </div>
-                      ),
-                      th: ({ children }) => <th className="border px-2 py-1 bg-muted text-left">{children}</th>,
-                      td: ({ children }) => <td className="border px-2 py-1">{children}</td>,
-                    }}
-                  >
-                    {description}
-                  </ReactMarkdown>
-                    );
-                  })()}
-                </div>
-              ) : (
+              </div>
+            )}
+
+            {/* Transcript Content */}
+            <Card id="transcript" className="scroll-mt-36">
+              <CardHeader className="px-4 pt-3 pb-2">
                 <button
                   type="button"
-                  onClick={() => setEditingDescription(true)}
-                  className="text-sm italic text-muted-foreground hover:text-foreground"
+                  onClick={() => toggleSection('transcript')}
+                  className="flex w-full items-center gap-2 text-left"
+                  aria-expanded={!collapsedSections.transcript}
                 >
-                  + Add notes
+                  <Headphones className="h-4 w-4 shrink-0 text-muted-foreground" />
+                  <span className="text-[13px] font-semibold">Transcript</span>
+                  {viewMode === 'raw' && (
+                    <Badge variant="outline" className="text-[10px]">
+                      Raw — read-only
+                    </Badge>
+                  )}
+                  {collapsedSections.transcript ? (
+                    <ChevronDown className="ml-auto h-4 w-4 shrink-0 text-muted-foreground" />
+                  ) : (
+                    <ChevronUp className="ml-auto h-4 w-4 shrink-0 text-muted-foreground" />
+                  )}
                 </button>
-              )}
-            </CardContent>
-            )}
-          </Card>
-        )}
-
-        {/* Speakers — friendly name + description per speaker */}
-        {viewMode === 'edited' && content?.utterances && content.utterances.length > 0 && (
-          <div id="speakers" className="scroll-mt-24">
-            <SpeakerSummaryPanel
-              utterances={content.utterances}
-              speakerLabels={speakerLabels}
-              onSave={handleSaveSpeaker}
-              canEdit={canEdit}
-              onPickPerson={handlePickPerson}
-              onRequestCreatePerson={handleRequestCreatePerson}
-              audioSrc={
-                row.status === 'completed' && audioAvailable
-                  ? `/api/transcripts/${row.assemblyai_id}/audio`
-                  : null
-              }
-              collapsed={!!collapsedSections.speakers}
-              onToggleCollapse={() => toggleSection('speakers')}
-              suggestions={speakerSuggestions}
-              onGuessNames={handleGuessSpeakers}
-              guessingNames={guessingSpeakers}
-            />
-          </div>
-        )}
-
-        {/* Transcript Content */}
-        <Card id="transcript" className="scroll-mt-24">
-          <CardHeader>
-            <button
-              type="button"
-              onClick={() => toggleSection('transcript')}
-              className="flex w-full items-center justify-between text-left"
-              aria-expanded={!collapsedSections.transcript}
-            >
-              <CardTitle>
-                Transcript{' '}
-                <span className="text-xs font-normal text-muted-foreground">
-                  ({viewMode === 'edited' ? 'edited view' : 'raw — read only'})
-                </span>
-              </CardTitle>
-              {collapsedSections.transcript ? (
-                <ChevronDown className="h-4 w-4 text-muted-foreground" />
-              ) : (
-                <ChevronUp className="h-4 w-4 text-muted-foreground" />
-              )}
-            </button>
-          </CardHeader>
-          {!collapsedSections.transcript && (
-          <CardContent>
-            {row.status === 'completed' && content ? (
-              <div className="space-y-2">
-                {content.utterances && content.utterances.length > 0 ? (
-                  content.utterances.map((utterance, index) => (
-                    <div key={index}>
-                      {viewMode === 'edited' && segmentByUtterance.has(index) && (
-                        <div className="flex items-center gap-2 pt-4 pb-1">
-                          <span className="font-mono text-[10px] text-muted-foreground">
-                            {formatTime(segmentByUtterance.get(index)!.start_ms)}
-                          </span>
-                          <h4 className="text-sm font-semibold text-foreground">
-                            {segmentByUtterance.get(index)!.title}
-                          </h4>
-                          <div className="h-px flex-1 bg-border" />
-                        </div>
-                      )}
-                    <EditableUtterance
-                      index={index}
-                      utterance={utterance}
-                      displayText={displayTextFor(index)}
-                      isTextEdited={viewMode === 'edited' && isTextEdited(index)}
-                      isActive={index === currentUtteranceIndex}
-                      speakerLabels={speakerLabels}
-                      highlights={highlightsByUtterance.get(index)}
-                      onSeek={handleSeekToUtterance}
-                      canEdit={viewMode === 'edited' && canEdit}
-                      onPickPerson={handlePickPerson}
-                      onRequestCreatePerson={handleRequestCreatePerson}
-                      onSaveText={
-                        viewMode === 'edited' && canEdit
-                          ? handleSaveText
-                          : () => {
-                              /* read-only */
-                            }
-                      }
-                      onSaveSpeaker={
-                        viewMode === 'edited' && canEdit
-                          ? handleSaveSpeaker
-                          : () => {
-                              /* read-only */
-                            }
-                      }
-                    />
-                    </div>
-                  ))
+              </CardHeader>
+              {!collapsedSections.transcript && (
+              <CardContent className="px-4 pb-4">
+                {row.status === 'completed' && content ? (
+                  <div>
+                    {content.utterances && content.utterances.length > 0 ? (
+                      content.utterances.map((utterance, index) => {
+                        const showSpeaker =
+                          index === 0 ||
+                          content.utterances![index - 1]!.speaker !== utterance.speaker ||
+                          segmentByUtterance.has(index);
+                        return (
+                          <div key={index}>
+                            {viewMode === 'edited' && segmentByUtterance.has(index) && (
+                              <div className="flex scroll-mt-36 items-center gap-2 pt-6 pb-1.5">
+                                <span className="font-mono text-[11px] tabular-nums text-muted-foreground">
+                                  {formatTime(segmentByUtterance.get(index)!.start_ms)}
+                                </span>
+                                <h4 className="text-[13px] font-semibold">
+                                  {segmentByUtterance.get(index)!.title}
+                                </h4>
+                                <div className="h-px flex-1 bg-border" />
+                              </div>
+                            )}
+                            <EditableUtterance
+                              index={index}
+                              utterance={utterance}
+                              displayText={displayTextFor(index)}
+                              isTextEdited={viewMode === 'edited' && isTextEdited(index)}
+                              isActive={index === currentUtteranceIndex}
+                              speakerLabels={speakerLabels}
+                              highlights={highlightsByUtterance.get(index)}
+                              onSeek={handleSeekToUtterance}
+                              canEdit={viewMode === 'edited' && canEdit}
+                              showSpeaker={showSpeaker}
+                              onPickPerson={handlePickPerson}
+                              onRequestCreatePerson={handleRequestCreatePerson}
+                              onSaveText={
+                                viewMode === 'edited' && canEdit
+                                  ? handleSaveText
+                                  : () => {
+                                      /* read-only */
+                                    }
+                              }
+                              onSaveSpeaker={
+                                viewMode === 'edited' && canEdit
+                                  ? handleSaveSpeaker
+                                  : () => {
+                                      /* read-only */
+                                    }
+                              }
+                            />
+                          </div>
+                        );
+                      })
+                    ) : (
+                      <p className="text-muted-foreground">
+                        {content.text || 'No transcript content available'}
+                      </p>
+                    )}
+                  </div>
                 ) : (
                   <p className="text-muted-foreground">
-                    {content.text || 'No transcript content available'}
+                    Transcript is {row.status}. Content will be available when processing is complete.
                   </p>
                 )}
-              </div>
-            ) : (
-              <p className="text-muted-foreground">
-                Transcript is {row.status}. Content will be available when processing is complete.
-              </p>
-            )}
-          </CardContent>
-          )}
-        </Card>
-      </div>
-
-      <aside className="hidden lg:block">
-        <div className="sticky top-4">
-          <TranscriptOutline
-            durationSec={row.duration ?? null}
-            hasNotes={!!description || canEdit}
-            hasSpeakers={
-              viewMode === 'edited' &&
-              !!content?.utterances &&
-              content.utterances.length > 0
-            }
-            notesHeadings={notesHeadings}
-            currentTimeSec={outlineTimeSec}
-            onJumpToSeconds={handleOutlineJump}
-            activeAnchor={activeAnchor}
-            segments={row.auto_segments}
-          />
-        </div>
-      </aside>
-      </div>
-
-      {/* Mobile / tablet outline FAB — opens the same outline in a dialog. */}
-      <button
-        type="button"
-        onClick={() => setOutlineOpenMobile(true)}
-        className="lg:hidden fixed bottom-4 right-4 z-40 flex items-center gap-1.5 rounded-full border bg-background shadow-md px-4 py-2.5 text-xs font-medium text-foreground hover:bg-muted"
-        aria-label="Open outline"
-      >
-        <ListTree className="h-4 w-4" />
-        Outline
-      </button>
-
-      <Dialog open={outlineOpenMobile} onOpenChange={setOutlineOpenMobile}>
-        <DialogContent className="max-w-sm">
-          <DialogHeader>
-            <DialogTitle>Outline</DialogTitle>
-          </DialogHeader>
-          <div onClick={() => setOutlineOpenMobile(false)}>
-            <TranscriptOutline
-              durationSec={row.duration ?? null}
-              hasNotes={!!description || canEdit}
-              hasSpeakers={
-                viewMode === 'edited' &&
-                !!content?.utterances &&
-                content.utterances.length > 0
-              }
-              notesHeadings={notesHeadings}
-              currentTimeSec={outlineTimeSec}
-              onJumpToSeconds={(s) => {
-                handleOutlineJump(s);
-                setOutlineOpenMobile(false);
-              }}
-              activeAnchor={activeAnchor}
-              segments={row.auto_segments}
-            />
-          </div>
-        </DialogContent>
-      </Dialog>
-
-      <ShareDialog
-        open={shareOpen}
-        onOpenChange={setShareOpen}
-        transcriptId={transcriptId}
-        callerAccess={access}
-        onSharesChanged={(shares) => {
-          setCollaboratorEmails(
-            new Set(shares.map((s) => s.shared_with_email.toLowerCase()))
-          );
-          bumpActivity();
-        }}
-      />
-
-      <AddPersonDialog
-        open={!!pendingCreate}
-        initialName={pendingCreate?.name ?? ''}
-        onCreated={handlePersonCreated}
-        onUseAsLabel={handleUsePersonAsLabel}
-        onCancel={() => setPendingCreate(null)}
-      />
-
-      <Dialog open={!!pendingShare} onOpenChange={(v) => !v && setPendingShare(null)}>
-        <DialogContent className="max-w-md">
-          <DialogHeader>
-            <DialogTitle>Add to access?</DialogTitle>
-            <DialogDescription>
-              {pendingShare && (
-                <>
-                  You tagged <span className="font-medium">{pendingShare.name}</span>{' '}
-                  as a speaker. Would you like to give them editor access to this
-                  transcript so they can make corrections?
-                </>
+              </CardContent>
               )}
-            </DialogDescription>
-          </DialogHeader>
-          {pendingShare?.email && (
-            <div className="rounded-md border p-3 text-sm">
-              <div className="font-medium">{pendingShare.name}</div>
-              <div className="text-xs text-muted-foreground">{pendingShare.email}</div>
-            </div>
-          )}
-          {sharingError && <p className="text-xs text-red-600">{sharingError}</p>}
-          <DialogFooter className="gap-2">
-            <Button
-              variant="outline"
-              onClick={() => setPendingShare(null)}
-              disabled={sharingPending}
-            >
-              Skip
-            </Button>
-            <Button onClick={handleConfirmPendingShare} disabled={sharingPending}>
-              {sharingPending ? 'Adding…' : 'Add as editor'}
-            </Button>
-          </DialogFooter>
-        </DialogContent>
-      </Dialog>
+            </Card>
+          </div>
 
-      <FindReplacePanel
-        open={findReplaceOpen}
-        onClose={() => setFindReplaceOpen(false)}
-        query={findQuery}
-        onQueryChange={(q) => {
-          setFindQuery(q);
-          setCurrentMatchPos(0);
-        }}
-        replace={replaceWith}
-        onReplaceChange={setReplaceWith}
-        caseSensitive={findCaseSensitive}
-        onCaseSensitiveChange={(cs) => {
-          setFindCaseSensitive(cs);
-          setCurrentMatchPos(0);
-        }}
-        matchCount={findMatches.length}
-        currentIndex={findMatches.length > 0 ? currentMatchPos + 1 : 0}
-        onNext={handleFindNext}
-        onPrev={handleFindPrev}
-        onReplaceCurrent={handleReplaceCurrent}
-        onReplaceAll={handleReplaceAll}
-      />
+          <aside className="hidden lg:block">
+            <div className="sticky top-[72px] max-h-[calc(100vh-88px)] space-y-4 overflow-y-auto pr-1">
+              {renderQuickActions()}
+              <TranscriptOutline
+                durationSec={row.duration ?? null}
+                hasNotes={!!description || canEdit}
+                hasSpeakers={
+                  viewMode === 'edited' &&
+                  !!content?.utterances &&
+                  content.utterances.length > 0
+                }
+                notesHeadings={notesHeadings}
+                currentTimeSec={outlineTimeSec}
+                onJumpToSeconds={handleOutlineJump}
+                activeAnchor={activeAnchor}
+                segments={row.auto_segments}
+              />
+              <AttachmentPanel
+                transcriptId={row.assemblyai_id}
+                canEdit={canEdit}
+                onChanged={bumpActivity}
+              />
+            </div>
+          </aside>
+        </div>
+
+        {/* Mobile / tablet outline FAB — opens quick actions + outline in a dialog. */}
+        <button
+          type="button"
+          onClick={() => setOutlineOpenMobile(true)}
+          className={`lg:hidden fixed bottom-4 right-4 z-40 flex items-center gap-1.5 rounded-full border bg-card px-4 py-2.5 text-xs font-medium text-foreground hover:bg-muted ${FLOATING_SHADOW}`}
+          aria-label="Open outline"
+        >
+          <ListTree className="h-4 w-4" />
+          Outline
+        </button>
+
+        <Dialog open={outlineOpenMobile} onOpenChange={setOutlineOpenMobile}>
+          <DialogContent className="max-w-sm">
+            <DialogHeader>
+              <DialogTitle className="text-base font-semibold">Outline</DialogTitle>
+            </DialogHeader>
+            {renderQuickActions(true)}
+            <div onClick={() => setOutlineOpenMobile(false)}>
+              <TranscriptOutline
+                durationSec={row.duration ?? null}
+                hasNotes={!!description || canEdit}
+                hasSpeakers={
+                  viewMode === 'edited' &&
+                  !!content?.utterances &&
+                  content.utterances.length > 0
+                }
+                notesHeadings={notesHeadings}
+                currentTimeSec={outlineTimeSec}
+                onJumpToSeconds={(s) => {
+                  handleOutlineJump(s);
+                  setOutlineOpenMobile(false);
+                }}
+                activeAnchor={activeAnchor}
+                segments={row.auto_segments}
+              />
+            </div>
+          </DialogContent>
+        </Dialog>
+
+        <ShareDialog
+          open={shareOpen}
+          onOpenChange={setShareOpen}
+          transcriptId={transcriptId}
+          callerAccess={access}
+          onSharesChanged={(shares) => {
+            setCollaboratorEmails(
+              new Set(shares.map((s) => s.shared_with_email.toLowerCase()))
+            );
+            bumpActivity();
+          }}
+        />
+
+        <AddPersonDialog
+          open={!!pendingCreate}
+          initialName={pendingCreate?.name ?? ''}
+          onCreated={handlePersonCreated}
+          onUseAsLabel={handleUsePersonAsLabel}
+          onCancel={() => setPendingCreate(null)}
+        />
+
+        <Dialog open={!!pendingShare} onOpenChange={(v) => !v && setPendingShare(null)}>
+          <DialogContent className="max-w-md">
+            <DialogHeader>
+              <DialogTitle>Add to access?</DialogTitle>
+              <DialogDescription>
+                {pendingShare && (
+                  <>
+                    You tagged <span className="font-medium">{pendingShare.name}</span>{' '}
+                    as a speaker. Would you like to give them editor access to this
+                    transcript so they can make corrections?
+                  </>
+                )}
+              </DialogDescription>
+            </DialogHeader>
+            {pendingShare?.email && (
+              <div className="rounded-md border p-3 text-sm">
+                <div className="font-medium">{pendingShare.name}</div>
+                <div className="text-xs text-muted-foreground">{pendingShare.email}</div>
+              </div>
+            )}
+            {sharingError && <p className="text-xs text-destructive">{sharingError}</p>}
+            <DialogFooter className="gap-2">
+              <Button
+                variant="outline"
+                onClick={() => setPendingShare(null)}
+                disabled={sharingPending}
+              >
+                Skip
+              </Button>
+              <Button onClick={handleConfirmPendingShare} disabled={sharingPending}>
+                {sharingPending ? 'Adding…' : 'Add as editor'}
+              </Button>
+            </DialogFooter>
+          </DialogContent>
+        </Dialog>
+
+        <FindReplacePanel
+          open={findReplaceOpen}
+          onClose={() => setFindReplaceOpen(false)}
+          query={findQuery}
+          onQueryChange={(q) => {
+            setFindQuery(q);
+            setCurrentMatchPos(0);
+          }}
+          replace={replaceWith}
+          onReplaceChange={setReplaceWith}
+          caseSensitive={findCaseSensitive}
+          onCaseSensitiveChange={(cs) => {
+            setFindCaseSensitive(cs);
+            setCurrentMatchPos(0);
+          }}
+          matchCount={findMatches.length}
+          currentIndex={findMatches.length > 0 ? currentMatchPos + 1 : 0}
+          onNext={handleFindNext}
+          onPrev={handleFindPrev}
+          onReplaceCurrent={handleReplaceCurrent}
+          onReplaceAll={handleReplaceAll}
+        />
+      </div>
     </div>
   );
 }

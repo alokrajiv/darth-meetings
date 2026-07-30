@@ -254,7 +254,7 @@ export function ActivityBar({ transcriptId, refreshSignal }: ActivityBarProps) {
       <button
         type="button"
         onClick={() => setOpen(true)}
-        className="inline-flex items-center gap-2 rounded-full border bg-background px-2 py-1 text-[11px] text-muted-foreground hover:bg-muted hover:text-foreground transition-colors"
+        className="inline-flex items-center gap-2 rounded-full border bg-card px-2 py-1 text-[11px] text-muted-foreground shadow-[0_1px_2px_0_rgb(0_0_0/0.04)] transition-colors hover:bg-accent hover:text-accent-foreground"
         title="Show activity timeline"
       >
         {stackedPeople.length > 0 && (
@@ -294,9 +294,9 @@ export function ActivityBar({ transcriptId, refreshSignal }: ActivityBarProps) {
       </button>
 
       <Dialog open={open} onOpenChange={setOpen}>
-        <DialogContent className="max-w-lg">
+        <DialogContent className="max-w-lg rounded-xl shadow-[0_4px_16px_-2px_rgb(0_0_0/0.08),0_1px_2px_0_rgb(0_0_0/0.04)]">
           <DialogHeader>
-            <DialogTitle className="flex items-center gap-2">
+            <DialogTitle className="flex items-center gap-2 text-base font-semibold">
               Activity
               <Badge variant="outline" className="text-[10px]">
                 {summary.events.length}

@@ -1,65 +1,148 @@
 'use client';
 
-import { useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import Link from 'next/link';
 import { TranscriptTable } from '@/components/transcript-table';
-import { AudioUpload } from '@/components/audio-upload';
+import { AudioUpload, AUDIO_UPLOAD_INPUT_ID } from '@/components/audio-upload';
 import { LogoutButton } from '@/components/logout-button';
 import { ImportDialog } from '@/components/import-dialog';
 import { GmeetImportDialog } from '@/components/gmeet-import-dialog';
 import { TranscriptImportDialog } from '@/components/transcript-import-dialog';
+import { AppHeader } from '@/components/app-header';
 import { Button } from '@/components/ui/button';
-import { Settings, Download, Video, FileUp } from 'lucide-react';
+import {
+  Settings,
+  Video,
+  FileText,
+  FileAudio,
+  ChevronDown,
+  KeyRound,
+} from 'lucide-react';
 
 export default function Home() {
   const [refreshTrigger, setRefreshTrigger] = useState(0);
   const [importOpen, setImportOpen] = useState(false);
   const [gmeetOpen, setGmeetOpen] = useState(false);
   const [textImportOpen, setTextImportOpen] = useState(false);
+  const [importMenuOpen, setImportMenuOpen] = useState(false);
+  const importMenuRef = useRef<HTMLDivElement>(null);
 
   const handleTranscriptCreated = () => {
     setRefreshTrigger((prev) => prev + 1);
   };
 
+  // Close the hand-rolled Import popover on outside click / Escape.
+  useEffect(() => {
+    if (!importMenuOpen) return;
+    const onPointerDown = (e: MouseEvent) => {
+      if (importMenuRef.current && !importMenuRef.current.contains(e.target as Node)) {
+        setImportMenuOpen(false);
+      }
+    };
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') setImportMenuOpen(false);
+    };
+    document.addEventListener('mousedown', onPointerDown);
+    document.addEventListener('keydown', onKeyDown);
+    return () => {
+      document.removeEventListener('mousedown', onPointerDown);
+      document.removeEventListener('keydown', onKeyDown);
+    };
+  }, [importMenuOpen]);
+
   return (
-    <div className="container mx-auto px-4 py-6 sm:py-8">
-      <div className="flex flex-col sm:flex-row sm:justify-between sm:items-center gap-3 mb-6 sm:mb-8">
-        <div>
-          <h1 className="text-2xl sm:text-3xl font-bold">Meeting Whisperer</h1>
+    <div className="min-h-screen">
+      <AppHeader>
+        <div className="relative" ref={importMenuRef}>
+          <Button
+            variant="outline"
+            size="sm"
+            onClick={() => setImportMenuOpen((o) => !o)}
+            aria-expanded={importMenuOpen}
+            aria-haspopup="menu"
+          >
+            Import
+            <ChevronDown className="h-4 w-4" />
+          </Button>
+          {importMenuOpen && (
+            <div
+              role="menu"
+              className="absolute right-0 top-full z-50 mt-1.5 w-64 rounded-lg border bg-popover p-1 text-popover-foreground shadow-[0_4px_16px_-2px_rgb(0_0_0/0.08),0_1px_2px_0_rgb(0_0_0/0.04)]"
+            >
+              <button
+                type="button"
+                role="menuitem"
+                className="flex w-full items-start gap-2.5 rounded-md px-3 py-2 text-left hover:bg-muted"
+                onClick={() => {
+                  setImportMenuOpen(false);
+                  setTextImportOpen(true);
+                }}
+              >
+                <FileText className="mt-0.5 h-4 w-4 shrink-0 text-muted-foreground" />
+                <span className="min-w-0">
+                  <span className="block text-sm font-medium">Transcript file</span>
+                  <span className="block text-[11px] text-muted-foreground">
+                    Teams, Zoom, VTT…
+                  </span>
+                </span>
+              </button>
+              <button
+                type="button"
+                role="menuitem"
+                className="flex w-full items-start gap-2.5 rounded-md px-3 py-2 text-left hover:bg-muted"
+                onClick={() => {
+                  setImportMenuOpen(false);
+                  setImportOpen(true);
+                }}
+              >
+                <KeyRound className="mt-0.5 h-4 w-4 shrink-0 text-muted-foreground" />
+                <span className="min-w-0">
+                  <span className="block text-sm font-medium">From AssemblyAI key</span>
+                  <span className="block text-[11px] text-muted-foreground">
+                    Bring across transcripts you already have
+                  </span>
+                </span>
+              </button>
+            </div>
+          )}
+        </div>
+        <Button
+          variant="outline"
+          size="sm"
+          onClick={() =>
+            (document.getElementById(AUDIO_UPLOAD_INPUT_ID) as HTMLInputElement | null)?.click()
+          }
+        >
+          <FileAudio className="h-4 w-4" />
+          Upload audio
+        </Button>
+        <Button size="sm" onClick={() => setGmeetOpen(true)}>
+          <Video className="h-4 w-4" />
+          Import from Meet
+        </Button>
+        <div className="h-5 w-px bg-border" />
+        <Link href="/settings">
+          <Button variant="ghost" size="sm" className="h-8 w-8 p-0" title="Settings">
+            <Settings className="h-4 w-4" />
+            <span className="sr-only">Settings</span>
+          </Button>
+        </Link>
+        <LogoutButton />
+      </AppHeader>
+
+      <main className="mx-auto max-w-[1200px] px-6 py-6">
+        <div className="mb-5">
+          <h1 className="text-2xl font-semibold tracking-tight leading-tight">Archive</h1>
           <p className="text-sm text-muted-foreground">
-            Upload meeting audio and manage your transcripts
+            Every meeting, transcribed and searchable.
           </p>
         </div>
-        <div className="flex items-center gap-1.5 flex-wrap">
-          <Button variant="outline" size="sm" onClick={() => setGmeetOpen(true)} title="Import from Google Meet">
-            <Video className="h-4 w-4 sm:mr-1" />
-            <span className="hidden sm:inline">Import from Meet</span>
-            <span className="sm:hidden">Meet</span>
-          </Button>
-          <Button variant="outline" size="sm" onClick={() => setTextImportOpen(true)} title="Import a transcript file (Teams, Zoom, VTT…)">
-            <FileUp className="h-4 w-4 sm:mr-1" />
-            <span className="hidden sm:inline">Import transcript</span>
-            <span className="sm:hidden">File</span>
-          </Button>
-          <Button variant="outline" size="sm" onClick={() => setImportOpen(true)} title="Import from AAI key">
-            <Download className="h-4 w-4 sm:mr-1" />
-            <span className="hidden sm:inline">Import from AAI key</span>
-            <span className="sm:hidden">Import</span>
-          </Button>
-          <Link href="/settings">
-            <Button variant="outline" size="sm" title="Settings">
-              <Settings className="h-4 w-4 sm:mr-1" />
-              <span className="hidden sm:inline">Settings</span>
-            </Button>
-          </Link>
-          <LogoutButton />
-        </div>
-      </div>
 
-      <div className="grid gap-6">
-        <AudioUpload onTranscriptCreated={handleTranscriptCreated} />
-        <TranscriptTable refreshTrigger={refreshTrigger} />
-      </div>
+        <div className="flex flex-col gap-5">
+          <AudioUpload onTranscriptCreated={handleTranscriptCreated} />
+          <TranscriptTable refreshTrigger={refreshTrigger} />
+        </div>
+      </main>
 
       <ImportDialog
         open={importOpen}

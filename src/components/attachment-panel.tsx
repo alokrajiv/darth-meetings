@@ -1,9 +1,6 @@
 'use client';
 
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { formatDistanceToNow } from 'date-fns';
-import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
-import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { Textarea } from '@/components/ui/textarea';
@@ -26,7 +23,7 @@ import {
   Trash2,
   Upload,
 } from 'lucide-react';
-import type { TranscriptAttachment } from '@/lib/format';
+import { formatSmartDate, type TranscriptAttachment } from '@/lib/format';
 
 const MAX_FILE_BYTES = 25 * 1024 * 1024;
 
@@ -39,16 +36,6 @@ function humanSize(bytes: number | null): string | null {
   return `${mb < 10 ? mb.toFixed(1) : Math.round(mb)} MB`;
 }
 
-function safeRelativeDate(value: string): string {
-  try {
-    const d = new Date(value);
-    if (isNaN(d.getTime())) return '';
-    return formatDistanceToNow(d, { addSuffix: true });
-  } catch {
-    return '';
-  }
-}
-
 interface AttachmentPanelProps {
   /** The transcript's assemblyai_id — same id used by the page's other routes. */
   transcriptId: string;
@@ -58,9 +45,9 @@ interface AttachmentPanelProps {
 }
 
 /**
- * "Attached context" card: files and pasted text that collaborators add to a
- * transcript before generating AI notes. Everything here is visible to anyone
- * with access and gets injected into the AI-notes prompt server-side.
+ * "Attached context" rail card: files and pasted text that collaborators add
+ * to a transcript before generating AI notes. Everything here is visible to
+ * anyone with access and gets injected into the AI-notes prompt server-side.
  */
 export function AttachmentPanel({ transcriptId, canEdit, onChanged }: AttachmentPanelProps) {
   const [attachments, setAttachments] = useState<TranscriptAttachment[]>([]);
@@ -207,48 +194,37 @@ export function AttachmentPanel({ transcriptId, canEdit, onChanged }: Attachment
   // Read-only with nothing attached: keep the page clean.
   if (loaded && attachments.length === 0 && !canEdit) return null;
 
-  const titleNode = (
-    <CardTitle className="flex items-center gap-2 text-base">
-      <Paperclip className="h-4 w-4" />
-      Attached context
-      <Badge variant="outline" className="ml-1 text-[10px]">
-        {attachments.length}
-      </Badge>
-    </CardTitle>
-  );
-
   return (
-    <Card id="attachments" className="scroll-mt-24">
-      <CardHeader className="pb-3">
-        <button
-          type="button"
-          onClick={() => setCollapsed((v) => !v)}
-          aria-expanded={!collapsed}
-          className="flex w-full items-center justify-between text-left"
-        >
-          {titleNode}
-          {collapsed ? (
-            <ChevronDown className="h-4 w-4 text-muted-foreground" />
-          ) : (
-            <ChevronUp className="h-4 w-4 text-muted-foreground" />
-          )}
-        </button>
-        {!collapsed && (
-          <p className="text-xs text-muted-foreground">
-            Docs, decks, and notes for the team — included when AI notes are generated.
-          </p>
+    <div id="attachments" className="rounded-lg border bg-card p-3">
+      <button
+        type="button"
+        onClick={() => setCollapsed((v) => !v)}
+        aria-expanded={!collapsed}
+        className="flex w-full items-center gap-1.5 text-left"
+        title="Docs, decks, and notes for the team — included when AI notes are generated."
+      >
+        <Paperclip className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
+        <span className="text-[11px] font-semibold uppercase tracking-wider text-muted-foreground">
+          Attached context
+        </span>
+        <span className="rounded-full bg-muted px-1.5 py-0.5 text-[11px] tabular-nums text-muted-foreground">
+          {attachments.length}
+        </span>
+        {collapsed ? (
+          <ChevronDown className="ml-auto h-3.5 w-3.5 shrink-0 text-muted-foreground" />
+        ) : (
+          <ChevronUp className="ml-auto h-3.5 w-3.5 shrink-0 text-muted-foreground" />
         )}
-      </CardHeader>
+      </button>
       {!collapsed && (
-        <CardContent className="space-y-2 pb-3">
+        <div className="mt-2 space-y-1">
           {attachments.length === 0 ? (
             canEdit && loaded ? (
-              <div className="rounded-md border border-dashed px-3 py-4 text-center text-xs text-muted-foreground">
-                No context attached yet — add an agenda, deck, or notes to make the AI
-                summary sharper.
+              <div className="rounded-md border border-dashed px-2 py-3 text-center text-[11px] text-muted-foreground">
+                No context yet — an agenda or deck makes the AI summary sharper.
               </div>
             ) : (
-              <div className="flex items-center gap-2 py-1 text-xs text-muted-foreground">
+              <div className="flex items-center gap-2 py-1 text-[11px] text-muted-foreground">
                 <RefreshCw className="h-3 w-3 animate-spin" />
                 Loading…
               </div>
@@ -260,18 +236,24 @@ export function AttachmentPanel({ transcriptId, canEdit, onChanged }: Attachment
               const expanded = expandedIds.has(a.id);
               const extractionFailed =
                 isFile && (a.extraction_status === 'failed' || a.extraction_status === 'none');
-              const meta: string[] = [];
-              if (isFile && a.original_filename && a.original_filename !== a.title) {
-                meta.push(a.original_filename);
-              }
               const size = humanSize(a.size_bytes);
-              if (size) meta.push(size);
-              if (a.added_by_email) meta.push(`added by ${a.added_by_email}`);
-              const when = safeRelativeDate(a.created_at);
-              if (when) meta.push(when);
+              const meta = [size, formatSmartDate(a.created_at)]
+                .filter(Boolean)
+                .join(' · ');
+              const tooltipBits: string[] = [];
+              if (isFile && a.original_filename && a.original_filename !== a.title) {
+                tooltipBits.push(a.original_filename);
+              }
+              if (a.added_by_email) tooltipBits.push(`added by ${a.added_by_email}`);
+              try {
+                const d = new Date(a.created_at);
+                if (!isNaN(d.getTime())) tooltipBits.push(d.toLocaleString());
+              } catch {
+                /* ignore */
+              }
               return (
-                <div key={a.id} className="rounded-md border bg-card px-2 py-1.5">
-                  <div className="flex items-start gap-2">
+                <div key={a.id} className="rounded-md px-1 py-1 hover:bg-muted/60">
+                  <div className="flex items-start gap-1.5">
                     {hasText ? (
                       <button
                         type="button"
@@ -290,26 +272,26 @@ export function AttachmentPanel({ transcriptId, canEdit, onChanged }: Attachment
                       <span className="mt-0.5 w-[18px] shrink-0" />
                     )}
                     {isFile ? (
-                      <FileText className="mt-0.5 h-4 w-4 shrink-0 text-muted-foreground" />
+                      <FileText className="mt-0.5 h-3.5 w-3.5 shrink-0 text-muted-foreground" />
                     ) : (
-                      <AlignLeft className="mt-0.5 h-4 w-4 shrink-0 text-muted-foreground" />
+                      <AlignLeft className="mt-0.5 h-3.5 w-3.5 shrink-0 text-muted-foreground" />
                     )}
-                    <div className="min-w-0 flex-1">
+                    <div className="min-w-0 flex-1" title={tooltipBits.join(' · ') || undefined}>
                       {isFile ? (
                         <a
                           href={`/api/transcripts/${transcriptId}/attachments/${a.id}/download`}
                           target="_blank"
                           rel="noreferrer"
-                          className="text-sm font-medium hover:underline"
+                          className="block truncate text-[13px] font-medium hover:underline"
                           title="Download file"
                         >
                           {a.title}
                         </a>
                       ) : (
-                        <span className="text-sm font-medium">{a.title}</span>
+                        <span className="block truncate text-[13px] font-medium">{a.title}</span>
                       )}
                       <div className="truncate text-[11px] text-muted-foreground">
-                        {meta.join(' · ')}
+                        {meta}
                       </div>
                       {extractionFailed && (
                         <div className="text-[11px] italic text-muted-foreground">
@@ -323,7 +305,7 @@ export function AttachmentPanel({ transcriptId, canEdit, onChanged }: Attachment
                         onClick={() => handleDelete(a)}
                         disabled={deletingId != null}
                         title="Remove attachment"
-                        className="shrink-0 rounded p-1 text-muted-foreground hover:bg-muted hover:text-red-600 disabled:opacity-50 transition-colors"
+                        className="shrink-0 rounded p-1 text-muted-foreground hover:bg-muted hover:text-destructive disabled:opacity-50 transition-colors"
                       >
                         {deletingId === a.id ? (
                           <RefreshCw className="h-3.5 w-3.5 animate-spin" />
@@ -334,7 +316,7 @@ export function AttachmentPanel({ transcriptId, canEdit, onChanged }: Attachment
                     )}
                   </div>
                   {expanded && hasText && (
-                    <pre className="mt-1.5 max-h-[15rem] overflow-y-auto whitespace-pre-wrap rounded-md bg-muted p-2 text-xs font-mono">
+                    <pre className="mt-1.5 max-h-40 overflow-y-auto whitespace-pre-wrap rounded-md bg-muted p-2 text-xs font-mono">
                       {a.text_content}
                     </pre>
                   )}
@@ -343,33 +325,33 @@ export function AttachmentPanel({ transcriptId, canEdit, onChanged }: Attachment
             })
           )}
 
-          {actionError && <p className="text-xs text-red-600">{actionError}</p>}
+          {actionError && <p className="text-xs text-destructive">{actionError}</p>}
 
           {canEdit && (
-            <div className="flex items-center gap-2 pt-1">
+            <div className="grid grid-cols-2 gap-1.5 pt-1">
               <Button
                 variant="outline"
                 size="sm"
-                className="h-7 text-xs"
+                className="h-7 w-full text-xs"
                 onClick={() => {
                   setTextError(null);
                   setTextDialogOpen(true);
                 }}
               >
-                <AlignLeft className="mr-1 h-3 w-3" />
+                <AlignLeft className="h-3 w-3" />
                 Add text
               </Button>
               <Button
                 variant="outline"
                 size="sm"
-                className="h-7 text-xs"
+                className="h-7 w-full text-xs"
                 disabled={uploading}
                 onClick={() => fileInputRef.current?.click()}
               >
                 {uploading ? (
-                  <RefreshCw className="mr-1 h-3 w-3 animate-spin" />
+                  <RefreshCw className="h-3 w-3 animate-spin" />
                 ) : (
-                  <Upload className="mr-1 h-3 w-3" />
+                  <Upload className="h-3 w-3" />
                 )}
                 {uploading ? 'Uploading…' : 'Upload file'}
               </Button>
@@ -382,13 +364,13 @@ export function AttachmentPanel({ transcriptId, canEdit, onChanged }: Attachment
               />
             </div>
           )}
-        </CardContent>
+        </div>
       )}
 
       <Dialog open={textDialogOpen} onOpenChange={(v) => !savingText && setTextDialogOpen(v)}>
-        <DialogContent className="max-w-lg">
+        <DialogContent className="max-w-lg rounded-xl shadow-[0_4px_16px_-2px_rgb(0_0_0/0.08),0_1px_2px_0_rgb(0_0_0/0.04)]">
           <DialogHeader>
-            <DialogTitle>Add text context</DialogTitle>
+            <DialogTitle className="text-base font-semibold">Add text context</DialogTitle>
             <DialogDescription>
               Paste an agenda, background notes, or anything that should inform the AI
               summary. Visible to everyone with access.
@@ -400,6 +382,7 @@ export function AttachmentPanel({ transcriptId, canEdit, onChanged }: Attachment
               placeholder="Title (optional — defaults to “Pasted notes”)"
               disabled={savingText}
               onChange={(e) => setTextTitle(e.target.value)}
+              className="h-9"
             />
             <Textarea
               autoFocus
@@ -410,11 +393,11 @@ export function AttachmentPanel({ transcriptId, canEdit, onChanged }: Attachment
               onChange={(e) => setTextBody(e.target.value)}
               className="text-sm"
             />
-            {textError && <p className="text-xs text-red-600">{textError}</p>}
+            {textError && <p className="text-xs text-destructive">{textError}</p>}
           </div>
           <DialogFooter className="gap-2">
             <Button
-              variant="outline"
+              variant="ghost"
               onClick={() => setTextDialogOpen(false)}
               disabled={savingText}
             >
@@ -423,7 +406,7 @@ export function AttachmentPanel({ transcriptId, canEdit, onChanged }: Attachment
             <Button onClick={handleSaveText} disabled={savingText || !textBody.trim()}>
               {savingText ? (
                 <>
-                  <RefreshCw className="mr-1 h-3 w-3 animate-spin" />
+                  <RefreshCw className="h-3 w-3 animate-spin" />
                   Saving…
                 </>
               ) : (
@@ -433,6 +416,6 @@ export function AttachmentPanel({ transcriptId, canEdit, onChanged }: Attachment
           </DialogFooter>
         </DialogContent>
       </Dialog>
-    </Card>
+    </div>
   );
 }

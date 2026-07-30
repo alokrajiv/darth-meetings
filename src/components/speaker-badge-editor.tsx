@@ -1,11 +1,10 @@
 'use client';
 
 import { useState } from 'react';
-import { Badge } from '@/components/ui/badge';
 import { Pencil } from 'lucide-react';
 import { UserPicker, type PickerPerson } from '@/components/user-picker';
 import type { SpeakerLabel } from '@/lib/format';
-import { defaultSpeakerLabel } from '@/lib/speaker-display';
+import { defaultSpeakerLabel, speakerColorVar } from '@/lib/speaker-display';
 
 interface SpeakerBadgeEditorProps {
   originalSpeaker: string;
@@ -27,9 +26,9 @@ interface SpeakerBadgeEditorProps {
 }
 
 /**
- * Inline pen on a speaker badge. Click the pen → badge transforms in place
- * into a compact UserPicker. The picker lets you either search Trames users
- * by name/email or commit free text via the "Use '…'" affordance. Save
+ * Inline speaker label with a pen. Click the pen → the label transforms in
+ * place into a compact UserPicker. The picker lets you either search Trames
+ * users by name/email or commit free text via the "Use '…'" affordance. Save
  * calls onSave with the new custom name; the parent does a global rename of
  * this speaker across the whole transcript.
  *
@@ -88,7 +87,7 @@ export function SpeakerBadgeEditor({
 
   return (
     <span
-      className="inline-flex items-center gap-1"
+      className="inline-flex min-w-0 items-center gap-1.5"
       onDoubleClick={(e) => {
         if (!canEdit) return;
         e.stopPropagation();
@@ -96,9 +95,16 @@ export function SpeakerBadgeEditor({
       }}
       title={canEdit ? 'Double-click to edit speaker' : ''}
     >
-      <Badge variant="outline">{currentDisplay}</Badge>
-      {mapping?.customName && (
-        <span className="text-[10px] text-muted-foreground">
+      <span
+        className="truncate text-xs font-semibold"
+        style={{ color: speakerColorVar(originalSpeaker) }}
+      >
+        {currentDisplay}
+      </span>
+      {mapping?.customName && mapping.customName !== defaultSpeakerLabel(originalSpeaker) && (
+        // Raw diarization label as a qualifier — but Meet/text imports arrive
+        // with real names as the raw label, where "Jane (Jane)" is noise.
+        <span className="shrink-0 text-[10px] text-muted-foreground">
           ({defaultSpeakerLabel(originalSpeaker)})
         </span>
       )}

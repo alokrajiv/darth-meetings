@@ -1,13 +1,12 @@
 'use client';
 
 import { useMemo, useState } from 'react';
-import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
-import { Badge } from '@/components/ui/badge';
+import { Card, CardContent, CardHeader } from '@/components/ui/card';
 import { type PickerPerson } from '@/components/user-picker';
 import { SpeakerPreviewDialog } from '@/components/speaker-preview-dialog';
 import { ChevronDown, ChevronUp, Pencil, Sparkles, Users } from 'lucide-react';
 import type { SpeakerLabel, SpeakerSuggestionMap } from '@/lib/format';
-import { defaultSpeakerLabel } from '@/lib/speaker-display';
+import { defaultSpeakerLabel, speakerColorVar } from '@/lib/speaker-display';
 
 interface Utterance {
   text: string;
@@ -41,10 +40,10 @@ interface SpeakerSummaryPanelProps {
 }
 
 /**
- * Top-of-page Speakers card. Each speaker is a single line: label badge,
- * line count, name (display), and one "Edit" button. Edit opens the
- * speaker dialog where you cycle speakers, hear their distinctive moments,
- * and set names + context — all consolidated there.
+ * Speakers card: a compact two-column grid of single-line rows — color dot,
+ * name, line count, inline auto-detected suggestion, and a hover Edit pencil
+ * that opens the speaker dialog where you cycle speakers, hear their
+ * distinctive moments, and set names + context.
  */
 export function SpeakerSummaryPanel({
   utterances,
@@ -74,145 +73,133 @@ export function SpeakerSummaryPanel({
     return counts;
   }, [utterances]);
 
-  const titleNode = (
-    <CardTitle className="flex items-center gap-2 text-base">
-      <Users className="h-4 w-4" />
-      Speakers
-      <Badge variant="outline" className="ml-1 text-[10px]">
+  const titleInner = (
+    <>
+      <Users className="h-4 w-4 shrink-0 text-muted-foreground" />
+      <span className="text-[13px] font-semibold">Speakers</span>
+      <span className="rounded-full bg-muted px-1.5 py-0.5 text-[11px] tabular-nums text-muted-foreground">
         {uniqueSpeakers.length}
-      </Badge>
-    </CardTitle>
+      </span>
+    </>
   );
 
   return (
     <>
       <Card>
-        <CardHeader className="pb-3">
-          {onToggleCollapse ? (
-            <button
-              type="button"
-              onClick={onToggleCollapse}
-              aria-expanded={!collapsed}
-              className="flex w-full items-center justify-between text-left"
-            >
-              {titleNode}
-              {collapsed ? (
-                <ChevronDown className="h-4 w-4 text-muted-foreground" />
-              ) : (
-                <ChevronUp className="h-4 w-4 text-muted-foreground" />
-              )}
-            </button>
-          ) : (
-            titleNode
-          )}
+        <CardHeader className="px-4 pt-3 pb-2">
+          <div className="flex items-center gap-2">
+            {onToggleCollapse ? (
+              <button
+                type="button"
+                onClick={onToggleCollapse}
+                aria-expanded={!collapsed}
+                className="flex min-w-0 flex-1 items-center gap-2 text-left"
+              >
+                {titleInner}
+                {collapsed ? (
+                  <ChevronDown className="ml-auto h-4 w-4 shrink-0 text-muted-foreground" />
+                ) : (
+                  <ChevronUp className="ml-auto h-4 w-4 shrink-0 text-muted-foreground" />
+                )}
+              </button>
+            ) : (
+              <div className="flex min-w-0 flex-1 items-center gap-2">{titleInner}</div>
+            )}
+            {canEdit && onGuessNames && (
+              <button
+                type="button"
+                onClick={onGuessNames}
+                disabled={guessingNames}
+                title="Match each voice against known people (local voiceprints — no AI call)"
+                className="flex shrink-0 items-center gap-1 rounded-md border border-primary/30 px-2 py-1 text-[11px] text-primary transition-colors hover:bg-accent disabled:opacity-50"
+              >
+                <Sparkles className={`h-3 w-3 ${guessingNames ? 'animate-pulse' : ''}`} />
+                {guessingNames ? 'Listening…' : 'Guess names'}
+              </button>
+            )}
+          </div>
         </CardHeader>
         {!collapsed && (
-          <CardContent className="space-y-1.5 pb-3">
-            {canEdit && onGuessNames && (
-              <div className="flex justify-end pb-1">
-                <button
-                  type="button"
-                  onClick={onGuessNames}
-                  disabled={guessingNames}
-                  title="Match each voice against known people (local voiceprints — no AI call)"
-                  className="flex items-center gap-1 rounded border border-violet-300 px-2 py-1 text-[11px] text-violet-700 hover:bg-violet-50 disabled:opacity-50 dark:border-violet-700 dark:text-violet-300 dark:hover:bg-violet-950 transition-colors"
-                >
-                  <Sparkles className={`h-3 w-3 ${guessingNames ? 'animate-pulse' : ''}`} />
-                  {guessingNames ? 'Listening…' : 'Guess names'}
-                </button>
-              </div>
-            )}
-            {uniqueSpeakers.map((speaker) => {
-              const mapping = speakerLabels.find((m) => m.originalSpeaker === speaker);
-              const name = mapping?.customName?.trim() ?? '';
-              const description = mapping?.description?.trim() ?? '';
-              const displayName = name || `Unnamed · ${defaultSpeakerLabel(speaker)}`;
-              return (
-                <div key={speaker} className="rounded-md border bg-card px-2 py-1.5">
-                  <div className="flex items-center gap-2">
-                    <Badge variant="outline" className="shrink-0">
-                      {defaultSpeakerLabel(speaker)}
-                    </Badge>
-                    <span className="shrink-0 text-[11px] text-muted-foreground">
-                      {(utteranceCounts[speaker] ?? 0)} line
-                      {(utteranceCounts[speaker] ?? 0) === 1 ? '' : 's'}
-                    </span>
-                    <div
-                      className={`min-w-0 flex-1 truncate text-sm ${
-                        name ? '' : 'text-muted-foreground italic'
+          <CardContent className="px-4 pb-4">
+            <div className="grid gap-x-6 gap-y-0.5 sm:grid-cols-2">
+              {uniqueSpeakers.map((speaker) => {
+                const mapping = speakerLabels.find((m) => m.originalSpeaker === speaker);
+                const name = mapping?.customName?.trim() ?? '';
+                const description = mapping?.description?.trim() ?? '';
+                const count = utteranceCounts[speaker] ?? 0;
+                const suggestion = !name ? suggestions?.[speaker] : undefined;
+                return (
+                  <div
+                    key={speaker}
+                    className="group flex h-9 items-center gap-2 rounded-md px-2 hover:bg-muted/60"
+                    onDoubleClick={() => canEdit && setEditSpeaker(speaker)}
+                    title={description || (canEdit ? 'Double-click to edit' : undefined)}
+                  >
+                    <span
+                      className="h-2.5 w-2.5 shrink-0 rounded-full"
+                      style={{ backgroundColor: speakerColorVar(speaker) }}
+                    />
+                    <span
+                      className={`truncate text-sm ${
+                        name ? 'font-medium' : 'italic text-muted-foreground'
                       }`}
-                      onDoubleClick={() => canEdit && setEditSpeaker(speaker)}
-                      title={canEdit ? 'Double-click to edit' : ''}
                     >
-                      {displayName}
-                    </div>
-                    {canEdit && (
-                      <button
-                        type="button"
-                        onClick={() => setEditSpeaker(speaker)}
-                        className="flex shrink-0 items-center gap-1 rounded px-2 py-1 text-[11px] text-muted-foreground hover:bg-muted hover:text-foreground transition-colors"
-                        title="Edit name & context (and preview this voice)"
-                      >
-                        <Pencil className="h-3 w-3" />
-                        Edit
-                      </button>
-                    )}
-                  </div>
-                  {description && (
-                    <p
-                      onDoubleClick={() => canEdit && setEditSpeaker(speaker)}
-                      className="pt-1 text-xs text-muted-foreground whitespace-pre-wrap"
-                      title={canEdit ? 'Double-click to edit' : ''}
-                    >
-                      {description}
-                    </p>
-                  )}
-                  {/* Auto-detected identity — only while the speaker is unnamed. */}
-                  {!name && suggestions?.[speaker] && (() => {
-                    const s = suggestions[speaker]!;
-                    const isVoice = s.source !== 'context';
-                    return (
-                      <div className="flex flex-wrap items-center gap-2 pt-1">
+                      {name || defaultSpeakerLabel(speaker)}
+                    </span>
+                    <span className="shrink-0 font-mono text-[11px] tabular-nums text-muted-foreground">
+                      · {count} {count === 1 ? 'line' : 'lines'}
+                    </span>
+                    {suggestion && (
+                      <>
                         <span
-                          className="flex items-center gap-1 text-xs text-violet-600 dark:text-violet-400"
-                          title={!isVoice && s.evidence ? `Evidence: ${s.evidence}` : undefined}
+                          className="flex min-w-0 items-center gap-1 text-xs text-primary"
+                          title={
+                            suggestion.evidence
+                              ? `Evidence: ${suggestion.evidence}`
+                              : suggestion.source !== 'context'
+                                ? `${Math.round(suggestion.confidence * 100)}% voice match`
+                                : undefined
+                          }
                         >
-                          <Sparkles className="h-3 w-3" />
-                          {isVoice ? 'Sounds like' : 'Transcript suggests'}{' '}
-                          <strong>{s.name}</strong>
-                          {isVoice ? (
-                            <span className="text-muted-foreground">
-                              ({Math.round(s.confidence * 100)}% voice match)
-                            </span>
-                          ) : (
-                            <span className="text-muted-foreground">(from context)</span>
-                          )}
+                          <Sparkles className="h-3 w-3 shrink-0" />
+                          <span className="truncate">{suggestion.name}?</span>
                         </span>
                         {canEdit && (
                           <>
                             <button
                               type="button"
-                              onClick={() => onSave(speaker, { customName: s.name })}
-                              className="rounded border border-violet-300 px-1.5 py-0.5 text-[11px] text-violet-700 hover:bg-violet-50 dark:border-violet-700 dark:text-violet-300 dark:hover:bg-violet-950 transition-colors"
+                              onClick={() => onSave(speaker, { customName: suggestion.name })}
+                              className="shrink-0 rounded border border-primary/30 px-1.5 py-0.5 text-[11px] text-primary transition-colors hover:bg-accent"
                             >
                               Confirm
                             </button>
                             <button
                               type="button"
-                              onClick={() => onRequestCreatePerson(speaker, s.name)}
+                              onClick={() => onRequestCreatePerson(speaker, suggestion.name)}
                               title="Confirm and add this person to the people directory"
-                              className="rounded border px-1.5 py-0.5 text-[11px] text-muted-foreground hover:bg-muted hover:text-foreground transition-colors"
+                              className="shrink-0 rounded border px-1.5 py-0.5 text-[11px] text-muted-foreground transition-colors hover:bg-muted hover:text-foreground"
                             >
-                              + Add person
+                              + Person
                             </button>
                           </>
                         )}
-                      </div>
-                    );
-                  })()}
-                </div>
-              );
-            })}
+                      </>
+                    )}
+                    {canEdit && (
+                      <button
+                        type="button"
+                        onClick={() => setEditSpeaker(speaker)}
+                        className="ml-auto shrink-0 rounded p-1 text-muted-foreground opacity-0 transition-opacity hover:bg-muted hover:text-foreground group-hover:opacity-100"
+                        title="Edit name & context (and preview this voice)"
+                        aria-label={`Edit speaker ${defaultSpeakerLabel(speaker)}`}
+                      >
+                        <Pencil className="h-3 w-3" />
+                      </button>
+                    )}
+                  </div>
+                );
+              })}
+            </div>
           </CardContent>
         )}
       </Card>

@@ -1,7 +1,6 @@
 'use client';
 
 import { useState, useCallback, useRef } from 'react';
-import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
 import { Progress } from '@/components/ui/progress';
 import { Badge } from '@/components/ui/badge';
@@ -15,6 +14,10 @@ import {
 import { Label } from '@/components/ui/label';
 import { Upload, FileAudio, X, CheckCircle, AlertCircle } from 'lucide-react';
 import type { StoredTranscript } from '@/lib/format';
+
+/** DOM id of the hidden file input — lets the page header's "Upload audio"
+ * button trigger the picker without threading refs across components. */
+export const AUDIO_UPLOAD_INPUT_ID = 'audio-upload-file-input';
 
 interface AudioUploadProps {
   onTranscriptCreated?: () => void;
@@ -256,11 +259,11 @@ export function AudioUpload({ onTranscriptCreated }: AudioUploadProps) {
   const getStatusIcon = (status: UploadStatus['status']) => {
     switch (status) {
       case 'completed':
-        return <CheckCircle className="h-4 w-4 text-green-500" />;
+        return <CheckCircle className="h-4 w-4 text-status-ok" />;
       case 'error':
-        return <AlertCircle className="h-4 w-4 text-red-500" />;
+        return <AlertCircle className="h-4 w-4 text-destructive" />;
       default:
-        return <FileAudio className="h-4 w-4 text-blue-500" />;
+        return <FileAudio className="h-4 w-4 text-primary" />;
     }
   };
 
@@ -281,80 +284,82 @@ export function AudioUpload({ onTranscriptCreated }: AudioUploadProps) {
 
   return (
     <>
-      <Card>
-        <CardHeader>
-          <CardTitle className="flex items-center gap-2">
-            <Upload className="h-5 w-5" />
-            Upload Audio Files
-          </CardTitle>
-        </CardHeader>
-        <CardContent className="space-y-4">
-          <div
-            className={`border-2 border-dashed rounded-lg p-4 sm:p-8 text-center transition-colors ${
-              isDragging ? 'border-blue-500 bg-blue-50' : 'border-gray-300 hover:border-gray-400'
-            }`}
-            onDragOver={handleDragOver}
-            onDragLeave={handleDragLeave}
-            onDrop={handleDrop}
-          >
-            <Upload className="h-8 w-8 sm:h-12 sm:w-12 mx-auto text-gray-400 mb-2 sm:mb-4" />
-            <p className="text-sm sm:text-lg font-medium mb-1 sm:mb-2">
-              Drop files here or click to browse
-            </p>
-            <p className="text-xs sm:text-sm text-muted-foreground mb-3 sm:mb-4">
-              Upload any audio or video file — we&apos;ll handle the rest
-            </p>
-            <Button onClick={handleFileSelect} variant="outline" size="sm">
-              Select Files
-            </Button>
-            <input
-              ref={fileInputRef}
-              type="file"
-              multiple
-              onChange={handleFileInputChange}
-              className="hidden"
-            />
-          </div>
+      <div className="space-y-3">
+        <div
+          className={`flex cursor-pointer items-center gap-3 rounded-lg border border-dashed bg-card px-4 py-3 transition-colors ${
+            isDragging
+              ? 'border-primary bg-accent/60'
+              : 'border-input hover:border-primary/50 hover:bg-accent/40'
+          }`}
+          onClick={handleFileSelect}
+          onDragOver={handleDragOver}
+          onDragLeave={handleDragLeave}
+          onDrop={handleDrop}
+        >
+          <Upload className="h-4 w-4 shrink-0 text-muted-foreground" />
+          <p className="text-sm">
+            <span className="font-medium">Drop audio or video here</span>{' '}
+            <span className="text-muted-foreground">or click to browse — up to 4 GB</span>
+          </p>
+          <span className="ml-auto hidden text-[11px] text-muted-foreground sm:block">
+            mp3 · m4a · mp4 · wav
+          </span>
+          <input
+            id={AUDIO_UPLOAD_INPUT_ID}
+            ref={fileInputRef}
+            type="file"
+            multiple
+            onChange={handleFileInputChange}
+            onClick={(e) => e.stopPropagation()}
+            className="hidden"
+          />
+        </div>
 
-          {uploads.length > 0 && (
-            <div className="space-y-3">
-              <h4 className="font-medium">Upload Queue</h4>
-              {uploads.map((upload, index) => (
-                <div key={`${upload.file.name}-${index}`} className="border rounded-lg p-3">
-                  <div className="flex items-center justify-between mb-2">
-                    <div className="flex items-center gap-2">
-                      {getStatusIcon(upload.status)}
-                      <span className="font-medium text-sm">{upload.file.name}</span>
-                      <Badge variant="outline" className="text-xs">
-                        {formatFileSize(upload.file.size)}
-                      </Badge>
-                    </div>
-                    <div className="flex items-center gap-2">
-                      <span className="text-sm text-muted-foreground">{getStatusText(upload)}</span>
-                      {(upload.status === 'completed' || upload.status === 'error') && (
-                        <Button variant="ghost" size="sm" onClick={() => removeUpload(upload.file)}>
-                          <X className="h-4 w-4" />
-                        </Button>
-                      )}
-                    </div>
+        {uploads.length > 0 && (
+          <div className="space-y-2">
+            {uploads.map((upload, index) => (
+              <div
+                key={`${upload.file.name}-${index}`}
+                className="rounded-md border bg-card px-3 py-2"
+              >
+                <div className="flex items-center justify-between gap-3">
+                  <div className="flex min-w-0 items-center gap-2">
+                    {getStatusIcon(upload.status)}
+                    <span className="truncate text-sm font-medium">{upload.file.name}</span>
+                    <span className="shrink-0 font-mono text-[11px] tabular-nums text-muted-foreground">
+                      {formatFileSize(upload.file.size)}
+                    </span>
                   </div>
-                  {(upload.status === 'uploading' || upload.status === 'transcribing') && (
-                    <Progress value={upload.progress} className="h-2" />
-                  )}
-                  {upload.status === 'error' && upload.error && (
-                    <p className="text-sm text-red-500 mt-1">{upload.error}</p>
-                  )}
+                  <div className="flex shrink-0 items-center gap-2">
+                    <span className="text-xs text-muted-foreground">{getStatusText(upload)}</span>
+                    {(upload.status === 'completed' || upload.status === 'error') && (
+                      <Button
+                        variant="ghost"
+                        size="sm"
+                        className="h-7 w-7 p-0"
+                        onClick={() => removeUpload(upload.file)}
+                      >
+                        <X className="h-4 w-4" />
+                      </Button>
+                    )}
+                  </div>
                 </div>
-              ))}
-            </div>
-          )}
-        </CardContent>
-      </Card>
+                {(upload.status === 'uploading' || upload.status === 'transcribing') && (
+                  <Progress value={upload.progress} className="mt-2 h-1" />
+                )}
+                {upload.status === 'error' && upload.error && (
+                  <p className="mt-1 text-xs text-destructive">{upload.error}</p>
+                )}
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
 
       <Dialog open={isDialogOpen} onOpenChange={setIsDialogOpen}>
-        <DialogContent>
+        <DialogContent className="rounded-xl shadow-[0_4px_16px_-2px_rgb(0_0_0/0.08),0_1px_2px_0_rgb(0_0_0/0.04)]">
           <DialogHeader>
-            <DialogTitle>Upload Settings</DialogTitle>
+            <DialogTitle className="text-base font-semibold">Upload Settings</DialogTitle>
           </DialogHeader>
           <div className="space-y-4 py-4">
             <div className="space-y-2">
@@ -379,7 +384,7 @@ export function AudioUpload({ onTranscriptCreated }: AudioUploadProps) {
                 id="language-select"
                 value={selectedLanguage}
                 onChange={(e) => setSelectedLanguage(e.target.value)}
-                className="flex h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm ring-offset-background focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2"
+                className="flex h-9 w-full rounded-md border border-input bg-background px-3 py-1.5 text-sm ring-offset-background focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2"
               >
                 {LANGUAGE_OPTIONS.map((lang) => (
                   <option key={lang.code} value={lang.code}>
@@ -393,7 +398,7 @@ export function AudioUpload({ onTranscriptCreated }: AudioUploadProps) {
             </div>
           </div>
           <DialogFooter>
-            <Button variant="outline" onClick={handleCancelUpload}>
+            <Button variant="ghost" onClick={handleCancelUpload}>
               Cancel
             </Button>
             <Button onClick={handleConfirmUpload}>Start Transcription</Button>

@@ -305,6 +305,30 @@ export function formatDuration(seconds: number): string {
   }
 }
 
+/**
+ * Scannable date: "Today 14:05" / "Yesterday" / "Tuesday" (<7 days) /
+ * "12 Jun" (same year) / "12 Jun 2025". Pair with a `title` attribute
+ * carrying the full locale timestamp for precision on demand.
+ */
+export function formatSmartDate(iso: string): string {
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return '';
+  const now = new Date();
+  const startOfDay = (x: Date) => new Date(x.getFullYear(), x.getMonth(), x.getDate());
+  const dayDiff = Math.round(
+    (startOfDay(now).getTime() - startOfDay(d).getTime()) / 86_400_000
+  );
+  if (dayDiff === 0) {
+    return `Today ${d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}`;
+  }
+  if (dayDiff === 1) return 'Yesterday';
+  if (dayDiff > 1 && dayDiff < 7) return d.toLocaleDateString([], { weekday: 'long' });
+  if (d.getFullYear() === now.getFullYear()) {
+    return d.toLocaleDateString([], { day: 'numeric', month: 'short' });
+  }
+  return d.toLocaleDateString([], { day: 'numeric', month: 'short', year: 'numeric' });
+}
+
 export function formatTime(milliseconds: number): string {
   const totalSeconds = Math.floor(milliseconds / 1000);
   const minutes = Math.floor(totalSeconds / 60);

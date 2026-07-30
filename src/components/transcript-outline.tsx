@@ -69,11 +69,8 @@ export function TranscriptOutline({
       : -1;
 
   return (
-    <nav
-      aria-label="Transcript outline"
-      className="text-sm space-y-3 rounded-md border bg-card/40 p-3"
-    >
-      <div className="flex items-center gap-1.5 text-[11px] font-semibold uppercase tracking-wide text-muted-foreground">
+    <nav aria-label="Transcript outline" className="text-sm space-y-3">
+      <div className="flex items-center gap-1.5 text-[11px] font-semibold uppercase tracking-wider text-muted-foreground">
         <ListTree className="h-3 w-3" />
         On this page
       </div>
@@ -85,7 +82,7 @@ export function TranscriptOutline({
               href="#notes"
               className={`flex items-center gap-1.5 rounded px-2 py-1 transition-colors ${
                 isActive('notes')
-                  ? 'bg-muted font-medium text-foreground'
+                  ? 'bg-accent/60 font-medium text-primary'
                   : 'text-muted-foreground hover:bg-muted hover:text-foreground'
               }`}
             >
@@ -100,7 +97,7 @@ export function TranscriptOutline({
                       href={`#${h.slug}`}
                       className={`block truncate rounded px-2 py-0.5 text-xs transition-colors ${
                         isActive(h.slug)
-                          ? 'bg-muted font-medium text-foreground'
+                          ? 'bg-accent/60 font-medium text-primary'
                           : 'text-muted-foreground hover:bg-muted hover:text-foreground'
                       }`}
                       style={{ paddingLeft: `${(h.level - minLevel) * 0.6 + 0.5}rem` }}
@@ -120,7 +117,7 @@ export function TranscriptOutline({
               href="#speakers"
               className={`flex items-center gap-1.5 rounded px-2 py-1 transition-colors ${
                 isActive('speakers')
-                  ? 'bg-muted font-medium text-foreground'
+                  ? 'bg-accent/60 font-medium text-primary'
                   : 'text-muted-foreground hover:bg-muted hover:text-foreground'
               }`}
             >
@@ -134,7 +131,7 @@ export function TranscriptOutline({
             href="#transcript"
             className={`flex items-center gap-1.5 rounded px-2 py-1 transition-colors ${
               isActive('transcript')
-                ? 'bg-muted font-medium text-foreground'
+                ? 'bg-accent/60 font-medium text-primary'
                 : 'text-muted-foreground hover:bg-muted hover:text-foreground'
             }`}
           >
@@ -158,7 +155,7 @@ export function TranscriptOutline({
                 onClick={() => onJumpToSeconds(startSec)}
                 className={`flex w-full items-baseline gap-1.5 rounded px-2 py-1 text-left text-xs transition-colors ${
                   isActiveSeg
-                    ? 'bg-muted text-foreground font-semibold'
+                    ? 'bg-accent/60 font-medium text-primary'
                     : 'text-muted-foreground hover:bg-muted hover:text-foreground'
                 }`}
                 title={`Jump to ${formatHMS(startSec)} — ${seg.title}`}
@@ -182,7 +179,7 @@ export function TranscriptOutline({
                 onClick={() => onJumpToSeconds(s)}
                 className={`block w-full text-left rounded px-2 py-1 text-xs font-mono transition-colors ${
                   isActive
-                    ? 'bg-muted text-foreground font-semibold'
+                    ? 'bg-accent/60 font-medium text-primary'
                     : 'text-muted-foreground hover:bg-muted hover:text-foreground'
                 }`}
                 title={`Jump to ${formatHMS(s)}`}

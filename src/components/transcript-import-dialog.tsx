@@ -111,9 +111,11 @@ export function TranscriptImportDialog({ open, onClose, onImported }: Transcript
 
   return (
     <Dialog open={open} onOpenChange={(o) => (!o ? handleClose() : null)}>
-      <DialogContent className="sm:max-w-xl">
+      <DialogContent className="sm:max-w-lg rounded-xl shadow-[0_4px_16px_-2px_rgb(0_0_0/0.08),0_1px_2px_0_rgb(0_0_0/0.04)]">
         <DialogHeader>
-          <DialogTitle>Import a transcript (any format)</DialogTitle>
+          <DialogTitle className="text-base font-semibold">
+            Import a transcript (any format)
+          </DialogTitle>
         </DialogHeader>
 
         {step === 'input' && (
@@ -182,7 +184,7 @@ export function TranscriptImportDialog({ open, onClose, onImported }: Transcript
             </div>
 
             {error && (
-              <p className="text-sm text-red-500 flex items-center gap-1">
+              <p className="text-xs text-destructive flex items-center gap-1">
                 <AlertCircle className="h-4 w-4" />
                 {error}
               </p>
@@ -192,7 +194,7 @@ export function TranscriptImportDialog({ open, onClose, onImported }: Transcript
 
         {step === 'working' && (
           <div className="py-8 text-center space-y-3">
-            <Sparkles className="h-10 w-10 mx-auto text-violet-500 animate-pulse" />
+            <Sparkles className="h-10 w-10 mx-auto text-primary animate-pulse" />
             <p className="text-sm text-muted-foreground">
               AI is reading the format and normalizing the transcript — usually under a
               minute. Keep this tab open.
@@ -202,7 +204,7 @@ export function TranscriptImportDialog({ open, onClose, onImported }: Transcript
 
         {step === 'done' && (
           <div className="py-6 text-center space-y-2">
-            <CheckCircle2 className="h-10 w-10 mx-auto text-green-500" />
+            <CheckCircle2 className="h-10 w-10 mx-auto text-status-ok" />
             <p className="text-sm font-medium">{doneTitle ?? 'Transcript imported'}</p>
             <p className="text-sm text-muted-foreground">
               Imported with named speakers — it&apos;s in your list now.
@@ -221,7 +223,7 @@ export function TranscriptImportDialog({ open, onClose, onImported }: Transcript
         <DialogFooter>
           {step === 'input' && (
             <>
-              <Button variant="outline" onClick={handleClose} disabled={busy}>
+              <Button variant="ghost" onClick={handleClose} disabled={busy}>
                 Cancel
               </Button>
               <Button onClick={() => void runImport()} disabled={busy || (!file && pasted.trim().length < 20)}>

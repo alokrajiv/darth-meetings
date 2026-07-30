@@ -1,7 +1,6 @@
 'use client';
 
 import { useEffect, useRef, useState } from 'react';
-import { Badge } from '@/components/ui/badge';
 import { formatTime, type SpeakerLabel } from '@/lib/format';
 import { SpeakerBadgeEditor } from '@/components/speaker-badge-editor';
 import type { PickerPerson } from '@/components/user-picker';
@@ -27,7 +26,7 @@ interface EditableUtteranceProps {
   utterance: Utterance;
   /** Composed display text (raw + any text override). */
   displayText: string;
-  /** Whether the displayed text differs from raw — used to show an "edited" badge. */
+  /** Whether the displayed text differs from raw — used to show an "edited" dot. */
   isTextEdited: boolean;
   /** Whether this utterance is the one currently playing in the audio player. */
   isActive: boolean;
@@ -39,10 +38,13 @@ interface EditableUtteranceProps {
   onSeek: (index: number) => void;
   /** Click-to-edit on text saved this new value. */
   onSaveText: (index: number, newText: string) => void;
-  /** Pen on speaker badge saved a partial speaker patch (name only — description goes through the summary panel). */
+  /** Pen on speaker label saved a partial speaker patch (name only — description goes through the summary panel). */
   onSaveSpeaker: (originalSpeaker: string, patch: { customName: string }) => void;
   /** Controls both text and speaker editing affordances. */
   canEdit: boolean;
+  /** Speaker-turn grouping: render the speaker header line only when this is
+   *  the first utterance of a turn (or the first after a segment heading). */
+  showSpeaker: boolean;
   /** Forwarded to SpeakerBadgeEditor so the page can show the add-to-access prompt. */
   onPickPerson?: (person: PickerPerson) => void;
   /** Forwarded to SpeakerBadgeEditor so the page can open AddPersonDialog. */
@@ -50,8 +52,10 @@ interface EditableUtteranceProps {
 }
 
 /**
- * One utterance in the transcript view. Click the text to edit it inline.
- * Click the pen on the speaker badge to rename that speaker globally.
+ * One utterance in the transcript view, laid out as a document row:
+ * timestamp gutter on the left, speaker header (per turn) + text on the
+ * right. Double-click the text to edit it inline. Click the pen on the
+ * speaker label to rename that speaker globally.
  *
  * Editing the text writes to `transcript_edits` (per-user, per-utterance);
  * editing the speaker writes to `speaker_mappings` (per-user, global to this
@@ -69,6 +73,7 @@ export function EditableUtterance({
   onSaveText,
   onSaveSpeaker,
   canEdit,
+  showSpeaker,
   onPickPerson,
   onRequestCreatePerson,
 }: EditableUtteranceProps) {
@@ -138,7 +143,7 @@ export function EditableUtterance({
 
   // The whole row is the click target so the hover-highlighted area is
   // also the clickable seek surface. Action elements (timestamp button,
-  // speaker badge, pencil icons, edit textarea) stop propagation so they
+  // speaker label, pencil icons, edit textarea) stop propagation so they
   // keep their own behaviors.
   const handleRowClick = (e: React.MouseEvent) => {
     if (isEditingText) return;
@@ -155,17 +160,25 @@ export function EditableUtterance({
     setIsEditingText(true);
   };
 
+  const editedDot = (
+    <span
+      className="inline-block h-1.5 w-1.5 shrink-0 rounded-full bg-primary/50"
+      title="Edited"
+      aria-label="Edited"
+    />
+  );
+
   return (
     <div
       data-utterance-index={index}
       onClick={handleRowClick}
       onDoubleClick={handleRowDoubleClick}
-      className={`group rounded-md border-l-4 pl-4 py-2 transition-colors ${
+      className={`group relative grid grid-cols-[64px_minmax(0,1fr)] gap-x-3 rounded-md py-1 transition-colors ${
         isEditingText ? '' : 'cursor-pointer'
       } ${
         isActive
-          ? 'border-blue-500 bg-blue-50'
-          : 'border-blue-200 hover:bg-muted/40'
+          ? 'bg-accent/50 before:absolute before:left-[-12px] before:top-1 before:bottom-1 before:w-0.5 before:rounded-full before:bg-primary'
+          : 'hover:bg-muted/50'
       }`}
       title={
         isEditingText
@@ -175,77 +188,84 @@ export function EditableUtterance({
             : 'Click to seek'
       }
     >
-      <div
-        className="flex items-center gap-2 mb-1"
-        onDoubleClick={(e) => e.stopPropagation()}
+      <button
+        type="button"
+        onClick={(e) => {
+          e.stopPropagation();
+          onSeek(index);
+        }}
+        className={`pt-1 text-right font-mono text-[11px] tabular-nums ${
+          isActive
+            ? 'font-medium text-primary'
+            : 'text-muted-foreground/70 hover:text-primary'
+        }`}
+        title="Seek audio to this moment"
       >
-        <SpeakerBadgeEditor
-          originalSpeaker={utterance.speaker}
-          speakerLabels={speakerLabels}
-          onSave={onSaveSpeaker}
-          canEdit={canEdit}
-          onPickPerson={onPickPerson}
-          onRequestCreatePerson={onRequestCreatePerson}
-        />
+        {formatTime(utterance.start)}
+      </button>
+      <div className="min-w-0">
+        {showSpeaker && (
+          <div
+            className="mb-0.5 flex items-center gap-2"
+            onDoubleClick={(e) => e.stopPropagation()}
+          >
+            <SpeakerBadgeEditor
+              originalSpeaker={utterance.speaker}
+              speakerLabels={speakerLabels}
+              onSave={onSaveSpeaker}
+              canEdit={canEdit}
+              onPickPerson={onPickPerson}
+              onRequestCreatePerson={onRequestCreatePerson}
+            />
+            {isTextEdited && editedDot}
+          </div>
+        )}
+        {isEditingText && canEdit ? (
+          <textarea
+            ref={textareaRef}
+            value={draftText}
+            onChange={(e) => {
+              setDraftText(e.target.value);
+              autoResize(e.target);
+            }}
+            onBlur={commitText}
+            onClick={(e) => e.stopPropagation()}
+            onKeyDown={(e) => {
+              if (e.key === 'Enter' && !e.shiftKey) {
+                e.preventDefault();
+                commitText();
+              } else if (e.key === 'Escape') {
+                e.preventDefault();
+                cancelText();
+              }
+            }}
+            rows={1}
+            className="w-full resize-none rounded-md border bg-background p-2 text-sm focus:outline-none focus:ring-2 focus:ring-ring"
+          />
+        ) : (
+          <p className="max-w-[75ch] text-sm leading-6">
+            {highlights && highlights.length > 0
+              ? renderHighlightedText(displayText, highlights)
+              : displayText}
+            {isTextEdited && !showSpeaker && (
+              <span className="ml-1.5 inline-flex align-middle">{editedDot}</span>
+            )}
+          </p>
+        )}
+      </div>
+      {canEdit && !isEditingText && (
         <button
           type="button"
           onClick={(e) => {
             e.stopPropagation();
-            onSeek(index);
+            setIsEditingText(true);
           }}
-          className="text-sm text-muted-foreground hover:text-foreground hover:underline"
-          title="Seek audio to this moment"
+          className="absolute right-1 top-1 rounded p-1 text-muted-foreground opacity-0 transition-opacity hover:bg-muted hover:text-foreground group-hover:opacity-100"
+          title="Edit text"
+          aria-label="Edit utterance text"
         >
-          {formatTime(utterance.start)}
+          <Pencil className="h-3 w-3" />
         </button>
-        {isTextEdited && (
-          <Badge variant="secondary" className="text-[10px] uppercase tracking-wide">
-            edited
-          </Badge>
-        )}
-        {canEdit && !isEditingText && (
-          <button
-            type="button"
-            onClick={(e) => {
-              e.stopPropagation();
-              setIsEditingText(true);
-            }}
-            className="ml-auto rounded p-1 text-muted-foreground opacity-0 transition-opacity hover:bg-muted hover:text-foreground group-hover:opacity-100"
-            title="Edit text"
-            aria-label="Edit utterance text"
-          >
-            <Pencil className="h-3 w-3" />
-          </button>
-        )}
-      </div>
-      {isEditingText && canEdit ? (
-        <textarea
-          ref={textareaRef}
-          value={draftText}
-          onChange={(e) => {
-            setDraftText(e.target.value);
-            autoResize(e.target);
-          }}
-          onBlur={commitText}
-          onClick={(e) => e.stopPropagation()}
-          onKeyDown={(e) => {
-            if (e.key === 'Enter' && !e.shiftKey) {
-              e.preventDefault();
-              commitText();
-            } else if (e.key === 'Escape') {
-              e.preventDefault();
-              cancelText();
-            }
-          }}
-          rows={1}
-          className="w-full resize-none rounded-md border bg-background p-2 text-sm focus:outline-none focus:ring-2 focus:ring-ring"
-        />
-      ) : (
-        <p className="text-sm rounded-md px-1 -mx-1">
-          {highlights && highlights.length > 0
-            ? renderHighlightedText(displayText, highlights)
-            : displayText}
-        </p>
       )}
     </div>
   );

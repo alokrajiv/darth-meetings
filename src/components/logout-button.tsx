@@ -15,9 +15,15 @@ export function LogoutButton() {
   };
 
   return (
-    <Button variant="outline" size="sm" onClick={handleLogout} title="Logout">
-      <LogOut className="h-4 w-4 sm:mr-1" />
-      <span className="hidden sm:inline">Logout</span>
+    <Button
+      variant="ghost"
+      size="sm"
+      className="h-8 w-8 p-0"
+      onClick={handleLogout}
+      title="Logout"
+    >
+      <LogOut className="h-4 w-4" />
+      <span className="sr-only">Logout</span>
     </Button>
   );
 }

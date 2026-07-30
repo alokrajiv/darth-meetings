@@ -1,8 +1,7 @@
 'use client';
 
-import { useState, useEffect, useCallback, useMemo } from 'react';
+import { useState, useEffect, useCallback, useMemo, useRef } from 'react';
 import { useRouter } from 'next/navigation';
-import { formatDistanceToNow } from 'date-fns';
 import {
   Table,
   TableBody,
@@ -13,12 +12,22 @@ import {
 } from '@/components/ui/table';
 import { Button } from '@/components/ui/button';
 import { Badge } from '@/components/ui/badge';
-import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
+import { Input } from '@/components/ui/input';
 import {
   formatDuration,
+  formatSmartDate,
   type TranscriptListRow,
 } from '@/lib/format';
-import { Trash2, RefreshCw, Users, Clock, FileAudio } from 'lucide-react';
+import {
+  Trash2,
+  RefreshCw,
+  FileAudio,
+  FileText,
+  Video,
+  Search,
+  ChevronRight,
+  Inbox,
+} from 'lucide-react';
 
 interface TranscriptTableProps {
   refreshTrigger?: number;
@@ -26,12 +35,16 @@ interface TranscriptTableProps {
 
 type TabKey = 'all' | 'mine' | 'shared';
 
+const RESTING_SHADOW = 'shadow-[0_1px_2px_0_rgb(0_0_0/0.04)]';
+
 export function TranscriptTable({ refreshTrigger }: TranscriptTableProps) {
   const router = useRouter();
   const [transcripts, setTranscripts] = useState<TranscriptListRow[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [tab, setTab] = useState<TabKey>('all');
+  const [query, setQuery] = useState('');
+  const searchRef = useRef<HTMLInputElement>(null);
 
   const loadTranscripts = useCallback(async () => {
     try {
@@ -54,6 +67,24 @@ export function TranscriptTable({ refreshTrigger }: TranscriptTableProps) {
     loadTranscripts();
   }, [loadTranscripts, refreshTrigger]);
 
+  // Global `/` focuses the search input when no other field has focus.
+  useEffect(() => {
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.key !== '/' || e.metaKey || e.ctrlKey || e.altKey) return;
+      const el = document.activeElement as HTMLElement | null;
+      if (
+        el &&
+        (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA' || el.isContentEditable)
+      ) {
+        return;
+      }
+      e.preventDefault();
+      searchRef.current?.focus();
+    };
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+  }, []);
+
   const counts = useMemo(() => {
     return {
       all: transcripts.length,
@@ -63,10 +94,19 @@ export function TranscriptTable({ refreshTrigger }: TranscriptTableProps) {
   }, [transcripts]);
 
   const filtered = useMemo(() => {
-    if (tab === 'mine') return transcripts.filter((t) => t.access === 'owner');
-    if (tab === 'shared') return transcripts.filter((t) => t.access !== 'owner');
-    return transcripts;
-  }, [transcripts, tab]);
+    let rows = transcripts;
+    if (tab === 'mine') rows = rows.filter((t) => t.access === 'owner');
+    else if (tab === 'shared') rows = rows.filter((t) => t.access !== 'owner');
+    const q = query.trim().toLowerCase();
+    if (q) {
+      rows = rows.filter((t) =>
+        [t.title, t.original_filename, t.owner_name, t.owner_email].some((v) =>
+          v?.toLowerCase().includes(q)
+        )
+      );
+    }
+    return rows;
+  }, [transcripts, tab, query]);
 
   const handleDeleteTranscript = async (e: React.MouseEvent, assemblyaiId: string) => {
     e.stopPropagation();
@@ -84,39 +124,69 @@ export function TranscriptTable({ refreshTrigger }: TranscriptTableProps) {
     }
   };
 
-  const statusBadge = (status: string) => {
+  const statusDot = (status: string) => {
+    const base = 'inline-flex h-2 w-2 shrink-0 rounded-full';
     switch (status) {
       case 'completed':
-        return (
-          <span className="inline-flex h-1.5 w-1.5 rounded-full bg-green-500" aria-label="Completed" />
-        );
+        return <span className={`${base} bg-status-ok`} aria-label="Completed" />;
       case 'processing':
-        return (
-          <span className="inline-flex h-1.5 w-1.5 rounded-full bg-amber-500 animate-pulse" aria-label="Processing" />
-        );
+        return <span className={`${base} bg-status-busy animate-pulse`} aria-label="Processing" />;
       case 'queued':
-        return (
-          <span className="inline-flex h-1.5 w-1.5 rounded-full bg-slate-400" aria-label="Queued" />
-        );
+        return <span className={`${base} bg-muted-foreground/40`} aria-label="Queued" />;
       case 'error':
-        return (
-          <span className="inline-flex h-1.5 w-1.5 rounded-full bg-red-500" aria-label="Error" />
-        );
+        return <span className={`${base} bg-status-err`} aria-label="Error" />;
       default:
-        return (
-          <span className="inline-flex h-1.5 w-1.5 rounded-full bg-slate-300" aria-label={status} />
-        );
+        return <span className={`${base} bg-muted-foreground/40`} aria-label={status} />;
     }
   };
 
-  const accessBadge = (access: TranscriptListRow['access']) => {
-    if (access === 'owner') return null;
+  const sourceIcon = (t: TranscriptListRow) => {
+    if (t.assemblyai_id.startsWith('gmeet-')) {
+      return (
+        <span title="Google Meet" className="shrink-0">
+          <Video className="h-3.5 w-3.5 text-muted-foreground" />
+        </span>
+      );
+    }
+    if (t.source === 'uploaded') {
+      return (
+        <span title="Uploaded audio" className="shrink-0">
+          <FileAudio className="h-3.5 w-3.5 text-muted-foreground" />
+        </span>
+      );
+    }
     return (
-      <Badge variant="outline" className="text-[10px]">
-        <Users className="h-3 w-3 mr-1" />
-        {access === 'edit' ? 'Shared · Editor' : 'Shared · Read'}
-      </Badge>
+      <span title="Imported transcript" className="shrink-0">
+        <FileText className="h-3.5 w-3.5 text-muted-foreground" />
+      </span>
     );
+  };
+
+  const ownerCell = (t: TranscriptListRow) => {
+    if (t.access === 'owner') {
+      return <span className="text-xs text-muted-foreground">You</span>;
+    }
+    const first = t.owner_name?.trim().split(/\s+/)[0] || t.owner_email || '—';
+    return (
+      <span className="flex items-center gap-1.5">
+        <span className="truncate text-xs text-muted-foreground">{first}</span>
+        <Badge variant="outline" className="shrink-0 text-[10px]">
+          {t.access === 'edit' ? 'Editor' : 'Read'}
+        </Badge>
+      </span>
+    );
+  };
+
+  const titleOf = (
+    t: TranscriptListRow
+  ): { primary: string; secondary: string | null; untitled: boolean } => {
+    if (t.title && t.title.trim().length > 0) {
+      return { primary: t.title, secondary: t.original_filename || null, untitled: false };
+    }
+    if (t.original_filename) {
+      return { primary: t.original_filename, secondary: null, untitled: false };
+    }
+    return { primary: 'Untitled meeting', secondary: null, untitled: true };
   };
 
   const tabButton = (key: TabKey, label: string, count: number) => (
@@ -124,190 +194,245 @@ export function TranscriptTable({ refreshTrigger }: TranscriptTableProps) {
       key={key}
       type="button"
       onClick={() => setTab(key)}
-      className={`rounded-md px-3 py-1 text-xs transition-colors ${
+      className={`relative px-2.5 pb-2.5 pt-1 text-sm transition-colors ${
         tab === key
-          ? 'bg-muted font-medium'
+          ? 'font-medium text-foreground after:absolute after:inset-x-0 after:-bottom-px after:h-0.5 after:rounded-full after:bg-primary'
           : 'text-muted-foreground hover:text-foreground'
       }`}
     >
       {label}
-      <span className="ml-1 text-[10px] text-muted-foreground">{count}</span>
+      <span className="ml-1.5 rounded-full bg-muted px-1.5 py-0.5 text-[11px] tabular-nums">
+        {count}
+      </span>
     </button>
   );
 
-  const formatRelativeDate = (value: string) => {
-    try {
-      const date = new Date(value);
-      if (isNaN(date.getTime())) return 'Unknown';
-      return formatDistanceToNow(date, { addSuffix: true });
-    } catch {
-      return 'Unknown';
-    }
-  };
+  const toolbar = (
+    <div className="mb-3 flex items-center gap-3 border-b">
+      <div className="flex items-center">
+        {tabButton('all', 'All', counts.all)}
+        {tabButton('mine', 'Mine', counts.mine)}
+        {tabButton('shared', 'Shared', counts.shared)}
+      </div>
+      <div className="ml-auto flex items-center gap-1.5 pb-2">
+        <div className="relative">
+          <Search className="pointer-events-none absolute left-2.5 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-muted-foreground" />
+          <Input
+            ref={searchRef}
+            value={query}
+            onChange={(e) => setQuery(e.target.value)}
+            placeholder="Search meetings…"
+            className="h-8 w-64 pl-8 pr-8"
+          />
+          <kbd className="pointer-events-none absolute right-2 top-1/2 -translate-y-1/2 rounded border bg-muted px-1.5 font-mono text-[10px] text-muted-foreground">
+            /
+          </kbd>
+        </div>
+        <Button
+          onClick={loadTranscripts}
+          variant="ghost"
+          size="sm"
+          className="h-8 w-8 p-0"
+          title="Refresh"
+        >
+          <RefreshCw className="h-4 w-4" />
+          <span className="sr-only">Refresh</span>
+        </Button>
+      </div>
+    </div>
+  );
 
-  const titleOf = (t: TranscriptListRow): { primary: string; secondary: string | null } => {
-    if (t.title && t.title.trim().length > 0) {
-      return { primary: t.title, secondary: t.original_filename || null };
-    }
-    if (t.original_filename) {
-      return { primary: t.original_filename, secondary: null };
-    }
-    return { primary: 'Untitled transcript', secondary: null };
-  };
+  const emptyState = (
+    icon: React.ReactNode,
+    headline: string,
+    sub: string | null
+  ) => (
+    <div className="flex flex-col items-center py-16 text-center">
+      <div className="grid h-10 w-10 place-items-center rounded-lg bg-muted">{icon}</div>
+      <p className="mt-3 text-sm font-medium">{headline}</p>
+      {sub && <p className="mt-1 text-xs text-muted-foreground">{sub}</p>}
+    </div>
+  );
+
+  const container = (children: React.ReactNode) => (
+    <div className={`overflow-hidden rounded-lg border bg-card ${RESTING_SHADOW}`}>
+      {children}
+    </div>
+  );
 
   if (loading) {
     return (
-      <Card>
-        <CardHeader>
-          <CardTitle className="text-base">Your Transcripts</CardTitle>
-        </CardHeader>
-        <CardContent>
-          <div className="flex items-center justify-center py-8 text-muted-foreground">
+      <div>
+        {toolbar}
+        {container(
+          <div className="flex items-center justify-center py-16 text-muted-foreground">
             <RefreshCw className="h-5 w-5 animate-spin" />
           </div>
-        </CardContent>
-      </Card>
+        )}
+      </div>
     );
   }
 
   if (error) {
     return (
-      <Card>
-        <CardHeader>
-          <CardTitle className="text-base">Error loading transcripts</CardTitle>
-        </CardHeader>
-        <CardContent>
-          <p className="text-red-500 mb-4 text-sm">{error}</p>
-          <Button onClick={loadTranscripts} variant="outline" size="sm">
-            <RefreshCw className="h-4 w-4 mr-2" />
-            Retry
-          </Button>
-        </CardContent>
-      </Card>
+      <div>
+        {toolbar}
+        {container(
+          <div className="flex flex-col items-center py-16 text-center">
+            <p className="text-sm font-medium">Couldn&apos;t load transcripts</p>
+            <p className="mt-1 text-xs text-destructive">{error}</p>
+            <Button onClick={loadTranscripts} variant="outline" size="sm" className="mt-4">
+              <RefreshCw className="h-4 w-4" />
+              Retry
+            </Button>
+          </div>
+        )}
+      </div>
     );
   }
 
+  const searchEmpty = filtered.length === 0 && query.trim().length > 0;
+
   return (
-    <Card>
-      <CardHeader className="pb-3">
-        <div className="flex flex-wrap items-center justify-between gap-2">
-          <CardTitle className="text-base">Your Transcripts</CardTitle>
-          <div className="flex items-center gap-2 flex-wrap">
-            <div className="inline-flex rounded-md border bg-background p-0.5">
-              {tabButton('all', 'All', counts.all)}
-              {tabButton('mine', 'Mine', counts.mine)}
-              {tabButton('shared', 'Shared', counts.shared)}
-            </div>
-            <Button onClick={loadTranscripts} variant="outline" size="sm" title="Refresh">
-              <RefreshCw className="h-4 w-4" />
-            </Button>
-          </div>
-        </div>
-      </CardHeader>
-      <CardContent className="p-0">
-        {filtered.length === 0 ? (
-          <div className="px-6 py-10 text-center text-sm text-muted-foreground">
-            {tab === 'shared'
-              ? 'Nothing has been shared with you yet.'
-              : tab === 'mine'
-                ? 'You haven\u2019t uploaded or imported anything yet.'
-                : 'No transcripts yet. Drop an audio or video file above to get started.'}
-          </div>
+    <div>
+      {toolbar}
+      {container(
+        filtered.length === 0 ? (
+          searchEmpty ? (
+            emptyState(
+              <Search className="h-5 w-5 text-muted-foreground" />,
+              `No matches for "${query.trim()}"`,
+              'Try a different title, filename, or owner.'
+            )
+          ) : tab === 'shared' ? (
+            emptyState(
+              <Inbox className="h-5 w-5 text-muted-foreground" />,
+              'Nothing shared with you yet',
+              'Transcripts colleagues share will show up here.'
+            )
+          ) : tab === 'mine' ? (
+            emptyState(
+              <FileAudio className="h-5 w-5 text-muted-foreground" />,
+              'You haven’t uploaded or imported anything yet',
+              'Drop an audio or video file above to get started.'
+            )
+          ) : (
+            emptyState(
+              <FileAudio className="h-5 w-5 text-muted-foreground" />,
+              'No transcripts yet',
+              'Drop an audio or video file above to get started.'
+            )
+          )
         ) : (
           <Table>
             <TableHeader>
               <TableRow className="hover:bg-transparent">
-                <TableHead>Title</TableHead>
-                <TableHead className="hidden md:table-cell w-[20%]">Created</TableHead>
-                <TableHead className="hidden sm:table-cell w-[15%]">Duration</TableHead>
-                <TableHead className="hidden lg:table-cell w-[12%]">Speakers</TableHead>
-                <TableHead className="w-[60px] text-right pr-4">&nbsp;</TableHead>
+                <TableHead className="h-9 bg-muted/50 text-[11px] font-medium uppercase tracking-wider text-muted-foreground">
+                  Title
+                </TableHead>
+                <TableHead className="hidden h-9 w-[16%] bg-muted/50 text-[11px] font-medium uppercase tracking-wider text-muted-foreground lg:table-cell">
+                  Owner
+                </TableHead>
+                <TableHead className="hidden h-9 w-[14%] bg-muted/50 text-[11px] font-medium uppercase tracking-wider text-muted-foreground md:table-cell">
+                  Created
+                </TableHead>
+                <TableHead className="hidden h-9 w-[11%] bg-muted/50 text-[11px] font-medium uppercase tracking-wider text-muted-foreground sm:table-cell">
+                  Duration
+                </TableHead>
+                <TableHead className="hidden h-9 w-[9%] bg-muted/50 text-[11px] font-medium uppercase tracking-wider text-muted-foreground lg:table-cell">
+                  Speakers
+                </TableHead>
+                <TableHead className="h-9 w-[72px] bg-muted/50">&nbsp;</TableHead>
               </TableRow>
             </TableHeader>
             <TableBody>
               {filtered.map((t) => {
-                const { primary, secondary } = titleOf(t);
+                const { primary, secondary, untitled } = titleOf(t);
                 const disabled = t.status !== 'completed';
+                const processing = t.status === 'processing';
                 return (
                   <TableRow
                     key={t.id}
                     onClick={() => !disabled && router.push(`/transcript/${t.assemblyai_id}`)}
-                    className={`group ${disabled ? 'opacity-60' : 'cursor-pointer'}`}
+                    className={`group transition-colors hover:bg-accent/40 ${
+                      disabled ? 'opacity-60' : 'cursor-pointer'
+                    }`}
                   >
                     <TableCell className="py-2.5">
-                      <div className="flex items-center gap-2 min-w-0">
-                        {statusBadge(t.status)}
-                        <FileAudio className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
+                      <div className="flex min-w-0 items-center gap-2">
+                        {statusDot(t.status)}
+                        {sourceIcon(t)}
                         <div className="min-w-0 flex-1">
-                          <div className="truncate text-sm font-medium">{primary}</div>
-                          {secondary && (
-                            <div className="truncate text-[11px] text-muted-foreground">{secondary}</div>
-                          )}
-                          {/* Inline meta visible only on small screens (where the
-                              dedicated columns are hidden). */}
-                          <div className="md:hidden mt-0.5 flex flex-wrap items-center gap-x-2 gap-y-0.5 text-[10px] text-muted-foreground">
-                            <span>{formatRelativeDate(t.created_at)}</span>
-                            {t.duration && (
-                              <>
-                                <span className="opacity-50">·</span>
-                                <span className="inline-flex items-center gap-0.5">
-                                  <Clock className="h-2.5 w-2.5" />
-                                  {formatDuration(t.duration)}
-                                </span>
-                              </>
-                            )}
-                            {t.speaker_count != null && (
-                              <>
-                                <span className="opacity-50">·</span>
-                                <span>{t.speaker_count} spkr</span>
-                              </>
-                            )}
+                          <div
+                            className={`truncate text-sm font-medium ${
+                              untitled ? 'italic text-muted-foreground' : ''
+                            } ${processing ? 'text-shimmer' : ''}`}
+                          >
+                            {primary}
                           </div>
+                          {processing ? (
+                            <div className="truncate font-mono text-[11px] text-muted-foreground">
+                              transcribing…
+                            </div>
+                          ) : (
+                            secondary && (
+                              <div className="truncate text-xs text-muted-foreground">
+                                {secondary}
+                              </div>
+                            )
+                          )}
                         </div>
-                        {accessBadge(t.access)}
-                        {t.status !== 'completed' && (
-                          <Badge variant="outline" className="text-[10px] capitalize">
-                            {t.status}
+                        {t.status === 'error' && (
+                          <Badge
+                            variant="outline"
+                            className="shrink-0 border-destructive/40 text-[10px] text-destructive"
+                          >
+                            Failed
                           </Badge>
                         )}
                       </div>
                     </TableCell>
-                    <TableCell className="hidden md:table-cell py-2.5 text-xs text-muted-foreground">
-                      {formatRelativeDate(t.created_at)}
+                    <TableCell className="hidden py-2.5 lg:table-cell">
+                      {ownerCell(t)}
                     </TableCell>
-                    <TableCell className="hidden sm:table-cell py-2.5 text-xs text-muted-foreground">
-                      {t.duration ? (
-                        <span className="inline-flex items-center gap-1">
-                          <Clock className="h-3 w-3" />
-                          {formatDuration(t.duration)}
-                        </span>
-                      ) : (
-                        '—'
-                      )}
+                    <TableCell className="hidden py-2.5 text-xs text-muted-foreground md:table-cell">
+                      <span title={new Date(t.created_at).toLocaleString()}>
+                        {formatSmartDate(t.created_at) || 'Unknown'}
+                      </span>
                     </TableCell>
-                    <TableCell className="hidden lg:table-cell py-2.5 text-xs text-muted-foreground">
+                    <TableCell className="hidden py-2.5 font-mono text-[11px] tabular-nums text-muted-foreground sm:table-cell">
+                      {t.duration ? formatDuration(t.duration) : '—'}
+                    </TableCell>
+                    <TableCell className="hidden py-2.5 text-xs tabular-nums text-muted-foreground lg:table-cell">
                       {t.speaker_count ?? '—'}
                     </TableCell>
-                    <TableCell className="py-2.5 text-right pr-4">
-                      {t.access === 'owner' && (
-                        <Button
-                          size="sm"
-                          variant="ghost"
-                          className="h-7 w-7 p-0 text-muted-foreground opacity-0 transition-opacity group-hover:opacity-100 hover:text-red-600"
-                          onClick={(e) => handleDeleteTranscript(e, t.assemblyai_id)}
-                          title="Delete"
-                        >
-                          <Trash2 className="h-3.5 w-3.5" />
-                        </Button>
-                      )}
+                    <TableCell className="py-2.5 pr-3">
+                      <div className="flex items-center justify-end gap-0.5">
+                        {t.access === 'owner' && (
+                          <Button
+                            size="sm"
+                            variant="ghost"
+                            className="h-7 w-7 p-0 text-muted-foreground opacity-0 transition-opacity hover:text-destructive group-hover:opacity-100"
+                            onClick={(e) => handleDeleteTranscript(e, t.assemblyai_id)}
+                            title="Delete"
+                          >
+                            <Trash2 className="h-3.5 w-3.5" />
+                          </Button>
+                        )}
+                        {!disabled && (
+                          <span className="grid h-7 w-7 place-items-center">
+                            <ChevronRight className="h-4 w-4 text-muted-foreground opacity-0 transition-opacity group-hover:opacity-100" />
+                          </span>
+                        )}
+                      </div>
                     </TableCell>
                   </TableRow>
                 );
               })}
             </TableBody>
           </Table>
-        )}
-      </CardContent>
-    </Card>
+        )
+      )}
+    </div>
   );
 }
