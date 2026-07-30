@@ -25,6 +25,7 @@ import { FindReplacePanel } from '@/components/find-replace-panel';
 import { SpeakerSummaryPanel } from '@/components/speaker-summary-panel';
 import { AttachmentPanel } from '@/components/attachment-panel';
 import { ShareDialog } from '@/components/share-dialog';
+import { LinkEventDialog } from '@/components/link-event-dialog';
 import { AddPersonDialog } from '@/components/add-person-dialog';
 import { ActivityBar } from '@/components/activity-bar';
 import { TranscriptOutline } from '@/components/transcript-outline';
@@ -61,6 +62,7 @@ import {
   FileAudio,
   FileText,
   Headphones,
+  CalendarSearch,
 } from 'lucide-react';
 
 /**
@@ -97,6 +99,28 @@ export default function TranscriptDetailPage({ params }: TranscriptDetailPagePro
   const [row, setRow] = useState<StoredTranscript | null>(null);
   const [access, setAccess] = useState<TranscriptAccess>('owner');
   const [shareOpen, setShareOpen] = useState(false);
+  const [linkEventOpen, setLinkEventOpen] = useState(false);
+  // Meeting-date inline editor state.
+  const [dateEditOpen, setDateEditOpen] = useState(false);
+  const [dateDraft, setDateDraft] = useState('');
+  const [dateSaving, setDateSaving] = useState(false);
+  // Unshared internal people detected in this meeting (named speakers /
+  // invitees) — drives the nudge dot on the Share buttons. Owner-only
+  // server-side; refreshed whenever sharing changes.
+  const [shareSuggestionCount, setShareSuggestionCount] = useState(0);
+  const refreshShareSuggestions = useCallback(async () => {
+    try {
+      const res = await fetch(`/api/transcripts/${transcriptId}/share-suggestions`);
+      if (!res.ok) return;
+      const { suggestions } = (await res.json()) as { suggestions: unknown[] };
+      setShareSuggestionCount(suggestions.length);
+    } catch {
+      // best-effort
+    }
+  }, [transcriptId]);
+  useEffect(() => {
+    void refreshShareSuggestions();
+  }, [refreshShareSuggestions]);
   const [collaboratorEmails, setCollaboratorEmails] = useState<Set<string>>(
     () => new Set()
   );
@@ -1413,6 +1437,18 @@ export default function TranscriptDetailPage({ params }: TranscriptDetailPagePro
             </kbd>
           </Button>
         )}
+        {canEdit && (
+          <Button
+            variant="ghost"
+            size="sm"
+            className="h-8 w-full justify-start gap-2 text-[13px]"
+            onClick={() => setLinkEventOpen(true)}
+            title="Attach the calendar invite this meeting came from — fills the date, title, and attendees"
+          >
+            <CalendarSearch className="h-4 w-4 text-muted-foreground" />
+            {row.gmeet_context?.eventId ? 'Re-link calendar event' : 'Link calendar event'}
+          </Button>
+        )}
         <Button
           variant="ghost"
           size="sm"
@@ -1422,6 +1458,14 @@ export default function TranscriptDetailPage({ params }: TranscriptDetailPagePro
         >
           <Users className="h-4 w-4 text-muted-foreground" />
           Share
+          {shareSuggestionCount > 0 && (
+            <span
+              className="ml-auto rounded-full bg-primary px-1.5 py-0.5 text-[10px] font-medium leading-none text-primary-foreground"
+              title={`${shareSuggestionCount} people from this meeting aren't shared yet`}
+            >
+              {shareSuggestionCount}
+            </span>
+          )}
         </Button>
       </div>
     </div>
@@ -1470,10 +1514,18 @@ export default function TranscriptDetailPage({ params }: TranscriptDetailPagePro
         <Button
           size="sm"
           onClick={() => setShareOpen(true)}
-          title="Share access with other people"
+          title={
+            shareSuggestionCount > 0
+              ? `Share — ${shareSuggestionCount} people from this meeting aren't shared yet`
+              : 'Share access with other people'
+          }
+          className="relative"
         >
           <Users className="h-4 w-4" />
           <span className="hidden md:inline">Share</span>
+          {shareSuggestionCount > 0 && (
+            <span className="absolute -right-1 -top-1 h-2.5 w-2.5 rounded-full border-2 border-background bg-status-busy" />
+          )}
         </Button>
         {/* ⋯ overflow: refresh, downloads, transcript ID */}
         <div className="relative" ref={overflowMenuRef}>
@@ -1611,9 +1663,75 @@ export default function TranscriptDetailPage({ params }: TranscriptDetailPagePro
                 </>
               )}
             </span>
-            <span title={safeFormatDate(row.created_at)}>
-              {formatHeaderDate(row.created_at)}
-            </span>
+            {dateEditOpen && canEdit ? (
+              <span
+                className="inline-flex items-center gap-1.5"
+                onClick={(e) => e.stopPropagation()}
+              >
+                <input
+                  type="datetime-local"
+                  value={dateDraft}
+                  onChange={(e) => setDateDraft(e.target.value)}
+                  className="h-7 rounded-md border bg-background px-1.5 text-xs"
+                  disabled={dateSaving}
+                />
+                <Button
+                  size="sm"
+                  className="h-7 px-2 text-xs"
+                  disabled={dateSaving || !dateDraft}
+                  onClick={async () => {
+                    setDateSaving(true);
+                    try {
+                      const res = await fetch(`/api/transcripts/${transcriptId}`, {
+                        method: 'PATCH',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({
+                          recordedAt: new Date(dateDraft).toISOString(),
+                        }),
+                      });
+                      if (res.ok) {
+                        setDateEditOpen(false);
+                        await loadAll();
+                      }
+                    } finally {
+                      setDateSaving(false);
+                    }
+                  }}
+                >
+                  Save
+                </Button>
+                <Button
+                  size="sm"
+                  variant="ghost"
+                  className="h-7 px-2 text-xs"
+                  disabled={dateSaving}
+                  onClick={() => setDateEditOpen(false)}
+                >
+                  Cancel
+                </Button>
+              </span>
+            ) : (
+              <button
+                type="button"
+                className={`${canEdit ? 'hover:text-foreground hover:underline decoration-dotted underline-offset-2' : 'cursor-default'}`}
+                title={
+                  canEdit
+                    ? `Meeting date — click to edit (${safeFormatDate(row.recorded_at ?? row.created_at)})`
+                    : safeFormatDate(row.recorded_at ?? row.created_at)
+                }
+                onClick={() => {
+                  if (!canEdit) return;
+                  const base = new Date(row.recorded_at ?? row.created_at);
+                  const pad = (n: number) => String(n).padStart(2, '0');
+                  setDateDraft(
+                    `${base.getFullYear()}-${pad(base.getMonth() + 1)}-${pad(base.getDate())}T${pad(base.getHours())}:${pad(base.getMinutes())}`
+                  );
+                  setDateEditOpen(true);
+                }}
+              >
+                {formatHeaderDate(row.recorded_at ?? row.created_at)}
+              </button>
+            )}
             {row.duration != null && (
               <span className="font-mono text-[11px] tabular-nums">
                 {formatDuration(row.duration)}
@@ -2095,6 +2213,19 @@ export default function TranscriptDetailPage({ params }: TranscriptDetailPagePro
             setCollaboratorEmails(
               new Set(shares.map((s) => s.shared_with_email.toLowerCase()))
             );
+            bumpActivity();
+            void refreshShareSuggestions();
+          }}
+        />
+
+        <LinkEventDialog
+          open={linkEventOpen}
+          onClose={() => setLinkEventOpen(false)}
+          transcriptId={transcriptId}
+          initialDateIso={row.recorded_at ?? row.created_at}
+          onLinked={() => {
+            void loadAll();
+            void refreshShareSuggestions();
             bumpActivity();
           }}
         />

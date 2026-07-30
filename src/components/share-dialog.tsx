@@ -42,6 +42,10 @@ export function ShareDialog({
   const [pendingAccess, setPendingAccess] = useState<'edit' | 'read'>('edit');
   const [pickerKey, setPickerKey] = useState(0); // bump to reset the picker after add
   const [error, setError] = useState<string | null>(null);
+  const [suggestions, setSuggestions] = useState<
+    Array<{ name: string; email: string; reason: string }>
+  >([]);
+  const [addingSuggestion, setAddingSuggestion] = useState<string | null>(null);
 
   const canManage = callerAccess === 'owner';
 
@@ -73,9 +77,30 @@ export function ShareDialog({
     }
   }, [transcriptId]);
 
+  // People from this meeting (named speakers, invitees) who aren't shared
+  // yet — refreshed whenever the share list changes so accepted suggestions
+  // disappear. Owner-only server-side; others just get [].
+  const loadSuggestions = useCallback(async () => {
+    try {
+      const res = await fetch(`/api/transcripts/${transcriptId}/share-suggestions`, {
+        credentials: 'include',
+      });
+      if (!res.ok) return;
+      const { suggestions: rows } = (await res.json()) as {
+        suggestions: Array<{ name: string; email: string; reason: string }>;
+      };
+      setSuggestions(rows);
+    } catch {
+      // best-effort
+    }
+  }, [transcriptId]);
+
   useEffect(() => {
-    if (open) loadShares();
-  }, [open, loadShares]);
+    if (open) {
+      loadShares();
+      loadSuggestions();
+    }
+  }, [open, loadShares, loadSuggestions]);
 
   const handleAdd = async (person: PickerPerson) => {
     if (!person.email) {
@@ -101,8 +126,26 @@ export function ShareDialog({
       }
       setPickerKey((k) => k + 1);
       await loadShares();
+      await loadSuggestions();
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to share');
+    }
+  };
+
+  const handleAddSuggestion = async (s: { name: string; email: string }) => {
+    setAddingSuggestion(s.email);
+    try {
+      await handleAdd({
+        id: 0,
+        name: s.name,
+        email: s.email,
+        slackHandle: null,
+        team: null,
+        role: null,
+        source: 'custom',
+      } as PickerPerson);
+    } finally {
+      setAddingSuggestion(null);
     }
   };
 
@@ -188,6 +231,35 @@ export function ShareDialog({
                 </button>
               </div>
             </div>
+
+            {suggestions.length > 0 && (
+              <div className="rounded-md border border-primary/25 bg-accent/40 p-2.5">
+                <p className="mb-1.5 text-[11px] font-semibold uppercase tracking-wider text-accent-foreground">
+                  Suggested — people in this meeting
+                </p>
+                <div className="flex flex-col gap-1">
+                  {suggestions.map((s) => (
+                    <div key={s.email} className="flex items-center gap-2 text-sm">
+                      <div className="min-w-0 flex-1">
+                        <span className="font-medium">{s.name}</span>{' '}
+                        <span className="text-xs text-muted-foreground">
+                          {s.email} · {s.reason}
+                        </span>
+                      </div>
+                      <Button
+                        size="sm"
+                        variant="outline"
+                        className="h-6 shrink-0 border-primary/30 px-2 text-xs text-primary hover:bg-accent"
+                        disabled={addingSuggestion !== null}
+                        onClick={() => void handleAddSuggestion(s)}
+                      >
+                        {addingSuggestion === s.email ? 'Adding…' : `Add as ${pendingAccess === 'edit' ? 'editor' : 'reader'}`}
+                      </Button>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
             {error && <p className="text-xs text-destructive">{error}</p>}
           </div>
         )}

@@ -4,6 +4,7 @@ import {
   createImportedForUser,
   findVisibleByAssemblyaiId,
   findVisibleByDriveFileId,
+  setRecordedAtForUser,
 } from '@/db-ops/transcripts';
 import { addShare } from '@/db-ops/transcript-shares';
 import {
@@ -361,6 +362,10 @@ export const POST = withAuth(async ({ user, request }) => {
       gmeetContext: { ...baseContext, meetTranscript: parsed },
     });
 
+    if (startIso) {
+      await setRecordedAtForUser(user.userId, syntheticId, new Date(startIso)).catch(() => {});
+    }
+
     // Real names from Meet → name the speakers + register people up front.
     try {
       const speakerNames = [...new Set(parsed!.utterances.map((u) => u.speaker))];
@@ -460,6 +465,12 @@ export const POST = withAuth(async ({ user, request }) => {
       driveFileId: videoFileId,
       gmeetContext: { ...baseContext, meetTranscript: parsed },
     });
+    const meetingStart = event.startTime ?? actuals?.conferenceStart;
+    if (meetingStart && !Number.isNaN(Date.parse(meetingStart))) {
+      await setRecordedAtForUser(user.userId, row.assemblyai_id, new Date(meetingStart)).catch(
+        () => {}
+      );
+    }
     const autoShared = await autoShareToInternalInvitees(
       row.id,
       user.userId,

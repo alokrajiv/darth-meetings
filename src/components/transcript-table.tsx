@@ -334,7 +334,7 @@ export function TranscriptTable({ refreshTrigger }: TranscriptTableProps) {
                   Owner
                 </TableHead>
                 <TableHead className="hidden h-9 w-[14%] bg-muted/50 text-[11px] font-medium uppercase tracking-wider text-muted-foreground md:table-cell">
-                  Created
+                  Date
                 </TableHead>
                 <TableHead className="hidden h-9 w-[11%] bg-muted/50 text-[11px] font-medium uppercase tracking-wider text-muted-foreground sm:table-cell">
                   Duration
@@ -396,8 +396,8 @@ export function TranscriptTable({ refreshTrigger }: TranscriptTableProps) {
                       {ownerCell(t)}
                     </TableCell>
                     <TableCell className="hidden py-2.5 text-xs text-muted-foreground md:table-cell">
-                      <span title={new Date(t.created_at).toLocaleString()}>
-                        {formatSmartDate(t.created_at) || 'Unknown'}
+                      <span title={new Date(t.recorded_at ?? t.created_at).toLocaleString()}>
+                        {formatSmartDate(t.recorded_at ?? t.created_at) || 'Unknown'}
                       </span>
                     </TableCell>
                     <TableCell className="hidden py-2.5 font-mono text-[11px] tabular-nums text-muted-foreground sm:table-cell">

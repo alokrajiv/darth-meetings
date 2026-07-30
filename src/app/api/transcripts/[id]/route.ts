@@ -2,6 +2,7 @@ import { NextResponse } from 'next/server';
 import { withAuth } from '@/lib/auth/with-auth';
 import {
   deleteForUser,
+  setRecordedAtForUser,
   touchLastAccessedForUser,
   updateMetaForUser,
 } from '@/db-ops/transcripts';
@@ -66,7 +67,23 @@ export const PATCH = withAuth(async ({ user, request }, { params }) => {
     return NextResponse.json({ error: 'Body must be an object' }, { status: 400 });
   }
 
-  const { title, description } = body as { title?: unknown; description?: unknown };
+  const { title, description, recordedAt } = body as {
+    title?: unknown;
+    description?: unknown;
+    recordedAt?: unknown;
+  };
+
+  // Meeting date: ISO string sets it, explicit null clears it.
+  if (recordedAt === null) {
+    await setRecordedAtForUser(access.ownerUserId, id, null);
+  } else if (typeof recordedAt === 'string') {
+    const d = new Date(recordedAt);
+    if (Number.isNaN(d.getTime())) {
+      return NextResponse.json({ error: 'recordedAt must be an ISO date' }, { status: 400 });
+    }
+    await setRecordedAtForUser(access.ownerUserId, id, d);
+  }
+
   const updated = await updateMetaForUser(access.ownerUserId, id, {
     title: typeof title === 'string' ? title : undefined,
     description: typeof description === 'string' ? description : undefined,

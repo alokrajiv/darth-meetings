@@ -91,7 +91,7 @@ export async function listVisibleToUser(
     SELECT t.id, t.user_id, t.assemblyai_id, t.original_filename, t.status,
            t.created_at, t.completed_at, t.duration, t.speaker_count,
            t.language_code, t.title, t.description, t.last_accessed,
-           t.source,
+           t.source, t.recorded_at,
            CASE
              WHEN t.user_id = ${userId} THEN 'owner'
              ELSE s.access
@@ -360,6 +360,36 @@ export async function updateMetaForUser(
     RETURNING *
   `;
   return rows[0] ?? null;
+}
+
+/** Set (or clear) when the meeting actually happened. */
+export async function setRecordedAtForUser(
+  userId: string,
+  assemblyaiId: string,
+  recordedAt: Date | null
+): Promise<void> {
+  await sql`
+    UPDATE ${sql(SCHEMA)}.transcripts
+    SET recorded_at = ${recordedAt}
+    WHERE user_id = ${userId} AND assemblyai_id = ${assemblyaiId}
+  `;
+}
+
+/**
+ * Merge calendar-event metadata into gmeet_context (retro-linking an
+ * uploaded recording to its real invite). Existing keys not present in the
+ * patch are preserved.
+ */
+export async function mergeGmeetContextForUser(
+  userId: string,
+  assemblyaiId: string,
+  patch: Partial<GmeetContext>
+): Promise<void> {
+  await sql`
+    UPDATE ${sql(SCHEMA)}.transcripts
+    SET gmeet_context = COALESCE(gmeet_context, '{}'::jsonb) || ${sql.json(patch as unknown as never)}
+    WHERE user_id = ${userId} AND assemblyai_id = ${assemblyaiId}
+  `;
 }
 
 export async function touchLastAccessedForUser(
