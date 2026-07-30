@@ -1,27 +1,17 @@
 import { NextResponse } from 'next/server';
 import { withAuth } from '@/lib/auth/with-auth';
 import {
-  createForUser,
   listVisibleToUser,
-  setLocalAudioPathForUser,
   updateStatusForUser,
 } from '@/db-ops/transcripts';
+import { getTranscript } from '@/lib/server/assemblyai';
 import {
-  uploadFile,
-  submitTranscription,
-  getTranscript,
-} from '@/lib/server/assemblyai';
-import {
-  audioFilename,
   deleteAudioFile,
-  renameAudioFile,
-  resolveAudioPath,
   saveAudioBytes,
   saveAudioStreamToTemp,
 } from '@/lib/server/audio-storage';
-import { getForUser as getUserVocab } from '@/db-ops/user-vocab';
-import { getCurrentPayload as getOrgVocabPayload } from '@/db-ops/org-vocab';
-import { mergeVocabs } from '@/lib/server/vocab-merge';
+import { IngestError, ingestLocalAudio } from '@/lib/server/ingest';
+import { onTranscriptCompleted } from '@/lib/server/post-completion';
 
 export const runtime = 'nodejs';
 // Handler wall-clock budget (only enforced on serverless hosts). Receiving a
@@ -75,6 +65,11 @@ export const GET = withAuth(async ({ user }) => {
             duration: aai.audio_duration ?? row.duration,
             speaker_count: speakerCount ?? row.speaker_count,
           };
+          // First observation of completion → auto-notes + speaker
+          // suggestions (fire-and-forget, owner-scoped).
+          if (aai.status === 'completed') {
+            onTranscriptCompleted(row.user_id, row.assemblyai_id);
+          }
         } catch (err) {
           console.warn('[GET /api/transcripts] refresh failed for', row.assemblyai_id, err);
         }
@@ -161,73 +156,22 @@ export const POST = withAuth(async ({ user, request }) => {
     }
   }
 
-  let audioUrl: string;
+  // Shared tail: AAI upload (disk-streamed) → vocab-biased submit → DB row →
+  // rename temp file to its permanent name. Same path as the Meet import.
   try {
-    // Path input → the SDK streams the file from disk.
-    audioUrl = await uploadFile(resolveAudioPath(tempFilename));
-  } catch (error) {
-    console.error('[POST /api/transcripts] AAI upload failed:', error);
-    await deleteAudioFile(tempFilename);
-    return NextResponse.json(
-      { error: 'Upload to AssemblyAI failed', detail: String(error) },
-      { status: 502 }
-    );
-  }
-
-  // Merge org + user vocab and pass to AAI as keyterms_prompt / custom_spelling.
-  // This is what biases AAI's recognition toward company-specific terms and
-  // employee names. Failures are non-fatal: we still submit, just without
-  // the bias hints.
-  let mergedVocab: ReturnType<typeof mergeVocabs> | null = null;
-  try {
-    const [orgVocabPayload, userVocab] = await Promise.all([
-      getOrgVocabPayload(),
-      getUserVocab(user.userId),
-    ]);
-    mergedVocab = mergeVocabs(orgVocabPayload, userVocab);
-  } catch (error) {
-    console.warn('[POST /api/transcripts] vocab merge failed (continuing without):', error);
-  }
-
-  let submitted: { id: string; status: string };
-  try {
-    submitted = await submitTranscription(audioUrl, {
+    const row = await ingestLocalAudio(user.userId, tempFilename, {
+      originalFilename,
       languageCode,
-      keytermsPrompt: mergedVocab?.keyterms_prompt,
-      customSpelling: mergedVocab?.custom_spelling,
     });
+    return NextResponse.json({ transcript: row }, { status: 201 });
   } catch (error) {
-    console.error('[POST /api/transcripts] AAI submit failed:', error);
-    await deleteAudioFile(tempFilename);
-    return NextResponse.json(
-      { error: 'Transcription submission failed', detail: String(error) },
-      { status: 502 }
-    );
+    if (error instanceof IngestError) {
+      console.error(`[POST /api/transcripts] ${error.stage} failed:`, error.causeErr);
+      return NextResponse.json(
+        { error: error.message, detail: String(error.causeErr) },
+        { status: 502 }
+      );
+    }
+    throw error;
   }
-
-  const row = await createForUser(user.userId, {
-    assemblyaiId: submitted.id,
-    originalFilename,
-    status: submitted.status,
-    languageCode: languageCode ?? null,
-    audioUrl: audioUrl,
-  });
-
-  // Keep our own copy of the audio. AAI deletes uploaded audio immediately
-  // after transcription, so their audio_url is useless for playback. The
-  // bytes are already on disk as the temp file — just rename it to its
-  // permanent name. We serve it via /api/transcripts/[id]/audio.
-  try {
-    const filename = audioFilename(submitted.id, originalFilename);
-    await renameAudioFile(tempFilename, filename);
-    await setLocalAudioPathForUser(user.userId, submitted.id, filename);
-    row.local_audio_path = filename;
-  } catch (error) {
-    // Non-fatal: the transcription itself succeeded. Audio playback for this
-    // row will fall back to (broken) remote URL until/unless we re-upload.
-    console.error('[POST /api/transcripts] local audio rename failed:', error);
-    await deleteAudioFile(tempFilename);
-  }
-
-  return NextResponse.json({ transcript: row }, { status: 201 });
 });

@@ -1,0 +1,135 @@
+import 'server-only';
+import {
+  createForUser,
+  setLocalAudioPathForUser,
+  type TranscriptRow,
+} from '@/db-ops/transcripts';
+import { uploadFile, submitTranscription } from '@/lib/server/assemblyai';
+import {
+  audioFilename,
+  deleteAudioFile,
+  renameAudioFile,
+  resolveAudioPath,
+} from '@/lib/server/audio-storage';
+import { getForUser as getUserVocab } from '@/db-ops/user-vocab';
+import { getCurrentPayload as getOrgVocabPayload } from '@/db-ops/org-vocab';
+import { mergeVocabs } from '@/lib/server/vocab-merge';
+import type { GmeetContext } from '@/lib/format';
+
+/**
+ * Shared ingestion tail for audio that has already landed as a temp file in
+ * the audio dir: upload to AssemblyAI (disk-streamed), submit transcription
+ * with merged vocab bias, create the DB row, and rename the temp file to its
+ * permanent `<aai-id>.<ext>` name.
+ *
+ * Used by both the raw-body upload route (POST /api/transcripts) and the
+ * Google Meet import route (which downloads the bytes from Drive first).
+ *
+ * On failure the temp file is deleted and an IngestError is thrown carrying
+ * the stage, so callers can map it to a precise HTTP response.
+ */
+
+export class IngestError extends Error {
+  constructor(
+    public stage: 'aai-upload' | 'aai-submit',
+    message: string,
+    public causeErr?: unknown
+  ) {
+    super(message);
+    this.name = 'IngestError';
+  }
+}
+
+export interface IngestOptions {
+  originalFilename: string | null;
+  languageCode?: string;
+  title?: string | null;
+  /**
+   * Extra recognition-bias phrases appended to the merged org+user vocab —
+   * e.g. attendee names from the source calendar event. Deduped, capped at
+   * AAI's 1000-term limit.
+   */
+  extraKeyterms?: string[];
+  driveFileId?: string | null;
+  gmeetContext?: GmeetContext | null;
+}
+
+export async function ingestLocalAudio(
+  userId: string,
+  tempFilename: string,
+  opts: IngestOptions
+): Promise<TranscriptRow> {
+  let audioUrl: string;
+  try {
+    // Path input → the SDK streams the file from disk.
+    audioUrl = await uploadFile(resolveAudioPath(tempFilename));
+  } catch (error) {
+    await deleteAudioFile(tempFilename);
+    throw new IngestError('aai-upload', 'Upload to AssemblyAI failed', error);
+  }
+
+  // Merge org + user vocab and pass to AAI as keyterms_prompt / custom_spelling.
+  // Failures are non-fatal: we still submit, just without the bias hints.
+  let keytermsPrompt: string[] | undefined;
+  let customSpelling: ReturnType<typeof mergeVocabs>['custom_spelling'] | undefined;
+  try {
+    const [orgVocabPayload, userVocab] = await Promise.all([
+      getOrgVocabPayload(),
+      getUserVocab(userId),
+    ]);
+    const merged = mergeVocabs(orgVocabPayload, userVocab);
+    keytermsPrompt = merged.keyterms_prompt;
+    customSpelling = merged.custom_spelling;
+  } catch (error) {
+    console.warn('[ingest] vocab merge failed (continuing without):', error);
+  }
+
+  if (opts.extraKeyterms && opts.extraKeyterms.length > 0) {
+    const seen = new Set((keytermsPrompt ?? []).map((t) => t.toLowerCase()));
+    const extras = opts.extraKeyterms
+      .map((t) => t.trim())
+      .filter((t) => t.length > 1 && !seen.has(t.toLowerCase()));
+    keytermsPrompt = [...(keytermsPrompt ?? []), ...extras].slice(0, 1000);
+  }
+
+  let submitted: { id: string; status: string };
+  try {
+    submitted = await submitTranscription(audioUrl, {
+      languageCode: opts.languageCode,
+      keytermsPrompt,
+      customSpelling,
+    });
+  } catch (error) {
+    await deleteAudioFile(tempFilename);
+    throw new IngestError('aai-submit', 'Transcription submission failed', error);
+  }
+
+  const row = await createForUser(userId, {
+    assemblyaiId: submitted.id,
+    originalFilename: opts.originalFilename,
+    status: submitted.status,
+    languageCode: opts.languageCode ?? null,
+    title: opts.title ?? null,
+    audioUrl: audioUrl,
+    driveFileId: opts.driveFileId ?? null,
+    gmeetContext: opts.gmeetContext ?? null,
+  });
+
+  // Keep our own copy of the audio. AAI deletes uploaded audio immediately
+  // after transcription, so their audio_url is useless for playback. The
+  // bytes are already on disk as the temp file — just rename it to its
+  // permanent name. We serve it via /api/transcripts/[id]/audio.
+  try {
+    const filename = audioFilename(submitted.id, opts.originalFilename);
+    await renameAudioFile(tempFilename, filename);
+    await setLocalAudioPathForUser(userId, submitted.id, filename);
+    row.local_audio_path = filename;
+  } catch (error) {
+    // Non-fatal: the transcription itself succeeded. Audio playback for this
+    // row will fall back to (broken) remote URL until/unless we re-upload.
+    console.error('[ingest] local audio rename failed:', error);
+    await deleteAudioFile(tempFilename);
+  }
+
+  return row;
+}

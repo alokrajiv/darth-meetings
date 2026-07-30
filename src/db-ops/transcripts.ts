@@ -2,9 +2,11 @@ import 'server-only';
 import { sql } from '@/lib/db';
 import { SCHEMAS } from '@/lib/constants/database';
 import type {
+  GmeetContext,
   StoredTranscript,
   TranscriptResponse,
   TranscriptListRow,
+  TranscriptSegment,
 } from '@/lib/format';
 
 export type TranscriptRow = StoredTranscript;
@@ -27,6 +29,8 @@ export interface TranscriptInsert {
   languageCode?: string | null;
   title?: string | null;
   audioUrl?: string | null;
+  driveFileId?: string | null;
+  gmeetContext?: GmeetContext | null;
 }
 
 export interface TranscriptStatusUpdate {
@@ -49,6 +53,9 @@ export interface ImportedTranscriptInsert {
   completedAt: Date | null;
   audioUrl: string | null;
   importedContent: TranscriptResponse;
+  title?: string | null;
+  driveFileId?: string | null;
+  gmeetContext?: GmeetContext | null;
 }
 
 export async function listForUser(userId: string): Promise<TranscriptRow[]> {
@@ -127,18 +134,23 @@ export async function createForUser(
 ): Promise<TranscriptRow> {
   const rows = await sql<TranscriptRow[]>`
     INSERT INTO ${sql(SCHEMA)}.transcripts (
-      user_id, assemblyai_id, original_filename, status, language_code, title, audio_url, source
+      user_id, assemblyai_id, original_filename, status, language_code, title, audio_url, source,
+      drive_file_id, gmeet_context
     ) VALUES (
       ${userId}, ${data.assemblyaiId}, ${data.originalFilename ?? null},
       ${data.status}, ${data.languageCode ?? null}, ${data.title ?? null},
-      ${data.audioUrl ?? null}, 'uploaded'
+      ${data.audioUrl ?? null}, 'uploaded',
+      ${data.driveFileId ?? null},
+      ${data.gmeetContext ? sql.json(data.gmeetContext as unknown as never) : null}
     )
     ON CONFLICT (user_id, assemblyai_id) DO UPDATE
       SET original_filename = EXCLUDED.original_filename,
           status = EXCLUDED.status,
           language_code = COALESCE(EXCLUDED.language_code, ${sql(SCHEMA)}.transcripts.language_code),
           title = COALESCE(EXCLUDED.title, ${sql(SCHEMA)}.transcripts.title),
-          audio_url = COALESCE(EXCLUDED.audio_url, ${sql(SCHEMA)}.transcripts.audio_url)
+          audio_url = COALESCE(EXCLUDED.audio_url, ${sql(SCHEMA)}.transcripts.audio_url),
+          drive_file_id = COALESCE(EXCLUDED.drive_file_id, ${sql(SCHEMA)}.transcripts.drive_file_id),
+          gmeet_context = COALESCE(EXCLUDED.gmeet_context, ${sql(SCHEMA)}.transcripts.gmeet_context)
     RETURNING *
   `;
   return rows[0]!;
@@ -157,26 +169,90 @@ export async function createImportedForUser(
     INSERT INTO ${sql(SCHEMA)}.transcripts (
       user_id, assemblyai_id, original_filename, status,
       created_at, completed_at, duration, speaker_count, language_code,
-      audio_url, source, imported_content
+      audio_url, source, imported_content, title, drive_file_id, gmeet_context
     ) VALUES (
       ${userId}, ${data.assemblyaiId}, ${data.originalFilename ?? null}, ${data.status},
       ${data.createdAt ?? sql`now()`}, ${data.completedAt ?? null},
       ${data.duration ?? null}, ${data.speakerCount ?? null},
       ${data.languageCode ?? null}, ${data.audioUrl ?? null}, 'imported',
-      ${sql.json(data.importedContent as unknown as never)}
+      ${sql.json(data.importedContent as unknown as never)},
+      ${data.title ?? null},
+      ${data.driveFileId ?? null},
+      ${data.gmeetContext ? sql.json(data.gmeetContext as unknown as never) : null}
     )
     ON CONFLICT (user_id, assemblyai_id) DO UPDATE
       SET status = EXCLUDED.status,
           created_at = COALESCE(EXCLUDED.created_at, ${sql(SCHEMA)}.transcripts.created_at),
+          completed_at = COALESCE(EXCLUDED.completed_at, ${sql(SCHEMA)}.transcripts.completed_at),
           duration = COALESCE(EXCLUDED.duration, ${sql(SCHEMA)}.transcripts.duration),
           speaker_count = COALESCE(EXCLUDED.speaker_count, ${sql(SCHEMA)}.transcripts.speaker_count),
           language_code = COALESCE(EXCLUDED.language_code, ${sql(SCHEMA)}.transcripts.language_code),
           audio_url = COALESCE(EXCLUDED.audio_url, ${sql(SCHEMA)}.transcripts.audio_url),
           imported_content = EXCLUDED.imported_content,
+          title = COALESCE(EXCLUDED.title, ${sql(SCHEMA)}.transcripts.title),
+          drive_file_id = COALESCE(EXCLUDED.drive_file_id, ${sql(SCHEMA)}.transcripts.drive_file_id),
+          gmeet_context = COALESCE(EXCLUDED.gmeet_context, ${sql(SCHEMA)}.transcripts.gmeet_context),
           source = 'imported'
     RETURNING *
   `;
   return rows[0]!;
+}
+
+export interface VisibleDupe {
+  assemblyai_id: string;
+  title: string | null;
+  user_id: string;
+  created_at: string;
+}
+
+/**
+ * Dedupe lookup for the Google Meet import: find any transcript visible to
+ * this user (owned or shared with their email) that was imported from the
+ * same Drive recording. Returns a skinny descriptor for the conflict UI.
+ */
+export async function findVisibleByDriveFileId(
+  userId: string,
+  email: string,
+  driveFileId: string
+): Promise<VisibleDupe | null> {
+  const normEmail = email.trim().toLowerCase();
+  const rows = await sql<VisibleDupe[]>`
+    SELECT t.assemblyai_id, t.title, t.user_id, t.created_at
+    FROM ${sql(SCHEMA)}.transcripts t
+    LEFT JOIN ${sql(SCHEMA)}.transcript_shares s
+      ON s.transcript_id = t.id
+      AND s.shared_with_email = ${normEmail}
+    WHERE t.drive_file_id = ${driveFileId}
+      AND (t.user_id = ${userId} OR s.id IS NOT NULL)
+    ORDER BY (t.user_id = ${userId}) DESC, t.created_at DESC
+    LIMIT 1
+  `;
+  return rows[0] ?? null;
+}
+
+/**
+ * Same dedupe, keyed by assemblyai_id — used for Meet-transcript-only imports
+ * whose synthetic id (`gmeet-<docId>`) is identical for every importer of the
+ * same Doc.
+ */
+export async function findVisibleByAssemblyaiId(
+  userId: string,
+  email: string,
+  assemblyaiId: string
+): Promise<VisibleDupe | null> {
+  const normEmail = email.trim().toLowerCase();
+  const rows = await sql<VisibleDupe[]>`
+    SELECT t.assemblyai_id, t.title, t.user_id, t.created_at
+    FROM ${sql(SCHEMA)}.transcripts t
+    LEFT JOIN ${sql(SCHEMA)}.transcript_shares s
+      ON s.transcript_id = t.id
+      AND s.shared_with_email = ${normEmail}
+    WHERE t.assemblyai_id = ${assemblyaiId}
+      AND (t.user_id = ${userId} OR s.id IS NOT NULL)
+    ORDER BY (t.user_id = ${userId}) DESC, t.created_at DESC
+    LIMIT 1
+  `;
+  return rows[0] ?? null;
 }
 
 /**
@@ -217,6 +293,38 @@ export async function setCachedContentForUser(
 
 /** @deprecated use setCachedContentForUser — kept for the import flow's clarity */
 export const setImportedContentForUser = setCachedContentForUser;
+
+/**
+ * Auto-notes state machine writes. `status` transitions:
+ * null -> 'running' -> 'completed' | 'error'. Notes/error are set atomically
+ * with the status so the UI never sees a half-written state.
+ */
+export async function setAutoNotesForUser(
+  userId: string,
+  assemblyaiId: string,
+  update: { status: string; notes?: string | null; error?: string | null }
+): Promise<void> {
+  await sql`
+    UPDATE ${sql(SCHEMA)}.transcripts
+    SET auto_notes_status = ${update.status},
+        auto_notes = ${update.notes !== undefined ? update.notes : sql`auto_notes`},
+        auto_notes_error = ${update.error ?? null},
+        auto_notes_at = now()
+    WHERE user_id = ${userId} AND assemblyai_id = ${assemblyaiId}
+  `;
+}
+
+export async function setAutoSegmentsForUser(
+  userId: string,
+  assemblyaiId: string,
+  segments: TranscriptSegment[]
+): Promise<void> {
+  await sql`
+    UPDATE ${sql(SCHEMA)}.transcripts
+    SET auto_segments = ${sql.json(segments as unknown as never)}
+    WHERE user_id = ${userId} AND assemblyai_id = ${assemblyaiId}
+  `;
+}
 
 export async function updateStatusForUser(
   userId: string,

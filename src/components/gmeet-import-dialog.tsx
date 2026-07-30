@@ -1,0 +1,1410 @@
+'use client';
+
+import { useCallback, useEffect, useRef, useState } from 'react';
+import {
+  Dialog,
+  DialogContent,
+  DialogHeader,
+  DialogTitle,
+  DialogFooter,
+} from '@/components/ui/dialog';
+import { Button } from '@/components/ui/button';
+import { Input } from '@/components/ui/input';
+import { Badge } from '@/components/ui/badge';
+import {
+  getGoogleAccessToken,
+  hasValidGoogleToken,
+  invalidateGoogleToken,
+} from '@/lib/google-token';
+import {
+  AlertCircle,
+  CheckCircle2,
+  ChevronLeft,
+  ChevronRight,
+  Download,
+  ExternalLink,
+  FileText,
+  History,
+  Link2,
+  Loader2,
+  Video,
+} from 'lucide-react';
+
+const MEET_API = 'https://meet.googleapis.com/v2';
+
+interface CalendarAttachment {
+  fileId?: string;
+  title?: string;
+  mimeType?: string;
+}
+
+interface CalendarEvent {
+  id: string;
+  summary?: string;
+  start?: { dateTime?: string; date?: string };
+  end?: { dateTime?: string; date?: string };
+  attendees?: Array<{
+    email?: string;
+    displayName?: string;
+    responseStatus?: string;
+    self?: boolean;
+  }>;
+  attachments?: CalendarAttachment[];
+  conferenceData?: { conferenceId?: string };
+}
+
+/** Meet API artifact info attached to a row by the day sweep / record pick. */
+interface MeetRowInfo {
+  recordName: string;
+  videoFileId: string | null;
+  transcriptDocId: string | null;
+  /** null = not checked yet (recents rows — resolved on pick) */
+  checked: boolean;
+}
+
+interface EventRow {
+  event: CalendarEvent;
+  video: CalendarAttachment | null;
+  transcriptDoc: CalendarAttachment | null;
+  geminiNotes: CalendarAttachment | null;
+  videoCount: number;
+  meet: MeetRowInfo | null;
+  /** conference record with no matching calendar event (orphan) */
+  offCalendar?: boolean;
+}
+
+/** Normalised selection — artifacts may come from calendar attachments or a
+ * Meet REST API conferenceRecords lookup (`transcriptSource` says which). */
+interface PickedMeeting {
+  event: CalendarEvent;
+  conferenceRecordName: string | null;
+  videoFileId: string | null;
+  videoName: string | null;
+  videoSize: number | null;
+  videoCount: number;
+  transcriptDocId: string | null;
+  transcriptSource: 'calendar' | 'meet-api' | 'gemini' | null;
+  geminiNotes: boolean;
+  enriching: boolean;
+  /** Row came from the Meet API with no calendar event — its summary is a
+   * synthesized label, never a real title. */
+  offCalendar: boolean;
+}
+
+interface ConflictInfo {
+  id: string;
+  title: string | null;
+  own: boolean;
+}
+
+type Mode = 'video' | 'transcript' | 'both';
+type Step = 'connect' | 'pick' | 'options' | 'importing' | 'done' | 'bulk';
+type SourceTab = 'calendar' | 'recent';
+
+const MAX_BULK = 20;
+
+interface BulkResult {
+  rowId: string;
+  title: string;
+  status: 'ok' | 'exists' | 'error';
+  transcriptId?: string;
+  detail?: string;
+}
+
+interface GmeetImportDialogProps {
+  open: boolean;
+  onClose: () => void;
+  /** Called after a successful import so the parent can refresh the list. */
+  onImported?: () => void;
+}
+
+function todayLocalISO(): string {
+  const d = new Date();
+  const pad = (n: number) => String(n).padStart(2, '0');
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+}
+
+function shiftDate(dateStr: string, days: number): string {
+  const d = new Date(`${dateStr}T12:00:00`);
+  d.setDate(d.getDate() + days);
+  const pad = (n: number) => String(n).padStart(2, '0');
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+}
+
+function classifyAttachments(atts: CalendarAttachment[] | undefined): {
+  video: CalendarAttachment | null;
+  transcriptDoc: CalendarAttachment | null;
+  geminiNotes: CalendarAttachment | null;
+  videoCount: number;
+} {
+  let video: CalendarAttachment | null = null;
+  let transcriptDoc: CalendarAttachment | null = null;
+  let geminiNotes: CalendarAttachment | null = null;
+  let videoCount = 0;
+  for (const a of atts ?? []) {
+    if (!a.fileId) continue;
+    if (a.mimeType?.startsWith('video/')) {
+      videoCount++;
+      if (!video) video = a;
+    } else if (a.mimeType === 'application/vnd.google-apps.document') {
+      if (/gemini/i.test(a.title ?? '')) {
+        if (!geminiNotes) geminiNotes = a;
+      } else if (/transcript/i.test(a.title ?? '')) {
+        if (!transcriptDoc) transcriptDoc = a;
+      }
+    }
+  }
+  return { video, transcriptDoc, geminiNotes, videoCount };
+}
+
+function fmtEventTime(e: CalendarEvent): string {
+  const iso = e.start?.dateTime;
+  if (!iso) return 'all day';
+  return new Date(iso).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+}
+
+function fmtDayTime(iso: string | undefined): string {
+  if (!iso) return '';
+  const d = new Date(iso);
+  return `${d.toLocaleDateString([], { day: 'numeric', month: 'short' })} ${d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}`;
+}
+
+function fmtEventRange(e: CalendarEvent): string {
+  const s = e.start?.dateTime;
+  const en = e.end?.dateTime;
+  if (!s) return 'all day';
+  const sd = new Date(s);
+  const day = sd.toLocaleDateString([], {
+    weekday: 'short',
+    day: 'numeric',
+    month: 'short',
+    year: 'numeric',
+  });
+  const t1 = sd.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+  const t2 = en
+    ? new Date(en).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
+    : '';
+  return `${day}, ${t1}${t2 ? `–${t2}` : ''}`;
+}
+
+function fmtBytes(n: number): string {
+  if (n >= 1024 * 1024 * 1024) return `${(n / (1024 * 1024 * 1024)).toFixed(1)} GB`;
+  if (n >= 1024 * 1024) return `${Math.round(n / (1024 * 1024))} MB`;
+  return `${Math.max(1, Math.round(n / 1024))} KB`;
+}
+
+function inviteeSummary(e: CalendarEvent): string {
+  const all = (e.attendees ?? []).filter(
+    (a) => a.email && !a.email.endsWith('.calendar.google.com')
+  );
+  const names = all.map((a) => a.displayName || a.email!.split('@')[0]);
+  const shown = names.slice(0, 8);
+  const more = names.length - shown.length;
+  return shown.join(', ') + (more > 0 ? ` +${more} more` : '');
+}
+
+/** Extract an abc-defg-hij meeting code from a pasted link or bare code. */
+function parseMeetCode(input: string): string | null {
+  const m = /([a-z]{3}-[a-z]{4}-[a-z]{3})/i.exec(input.trim());
+  return m ? m[1]!.toLowerCase() : null;
+}
+
+async function fetchDriveMeta(
+  token: string,
+  fileId: string
+): Promise<{ name: string; size: number | null } | null> {
+  try {
+    const res = await fetch(
+      `https://www.googleapis.com/drive/v3/files/${encodeURIComponent(fileId)}?fields=name,size&supportsAllDrives=true`,
+      { headers: { Authorization: `Bearer ${token}` } }
+    );
+    if (!res.ok) return null;
+    const j = (await res.json()) as { name?: string; size?: string };
+    return { name: j.name ?? 'recording', size: j.size != null ? Number(j.size) : null };
+  } catch {
+    return null;
+  }
+}
+
+interface MeetRecordLite {
+  name: string;
+  startTime?: string;
+  endTime?: string;
+  spaceResource?: string;
+}
+
+/** List conference records matching a filter (the caller's own meetings). */
+async function listMeetRecords(
+  token: string,
+  filterExpr: string,
+  pageLimit = 3
+): Promise<MeetRecordLite[]> {
+  const out: MeetRecordLite[] = [];
+  let pageToken: string | undefined;
+  for (let i = 0; i < pageLimit; i++) {
+    const res = await fetch(
+      `${MEET_API}/conferenceRecords?filter=${encodeURIComponent(filterExpr)}&pageSize=50${pageToken ? `&pageToken=${pageToken}` : ''}`,
+      { headers: { Authorization: `Bearer ${token}` } }
+    );
+    if (!res.ok) {
+      // THROW, don't return partial: callers must distinguish "no records"
+      // (meeting never happened) from "couldn't check" (scope/quota) — a
+      // silent empty result greys out real meetings as "never started".
+      const detail = await res.text().catch(() => '');
+      console.debug('[gmeet-import] conferenceRecords list failed', res.status, detail);
+      throw new Error(`Meet API list failed (${res.status})`);
+    }
+    const j = (await res.json()) as {
+      conferenceRecords?: Array<{ name: string; startTime?: string; endTime?: string; space?: string }>;
+      nextPageToken?: string;
+    };
+    for (const r of j.conferenceRecords ?? []) {
+      out.push({ name: r.name, startTime: r.startTime, endTime: r.endTime, spaceResource: r.space });
+    }
+    pageToken = j.nextPageToken;
+    if (!pageToken) break;
+  }
+  return out;
+}
+
+/** Resolve a record's space resource to its human meeting code. */
+async function fetchMeetingCode(token: string, spaceResource: string): Promise<string | null> {
+  try {
+    const res = await fetch(`${MEET_API}/${spaceResource}`, {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    if (!res.ok) return null;
+    const j = (await res.json()) as { meetingCode?: string };
+    return j.meetingCode ?? null;
+  } catch {
+    return null;
+  }
+}
+
+/** Fetch a record's recording + transcript artifact ids. */
+async function recordArtifacts(
+  token: string,
+  recordName: string
+): Promise<{ videoFileId: string | null; transcriptDocId: string | null }> {
+  const auth = { headers: { Authorization: `Bearer ${token}` } };
+  const [recRes, transRes] = await Promise.all([
+    fetch(`${MEET_API}/${recordName}/recordings`, auth),
+    fetch(`${MEET_API}/${recordName}/transcripts`, auth),
+  ]);
+  const recs = recRes.ok
+    ? ((await recRes.json()) as { recordings?: Array<{ driveDestination?: { file?: string } }> })
+    : {};
+  const trans = transRes.ok
+    ? ((await transRes.json()) as {
+        transcripts?: Array<{ docsDestination?: { document?: string } }>;
+      })
+    : {};
+  return {
+    videoFileId: recs.recordings?.[0]?.driveDestination?.file ?? null,
+    transcriptDocId: trans.transcripts?.[0]?.docsDestination?.document ?? null,
+  };
+}
+
+/**
+ * "Import from Meet": connect Google → pick a meeting (from the calendar day
+ * view, the last-30-days Meet history, or a pasted Meet link) → the options
+ * step enriches it (Drive metadata + Meet API artifacts) → choose how to
+ * import → run. All Google reads happen in the browser with the user's
+ * short-lived token; only the import call goes through our server.
+ */
+export function GmeetImportDialog({ open, onClose, onImported }: GmeetImportDialogProps) {
+  const [step, setStep] = useState<Step>('connect');
+  const [tab, setTab] = useState<SourceTab>('calendar');
+  const [error, setError] = useState<string | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [date, setDate] = useState<string>(todayLocalISO());
+  const [rows, setRows] = useState<EventRow[]>([]);
+  const [paste, setPaste] = useState('');
+  const [picked, setPicked] = useState<PickedMeeting | null>(null);
+  const [mode, setMode] = useState<Mode>('both');
+  const [conflict, setConflict] = useState<ConflictInfo | null>(null);
+  const [doneInfo, setDoneInfo] = useState<{ mode: Mode; title: string; autoShared: number } | null>(null);
+  const [selected, setSelected] = useState<Set<string>>(new Set());
+  const [bulkResults, setBulkResults] = useState<BulkResult[]>([]);
+  const [bulkProgress, setBulkProgress] = useState<{ done: number; total: number } | null>(null);
+  /** True once the day sweep has SUCCESSFULLY listed the day's conferences —
+   * only then can we trust "no record = meeting never happened". */
+  const [sweepDone, setSweepDone] = useState(false);
+  /** Did the user pick a mode by hand (don't let a late enrich() stomp it). */
+  const modeTouchedRef = useRef(false);
+
+  const reset = () => {
+    setStep('connect');
+    setTab('calendar');
+    setError(null);
+    setBusy(false);
+    setRows([]);
+    setPaste('');
+    setPicked(null);
+    setConflict(null);
+    setDoneInfo(null);
+    setSelected(new Set());
+    setBulkResults([]);
+    setBulkProgress(null);
+  };
+
+  const handleClose = () => {
+    reset();
+    onClose();
+  };
+
+  /**
+   * Day sweep: one Meet API listing for the day joins actual conferences to
+   * the calendar rows (accurate badges even when nothing is attached to the
+   * event), and surfaces meetings you joined that aren't on your calendar.
+   */
+  const sweepDay = useCallback(async (forDate: string, token: string) => {
+    try {
+      const lo = new Date(`${forDate}T00:00:00`).toISOString();
+      const hi = new Date(`${forDate}T23:59:59.999`).toISOString();
+      const records = await listMeetRecords(
+        token,
+        `start_time >= "${lo}" AND start_time <= "${hi}"`,
+        2
+      );
+      if (records.length === 0) {
+        setSweepDone(true);
+        return;
+      }
+
+      const enriched = await Promise.all(
+        records.map(async (r) => {
+          const [code, artifacts] = await Promise.all([
+            r.spaceResource ? fetchMeetingCode(token, r.spaceResource) : Promise.resolve(null),
+            recordArtifacts(token, r.name),
+          ]);
+          return { ...r, code, ...artifacts };
+        })
+      );
+      console.debug('[gmeet-import] day sweep', forDate, enriched);
+
+      setRows((prev) => {
+        const next = prev.map((row) => ({ ...row }));
+        const extras: EventRow[] = [];
+        for (const rec of enriched) {
+          const info: MeetRowInfo = {
+            recordName: rec.name,
+            videoFileId: rec.videoFileId,
+            transcriptDocId: rec.transcriptDocId,
+            checked: true,
+          };
+          // Join ONLY by exact meeting code. No time-overlap guessing: a
+          // moved calendar event once matched a neighbouring slot's record
+          // and imported a completely different meeting's transcript.
+          const target = rec.code
+            ? next.find((row) => row.event.conferenceData?.conferenceId === rec.code)
+            : undefined;
+          if (target) {
+            // Keep the earliest-found artifacts; Meet API fills gaps.
+            target.meet = target.meet ?? info;
+          } else {
+            extras.push({
+              event: {
+                id: rec.name,
+                summary: `Meet${rec.code ? ` · ${rec.code}` : ''} (not on calendar)`,
+                start: { dateTime: rec.startTime },
+                end: { dateTime: rec.endTime },
+                conferenceData: rec.code ? { conferenceId: rec.code } : undefined,
+                attendees: [],
+              },
+              video: null,
+              transcriptDoc: null,
+              geminiNotes: null,
+              videoCount: 0,
+              meet: info,
+              offCalendar: true,
+            });
+          }
+        }
+        return [...next, ...extras];
+      });
+      setSweepDone(true);
+    } catch (err) {
+      // Sweep unavailable (scope/API not granted) — stay permissive, don't
+      // grey rows we can't actually verify.
+      console.debug('[gmeet-import] day sweep failed', err);
+    }
+  }, []);
+
+  const loadEvents = useCallback(
+    async (forDate: string) => {
+      setBusy(true);
+      setError(null);
+      setTab('calendar');
+      try {
+        const token = await getGoogleAccessToken();
+        const params = new URLSearchParams({
+          timeMin: new Date(`${forDate}T00:00:00`).toISOString(),
+          timeMax: new Date(`${forDate}T23:59:59.999`).toISOString(),
+          singleEvents: 'true',
+          orderBy: 'startTime',
+          maxResults: '50',
+          fields:
+            'items(id,summary,start,end,attendees(email,displayName,responseStatus,self),attachments(fileId,title,mimeType),conferenceData(conferenceId))',
+        });
+        const res = await fetch(
+          `https://www.googleapis.com/calendar/v3/calendars/primary/events?${params}`,
+          { headers: { Authorization: `Bearer ${token}` } }
+        );
+        if (res.status === 401) {
+          invalidateGoogleToken();
+          throw new Error('Google session expired — hit Connect again.');
+        }
+        if (!res.ok) throw new Error(`Calendar request failed (${res.status})`);
+        const data = (await res.json()) as { items?: CalendarEvent[] };
+        console.debug('[gmeet-import] events for', forDate, data.items);
+        const evRows: EventRow[] = (data.items ?? [])
+          // Meetings only — skip all-day events (no dateTime).
+          .filter((e) => e.start?.dateTime)
+          .map((event) => ({ event, ...classifyAttachments(event.attachments), meet: null }));
+        setSweepDone(false);
+        setSelected(new Set());
+        setRows(evRows);
+        setStep('pick');
+        // Non-blocking: join the day's actual conferences in when they load.
+        void sweepDay(forDate, token);
+      } catch (err) {
+        setError(err instanceof Error ? err.message : 'Failed to load calendar');
+        if (!hasValidGoogleToken()) setStep('connect');
+      } finally {
+        setBusy(false);
+      }
+    },
+    [sweepDay]
+  );
+
+  /** Last 30 days of conferences the user was in (Meet API only, no titles). */
+  const loadRecents = useCallback(async () => {
+    setBusy(true);
+    setError(null);
+    setTab('recent');
+    try {
+      const token = await getGoogleAccessToken();
+      const lo = new Date(Date.now() - 30 * 24 * 3600_000).toISOString();
+      const records = await listMeetRecords(token, `start_time >= "${lo}"`, 3);
+      records.sort((a, b) => (b.startTime ?? '').localeCompare(a.startTime ?? ''));
+      setSelected(new Set());
+      setRows(
+        records.map((r) => ({
+          event: {
+            id: r.name,
+            summary: `Meet — ${fmtDayTime(r.startTime)}`,
+            start: { dateTime: r.startTime },
+            end: { dateTime: r.endTime },
+            attendees: [],
+          },
+          video: null,
+          transcriptDoc: null,
+          geminiNotes: null,
+          videoCount: 0,
+          meet: { recordName: r.name, videoFileId: null, transcriptDocId: null, checked: false },
+          offCalendar: true,
+        }))
+      );
+      setStep('pick');
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Failed to load recent meets');
+    } finally {
+      setBusy(false);
+    }
+  }, []);
+
+  /** Pasted Meet link/code → list that code's conference instances. */
+  const lookupPaste = useCallback(async () => {
+    const code = parseMeetCode(paste);
+    if (!code) {
+      setError('That doesn’t look like a Meet link or code (abc-defg-hij).');
+      return;
+    }
+    setBusy(true);
+    setError(null);
+    setTab('recent');
+    try {
+      const token = await getGoogleAccessToken();
+      const records = await listMeetRecords(token, `space.meeting_code = "${code}"`, 2);
+      records.sort((a, b) => (b.startTime ?? '').localeCompare(a.startTime ?? ''));
+      if (records.length === 0) {
+        setError(
+          `No conference records found for ${code} — the Meet API only shows meetings you attended or organised.`
+        );
+        return;
+      }
+      setSelected(new Set());
+      setRows(
+        records.map((r) => ({
+          event: {
+            id: r.name,
+            summary: `${code} — ${fmtDayTime(r.startTime)}`,
+            start: { dateTime: r.startTime },
+            end: { dateTime: r.endTime },
+            conferenceData: { conferenceId: code },
+            attendees: [],
+          },
+          video: null,
+          transcriptDoc: null,
+          geminiNotes: null,
+          videoCount: 0,
+          meet: { recordName: r.name, videoFileId: null, transcriptDocId: null, checked: false },
+          offCalendar: true,
+        }))
+      );
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Lookup failed');
+    } finally {
+      setBusy(false);
+    }
+  }, [paste]);
+
+  // Skip the connect step when a token from earlier in this page session is
+  // still alive.
+  useEffect(() => {
+    if (open && step === 'connect' && hasValidGoogleToken()) {
+      void loadEvents(date);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [open]);
+
+  const changeDate = (next: string) => {
+    setDate(next);
+    void loadEvents(next);
+  };
+
+  /** Merge Drive metadata + Meet API artifacts into the picked meeting. */
+  const enrich = async (initial: PickedMeeting) => {
+    try {
+      const token = await getGoogleAccessToken();
+      const e = initial.event;
+      let recordName = initial.conferenceRecordName;
+      let videoFileId = initial.videoFileId;
+      let transcriptDocId = initial.transcriptDocId;
+      let transcriptSource = initial.transcriptSource;
+
+      // Find the conference record if we don't have it yet. The API returns
+      // records NEWEST-first — always pick the one NEAREST the event start,
+      // never [0], or a reused standing link imports the wrong meeting.
+      if (!recordName && e.conferenceData?.conferenceId) {
+        let filter = `space.meeting_code = "${e.conferenceData.conferenceId}"`;
+        if (e.start?.dateTime) {
+          const t = new Date(e.start.dateTime).getTime();
+          filter += ` AND start_time >= "${new Date(t - 6 * 3600_000).toISOString()}" AND start_time <= "${new Date(t + 12 * 3600_000).toISOString()}"`;
+        }
+        const records = await listMeetRecords(token, filter, 1);
+        if (records.length > 0) {
+          const target = e.start?.dateTime ? new Date(e.start.dateTime).getTime() : null;
+          if (target != null) {
+            records.sort(
+              (a, b) =>
+                Math.abs(new Date(a.startTime ?? 0).getTime() - target) -
+                Math.abs(new Date(b.startTime ?? 0).getTime() - target)
+            );
+          }
+          recordName = records[0]!.name;
+        }
+      }
+
+      // Fill artifact gaps from the record.
+      if (recordName && (!videoFileId || !transcriptDocId)) {
+        const found = await recordArtifacts(token, recordName);
+        if (!videoFileId && found.videoFileId) videoFileId = found.videoFileId;
+        if (!transcriptDocId && found.transcriptDocId) {
+          transcriptDocId = found.transcriptDocId;
+          transcriptSource = 'meet-api';
+        }
+      }
+
+      let videoName: string | null = null;
+      let videoSize: number | null = null;
+      if (videoFileId) {
+        const meta = await fetchDriveMeta(token, videoFileId);
+        if (meta) {
+          videoName = meta.name;
+          videoSize = meta.size;
+        }
+      }
+
+      let applied = false;
+      setPicked((prev) => {
+        if (!prev || prev.event.id !== initial.event.id) return prev;
+        applied = true;
+        return {
+          ...prev,
+          conferenceRecordName: recordName,
+          videoFileId,
+          videoName,
+          videoSize,
+          transcriptDocId,
+          transcriptSource,
+          enriching: false,
+        };
+      });
+      // Transcript-first default — but only for the row that's still picked,
+      // and never over a choice the user already made by hand.
+      if (applied && !modeTouchedRef.current) {
+        setMode(transcriptDocId ? 'transcript' : videoFileId ? 'video' : 'transcript');
+      }
+    } catch {
+      setPicked((prev) =>
+        prev && prev.event.id === initial.event.id ? { ...prev, enriching: false } : prev
+      );
+    }
+  };
+
+  const pickEvent = (row: EventRow) => {
+    const videoFileId = row.video?.fileId ?? row.meet?.videoFileId ?? null;
+    // Transcript source priority: explicit transcript doc → Meet API doc →
+    // the Gemini notes doc (its Transcript tab — the server extracts it).
+    const transcriptDocId =
+      row.transcriptDoc?.fileId ??
+      row.meet?.transcriptDocId ??
+      row.geminiNotes?.fileId ??
+      null;
+    const initial: PickedMeeting = {
+      event: row.event,
+      conferenceRecordName: row.meet?.recordName ?? null,
+      videoFileId,
+      videoName: row.video?.title ?? null,
+      videoSize: null,
+      videoCount: row.videoCount,
+      transcriptDocId,
+      transcriptSource: row.transcriptDoc
+        ? 'calendar'
+        : row.meet?.transcriptDocId
+          ? 'meet-api'
+          : row.geminiNotes
+            ? 'gemini'
+            : null,
+      geminiNotes: !!row.geminiNotes,
+      enriching: true,
+      offCalendar: !!row.offCalendar,
+    };
+    setPicked(initial);
+    setError(null);
+    setConflict(null);
+    modeTouchedRef.current = false;
+    // Transcript-first default.
+    setMode(transcriptDocId ? 'transcript' : videoFileId ? 'video' : 'transcript');
+    setStep('options');
+    void enrich(initial);
+  };
+
+  /** Can this row be bulk quick-imported (transcript-only)? Requires real
+   * evidence a transcript can exist: a transcript/Gemini doc, or a conference
+   * record proving the meeting actually happened (server resolves the doc).
+   * A bare Meet link is NOT enough — scheduled-but-never-started meetings
+   * have one too. */
+  const bulkEligible = (row: EventRow): boolean =>
+    !!(
+      row.transcriptDoc ||
+      row.geminiNotes ||
+      row.meet?.transcriptDocId ||
+      row.meet?.recordName
+    );
+
+  const toggleSelect = (rowId: string) => {
+    setSelected((prev) => {
+      const next = new Set(prev);
+      if (next.has(rowId)) next.delete(rowId);
+      else if (next.size < MAX_BULK) next.add(rowId);
+      return next;
+    });
+  };
+
+  /** Mass quick-import: transcript-only, sequential, per-row results. */
+  const runBulkImport = async () => {
+    const targets = rows.filter((r) => selected.has(r.event.id));
+    if (targets.length === 0) return;
+    setBusy(true);
+    setError(null);
+    setBulkResults([]);
+    setBulkProgress({ done: 0, total: targets.length });
+    setStep('bulk');
+    const results: BulkResult[] = [];
+    for (const row of targets) {
+      const e = row.event;
+      const title = e.summary ?? '(no title)';
+      try {
+        const token = await getGoogleAccessToken();
+        const res = await fetch('/api/gmeet/import', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            accessToken: token,
+            mode: 'transcript',
+            transcriptDocId:
+              row.transcriptDoc?.fileId ??
+              row.meet?.transcriptDocId ??
+              row.geminiNotes?.fileId ??
+              undefined,
+            conferenceRecordName: row.meet?.recordName ?? undefined,
+            event: {
+              id: e.id,
+              title: row.offCalendar ? undefined : e.summary,
+              startTime: e.start?.dateTime,
+              endTime: e.end?.dateTime,
+              meetingCode: e.conferenceData?.conferenceId,
+              attendees: (e.attendees ?? [])
+                .filter((a) => a.email)
+                .map((a) => ({
+                  email: a.email!,
+                  name: a.displayName,
+                  responseStatus: a.responseStatus,
+                })),
+            },
+          }),
+        });
+        if (res.status === 409) {
+          const detail = (await res.json()) as { existing?: { assemblyai_id?: string } };
+          results.push({
+            rowId: e.id,
+            title,
+            status: 'exists',
+            transcriptId: detail.existing?.assemblyai_id,
+          });
+        } else if (res.ok) {
+          const payload = (await res.json()) as { transcript?: { assemblyai_id?: string } };
+          results.push({
+            rowId: e.id,
+            title,
+            status: 'ok',
+            transcriptId: payload.transcript?.assemblyai_id,
+          });
+        } else {
+          const detail = await res.json().catch(() => ({}) as { error?: string });
+          results.push({
+            rowId: e.id,
+            title,
+            status: 'error',
+            detail: detail.error || `HTTP ${res.status}`,
+          });
+        }
+      } catch (err) {
+        results.push({
+          rowId: e.id,
+          title,
+          status: 'error',
+          detail: err instanceof Error ? err.message : 'failed',
+        });
+      }
+      setBulkResults([...results]);
+      setBulkProgress({ done: results.length, total: targets.length });
+    }
+    setBusy(false);
+    setSelected(new Set());
+    onImported?.();
+  };
+
+  const runImport = async (force = false) => {
+    if (!picked) return;
+    setBusy(true);
+    setError(null);
+    setConflict(null);
+    setStep('importing');
+    try {
+      const token = await getGoogleAccessToken();
+      const e = picked.event;
+      const res = await fetch('/api/gmeet/import', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          accessToken: token,
+          mode,
+          videoFileId: picked.videoFileId ?? undefined,
+          transcriptDocId: picked.transcriptDocId ?? undefined,
+          conferenceRecordName: picked.conferenceRecordName ?? undefined,
+          force,
+          event: {
+            id: e.id,
+            title: picked.offCalendar ? undefined : e.summary,
+            startTime: e.start?.dateTime,
+            endTime: e.end?.dateTime,
+            meetingCode: e.conferenceData?.conferenceId,
+            attendees: (e.attendees ?? [])
+              .filter((a) => a.email)
+              .map((a) => ({
+                email: a.email!,
+                name: a.displayName,
+                responseStatus: a.responseStatus,
+              })),
+          },
+        }),
+      });
+
+      if (res.status === 409) {
+        const detail = (await res.json()) as {
+          existing?: { assemblyai_id?: string; own?: boolean; title?: string | null };
+        };
+        setConflict({
+          id: detail.existing?.assemblyai_id ?? '',
+          title: detail.existing?.title ?? null,
+          own: !!detail.existing?.own,
+        });
+        setStep('options');
+        return;
+      }
+      if (!res.ok) {
+        const detail = await res.json().catch(() => ({}) as { error?: string });
+        throw new Error(detail.error || `Import failed (${res.status})`);
+      }
+
+      const payload = (await res.json()) as { autoShared?: number };
+      setDoneInfo({
+        mode,
+        title: e.summary ?? 'Untitled meeting',
+        autoShared: payload.autoShared ?? 0,
+      });
+      setStep('done');
+      onImported?.();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Import failed');
+      setStep('options');
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const connect = async () => {
+    setError(null);
+    setBusy(true);
+    try {
+      await getGoogleAccessToken(); // popup — must run inside the click
+      await loadEvents(date);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Google sign-in failed');
+      setBusy(false);
+    }
+  };
+
+  return (
+    <Dialog open={open} onOpenChange={(o) => (!o ? handleClose() : null)}>
+      {/* sm:max-w-2xl (not max-w-2xl): DialogContent ships sm:max-w-lg and
+          twMerge only replaces within the same breakpoint group — a base
+          max-w-2xl loses to it and the content overflows the 512px card. */}
+      <DialogContent className="sm:max-w-2xl">
+        <DialogHeader>
+          <DialogTitle>Import from Google Meet</DialogTitle>
+        </DialogHeader>
+
+        {step === 'connect' && (
+          <div className="space-y-4 py-2 min-w-0">
+            <div className="rounded-md border bg-muted/40 p-3 text-sm">
+              <p className="font-medium mb-1">Pull a meeting straight from your calendar</p>
+              <p className="text-muted-foreground">
+                Connect your Trames Google account (read-only: Calendar + Drive + Meet +
+                directory), pick the meeting, and we&apos;ll fetch its recording and/or Meet
+                transcript for you — no downloading and re-uploading.
+              </p>
+            </div>
+            {error && (
+              <p className="text-sm text-red-500 flex items-center gap-1">
+                <AlertCircle className="h-4 w-4" />
+                {error}
+              </p>
+            )}
+          </div>
+        )}
+
+        {step === 'pick' && (
+          // min-w-0: DialogContent is a grid; without it this item sizes to
+          // its content's min-content and paints outside the card.
+          <div className="space-y-3 min-w-0">
+            <div className="flex items-center gap-2 flex-wrap">
+              <div className="flex items-center rounded-md border p-0.5">
+                <Button
+                  variant={tab === 'calendar' ? 'secondary' : 'ghost'}
+                  size="sm"
+                  onClick={() => void loadEvents(date)}
+                  disabled={busy}
+                >
+                  Calendar
+                </Button>
+                <Button
+                  variant={tab === 'recent' ? 'secondary' : 'ghost'}
+                  size="sm"
+                  onClick={() => void loadRecents()}
+                  disabled={busy}
+                  title="Meetings you were in over the last 30 days (via the Meet API)"
+                >
+                  <History className="h-3.5 w-3.5 mr-1" />
+                  Recent 30d
+                </Button>
+              </div>
+              {tab === 'calendar' && (
+                <div className="flex items-center gap-1">
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    onClick={() => changeDate(shiftDate(date, -1))}
+                    disabled={busy}
+                  >
+                    <ChevronLeft className="h-4 w-4" />
+                  </Button>
+                  <Input
+                    type="date"
+                    value={date}
+                    onChange={(e) => e.target.value && changeDate(e.target.value)}
+                    className="w-36"
+                    disabled={busy}
+                  />
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    onClick={() => changeDate(shiftDate(date, 1))}
+                    disabled={busy}
+                  >
+                    <ChevronRight className="h-4 w-4" />
+                  </Button>
+                </div>
+              )}
+              {busy && <Loader2 className="h-4 w-4 animate-spin text-muted-foreground" />}
+            </div>
+
+            <div className="flex items-center gap-2">
+              <Link2 className="h-4 w-4 text-muted-foreground shrink-0" />
+              <Input
+                placeholder="…or paste a Meet link / code (abc-defg-hij) someone sent you"
+                value={paste}
+                onChange={(e) => setPaste(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter' && paste.trim()) void lookupPaste();
+                }}
+                className="text-sm"
+                disabled={busy}
+              />
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={() => void lookupPaste()}
+                disabled={busy || !paste.trim()}
+              >
+                Find
+              </Button>
+            </div>
+
+            <div className="max-h-[45vh] overflow-y-auto rounded-md border">
+              {rows.length === 0 && !busy ? (
+                <p className="p-4 text-sm text-muted-foreground">
+                  {tab === 'calendar' ? 'No meetings on this day.' : 'No meetings found.'}
+                </p>
+              ) : (
+                <ul className="divide-y">
+                  {rows.map((row) => {
+                    const hasVideo = !!(row.video || row.meet?.videoFileId);
+                    const hasTranscript = !!(
+                      row.transcriptDoc ||
+                      row.meet?.transcriptDocId ||
+                      row.geminiNotes
+                    );
+                    // Before the day sweep confirms which meetings actually
+                    // happened, a Meet link is enough to try; after it, a
+                    // link with no conference record = never started.
+                    const importable =
+                      hasVideo ||
+                      hasTranscript ||
+                      !!row.meet ||
+                      (!sweepDone && !!row.event.conferenceData?.conferenceId);
+                    return (
+                      <li key={row.event.id} className="flex items-center">
+                        {bulkEligible(row) ? (
+                          <input
+                            type="checkbox"
+                            className="ml-3 h-4 w-4 shrink-0"
+                            checked={selected.has(row.event.id)}
+                            onChange={() => toggleSelect(row.event.id)}
+                            disabled={busy}
+                            title="Select for bulk quick-import (transcript only)"
+                          />
+                        ) : (
+                          <span className="ml-3 w-4 shrink-0" />
+                        )}
+                        <button
+                          type="button"
+                          onClick={() => importable && pickEvent(row)}
+                          disabled={!importable || busy}
+                          className={`w-full text-left flex items-center gap-3 p-3 min-w-0 ${
+                            importable
+                              ? 'hover:bg-muted/50 cursor-pointer'
+                              : 'opacity-50 cursor-default'
+                          }`}
+                        >
+                          <span className="text-xs text-muted-foreground w-16 shrink-0">
+                            {tab === 'calendar' ? fmtEventTime(row.event) : ''}
+                          </span>
+                          <span className="flex-1 min-w-0 truncate text-sm">
+                            {row.event.summary ?? '(no title)'}
+                          </span>
+                          {hasVideo && (
+                            <Badge variant="outline" className="text-[10px] gap-1 shrink-0">
+                              <Video className="h-3 w-3" />
+                              recording{row.videoCount > 1 ? ` ×${row.videoCount}` : ''}
+                            </Badge>
+                          )}
+                          {hasTranscript && (
+                            <Badge variant="outline" className="text-[10px] gap-1 shrink-0">
+                              <FileText className="h-3 w-3" />
+                              transcript
+                            </Badge>
+                          )}
+                          {!importable && (
+                            <span className="text-[10px] text-muted-foreground shrink-0">
+                              {row.event.conferenceData?.conferenceId
+                                ? 'never started'
+                                : 'no meet link'}
+                            </span>
+                          )}
+                        </button>
+                      </li>
+                    );
+                  })}
+                </ul>
+              )}
+            </div>
+            {selected.size > 0 && (
+              <p className="text-xs text-muted-foreground">
+                {selected.size}/{MAX_BULK} selected for quick-import (Meet transcript only —
+                you can re-run diarization on any of them later).
+              </p>
+            )}
+            {error && (
+              <p className="text-sm text-red-500 flex items-center gap-1">
+                <AlertCircle className="h-4 w-4" />
+                {error}
+              </p>
+            )}
+          </div>
+        )}
+
+        {step === 'bulk' && (
+          <div className="space-y-3 min-w-0">
+            <p className="text-sm text-muted-foreground flex items-center gap-2">
+              {busy && <Loader2 className="h-4 w-4 animate-spin" />}
+              {busy
+                ? `Importing ${(bulkProgress?.done ?? 0) + 1} of ${bulkProgress?.total}…`
+                : `Done — ${bulkResults.filter((r) => r.status === 'ok').length} imported, ${bulkResults.filter((r) => r.status === 'exists').length} already existed, ${bulkResults.filter((r) => r.status === 'error').length} failed.`}
+            </p>
+            <div className="max-h-[50vh] overflow-y-auto rounded-md border">
+              <ul className="divide-y">
+                {bulkResults.map((r) => (
+                  <li key={r.rowId} className="flex items-center gap-2 p-3 text-xs">
+                    {r.status === 'ok' && (
+                      <CheckCircle2 className="h-4 w-4 text-green-500 shrink-0" />
+                    )}
+                    {r.status === 'exists' && (
+                      <CheckCircle2 className="h-4 w-4 text-muted-foreground shrink-0" />
+                    )}
+                    {r.status === 'error' && (
+                      <AlertCircle className="h-4 w-4 text-red-500 shrink-0" />
+                    )}
+                    <span className="flex-1 min-w-0 truncate">{r.title}</span>
+                    {r.status === 'exists' && (
+                      <span className="text-muted-foreground shrink-0">already imported</span>
+                    )}
+                    {r.status === 'error' && (
+                      <span className="text-red-500 truncate max-w-[40%]">{r.detail}</span>
+                    )}
+                    {r.transcriptId && (
+                      <a
+                        href={`/transcript/${r.transcriptId}`}
+                        target="_blank"
+                        rel="noreferrer"
+                        className="shrink-0"
+                      >
+                        <Button variant="ghost" size="sm" className="h-6 px-2 text-xs">
+                          <ExternalLink className="h-3 w-3 mr-1" />
+                          open
+                        </Button>
+                      </a>
+                    )}
+                  </li>
+                ))}
+              </ul>
+            </div>
+          </div>
+        )}
+
+        {step === 'options' && picked && (
+          <div className="space-y-4 min-w-0">
+            <div className="rounded-md border bg-muted/40 p-3 space-y-1.5">
+              <p className="text-sm font-medium">{picked.event.summary ?? '(no title)'}</p>
+              <p className="text-xs text-muted-foreground">{fmtEventRange(picked.event)}</p>
+              {picked.event.conferenceData?.conferenceId && (
+                <p className="text-xs text-muted-foreground font-mono">
+                  meet.google.com/{picked.event.conferenceData.conferenceId}
+                </p>
+              )}
+              {(picked.event.attendees ?? []).length > 0 && (
+                <p className="text-xs text-muted-foreground">
+                  <span className="font-medium">
+                    {(picked.event.attendees ?? []).length} invitees:
+                  </span>{' '}
+                  {inviteeSummary(picked.event)}
+                </p>
+              )}
+              <div className="pt-1 space-y-0.5">
+                {picked.enriching ? (
+                  <p className="text-xs text-muted-foreground flex items-center gap-1">
+                    <Loader2 className="h-3 w-3 animate-spin" />
+                    Checking Drive and the Meet API for artifacts…
+                  </p>
+                ) : (
+                  <>
+                    {picked.videoFileId ? (
+                      <p className="text-xs flex items-center gap-1">
+                        <Video className="h-3 w-3 shrink-0" />
+                        <span className="truncate">
+                          {picked.videoName ?? 'Recording'}
+                          {picked.videoSize != null && (
+                            <span className="text-muted-foreground">
+                              {' '}
+                              · {fmtBytes(picked.videoSize)}
+                            </span>
+                          )}
+                          {picked.videoCount > 1 && (
+                            <span className="text-muted-foreground">
+                              {' '}
+                              · {picked.videoCount} recordings, importing the first
+                            </span>
+                          )}
+                        </span>
+                      </p>
+                    ) : (
+                      <p className="text-xs text-muted-foreground">No recording found.</p>
+                    )}
+                    {picked.transcriptDocId ? (
+                      <p className="text-xs flex items-center gap-1">
+                        <FileText className="h-3 w-3 shrink-0" />
+                        Meet transcript found
+                        {picked.transcriptSource === 'meet-api' && (
+                          <span className="text-muted-foreground">
+                            (via Meet API — not on the calendar event)
+                          </span>
+                        )}
+                        {picked.transcriptSource === 'gemini' && (
+                          <span className="text-muted-foreground">
+                            (Transcript tab of the Notes by Gemini doc)
+                          </span>
+                        )}
+                      </p>
+                    ) : (
+                      <p className="text-xs text-muted-foreground">
+                        No Meet transcript found for this meeting.
+                      </p>
+                    )}
+                    <p className="text-xs text-muted-foreground">
+                      On import we also snapshot who actually joined (with join/leave times)
+                      and Meet&apos;s own per-utterance transcript timings — they expire on
+                      Google&apos;s side after 30 days.
+                    </p>
+                  </>
+                )}
+              </div>
+            </div>
+
+            {conflict && (
+              <div className="rounded-md border border-amber-400 bg-amber-50 dark:bg-amber-950/30 p-3 space-y-2">
+                <p className="text-sm">
+                  Already imported by {conflict.own ? 'you' : 'a teammate'}
+                  {conflict.title ? (
+                    <>
+                      {' '}
+                      — <span className="font-medium">{conflict.title}</span>
+                    </>
+                  ) : null}
+                  . It&apos;s in your list (invitees are shared in automatically).
+                </p>
+                <div className="flex gap-2">
+                  <a href={`/transcript/${conflict.id}`}>
+                    <Button size="sm">
+                      <ExternalLink className="h-3.5 w-3.5 mr-1.5" />
+                      Open transcript
+                    </Button>
+                  </a>
+                  <Button
+                    size="sm"
+                    variant="outline"
+                    onClick={() => runImport(true)}
+                    disabled={busy}
+                  >
+                    {conflict.own ? 'Re-import (overwrites yours)' : 'Import my own copy anyway'}
+                  </Button>
+                </div>
+              </div>
+            )}
+
+            <div className="space-y-2">
+              {picked.transcriptDocId && (
+                <label className="flex items-start gap-2 rounded-md border p-3 cursor-pointer has-[:checked]:border-primary">
+                  <input
+                    type="radio"
+                    name="gmeet-mode"
+                    checked={mode === 'transcript'}
+                    onChange={() => {
+                      modeTouchedRef.current = true;
+                      setMode('transcript');
+                    }}
+                    className="mt-0.5"
+                  />
+                  <span className="text-sm">
+                    <span className="font-medium">
+                      Quick import Meet&apos;s transcript (recommended)
+                    </span>
+                    <span className="block text-xs text-muted-foreground">
+                      Instant and free, with real participant names. Caveat: people sharing
+                      one meeting-room mic show up as one speaker, and there&apos;s no audio
+                      playback — you can always re-run diarization later if that matters.
+                    </span>
+                  </span>
+                </label>
+              )}
+              {picked.videoFileId && picked.transcriptDocId && (
+                <label className="flex items-start gap-2 rounded-md border p-3 cursor-pointer has-[:checked]:border-primary">
+                  <input
+                    type="radio"
+                    name="gmeet-mode"
+                    checked={mode === 'both'}
+                    onChange={() => {
+                      modeTouchedRef.current = true;
+                      setMode('both');
+                    }}
+                    className="mt-0.5"
+                  />
+                  <span className="text-sm">
+                    <span className="font-medium">Re-transcribe + keep Meet transcript</span>
+                    <span className="block text-xs text-muted-foreground">
+                      For when speaker separation matters (pooled meeting-room audio):
+                      voice-level diarization from the video, with Google&apos;s transcript
+                      kept alongside for names. Slower, uses transcription credit.
+                    </span>
+                  </span>
+                </label>
+              )}
+              {picked.videoFileId && (
+                <label className="flex items-start gap-2 rounded-md border p-3 cursor-pointer has-[:checked]:border-primary">
+                  <input
+                    type="radio"
+                    name="gmeet-mode"
+                    checked={mode === 'video'}
+                    onChange={() => {
+                      modeTouchedRef.current = true;
+                      setMode('video');
+                    }}
+                    className="mt-0.5"
+                  />
+                  <span className="text-sm">
+                    <span className="font-medium">Re-transcribe the recording only</span>
+                    <span className="block text-xs text-muted-foreground">
+                      Exception path: fetch the video from Drive and run our transcription
+                      with speaker diarization. Takes a few minutes.
+                    </span>
+                  </span>
+                </label>
+              )}
+              {!picked.enriching && !picked.videoFileId && !picked.transcriptDocId && (
+                <p className="text-sm text-muted-foreground p-1">
+                  Nothing importable found for this meeting — it may not have been recorded,
+                  or Meet is still processing the artifacts.
+                </p>
+              )}
+            </div>
+
+            {error && (
+              <p className="text-sm text-red-500 flex items-center gap-1">
+                <AlertCircle className="h-4 w-4" />
+                {error}
+              </p>
+            )}
+          </div>
+        )}
+
+        {step === 'importing' && (
+          <div className="py-8 text-center">
+            <Download className="h-10 w-10 animate-bounce mx-auto text-blue-500" />
+            <p className="mt-3 text-sm text-muted-foreground">
+              {mode === 'transcript'
+                ? 'Importing the Meet transcript…'
+                : 'Pulling the recording from Drive and submitting for transcription… this can take a few minutes for long meetings. Keep this tab open.'}
+            </p>
+          </div>
+        )}
+
+        {step === 'done' && doneInfo && (
+          <div className="py-6 text-center space-y-2">
+            <CheckCircle2 className="h-10 w-10 mx-auto text-green-500" />
+            <p className="text-sm font-medium">{doneInfo.title}</p>
+            <p className="text-sm text-muted-foreground">
+              {doneInfo.mode === 'transcript'
+                ? 'Meet transcript imported — it’s ready in your list now.'
+                : 'Recording submitted for transcription — it’ll show up in your list as processing and complete in a few minutes.'}
+            </p>
+            {doneInfo.autoShared > 0 && (
+              <p className="text-xs text-muted-foreground">
+                Auto-shared with {doneInfo.autoShared} Trames colleague
+                {doneInfo.autoShared === 1 ? '' : 's'} who {doneInfo.autoShared === 1 ? 'was' : 'were'} in the meeting.
+              </p>
+            )}
+          </div>
+        )}
+
+        <DialogFooter>
+          {step === 'connect' && (
+            <>
+              <Button variant="outline" onClick={handleClose} disabled={busy}>
+                Cancel
+              </Button>
+              <Button onClick={connect} disabled={busy}>
+                {busy ? (
+                  <Loader2 className="h-4 w-4 mr-2 animate-spin" />
+                ) : (
+                  <Video className="h-4 w-4 mr-2" />
+                )}
+                Connect Google
+              </Button>
+            </>
+          )}
+          {step === 'pick' && (
+            <>
+              <Button variant="outline" onClick={handleClose}>
+                Cancel
+              </Button>
+              {selected.size > 0 && (
+                <Button onClick={() => void runBulkImport()} disabled={busy}>
+                  <Download className="h-4 w-4 mr-2" />
+                  Quick-import {selected.size} transcript{selected.size === 1 ? '' : 's'}
+                </Button>
+              )}
+            </>
+          )}
+          {step === 'bulk' && (
+            <Button onClick={handleClose} disabled={busy}>
+              Done
+            </Button>
+          )}
+          {step === 'options' && (
+            <>
+              <Button variant="outline" onClick={() => setStep('pick')} disabled={busy}>
+                Back
+              </Button>
+              <Button
+                onClick={() => runImport()}
+                disabled={
+                  busy ||
+                  picked?.enriching ||
+                  (!picked?.videoFileId && !picked?.transcriptDocId) ||
+                  !!conflict
+                }
+              >
+                <Download className="h-4 w-4 mr-2" />
+                Import
+              </Button>
+            </>
+          )}
+          {step === 'done' && <Button onClick={handleClose}>Done</Button>}
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
+  );
+}
