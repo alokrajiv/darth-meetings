@@ -111,10 +111,14 @@ export function LinkEventDialog({
     setLinking(e.id);
     setError(null);
     try {
+      // Pass the token so the server can enrich from the Meet API too
+      // (participants, conference times, transcript sidecar).
+      const token = await getGoogleAccessToken();
       const res = await fetch(`/api/transcripts/${transcriptId}/link-event`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
+          accessToken: token,
           event: {
             id: e.id,
             title: e.summary,

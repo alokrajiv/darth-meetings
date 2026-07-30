@@ -9,7 +9,12 @@ import {
 } from '@/db-ops/transcripts';
 import { logActivity } from '@/db-ops/transcript-activity';
 import { registerPeopleFromMeeting } from '@/lib/server/import-helpers';
-import type { GmeetAttendee } from '@/lib/format';
+import {
+  captureMeetActuals,
+  findConferenceRecordName,
+  utterancesFromEntries,
+} from '@/lib/server/gmeet';
+import type { GmeetAttendee, GmeetContext, MeetActuals } from '@/lib/format';
 
 export const runtime = 'nodejs';
 
@@ -32,6 +37,8 @@ export const POST = withAuth(async ({ user, request }, { params }) => {
   }
 
   let body: {
+    /** Caller's Google token — enables the Meet API enrichment pass. */
+    accessToken?: string;
     event?: {
       id?: string;
       title?: string;
@@ -57,17 +64,48 @@ export const POST = withAuth(async ({ user, request }, { params }) => {
         .map((a) => ({ email: a.email, name: a.name, responseStatus: a.responseStatus }))
     : [];
 
-  await mergeGmeetContextForUser(access.ownerUserId, id, {
+  // Enrichment: if the event had a Meet and we hold a token, capture the
+  // same "actuals" an import would — who actually joined (with directory
+  // emails), real conference times, and the Meet transcript entries. The
+  // entries become a notes cross-reference sidecar; timeline ALIGNMENT is
+  // deliberately skipped here (an uploaded recording's t=0 is arbitrary, so
+  // overlap voting against Meet's clock could misattribute speakers).
+  let actuals: MeetActuals | null = null;
+  if (typeof body.accessToken === 'string' && body.accessToken.length > 20 && event.meetingCode) {
+    try {
+      const recordName = await findConferenceRecordName(
+        body.accessToken,
+        event.meetingCode,
+        event.startTime
+      );
+      if (recordName) actuals = await captureMeetActuals(body.accessToken, recordName);
+    } catch (err) {
+      console.warn('[link-event] actuals capture failed (continuing):', err);
+    }
+  }
+
+  const patch: Partial<GmeetContext> = {
     eventId: event.id,
     eventTitle: event.title,
     startTime: event.startTime,
     endTime: event.endTime,
     meetingCode: event.meetingCode,
     attendees,
-  });
+  };
+  if (actuals) {
+    patch.actuals = actuals;
+    if (actuals.transcriptEntries && actuals.transcriptEntries.length > 0) {
+      patch.meetTranscript = {
+        attendees: (actuals.participants ?? []).map((p) => p.displayName),
+        utterances: utterancesFromEntries(actuals.transcriptEntries),
+      };
+    }
+  }
+  await mergeGmeetContextForUser(access.ownerUserId, id, patch);
 
-  if (event.startTime && !Number.isNaN(Date.parse(event.startTime))) {
-    await setRecordedAtForUser(access.ownerUserId, id, new Date(event.startTime));
+  const startIso = event.startTime ?? actuals?.conferenceStart;
+  if (startIso && !Number.isNaN(Date.parse(startIso))) {
+    await setRecordedAtForUser(access.ownerUserId, id, new Date(startIso));
   }
 
   // Fill an empty title from the event — never clobber an existing one.
@@ -76,7 +114,12 @@ export const POST = withAuth(async ({ user, request }, { params }) => {
   }
 
   await registerPeopleFromMeeting(
-    attendees.map((a) => ({ email: a.email, name: a.name })),
+    [
+      ...attendees.map((a) => ({ email: a.email, name: a.name })),
+      ...(actuals?.participants ?? [])
+        .filter((p) => p.email)
+        .map((p) => ({ email: p.email!, name: p.displayName })),
+    ],
     user.userId
   );
 
