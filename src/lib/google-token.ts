@@ -59,6 +59,52 @@ declare global {
 let cached: { token: string; expiresAt: number } | null = null;
 let scriptPromise: Promise<void> | null = null;
 
+/**
+ * The token also lives in sessionStorage so a page reload doesn't force a
+ * fresh popup: it's origin-scoped, dies with the tab, and the token itself
+ * expires in ~1h regardless — acceptable for an internal app with read-only
+ * scopes. The scope list is stored alongside so adding a scope in a deploy
+ * invalidates old cached tokens instead of silently 403ing.
+ */
+const STORAGE_KEY = 'mw_google_token';
+
+function readStoredToken(): { token: string; expiresAt: number } | null {
+  try {
+    const raw = window.sessionStorage.getItem(STORAGE_KEY);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw) as {
+      token?: string;
+      expiresAt?: number;
+      scopes?: string;
+    };
+    if (
+      typeof parsed.token !== 'string' ||
+      typeof parsed.expiresAt !== 'number' ||
+      parsed.scopes !== SCOPES
+    ) {
+      return null;
+    }
+    return { token: parsed.token, expiresAt: parsed.expiresAt };
+  } catch {
+    return null;
+  }
+}
+
+function writeStoredToken(value: { token: string; expiresAt: number } | null): void {
+  try {
+    if (value) {
+      window.sessionStorage.setItem(
+        STORAGE_KEY,
+        JSON.stringify({ ...value, scopes: SCOPES })
+      );
+    } else {
+      window.sessionStorage.removeItem(STORAGE_KEY);
+    }
+  } catch {
+    // storage unavailable — memory cache still works
+  }
+}
+
 function loadGsiScript(): Promise<void> {
   if (window.google?.accounts?.oauth2) return Promise.resolve();
   if (scriptPromise) return scriptPromise;
@@ -78,12 +124,14 @@ function loadGsiScript(): Promise<void> {
 
 /** True when a cached token has >2 min of life left (skip the connect step). */
 export function hasValidGoogleToken(): boolean {
+  if (!cached) cached = readStoredToken();
   return cached !== null && cached.expiresAt - Date.now() > 120_000;
 }
 
 /** Drop the cached token (e.g. after a Google API 401). */
 export function invalidateGoogleToken(): void {
   cached = null;
+  writeStoredToken(null);
 }
 
 export async function getGoogleAccessToken(): Promise<string> {
@@ -112,6 +160,7 @@ export async function getGoogleAccessToken(): Promise<string> {
           token: resp.access_token,
           expiresAt: Date.now() + expiresIn * 1000,
         };
+        writeStoredToken(cached);
         resolve(resp.access_token);
       },
       error_callback: (err) => {
