@@ -51,6 +51,23 @@ type ColKey = 'owner' | 'date' | 'duration' | 'speakers' | 'language' | 'importe
 interface ColPrefs {
   order: ColKey[];
   hidden: ColKey[];
+  /** Show the description/filename line under titles (default on). */
+  showDesc: boolean;
+}
+
+/**
+ * Descriptions are free-form (sometimes pasted markdown) — flatten to one
+ * short plain-text line for the listing.
+ */
+function cleanDescription(raw: string): string {
+  return raw
+    .replace(/```[\s\S]*?```/g, ' ')
+    .replace(/^#+\s*/gm, '')
+    .replace(/[*_`>]+/g, '')
+    .replace(/\[([^\]]*)\]\([^)]*\)/g, '$1')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, 140);
 }
 
 const DEFAULT_COL_ORDER: ColKey[] = [
@@ -94,16 +111,16 @@ const COL_RESPONSIVE: Record<ColKey, string> = {
 function loadColPrefs(): ColPrefs {
   try {
     const raw = localStorage.getItem(COLS_STORAGE_KEY);
-    if (!raw) return { order: DEFAULT_COL_ORDER, hidden: DEFAULT_HIDDEN };
+    if (!raw) return { order: DEFAULT_COL_ORDER, hidden: DEFAULT_HIDDEN, showDesc: true };
     const parsed = JSON.parse(raw) as Partial<ColPrefs>;
     const valid = new Set<ColKey>(DEFAULT_COL_ORDER);
     const order = (parsed.order ?? []).filter((k): k is ColKey => valid.has(k as ColKey));
     // Append any columns added after the prefs were saved.
     for (const k of DEFAULT_COL_ORDER) if (!order.includes(k)) order.push(k);
     const hidden = (parsed.hidden ?? []).filter((k): k is ColKey => valid.has(k as ColKey));
-    return { order, hidden };
+    return { order, hidden, showDesc: parsed.showDesc !== false };
   } catch {
-    return { order: DEFAULT_COL_ORDER, hidden: DEFAULT_HIDDEN };
+    return { order: DEFAULT_COL_ORDER, hidden: DEFAULT_HIDDEN, showDesc: true };
   }
 }
 
@@ -121,6 +138,7 @@ export function TranscriptTable({ refreshTrigger }: TranscriptTableProps) {
   const [colPrefs, setColPrefs] = useState<ColPrefs>({
     order: DEFAULT_COL_ORDER,
     hidden: DEFAULT_HIDDEN,
+    showDesc: true,
   });
   const [colsOpen, setColsOpen] = useState(false);
   const colsMenuRef = useRef<HTMLDivElement | null>(null);
@@ -333,12 +351,16 @@ export function TranscriptTable({ refreshTrigger }: TranscriptTableProps) {
   const titleOf = (
     t: TranscriptListRow
   ): { primary: string; secondary: string | null; untitled: boolean } => {
-    // Secondary line: a human-written description beats the raw filename.
-    const desc = t.description?.trim() || null;
+    // Secondary line: a human-written description beats the raw filename —
+    // flattened + truncated, and toggleable from the column chooser.
+    const desc =
+      colPrefs.showDesc && t.description?.trim()
+        ? cleanDescription(t.description) || null
+        : null;
     if (t.title && t.title.trim().length > 0) {
       return {
         primary: t.title,
-        secondary: desc ?? (t.original_filename || null),
+        secondary: desc ?? (colPrefs.showDesc ? t.original_filename || null : null),
         untitled: false,
       };
     }
@@ -480,10 +502,25 @@ export function TranscriptTable({ refreshTrigger }: TranscriptTableProps) {
               </div>
             );
           })}
+          <div className="mt-1 border-t px-2 py-1.5">
+            <label className="flex cursor-pointer items-center gap-2 text-sm">
+              <input
+                type="checkbox"
+                checked={colPrefs.showDesc}
+                onChange={() =>
+                  saveColPrefs({ ...colPrefs, showDesc: !colPrefs.showDesc })
+                }
+                className="h-3.5 w-3.5 accent-primary"
+              />
+              Description line
+            </label>
+          </div>
           <button
             type="button"
-            onClick={() => saveColPrefs({ order: DEFAULT_COL_ORDER, hidden: DEFAULT_HIDDEN })}
-            className="mt-1 block w-full rounded border-t px-2 py-1.5 text-left text-xs text-muted-foreground hover:bg-muted hover:text-foreground"
+            onClick={() =>
+              saveColPrefs({ order: DEFAULT_COL_ORDER, hidden: DEFAULT_HIDDEN, showDesc: true })
+            }
+            className="block w-full rounded border-t px-2 py-1.5 text-left text-xs text-muted-foreground hover:bg-muted hover:text-foreground"
           >
             Reset to defaults
           </button>
@@ -660,7 +697,7 @@ export function TranscriptTable({ refreshTrigger }: TranscriptTableProps) {
                       disabled ? 'opacity-60' : 'cursor-pointer'
                     }`}
                   >
-                    <TableCell className="py-2.5">
+                    <TableCell className="py-1.5">
                       <div className="flex min-w-0 items-center gap-2">
                         {statusDot(t.status)}
                         {sourceIcon(t)}
@@ -706,11 +743,11 @@ export function TranscriptTable({ refreshTrigger }: TranscriptTableProps) {
                       </div>
                     </TableCell>
                     {visibleCols.map((key) => (
-                      <TableCell key={key} className={`py-2.5 ${COL_RESPONSIVE[key]}`}>
+                      <TableCell key={key} className={`py-1.5 ${COL_RESPONSIVE[key]}`}>
                         {renderColCell(key, t)}
                       </TableCell>
                     ))}
-                    <TableCell className="py-2.5 pr-3">
+                    <TableCell className="py-1.5 pr-3">
                       <div className="flex items-center justify-end gap-0.5">
                         {t.status === 'completed' && t.auto_notes_status === 'running' && (
                           <span
