@@ -1,6 +1,8 @@
 import 'server-only';
 import { getTranscript } from '@/lib/server/assemblyai';
-import { runClaude } from '@/lib/server/claude-cli';
+import { runClaudeWithMeta } from '@/lib/server/claude-cli';
+import { recordAiRun } from '@/db-ops/ai-runs';
+import { findPeopleByEmails, type Person } from '@/db-ops/people';
 import {
   getForUser,
   setAutoNotesForUser,
@@ -169,6 +171,68 @@ function buildMeetCrossReference(row: TranscriptRow): string {
   );
 }
 
+/**
+ * Team-directory block: who was invited / actually joined, enriched with
+ * team + role from the Trames directory. Helps the notes attribute
+ * positions correctly, spell names right, and understand reporting
+ * relationships ("X's team", "the ops side") without inventing them.
+ */
+const MAX_PEOPLE_CHARS = 4_000;
+
+async function buildPeopleContext(row: TranscriptRow): Promise<string> {
+  const ctx = row.gmeet_context;
+  if (!ctx) return '';
+
+  // Invitees + actual joiners, deduped by email (fall back to name-only
+  // for anonymous/room participants).
+  const emails: string[] = [];
+  const nameOnly: string[] = [];
+  for (const a of ctx.attendees ?? []) {
+    if (a.email) emails.push(a.email);
+  }
+  for (const p of ctx.actuals?.participants ?? []) {
+    if (p.email) emails.push(p.email);
+    else if (p.displayName) nameOnly.push(p.displayName);
+  }
+  if (emails.length === 0 && nameOnly.length === 0) return '';
+
+  let directory = new Map<string, Person>();
+  try {
+    directory = await findPeopleByEmails(emails);
+  } catch (err) {
+    console.warn('[auto-notes] people lookup failed (continuing):', err);
+  }
+
+  const seen = new Set<string>();
+  const lines: string[] = [];
+  for (const email of emails) {
+    const key = email.trim().toLowerCase();
+    if (!key || seen.has(key)) continue;
+    seen.add(key);
+    const p = directory.get(key);
+    if (p) {
+      const bits = [p.team && `team: ${p.team}`, p.role && `role: ${p.role}`]
+        .filter(Boolean)
+        .join(', ');
+      lines.push(`- ${p.name} <${key}>${bits ? ` (${bits})` : ''}`);
+    } else {
+      lines.push(`- <${key}>`);
+    }
+  }
+  for (const n of nameOnly) {
+    lines.push(`- ${n} (joined without a signed-in account)`);
+  }
+  if (lines.length === 0) return '';
+
+  let block = lines.join('\n');
+  if (block.length > MAX_PEOPLE_CHARS) block = block.slice(0, MAX_PEOPLE_CHARS);
+  return (
+    `People on the calendar invite / who joined this meeting, with their team and role from the company directory. Use this to spell names correctly, resolve who "X" refers to, and understand team relationships — but only people evidenced in the transcript actually spoke:\n\n` +
+    block +
+    '\n\n'
+  );
+}
+
 function buildTranscriptText(
   content: TranscriptResponse,
   labels: SpeakerLabel[]
@@ -214,7 +278,11 @@ export async function getContentCached(
 export async function generateAutoNotes(
   ownerUserId: string,
   assemblyaiId: string,
-  opts: { force?: boolean } = {}
+  opts: {
+    force?: boolean;
+    /** Who clicked the button — recorded on the ai_runs stats row. */
+    triggeredBy?: { userId: string; email: string };
+  } = {}
 ): Promise<void> {
   const key = `${ownerUserId}:${assemblyaiId}`;
   if (inFlight.has(key)) return;
@@ -241,14 +309,41 @@ export async function generateAutoNotes(
     const speakerContext = buildSpeakerContext(labels, existingSuggestions);
     const attachmentContext = await buildAttachmentContext(row.id);
     const meetCrossRef = buildMeetCrossReference(row);
+    const peopleContext = await buildPeopleContext(row);
 
+    const prompt =
+      PROMPT_HEADER + attachmentContext + meetCrossRef + peopleContext + speakerContext + transcriptText;
     const started = Date.now();
-    const raw = await runClaude(
-      PROMPT_HEADER + attachmentContext + meetCrossRef + speakerContext + transcriptText
-    );
-    console.log(
-      `[auto-notes] ${assemblyaiId}: generated ${raw.length} chars in ${Math.round((Date.now() - started) / 1000)}s`
-    );
+    let raw: string;
+    try {
+      const run = await runClaudeWithMeta(prompt);
+      raw = run.text;
+      console.log(
+        `[auto-notes] ${assemblyaiId}: generated ${raw.length} chars in ${Math.round((Date.now() - started) / 1000)}s` +
+          (run.meta.costUsd != null ? ` ($${run.meta.costUsd.toFixed(4)}, ${run.meta.model ?? 'model?'})` : '')
+      );
+      void recordAiRun({
+        transcriptId: row.id,
+        assemblyaiId,
+        kind: 'auto_notes',
+        triggeredBy: opts.triggeredBy ?? null,
+        status: 'completed',
+        meta: run.meta,
+        promptChars: prompt.length,
+        resultChars: raw.length,
+      });
+    } catch (runErr) {
+      void recordAiRun({
+        transcriptId: row.id,
+        assemblyaiId,
+        kind: 'auto_notes',
+        triggeredBy: opts.triggeredBy ?? null,
+        status: 'error',
+        error: String(runErr).slice(0, 1000),
+        promptChars: prompt.length,
+      });
+      throw runErr;
+    }
 
     // Header lines: "TITLE: ..." then "SPEAKERS: {...}" — split off both.
     let notes = raw;

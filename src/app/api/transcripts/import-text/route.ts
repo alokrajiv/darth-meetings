@@ -4,7 +4,8 @@ import path from 'node:path';
 import { promises as fsp } from 'node:fs';
 import { withAuth } from '@/lib/auth/with-auth';
 import { createImportedForUser } from '@/db-ops/transcripts';
-import { runClaude, parseJsonFromClaude } from '@/lib/server/claude-cli';
+import { runClaudeWithMeta, parseJsonFromClaude } from '@/lib/server/claude-cli';
+import { recordAiRun } from '@/db-ops/ai-runs';
 import { extractAttachmentText } from '@/lib/server/attachment-extract';
 import { getStorageDir } from '@/lib/server/audio-storage';
 import { autoNameSpeakers } from '@/lib/server/import-helpers';
@@ -124,11 +125,21 @@ export const POST = withAuth(async ({ user, request }) => {
 
   // Headless-Claude normalization pass.
   let normalized: NormalizedTranscript;
+  let normalizeRun: Awaited<ReturnType<typeof runClaudeWithMeta>> | null = null;
+  const normalizePrompt = NORMALIZE_PROMPT + sourceText;
   try {
-    const raw = await runClaude(NORMALIZE_PROMPT + sourceText, 8 * 60 * 1000);
-    normalized = parseJsonFromClaude<NormalizedTranscript>(raw);
+    normalizeRun = await runClaudeWithMeta(normalizePrompt, { timeoutMs: 8 * 60 * 1000 });
+    normalized = parseJsonFromClaude<NormalizedTranscript>(normalizeRun.text);
   } catch (err) {
     console.error('[import-text] normalization failed:', err);
+    void recordAiRun({
+      kind: 'import_normalize',
+      triggeredBy: { userId: user.userId, email: user.email },
+      status: 'error',
+      error: String(err).slice(0, 1000),
+      meta: normalizeRun?.meta ?? null,
+      promptChars: normalizePrompt.length,
+    });
     return NextResponse.json(
       { error: 'AI normalization failed', detail: String(err).slice(0, 300) },
       { status: 502 }
@@ -184,6 +195,17 @@ export const POST = withAuth(async ({ user, request }) => {
     audioUrl: null,
     importedContent: content,
     title: title ?? normalized.title?.trim().slice(0, 200) ?? null,
+  });
+
+  void recordAiRun({
+    transcriptId: row.id,
+    assemblyaiId: syntheticId,
+    kind: 'import_normalize',
+    triggeredBy: { userId: user.userId, email: user.email },
+    status: 'completed',
+    meta: normalizeRun.meta,
+    promptChars: normalizePrompt.length,
+    resultChars: normalizeRun.text.length,
   });
 
   try {

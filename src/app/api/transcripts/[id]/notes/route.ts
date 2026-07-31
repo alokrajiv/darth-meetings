@@ -30,7 +30,10 @@ export const POST = withAuth(async ({ user }, { params }) => {
     );
   }
 
-  void generateAutoNotes(access.ownerUserId, id, { force: true });
+  void generateAutoNotes(access.ownerUserId, id, {
+    force: true,
+    triggeredBy: { userId: user.userId, email: user.email },
+  });
 
   // Also refresh voiceprint suggestions — lets older transcripts (completed
   // before the feature shipped) pick up speaker auto-detection on demand.

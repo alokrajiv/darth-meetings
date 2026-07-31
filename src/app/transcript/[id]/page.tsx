@@ -146,7 +146,19 @@ export default function TranscriptDetailPage({ params }: TranscriptDetailPagePro
   const [speakerSuggestions, setSpeakerSuggestions] = useState<SpeakerSuggestionMap>({});
   const [transcriptEdits, setTranscriptEdits] = useState<TranscriptEditMap>({});
   const [generatingNotes, setGeneratingNotes] = useState(false);
-  const [notesStale, setNotesStale] = useState(false);
+  // Non-null = the summary predates a data change; the value is the banner text.
+  const [notesStale, setNotesStale] = useState<string | null>(null);
+  const [aiStats, setAiStats] = useState<{
+    latest: {
+      cost_usd: string | null;
+      duration_ms: number | null;
+      input_tokens: string | null;
+      output_tokens: string | null;
+      model: string | null;
+      triggered_by_email: string | null;
+    } | null;
+    totals: { runs: number; cost_usd: string | null };
+  } | null>(null);
 
   const [title, setTitle] = useState<string>('');
   const [description, setDescription] = useState<string>('');
@@ -365,6 +377,38 @@ export default function TranscriptDetailPage({ params }: TranscriptDetailPagePro
     return () => clearInterval(timer);
   }, [row?.auto_notes_status, transcriptId, editingTitle]);
 
+  // AI usage stats for the summary footer ("$0.31 · 52s"). Refetched when a
+  // generation completes (auto_notes_at changes).
+  useEffect(() => {
+    if (!row?.auto_notes_at) return;
+    let cancelled = false;
+    fetch(`/api/transcripts/${transcriptId}/ai-runs`)
+      .then((r) => (r.ok ? r.json() : null))
+      .then((data) => {
+        if (cancelled || !data) return;
+        const completed = (data.runs as Array<Record<string, unknown>> | undefined)?.find(
+          (r) => r.status === 'completed' && r.kind === 'auto_notes'
+        );
+        setAiStats({
+          latest: completed
+            ? {
+                cost_usd: (completed.cost_usd as string | null) ?? null,
+                duration_ms: (completed.duration_ms as number | null) ?? null,
+                input_tokens: (completed.input_tokens as string | null) ?? null,
+                output_tokens: (completed.output_tokens as string | null) ?? null,
+                model: (completed.model as string | null) ?? null,
+                triggered_by_email: (completed.triggered_by_email as string | null) ?? null,
+              }
+            : null,
+          totals: data.totals ?? { runs: 0, cost_usd: null },
+        });
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+  }, [transcriptId, row?.auto_notes_at]);
+
   const [guessingSpeakers, setGuessingSpeakers] = useState(false);
   const handleGuessSpeakers = useCallback(async () => {
     if (guessingSpeakers) return;
@@ -395,7 +439,7 @@ export default function TranscriptDetailPage({ params }: TranscriptDetailPagePro
         setRow((prev) =>
           prev ? { ...prev, auto_notes_status: 'running', auto_notes_error: null } : prev
         );
-        setNotesStale(false);
+        setNotesStale(null);
         bumpActivity();
       }
     } finally {
@@ -736,7 +780,8 @@ export default function TranscriptDetailPage({ params }: TranscriptDetailPagePro
         bumpActivity();
         // The AI summary was written with the old speaker names — offer a
         // one-click rerun instead of silently going stale.
-        if (row?.auto_notes) setNotesStale(true);
+        if (row?.auto_notes)
+          setNotesStale('Speaker names changed — the summary still uses the old ones.');
       } catch (err) {
         console.error('Failed to save speaker:', err);
         alert('Failed to save speaker. Reloading from server.');
@@ -1317,7 +1362,9 @@ export default function TranscriptDetailPage({ params }: TranscriptDetailPagePro
    * elements (the download popover's outside-click ref re-attaches to the
    * instance rendered last).
    */
-  const renderQuickActions = (inDialog = false) => (
+  // (dropdown now always opens below the button, so the dialog/sidebar
+  // distinction no longer matters — param kept for call-site stability)
+  const renderQuickActions = (_inDialog = false) => (
     <div className="rounded-lg border bg-card p-3">
       <div className="text-[11px] font-semibold uppercase tracking-wider text-muted-foreground">
         Quick actions
@@ -1394,9 +1441,7 @@ export default function TranscriptDetailPage({ params }: TranscriptDetailPagePro
           </Button>
           {downloadMenuOpen && (
             <div
-              className={`absolute z-50 min-w-[150px] rounded-md border bg-popover p-1 shadow-md ${
-                inDialog ? 'right-0 top-full mt-1' : 'right-full top-0 mr-1'
-              }`}
+              className="absolute right-0 top-full z-50 mt-1 min-w-[150px] rounded-md border bg-popover p-1 shadow-md"
             >
               <button
                 type="button"
@@ -1795,9 +1840,7 @@ export default function TranscriptDetailPage({ params }: TranscriptDetailPagePro
                   <CardContent className="px-4 pb-4">
                     {notesStale && row.auto_notes_status !== 'running' && canEdit && (
                       <div className="mb-3 flex items-center justify-between gap-2 rounded-md border bg-muted/60 px-3 py-2 text-xs">
-                        <span className="text-muted-foreground">
-                          Speaker names changed — the summary still uses the old ones.
-                        </span>
+                        <span className="text-muted-foreground">{notesStale}</span>
                         <Button
                           variant="ghost"
                           size="sm"
@@ -1865,8 +1908,25 @@ export default function TranscriptDetailPage({ params }: TranscriptDetailPagePro
                             </Button>
                           )}
                           {row.auto_notes_at && (
-                            <span className="ml-auto text-[11px] text-muted-foreground">
+                            <span
+                              className="ml-auto text-[11px] text-muted-foreground"
+                              title={
+                                aiStats?.latest
+                                  ? `${aiStats.latest.model ?? 'model n/a'} · in ${Number(aiStats.latest.input_tokens ?? 0).toLocaleString()} tok / out ${Number(aiStats.latest.output_tokens ?? 0).toLocaleString()} tok` +
+                                    (aiStats.latest.triggered_by_email
+                                      ? ` · by ${aiStats.latest.triggered_by_email}`
+                                      : '') +
+                                    (aiStats.totals.runs > 1
+                                      ? ` · lifetime: ${aiStats.totals.runs} runs, $${Number(aiStats.totals.cost_usd ?? 0).toFixed(2)}`
+                                      : '')
+                                  : undefined
+                              }
+                            >
                               generated {formatDistanceToNow(new Date(row.auto_notes_at), { addSuffix: true })}
+                              {aiStats?.latest?.cost_usd != null &&
+                                ` · $${Number(aiStats.latest.cost_usd).toFixed(2)}`}
+                              {aiStats?.latest?.duration_ms != null &&
+                                ` · ${Math.round(aiStats.latest.duration_ms / 1000)}s`}
                             </span>
                           )}
                         </div>
@@ -2227,6 +2287,12 @@ export default function TranscriptDetailPage({ params }: TranscriptDetailPagePro
             void loadAll();
             void refreshShareSuggestions();
             bumpActivity();
+            // Attendees / meeting metadata just changed — the existing
+            // summary doesn't know about them. Offer a rerun, never auto-run.
+            if (row?.auto_notes)
+              setNotesStale(
+                'Calendar event linked — attendees and meeting data changed since this summary was generated.'
+              );
           }}
         />
 

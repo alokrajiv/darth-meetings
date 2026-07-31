@@ -170,6 +170,75 @@ export async function findPersonByEmail(email: string): Promise<Person | null> {
   return null;
 }
 
+/**
+ * Batch email → Person lookup across both directories (plagueis wins).
+ * Powers the team-directory context injected into the auto-notes prompt.
+ * Returns a map keyed by normalized email; misses are simply absent.
+ */
+export async function findPeopleByEmails(emails: string[]): Promise<Map<string, Person>> {
+  const normed = [...new Set(emails.map(norm).filter(Boolean))];
+  const out = new Map<string, Person>();
+  if (normed.length === 0) return out;
+
+  try {
+    const plagueisRows = await plagueisSql<Array<Omit<Person, 'source'> & { matched_email: string }>>`
+      SELECT DISTINCT ON (matched.email)
+             p.id,
+             p.name,
+             COALESCE(p.primary_email, matched.email) AS email,
+             p.slack_handle AS "slackHandle",
+             p.team,
+             p.role,
+             matched.email AS matched_email
+      FROM darth_plagueis.ppl p
+      LEFT JOIN darth_plagueis.emails pe ON pe.ppl_id = p.id
+      JOIN LATERAL (
+        SELECT e FROM unnest(${normed}::text[]) AS e
+        WHERE LOWER(p.primary_email) = e OR LOWER(pe.email) = e
+      ) AS matched(email) ON true
+    `;
+    for (const r of plagueisRows) {
+      out.set(r.matched_email, {
+        id: r.id,
+        name: r.name,
+        email: r.email,
+        slackHandle: r.slackHandle,
+        team: r.team,
+        role: r.role,
+        source: 'trames',
+      });
+    }
+  } catch (err) {
+    console.warn('[people] plagueis batch lookup failed (continuing):', err);
+  }
+
+  const remaining = normed.filter((e) => !out.has(e));
+  if (remaining.length > 0) {
+    try {
+      const ownRows = await sql<Array<{ id: number; name: string; email: string }>>`
+        SELECT id, name, email
+        FROM ${sql(MW_SCHEMA)}.people
+        WHERE LOWER(email) = ANY(${remaining})
+      `;
+      for (const r of ownRows) {
+        out.set(norm(r.email), {
+          id: r.id,
+          name: r.name,
+          email: r.email,
+          slackHandle: null,
+          team: null,
+          role: null,
+          source: 'custom',
+        });
+      }
+    } catch (err) {
+      console.warn('[people] custom batch lookup failed (continuing):', err);
+    }
+  }
+
+  return out;
+}
+
 // ─── createCustomPerson ─────────────────────────────────────────────────
 
 export interface CreateCustomPersonInput {

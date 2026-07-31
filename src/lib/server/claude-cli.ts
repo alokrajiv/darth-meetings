@@ -7,16 +7,74 @@ import { spawn } from 'node:child_process';
  * authenticated Claude Code install, so LLM work rides on the existing
  * subscription with zero key management. Prompts are piped over stdin
  * (no shell-arg length limits, nothing written to disk).
+ *
+ * Runs use `--output-format json`, which wraps the result text in an
+ * envelope carrying cost/token/duration/session metadata — persisted to
+ * ai_runs for usage stats. The session_id also makes `claude -p --resume`
+ * possible later (incremental "the data changed, update the notes" turns).
  */
 
 const CLAUDE_BIN = process.env.MW_CLAUDE_BIN || 'claude';
 const CLAUDE_MODEL = process.env.MW_CLAUDE_MODEL || ''; // empty = CLI default
+const EFFORT_LEVELS = new Set(['low', 'medium', 'high', 'xhigh', 'max']);
+const CLAUDE_EFFORT = EFFORT_LEVELS.has(process.env.MW_CLAUDE_EFFORT || '')
+  ? (process.env.MW_CLAUDE_EFFORT as string)
+  : ''; // empty = CLI default
 const DEFAULT_TIMEOUT_MS = 10 * 60 * 1000;
 
-export function runClaude(prompt: string, timeoutMs = DEFAULT_TIMEOUT_MS): Promise<string> {
+export interface ClaudeRunMeta {
+  sessionId: string | null;
+  model: string | null;
+  costUsd: number | null;
+  durationMs: number | null;
+  apiDurationMs: number | null;
+  numTurns: number | null;
+  inputTokens: number | null;
+  outputTokens: number | null;
+  cacheReadTokens: number | null;
+  cacheCreationTokens: number | null;
+}
+
+export interface ClaudeRunResult {
+  text: string;
+  meta: ClaudeRunMeta;
+}
+
+interface ClaudeJsonEnvelope {
+  type?: string;
+  subtype?: string;
+  is_error?: boolean;
+  result?: string;
+  session_id?: string;
+  total_cost_usd?: number;
+  duration_ms?: number;
+  duration_api_ms?: number;
+  num_turns?: number;
+  usage?: {
+    input_tokens?: number;
+    output_tokens?: number;
+    cache_read_input_tokens?: number;
+    cache_creation_input_tokens?: number;
+  };
+  modelUsage?: Record<string, unknown>;
+}
+
+export interface RunClaudeOpts {
+  timeoutMs?: number;
+  /** Resume an earlier headless session (claude -p --resume <id>). */
+  resumeSessionId?: string;
+}
+
+export function runClaudeWithMeta(
+  prompt: string,
+  opts: RunClaudeOpts = {}
+): Promise<ClaudeRunResult> {
+  const timeoutMs = opts.timeoutMs ?? DEFAULT_TIMEOUT_MS;
   return new Promise((resolve, reject) => {
-    const args = ['-p', '--output-format', 'text'];
+    const args = ['-p', '--output-format', 'json'];
     if (CLAUDE_MODEL) args.push('--model', CLAUDE_MODEL);
+    if (CLAUDE_EFFORT) args.push('--effort', CLAUDE_EFFORT);
+    if (opts.resumeSessionId) args.push('--resume', opts.resumeSessionId);
 
     const child = spawn(CLAUDE_BIN, args, {
       // Run from the storage dir, not the repo — headless mode denies tool
@@ -41,16 +99,87 @@ export function runClaude(prompt: string, timeoutMs = DEFAULT_TIMEOUT_MS): Promi
     });
     child.on('close', (code) => {
       clearTimeout(timer);
-      if (code === 0 && stdout.trim()) {
-        resolve(stdout.trim());
-      } else {
+      if (code !== 0 || !stdout.trim()) {
         reject(new Error(`claude -p exited ${code}: ${(stderr || stdout).slice(0, 500)}`));
+        return;
       }
+      // `--output-format json` emits an ARRAY of events (system init first,
+      // the result envelope last) on current Claude Code; older builds
+      // emitted the bare result object. Handle both.
+      let envelope: ClaudeJsonEnvelope | undefined;
+      try {
+        const parsed = JSON.parse(stdout) as ClaudeJsonEnvelope | ClaudeJsonEnvelope[];
+        envelope = Array.isArray(parsed)
+          ? parsed.find((e) => e?.type === 'result')
+          : parsed;
+      } catch {
+        // Envelope parse failure shouldn't lose a successful run — fall
+        // back to treating stdout as the result text, meta-less.
+        resolve({ text: stdout.trim(), meta: emptyMeta() });
+        return;
+      }
+      if (!envelope) {
+        reject(new Error(`claude -p json output had no result envelope: ${stdout.slice(0, 300)}`));
+        return;
+      }
+      const text = (envelope.result ?? '').trim();
+      if (envelope.is_error || !text) {
+        reject(
+          new Error(
+            `claude -p returned ${envelope.subtype || 'error'}: ${text.slice(0, 500) || '(empty result)'}`
+          )
+        );
+        return;
+      }
+      resolve({ text, meta: extractMeta(envelope) });
     });
 
     child.stdin.write(prompt);
     child.stdin.end();
   });
+}
+
+/** Back-compat string-returning wrapper. */
+export async function runClaude(
+  prompt: string,
+  timeoutMs = DEFAULT_TIMEOUT_MS
+): Promise<string> {
+  const { text } = await runClaudeWithMeta(prompt, { timeoutMs });
+  return text;
+}
+
+function emptyMeta(): ClaudeRunMeta {
+  return {
+    sessionId: null,
+    model: null,
+    costUsd: null,
+    durationMs: null,
+    apiDurationMs: null,
+    numTurns: null,
+    inputTokens: null,
+    outputTokens: null,
+    cacheReadTokens: null,
+    cacheCreationTokens: null,
+  };
+}
+
+function extractMeta(env: ClaudeJsonEnvelope): ClaudeRunMeta {
+  const num = (v: unknown): number | null => (typeof v === 'number' && isFinite(v) ? v : null);
+  // The envelope doesn't name the model directly; modelUsage is keyed by
+  // model id. Take the first key (subagent-less headless runs have one).
+  const modelKeys = env.modelUsage ? Object.keys(env.modelUsage) : [];
+  return {
+    sessionId: typeof env.session_id === 'string' ? env.session_id : null,
+    model: modelKeys[0] ?? (CLAUDE_MODEL || null),
+    costUsd: num(env.total_cost_usd),
+    durationMs: num(env.duration_ms),
+    apiDurationMs: num(env.duration_api_ms),
+    numTurns: num(env.num_turns),
+    inputTokens: num(env.usage?.input_tokens),
+    outputTokens: num(env.usage?.output_tokens),
+    cacheReadTokens: num(env.usage?.cache_read_input_tokens),
+    cacheCreationTokens: num(env.usage?.cache_creation_input_tokens),
+  };
 }
 
 /** Strip optional markdown fences and parse the largest JSON object/array. */
