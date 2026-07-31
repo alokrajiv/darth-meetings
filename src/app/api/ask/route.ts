@@ -77,7 +77,9 @@ export const POST = withAuth(async ({ user, request }) => {
       .filter((r) => r.status === 'completed')
       .slice(0, 300)
       .map((r) => {
-        const date = (r.recorded_at ?? r.created_at).slice(0, 10);
+        // postgres.js hands timestamps back as Date objects despite the
+        // string-typed row interface — normalise before slicing.
+        const date = new Date(r.recorded_at ?? r.created_at).toISOString().slice(0, 10);
         const mins = r.duration ? Math.round(r.duration / 60) : null;
         const desc = r.description?.trim()
           ? ` — ${r.description.trim().slice(0, 120)}`
