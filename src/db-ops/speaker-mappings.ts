@@ -1,6 +1,7 @@
 import 'server-only';
 import { sql } from '@/lib/db';
 import { SCHEMAS } from '@/lib/constants/database';
+import { publishEvent } from '@/lib/server/event-bus';
 import type { SpeakerLabel, SpeakerSuggestionMap } from '@/lib/format';
 
 export type { SpeakerLabel };
@@ -53,6 +54,7 @@ export async function upsertForUser(
           updated_at = now()
     RETURNING *
   `;
+  publishEvent({ kind: 'speakers', assemblyaiId });
   return rows[0]!;
 }
 
@@ -75,6 +77,7 @@ export async function setSuggestionsForUser(
       SET suggestions = EXCLUDED.suggestions,
           updated_at = now()
   `;
+  publishEvent({ kind: 'speakers', assemblyaiId });
 }
 
 export async function deleteForUser(

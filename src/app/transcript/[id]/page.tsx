@@ -2,6 +2,7 @@
 
 import { useState, useEffect, useCallback, useMemo, useRef, use } from 'react';
 import { useRouter } from 'next/navigation';
+import { useLiveEvents } from '@/hooks/use-live-events';
 import { formatDistanceToNow } from 'date-fns';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
@@ -261,9 +262,9 @@ export default function TranscriptDetailPage({ params }: TranscriptDetailPagePro
 
   // --- network actions ---
 
-  const loadAll = useCallback(async () => {
+  const loadAll = useCallback(async (opts?: { silent?: boolean }) => {
     try {
-      setLoading(true);
+      if (!opts?.silent) setLoading(true);
       setError(null);
 
       const [rowRes, speakersRes, editsRes, sharesRes] = await Promise.all([
@@ -317,15 +318,35 @@ export default function TranscriptDetailPage({ params }: TranscriptDetailPagePro
         }
       }
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Failed to load transcript');
+      if (!opts?.silent) {
+        setError(err instanceof Error ? err.message : 'Failed to load transcript');
+      }
     } finally {
-      setLoading(false);
+      if (!opts?.silent) setLoading(false);
     }
   }, [transcriptId]);
 
   useEffect(() => {
     loadAll();
   }, [loadAll]);
+
+  // Live updates: a collaborator changed THIS transcript — silently re-pull
+  // everything. Skipped while the user is mid-edit (focused form field) so a
+  // reload never stomps typing; debounced so event bursts coalesce.
+  const liveReloadTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  useLiveEvents((e) => {
+    if (e.assemblyaiId !== transcriptId) return;
+    if (liveReloadTimer.current) clearTimeout(liveReloadTimer.current);
+    liveReloadTimer.current = setTimeout(() => {
+      const el = document.activeElement as HTMLElement | null;
+      const editing =
+        !!el &&
+        (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA' || el.isContentEditable);
+      if (editing) return; // next event (or manual action) will catch up
+      void loadAll({ silent: true });
+      bumpActivity();
+    }, 1000);
+  });
 
   // Grab the current user's email once so the speaker-pick "add to access?"
   // prompt can suppress itself when the owner picks themselves from the
@@ -1340,7 +1361,7 @@ export default function TranscriptDetailPage({ params }: TranscriptDetailPagePro
             <CardContent>
               <p className="text-destructive mb-4">{error}</p>
               <div className="flex gap-2">
-                <Button onClick={loadAll} variant="outline">
+                <Button onClick={() => void loadAll()} variant="outline">
                   <RefreshCw className="h-4 w-4 mr-2" />
                   Retry
                 </Button>

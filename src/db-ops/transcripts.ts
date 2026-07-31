@@ -1,6 +1,7 @@
 import 'server-only';
 import { sql } from '@/lib/db';
 import { SCHEMAS } from '@/lib/constants/database';
+import { publishEvent } from '@/lib/server/event-bus';
 import type {
   GmeetContext,
   StoredTranscript,
@@ -91,7 +92,7 @@ export async function listVisibleToUser(
     SELECT t.id, t.user_id, t.assemblyai_id, t.original_filename, t.status,
            t.created_at, t.completed_at, t.duration, t.speaker_count,
            t.language_code, t.title, t.description, t.last_accessed,
-           t.source, t.recorded_at,
+           t.source, t.recorded_at, t.auto_notes_status,
            CASE
              WHEN t.user_id = ${userId} THEN 'owner'
              ELSE s.access
@@ -153,6 +154,7 @@ export async function createForUser(
           gmeet_context = COALESCE(EXCLUDED.gmeet_context, ${sql(SCHEMA)}.transcripts.gmeet_context)
     RETURNING *
   `;
+  publishEvent({ kind: 'created', assemblyaiId: data.assemblyaiId });
   return rows[0]!;
 }
 
@@ -195,6 +197,7 @@ export async function createImportedForUser(
           source = 'imported'
     RETURNING *
   `;
+  publishEvent({ kind: 'created', assemblyaiId: data.assemblyaiId });
   return rows[0]!;
 }
 
@@ -312,6 +315,7 @@ export async function setAutoNotesForUser(
         auto_notes_at = now()
     WHERE user_id = ${userId} AND assemblyai_id = ${assemblyaiId}
   `;
+  publishEvent({ kind: 'notes', assemblyaiId });
 }
 
 export async function setAutoSegmentsForUser(
@@ -343,6 +347,7 @@ export async function updateStatusForUser(
     WHERE user_id = ${userId} AND assemblyai_id = ${assemblyaiId}
     RETURNING *
   `;
+  if (rows[0]) publishEvent({ kind: 'status', assemblyaiId });
   return rows[0] ?? null;
 }
 
@@ -359,6 +364,7 @@ export async function updateMetaForUser(
     WHERE user_id = ${userId} AND assemblyai_id = ${assemblyaiId}
     RETURNING *
   `;
+  if (rows[0]) publishEvent({ kind: 'meta', assemblyaiId });
   return rows[0] ?? null;
 }
 
@@ -390,6 +396,7 @@ export async function mergeGmeetContextForUser(
     SET gmeet_context = COALESCE(gmeet_context, '{}'::jsonb) || ${sql.json(patch as unknown as never)}
     WHERE user_id = ${userId} AND assemblyai_id = ${assemblyaiId}
   `;
+  publishEvent({ kind: 'meta', assemblyaiId });
 }
 
 export async function touchLastAccessedForUser(
@@ -412,5 +419,6 @@ export async function deleteForUser(
     WHERE user_id = ${userId} AND assemblyai_id = ${assemblyaiId}
     RETURNING id
   `;
+  if (rows.length > 0) publishEvent({ kind: 'deleted', assemblyaiId });
   return rows.length > 0;
 }

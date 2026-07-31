@@ -63,6 +63,8 @@ export interface RunClaudeOpts {
   timeoutMs?: number;
   /** Resume an earlier headless session (claude -p --resume <id>). */
   resumeSessionId?: string;
+  /** Per-call effort override (low|medium|high|xhigh|max) — beats the env. */
+  effort?: string;
 }
 
 export function runClaudeWithMeta(
@@ -73,7 +75,9 @@ export function runClaudeWithMeta(
   return new Promise((resolve, reject) => {
     const args = ['-p', '--output-format', 'json'];
     if (CLAUDE_MODEL) args.push('--model', CLAUDE_MODEL);
-    if (CLAUDE_EFFORT) args.push('--effort', CLAUDE_EFFORT);
+    const effort =
+      opts.effort && EFFORT_LEVELS.has(opts.effort) ? opts.effort : CLAUDE_EFFORT;
+    if (effort) args.push('--effort', effort);
     if (opts.resumeSessionId) args.push('--resume', opts.resumeSessionId);
 
     const child = spawn(CLAUDE_BIN, args, {

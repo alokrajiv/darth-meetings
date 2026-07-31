@@ -9,6 +9,7 @@ import { ImportDialog } from '@/components/import-dialog';
 import { GmeetImportDialog } from '@/components/gmeet-import-dialog';
 import { TranscriptImportDialog } from '@/components/transcript-import-dialog';
 import { AppHeader } from '@/components/app-header';
+import { AskAiPanel } from '@/components/ask-ai-panel';
 import { Button } from '@/components/ui/button';
 import {
   Settings,
@@ -17,6 +18,7 @@ import {
   FileAudio,
   ChevronDown,
   KeyRound,
+  Sparkles,
 } from 'lucide-react';
 
 const SYNC_NUDGE_AFTER_DAYS = 5;
@@ -28,6 +30,7 @@ export default function Home() {
   const [gmeetSyncMode, setGmeetSyncMode] = useState(false);
   const [textImportOpen, setTextImportOpen] = useState(false);
   const [importMenuOpen, setImportMenuOpen] = useState(false);
+  const [askOpen, setAskOpen] = useState(false);
   const importMenuRef = useRef<HTMLDivElement>(null);
 
   // "Don't forget to sync" nudge: fetched once per visit; shows when the
@@ -151,12 +154,32 @@ export default function Home() {
       </AppHeader>
 
       <main className="mx-auto max-w-[1200px] px-6 py-6">
-        <div className="mb-5">
-          <h1 className="text-2xl font-semibold tracking-tight leading-tight">Archive</h1>
-          <p className="text-sm text-muted-foreground">
-            Every meeting, transcribed and searchable.
-          </p>
+        <div className="mb-5 flex items-start gap-3">
+          <div>
+            <h1 className="text-2xl font-semibold tracking-tight leading-tight">Archive</h1>
+            <p className="text-sm text-muted-foreground">
+              Every meeting, transcribed and searchable.
+            </p>
+          </div>
+          {!askOpen && (
+            <Button
+              variant="outline"
+              size="sm"
+              className="ml-auto mt-1"
+              onClick={() => setAskOpen(true)}
+              title="Ask questions about your meetings — the AI answers with links"
+            >
+              <Sparkles className="h-4 w-4 text-primary" />
+              Ask AI
+            </Button>
+          )}
         </div>
+
+        {askOpen && (
+          <div className="mb-4">
+            <AskAiPanel onClose={() => setAskOpen(false)} />
+          </div>
+        )}
 
         {showSyncNudge && (
           <div className="mb-4 flex flex-wrap items-center gap-2 rounded-lg border border-primary/25 bg-primary/5 px-4 py-2.5 text-sm">

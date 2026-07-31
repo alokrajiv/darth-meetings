@@ -163,6 +163,7 @@ export interface TranscriptListRow {
   last_accessed: string;
   source: 'uploaded' | 'imported';
   recorded_at: string | null;
+  auto_notes_status: string | null;
   access: TranscriptAccess;
   owner_email: string | null;
   owner_name: string | null;

@@ -18,6 +18,7 @@ import {
   formatSmartDate,
   type TranscriptListRow,
 } from '@/lib/format';
+import { useLiveEvents } from '@/hooks/use-live-events';
 import {
   Trash2,
   RefreshCw,
@@ -29,6 +30,7 @@ import {
   Inbox,
   Columns3,
   GripVertical,
+  Sparkles,
 } from 'lucide-react';
 
 interface TranscriptTableProps {
@@ -150,9 +152,9 @@ export function TranscriptTable({ refreshTrigger }: TranscriptTableProps) {
     [colPrefs]
   );
 
-  const loadTranscripts = useCallback(async () => {
+  const loadTranscripts = useCallback(async (opts?: { silent?: boolean }) => {
     try {
-      setLoading(true);
+      if (!opts?.silent) setLoading(true);
       setError(null);
       const res = await fetch('/api/transcripts', { credentials: 'include' });
       if (!res.ok) {
@@ -161,15 +163,27 @@ export function TranscriptTable({ refreshTrigger }: TranscriptTableProps) {
       const { transcripts } = (await res.json()) as { transcripts: TranscriptListRow[] };
       setTranscripts(transcripts);
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Failed to load transcripts');
+      if (!opts?.silent) {
+        setError(err instanceof Error ? err.message : 'Failed to load transcripts');
+      }
     } finally {
-      setLoading(false);
+      if (!opts?.silent) setLoading(false);
     }
   }, []);
 
   useEffect(() => {
     loadTranscripts();
   }, [loadTranscripts, refreshTrigger]);
+
+  // Live updates: someone (including another tab or a colleague) changed a
+  // transcript — silently refresh the list. Debounced so bursts (bulk
+  // imports) coalesce into one reload.
+  const liveReloadTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  useLiveEvents((e) => {
+    if (!['created', 'deleted', 'meta', 'status', 'notes', 'shares'].includes(e.kind)) return;
+    if (liveReloadTimer.current) clearTimeout(liveReloadTimer.current);
+    liveReloadTimer.current = setTimeout(() => void loadTranscripts({ silent: true }), 800);
+  });
 
   // Global `/` focuses the search input when no other field has focus.
   useEffect(() => {
@@ -319,13 +333,43 @@ export function TranscriptTable({ refreshTrigger }: TranscriptTableProps) {
   const titleOf = (
     t: TranscriptListRow
   ): { primary: string; secondary: string | null; untitled: boolean } => {
+    // Secondary line: a human-written description beats the raw filename.
+    const desc = t.description?.trim() || null;
     if (t.title && t.title.trim().length > 0) {
-      return { primary: t.title, secondary: t.original_filename || null, untitled: false };
+      return {
+        primary: t.title,
+        secondary: desc ?? (t.original_filename || null),
+        untitled: false,
+      };
     }
     if (t.original_filename) {
-      return { primary: t.original_filename, secondary: null, untitled: false };
+      return { primary: t.original_filename, secondary: desc, untitled: false };
     }
-    return { primary: 'Untitled meeting', secondary: null, untitled: true };
+    return { primary: 'Untitled meeting', secondary: desc, untitled: true };
+  };
+
+  // Kick off AI summary generation straight from the list — no need to open
+  // the transcript first. The SSE 'notes' events keep the row state fresh.
+  const [generatingIds, setGeneratingIds] = useState<Set<string>>(new Set());
+  const handleGenerateFromList = async (e: React.MouseEvent, t: TranscriptListRow) => {
+    e.stopPropagation();
+    setGeneratingIds((prev) => new Set(prev).add(t.assemblyai_id));
+    setTranscripts((prev) =>
+      prev.map((r) =>
+        r.assemblyai_id === t.assemblyai_id ? { ...r, auto_notes_status: 'running' } : r
+      )
+    );
+    try {
+      await fetch(`/api/transcripts/${t.assemblyai_id}/notes`, { method: 'POST' });
+    } catch {
+      // the silent live reload will restore true state
+    } finally {
+      setGeneratingIds((prev) => {
+        const next = new Set(prev);
+        next.delete(t.assemblyai_id);
+        return next;
+      });
+    }
   };
 
   const renderColCell = (key: ColKey, t: TranscriptListRow) => {
@@ -489,7 +533,7 @@ export function TranscriptTable({ refreshTrigger }: TranscriptTableProps) {
         </div>
         {columnChooser}
         <Button
-          onClick={loadTranscripts}
+          onClick={() => void loadTranscripts()}
           variant="ghost"
           size="sm"
           className="h-8 w-8 p-0"
@@ -541,7 +585,7 @@ export function TranscriptTable({ refreshTrigger }: TranscriptTableProps) {
           <div className="flex flex-col items-center py-16 text-center">
             <p className="text-sm font-medium">Couldn&apos;t load transcripts</p>
             <p className="mt-1 text-xs text-destructive">{error}</p>
-            <Button onClick={loadTranscripts} variant="outline" size="sm" className="mt-4">
+            <Button onClick={() => void loadTranscripts()} variant="outline" size="sm" className="mt-4">
               <RefreshCw className="h-4 w-4" />
               Retry
             </Button>
@@ -668,6 +712,28 @@ export function TranscriptTable({ refreshTrigger }: TranscriptTableProps) {
                     ))}
                     <TableCell className="py-2.5 pr-3">
                       <div className="flex items-center justify-end gap-0.5">
+                        {t.status === 'completed' && t.auto_notes_status === 'running' && (
+                          <span
+                            className="grid h-7 w-7 place-items-center"
+                            title="AI summary is being generated…"
+                          >
+                            <Sparkles className="h-3.5 w-3.5 animate-pulse text-primary" />
+                          </span>
+                        )}
+                        {t.status === 'completed' &&
+                          t.access !== 'read' &&
+                          (!t.auto_notes_status || t.auto_notes_status === 'error') && (
+                            <Button
+                              size="sm"
+                              variant="ghost"
+                              className="h-7 w-7 p-0 text-muted-foreground opacity-0 transition-opacity hover:text-primary group-hover:opacity-100"
+                              disabled={generatingIds.has(t.assemblyai_id)}
+                              onClick={(e) => void handleGenerateFromList(e, t)}
+                              title="Generate AI summary (without opening the transcript)"
+                            >
+                              <Sparkles className="h-3.5 w-3.5" />
+                            </Button>
+                          )}
                         {t.access === 'owner' && (
                           <Button
                             size="sm"

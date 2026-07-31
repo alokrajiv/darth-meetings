@@ -1,6 +1,7 @@
 import 'server-only';
 import { sql } from '@/lib/db';
 import { SCHEMAS } from '@/lib/constants/database';
+import { publishEvent } from '@/lib/server/event-bus';
 import type { TranscriptShare } from '@/lib/format';
 
 // CRUD for transcript_shares. Everything here assumes the caller has already
@@ -87,6 +88,7 @@ export async function addShare(input: AddShareInput): Promise<TranscriptShareRow
           updated_at = now()
     RETURNING *
   `;
+  publishEvent({ kind: 'shares' });
   return rows[0]!;
 }
 
@@ -102,6 +104,7 @@ export async function updateAccess(
       AND shared_with_email = ${normEmail(email)}
     RETURNING *
   `;
+  if (rows[0]) publishEvent({ kind: 'shares' });
   return rows[0] ?? null;
 }
 
@@ -112,5 +115,6 @@ export async function removeShare(transcriptId: number, email: string): Promise<
       AND shared_with_email = ${normEmail(email)}
     RETURNING id
   `;
+  if (rows.length > 0) publishEvent({ kind: 'shares' });
   return rows.length > 0;
 }

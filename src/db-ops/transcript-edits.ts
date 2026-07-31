@@ -1,6 +1,7 @@
 import 'server-only';
 import { sql } from '@/lib/db';
 import { SCHEMAS } from '@/lib/constants/database';
+import { publishEvent } from '@/lib/server/event-bus';
 import type { TranscriptEditMap } from '@/lib/format';
 
 /**
@@ -58,6 +59,7 @@ export async function upsertForUser(
           updated_at = now()
     RETURNING *
   `;
+  publishEvent({ kind: 'edits', assemblyaiId });
   return rows[0]!;
 }
 
