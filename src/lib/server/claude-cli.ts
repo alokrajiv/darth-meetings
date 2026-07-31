@@ -166,11 +166,26 @@ function emptyMeta(): ClaudeRunMeta {
 function extractMeta(env: ClaudeJsonEnvelope): ClaudeRunMeta {
   const num = (v: unknown): number | null => (typeof v === 'number' && isFinite(v) ? v : null);
   // The envelope doesn't name the model directly; modelUsage is keyed by
-  // model id. Take the first key (subagent-less headless runs have one).
-  const modelKeys = env.modelUsage ? Object.keys(env.modelUsage) : [];
+  // model id — and includes Claude Code's internal helper model (haiku)
+  // alongside the main one. Pick the entry that cost the most: that's the
+  // model that actually generated the result.
+  let model: string | null = null;
+  if (env.modelUsage) {
+    let bestCost = -1;
+    for (const [id, v] of Object.entries(env.modelUsage)) {
+      const c =
+        v && typeof (v as { costUSD?: unknown }).costUSD === 'number'
+          ? ((v as { costUSD: number }).costUSD)
+          : 0;
+      if (c > bestCost) {
+        bestCost = c;
+        model = id;
+      }
+    }
+  }
   return {
     sessionId: typeof env.session_id === 'string' ? env.session_id : null,
-    model: modelKeys[0] ?? (CLAUDE_MODEL || null),
+    model: model ?? (CLAUDE_MODEL || null),
     costUsd: num(env.total_cost_usd),
     durationMs: num(env.duration_ms),
     apiDurationMs: num(env.duration_api_ms),

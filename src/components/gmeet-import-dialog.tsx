@@ -19,6 +19,7 @@ import {
 } from '@/lib/google-token';
 import {
   AlertCircle,
+  BellOff,
   CheckCircle2,
   ChevronLeft,
   ChevronRight,
@@ -28,6 +29,7 @@ import {
   History,
   Link2,
   Loader2,
+  RefreshCw,
   Video,
 } from 'lucide-react';
 
@@ -100,9 +102,30 @@ interface ConflictInfo {
 
 type Mode = 'video' | 'transcript' | 'both';
 type Step = 'connect' | 'pick' | 'options' | 'importing' | 'done' | 'bulk';
-type SourceTab = 'calendar' | 'recent';
+type SourceTab = 'calendar' | 'recent' | 'sync';
 
 const MAX_BULK = 20;
+
+/** Cross-user "someone already imported this" info from /api/gmeet/check. */
+interface ImportedMark {
+  assemblyaiId: string | null;
+  title: string | null;
+  ownerEmail: string | null;
+  accessible: boolean;
+  mine: boolean;
+}
+
+interface SyncInfo {
+  lastSyncedAt: string | null;
+  skips: Set<string>;
+}
+
+function relDays(iso: string): string {
+  const days = Math.floor((Date.now() - new Date(iso).getTime()) / 86_400_000);
+  if (days <= 0) return 'today';
+  if (days === 1) return 'yesterday';
+  return `${days} days ago`;
+}
 
 interface BulkResult {
   rowId: string;
@@ -117,6 +140,8 @@ interface GmeetImportDialogProps {
   onClose: () => void;
   /** Called after a successful import so the parent can refresh the list. */
   onImported?: () => void;
+  /** Open straight into the "Sync" tab (the last-sync nudge on the archive). */
+  startInSync?: boolean;
 }
 
 function todayLocalISO(): string {
@@ -313,7 +338,12 @@ async function recordArtifacts(
  * import → run. All Google reads happen in the browser with the user's
  * short-lived token; only the import call goes through our server.
  */
-export function GmeetImportDialog({ open, onClose, onImported }: GmeetImportDialogProps) {
+export function GmeetImportDialog({
+  open,
+  onClose,
+  onImported,
+  startInSync,
+}: GmeetImportDialogProps) {
   const [step, setStep] = useState<Step>('connect');
   const [tab, setTab] = useState<SourceTab>('calendar');
   const [error, setError] = useState<string | null>(null);
@@ -333,6 +363,239 @@ export function GmeetImportDialog({ open, onClose, onImported }: GmeetImportDial
   const [sweepDone, setSweepDone] = useState(false);
   /** Did the user pick a mode by hand (don't let a late enrich() stomp it). */
   const modeTouchedRef = useRef(false);
+
+  // --- sync tab state ---
+  const [syncInfo, setSyncInfo] = useState<SyncInfo | null>(null);
+  /** meetingCode → who already imported it (any user). */
+  const [importedMap, setImportedMap] = useState<Record<string, ImportedMark>>({});
+  const [syncFrom, setSyncFrom] = useState<string | null>(null);
+
+  /** Mute key: meeting code when there is one, else the calendar event id. */
+  const rowKey = (row: EventRow): string =>
+    row.event.conferenceData?.conferenceId ?? row.event.id;
+
+  // Whenever rows change, ask the server which meeting codes anyone has
+  // already imported — powers "in archive" / "synced by X" markers.
+  useEffect(() => {
+    const codes = [
+      ...new Set(
+        rows
+          .map((r) => r.event.conferenceData?.conferenceId)
+          .filter((c): c is string => !!c)
+      ),
+    ];
+    if (codes.length === 0) return;
+    let cancelled = false;
+    void (async () => {
+      try {
+        const res = await fetch('/api/gmeet/check', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ meetingCodes: codes }),
+        });
+        if (!res.ok) return;
+        const { imported } = (await res.json()) as {
+          imported: Record<string, ImportedMark>;
+        };
+        if (!cancelled) setImportedMap((prev) => ({ ...prev, ...imported }));
+      } catch {
+        // markers are cosmetic
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [rows]);
+
+  const muteRow = async (row: EventRow) => {
+    const key = rowKey(row);
+    setSyncInfo((prev) =>
+      prev ? { ...prev, skips: new Set([...prev.skips, key]) } : prev
+    );
+    setSelected((prev) => {
+      const next = new Set(prev);
+      next.delete(row.event.id);
+      return next;
+    });
+    try {
+      await fetch('/api/gmeet/skips', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          eventKey: key,
+          title: row.event.summary ?? null,
+          eventStart: row.event.start?.dateTime ?? null,
+        }),
+      });
+    } catch {
+      // optimistic; worst case the mute doesn't stick
+    }
+  };
+
+  const unmuteRow = async (row: EventRow) => {
+    const key = rowKey(row);
+    setSyncInfo((prev) => {
+      if (!prev) return prev;
+      const skips = new Set(prev.skips);
+      skips.delete(key);
+      return { ...prev, skips };
+    });
+    try {
+      await fetch(`/api/gmeet/skips?eventKey=${encodeURIComponent(key)}`, {
+        method: 'DELETE',
+      });
+    } catch {
+      // ignore
+    }
+  };
+
+  const markSynced = useCallback(async () => {
+    try {
+      const res = await fetch('/api/gmeet/sync-state', { method: 'POST' });
+      if (res.ok) {
+        const data = (await res.json()) as {
+          lastSyncedAt: string | null;
+          skips: Array<{ event_key: string }>;
+        };
+        setSyncInfo({
+          lastSyncedAt: data.lastSyncedAt,
+          skips: new Set(data.skips.map((s) => s.event_key)),
+        });
+      }
+    } catch {
+      // non-fatal
+    }
+  }, []);
+
+  /**
+   * Sync view: everything with a Meet presence between the user's last sync
+   * (never synced → 14 days back; capped at the Meet API's ~30-day history)
+   * and now — so nobody has to remember which days they already pulled in.
+   */
+  const loadSync = useCallback(async () => {
+    setBusy(true);
+    setError(null);
+    setTab('sync');
+    try {
+      const token = await getGoogleAccessToken();
+
+      // 1. Our sync state (last sync + mutes).
+      let lastSyncedAt: string | null = null;
+      let skips = new Set<string>();
+      try {
+        const res = await fetch('/api/gmeet/sync-state');
+        if (res.ok) {
+          const data = (await res.json()) as {
+            lastSyncedAt: string | null;
+            skips: Array<{ event_key: string }>;
+          };
+          lastSyncedAt = data.lastSyncedAt;
+          skips = new Set(data.skips.map((s) => s.event_key));
+        }
+      } catch {
+        // sync state unavailable — fall back to the default window
+      }
+      setSyncInfo({ lastSyncedAt, skips });
+
+      const lastMs = lastSyncedAt ? new Date(lastSyncedAt).getTime() : 0;
+      const fromMs = Math.max(
+        lastMs || Date.now() - 14 * 24 * 3600_000,
+        Date.now() - 30 * 24 * 3600_000
+      );
+      const fromIso = new Date(fromMs).toISOString();
+      setSyncFrom(fromIso);
+
+      // 2. Calendar events over the window.
+      const params = new URLSearchParams({
+        timeMin: fromIso,
+        timeMax: new Date().toISOString(),
+        singleEvents: 'true',
+        orderBy: 'startTime',
+        maxResults: '250',
+        fields:
+          'items(id,summary,start,end,attendees(email,displayName,responseStatus,self),attachments(fileId,title,mimeType),conferenceData(conferenceId))',
+      });
+      const calRes = await fetch(
+        `https://www.googleapis.com/calendar/v3/calendars/primary/events?${params}`,
+        { headers: { Authorization: `Bearer ${token}` } }
+      );
+      if (calRes.status === 401) {
+        invalidateGoogleToken();
+        throw new Error('Google session expired — hit Connect again.');
+      }
+      if (!calRes.ok) throw new Error(`Calendar request failed (${calRes.status})`);
+      const calData = (await calRes.json()) as { items?: CalendarEvent[] };
+      const evRows: EventRow[] = (calData.items ?? [])
+        .filter((e) => e.start?.dateTime && e.conferenceData?.conferenceId)
+        .map((event) => ({ event, ...classifyAttachments(event.attachments), meet: null }));
+
+      // 3. Conference records over the window (proves which meetings actually
+      // happened + finds their artifacts), joined by exact meeting code.
+      try {
+        const records = await listMeetRecords(token, `start_time >= "${fromIso}"`, 3);
+        const enriched = await Promise.all(
+          records.map(async (r) => {
+            const [code, artifacts] = await Promise.all([
+              r.spaceResource
+                ? fetchMeetingCode(token, r.spaceResource)
+                : Promise.resolve(null),
+              recordArtifacts(token, r.name),
+            ]);
+            return { ...r, code, ...artifacts };
+          })
+        );
+        const extras: EventRow[] = [];
+        for (const rec of enriched) {
+          const info: MeetRowInfo = {
+            recordName: rec.name,
+            videoFileId: rec.videoFileId,
+            transcriptDocId: rec.transcriptDocId,
+            checked: true,
+          };
+          const target = rec.code
+            ? evRows.find((row) => row.event.conferenceData?.conferenceId === rec.code)
+            : undefined;
+          if (target) {
+            target.meet = target.meet ?? info;
+          } else {
+            extras.push({
+              event: {
+                id: rec.name,
+                summary: `Meet${rec.code ? ` · ${rec.code}` : ''} (not on calendar)`,
+                start: { dateTime: rec.startTime },
+                end: { dateTime: rec.endTime },
+                conferenceData: rec.code ? { conferenceId: rec.code } : undefined,
+                attendees: [],
+              },
+              video: null,
+              transcriptDoc: null,
+              geminiNotes: null,
+              videoCount: 0,
+              meet: info,
+              offCalendar: true,
+            });
+          }
+        }
+        evRows.push(...extras);
+        setSweepDone(true);
+      } catch (err) {
+        console.debug('[gmeet-import] sync sweep failed', err);
+        setSweepDone(false);
+      }
+
+      evRows.sort((a, b) =>
+        (b.event.start?.dateTime ?? '').localeCompare(a.event.start?.dateTime ?? '')
+      );
+      setSelected(new Set());
+      setRows(evRows);
+      setStep('pick');
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Failed to load sync view');
+      if (!hasValidGoogleToken()) setStep('connect');
+    } finally {
+      setBusy(false);
+    }
+  }, []);
 
   const reset = () => {
     setStep('connect');
@@ -565,7 +828,8 @@ export function GmeetImportDialog({ open, onClose, onImported }: GmeetImportDial
   // still alive.
   useEffect(() => {
     if (open && step === 'connect' && hasValidGoogleToken()) {
-      void loadEvents(date);
+      if (startInSync) void loadSync();
+      else void loadEvents(date);
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [open]);
@@ -796,6 +1060,9 @@ export function GmeetImportDialog({ open, onClose, onImported }: GmeetImportDial
     }
     setBusy(false);
     setSelected(new Set());
+    // A bulk run from the sync view IS a sync pass — move the marker so the
+    // next visit starts where this one ended.
+    if (tab === 'sync') void markSynced();
     onImported?.();
   };
 
@@ -873,7 +1140,8 @@ export function GmeetImportDialog({ open, onClose, onImported }: GmeetImportDial
     setBusy(true);
     try {
       await getGoogleAccessToken(); // popup — must run inside the click
-      await loadEvents(date);
+      if (startInSync) await loadSync();
+      else await loadEvents(date);
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Google sign-in failed');
       setBusy(false);
@@ -933,6 +1201,16 @@ export function GmeetImportDialog({ open, onClose, onImported }: GmeetImportDial
                   <History className="h-3.5 w-3.5 mr-1" />
                   Recent 30d
                 </Button>
+                <Button
+                  variant={tab === 'sync' ? 'secondary' : 'ghost'}
+                  size="sm"
+                  onClick={() => void loadSync()}
+                  disabled={busy}
+                  title="Everything since your last sync — import the lot in one go"
+                >
+                  <RefreshCw className="h-3.5 w-3.5 mr-1" />
+                  Sync
+                </Button>
               </div>
               {tab === 'calendar' && (
                 <div className="flex items-center gap-1">
@@ -963,6 +1241,51 @@ export function GmeetImportDialog({ open, onClose, onImported }: GmeetImportDial
               )}
               {busy && <Loader2 className="h-4 w-4 animate-spin text-muted-foreground" />}
             </div>
+
+            {tab === 'sync' && (
+              <div className="flex flex-wrap items-center gap-2 rounded-md border bg-muted/40 px-3 py-2 text-xs text-muted-foreground">
+                <span>
+                  {syncInfo?.lastSyncedAt
+                    ? `Last synced ${relDays(syncInfo.lastSyncedAt)} — showing meetings since then.`
+                    : 'Never synced — showing the last 14 days.'}
+                  {syncFrom &&
+                    ` (${new Date(syncFrom).toLocaleDateString(undefined, { month: 'short', day: 'numeric' })} → today)`}
+                </span>
+                <span className="ml-auto flex items-center gap-1.5">
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    className="h-6 px-2 text-[11px]"
+                    disabled={busy}
+                    title="Select every pending meeting with a transcript"
+                    onClick={() => {
+                      const pending = rows.filter((r) => {
+                        const code = r.event.conferenceData?.conferenceId;
+                        const mark = code ? importedMap[code] : undefined;
+                        return (
+                          bulkEligible(r) &&
+                          !mark &&
+                          !syncInfo?.skips.has(rowKey(r))
+                        );
+                      });
+                      setSelected(new Set(pending.slice(0, MAX_BULK).map((r) => r.event.id)));
+                    }}
+                  >
+                    Select all pending
+                  </Button>
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    className="h-6 px-2 text-[11px]"
+                    disabled={busy}
+                    title="Nothing (more) to pull in — move the sync marker to now"
+                    onClick={() => void markSynced()}
+                  >
+                    Mark as synced
+                  </Button>
+                </span>
+              </div>
+            )}
 
             <div className="flex items-center gap-2">
               <Link2 className="h-4 w-4 text-muted-foreground shrink-0" />
@@ -1008,9 +1331,15 @@ export function GmeetImportDialog({ open, onClose, onImported }: GmeetImportDial
                       hasTranscript ||
                       !!row.meet ||
                       (!sweepDone && !!row.event.conferenceData?.conferenceId);
+                    const code = row.event.conferenceData?.conferenceId;
+                    const mark = code ? importedMap[code] : undefined;
+                    const muted = !!syncInfo?.skips.has(rowKey(row));
                     return (
-                      <li key={row.event.id} className="flex items-center">
-                        {bulkEligible(row) ? (
+                      <li
+                        key={row.event.id}
+                        className={`flex items-center ${muted ? 'opacity-45' : ''}`}
+                      >
+                        {bulkEligible(row) && !mark && !muted ? (
                           <input
                             type="checkbox"
                             className="ml-3 h-4 w-4 shrink-0"
@@ -1032,12 +1361,49 @@ export function GmeetImportDialog({ open, onClose, onImported }: GmeetImportDial
                               : 'opacity-50 cursor-default'
                           }`}
                         >
-                          <span className="text-xs text-muted-foreground w-16 shrink-0">
-                            {tab === 'calendar' ? fmtEventTime(row.event) : ''}
+                          <span
+                            className={`text-xs text-muted-foreground shrink-0 ${
+                              tab === 'sync' ? 'w-24' : 'w-16'
+                            }`}
+                          >
+                            {tab === 'calendar'
+                              ? fmtEventTime(row.event)
+                              : tab === 'sync'
+                                ? fmtDayTime(row.event.start?.dateTime)
+                                : ''}
                           </span>
                           <span className="flex-1 min-w-0 truncate text-sm">
                             {row.event.summary ?? '(no title)'}
                           </span>
+                          {mark && mark.accessible && (
+                            <Badge
+                              variant="outline"
+                              className="text-[10px] gap-1 shrink-0 border-status-ok/40 text-status-ok"
+                              title={
+                                mark.mine
+                                  ? 'Already in your archive'
+                                  : `Imported by ${mark.ownerEmail ?? 'a colleague'} and shared with you`
+                              }
+                            >
+                              <CheckCircle2 className="h-3 w-3" />
+                              in archive
+                            </Badge>
+                          )}
+                          {mark && !mark.accessible && (
+                            <Badge
+                              variant="outline"
+                              className="text-[10px] gap-1 shrink-0"
+                              title={`${mark.ownerEmail ?? 'A colleague'} already imported this meeting (not shared with you — ask them for access)`}
+                            >
+                              <CheckCircle2 className="h-3 w-3" />
+                              synced by {mark.ownerEmail?.split('@')[0] ?? 'a colleague'}
+                            </Badge>
+                          )}
+                          {muted && (
+                            <span className="text-[10px] text-muted-foreground shrink-0">
+                              muted
+                            </span>
+                          )}
                           {hasVideo && (
                             <Badge variant="outline" className="text-[10px] gap-1 shrink-0">
                               <Video className="h-3 w-3" />
@@ -1058,6 +1424,21 @@ export function GmeetImportDialog({ open, onClose, onImported }: GmeetImportDial
                             </span>
                           )}
                         </button>
+                        {tab === 'sync' && !mark && (
+                          <button
+                            type="button"
+                            onClick={() => void (muted ? unmuteRow(row) : muteRow(row))}
+                            disabled={busy}
+                            className="mr-2 shrink-0 rounded p-1.5 text-muted-foreground hover:bg-muted hover:text-foreground"
+                            title={
+                              muted
+                                ? 'Un-mute — offer this meeting for sync again'
+                                : 'Never sync this meeting (mute it from sync reminders)'
+                            }
+                          >
+                            <BellOff className="h-3.5 w-3.5" />
+                          </button>
+                        )}
                       </li>
                     );
                   })}

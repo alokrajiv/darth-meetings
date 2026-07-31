@@ -19,13 +19,33 @@ import {
   KeyRound,
 } from 'lucide-react';
 
+const SYNC_NUDGE_AFTER_DAYS = 5;
+
 export default function Home() {
   const [refreshTrigger, setRefreshTrigger] = useState(0);
   const [importOpen, setImportOpen] = useState(false);
   const [gmeetOpen, setGmeetOpen] = useState(false);
+  const [gmeetSyncMode, setGmeetSyncMode] = useState(false);
   const [textImportOpen, setTextImportOpen] = useState(false);
   const [importMenuOpen, setImportMenuOpen] = useState(false);
   const importMenuRef = useRef<HTMLDivElement>(null);
+
+  // "Don't forget to sync" nudge: fetched once per visit; shows when the
+  // user has never run a Meet sync or their last one is getting stale.
+  const [lastSyncedAt, setLastSyncedAt] = useState<string | null | undefined>(undefined);
+  useEffect(() => {
+    fetch('/api/gmeet/sync-state')
+      .then((r) => (r.ok ? r.json() : null))
+      .then((data) => setLastSyncedAt(data ? (data.lastSyncedAt ?? null) : undefined))
+      .catch(() => {});
+  }, [refreshTrigger]);
+  const syncAgeDays =
+    lastSyncedAt === undefined
+      ? null // unknown yet — no nudge flash
+      : lastSyncedAt === null
+        ? Infinity
+        : Math.floor((Date.now() - new Date(lastSyncedAt).getTime()) / 86_400_000);
+  const showSyncNudge = syncAgeDays !== null && syncAgeDays >= SYNC_NUDGE_AFTER_DAYS;
 
   const handleTranscriptCreated = () => {
     setRefreshTrigger((prev) => prev + 1);
@@ -138,6 +158,31 @@ export default function Home() {
           </p>
         </div>
 
+        {showSyncNudge && (
+          <div className="mb-4 flex flex-wrap items-center gap-2 rounded-lg border border-primary/25 bg-primary/5 px-4 py-2.5 text-sm">
+            <Video className="h-4 w-4 shrink-0 text-primary" />
+            <span>
+              {lastSyncedAt
+                ? `Your Meet meetings were last synced ${syncAgeDays} days ago.`
+                : 'You haven’t synced your Meet meetings yet.'}
+              <span className="text-muted-foreground">
+                {' '}
+                Pull everything in so nothing gets forgotten.
+              </span>
+            </span>
+            <Button
+              size="sm"
+              className="ml-auto h-7"
+              onClick={() => {
+                setGmeetSyncMode(true);
+                setGmeetOpen(true);
+              }}
+            >
+              Sync now
+            </Button>
+          </div>
+        )}
+
         <div className="flex flex-col gap-5">
           <AudioUpload onTranscriptCreated={handleTranscriptCreated} />
           <TranscriptTable refreshTrigger={refreshTrigger} />
@@ -151,8 +196,14 @@ export default function Home() {
       />
       <GmeetImportDialog
         open={gmeetOpen}
-        onClose={() => setGmeetOpen(false)}
+        onClose={() => {
+          setGmeetOpen(false);
+          setGmeetSyncMode(false);
+          // Re-check the nudge — a sync pass inside the dialog moves the marker.
+          setRefreshTrigger((prev) => prev + 1);
+        }}
         onImported={handleTranscriptCreated}
+        startInSync={gmeetSyncMode}
       />
       <TranscriptImportDialog
         open={textImportOpen}

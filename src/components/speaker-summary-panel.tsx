@@ -1,6 +1,6 @@
 'use client';
 
-import { useMemo, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import { Card, CardContent, CardHeader } from '@/components/ui/card';
 import { type PickerPerson } from '@/components/user-picker';
 import { SpeakerPreviewDialog } from '@/components/speaker-preview-dialog';
@@ -65,6 +65,58 @@ export function SpeakerSummaryPanel({
     [utterances]
   );
 
+  // Suggested names that already exist in the people directory. Voice
+  // matches come from enrolled voiceprints (known people by definition);
+  // context guesses are checked against /api/users/search so "+ Person"
+  // only shows for genuinely new names.
+  const [knownNames, setKnownNames] = useState<Set<string>>(new Set());
+  const contextNamesKey = useMemo(() => {
+    if (!suggestions) return '';
+    const named = new Set(
+      speakerLabels.filter((l) => l.customName.trim()).map((l) => l.originalSpeaker)
+    );
+    return [
+      ...new Set(
+        Object.entries(suggestions)
+          .filter(([sp, s]) => !named.has(sp) && s.source === 'context')
+          .map(([, s]) => s.name.trim())
+          .filter(Boolean)
+      ),
+    ]
+      .sort()
+      .join('\n');
+  }, [suggestions, speakerLabels]);
+  useEffect(() => {
+    const names = contextNamesKey ? contextNamesKey.split('\n') : [];
+    if (names.length === 0) return;
+    let cancelled = false;
+    void (async () => {
+      const found = new Set<string>();
+      await Promise.all(
+        names.map(async (name) => {
+          try {
+            const res = await fetch(
+              `/api/users/search?q=${encodeURIComponent(name)}&limit=5`
+            );
+            if (!res.ok) return;
+            const { people } = (await res.json()) as {
+              people: Array<{ name: string }>;
+            };
+            if (people.some((p) => p.name.trim().toLowerCase() === name.toLowerCase())) {
+              found.add(name.toLowerCase());
+            }
+          } catch {
+            // directory check is cosmetic — ignore failures
+          }
+        })
+      );
+      if (!cancelled) setKnownNames(found);
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [contextNamesKey]);
+
   const utteranceCounts = useMemo(() => {
     const counts: Record<string, number> = {};
     for (const u of utterances) {
@@ -128,29 +180,48 @@ export function SpeakerSummaryPanel({
                 const description = mapping?.description?.trim() ?? '';
                 const count = utteranceCounts[speaker] ?? 0;
                 const suggestion = !name ? suggestions?.[speaker] : undefined;
+                // "+ Person" only makes sense for names the directory
+                // doesn't know yet: voice matches are enrolled (known)
+                // people, and known context names are filtered via search.
+                const offerCreatePerson =
+                  suggestion?.source === 'context' &&
+                  !knownNames.has(suggestion.name.trim().toLowerCase());
                 return (
                   <div
                     key={speaker}
-                    className="group flex h-9 items-center gap-2 rounded-md px-2 hover:bg-muted/60"
+                    className="group rounded-md px-2 py-1 hover:bg-muted/60"
                     onDoubleClick={() => canEdit && setEditSpeaker(speaker)}
                     title={description || (canEdit ? 'Double-click to edit' : undefined)}
                   >
-                    <span
-                      className="h-2.5 w-2.5 shrink-0 rounded-full"
-                      style={{ backgroundColor: speakerColorVar(speaker) }}
-                    />
-                    <span
-                      className={`truncate text-sm ${
-                        name ? 'font-medium' : 'italic text-muted-foreground'
-                      }`}
-                    >
-                      {name || defaultSpeakerLabel(speaker)}
-                    </span>
-                    <span className="shrink-0 font-mono text-[11px] tabular-nums text-muted-foreground">
-                      · {count} {count === 1 ? 'line' : 'lines'}
-                    </span>
+                    <div className="flex h-7 items-center gap-2">
+                      <span
+                        className="h-2.5 w-2.5 shrink-0 rounded-full"
+                        style={{ backgroundColor: speakerColorVar(speaker) }}
+                      />
+                      <span
+                        className={`truncate text-sm ${
+                          name ? 'font-medium' : 'italic text-muted-foreground'
+                        }`}
+                      >
+                        {name || defaultSpeakerLabel(speaker)}
+                      </span>
+                      <span className="shrink-0 font-mono text-[11px] tabular-nums text-muted-foreground">
+                        · {count} {count === 1 ? 'line' : 'lines'}
+                      </span>
+                      {canEdit && (
+                        <button
+                          type="button"
+                          onClick={() => setEditSpeaker(speaker)}
+                          className="ml-auto shrink-0 rounded p-1 text-muted-foreground opacity-0 transition-opacity hover:bg-muted hover:text-foreground group-hover:opacity-100"
+                          title="Edit name & context (and preview this voice)"
+                          aria-label={`Edit speaker ${defaultSpeakerLabel(speaker)}`}
+                        >
+                          <Pencil className="h-3 w-3" />
+                        </button>
+                      )}
+                    </div>
                     {suggestion && (
-                      <>
+                      <div className="flex items-center gap-2 pb-1 pl-[18px]">
                         <span
                           className="flex min-w-0 items-center gap-1 text-xs text-primary"
                           title={
@@ -173,28 +244,19 @@ export function SpeakerSummaryPanel({
                             >
                               Confirm
                             </button>
-                            <button
-                              type="button"
-                              onClick={() => onRequestCreatePerson(speaker, suggestion.name)}
-                              title="Confirm and add this person to the people directory"
-                              className="shrink-0 rounded border px-1.5 py-0.5 text-[11px] text-muted-foreground transition-colors hover:bg-muted hover:text-foreground"
-                            >
-                              + Person
-                            </button>
+                            {offerCreatePerson && (
+                              <button
+                                type="button"
+                                onClick={() => onRequestCreatePerson(speaker, suggestion.name)}
+                                title="Confirm and add this person to the people directory"
+                                className="shrink-0 rounded border px-1.5 py-0.5 text-[11px] text-muted-foreground transition-colors hover:bg-muted hover:text-foreground"
+                              >
+                                + Person
+                              </button>
+                            )}
                           </>
                         )}
-                      </>
-                    )}
-                    {canEdit && (
-                      <button
-                        type="button"
-                        onClick={() => setEditSpeaker(speaker)}
-                        className="ml-auto shrink-0 rounded p-1 text-muted-foreground opacity-0 transition-opacity hover:bg-muted hover:text-foreground group-hover:opacity-100"
-                        title="Edit name & context (and preview this voice)"
-                        aria-label={`Edit speaker ${defaultSpeakerLabel(speaker)}`}
-                      >
-                        <Pencil className="h-3 w-3" />
-                      </button>
+                      </div>
                     )}
                   </div>
                 );

@@ -154,6 +154,8 @@ export default function TranscriptDetailPage({ params }: TranscriptDetailPagePro
       duration_ms: number | null;
       input_tokens: string | null;
       output_tokens: string | null;
+      cache_read_tokens: string | null;
+      cache_creation_tokens: string | null;
       model: string | null;
       triggered_by_email: string | null;
     } | null;
@@ -396,6 +398,9 @@ export default function TranscriptDetailPage({ params }: TranscriptDetailPagePro
                 duration_ms: (completed.duration_ms as number | null) ?? null,
                 input_tokens: (completed.input_tokens as string | null) ?? null,
                 output_tokens: (completed.output_tokens as string | null) ?? null,
+                cache_read_tokens: (completed.cache_read_tokens as string | null) ?? null,
+                cache_creation_tokens:
+                  (completed.cache_creation_tokens as string | null) ?? null,
                 model: (completed.model as string | null) ?? null,
                 triggered_by_email: (completed.triggered_by_email as string | null) ?? null,
               }
@@ -1912,7 +1917,11 @@ export default function TranscriptDetailPage({ params }: TranscriptDetailPagePro
                               className="ml-auto text-[11px] text-muted-foreground"
                               title={
                                 aiStats?.latest
-                                  ? `${aiStats.latest.model ?? 'model n/a'} · in ${Number(aiStats.latest.input_tokens ?? 0).toLocaleString()} tok / out ${Number(aiStats.latest.output_tokens ?? 0).toLocaleString()} tok` +
+                                  ? `${aiStats.latest.model ?? 'model n/a'} · in ${(
+                                      Number(aiStats.latest.input_tokens ?? 0) +
+                                      Number(aiStats.latest.cache_read_tokens ?? 0) +
+                                      Number(aiStats.latest.cache_creation_tokens ?? 0)
+                                    ).toLocaleString()} tok / out ${Number(aiStats.latest.output_tokens ?? 0).toLocaleString()} tok` +
                                     (aiStats.latest.triggered_by_email
                                       ? ` · by ${aiStats.latest.triggered_by_email}`
                                       : '') +

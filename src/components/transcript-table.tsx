@@ -27,6 +27,8 @@ import {
   Search,
   ChevronRight,
   Inbox,
+  Columns3,
+  GripVertical,
 } from 'lucide-react';
 
 interface TranscriptTableProps {
@@ -37,6 +39,72 @@ type TabKey = 'all' | 'mine' | 'shared';
 
 const RESTING_SHADOW = 'shadow-[0_1px_2px_0_rgb(0_0_0/0.04)]';
 
+/**
+ * Configurable middle columns (Title is locked first, actions locked last).
+ * Users pick visibility + order via the toolbar chooser; persisted in
+ * localStorage under COLS_STORAGE_KEY.
+ */
+type ColKey = 'owner' | 'date' | 'duration' | 'speakers' | 'language' | 'imported';
+
+interface ColPrefs {
+  order: ColKey[];
+  hidden: ColKey[];
+}
+
+const DEFAULT_COL_ORDER: ColKey[] = [
+  'owner',
+  'date',
+  'duration',
+  'speakers',
+  'language',
+  'imported',
+];
+const DEFAULT_HIDDEN: ColKey[] = ['language', 'imported'];
+const COLS_STORAGE_KEY = 'mw:cols:v1';
+
+const COL_LABELS: Record<ColKey, string> = {
+  owner: 'Owner',
+  date: 'Date',
+  duration: 'Duration',
+  speakers: 'Speakers',
+  language: 'Language',
+  imported: 'Imported',
+};
+
+/** Width + responsive visibility per column (applied to head & cells). */
+const COL_HEAD_WIDTH: Record<ColKey, string> = {
+  owner: 'w-[16%]',
+  date: 'w-[14%]',
+  duration: 'w-[11%]',
+  speakers: 'w-[9%]',
+  language: 'w-[9%]',
+  imported: 'w-[12%]',
+};
+const COL_RESPONSIVE: Record<ColKey, string> = {
+  owner: 'hidden lg:table-cell',
+  date: 'hidden md:table-cell',
+  duration: 'hidden sm:table-cell',
+  speakers: 'hidden lg:table-cell',
+  language: 'hidden lg:table-cell',
+  imported: 'hidden lg:table-cell',
+};
+
+function loadColPrefs(): ColPrefs {
+  try {
+    const raw = localStorage.getItem(COLS_STORAGE_KEY);
+    if (!raw) return { order: DEFAULT_COL_ORDER, hidden: DEFAULT_HIDDEN };
+    const parsed = JSON.parse(raw) as Partial<ColPrefs>;
+    const valid = new Set<ColKey>(DEFAULT_COL_ORDER);
+    const order = (parsed.order ?? []).filter((k): k is ColKey => valid.has(k as ColKey));
+    // Append any columns added after the prefs were saved.
+    for (const k of DEFAULT_COL_ORDER) if (!order.includes(k)) order.push(k);
+    const hidden = (parsed.hidden ?? []).filter((k): k is ColKey => valid.has(k as ColKey));
+    return { order, hidden };
+  } catch {
+    return { order: DEFAULT_COL_ORDER, hidden: DEFAULT_HIDDEN };
+  }
+}
+
 export function TranscriptTable({ refreshTrigger }: TranscriptTableProps) {
   const router = useRouter();
   const [transcripts, setTranscripts] = useState<TranscriptListRow[]>([]);
@@ -45,6 +113,42 @@ export function TranscriptTable({ refreshTrigger }: TranscriptTableProps) {
   const [tab, setTab] = useState<TabKey>('all');
   const [query, setQuery] = useState('');
   const searchRef = useRef<HTMLInputElement>(null);
+
+  // Column prefs (visibility + order) — loaded client-side to avoid SSR
+  // localStorage access; saved on every change.
+  const [colPrefs, setColPrefs] = useState<ColPrefs>({
+    order: DEFAULT_COL_ORDER,
+    hidden: DEFAULT_HIDDEN,
+  });
+  const [colsOpen, setColsOpen] = useState(false);
+  const colsMenuRef = useRef<HTMLDivElement | null>(null);
+  const dragKeyRef = useRef<ColKey | null>(null);
+  useEffect(() => {
+    setColPrefs(loadColPrefs());
+  }, []);
+  const saveColPrefs = useCallback((next: ColPrefs) => {
+    setColPrefs(next);
+    try {
+      localStorage.setItem(COLS_STORAGE_KEY, JSON.stringify(next));
+    } catch {
+      // storage full/blocked — prefs just won't persist
+    }
+  }, []);
+  useEffect(() => {
+    if (!colsOpen) return;
+    const onDown = (e: MouseEvent) => {
+      if (colsMenuRef.current && !colsMenuRef.current.contains(e.target as Node)) {
+        setColsOpen(false);
+      }
+    };
+    document.addEventListener('mousedown', onDown);
+    return () => document.removeEventListener('mousedown', onDown);
+  }, [colsOpen]);
+
+  const visibleCols = useMemo(
+    () => colPrefs.order.filter((k) => !colPrefs.hidden.includes(k)),
+    [colPrefs]
+  );
 
   const loadTranscripts = useCallback(async () => {
     try {
@@ -100,8 +204,8 @@ export function TranscriptTable({ refreshTrigger }: TranscriptTableProps) {
     const q = query.trim().toLowerCase();
     if (q) {
       rows = rows.filter((t) =>
-        [t.title, t.original_filename, t.owner_name, t.owner_email].some((v) =>
-          v?.toLowerCase().includes(q)
+        [t.title, t.original_filename, t.description, t.owner_name, t.owner_email].some(
+          (v) => v?.toLowerCase().includes(q)
         )
       );
     }
@@ -189,6 +293,126 @@ export function TranscriptTable({ refreshTrigger }: TranscriptTableProps) {
     return { primary: 'Untitled meeting', secondary: null, untitled: true };
   };
 
+  const renderColCell = (key: ColKey, t: TranscriptListRow) => {
+    switch (key) {
+      case 'owner':
+        return ownerCell(t);
+      case 'date':
+        return (
+          <span
+            className="text-xs text-muted-foreground"
+            title={new Date(t.recorded_at ?? t.created_at).toLocaleString()}
+          >
+            {formatSmartDate(t.recorded_at ?? t.created_at) || 'Unknown'}
+          </span>
+        );
+      case 'duration':
+        return (
+          <span className="font-mono text-[11px] tabular-nums text-muted-foreground">
+            {t.duration ? formatDuration(t.duration) : '—'}
+          </span>
+        );
+      case 'speakers':
+        return (
+          <span className="text-xs tabular-nums text-muted-foreground">
+            {t.speaker_count ?? '—'}
+          </span>
+        );
+      case 'language':
+        return (
+          <span className="text-xs uppercase text-muted-foreground">
+            {t.language_code ?? '—'}
+          </span>
+        );
+      case 'imported':
+        return (
+          <span
+            className="text-xs text-muted-foreground"
+            title={new Date(t.created_at).toLocaleString()}
+          >
+            {formatSmartDate(t.created_at) || '—'}
+          </span>
+        );
+    }
+  };
+
+  const moveCol = (from: ColKey, to: ColKey) => {
+    if (from === to) return;
+    const order = [...colPrefs.order];
+    const fi = order.indexOf(from);
+    const ti = order.indexOf(to);
+    if (fi < 0 || ti < 0) return;
+    order.splice(fi, 1);
+    order.splice(ti, 0, from);
+    saveColPrefs({ ...colPrefs, order });
+  };
+
+  const columnChooser = (
+    <div className="relative" ref={colsMenuRef}>
+      <Button
+        variant="ghost"
+        size="sm"
+        className="h-8 w-8 p-0"
+        title="Choose columns"
+        onClick={() => setColsOpen((v) => !v)}
+      >
+        <Columns3 className="h-4 w-4" />
+        <span className="sr-only">Choose columns</span>
+      </Button>
+      {colsOpen && (
+        <div className="absolute right-0 top-full z-50 mt-1 w-52 rounded-md border bg-popover p-1 shadow-md">
+          <p className="px-2 pb-1 pt-1.5 text-[10px] font-medium uppercase tracking-wider text-muted-foreground">
+            Columns — drag to reorder
+          </p>
+          {colPrefs.order.map((key) => {
+            const hidden = colPrefs.hidden.includes(key);
+            return (
+              <div
+                key={key}
+                draggable
+                onDragStart={() => {
+                  dragKeyRef.current = key;
+                }}
+                onDragOver={(e) => e.preventDefault()}
+                onDrop={(e) => {
+                  e.preventDefault();
+                  if (dragKeyRef.current) moveCol(dragKeyRef.current, key);
+                  dragKeyRef.current = null;
+                }}
+                className="flex cursor-grab items-center gap-2 rounded px-2 py-1.5 text-sm hover:bg-muted active:cursor-grabbing"
+              >
+                <GripVertical className="h-3.5 w-3.5 shrink-0 text-muted-foreground/60" />
+                <label className="flex flex-1 cursor-pointer items-center gap-2">
+                  <input
+                    type="checkbox"
+                    checked={!hidden}
+                    onChange={() =>
+                      saveColPrefs({
+                        ...colPrefs,
+                        hidden: hidden
+                          ? colPrefs.hidden.filter((k) => k !== key)
+                          : [...colPrefs.hidden, key],
+                      })
+                    }
+                    className="h-3.5 w-3.5 accent-primary"
+                  />
+                  {COL_LABELS[key]}
+                </label>
+              </div>
+            );
+          })}
+          <button
+            type="button"
+            onClick={() => saveColPrefs({ order: DEFAULT_COL_ORDER, hidden: DEFAULT_HIDDEN })}
+            className="mt-1 block w-full rounded border-t px-2 py-1.5 text-left text-xs text-muted-foreground hover:bg-muted hover:text-foreground"
+          >
+            Reset to defaults
+          </button>
+        </div>
+      )}
+    </div>
+  );
+
   const tabButton = (key: TabKey, label: string, count: number) => (
     <button
       key={key}
@@ -228,6 +452,7 @@ export function TranscriptTable({ refreshTrigger }: TranscriptTableProps) {
             /
           </kbd>
         </div>
+        {columnChooser}
         <Button
           onClick={loadTranscripts}
           variant="ghost"
@@ -330,18 +555,14 @@ export function TranscriptTable({ refreshTrigger }: TranscriptTableProps) {
                 <TableHead className="h-9 bg-muted/50 text-[11px] font-medium uppercase tracking-wider text-muted-foreground">
                   Title
                 </TableHead>
-                <TableHead className="hidden h-9 w-[16%] bg-muted/50 text-[11px] font-medium uppercase tracking-wider text-muted-foreground lg:table-cell">
-                  Owner
-                </TableHead>
-                <TableHead className="hidden h-9 w-[14%] bg-muted/50 text-[11px] font-medium uppercase tracking-wider text-muted-foreground md:table-cell">
-                  Date
-                </TableHead>
-                <TableHead className="hidden h-9 w-[11%] bg-muted/50 text-[11px] font-medium uppercase tracking-wider text-muted-foreground sm:table-cell">
-                  Duration
-                </TableHead>
-                <TableHead className="hidden h-9 w-[9%] bg-muted/50 text-[11px] font-medium uppercase tracking-wider text-muted-foreground lg:table-cell">
-                  Speakers
-                </TableHead>
+                {visibleCols.map((key) => (
+                  <TableHead
+                    key={key}
+                    className={`h-9 ${COL_HEAD_WIDTH[key]} bg-muted/50 text-[11px] font-medium uppercase tracking-wider text-muted-foreground ${COL_RESPONSIVE[key]}`}
+                  >
+                    {COL_LABELS[key]}
+                  </TableHead>
+                ))}
                 <TableHead className="h-9 w-[72px] bg-muted/50">&nbsp;</TableHead>
               </TableRow>
             </TableHeader>
@@ -392,20 +613,11 @@ export function TranscriptTable({ refreshTrigger }: TranscriptTableProps) {
                         )}
                       </div>
                     </TableCell>
-                    <TableCell className="hidden py-2.5 lg:table-cell">
-                      {ownerCell(t)}
-                    </TableCell>
-                    <TableCell className="hidden py-2.5 text-xs text-muted-foreground md:table-cell">
-                      <span title={new Date(t.recorded_at ?? t.created_at).toLocaleString()}>
-                        {formatSmartDate(t.recorded_at ?? t.created_at) || 'Unknown'}
-                      </span>
-                    </TableCell>
-                    <TableCell className="hidden py-2.5 font-mono text-[11px] tabular-nums text-muted-foreground sm:table-cell">
-                      {t.duration ? formatDuration(t.duration) : '—'}
-                    </TableCell>
-                    <TableCell className="hidden py-2.5 text-xs tabular-nums text-muted-foreground lg:table-cell">
-                      {t.speaker_count ?? '—'}
-                    </TableCell>
+                    {visibleCols.map((key) => (
+                      <TableCell key={key} className={`py-2.5 ${COL_RESPONSIVE[key]}`}>
+                        {renderColCell(key, t)}
+                      </TableCell>
+                    ))}
                     <TableCell className="py-2.5 pr-3">
                       <div className="flex items-center justify-end gap-0.5">
                         {t.access === 'owner' && (
