@@ -197,20 +197,55 @@ export function TranscriptTable({ refreshTrigger }: TranscriptTableProps) {
     };
   }, [transcripts]);
 
+  // Deep search: debounced server-side pass over summaries + full transcript
+  // text (the client filter below only sees listing fields). Results merge
+  // into `filtered`, with a snippet shown under the title.
+  const [deepHits, setDeepHits] = useState<
+    Map<string, { matched_in: string; snippet: string | null }>
+  >(new Map());
+  const [deepSearching, setDeepSearching] = useState(false);
+  useEffect(() => {
+    const q = query.trim();
+    if (q.length < 3) {
+      setDeepHits(new Map());
+      setDeepSearching(false);
+      return;
+    }
+    setDeepSearching(true);
+    const timer = setTimeout(async () => {
+      try {
+        const res = await fetch(`/api/transcripts/search?q=${encodeURIComponent(q)}`);
+        if (!res.ok) return;
+        const { hits } = (await res.json()) as {
+          hits: Array<{ assemblyai_id: string; matched_in: string; snippet: string | null }>;
+        };
+        setDeepHits(
+          new Map(hits.map((h) => [h.assemblyai_id, { matched_in: h.matched_in, snippet: h.snippet }]))
+        );
+      } catch {
+        // deep search is additive — client filter still works
+      } finally {
+        setDeepSearching(false);
+      }
+    }, 350);
+    return () => clearTimeout(timer);
+  }, [query]);
+
   const filtered = useMemo(() => {
     let rows = transcripts;
     if (tab === 'mine') rows = rows.filter((t) => t.access === 'owner');
     else if (tab === 'shared') rows = rows.filter((t) => t.access !== 'owner');
     const q = query.trim().toLowerCase();
     if (q) {
-      rows = rows.filter((t) =>
-        [t.title, t.original_filename, t.description, t.owner_name, t.owner_email].some(
-          (v) => v?.toLowerCase().includes(q)
-        )
+      rows = rows.filter(
+        (t) =>
+          [t.title, t.original_filename, t.description, t.owner_name, t.owner_email].some(
+            (v) => v?.toLowerCase().includes(q)
+          ) || deepHits.has(t.assemblyai_id)
       );
     }
     return rows;
-  }, [transcripts, tab, query]);
+  }, [transcripts, tab, query, deepHits]);
 
   const handleDeleteTranscript = async (e: React.MouseEvent, assemblyaiId: string) => {
     e.stopPropagation();
@@ -526,8 +561,10 @@ export function TranscriptTable({ refreshTrigger }: TranscriptTableProps) {
           searchEmpty ? (
             emptyState(
               <Search className="h-5 w-5 text-muted-foreground" />,
-              `No matches for "${query.trim()}"`,
-              'Try a different title, filename, or owner.'
+              deepSearching ? 'Searching transcripts…' : `No matches for "${query.trim()}"`,
+              deepSearching
+                ? null
+                : 'Searched titles, filenames, descriptions, summaries, and full transcript text.'
             )
           ) : tab === 'shared' ? (
             emptyState(
@@ -595,13 +632,24 @@ export function TranscriptTable({ refreshTrigger }: TranscriptTableProps) {
                             <div className="truncate font-mono text-[11px] text-muted-foreground">
                               transcribing…
                             </div>
-                          ) : (
-                            secondary && (
+                          ) : (() => {
+                            const hit = query.trim() ? deepHits.get(t.assemblyai_id) : undefined;
+                            if (hit?.snippet && (hit.matched_in === 'notes' || hit.matched_in === 'content')) {
+                              return (
+                                <div className="truncate text-xs text-muted-foreground">
+                                  <span className="italic">…{hit.snippet.trim()}…</span>{' '}
+                                  <span className="text-[10px] uppercase tracking-wide">
+                                    in {hit.matched_in === 'notes' ? 'summary' : 'transcript'}
+                                  </span>
+                                </div>
+                              );
+                            }
+                            return secondary ? (
                               <div className="truncate text-xs text-muted-foreground">
                                 {secondary}
                               </div>
-                            )
-                          )}
+                            ) : null;
+                          })()}
                         </div>
                         {t.status === 'error' && (
                           <Badge

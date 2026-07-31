@@ -63,6 +63,7 @@ import {
   FileText,
   Headphones,
   CalendarSearch,
+  ExternalLink,
 } from 'lucide-react';
 
 /**
@@ -413,6 +414,27 @@ export default function TranscriptDetailPage({ params }: TranscriptDetailPagePro
       cancelled = true;
     };
   }, [transcriptId, row?.auto_notes_at]);
+
+  // While AAI is still transcribing (fresh upload or a diarization re-run),
+  // poll until the status settles, then do a full reload — no more manual
+  // browser refreshes to see the finished transcript.
+  useEffect(() => {
+    const status = row?.status;
+    if (status !== 'processing' && status !== 'queued') return;
+    const timer = setInterval(async () => {
+      try {
+        const res = await fetch(`/api/transcripts/${transcriptId}`);
+        if (!res.ok) return;
+        const { transcript } = (await res.json()) as { transcript: StoredTranscript };
+        if (transcript.status !== status) {
+          void loadAll();
+        }
+      } catch {
+        // transient — keep polling
+      }
+    }, 8000);
+    return () => clearInterval(timer);
+  }, [row?.status, transcriptId, loadAll]);
 
   const [guessingSpeakers, setGuessingSpeakers] = useState(false);
   const handleGuessSpeakers = useCallback(async () => {
@@ -1367,6 +1389,56 @@ export default function TranscriptDetailPage({ params }: TranscriptDetailPagePro
    * elements (the download popover's outside-click ref re-attaches to the
    * instance rendered last).
    */
+  // Deep links back to the Google-side sources of this row: the Meet room,
+  // the calendar event, the Drive recording, and the Meet transcript Doc.
+  const sourceLinks = useMemo(() => {
+    const g = row?.gmeet_context;
+    const links: Array<{ href: string; label: string; title: string; icon: React.ReactNode }> = [];
+    if (!row) return links;
+    if (g?.meetingCode) {
+      links.push({
+        href: `https://meet.google.com/${g.meetingCode}`,
+        label: `meet.google.com/${g.meetingCode}`,
+        title: 'Open the Meet room',
+        icon: <Video className="h-4 w-4 shrink-0 text-muted-foreground" />,
+      });
+    }
+    if (g?.eventId && currentUserEmail) {
+      // Google Calendar deep link: eid = base64url("<eventId> <email>").
+      try {
+        const eid = btoa(`${g.eventId} ${currentUserEmail}`).replace(/=+$/, '');
+        links.push({
+          href: `https://calendar.google.com/calendar/event?eid=${eid}`,
+          label: g.eventTitle || 'Calendar event',
+          title: 'Open the calendar event',
+          icon: <CalendarSearch className="h-4 w-4 shrink-0 text-muted-foreground" />,
+        });
+      } catch {
+        // non-ASCII event id — skip the link
+      }
+    }
+    const videoId =
+      row.drive_file_id ?? g?.videoFileId ?? g?.actuals?.recordings?.[0]?.fileId ?? null;
+    if (videoId) {
+      links.push({
+        href: `https://drive.google.com/file/d/${videoId}/view`,
+        label: 'Recording on Drive',
+        title: 'Open the original recording in Google Drive',
+        icon: <FileAudio className="h-4 w-4 shrink-0 text-muted-foreground" />,
+      });
+    }
+    const docId = g?.transcriptDocId ?? g?.actuals?.transcriptDocIds?.[0] ?? null;
+    if (docId) {
+      links.push({
+        href: `https://docs.google.com/document/d/${docId}/edit`,
+        label: 'Meet transcript Doc',
+        title: 'Open the Google Meet transcript document',
+        icon: <FileText className="h-4 w-4 shrink-0 text-muted-foreground" />,
+      });
+    }
+    return links;
+  }, [row, currentUserEmail]);
+
   // (dropdown now always opens below the button, so the dialog/sidebar
   // distinction no longer matters — param kept for call-site stability)
   const renderQuickActions = (_inDialog = false) => (
@@ -1517,6 +1589,28 @@ export default function TranscriptDetailPage({ params }: TranscriptDetailPagePro
             </span>
           )}
         </Button>
+        {sourceLinks.length > 0 && (
+          <>
+            <div className="my-1.5 border-t" />
+            <p className="px-2 pb-0.5 text-[10px] font-medium uppercase tracking-wider text-muted-foreground">
+              Source links
+            </p>
+            {sourceLinks.map((l) => (
+              <a
+                key={l.href}
+                href={l.href}
+                target="_blank"
+                rel="noreferrer"
+                className="flex h-8 w-full items-center gap-2 rounded-md px-3 text-[13px] hover:bg-muted"
+                title={l.title}
+              >
+                {l.icon}
+                <span className="min-w-0 flex-1 truncate">{l.label}</span>
+                <ExternalLink className="h-3 w-3 shrink-0 text-muted-foreground" />
+              </a>
+            ))}
+          </>
+        )}
       </div>
     </div>
   );

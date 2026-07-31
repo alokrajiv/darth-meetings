@@ -98,6 +98,10 @@ interface ConflictInfo {
   id: string;
   title: string | null;
   own: boolean;
+  /** Who owns the existing import (cross-user conflicts). */
+  ownerEmail?: string | null;
+  /** False when a colleague imported it but never shared it with you. */
+  accessible?: boolean;
 }
 
 type Mode = 'video' | 'transcript' | 'both';
@@ -1060,9 +1064,20 @@ export function GmeetImportDialog({
     }
     setBusy(false);
     setSelected(new Set());
-    // A bulk run from the sync view IS a sync pass — move the marker so the
-    // next visit starts where this one ended.
-    if (tab === 'sync') void markSynced();
+    if (tab === 'sync') {
+      // A bulk run from the sync view IS a sync pass — move the marker so
+      // the next visit starts where this one ended.
+      void markSynced();
+      // Meetings that failed because there is simply nothing to import
+      // (never recorded/transcribed) will never succeed — mute them so they
+      // don't come back as "unsynced" noise. Other errors stay retryable.
+      for (const r of results) {
+        if (r.status === 'error' && /no meet transcript/i.test(r.detail ?? '')) {
+          const row = targets.find((t) => t.event.id === r.rowId);
+          if (row) void muteRow(row);
+        }
+      }
+    }
     onImported?.();
   };
 
@@ -1104,9 +1119,17 @@ export function GmeetImportDialog({
 
       if (res.status === 409) {
         const detail = (await res.json()) as {
-          existing?: { assemblyai_id?: string; own?: boolean; title?: string | null };
+          existing?: {
+            assemblyai_id?: string | null;
+            own?: boolean;
+            title?: string | null;
+            ownerEmail?: string | null;
+            accessible?: boolean;
+          };
         };
         setConflict({
+          ownerEmail: detail.existing?.ownerEmail ?? null,
+          accessible: detail.existing?.accessible !== false,
           id: detail.existing?.assemblyai_id ?? '',
           title: detail.existing?.title ?? null,
           own: !!detail.existing?.own,
@@ -1484,6 +1507,15 @@ export function GmeetImportDialog({
                 ? `Importing ${(bulkProgress?.done ?? 0) + 1} of ${bulkProgress?.total}…`
                 : `Done — ${bulkResults.filter((r) => r.status === 'ok').length} imported, ${bulkResults.filter((r) => r.status === 'exists').length} already existed, ${bulkResults.filter((r) => r.status === 'error').length} failed.`}
             </p>
+            {!busy && tab === 'sync' && (
+              <p className="text-xs text-muted-foreground">
+                Sync point updated — next sync starts from now.
+                {bulkResults.some(
+                  (r) => r.status === 'error' && /no meet transcript/i.test(r.detail ?? '')
+                ) &&
+                  ' Meetings with no Meet transcript were muted (nothing to import — they won’t be offered again).'}
+              </p>
+            )}
             <div className="max-h-[50vh] overflow-y-auto rounded-md border">
               <ul className="divide-y">
                 {bulkResults.map((r) => (
@@ -1605,22 +1637,27 @@ export function GmeetImportDialog({
             {conflict && (
               <div className="rounded-md border border-amber-400 bg-amber-50 dark:bg-amber-950/30 p-3 space-y-2">
                 <p className="text-sm">
-                  Already imported by {conflict.own ? 'you' : 'a teammate'}
+                  Already imported by{' '}
+                  {conflict.own ? 'you' : (conflict.ownerEmail ?? 'a teammate')}
                   {conflict.title ? (
                     <>
                       {' '}
                       — <span className="font-medium">{conflict.title}</span>
                     </>
                   ) : null}
-                  . It&apos;s in your list (invitees are shared in automatically).
+                  {conflict.accessible === false
+                    ? ". It hasn't been shared with you — ask them for access, or import your own copy."
+                    : ". It's in your list (invitees are shared in automatically)."}
                 </p>
                 <div className="flex gap-2">
-                  <a href={`/transcript/${conflict.id}`}>
-                    <Button size="sm">
-                      <ExternalLink className="h-3.5 w-3.5 mr-1.5" />
-                      Open transcript
-                    </Button>
-                  </a>
+                  {conflict.id && (
+                    <a href={`/transcript/${conflict.id}`}>
+                      <Button size="sm">
+                        <ExternalLink className="h-3.5 w-3.5 mr-1.5" />
+                        Open transcript
+                      </Button>
+                    </a>
+                  )}
                   <Button
                     size="sm"
                     variant="outline"

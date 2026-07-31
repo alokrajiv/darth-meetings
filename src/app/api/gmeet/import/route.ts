@@ -7,6 +7,7 @@ import {
   setRecordedAtForUser,
 } from '@/db-ops/transcripts';
 import { addShare } from '@/db-ops/transcript-shares';
+import { findImportedByMeetingCodes } from '@/db-ops/gmeet-sync';
 import {
   autoNameSpeakers,
   registerPeopleFromMeeting,
@@ -87,6 +88,44 @@ async function autoShareToInternalInvitees(
     }
   }
   return shared;
+}
+
+/**
+ * Cross-user duplicate check by meeting code. Returns a 409 response when
+ * someone ELSE already imported this meeting (shared with the caller or
+ * not), null when the meeting is unclaimed. `force` bypasses at call sites.
+ */
+async function checkCrossUserDuplicate(
+  meetingCode: string,
+  user: { userId: string; email: string }
+): Promise<NextResponse | null> {
+  try {
+    const [other] = await findImportedByMeetingCodes([meetingCode], {
+      userId: user.userId,
+      email: user.email,
+    });
+    if (!other) return null;
+    return NextResponse.json(
+      {
+        error: other.accessible
+          ? 'This meeting was already imported.'
+          : `This meeting was already imported by ${other.owner_email ?? 'a colleague'} (not shared with you).`,
+        existing: {
+          assemblyai_id: other.accessible ? other.assemblyai_id : null,
+          title: other.accessible ? other.title : null,
+          created_at: null,
+          own: other.mine,
+          ownerEmail: other.owner_email,
+          accessible: other.accessible,
+        },
+      },
+      { status: 409 }
+    );
+  } catch (err) {
+    // Dedupe is best-effort — never block an import on a failed check.
+    console.warn('[gmeet/import] cross-user dedupe check failed:', err);
+    return null;
+  }
 }
 
 function googleErrorResponse(err: GoogleApiError): NextResponse {
@@ -333,10 +372,18 @@ export const POST = withAuth(async ({ user, request }) => {
             title: dupe.title,
             created_at: dupe.created_at,
             own: dupe.user_id === user.userId,
+            accessible: true,
           },
         },
         { status: 409 }
       );
+    }
+    // Cross-USER dedupe: a colleague may have imported this meeting without
+    // sharing it (off-invite import, or pre-auto-share rows). Surface who
+    // has it instead of silently minting a duplicate; force overrides.
+    if (!dupe && !force && event.meetingCode) {
+      const crossUserConflict = await checkCrossUserDuplicate(event.meetingCode, user);
+      if (crossUserConflict) return crossUserConflict;
     }
 
     const startIso = event.startTime ?? actuals?.conferenceStart;
@@ -406,10 +453,15 @@ export const POST = withAuth(async ({ user, request }) => {
           title: existing.title,
           created_at: existing.created_at,
           own: existing.user_id === user.userId,
+          accessible: true,
         },
       },
       { status: 409 }
     );
+  }
+  if (!existing && !force && event.meetingCode) {
+    const crossUserConflict = await checkCrossUserDuplicate(event.meetingCode, user);
+    if (crossUserConflict) return crossUserConflict;
   }
 
   let meta;
