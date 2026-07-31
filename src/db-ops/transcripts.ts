@@ -298,6 +298,33 @@ export async function setCachedContentForUser(
 export const setImportedContentForUser = setCachedContentForUser;
 
 /**
+ * Sweep candidates for the auto-notes watchdog: completed transcripts whose
+ * notes never ran (status NULL, older than the grace window) or whose run is
+ * stuck in 'running' — a pm2 restart kills in-flight generations and nothing
+ * else ever retries them.
+ */
+export async function listNotesBacklog(
+  graceMinutes: number,
+  stuckMinutes: number,
+  limit: number
+): Promise<Array<{ user_id: string; assemblyai_id: string; auto_notes_status: string | null }>> {
+  return sql<Array<{ user_id: string; assemblyai_id: string; auto_notes_status: string | null }>>`
+    SELECT user_id, assemblyai_id, auto_notes_status
+    FROM ${sql(SCHEMA)}.transcripts
+    WHERE status = 'completed'
+      AND (
+        (auto_notes_status IS NULL
+          AND COALESCE(completed_at, created_at) < now() - make_interval(mins => ${graceMinutes}))
+        OR
+        (auto_notes_status = 'running'
+          AND auto_notes_at < now() - make_interval(mins => ${stuckMinutes}))
+      )
+    ORDER BY COALESCE(completed_at, created_at) DESC
+    LIMIT ${limit}
+  `;
+}
+
+/**
  * Auto-notes state machine writes. `status` transitions:
  * null -> 'running' -> 'completed' | 'error'. Notes/error are set atomically
  * with the status so the UI never sees a half-written state.

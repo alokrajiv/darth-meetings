@@ -1,6 +1,8 @@
 import { NextResponse } from 'next/server';
+import { tool, createSdkMcpServer } from '@anthropic-ai/claude-agent-sdk';
+import { z } from 'zod';
 import { withAuth } from '@/lib/auth/with-auth';
-import { runClaudeWithMeta } from '@/lib/server/claude-cli';
+import { runClaudeWithMeta } from '@/lib/server/claude-agent';
 import { recordAiRun } from '@/db-ops/ai-runs';
 import { listVisibleToUser } from '@/db-ops/transcripts';
 import { searchVisibleTranscripts } from '@/db-ops/transcript-search';
@@ -8,18 +10,59 @@ import { searchVisibleTranscripts } from '@/db-ops/transcript-search';
 export const runtime = 'nodejs';
 export const maxDuration = 300;
 
+const SYSTEM_PROMPT = `You are the meeting-archive assistant for Trames' internal "Meeting Whisperer" tool. The user asks questions about their recorded meetings; you answer conversationally and point them at the right transcripts.
+
+Rules:
+- Link every meeting you mention as a markdown link: [<title>](/transcript/<id>) using the exact id given. Never invent ids.
+- Use the search_transcripts tool whenever the provided context doesn't already answer the question — search short specific terms (product names, acronyms like SAP/ERP, people) and variants, not whole sentences. Several quick searches beat one vague one.
+- Ground answers ONLY in the meeting list and search results. If nothing turns up after searching, say so.
+- Be brief: a couple of sentences plus the relevant links. This is a chat panel, not a report.
+- The user may ask follow-ups later in this same session — keep context.`;
+
+/**
+ * Per-request in-process MCP server: gives the model a real search tool
+ * scoped to the caller's visible transcripts (same ACL as the UI search).
+ */
+function archiveTools(userId: string, email: string) {
+  return createSdkMcpServer({
+    name: 'archive',
+    tools: [
+      tool(
+        'search_transcripts',
+        'Full-text search across the meeting archive: titles, descriptions, AI notes, and raw transcript text. Returns matching meetings with their id, where the match was found, and a snippet.',
+        {
+          query: z.string().describe('A word or short phrase — acronyms and names work well'),
+          limit: z.number().int().min(1).max(20).optional(),
+        },
+        async ({ query: q, limit }) => {
+          const hits = await searchVisibleTranscripts(userId, email, q, Math.min(limit ?? 8, 20));
+          const text = hits.length
+            ? hits
+                .map(
+                  (h) =>
+                    `id=${h.assemblyai_id} | matched in ${h.matched_in}${h.snippet ? ` | "…${h.snippet.trim()}…"` : ''}`
+                )
+                .join('\n')
+            : '(no matches)';
+          return { content: [{ type: 'text', text }] };
+        }
+      ),
+    ],
+  });
+}
+
 /**
  * POST /api/ask — conversational "Ask AI" over the caller's archive.
  * Body: { question: string, sessionId?: string }
  *
- * First turn: the prompt carries the caller's full visible meeting list
- * (small — titles/dates/descriptions) plus deep-search snippets for the
- * question. Follow-ups ride `claude -p --resume <sessionId>` so the model
- * keeps the whole conversation (and the archive context) without resending
- * it — that's what makes follow-ups cheap and coherent.
+ * Runs on the Claude Agent SDK (subscription auth, same as the old
+ * `claude -p` path). First turn: the prompt carries the caller's full
+ * visible meeting list plus seed deep-search snippets for the question;
+ * the model can then search iteratively itself via the archive MCP tool.
+ * Follow-ups resume the session so context carries over without resending.
  *
- * Runs at effort LOW for latency: retrieval is done here in SQL; the model
- * only has to read, reason lightly, and answer with links.
+ * Runs at effort LOW for latency: the model reads, searches, and answers
+ * with links — no heavy reasoning needed.
  */
 export const POST = withAuth(async ({ user, request }) => {
   const body = (await request.json().catch(() => null)) as {
@@ -35,12 +78,28 @@ export const POST = withAuth(async ({ user, request }) => {
   }
 
   // Retrieval — always: deep-search hits for the question terms (whole
-  // phrase + significant words), capped tight.
+  // phrase + significant words), capped tight. Length-only filtering is a
+  // trap: it drops exactly the acronyms people ask about (SAP, ERP, TAT)
+  // while keeping question filler ("when", "about", "recently") that
+  // matches every transcript. So: 3+ chars, minus stopwords.
+  const STOPWORDS = new Set([
+    'the', 'and', 'for', 'are', 'was', 'were', 'has', 'have', 'had', 'did',
+    'does', 'can', 'could', 'will', 'would', 'should', 'not', 'but', 'with',
+    'from', 'into', 'over', 'out', 'our', 'your', 'you', 'they', 'them',
+    'their', 'this', 'that', 'these', 'those', 'there', 'then', 'than',
+    'what', 'when', 'where', 'which', 'who', 'whom', 'why', 'how', 'all',
+    'any', 'some', 'something', 'anything', 'someone', 'anyone', 'more',
+    'most', 'other', 'about', 'again', 'last', 'just', 'like', 'also',
+    'talk', 'talks', 'talked', 'talking', 'say', 'said', 'says', 'tell',
+    'told', 'discuss', 'discussed', 'discussion', 'mention', 'mentioned',
+    'meeting', 'meetings', 'call', 'calls', 'recent', 'recently', 'week',
+    'month', 'today', 'yesterday', 'time',
+  ]);
   const words = [
     ...new Set(
       question
         .split(/[^\p{L}\p{N}-]+/u)
-        .filter((w) => w.length >= 4)
+        .filter((w) => w.length >= 3 && !STOPWORDS.has(w.toLowerCase()))
         .slice(0, 6)
     ),
   ];
@@ -88,19 +147,11 @@ export const POST = withAuth(async ({ user, request }) => {
       })
       .join('\n');
 
-    prompt = `You are the meeting-archive assistant for Trames' internal "Meeting Whisperer" tool. The user asks questions about their recorded meetings; you answer conversationally and point them at the right transcripts.
-
-Rules:
-- Link every meeting you mention as a markdown link: [<title>](/transcript/<id>) using the exact id given. Never invent ids.
-- Ground answers ONLY in the meeting list and search snippets provided. If the evidence is thin, say what you'd search instead of guessing.
-- Be brief: a couple of sentences plus the relevant links. This is a chat panel, not a report.
-- The user may ask follow-ups later in this same session — keep context.
-
-The user's meeting archive (completed meetings, newest first):
+    prompt = `The user's meeting archive (completed meetings, newest first):
 ${listing}
 
-Search hits for the current question (snippets from transcript text/summaries):
-${hitLines.join('\n') || '(no text matches — reason from titles/dates)'}
+Seed search hits for the current question (snippets from transcript text/summaries — search for more yourself if these don't answer it):
+${hitLines.join('\n') || '(no text matches yet — use search_transcripts with better terms)'}
 
 Question: ${question}`;
   }
@@ -111,6 +162,9 @@ Question: ${question}`;
       timeoutMs: 4 * 60 * 1000,
       resumeSessionId: body?.sessionId,
       effort: 'low',
+      systemPrompt: SYSTEM_PROMPT,
+      mcpServers: { archive: archiveTools(user.userId, user.email) },
+      allowedTools: ['mcp__archive__search_transcripts'],
     });
     void recordAiRun({
       kind: 'ask',

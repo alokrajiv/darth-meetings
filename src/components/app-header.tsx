@@ -18,7 +18,7 @@ interface AppHeaderProps {
 export function AppHeader({ children, breadcrumb }: AppHeaderProps) {
   return (
     <header className="sticky top-0 z-40 h-14 border-b bg-background/85 backdrop-blur">
-      <div className="mx-auto flex h-14 max-w-[1200px] items-center gap-3 px-6">
+      <div className="mx-auto flex h-14 max-w-[1720px] items-center gap-3 px-6">
         <Link href="/" className="flex shrink-0 items-center gap-2">
           <span className="grid h-7 w-7 place-items-center rounded-md bg-primary text-primary-foreground">
             <AudioLines className="h-4 w-4" />

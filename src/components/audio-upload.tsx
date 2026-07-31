@@ -1,6 +1,6 @@
 'use client';
 
-import { useState, useCallback, useRef } from 'react';
+import { useState, useCallback, useEffect, useRef } from 'react';
 import { Button } from '@/components/ui/button';
 import { Progress } from '@/components/ui/progress';
 import { Badge } from '@/components/ui/badge';
@@ -199,36 +199,52 @@ export function AudioUpload({ onTranscriptCreated }: AudioUploadProps) {
     []
   );
 
-  const handleDragOver = useCallback((e: React.DragEvent) => {
-    e.preventDefault();
-    setIsDragging(true);
-  }, []);
-
-  const handleDragLeave = useCallback((e: React.DragEvent) => {
-    e.preventDefault();
-    setIsDragging(false);
-  }, []);
-
   const handleFilesSelected = useCallback((files: FileList) => {
     setPendingFiles(Array.from(files));
     setSelectedLanguage('');
     setIsDialogOpen(true);
   }, []);
 
-  const handleDrop = useCallback(
-    (e: React.DragEvent) => {
-      e.preventDefault();
+  // Page-wide drag & drop: the visible dropzone strip is gone (it cost a
+  // full row of chrome) — instead, dragging files anywhere over the window
+  // raises a fixed overlay, and dropping anywhere uploads. Depth counter
+  // because dragenter/dragleave fire for every child element crossed.
+  useEffect(() => {
+    let depth = 0;
+    const hasFiles = (e: DragEvent) =>
+      Array.from(e.dataTransfer?.types ?? []).includes('Files');
+    const onEnter = (e: DragEvent) => {
+      if (!hasFiles(e)) return;
+      depth += 1;
+      setIsDragging(true);
+    };
+    const onOver = (e: DragEvent) => {
+      if (hasFiles(e)) e.preventDefault();
+    };
+    const onLeave = () => {
+      depth = Math.max(0, depth - 1);
+      if (depth === 0) setIsDragging(false);
+    };
+    const onDrop = (e: DragEvent) => {
+      depth = 0;
       setIsDragging(false);
-      if (e.dataTransfer.files.length > 0) {
+      if (!hasFiles(e)) return;
+      e.preventDefault();
+      if (e.dataTransfer && e.dataTransfer.files.length > 0) {
         handleFilesSelected(e.dataTransfer.files);
       }
-    },
-    [handleFilesSelected]
-  );
-
-  const handleFileSelect = useCallback(() => {
-    fileInputRef.current?.click();
-  }, []);
+    };
+    window.addEventListener('dragenter', onEnter);
+    window.addEventListener('dragover', onOver);
+    window.addEventListener('dragleave', onLeave);
+    window.addEventListener('drop', onDrop);
+    return () => {
+      window.removeEventListener('dragenter', onEnter);
+      window.removeEventListener('dragover', onOver);
+      window.removeEventListener('dragleave', onLeave);
+      window.removeEventListener('drop', onDrop);
+    };
+  }, [handleFilesSelected]);
 
   const handleFileInputChange = useCallback(
     (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -284,36 +300,26 @@ export function AudioUpload({ onTranscriptCreated }: AudioUploadProps) {
 
   return (
     <>
-      <div className="space-y-3">
-        <div
-          className={`flex cursor-pointer items-center gap-3 rounded-lg border border-dashed bg-card px-4 py-3 transition-colors ${
-            isDragging
-              ? 'border-primary bg-accent/60'
-              : 'border-input hover:border-primary/50 hover:bg-accent/40'
-          }`}
-          onClick={handleFileSelect}
-          onDragOver={handleDragOver}
-          onDragLeave={handleDragLeave}
-          onDrop={handleDrop}
-        >
-          <Upload className="h-4 w-4 shrink-0 text-muted-foreground" />
-          <p className="text-sm">
-            <span className="font-medium">Drop audio or video here</span>{' '}
-            <span className="text-muted-foreground">or click to browse — up to 4 GB</span>
-          </p>
-          <span className="ml-auto hidden text-[11px] text-muted-foreground sm:block">
-            mp3 · m4a · mp4 · wav
-          </span>
-          <input
-            id={AUDIO_UPLOAD_INPUT_ID}
-            ref={fileInputRef}
-            type="file"
-            multiple
-            onChange={handleFileInputChange}
-            onClick={(e) => e.stopPropagation()}
-            className="hidden"
-          />
-        </div>
+      <div className={uploads.length > 0 ? 'mb-3 space-y-3' : ''}>
+        <input
+          id={AUDIO_UPLOAD_INPUT_ID}
+          ref={fileInputRef}
+          type="file"
+          multiple
+          onChange={handleFileInputChange}
+          className="hidden"
+        />
+        {isDragging && (
+          <div className="pointer-events-none fixed inset-0 z-50 grid place-items-center bg-background/80 backdrop-blur-sm">
+            <div className="rounded-xl border-2 border-dashed border-primary bg-card px-10 py-8 text-center shadow-lg">
+              <Upload className="mx-auto h-6 w-6 text-primary" />
+              <p className="mt-3 text-sm font-medium">Drop audio or video to upload</p>
+              <p className="mt-1 text-xs text-muted-foreground">
+                up to 4 GB · mp3 · m4a · mp4 · wav
+              </p>
+            </div>
+          </div>
+        )}
 
         {uploads.length > 0 && (
           <div className="space-y-2">

@@ -1327,6 +1327,58 @@ export default function TranscriptDetailPage({ params }: TranscriptDetailPagePro
     }
   };
 
+  // Deep links back to the Google-side sources of this row: the Meet room,
+  // the calendar event, the Drive recording, and the Meet transcript Doc.
+  // Must stay ABOVE the early returns: a hook below them runs on some renders
+  // and not others, which is React error #310 (the blank-detail-page bug).
+  const sourceLinks = useMemo(() => {
+    const g = row?.gmeet_context;
+    const links: Array<{ href: string; label: string; title: string; icon: React.ReactNode }> = [];
+    if (!row) return links;
+    if (g?.meetingCode) {
+      links.push({
+        href: `https://meet.google.com/${g.meetingCode}`,
+        label: `meet.google.com/${g.meetingCode}`,
+        title: 'Open the Meet room',
+        icon: <Video className="h-4 w-4 shrink-0 text-muted-foreground" />,
+      });
+    }
+    if (g?.eventId && currentUserEmail) {
+      // Google Calendar deep link: eid = base64url("<eventId> <email>").
+      try {
+        const eid = btoa(`${g.eventId} ${currentUserEmail}`).replace(/=+$/, '');
+        links.push({
+          href: `https://calendar.google.com/calendar/event?eid=${eid}`,
+          label: g.eventTitle || 'Calendar event',
+          title: 'Open the calendar event',
+          icon: <CalendarSearch className="h-4 w-4 shrink-0 text-muted-foreground" />,
+        });
+      } catch {
+        // non-ASCII event id — skip the link
+      }
+    }
+    const videoId =
+      row.drive_file_id ?? g?.videoFileId ?? g?.actuals?.recordings?.[0]?.fileId ?? null;
+    if (videoId) {
+      links.push({
+        href: `https://drive.google.com/file/d/${videoId}/view`,
+        label: 'Recording on Drive',
+        title: 'Open the original recording in Google Drive',
+        icon: <FileAudio className="h-4 w-4 shrink-0 text-muted-foreground" />,
+      });
+    }
+    const docId = g?.transcriptDocId ?? g?.actuals?.transcriptDocIds?.[0] ?? null;
+    if (docId) {
+      links.push({
+        href: `https://docs.google.com/document/d/${docId}/edit`,
+        label: 'Meet transcript Doc',
+        title: 'Open the Google Meet transcript document',
+        icon: <FileText className="h-4 w-4 shrink-0 text-muted-foreground" />,
+      });
+    }
+    return links;
+  }, [row, currentUserEmail]);
+
   // --- early returns ---
 
   if (loading) {
@@ -1410,56 +1462,6 @@ export default function TranscriptDetailPage({ params }: TranscriptDetailPagePro
    * elements (the download popover's outside-click ref re-attaches to the
    * instance rendered last).
    */
-  // Deep links back to the Google-side sources of this row: the Meet room,
-  // the calendar event, the Drive recording, and the Meet transcript Doc.
-  const sourceLinks = useMemo(() => {
-    const g = row?.gmeet_context;
-    const links: Array<{ href: string; label: string; title: string; icon: React.ReactNode }> = [];
-    if (!row) return links;
-    if (g?.meetingCode) {
-      links.push({
-        href: `https://meet.google.com/${g.meetingCode}`,
-        label: `meet.google.com/${g.meetingCode}`,
-        title: 'Open the Meet room',
-        icon: <Video className="h-4 w-4 shrink-0 text-muted-foreground" />,
-      });
-    }
-    if (g?.eventId && currentUserEmail) {
-      // Google Calendar deep link: eid = base64url("<eventId> <email>").
-      try {
-        const eid = btoa(`${g.eventId} ${currentUserEmail}`).replace(/=+$/, '');
-        links.push({
-          href: `https://calendar.google.com/calendar/event?eid=${eid}`,
-          label: g.eventTitle || 'Calendar event',
-          title: 'Open the calendar event',
-          icon: <CalendarSearch className="h-4 w-4 shrink-0 text-muted-foreground" />,
-        });
-      } catch {
-        // non-ASCII event id — skip the link
-      }
-    }
-    const videoId =
-      row.drive_file_id ?? g?.videoFileId ?? g?.actuals?.recordings?.[0]?.fileId ?? null;
-    if (videoId) {
-      links.push({
-        href: `https://drive.google.com/file/d/${videoId}/view`,
-        label: 'Recording on Drive',
-        title: 'Open the original recording in Google Drive',
-        icon: <FileAudio className="h-4 w-4 shrink-0 text-muted-foreground" />,
-      });
-    }
-    const docId = g?.transcriptDocId ?? g?.actuals?.transcriptDocIds?.[0] ?? null;
-    if (docId) {
-      links.push({
-        href: `https://docs.google.com/document/d/${docId}/edit`,
-        label: 'Meet transcript Doc',
-        title: 'Open the Google Meet transcript document',
-        icon: <FileText className="h-4 w-4 shrink-0 text-muted-foreground" />,
-      });
-    }
-    return links;
-  }, [row, currentUserEmail]);
-
   // (dropdown now always opens below the button, so the dialog/sidebar
   // distinction no longer matters — param kept for call-site stability)
   const renderQuickActions = (_inDialog = false) => (

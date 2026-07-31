@@ -5,7 +5,6 @@ import Link from 'next/link';
 import { TranscriptTable } from '@/components/transcript-table';
 import { AudioUpload, AUDIO_UPLOAD_INPUT_ID } from '@/components/audio-upload';
 import { LogoutButton } from '@/components/logout-button';
-import { ImportDialog } from '@/components/import-dialog';
 import { GmeetImportDialog } from '@/components/gmeet-import-dialog';
 import { TranscriptImportDialog } from '@/components/transcript-import-dialog';
 import { AppHeader } from '@/components/app-header';
@@ -17,7 +16,6 @@ import {
   FileText,
   FileAudio,
   ChevronDown,
-  KeyRound,
   Sparkles,
 } from 'lucide-react';
 
@@ -25,7 +23,6 @@ const SYNC_NUDGE_AFTER_DAYS = 5;
 
 export default function Home() {
   const [refreshTrigger, setRefreshTrigger] = useState(0);
-  const [importOpen, setImportOpen] = useState(false);
   const [gmeetOpen, setGmeetOpen] = useState(false);
   const [gmeetSyncMode, setGmeetSyncMode] = useState(false);
   const [textImportOpen, setTextImportOpen] = useState(false);
@@ -109,23 +106,6 @@ export default function Home() {
                   </span>
                 </span>
               </button>
-              <button
-                type="button"
-                role="menuitem"
-                className="flex w-full items-start gap-2.5 rounded-md px-3 py-2 text-left hover:bg-muted"
-                onClick={() => {
-                  setImportMenuOpen(false);
-                  setImportOpen(true);
-                }}
-              >
-                <KeyRound className="mt-0.5 h-4 w-4 shrink-0 text-muted-foreground" />
-                <span className="min-w-0">
-                  <span className="block text-sm font-medium">From AssemblyAI key</span>
-                  <span className="block text-[11px] text-muted-foreground">
-                    Bring across transcripts you already have
-                  </span>
-                </span>
-              </button>
             </div>
           )}
         </div>
@@ -153,70 +133,59 @@ export default function Home() {
         <LogoutButton />
       </AppHeader>
 
-      <main className="mx-auto max-w-[1200px] px-6 py-6">
-        <div className="mb-5 flex items-start gap-3">
-          <div>
-            <h1 className="text-2xl font-semibold tracking-tight leading-tight">Archive</h1>
-            <p className="text-sm text-muted-foreground">
-              Every meeting, transcribed and searchable.
-            </p>
-          </div>
-          {!askOpen && (
-            <Button
-              variant="outline"
-              size="sm"
-              className="ml-auto mt-1"
-              onClick={() => setAskOpen(true)}
-              title="Ask questions about your meetings — the AI answers with links"
-            >
-              <Sparkles className="h-4 w-4 text-primary" />
-              Ask AI
-            </Button>
-          )}
-        </div>
-
+      <main className="mx-auto max-w-[1720px] px-6 py-4">
         {askOpen && (
           <div className="mb-4">
             <AskAiPanel onClose={() => setAskOpen(false)} />
           </div>
         )}
 
-        {showSyncNudge && (
-          <div className="mb-4 flex flex-wrap items-center gap-2 rounded-lg border border-primary/25 bg-primary/5 px-4 py-2.5 text-sm">
-            <Video className="h-4 w-4 shrink-0 text-primary" />
-            <span>
-              {lastSyncedAt
-                ? `Your Meet meetings were last synced ${syncAgeDays} days ago.`
-                : 'You haven’t synced your Meet meetings yet.'}
-              <span className="text-muted-foreground">
-                {' '}
-                Pull everything in so nothing gets forgotten.
-              </span>
-            </span>
-            <Button
-              size="sm"
-              className="ml-auto h-7"
-              onClick={() => {
-                setGmeetSyncMode(true);
-                setGmeetOpen(true);
-              }}
-            >
-              Sync now
-            </Button>
-          </div>
-        )}
+        {/* Renders the page-wide drag-drop overlay, the hidden file input the
+            header button clicks, and in-flight upload progress rows. */}
+        <AudioUpload onTranscriptCreated={handleTranscriptCreated} />
 
-        <div className="flex flex-col gap-5">
-          <AudioUpload onTranscriptCreated={handleTranscriptCreated} />
-          <TranscriptTable refreshTrigger={refreshTrigger} />
-        </div>
+        <TranscriptTable
+          refreshTrigger={refreshTrigger}
+          toolbarExtra={
+            <>
+              {showSyncNudge && (
+                <div className="mr-1 flex items-center gap-1.5 rounded-md border border-primary/25 bg-primary/5 py-0.5 pl-2 pr-0.5 text-xs">
+                  <Video className="h-3.5 w-3.5 shrink-0 text-primary" />
+                  <span
+                    className="text-muted-foreground"
+                    title="Pull everything in so nothing gets forgotten."
+                  >
+                    {lastSyncedAt ? `Synced ${syncAgeDays}d ago` : 'Meet not synced'}
+                  </span>
+                  <Button
+                    size="sm"
+                    className="h-6 px-2 text-xs"
+                    onClick={() => {
+                      setGmeetSyncMode(true);
+                      setGmeetOpen(true);
+                    }}
+                  >
+                    Sync now
+                  </Button>
+                </div>
+              )}
+              {!askOpen && (
+                <Button
+                  variant="outline"
+                  size="sm"
+                  className="h-8"
+                  onClick={() => setAskOpen(true)}
+                  title="Ask questions about your meetings — the AI answers with links"
+                >
+                  <Sparkles className="h-4 w-4 text-primary" />
+                  Ask AI
+                </Button>
+              )}
+            </>
+          }
+        />
       </main>
 
-      <ImportDialog
-        open={importOpen}
-        onClose={() => setImportOpen(false)}
-        onImported={handleTranscriptCreated}
-      />
       <GmeetImportDialog
         open={gmeetOpen}
         onClose={() => {

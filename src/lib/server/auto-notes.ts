@@ -1,7 +1,7 @@
 import 'server-only';
 import { getTranscript } from '@/lib/server/assemblyai';
-import { runClaudeWithMeta } from '@/lib/server/claude-cli';
-import { recordAiRun } from '@/db-ops/ai-runs';
+import { runClaudeWithMeta } from '@/lib/server/claude-agent';
+import { recordAiRun, getLatestSessionId } from '@/db-ops/ai-runs';
 import { findPeopleByEmails, type Person } from '@/db-ops/people';
 import {
   getForUser,
@@ -313,10 +313,40 @@ export async function generateAutoNotes(
 
     const prompt =
       PROMPT_HEADER + attachmentContext + meetCrossRef + peopleContext + speakerContext + transcriptText;
+
+    // Incremental top-up: a forced regeneration (speaker renamed, context
+    // file attached, …) resumes the prior session instead of resending the
+    // whole transcript — the session already holds it, so the bulk of the
+    // prompt is a cache read. Falls back to a fresh full run if the resume
+    // fails (session file gone, expired, whatever). NOTE: assumes the
+    // transcript text itself is unchanged; heavy transcript edits still get
+    // fresh full runs because the top-up re-supplies context, not content.
+    const priorSessionId = opts.force ? await getLatestSessionId(row.id) : null;
+    const topUpPrompt =
+      `The meeting data has been updated since you generated these notes (speaker identifications, attached context files, or the team directory may have changed). Regenerate the notes now, following EXACTLY the same output format as before: the TITLE line, the SPEAKERS line, the SEGMENTS line, a blank line, then the markdown notes.\n\n` +
+      `Current context (supersedes earlier versions; the transcript itself is unchanged):\n\n` +
+      attachmentContext +
+      peopleContext +
+      speakerContext.replace(/Transcript follows:\n\n$/, '');
+
     const started = Date.now();
     let raw: string;
     try {
-      const run = await runClaudeWithMeta(prompt);
+      let run: Awaited<ReturnType<typeof runClaudeWithMeta>> | null = null;
+      if (priorSessionId) {
+        try {
+          run = await runClaudeWithMeta(topUpPrompt, { resumeSessionId: priorSessionId });
+          console.log(
+            `[auto-notes] ${assemblyaiId}: top-up resume of session ${priorSessionId.slice(0, 8)}…`
+          );
+        } catch (resumeErr) {
+          console.warn(
+            `[auto-notes] ${assemblyaiId}: resume failed, falling back to full run:`,
+            resumeErr
+          );
+        }
+      }
+      if (!run) run = await runClaudeWithMeta(prompt);
       raw = run.text;
       console.log(
         `[auto-notes] ${assemblyaiId}: generated ${raw.length} chars in ${Math.round((Date.now() - started) / 1000)}s` +

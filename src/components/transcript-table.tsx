@@ -35,6 +35,8 @@ import {
 
 interface TranscriptTableProps {
   refreshTrigger?: number;
+  /** Extra controls rendered in the toolbar row, left of the search box. */
+  toolbarExtra?: React.ReactNode;
 }
 
 type TabKey = 'all' | 'mine' | 'shared';
@@ -124,7 +126,7 @@ function loadColPrefs(): ColPrefs {
   }
 }
 
-export function TranscriptTable({ refreshTrigger }: TranscriptTableProps) {
+export function TranscriptTable({ refreshTrigger, toolbarExtra }: TranscriptTableProps) {
   const router = useRouter();
   const [transcripts, setTranscripts] = useState<TranscriptListRow[]>([]);
   const [loading, setLoading] = useState(true);
@@ -555,6 +557,7 @@ export function TranscriptTable({ refreshTrigger }: TranscriptTableProps) {
         {tabButton('shared', 'Shared', counts.shared)}
       </div>
       <div className="ml-auto flex items-center gap-1.5 pb-2">
+        {toolbarExtra}
         <div className="relative">
           <Search className="pointer-events-none absolute left-2.5 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-muted-foreground" />
           <Input
@@ -657,13 +660,13 @@ export function TranscriptTable({ refreshTrigger }: TranscriptTableProps) {
             emptyState(
               <FileAudio className="h-5 w-5 text-muted-foreground" />,
               'You haven’t uploaded or imported anything yet',
-              'Drop an audio or video file above to get started.'
+              'Drag a file anywhere on this page, or use Upload audio in the header.'
             )
           ) : (
             emptyState(
               <FileAudio className="h-5 w-5 text-muted-foreground" />,
               'No transcripts yet',
-              'Drop an audio or video file above to get started.'
+              'Drag a file anywhere on this page, or use Upload audio in the header.'
             )
           )
         ) : (
@@ -699,6 +702,31 @@ export function TranscriptTable({ refreshTrigger }: TranscriptTableProps) {
                   >
                     <TableCell className="py-1.5">
                       <div className="flex min-w-0 items-center gap-2">
+                        {t.status === 'completed' && t.auto_notes_status === 'running' ? (
+                          <span
+                            className="grid h-7 w-7 shrink-0 place-items-center"
+                            title="AI summary is being generated…"
+                          >
+                            <Sparkles className="h-3.5 w-3.5 animate-pulse text-primary" />
+                          </span>
+                        ) : t.status === 'completed' && t.access !== 'read' ? (
+                          <Button
+                            size="sm"
+                            variant="ghost"
+                            className="h-7 w-7 shrink-0 p-0 text-muted-foreground/50 hover:text-primary"
+                            disabled={generatingIds.has(t.assemblyai_id)}
+                            onClick={(e) => void handleGenerateFromList(e, t)}
+                            title={
+                              t.auto_notes_status && t.auto_notes_status !== 'error'
+                                ? 'Re-run AI notes for this meeting'
+                                : 'Generate AI notes for this meeting'
+                            }
+                          >
+                            <Sparkles className="h-3.5 w-3.5" />
+                          </Button>
+                        ) : (
+                          <span className="h-7 w-7 shrink-0" />
+                        )}
                         {statusDot(t.status)}
                         {sourceIcon(t)}
                         <div className="min-w-0 flex-1">
@@ -749,28 +777,6 @@ export function TranscriptTable({ refreshTrigger }: TranscriptTableProps) {
                     ))}
                     <TableCell className="py-1.5 pr-3">
                       <div className="flex items-center justify-end gap-0.5">
-                        {t.status === 'completed' && t.auto_notes_status === 'running' && (
-                          <span
-                            className="grid h-7 w-7 place-items-center"
-                            title="AI summary is being generated…"
-                          >
-                            <Sparkles className="h-3.5 w-3.5 animate-pulse text-primary" />
-                          </span>
-                        )}
-                        {t.status === 'completed' &&
-                          t.access !== 'read' &&
-                          (!t.auto_notes_status || t.auto_notes_status === 'error') && (
-                            <Button
-                              size="sm"
-                              variant="ghost"
-                              className="h-7 w-7 p-0 text-muted-foreground opacity-0 transition-opacity hover:text-primary group-hover:opacity-100"
-                              disabled={generatingIds.has(t.assemblyai_id)}
-                              onClick={(e) => void handleGenerateFromList(e, t)}
-                              title="Generate AI summary (without opening the transcript)"
-                            >
-                              <Sparkles className="h-3.5 w-3.5" />
-                            </Button>
-                          )}
                         {t.access === 'owner' && (
                           <Button
                             size="sm"

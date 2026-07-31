@@ -1,7 +1,7 @@
 import 'server-only';
 import { sql } from '@/lib/db';
 import { SCHEMAS } from '@/lib/constants/database';
-import type { ClaudeRunMeta } from '@/lib/server/claude-cli';
+import type { ClaudeRunMeta } from '@/lib/server/claude-agent';
 
 // Stats layer for headless Claude runs (see claude-cli.ts). Every
 // `claude -p` invocation records a row here — cost, tokens, duration,

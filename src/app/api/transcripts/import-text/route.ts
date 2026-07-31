@@ -4,7 +4,7 @@ import path from 'node:path';
 import { promises as fsp } from 'node:fs';
 import { withAuth } from '@/lib/auth/with-auth';
 import { createImportedForUser } from '@/db-ops/transcripts';
-import { runClaudeWithMeta, parseJsonFromClaude } from '@/lib/server/claude-cli';
+import { runClaudeWithMeta, parseJsonFromClaude } from '@/lib/server/claude-agent';
 import { recordAiRun } from '@/db-ops/ai-runs';
 import { extractAttachmentText } from '@/lib/server/attachment-extract';
 import { getStorageDir } from '@/lib/server/audio-storage';
