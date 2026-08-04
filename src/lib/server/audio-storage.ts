@@ -110,6 +110,18 @@ export async function saveAudioStreamToTemp(
   return { tempFilename, bytes };
 }
 
+/**
+ * Copy a stored audio file to a fresh temp name. Lets a re-transcription
+ * consume the copy via the normal temp→final rename while the source row
+ * keeps its audio.
+ */
+export async function copyAudioToTemp(sourceFilename: string): Promise<string> {
+  await ensureAudioDir();
+  const tempFilename = `upload-${randomUUID()}.part`;
+  await fsp.copyFile(resolveAudioPath(sourceFilename), resolveAudioPath(tempFilename));
+  return tempFilename;
+}
+
 /** Rename a stored audio file (e.g. temp upload → final AAI-id-based name). */
 export async function renameAudioFile(fromFilename: string, toFilename: string): Promise<string> {
   const from = resolveAudioPath(fromFilename);

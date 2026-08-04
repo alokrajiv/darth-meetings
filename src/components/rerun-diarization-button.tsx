@@ -2,13 +2,16 @@
 
 import { useState } from 'react';
 import { Button } from '@/components/ui/button';
-import { getGoogleAccessToken } from '@/lib/google-token';
 import type { GmeetContext } from '@/lib/format';
 import { AudioWaveform, Loader2 } from 'lucide-react';
 
 interface RerunDiarizationButtonProps {
   assemblyaiId: string;
   gmeetContext: GmeetContext | null | undefined;
+  /** Whether this row already has the recording's audio stored locally
+   * (fetch-audio). Diarization runs on that copy — without it the button
+   * renders disabled with a pointer to the Sources card. */
+  hasLocalAudio: boolean;
   /** Compact rendering for a quick-actions rail. */
   size?: 'sm' | 'default';
   /** Button variant — e.g. 'ghost' to match a rail's justify-start recipe. */
@@ -18,19 +21,21 @@ interface RerunDiarizationButtonProps {
 }
 
 /**
- * "Re-run with diarization": upgrade a Meet-transcript-only import (device-
- * level speaker attribution) to a full AAI transcription of the recording
- * (voice-level separation). Fetches the video from Drive with a fresh
- * browser Google token and submits it through the normal import pipeline —
- * a NEW transcript row is created (processing) and we navigate to it; the
- * quick import stays untouched.
+ * "Diarize with AssemblyAI": upgrade a Meet-transcript-only import (device-
+ * level speaker attribution — one room mic = one speaker) to a voice-level
+ * AAI transcription. Runs on the audio ALREADY stored by "Fetch audio for
+ * playback" — one Drive download total, no Google popup here; the server
+ * reuses the stored Meet context (actuals + transcript sidecar) too. A NEW
+ * transcript row is created (processing) and we navigate to it; the quick
+ * import stays untouched.
  *
- * Renders nothing unless this row IS a Meet quick-import that has a known
- * recording on Drive.
+ * Renders only on Meet quick-imports (rows that are already AAI-diarized
+ * have nothing to gain); disabled until the audio has been fetched.
  */
 export function RerunDiarizationButton({
   assemblyaiId,
   gmeetContext,
+  hasLocalAudio,
   size = 'sm',
   variant = 'outline',
   className,
@@ -39,13 +44,13 @@ export function RerunDiarizationButton({
   const [error, setError] = useState<string | null>(null);
 
   const videoFileId = gmeetContext?.videoFileId ?? gmeetContext?.actuals?.recordings?.[0]?.fileId;
-  if (!assemblyaiId.startsWith('gmeet-') || !videoFileId) return null;
+  if (!assemblyaiId.startsWith('gmeet-') || (!videoFileId && !hasLocalAudio)) return null;
 
   const run = async () => {
     if (
       !window.confirm(
-        'Re-transcribe the original recording with voice-level speaker separation? ' +
-          'This fetches the video from Drive and takes a few minutes; a new transcript is created alongside this one.'
+        'Run voice-level speaker separation (AssemblyAI) on the stored audio? ' +
+          'Takes a few minutes and uses transcription credit; a new transcript is created alongside this one — the Meet transcript stays untouched.'
       )
     ) {
       return;
@@ -53,16 +58,13 @@ export function RerunDiarizationButton({
     setBusy(true);
     setError(null);
     try {
-      const token = await getGoogleAccessToken(); // popup — user gesture
       const res = await fetch('/api/gmeet/import', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          accessToken: token,
           mode: 'both',
+          sourceTranscriptId: assemblyaiId,
           videoFileId,
-          transcriptDocId: gmeetContext?.transcriptDocId,
-          conferenceRecordName: gmeetContext?.actuals?.conferenceRecordName,
           force: true,
           event: {
             id: gmeetContext?.eventId,
@@ -87,7 +89,7 @@ export function RerunDiarizationButton({
       const newId = payload.transcript?.assemblyai_id;
       if (newId) window.location.href = `/transcript/${newId}`;
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Failed to start re-run');
+      setError(err instanceof Error ? err.message : 'Failed to start diarization');
       setBusy(false);
     }
   };
@@ -99,15 +101,19 @@ export function RerunDiarizationButton({
         size={size}
         className={className}
         onClick={() => void run()}
-        disabled={busy}
-        title="Fetch the recording from Drive and re-transcribe with voice-level speaker separation"
+        disabled={busy || !hasLocalAudio}
+        title={
+          hasLocalAudio
+            ? 'Voice-level speaker separation from the stored audio — for meetings where several people shared one mic'
+            : 'Fetch audio for playback first (Sources card below) — diarization runs on that stored copy'
+        }
       >
         {busy ? (
           <Loader2 className="h-4 w-4 animate-spin text-muted-foreground" />
         ) : (
           <AudioWaveform className="h-4 w-4 text-muted-foreground" />
         )}
-        {busy ? 'Fetching recording…' : 'Re-run diarization'}
+        {busy ? 'Submitting to AssemblyAI…' : 'Diarize with AssemblyAI'}
       </Button>
       {error && <p className="px-2 text-xs text-destructive">{error}</p>}
     </>

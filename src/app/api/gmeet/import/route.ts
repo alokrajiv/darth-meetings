@@ -23,10 +23,16 @@ import {
   utterancesFromEntries,
   type ParsedMeetTranscript,
 } from '@/lib/server/gmeet';
-import { deleteAudioFile } from '@/lib/server/audio-storage';
+import { copyAudioToTemp, deleteAudioFile } from '@/lib/server/audio-storage';
 import { IngestError, ingestLocalAudio } from '@/lib/server/ingest';
 import { onTranscriptCompleted } from '@/lib/server/post-completion';
-import type { GmeetAttendee, GmeetContext, MeetActuals } from '@/lib/format';
+import { resolveAccess } from '@/db-ops/transcript-access';
+import type {
+  GmeetAttendee,
+  GmeetContext,
+  MeetActuals,
+  StoredTranscript,
+} from '@/lib/format';
 
 export const runtime = 'nodejs';
 // Pulling a multi-GB recording from Drive and re-uploading it to AssemblyAI
@@ -34,7 +40,8 @@ export const runtime = 'nodejs';
 export const maxDuration = 900;
 
 interface ImportBody {
-  accessToken: string;
+  /** Optional when sourceTranscriptId provides everything locally. */
+  accessToken?: string;
   mode: 'video' | 'transcript' | 'both';
   videoFileId?: string;
   transcriptDocId?: string;
@@ -43,6 +50,10 @@ interface ImportBody {
   /** Meet API conference record resource name, when the client already found
    * it (orphan-link / recent-meets flows). Saves a lookup. */
   conferenceRecordName?: string;
+  /** Re-run-diarization path: reuse this existing row's already-fetched
+   * local audio and stored Meet context (actuals + meetTranscript) instead
+   * of touching Drive/Meet again — no second download, no Google popup. */
+  sourceTranscriptId?: string;
   event?: {
     id?: string;
     title?: string;
@@ -194,13 +205,32 @@ export const POST = withAuth(async ({ user, request }) => {
   // Garbage dates would blow up Date arithmetic / SQL later — drop them.
   if (event.startTime && Number.isNaN(Date.parse(event.startTime))) event.startTime = undefined;
   if (event.endTime && Number.isNaN(Date.parse(event.endTime))) event.endTime = undefined;
-  if (typeof accessToken !== 'string' || accessToken.length < 20) {
+
+  // ---- Re-run-from-local: reuse an existing row's fetched audio + stored
+  // Meet context. Everything Google-side is skipped, so no token needed. ----
+  let sourceRow: StoredTranscript | null = null;
+  if (body.sourceTranscriptId) {
+    const src = await resolveAccess(user.userId, user.email, body.sourceTranscriptId);
+    if (!src) {
+      return NextResponse.json({ error: 'Source transcript not found' }, { status: 404 });
+    }
+    if (!src.row.local_audio_path) {
+      return NextResponse.json(
+        { error: 'No audio on the source transcript yet — fetch audio for playback first.' },
+        { status: 422 }
+      );
+    }
+    sourceRow = src.row;
+  }
+
+  const hasToken = typeof accessToken === 'string' && accessToken.length >= 20;
+  if (!hasToken && !sourceRow) {
     return NextResponse.json({ error: 'accessToken is required' }, { status: 400 });
   }
   if (mode !== 'video' && mode !== 'transcript' && mode !== 'both') {
     return NextResponse.json({ error: "mode must be 'video' | 'transcript' | 'both'" }, { status: 400 });
   }
-  if ((mode === 'video' || mode === 'both') && !videoFileId) {
+  if ((mode === 'video' || mode === 'both') && !videoFileId && !sourceRow) {
     return NextResponse.json({ error: 'videoFileId is required for this mode' }, { status: 400 });
   }
   // Transcript mode doesn't strictly need a Doc id up front — given a
@@ -226,11 +256,13 @@ export const POST = withAuth(async ({ user, request }) => {
 
   // ---- Meet API actuals: participants (emails via People API), recording
   // segment times, structured transcript entries. Best-effort — captured NOW
-  // because entries expire 30 days after the meeting. -----------------------
-  let actuals: MeetActuals | null = null;
+  // because entries expire 30 days after the meeting. A re-run from a local
+  // source reuses the snapshot frozen at original import time (the live API
+  // may already have expired it, and often 403s for non-organizers). -------
+  let actuals: MeetActuals | null = sourceRow?.gmeet_context?.actuals ?? null;
   try {
-    if (body.conferenceRecordName) {
-      actuals = await captureMeetActuals(accessToken, body.conferenceRecordName);
+    if (!actuals && hasToken && body.conferenceRecordName) {
+      actuals = await captureMeetActuals(accessToken!, body.conferenceRecordName);
       // Cross-check the CLIENT-supplied record against the event's own time
       // window. Without this, a stale/buggy/malicious client can attach one
       // meeting's content and participants to another meeting's title and
@@ -249,13 +281,13 @@ export const POST = withAuth(async ({ user, request }) => {
         actuals = null;
       }
     }
-    if (!actuals && event.meetingCode) {
+    if (!actuals && hasToken && event.meetingCode) {
       const found = await findConferenceRecordName(
-        accessToken,
+        accessToken!,
         event.meetingCode,
         event.startTime
       );
-      if (found) actuals = await captureMeetActuals(accessToken, found);
+      if (found) actuals = await captureMeetActuals(accessToken!, found);
     }
   } catch (err) {
     console.warn('[gmeet/import] actuals capture failed (continuing):', err);
@@ -305,7 +337,11 @@ export const POST = withAuth(async ({ user, request }) => {
   // the only option for meetings older than the API's 30-day entry window.
   let parsed: ParsedMeetTranscript | null = null;
   if (mode === 'transcript' || mode === 'both') {
-    if (actuals?.transcriptEntries && actuals.transcriptEntries.length > 0) {
+    if (sourceRow?.gmeet_context?.meetTranscript?.utterances?.length) {
+      // Re-run from a quick import: its parsed Meet transcript is already
+      // stored — carry it over as the sidecar without touching Google.
+      parsed = sourceRow.gmeet_context.meetTranscript;
+    } else if (actuals?.transcriptEntries && actuals.transcriptEntries.length > 0) {
       parsed = {
         attendees: (actuals.participants ?? []).map((p) => p.displayName),
         utterances: utterancesFromEntries(actuals.transcriptEntries),
@@ -320,7 +356,7 @@ export const POST = withAuth(async ({ user, request }) => {
           { status: 422 }
         );
       }
-    } else {
+    } else if (hasToken) {
       try {
         // One doc per transcription session on classic tenants — parse ALL
         // of them (start/stop/start = several docs), not just the first.
@@ -328,7 +364,7 @@ export const POST = withAuth(async ({ user, request }) => {
           (actuals?.transcriptDocIds?.length ?? 0) > 1
             ? actuals!.transcriptDocIds!
             : [effectiveDocId];
-        parsed = await parseTranscriptDocs(accessToken, docIds);
+        parsed = await parseTranscriptDocs(accessToken!, docIds);
       } catch (err) {
         if (err instanceof GoogleApiError) {
           // In 'both' mode the transcript is a bonus — don't fail the video
@@ -458,7 +494,9 @@ export const POST = withAuth(async ({ user, request }) => {
   }
 
   // ---- Video path: dedupe, capability check, download, AAI pipeline --------
-  const existing = await findVisibleByDriveFileId(user.userId, user.email, videoFileId!);
+  const existing = videoFileId
+    ? await findVisibleByDriveFileId(user.userId, user.email, videoFileId)
+    : null;
   if (existing && !force) {
     return NextResponse.json(
       {
@@ -483,38 +521,54 @@ export const POST = withAuth(async ({ user, request }) => {
     if (crossUserConflict) return crossUserConflict;
   }
 
-  let meta;
-  try {
-    meta = await getDriveFileMeta(accessToken, videoFileId!);
-  } catch (err) {
-    if (err instanceof GoogleApiError) return googleErrorResponse(err);
-    throw err;
-  }
-  if (!meta.canDownload) {
-    return NextResponse.json(
-      {
-        error:
-          'The owner has disabled downloads for viewers on this recording. Ask them for edit access or to lift the restriction (Share → gear icon).',
-      },
-      { status: 403 }
-    );
-  }
-
   let tempFilename: string;
-  try {
-    const dl = await downloadDriveFileToTemp(accessToken, videoFileId!);
-    tempFilename = dl.tempFilename;
-    if (dl.bytes === 0) {
-      await deleteAudioFile(tempFilename);
-      return NextResponse.json({ error: 'Drive returned an empty file' }, { status: 502 });
+  let originalFilename: string;
+  if (sourceRow?.local_audio_path) {
+    // Re-run from local: the bytes were already fetched (fetch-audio) —
+    // copy them so the ingest rename consumes the copy, not the source.
+    try {
+      tempFilename = await copyAudioToTemp(sourceRow.local_audio_path);
+    } catch (err) {
+      console.error('[gmeet/import] local audio copy failed:', err);
+      return NextResponse.json(
+        { error: 'Could not read the stored audio — try fetching audio again.' },
+        { status: 502 }
+      );
     }
-  } catch (err) {
-    if (err instanceof GoogleApiError) return googleErrorResponse(err);
-    console.error('[gmeet/import] download failed:', err);
-    return NextResponse.json(
-      { error: 'Download from Drive failed', detail: String(err) },
-      { status: 502 }
-    );
+    originalFilename = sourceRow.original_filename ?? sourceRow.local_audio_path;
+  } else {
+    let meta;
+    try {
+      meta = await getDriveFileMeta(accessToken!, videoFileId!);
+    } catch (err) {
+      if (err instanceof GoogleApiError) return googleErrorResponse(err);
+      throw err;
+    }
+    if (!meta.canDownload) {
+      return NextResponse.json(
+        {
+          error:
+            'The owner has disabled downloads for viewers on this recording. Ask them for edit access or to lift the restriction (Share → gear icon).',
+        },
+        { status: 403 }
+      );
+    }
+    try {
+      const dl = await downloadDriveFileToTemp(accessToken!, videoFileId!);
+      tempFilename = dl.tempFilename;
+      if (dl.bytes === 0) {
+        await deleteAudioFile(tempFilename);
+        return NextResponse.json({ error: 'Drive returned an empty file' }, { status: 502 });
+      }
+    } catch (err) {
+      if (err instanceof GoogleApiError) return googleErrorResponse(err);
+      console.error('[gmeet/import] download failed:', err);
+      return NextResponse.json(
+        { error: 'Download from Drive failed', detail: String(err) },
+        { status: 502 }
+      );
+    }
+    originalFilename = meta.name;
   }
 
   // Names of the people who were invited or actually joined bias AAI's
@@ -529,11 +583,11 @@ export const POST = withAuth(async ({ user, request }) => {
 
   try {
     const row = await ingestLocalAudio(user.userId, tempFilename, {
-      originalFilename: meta.name,
+      originalFilename,
       languageCode,
       title,
       extraKeyterms: [...keytermNames],
-      driveFileId: videoFileId,
+      driveFileId: videoFileId ?? actuals?.recordings?.[0]?.fileId ?? null,
       gmeetContext: { ...baseContext, meetTranscript: parsed },
     });
     const meetingStart = event.startTime ?? actuals?.conferenceStart;

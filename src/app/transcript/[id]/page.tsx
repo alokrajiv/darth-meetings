@@ -1507,6 +1507,7 @@ export default function TranscriptDetailPage({ params }: TranscriptDetailPagePro
         <RerunDiarizationButton
           assemblyaiId={row.assemblyai_id}
           gmeetContext={row.gmeet_context}
+          hasLocalAudio={!!row.local_audio_path}
           size="sm"
           variant="ghost"
           className="h-8 w-full justify-start gap-2 text-[13px]"

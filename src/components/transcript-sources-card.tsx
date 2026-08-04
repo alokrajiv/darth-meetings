@@ -54,6 +54,19 @@ export function TranscriptSourcesCard({
   const recordingFileId = ctx?.videoFileId ?? ctx?.actuals?.recordings?.[0]?.fileId;
   const canFetchAudio = !hasAudio && !row.local_audio_path && !!recordingFileId && canEdit;
 
+  // Cheap pooled-mic tell on quick imports: Meet's snapshot knows who
+  // actually JOINED; if clearly more people joined than Meet heard voices,
+  // several of them almost certainly shared one room mic. Pure metadata —
+  // no audio analysis needed. (Silent joiners make this a hint, not proof.)
+  const joinedCount = (ctx?.actuals?.participants ?? []).filter(
+    (p) => p.kind !== 'phone'
+  ).length;
+  const pooledMicSuspected =
+    isMeetPrimary &&
+    joinedCount > 0 &&
+    (row.speaker_count ?? 0) > 0 &&
+    joinedCount - (row.speaker_count ?? 0) >= 2;
+
   const fetchAudio = async () => {
     setFetching(true);
     setError(null);
@@ -170,6 +183,14 @@ export function TranscriptSourcesCard({
           </span>
         </li>
       </ul>
+      {pooledMicSuspected && (
+        <p className="mt-2 rounded-md border border-amber-400/50 bg-amber-50 px-2 py-1.5 text-[11px] leading-snug text-amber-900 dark:bg-amber-950/30 dark:text-amber-200">
+          {joinedCount} people joined but Meet heard only {row.speaker_count} voice
+          {(row.speaker_count ?? 0) > 1 ? 's' : ''} — several likely shared one room mic.
+          &ldquo;Diarize with AssemblyAI&rdquo; separates them by voice
+          {row.local_audio_path ? '.' : ' (fetch audio first).'}
+        </p>
+      )}
       {canFetchAudio && (
         <Button
           variant="outline"
