@@ -32,6 +32,7 @@ import { ActivityBar } from '@/components/activity-bar';
 import { TranscriptOutline } from '@/components/transcript-outline';
 import { AppHeader } from '@/components/app-header';
 import { RerunDiarizationButton } from '@/components/rerun-diarization-button';
+import { TranscriptSourcesCard } from '@/components/transcript-sources-card';
 import type { PickerPerson } from '@/components/user-picker';
 import {
   Dialog,
@@ -2328,6 +2329,16 @@ export default function TranscriptDetailPage({ params }: TranscriptDetailPagePro
           <aside className="hidden lg:block">
             <div className="sticky top-[72px] max-h-[calc(100vh-88px)] space-y-4 overflow-y-auto pr-1">
               {renderQuickActions()}
+              <TranscriptSourcesCard
+                row={row}
+                suggestions={speakerSuggestions}
+                audioAvailable={audioAvailable}
+                canEdit={canEdit}
+                onAudioFetched={() => {
+                  setAudioAvailable(true);
+                  void loadAll();
+                }}
+              />
               <TranscriptOutline
                 durationSec={row.duration ?? null}
                 hasNotes={!!description || canEdit}
