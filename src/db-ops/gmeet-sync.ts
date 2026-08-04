@@ -70,32 +70,63 @@ export interface ImportedMeetingInfo {
   mine: boolean;
 }
 
+export interface MeetingOccurrenceQuery {
+  code: string;
+  /** Event start of the SPECIFIC occurrence being asked about. Recurring
+   * meetings reuse one meeting code forever, so without this a single
+   * imported occurrence would claim every other date in the series. */
+  startTime?: string | null;
+}
+
+/** A recurring Meet's occurrences are at least a day apart (weekly usually),
+ * so a stored occurrence within ±12h of the asked-about event start is the
+ * same call. Matches the conferenceRecord↔event window in gmeet/import. */
+const OCCURRENCE_WINDOW_MS = 12 * 3600_000;
+
 /**
- * Which of these meeting codes has ANYONE already imported? Unlike the
+ * Which of these meeting occurrences has ANYONE already imported? Unlike the
  * per-user 409 conflict check at import time, this looks across all users —
  * a teammate's un-shared import still shows up (as an inaccessible marker).
- * One row per code (the earliest import wins for attribution).
+ *
+ * Returns one entry per query, aligned by index (null = not imported).
+ * Matching is meeting code + occurrence time: a stored row counts only when
+ * its occurrence start (event start, else Meet's conference start, else
+ * recorded_at) lands within ±12h of the query's startTime. Queries without a
+ * startTime fall back to code-only matching (pasted links with no calendar
+ * context). Earliest import wins for attribution.
  */
 export async function findImportedByMeetingCodes(
-  codes: string[],
+  meetings: MeetingOccurrenceQuery[],
   caller: { userId: string; email: string }
-): Promise<ImportedMeetingInfo[]> {
-  const cleaned = [...new Set(codes.map((c) => c.trim()).filter(Boolean))];
-  if (cleaned.length === 0) return [];
+): Promise<(ImportedMeetingInfo | null)[]> {
+  const cleaned = meetings.map((m) => ({
+    code: m.code.trim(),
+    startTime: m.startTime ?? null,
+  }));
+  const codes = [...new Set(cleaned.map((m) => m.code).filter(Boolean))];
+  if (codes.length === 0) return meetings.map(() => null);
 
-  return sql<ImportedMeetingInfo[]>`
-    SELECT DISTINCT ON (t.gmeet_context->>'meetingCode')
+  const rows = await sql<
+    Array<ImportedMeetingInfo & { occurrence_start: string | null }>
+  >`
+    SELECT
       t.gmeet_context->>'meetingCode' AS meeting_code,
       t.assemblyai_id,
       t.title,
       t.user_id AS owner_user_id,
       owner_act.user_email AS owner_email,
-      (t.user_id = ${caller.userId} OR s.id IS NOT NULL) AS accessible,
-      (t.user_id = ${caller.userId}) AS mine
+      (t.user_id = ${caller.userId} OR EXISTS (
+        SELECT 1 FROM ${sql(SCHEMA)}.transcript_shares s
+        WHERE s.transcript_id = t.id
+          AND LOWER(s.shared_with_email) = ${caller.email.toLowerCase()}
+      )) AS accessible,
+      (t.user_id = ${caller.userId}) AS mine,
+      COALESCE(
+        t.gmeet_context->>'startTime',
+        t.gmeet_context->'actuals'->>'conferenceStart',
+        t.recorded_at::text
+      ) AS occurrence_start
     FROM ${sql(SCHEMA)}.transcripts t
-    LEFT JOIN ${sql(SCHEMA)}.transcript_shares s
-      ON s.transcript_id = t.id
-     AND LOWER(s.shared_with_email) = ${caller.email.toLowerCase()}
     LEFT JOIN LATERAL (
       SELECT a.user_email
       FROM ${sql(SCHEMA)}.transcript_activity a
@@ -103,7 +134,23 @@ export async function findImportedByMeetingCodes(
       ORDER BY a.at DESC
       LIMIT 1
     ) AS owner_act ON true
-    WHERE t.gmeet_context->>'meetingCode' = ANY(${cleaned})
-    ORDER BY t.gmeet_context->>'meetingCode', t.created_at ASC
+    WHERE t.gmeet_context->>'meetingCode' = ANY(${codes})
+    ORDER BY t.created_at ASC
   `;
+
+  return cleaned.map(({ code, startTime }) => {
+    if (!code) return null;
+    const candidates = rows.filter((r) => r.meeting_code === code);
+    const wanted = startTime ? Date.parse(startTime) : NaN;
+    const match = Number.isNaN(wanted)
+      ? candidates[0]
+      : candidates.find((r) => {
+          const at = r.occurrence_start ? Date.parse(r.occurrence_start) : NaN;
+          return !Number.isNaN(at) && Math.abs(at - wanted) <= OCCURRENCE_WINDOW_MS;
+        });
+    if (!match) return null;
+    const { occurrence_start, ...info } = match;
+    void occurrence_start;
+    return info;
+  });
 }

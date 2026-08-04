@@ -91,19 +91,26 @@ async function autoShareToInternalInvitees(
 }
 
 /**
- * Cross-user duplicate check by meeting code. Returns a 409 response when
- * someone ELSE already imported this meeting (shared with the caller or
- * not), null when the meeting is unclaimed. `force` bypasses at call sites.
+ * Cross-user duplicate check by meeting code + occurrence start. Returns a
+ * 409 response when someone ELSE already imported this occurrence (shared
+ * with the caller or not), null when it's unclaimed. `occurrenceStart` keeps
+ * recurring meetings honest — one code covers the whole series, so without
+ * it any imported date would block every other date. `force` bypasses at
+ * call sites.
  */
 async function checkCrossUserDuplicate(
   meetingCode: string,
+  occurrenceStart: string | null,
   user: { userId: string; email: string }
 ): Promise<NextResponse | null> {
   try {
-    const [other] = await findImportedByMeetingCodes([meetingCode], {
-      userId: user.userId,
-      email: user.email,
-    });
+    const [other] = await findImportedByMeetingCodes(
+      [{ code: meetingCode, startTime: occurrenceStart }],
+      {
+        userId: user.userId,
+        email: user.email,
+      }
+    );
     if (!other) return null;
     return NextResponse.json(
       {
@@ -382,7 +389,11 @@ export const POST = withAuth(async ({ user, request }) => {
     // sharing it (off-invite import, or pre-auto-share rows). Surface who
     // has it instead of silently minting a duplicate; force overrides.
     if (!dupe && !force && event.meetingCode) {
-      const crossUserConflict = await checkCrossUserDuplicate(event.meetingCode, user);
+      const crossUserConflict = await checkCrossUserDuplicate(
+        event.meetingCode,
+        event.startTime ?? actuals?.conferenceStart ?? null,
+        user
+      );
       if (crossUserConflict) return crossUserConflict;
     }
 
@@ -460,7 +471,11 @@ export const POST = withAuth(async ({ user, request }) => {
     );
   }
   if (!existing && !force && event.meetingCode) {
-    const crossUserConflict = await checkCrossUserDuplicate(event.meetingCode, user);
+    const crossUserConflict = await checkCrossUserDuplicate(
+      event.meetingCode,
+      event.startTime ?? actuals?.conferenceStart ?? null,
+      user
+    );
     if (crossUserConflict) return crossUserConflict;
   }
 

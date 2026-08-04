@@ -370,7 +370,9 @@ export function GmeetImportDialog({
 
   // --- sync tab state ---
   const [syncInfo, setSyncInfo] = useState<SyncInfo | null>(null);
-  /** meetingCode → who already imported it (any user). */
+  /** `${meetingCode}|${eventStart}` → who already imported that OCCURRENCE
+   * (any user). Keyed per occurrence, not per code — recurring meetings
+   * reuse one code, and one imported date must not mark the whole series. */
   const [importedMap, setImportedMap] = useState<Record<string, ImportedMark>>({});
   const [syncFrom, setSyncFrom] = useState<string | null>(null);
 
@@ -378,24 +380,31 @@ export function GmeetImportDialog({
   const rowKey = (row: EventRow): string =>
     row.event.conferenceData?.conferenceId ?? row.event.id;
 
-  // Whenever rows change, ask the server which meeting codes anyone has
-  // already imported — powers "in archive" / "synced by X" markers.
+  /** importedMap key for a row — must mirror /api/gmeet/check's response keys. */
+  const markKey = (row: EventRow): string | null => {
+    const code = row.event.conferenceData?.conferenceId;
+    return code ? `${code}|${row.event.start?.dateTime ?? ''}` : null;
+  };
+
+  // Whenever rows change, ask the server which meeting occurrences anyone
+  // has already imported — powers "in archive" / "synced by X" markers.
   useEffect(() => {
-    const codes = [
-      ...new Set(
-        rows
-          .map((r) => r.event.conferenceData?.conferenceId)
-          .filter((c): c is string => !!c)
-      ),
-    ];
-    if (codes.length === 0) return;
+    const byKey = new Map<string, { code: string; startTime: string | null }>();
+    for (const r of rows) {
+      const code = r.event.conferenceData?.conferenceId;
+      const key = markKey(r);
+      if (code && key && !byKey.has(key)) {
+        byKey.set(key, { code, startTime: r.event.start?.dateTime ?? null });
+      }
+    }
+    if (byKey.size === 0) return;
     let cancelled = false;
     void (async () => {
       try {
         const res = await fetch('/api/gmeet/check', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ meetingCodes: codes }),
+          body: JSON.stringify({ meetings: [...byKey.values()] }),
         });
         if (!res.ok) return;
         const { imported } = (await res.json()) as {
@@ -1283,8 +1292,8 @@ export function GmeetImportDialog({
                     title="Select every pending meeting with a transcript"
                     onClick={() => {
                       const pending = rows.filter((r) => {
-                        const code = r.event.conferenceData?.conferenceId;
-                        const mark = code ? importedMap[code] : undefined;
+                        const key = markKey(r);
+                        const mark = key ? importedMap[key] : undefined;
                         return (
                           bulkEligible(r) &&
                           !mark &&
@@ -1354,8 +1363,8 @@ export function GmeetImportDialog({
                       hasTranscript ||
                       !!row.meet ||
                       (!sweepDone && !!row.event.conferenceData?.conferenceId);
-                    const code = row.event.conferenceData?.conferenceId;
-                    const mark = code ? importedMap[code] : undefined;
+                    const key = markKey(row);
+                    const mark = key ? importedMap[key] : undefined;
                     const muted = !!syncInfo?.skips.has(rowKey(row));
                     return (
                       <li
