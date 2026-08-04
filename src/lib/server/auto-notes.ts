@@ -94,6 +94,13 @@ function buildSpeakerContext(
       lines.push(
         `- Speaker ${sp}: very likely ${s.name} (${Math.round(s.confidence * 100)}% voice-fingerprint match) — treat as their identity unless the transcript contradicts it`
       );
+    } else if (s.confidence > 0) {
+      // Meet↔AAI timeline-alignment vote (source 'context' with a real
+      // confidence — Claude's own prior text guesses carry confidence 0 and
+      // are deliberately NOT fed back, to avoid self-reinforcement).
+      lines.push(
+        `- Speaker ${sp}: likely ${s.name} (${s.evidence ?? `${Math.round(s.confidence * 100)}% timeline overlap with Google Meet's transcript`}) — strong hint; verify against the transcript`
+      );
     }
   }
   if (lines.length === 0) return 'Speaker identities: none known yet.\n\nTranscript follows:\n\n';
