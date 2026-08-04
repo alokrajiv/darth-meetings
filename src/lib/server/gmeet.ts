@@ -293,6 +293,49 @@ export function parseMeetTranscriptDoc(text: string): ParsedMeetTranscript {
   return { attendees, utterances };
 }
 
+/**
+ * Merge several parsed transcript segments into one timeline. Classic
+ * tenants get one Doc PER transcription session (stop → start = new doc),
+ * so a meeting where recording was toggled produces N docs that each start
+ * at 00:00:00. Later segments are shifted past the previous segment's end —
+ * the same 5-minute-gap heuristic the parser uses for in-doc clock restarts.
+ */
+export function mergeParsedTranscripts(parts: ParsedMeetTranscript[]): ParsedMeetTranscript {
+  const attendees: string[] = [];
+  const utterances: MeetUtterance[] = [];
+  let offsetMs = 0;
+  for (const part of parts) {
+    for (const a of part.attendees) {
+      if (!attendees.includes(a)) attendees.push(a);
+    }
+    let segmentEnd = offsetMs;
+    for (const u of part.utterances) {
+      const shifted = { ...u, start: u.start + offsetMs, end: u.end + offsetMs };
+      utterances.push(shifted);
+      if (shifted.end > segmentEnd) segmentEnd = shifted.end;
+    }
+    if (part.utterances.length > 0) offsetMs = segmentEnd + 5 * 60_000;
+  }
+  return { attendees, utterances };
+}
+
+/**
+ * Export + parse one or more transcript Docs as a single transcript. A lone
+ * doc id is the common case; multiple ids = one per transcription session
+ * (see mergeParsedTranscripts).
+ */
+export async function parseTranscriptDocs(
+  token: string,
+  docIds: string[]
+): Promise<ParsedMeetTranscript> {
+  const parts: ParsedMeetTranscript[] = [];
+  for (const docId of [...new Set(docIds)]) {
+    const text = await exportTranscriptText(token, docId);
+    parts.push(parseMeetTranscriptDoc(text));
+  }
+  return mergeParsedTranscripts(parts);
+}
+
 // ---------------------------------------------------------------------------
 // Meet REST API "actuals" capture — snapshotted at import time because
 // transcript entries expire 30 days after the meeting.
@@ -374,6 +417,7 @@ export async function captureMeetActuals(
     tryJson<{
       transcripts?: Array<{
         name: string;
+        startTime?: string;
         docsDestination?: { document?: string };
       }>;
     }>(token, `${MEET_API}/${recordName}/transcripts`),
@@ -446,22 +490,40 @@ export async function captureMeetActuals(
   });
 
   // Anchor: first recording's start (AAI's t=0) — else conference start.
-  const recordings = (recs?.recordings ?? []).map((r) => ({
-    fileId: r.driveDestination?.file,
-    startTime: r.startTime,
-    endTime: r.endTime,
-  }));
+  // Sorted: stop/start produces several recording segments and the API's
+  // ordering isn't contractual.
+  const recordings = (recs?.recordings ?? [])
+    .map((r) => ({
+      fileId: r.driveDestination?.file,
+      startTime: r.startTime,
+      endTime: r.endTime,
+    }))
+    .sort((a, b) => (a.startTime ?? '').localeCompare(b.startTime ?? ''));
   const anchorIso = recordings[0]?.startTime ?? record?.startTime;
   const anchorMs = anchorIso ? new Date(anchorIso).getTime() : null;
 
-  // Structured transcript entries (paginated, capped).
-  const transcriptDocIds = (trans?.transcripts ?? [])
-    .map((t) => t.docsDestination?.document)
-    .filter((d): d is string => !!d);
+  // Transcription can be stopped and restarted mid-meeting — every session
+  // becomes its OWN transcript resource (and, on classic tenants, its own
+  // Doc). Keep them all, in wall-clock order; reading only the first silently
+  // drops everything said after the first stop.
+  const transcriptSessions = [...(trans?.transcripts ?? [])].sort((a, b) =>
+    (a.startTime ?? '').localeCompare(b.startTime ?? '')
+  );
+  const transcriptDocIds = [
+    ...new Set(
+      transcriptSessions
+        .map((t) => t.docsDestination?.document)
+        .filter((d): d is string => !!d)
+    ),
+  ];
+  // Structured transcript entries (paginated, capped) across ALL sessions.
   const entries: MeetTranscriptEntry[] = [];
   let entriesTruncated = false;
-  const firstTranscript = trans?.transcripts?.[0];
-  if (firstTranscript) {
+  for (const session of transcriptSessions) {
+    if (entries.length >= MAX_TRANSCRIPT_ENTRIES) {
+      entriesTruncated = true;
+      break;
+    }
     let entryPageToken: string | undefined;
     while (entries.length < MAX_TRANSCRIPT_ENTRIES) {
       const page = await tryJson<{
@@ -474,7 +536,7 @@ export async function captureMeetActuals(
         nextPageToken?: string;
       }>(
         token,
-        `${MEET_API}/${firstTranscript.name}/entries?pageSize=1000${entryPageToken ? `&pageToken=${entryPageToken}` : ''}`
+        `${MEET_API}/${session.name}/entries?pageSize=1000${entryPageToken ? `&pageToken=${entryPageToken}` : ''}`
       );
       if (!page) break;
       for (const e of page.transcriptEntries ?? []) {

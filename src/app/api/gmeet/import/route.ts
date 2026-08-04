@@ -16,10 +16,9 @@ import {
   GoogleApiError,
   captureMeetActuals,
   downloadDriveFileToTemp,
-  exportTranscriptText,
   findConferenceRecordName,
   getDriveFileMeta,
-  parseMeetTranscriptDoc,
+  parseTranscriptDocs,
   synthesizeTranscriptResponse,
   utterancesFromEntries,
   type ParsedMeetTranscript,
@@ -323,8 +322,13 @@ export const POST = withAuth(async ({ user, request }) => {
       }
     } else {
       try {
-        const docText = await exportTranscriptText(accessToken, effectiveDocId);
-        parsed = parseMeetTranscriptDoc(docText);
+        // One doc per transcription session on classic tenants — parse ALL
+        // of them (start/stop/start = several docs), not just the first.
+        const docIds =
+          (actuals?.transcriptDocIds?.length ?? 0) > 1
+            ? actuals!.transcriptDocIds!
+            : [effectiveDocId];
+        parsed = await parseTranscriptDocs(accessToken, docIds);
       } catch (err) {
         if (err instanceof GoogleApiError) {
           // In 'both' mode the transcript is a bonus — don't fail the video
