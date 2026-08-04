@@ -58,11 +58,15 @@ export function TranscriptSourcesCard({
   // actually JOINED; if clearly more people joined than Meet heard voices,
   // several of them almost certainly shared one room mic. Pure metadata —
   // no audio analysis needed. (Silent joiners make this a hint, not proof.)
+  // Deliberately a recommendation, never an auto-run — and only shown when
+  // acting on it is actually possible (audio stored, or fetchable from
+  // Drive). The user makes the call.
   const joinedCount = (ctx?.actuals?.participants ?? []).filter(
     (p) => p.kind !== 'phone'
   ).length;
   const pooledMicSuspected =
     isMeetPrimary &&
+    (!!row.local_audio_path || !!recordingFileId) &&
     joinedCount > 0 &&
     (row.speaker_count ?? 0) > 0 &&
     joinedCount - (row.speaker_count ?? 0) >= 2;
