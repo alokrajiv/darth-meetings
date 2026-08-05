@@ -220,11 +220,12 @@ const meetings: Subcommand = {
       case "text": {
         if (!args[0]) { console.error("usage: darth-cli meetings text <id>"); return 1; }
         const id = args[0];
-        const [content, speakers] = await Promise.all([
+        const [contentRes, speakers] = await Promise.all([
           ctx.expectJson<any>(ctx.api("meetings", `/api/transcripts/${id}/content`)),
           ctx.expectJson<{ speakerLabels: Array<{ originalSpeaker: string; customName: string }> }>(
             ctx.api("meetings", `/api/transcripts/${id}/speakers`)),
         ]);
+        const content = contentRes.content ?? contentRes;
         const names = new Map(speakers.speakerLabels.map(l => [l.originalSpeaker, l.customName]));
         const utterances: any[] = content.utterances || [];
         if (!utterances.length) {
