@@ -83,7 +83,8 @@ Structure:
 - Use GFM tables for anything naturally tabular (per-item rules, options compared, figures discussed).
 - End with an ## Action Items section (owner — action — deadline) and, if warranted, ## Open Questions.
 
-Evidence and navigation (the UI renders all three specially — use the EXACT forms):
+Evidence and navigation (the UI renders these specially — use the EXACT forms):
+- People: on a person's FIRST mention in each major section, tag them as [Full Name](person:) — the UI renders a person chip linked to the speakers panel. Later mentions in the same section stay plain text.
 - Timestamp citations: after any specific claim, decision, or number worth verifying, append [m:ss](t:<millisecond offset>) — e.g. [12:30](t:750000). These become click-to-jump player chips. Cite generously, like footnotes in a good article.
 - Attached files: when you draw on an attached document listed in the context, link it inline as [<file title>](attachment:<id>) using the ids given.
 - Video frames (when a grab_frames tool is available): the recording contains the participants' screen shares. Find the moments where something was SHOWN (demos, "as you can see", walkthroughs of documents/dashboards), grab frames in batches, and study them — then use what you actually SEE to make the report concrete: real figures, labels, column names, error text. Embed the genuinely informative frames (typically 4-10) as figures near the text they support, each on its own line: ![<one-line caption>](frame:<ms>). Never describe a visual you did not verify in a frame, and never embed a frame that adds nothing (webcam tiles).

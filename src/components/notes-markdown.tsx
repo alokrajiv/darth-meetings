@@ -2,7 +2,7 @@
 
 import ReactMarkdown, { defaultUrlTransform } from 'react-markdown';
 import remarkGfm from 'remark-gfm';
-import { Paperclip, Play } from 'lucide-react';
+import { Paperclip, Play, UserRound } from 'lucide-react';
 
 interface NotesMarkdownProps {
   markdown: string;
@@ -32,7 +32,7 @@ export function NotesMarkdown({ markdown, transcriptId, onSeek }: NotesMarkdownP
       // Default sanitizer strips unknown protocols, which would erase our
       // t:<ms> and attachment:<id> hrefs before the renderers see them.
       urlTransform={(url) =>
-        /^(t:\d+|attachment:\d+)$/.test(url) ? url : defaultUrlTransform(url)
+        /^(t:\d+|attachment:\d+|person:)/.test(url) ? url : defaultUrlTransform(url)
       }
       components={{
         a: ({ href, children }) => {
@@ -48,6 +48,21 @@ export function NotesMarkdown({ markdown, transcriptId, onSeek }: NotesMarkdownP
                 className="mx-0.5 inline-flex translate-y-[-1px] cursor-pointer items-center gap-0.5 rounded bg-primary/10 px-1 py-px align-middle text-[11px] font-medium leading-4 text-primary hover:bg-primary/20"
               >
                 <Play className="h-2.5 w-2.5" />
+                {children}
+              </button>
+            );
+          }
+          if (h.startsWith('person:')) {
+            return (
+              <button
+                type="button"
+                onClick={() =>
+                  document.getElementById('speakers')?.scrollIntoView({ behavior: 'smooth' })
+                }
+                title="Jump to the speakers section"
+                className="mx-0.5 inline-flex cursor-pointer items-center gap-0.5 rounded bg-muted px-1 py-px align-baseline text-[inherit] font-medium leading-[inherit] text-foreground hover:bg-muted/70"
+              >
+                <UserRound className="h-3 w-3 text-muted-foreground" />
                 {children}
               </button>
             );

@@ -191,6 +191,9 @@ export default function TranscriptDetailPage({ params }: TranscriptDetailPagePro
     } | null;
     totals: { runs: number; cost_usd: string | null };
   } | null>(null);
+  // Raw run list for the cost-breakdown popup (regenerations add up).
+  const [aiRuns, setAiRuns] = useState<Array<Record<string, unknown>>>([]);
+  const [aiRunsOpen, setAiRunsOpen] = useState(false);
 
   const [title, setTitle] = useState<string>('');
   const [description, setDescription] = useState<string>('');
@@ -444,6 +447,7 @@ export default function TranscriptDetailPage({ params }: TranscriptDetailPagePro
         const completedReport = (data.runs as Array<Record<string, unknown>> | undefined)?.find(
           (r) => r.status === 'completed' && r.kind === 'auto_report'
         );
+        setAiRuns((data.runs as Array<Record<string, unknown>> | undefined) ?? []);
         setAiStats({
           latestReport: completedReport
             ? {
@@ -2113,23 +2117,20 @@ export default function TranscriptDetailPage({ params }: TranscriptDetailPagePro
                               </Button>
                             )}
                             {row.auto_report_at && (
-                              <span
-                                className="ml-auto text-[11px] text-muted-foreground"
-                                title={
-                                  aiStats?.latestReport
-                                    ? `${aiStats.latestReport.model ?? 'model n/a'}` +
-                                      (aiStats.latestReport.triggered_by_email
-                                        ? ` · by ${aiStats.latestReport.triggered_by_email}`
-                                        : '')
-                                    : undefined
-                                }
+                              <button
+                                type="button"
+                                onClick={() => setAiRunsOpen(true)}
+                                className="ml-auto cursor-pointer text-[11px] text-muted-foreground underline-offset-2 hover:underline"
+                                title="All AI runs & costs for this meeting"
                               >
                                 generated {formatDistanceToNow(new Date(row.auto_report_at), { addSuffix: true })}
                                 {aiStats?.latestReport?.cost_usd != null &&
                                   ` · $${Number(aiStats.latestReport.cost_usd).toFixed(2)}`}
                                 {aiStats?.latestReport?.duration_ms != null &&
                                   ` · ${Math.round(aiStats.latestReport.duration_ms / 1000)}s`}
-                              </span>
+                                {aiStats && aiStats.totals.runs > 1 &&
+                                  ` · Σ $${Number(aiStats.totals.cost_usd ?? 0).toFixed(2)}`}
+                              </button>
                             )}
                           </div>
                         </>
@@ -2228,30 +2229,20 @@ export default function TranscriptDetailPage({ params }: TranscriptDetailPagePro
                             </Button>
                           )}
                           {row.auto_notes_at && (
-                            <span
-                              className="ml-auto text-[11px] text-muted-foreground"
-                              title={
-                                aiStats?.latest
-                                  ? `${aiStats.latest.model ?? 'model n/a'} · in ${(
-                                      Number(aiStats.latest.input_tokens ?? 0) +
-                                      Number(aiStats.latest.cache_read_tokens ?? 0) +
-                                      Number(aiStats.latest.cache_creation_tokens ?? 0)
-                                    ).toLocaleString()} tok / out ${Number(aiStats.latest.output_tokens ?? 0).toLocaleString()} tok` +
-                                    (aiStats.latest.triggered_by_email
-                                      ? ` · by ${aiStats.latest.triggered_by_email}`
-                                      : '') +
-                                    (aiStats.totals.runs > 1
-                                      ? ` · lifetime: ${aiStats.totals.runs} runs, $${Number(aiStats.totals.cost_usd ?? 0).toFixed(2)}`
-                                      : '')
-                                  : undefined
-                              }
+                            <button
+                              type="button"
+                              onClick={() => setAiRunsOpen(true)}
+                              className="ml-auto cursor-pointer text-[11px] text-muted-foreground underline-offset-2 hover:underline"
+                              title="All AI runs & costs for this meeting"
                             >
                               generated {formatDistanceToNow(new Date(row.auto_notes_at), { addSuffix: true })}
                               {aiStats?.latest?.cost_usd != null &&
                                 ` · $${Number(aiStats.latest.cost_usd).toFixed(2)}`}
                               {aiStats?.latest?.duration_ms != null &&
                                 ` · ${Math.round(aiStats.latest.duration_ms / 1000)}s`}
-                            </span>
+                              {aiStats && aiStats.totals.runs > 1 &&
+                                ` · Σ $${Number(aiStats.totals.cost_usd ?? 0).toFixed(2)}`}
+                            </button>
                           )}
                         </div>
                       </>
@@ -2571,6 +2562,80 @@ export default function TranscriptDetailPage({ params }: TranscriptDetailPagePro
           <ListTree className="h-4 w-4" />
           Outline
         </button>
+
+        <Dialog open={aiRunsOpen} onOpenChange={setAiRunsOpen}>
+          <DialogContent className="max-w-lg">
+            <DialogHeader>
+              <DialogTitle className="text-base font-semibold">AI usage — this meeting</DialogTitle>
+              <DialogDescription className="text-xs">
+                Every Claude run on this transcript. Regenerations add up; the totals are lifetime.
+              </DialogDescription>
+            </DialogHeader>
+            <div className="flex items-baseline gap-4 rounded-md border bg-muted/40 px-3 py-2">
+              <span className="text-lg font-semibold">
+                ${Number(aiStats?.totals.cost_usd ?? 0).toFixed(2)}
+              </span>
+              <span className="text-xs text-muted-foreground">
+                {aiStats?.totals.runs ?? 0} run{(aiStats?.totals.runs ?? 0) === 1 ? '' : 's'} total
+              </span>
+            </div>
+            <div className="max-h-[45vh] overflow-y-auto">
+              <table className="w-full text-xs">
+                <thead>
+                  <tr className="border-b text-left text-muted-foreground">
+                    <th className="py-1 pr-2 font-medium">What</th>
+                    <th className="py-1 pr-2 font-medium">When</th>
+                    <th className="py-1 pr-2 font-medium">By</th>
+                    <th className="py-1 pr-2 text-right font-medium">Time</th>
+                    <th className="py-1 text-right font-medium">Cost</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {aiRuns.map((r, i) => {
+                    const kindLabel =
+                      ({
+                        auto_notes: 'Summary',
+                        auto_report: 'Detailed report',
+                        import_normalize: 'Import',
+                        ask: 'Ask AI',
+                      } as Record<string, string>)[String(r.kind)] ?? String(r.kind);
+                    return (
+                      <tr key={i} className="border-b border-dashed last:border-0">
+                        <td className="py-1 pr-2">
+                          {kindLabel}
+                          {r.status === 'error' && (
+                            <span className="ml-1 text-destructive">failed</span>
+                          )}
+                        </td>
+                        <td className="py-1 pr-2 whitespace-nowrap text-muted-foreground">
+                          {r.created_at
+                            ? formatDistanceToNow(new Date(String(r.created_at)), { addSuffix: true })
+                            : '—'}
+                        </td>
+                        <td className="max-w-[10rem] truncate py-1 pr-2 text-muted-foreground">
+                          {String(r.triggered_by_email ?? '') || 'auto'}
+                        </td>
+                        <td className="py-1 pr-2 text-right text-muted-foreground">
+                          {r.duration_ms != null ? `${Math.round(Number(r.duration_ms) / 1000)}s` : '—'}
+                        </td>
+                        <td className="py-1 text-right">
+                          {r.cost_usd != null ? `$${Number(r.cost_usd).toFixed(2)}` : '—'}
+                        </td>
+                      </tr>
+                    );
+                  })}
+                  {aiRuns.length === 0 && (
+                    <tr>
+                      <td colSpan={5} className="py-3 text-center text-muted-foreground">
+                        No AI runs yet.
+                      </td>
+                    </tr>
+                  )}
+                </tbody>
+              </table>
+            </div>
+          </DialogContent>
+        </Dialog>
 
         <Dialog open={notesPromptOpen} onOpenChange={setNotesPromptOpen}>
           <DialogContent className="max-w-md">
