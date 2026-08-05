@@ -73,8 +73,11 @@ function mimeFromPath(p: string): string {
     case 'mp3':
       return 'audio/mpeg';
     case 'm4a':
-    case 'mp4':
       return 'audio/mp4';
+    case 'mp4':
+      // Meeting recordings are video containers; <video> and <audio>
+      // elements both play video/mp4 fine.
+      return 'video/mp4';
     case 'wav':
       return 'audio/wav';
     case 'webm':

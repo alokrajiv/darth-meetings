@@ -1,6 +1,10 @@
 import 'server-only';
+import { promises as fsp } from 'node:fs';
+import { z } from 'zod';
+import { tool, createSdkMcpServer } from '@anthropic-ai/claude-agent-sdk';
 import { getTranscript } from '@/lib/server/assemblyai';
 import { runClaudeWithMeta } from '@/lib/server/claude-agent';
+import { extractFrame, hasVideoStream } from '@/lib/server/video-frames';
 import { recordAiRun, getLatestSessionId } from '@/db-ops/ai-runs';
 import { findPeopleByEmails, type Person } from '@/db-ops/people';
 import {
@@ -67,6 +71,20 @@ Bulleted list as "**Owner** — action (deadline if mentioned)". Use the speaker
 Anything explicitly left unresolved.
 
 Rules: do not invent facts, names, or dates not present in the transcript. For speakers identified in the context below (confirmed names, strong voice matches, or your own text-evidence identifications), use their real names in the notes. Refer to any remaining unidentified speaker as "Speaker A" etc. Keep the notes under 600 words. Output ONLY the TITLE line, the SPEAKERS line, the SEGMENTS line, and the markdown notes — no preamble.
+
+`;
+
+const VIDEO_CONTEXT = `
+THIS MEETING HAS VIDEO. The recording includes the participants' screen shares, and you have a tool — grab_frames — that returns actual video frames at millisecond timestamps you choose.
+
+Use it like this:
+1. Read the transcript first and note moments where something was being SHOWN: phrases like "as you can see", "on my screen", "this chart/table/page", demos, walkthroughs of documents or dashboards.
+2. Call grab_frames with a batch of those timestamps (pick the middle of the moment, not its first word). Look at what comes back — if a frame is just webcam faces, don't request neighbouring timestamps of the same scene.
+3. Use what you actually SEE to make the notes concrete: real figures, labels, table columns, error messages, page names — things the audio alone doesn't carry. Never describe a visual you did not verify in a frame.
+4. Embed the most useful frames (aim for 3-6, only ones that genuinely add information) into the notes as markdown images, each on its own line next to the point it supports:
+![<one-line caption of what the frame shows>](frame:<ms>)
+   where <ms> is a millisecond timestamp you grabbed. Use EXACTLY that frame:<ms> URL form — the server rewrites it.
+5. Independently of frames, cite timestamps inline as [m:ss] after key moments, decisions, and action items so readers can jump to them in the player.
 
 `;
 
@@ -279,6 +297,71 @@ export async function getContentCached(
 }
 
 /**
+ * In-process MCP server exposing grab_frames over the stored recording.
+ * A closure counter caps total frames per run — vision tokens are the cost
+ * driver here, not ffmpeg.
+ */
+function buildVideoTools(assemblyaiId: string, audioFilename: string, durationMs: number | null) {
+  let grabbed = 0;
+  const MAX_PER_CALL = 8;
+  const MAX_PER_RUN = 24;
+  return createSdkMcpServer({
+    name: 'video',
+    tools: [
+      tool(
+        'grab_frames',
+        'Return video frames from the meeting recording at the given millisecond timestamps (batch several at once). Use to SEE what was on screen — slides, dashboards, documents — at moments the transcript suggests something was being shown.',
+        {
+          timestamps_ms: z
+            .array(z.number().int().min(0))
+            .min(1)
+            .max(MAX_PER_CALL)
+            .describe(`Millisecond offsets into the recording, up to ${MAX_PER_CALL} per call`),
+        },
+        async ({ timestamps_ms }) => {
+          const content: Array<
+            | { type: 'text'; text: string }
+            | { type: 'image'; data: string; mimeType: string }
+          > = [];
+          for (const rawMs of timestamps_ms) {
+            if (grabbed >= MAX_PER_RUN) {
+              content.push({
+                type: 'text',
+                text: `(frame budget reached — ${MAX_PER_RUN} frames max per run; work with what you have)`,
+              });
+              break;
+            }
+            const ms = durationMs ? Math.min(rawMs, Math.max(0, durationMs - 1000)) : rawMs;
+            const m = Math.floor(ms / 60000);
+            const s = Math.floor((ms % 60000) / 1000);
+            try {
+              const abs = await extractFrame(assemblyaiId, audioFilename, ms);
+              const data = await fsp.readFile(abs);
+              grabbed++;
+              content.push({ type: 'text', text: `Frame at ${m}:${String(s).padStart(2, '0')} (${ms} ms):` });
+              content.push({ type: 'image', data: data.toString('base64'), mimeType: 'image/jpeg' });
+            } catch (err) {
+              content.push({ type: 'text', text: `Frame at ${ms} ms unavailable: ${String(err).slice(0, 120)}` });
+            }
+          }
+          return { content };
+        }
+      ),
+    ],
+  });
+}
+
+/** Rewrite the agent's frame:<ms> refs to real serving URLs and pre-warm the
+ * extraction cache so first render is instant. */
+function rewriteFrameRefs(notes: string, assemblyaiId: string, audioFilename: string | null): string {
+  return notes.replace(/\(frame:(\d+)\)/g, (_m, msStr: string) => {
+    const ms = Number.parseInt(msStr, 10);
+    if (audioFilename) void extractFrame(assemblyaiId, audioFilename, ms).catch(() => {});
+    return `(/api/transcripts/${assemblyaiId}/frames/${ms}.jpg)`;
+  });
+}
+
+/**
  * Generate notes for one transcript. Runs the full pipeline; errors land in
  * auto_notes_error. `force` regenerates even if notes already exist.
  */
@@ -326,8 +409,23 @@ export async function generateAutoNotes(
       ? `\nUSER INSTRUCTIONS for this run — follow them (they may adjust tone, depth, focus, or language, but the TITLE/SPEAKERS/SEGMENTS envelope format is non-negotiable):\n${instructions}\n\n`
       : '';
 
+    // Video awareness: when the stored recording has a video stream, hand
+    // the agent a frame-grabbing tool and the instructions to use it.
+    const videoOk = row.local_audio_path ? await hasVideoStream(row.local_audio_path) : false;
+    const videoContext = videoOk ? VIDEO_CONTEXT : '';
+    const durationMs =
+      (row.duration ?? content.audio_duration ?? 0) * 1000 || null;
+    const agentOpts = videoOk
+      ? {
+          mcpServers: {
+            video: buildVideoTools(assemblyaiId, row.local_audio_path!, durationMs),
+          },
+          allowedTools: ['mcp__video__grab_frames'],
+        }
+      : {};
+
     const prompt =
-      PROMPT_HEADER + styleContext + attachmentContext + meetCrossRef + peopleContext + speakerContext + transcriptText;
+      PROMPT_HEADER + styleContext + videoContext + attachmentContext + meetCrossRef + peopleContext + speakerContext + transcriptText;
 
     // Incremental top-up: a forced regeneration (speaker renamed, context
     // file attached, …) resumes the prior session instead of resending the
@@ -336,11 +434,16 @@ export async function generateAutoNotes(
     // fails (session file gone, expired, whatever). NOTE: assumes the
     // transcript text itself is unchanged; heavy transcript edits still get
     // fresh full runs because the top-up re-supplies context, not content.
-    const priorSessionId = opts.force ? await getLatestSessionId(row.id) : null;
+    // First video-aware run on a row whose notes predate video: force a
+    // fresh full pass — the old session never saw the frame workflow, and a
+    // top-up would just patch the old text instead of doing the visual read.
+    const firstVideoRun = videoOk && !(row.auto_notes ?? '').includes('/frames/');
+    const priorSessionId = opts.force && !firstVideoRun ? await getLatestSessionId(row.id) : null;
     const topUpPrompt =
       `The meeting data has been updated since you generated these notes (speaker identifications, attached context files, or the team directory may have changed). Regenerate the notes now, following EXACTLY the same output format as before: the TITLE line, the SPEAKERS line, the SEGMENTS line, a blank line, then the markdown notes.\n\n` +
       `Current context (supersedes earlier versions; the transcript itself is unchanged):\n\n` +
       styleContext +
+      videoContext +
       attachmentContext +
       peopleContext +
       speakerContext.replace(/Transcript follows:\n\n$/, '');
@@ -351,7 +454,7 @@ export async function generateAutoNotes(
       let run: Awaited<ReturnType<typeof runClaudeWithMeta>> | null = null;
       if (priorSessionId) {
         try {
-          run = await runClaudeWithMeta(topUpPrompt, { resumeSessionId: priorSessionId });
+          run = await runClaudeWithMeta(topUpPrompt, { resumeSessionId: priorSessionId, ...agentOpts });
           console.log(
             `[auto-notes] ${assemblyaiId}: top-up resume of session ${priorSessionId.slice(0, 8)}…`
           );
@@ -362,7 +465,7 @@ export async function generateAutoNotes(
           );
         }
       }
-      if (!run) run = await runClaudeWithMeta(prompt);
+      if (!run) run = await runClaudeWithMeta(prompt, agentOpts);
       raw = run.text;
       console.log(
         `[auto-notes] ${assemblyaiId}: generated ${raw.length} chars in ${Math.round((Date.now() - started) / 1000)}s` +
@@ -466,6 +569,10 @@ export async function generateAutoNotes(
       } catch (err) {
         console.warn(`[auto-notes] ${assemblyaiId}: bad SEGMENTS json:`, err);
       }
+    }
+
+    if (videoOk) {
+      notes = rewriteFrameRefs(notes, assemblyaiId, row.local_audio_path);
     }
 
     await setAutoNotesForUser(ownerUserId, assemblyaiId, {

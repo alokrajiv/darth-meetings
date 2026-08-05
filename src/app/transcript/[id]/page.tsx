@@ -1943,6 +1943,7 @@ export default function TranscriptDetailPage({ params }: TranscriptDetailPagePro
                   ref={playerRef}
                   className="h-10 w-full"
                   src={`/api/transcripts/${row.assemblyai_id}/audio`}
+                  hasVideo={/\.(mp4|webm|mov|mkv|m4v)$/i.test(row.local_audio_path ?? '')}
                   onTimeUpdate={setCurrentTime}
                   onError={() => setAudioAvailable(false)}
                 />
@@ -2005,6 +2006,22 @@ export default function TranscriptDetailPage({ params }: TranscriptDetailPagePro
                           <ReactMarkdown
                             remarkPlugins={[remarkGfm]}
                             components={{
+                              img: ({ src, alt }) => (
+                                <a href={typeof src === 'string' ? src : undefined} target="_blank" rel="noreferrer" className="my-2 block">
+                                  {/* eslint-disable-next-line @next/next/no-img-element */}
+                                  <img
+                                    src={typeof src === 'string' ? src : undefined}
+                                    alt={alt ?? ''}
+                                    loading="lazy"
+                                    className="max-h-[360px] w-auto max-w-full rounded-md border"
+                                  />
+                                  {alt && (
+                                    <span className="mt-1 block text-[11px] leading-snug text-muted-foreground">
+                                      {alt}
+                                    </span>
+                                  )}
+                                </a>
+                              ),
                               h1: ({ children }) => <h2 className="text-[15px] font-semibold mt-4 mb-1.5">{children}</h2>,
                               h2: ({ children }) => <h2 className="text-[15px] font-semibold mt-4 mb-1.5">{children}</h2>,
                               h3: ({ children }) => <h3 className="text-sm font-semibold mt-3 mb-1">{children}</h3>,

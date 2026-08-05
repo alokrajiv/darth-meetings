@@ -236,7 +236,15 @@ export function TranscriptSourcesCard({
             className={`mt-0.5 h-3.5 w-3.5 shrink-0 ${hasAudio ? 'text-status-ok' : 'text-muted-foreground'}`}
           />
           <span>
-            {hasAudio ? (
+            {hasAudio && /\.(mp4|webm|mov|mkv|m4v)$/i.test(row.local_audio_path ?? '') ? (
+              <>
+                <span className="font-medium">Video recording stored</span>
+                <span className="text-muted-foreground">
+                  {' '}
+                  — toggle video in the player; AI summaries can read the screen shares
+                </span>
+              </>
+            ) : hasAudio ? (
               <>
                 <span className="font-medium">Audio available</span>
                 <span className="text-muted-foreground"> — playback &amp; voiceprints work</span>
