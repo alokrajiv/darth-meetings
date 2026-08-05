@@ -54,7 +54,7 @@ function LoginInner() {
     <div className="min-h-screen flex items-center justify-center bg-gradient-to-br from-slate-50 to-slate-100">
       <div className="w-full max-w-md rounded-xl border bg-white shadow p-6">
         <div className="flex flex-col space-y-1.5 pb-4">
-          <h2 className="text-2xl font-semibold">Meeting Whisperer</h2>
+          <h2 className="text-2xl font-semibold">Darth Meetings</h2>
           <p className="text-sm text-gray-500">{message}</p>
         </div>
         <div className="flex justify-center py-8">

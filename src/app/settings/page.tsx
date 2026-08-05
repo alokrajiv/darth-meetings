@@ -141,7 +141,7 @@ export default function SettingsPage() {
           />
           <VocabEditor
             title="Company vocabulary"
-            description="Shared across everyone using meeting-whisperer. Anyone can edit; every save is versioned in the database."
+            description="Shared across everyone using Darth Meetings. Anyone can edit; every save is versioned in the database."
             initial={orgVocab}
             onSave={saveOrg}
             meta={

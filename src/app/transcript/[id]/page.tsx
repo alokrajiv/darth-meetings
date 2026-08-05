@@ -1263,9 +1263,9 @@ export default function TranscriptDetailPage({ params }: TranscriptDetailPagePro
   useEffect(() => {
     const computed =
       (row?.title?.trim()) || row?.original_filename || 'Untitled transcript';
-    document.title = `${computed} · Meeting Whisperer`;
+    document.title = `${computed} · Darth Meetings`;
     return () => {
-      document.title = 'Meeting Whisperer';
+      document.title = 'Darth Meetings';
     };
   }, [row?.title, row?.original_filename]);
 

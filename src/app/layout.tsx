@@ -14,8 +14,8 @@ const geistMono = Geist_Mono({
 
 export const metadata: Metadata = {
   title: {
-    default: "Meeting Whisperer",
-    template: "%s · Meeting Whisperer",
+    default: "Darth Meetings",
+    template: "%s · Darth Meetings",
   },
   description: "Upload meeting audio, get a clean speaker-labelled transcript.",
 };

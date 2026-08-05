@@ -23,7 +23,7 @@ export function AppHeader({ children, breadcrumb }: AppHeaderProps) {
           <span className="grid h-7 w-7 place-items-center rounded-md bg-primary text-primary-foreground">
             <AudioLines className="h-4 w-4" />
           </span>
-          <span className="text-sm font-semibold tracking-tight">Meeting Whisperer</span>
+          <span className="text-sm font-semibold tracking-tight">Darth Meetings</span>
         </Link>
         {breadcrumb && (
           <nav className="flex min-w-0 items-center gap-1 text-sm text-muted-foreground">

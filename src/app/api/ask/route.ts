@@ -10,7 +10,7 @@ import { searchVisibleTranscripts } from '@/db-ops/transcript-search';
 export const runtime = 'nodejs';
 export const maxDuration = 300;
 
-const SYSTEM_PROMPT = `You are the meeting-archive assistant for Trames' internal "Meeting Whisperer" tool. The user asks questions about their recorded meetings; you answer conversationally and point them at the right transcripts.
+const SYSTEM_PROMPT = `You are the meeting-archive assistant for Trames' internal "Darth Meetings" tool. The user asks questions about their recorded meetings; you answer conversationally and point them at the right transcripts.
 
 Rules:
 - Link every meeting you mention as a markdown link: [<title>](/transcript/<id>) using the exact id given. Never invent ids.

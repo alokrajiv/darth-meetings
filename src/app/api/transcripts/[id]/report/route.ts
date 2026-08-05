@@ -1,6 +1,8 @@
 import { NextResponse } from 'next/server';
 import { withAuth } from '@/lib/auth/with-auth';
 import { resolveAccess } from '@/db-ops/transcript-access';
+import { logActivity } from '@/db-ops/transcript-activity';
+import { setAutoReportForUser } from '@/db-ops/transcripts';
 import { generateAutoReport } from '@/lib/server/auto-notes';
 
 export const runtime = 'nodejs';
@@ -45,4 +47,51 @@ export const POST = withAuth(async ({ user, request }, { params }) => {
   });
 
   return NextResponse.json({ status: 'running' });
+});
+
+/**
+ * PUT /api/transcripts/:id/report
+ * Set the report markdown directly — no AI run. darth-cli write-back path,
+ * mirror of PUT …/notes. Editors only. Body: { markdown: string }.
+ */
+export const PUT = withAuth(async ({ user, request, cliScope }, { params }) => {
+  const { id } = await params;
+
+  const access = await resolveAccess(user.userId, user.email, id);
+  if (!access) {
+    return NextResponse.json({ error: 'Not found' }, { status: 404 });
+  }
+  if (access.access === 'read') {
+    return NextResponse.json({ error: 'Read-only access' }, { status: 403 });
+  }
+
+  let markdown: string;
+  try {
+    const body = (await request.json()) as { markdown?: unknown };
+    if (typeof body.markdown !== 'string' || !body.markdown.trim()) {
+      return NextResponse.json({ error: 'Body must be { markdown: string } (non-empty)' }, { status: 400 });
+    }
+    if (body.markdown.length > 512 * 1024) {
+      return NextResponse.json({ error: 'markdown too large (512KB max)' }, { status: 400 });
+    }
+    markdown = body.markdown;
+  } catch {
+    return NextResponse.json({ error: 'Invalid JSON body' }, { status: 400 });
+  }
+
+  await setAutoReportForUser(access.ownerUserId, id, {
+    status: 'completed',
+    report: markdown,
+    error: null,
+  });
+
+  void logActivity({
+    transcriptId: access.row.id,
+    userId: user.userId,
+    email: user.email,
+    action: 'set_report',
+    details: cliScope ? { via: 'darth-cli' } : undefined,
+  });
+
+  return NextResponse.json({ status: 'completed' });
 });

@@ -30,7 +30,9 @@ export type ActivityAction =
   | 'share_add'
   | 'share_update'
   | 'share_remove'
-  | 'generate_notes';
+  | 'generate_notes'
+  | 'set_notes'
+  | 'set_report';
 
 export interface ActivityRow {
   id: number;
@@ -129,6 +131,14 @@ function actionVerb(row: ActivityRow): string {
     }
     case 'generate_notes':
       return 'generated AI notes';
+    case 'set_notes': {
+      const d = row.details as { via?: string } | null;
+      return d?.via ? `updated notes via ${d.via}` : 'updated notes';
+    }
+    case 'set_report': {
+      const d = row.details as { via?: string } | null;
+      return d?.via ? `updated report via ${d.via}` : 'updated report';
+    }
     default:
       return row.action;
   }

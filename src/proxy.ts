@@ -26,8 +26,14 @@ export async function proxy(request: NextRequest) {
     return NextResponse.next();
   }
 
-  // Protected API routes — 401 if no cookie
+  // Protected API routes — 401 if no cookie. darth-cli bearer tokens (dth_…)
+  // pass through on header *presence* only — the proxy runs on Edge, so real
+  // introspection happens in withAuth; an invalid token still 401s there.
   if (pathname.startsWith('/api/')) {
+    const authz = request.headers.get('authorization') || '';
+    if (/^Bearer\s+dth_/.test(authz)) {
+      return NextResponse.next();
+    }
     if (!hasSSOSession(request)) {
       return NextResponse.json(
         { error: 'Unauthorized - No session found' },

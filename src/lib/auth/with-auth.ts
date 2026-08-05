@@ -9,6 +9,7 @@
 
 import { NextRequest, NextResponse } from 'next/server';
 import { getCurrentUser, SSOSessionData } from './sso-session';
+import { getCliBearer, resolveCliToken, CliScope } from './cli-auth';
 
 // Force Node.js runtime (Edge can't do jsonwebtoken RS256 verify with crypto.createPublicKey)
 export const runtime = 'nodejs';
@@ -17,6 +18,8 @@ export interface AuthContext {
   user: SSOSessionData;
   request: NextRequest;
   scopes: string[];
+  /** Set when the caller authenticated with a darth-cli token instead of the SSO cookie. */
+  cliScope?: CliScope;
 }
 
 type AuthenticatedHandler = (
@@ -40,6 +43,33 @@ export function withAuth(
 ): (request: NextRequest, context: { params: Promise<Record<string, string>> }) => Promise<Response> {
   return async (request: NextRequest, context: { params: Promise<Record<string, string>> }) => {
     try {
+      // darth-cli bearer takes precedence over the cookie. An invalid/revoked
+      // token is a hard 401 — it must not fall through to cookie auth.
+      const cliToken = getCliBearer(request.headers.get('authorization'));
+      if (cliToken) {
+        const identity = await resolveCliToken(cliToken);
+        if (!identity) {
+          return NextResponse.json(
+            { error: 'Unauthorized - invalid or revoked darth-cli token' },
+            { status: 401 }
+          );
+        }
+        const method = request.method.toUpperCase();
+        if (identity.scope === 'read' && method !== 'GET' && method !== 'HEAD') {
+          return NextResponse.json(
+            { error: 'Forbidden - token is read-only for meetings; re-run `darth-cli login` and pick Read + write' },
+            { status: 403 }
+          );
+        }
+        const authContext: AuthContext = {
+          user: { userId: identity.userId, email: identity.email, allowedApps: [], scopes: [] },
+          request,
+          scopes: [],
+          cliScope: identity.scope,
+        };
+        return await handler(authContext, context);
+      }
+
       const user = await getCurrentUser();
 
       if (!user) {
