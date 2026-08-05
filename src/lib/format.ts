@@ -42,6 +42,11 @@ export interface StoredTranscript {
   auto_notes_status: string | null;
   auto_notes_error: string | null;
   auto_notes_at: string | null;
+  /** Detailed wiki-style AI report (markdown with frame images, t: links) */
+  auto_report: string | null;
+  auto_report_status: string | null;
+  auto_report_error: string | null;
+  auto_report_at: string | null;
 }
 
 /** One invitee of the source calendar event (Google Meet import). */

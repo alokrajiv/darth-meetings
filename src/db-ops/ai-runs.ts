@@ -9,7 +9,7 @@ import type { ClaudeRunMeta } from '@/lib/server/claude-agent';
 
 const SCHEMA = SCHEMAS.MEETING_WHISPERER;
 
-export type AiRunKind = 'auto_notes' | 'import_normalize' | 'ask';
+export type AiRunKind = 'auto_notes' | 'auto_report' | 'import_normalize' | 'ask';
 
 export interface AiRunRow {
   id: number;

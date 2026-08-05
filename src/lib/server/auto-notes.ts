@@ -10,6 +10,7 @@ import { findPeopleByEmails, type Person } from '@/db-ops/people';
 import {
   getForUser,
   setAutoNotesForUser,
+  setAutoReportForUser,
   setAutoSegmentsForUser,
   setCachedContentForUser,
   updateMetaForUser,
@@ -70,21 +71,31 @@ Bulleted list as "**Owner** — action (deadline if mentioned)". Use the speaker
 ## Open Questions
 Anything explicitly left unresolved.
 
-Rules: do not invent facts, names, or dates not present in the transcript. For speakers identified in the context below (confirmed names, strong voice matches, or your own text-evidence identifications), use their real names in the notes. Refer to any remaining unidentified speaker as "Speaker A" etc. Keep the notes under 600 words. Output ONLY the TITLE line, the SPEAKERS line, the SEGMENTS line, and the markdown notes — no preamble.
+Rules: do not invent facts, names, or dates not present in the transcript. For speakers identified in the context below (confirmed names, strong voice matches, or your own text-evidence identifications), use their real names in the notes. Refer to any remaining unidentified speaker as "Speaker A" etc. Keep the notes under 600 words. These notes are the QUICK summary — a fast, clean read. No images. No timestamps in headings and no play-by-play structure; organise by topic. You may attach a timestamp link to at most ~6 pivotal moments (a decision being made, an action item assigned) using EXACTLY this markdown form: [m:ss](t:<millisecond offset>) — e.g. [6:59](t:419000) — the UI turns these into click-to-jump chips. Output ONLY the TITLE line, the SPEAKERS line, the SEGMENTS line, and the markdown notes — no preamble.
+
+`;
+
+const REPORT_PROMPT = `You are writing a DETAILED REPORT of a meeting from its diarized transcript — the deep-dive companion to a short summary that already exists. Think of the output as a well-edited internal wiki article someone reads INSTEAD of watching the 1-hour recording: complete, skimmable, and visual.
+
+Structure:
+- Start with a one-paragraph lede: what the meeting was, who drove it, what came out of it. No heading above the lede.
+- Then ## sections organised by TOPIC (never chronology for its own sake). Use ### subsections where a topic is dense.
+- Use GFM tables for anything naturally tabular (per-item rules, options compared, figures discussed).
+- End with an ## Action Items section (owner — action — deadline) and, if warranted, ## Open Questions.
+
+Evidence and navigation (the UI renders all three specially — use the EXACT forms):
+- Timestamp citations: after any specific claim, decision, or number worth verifying, append [m:ss](t:<millisecond offset>) — e.g. [12:30](t:750000). These become click-to-jump player chips. Cite generously, like footnotes in a good article.
+- Attached files: when you draw on an attached document listed in the context, link it inline as [<file title>](attachment:<id>) using the ids given.
+- Video frames (when a grab_frames tool is available): the recording contains the participants' screen shares. Find the moments where something was SHOWN (demos, "as you can see", walkthroughs of documents/dashboards), grab frames in batches, and study them — then use what you actually SEE to make the report concrete: real figures, labels, column names, error text. Embed the genuinely informative frames (typically 4-10) as figures near the text they support, each on its own line: ![<one-line caption>](frame:<ms>). Never describe a visual you did not verify in a frame, and never embed a frame that adds nothing (webcam tiles).
+
+Source hierarchy: the main transcript below is AssemblyAI voice-level diarization — the most accurate speaker separation and timing available, but its speaker labels are anonymous (A, B, C…). Identity comes from the speaker context: confirmed names, voiceprint matches (with confidence), and calendar/Meet participants — use those to name speakers, and reason about weak matches yourself. When a Google Meet/Teams transcript rides along as a cross-reference, it has real names but device-level attribution (a shared room mic looks like one person) — trust AssemblyAI for who-spoke-when, and use the sidecar to repair garbled words, product names, and spellings.
+
+Rules: do not invent facts, names, or dates not in the transcript/frames/attachments. Use the real speaker names from the context. Scale length to the meeting's density — typically 800-1500 words of prose (plus tables/figures); a thin meeting deserves a short report. Output ONLY the markdown report, no preamble, no TITLE/SPEAKERS/SEGMENTS envelope.
 
 `;
 
 const VIDEO_CONTEXT = `
-THIS MEETING HAS VIDEO. The recording includes the participants' screen shares, and you have a tool — grab_frames — that returns actual video frames at millisecond timestamps you choose.
-
-Use it like this:
-1. Read the transcript first and note moments where something was being SHOWN: phrases like "as you can see", "on my screen", "this chart/table/page", demos, walkthroughs of documents or dashboards.
-2. Call grab_frames with a batch of those timestamps (pick the middle of the moment, not its first word). Look at what comes back — if a frame is just webcam faces, don't request neighbouring timestamps of the same scene.
-3. Use what you actually SEE to make the notes concrete: real figures, labels, table columns, error messages, page names — things the audio alone doesn't carry. Never describe a visual you did not verify in a frame.
-4. Embed the most useful frames (aim for 3-6, only ones that genuinely add information) into the notes as markdown images, each on its own line next to the point it supports:
-![<one-line caption of what the frame shows>](frame:<ms>)
-   where <ms> is a millisecond timestamp you grabbed. Use EXACTLY that frame:<ms> URL form — the server rewrites it.
-5. Independently of frames, cite timestamps inline as [m:ss] after key moments, decisions, and action items so readers can jump to them in the player.
+THIS MEETING HAS VIDEO and you have the grab_frames tool (batch several timestamps per call). Use the workflow described above: locate screen-share moments from the transcript, look at real frames, embed the informative ones as ![caption](frame:<ms>).
 
 `;
 
@@ -409,23 +420,8 @@ export async function generateAutoNotes(
       ? `\nUSER INSTRUCTIONS for this run — follow them (they may adjust tone, depth, focus, or language, but the TITLE/SPEAKERS/SEGMENTS envelope format is non-negotiable):\n${instructions}\n\n`
       : '';
 
-    // Video awareness: when the stored recording has a video stream, hand
-    // the agent a frame-grabbing tool and the instructions to use it.
-    const videoOk = row.local_audio_path ? await hasVideoStream(row.local_audio_path) : false;
-    const videoContext = videoOk ? VIDEO_CONTEXT : '';
-    const durationMs =
-      (row.duration ?? content.audio_duration ?? 0) * 1000 || null;
-    const agentOpts = videoOk
-      ? {
-          mcpServers: {
-            video: buildVideoTools(assemblyaiId, row.local_audio_path!, durationMs),
-          },
-          allowedTools: ['mcp__video__grab_frames'],
-        }
-      : {};
-
     const prompt =
-      PROMPT_HEADER + styleContext + videoContext + attachmentContext + meetCrossRef + peopleContext + speakerContext + transcriptText;
+      PROMPT_HEADER + styleContext + attachmentContext + meetCrossRef + peopleContext + speakerContext + transcriptText;
 
     // Incremental top-up: a forced regeneration (speaker renamed, context
     // file attached, …) resumes the prior session instead of resending the
@@ -434,16 +430,14 @@ export async function generateAutoNotes(
     // fails (session file gone, expired, whatever). NOTE: assumes the
     // transcript text itself is unchanged; heavy transcript edits still get
     // fresh full runs because the top-up re-supplies context, not content.
-    // First video-aware run on a row whose notes predate video: force a
-    // fresh full pass — the old session never saw the frame workflow, and a
-    // top-up would just patch the old text instead of doing the visual read.
-    const firstVideoRun = videoOk && !(row.auto_notes ?? '').includes('/frames/');
-    const priorSessionId = opts.force && !firstVideoRun ? await getLatestSessionId(row.id) : null;
+    // Prompt regime change (quick summary went back to clean/no-frames):
+    // don't resume sessions whose notes still carry embedded frames.
+    const staleFormat = (row.auto_notes ?? '').includes('/frames/');
+    const priorSessionId = opts.force && !staleFormat ? await getLatestSessionId(row.id) : null;
     const topUpPrompt =
       `The meeting data has been updated since you generated these notes (speaker identifications, attached context files, or the team directory may have changed). Regenerate the notes now, following EXACTLY the same output format as before: the TITLE line, the SPEAKERS line, the SEGMENTS line, a blank line, then the markdown notes.\n\n` +
       `Current context (supersedes earlier versions; the transcript itself is unchanged):\n\n` +
       styleContext +
-      videoContext +
       attachmentContext +
       peopleContext +
       speakerContext.replace(/Transcript follows:\n\n$/, '');
@@ -454,7 +448,7 @@ export async function generateAutoNotes(
       let run: Awaited<ReturnType<typeof runClaudeWithMeta>> | null = null;
       if (priorSessionId) {
         try {
-          run = await runClaudeWithMeta(topUpPrompt, { resumeSessionId: priorSessionId, ...agentOpts });
+          run = await runClaudeWithMeta(topUpPrompt, { resumeSessionId: priorSessionId });
           console.log(
             `[auto-notes] ${assemblyaiId}: top-up resume of session ${priorSessionId.slice(0, 8)}…`
           );
@@ -465,7 +459,7 @@ export async function generateAutoNotes(
           );
         }
       }
-      if (!run) run = await runClaudeWithMeta(prompt, agentOpts);
+      if (!run) run = await runClaudeWithMeta(prompt);
       raw = run.text;
       console.log(
         `[auto-notes] ${assemblyaiId}: generated ${raw.length} chars in ${Math.round((Date.now() - started) / 1000)}s` +
@@ -571,9 +565,8 @@ export async function generateAutoNotes(
       }
     }
 
-    if (videoOk) {
-      notes = rewriteFrameRefs(notes, assemblyaiId, row.local_audio_path);
-    }
+    // Harmless when no frame refs; keeps any legacy embeds rendering.
+    notes = rewriteFrameRefs(notes, assemblyaiId, row.local_audio_path);
 
     await setAutoNotesForUser(ownerUserId, assemblyaiId, {
       status: 'completed',
@@ -590,6 +583,139 @@ export async function generateAutoNotes(
   } catch (err) {
     console.error(`[auto-notes] ${assemblyaiId}: failed:`, err);
     await setAutoNotesForUser(ownerUserId, assemblyaiId, {
+      status: 'error',
+      error: String(err).slice(0, 1000),
+    }).catch(() => {});
+  } finally {
+    inFlight.delete(key);
+  }
+}
+
+/** Attachments the report can link to inline via [title](attachment:<id>). */
+async function buildAttachmentLinkIndex(transcriptRowId: number): Promise<string> {
+  try {
+    const attachments = await listAttachments(transcriptRowId);
+    const files = attachments.filter((a) => a.kind === 'file');
+    if (files.length === 0) return '';
+    return (
+      'Attached files — link them inline as [<title>](attachment:<id>) where you draw on their content:\n' +
+      files.map((a) => `- id=${a.id} "${a.title}"`).join('\n') +
+      '\n\n'
+    );
+  } catch {
+    return '';
+  }
+}
+
+/**
+ * Generate the DETAILED REPORT tier. Same status-machine shape as the quick
+ * summary (auto_report_status: running -> completed | error), but always a
+ * fresh full pass at HIGH reasoning effort, with the frame-grabbing tool
+ * when the recording has video. User-triggered only — never swept.
+ */
+export async function generateAutoReport(
+  ownerUserId: string,
+  assemblyaiId: string,
+  opts: {
+    triggeredBy?: { userId: string; email: string };
+    instructions?: string;
+    /** false = text-only report even when the recording has video. */
+    useVideo?: boolean;
+  } = {}
+): Promise<void> {
+  const key = `report:${ownerUserId}:${assemblyaiId}`;
+  if (inFlight.has(key)) return;
+
+  const row = await getForUser(ownerUserId, assemblyaiId);
+  if (!row || row.status !== 'completed') return;
+  if (row.auto_report_status === 'running') return;
+
+  inFlight.add(key);
+  try {
+    await setAutoReportForUser(ownerUserId, assemblyaiId, { status: 'running' });
+
+    const content = await getContentCached(ownerUserId, row);
+    if (!content?.utterances?.length) {
+      throw new Error('no utterances available for this transcript');
+    }
+
+    const mappings = await getMappingsForUser(ownerUserId, assemblyaiId);
+    const labels = mappings?.speaker_labels ?? [];
+    const existingSuggestions = mappings?.suggestions ?? {};
+    const transcriptText = buildTranscriptText(content, labels);
+    const speakerContext = buildSpeakerContext(labels, existingSuggestions);
+    const attachmentContext = await buildAttachmentContext(row.id);
+    const attachmentLinks = await buildAttachmentLinkIndex(row.id);
+    const meetCrossRef = buildMeetCrossReference(row);
+    const peopleContext = await buildPeopleContext(row);
+
+    const instructions = opts.instructions?.trim().slice(0, 2000);
+    const styleContext = instructions
+      ? `\nUSER INSTRUCTIONS for this report — follow them:\n${instructions}\n\n`
+      : '';
+
+    const videoOk =
+      opts.useVideo !== false && row.local_audio_path
+        ? await hasVideoStream(row.local_audio_path)
+        : false;
+    const durationMs = (row.duration ?? content.audio_duration ?? 0) * 1000 || null;
+    const agentOpts = videoOk
+      ? {
+          effort: 'high',
+          mcpServers: {
+            video: buildVideoTools(assemblyaiId, row.local_audio_path!, durationMs),
+          },
+          allowedTools: ['mcp__video__grab_frames'],
+        }
+      : { effort: 'high' };
+
+    const prompt =
+      REPORT_PROMPT +
+      styleContext +
+      (videoOk ? VIDEO_CONTEXT : '') +
+      attachmentLinks +
+      attachmentContext +
+      meetCrossRef +
+      peopleContext +
+      speakerContext +
+      transcriptText;
+
+    const started = Date.now();
+    const run = await runClaudeWithMeta(prompt, agentOpts);
+    let report = run.text;
+    console.log(
+      `[auto-report] ${assemblyaiId}: generated ${report.length} chars in ${Math.round((Date.now() - started) / 1000)}s` +
+        (run.meta.costUsd != null ? ` ($${run.meta.costUsd.toFixed(4)}, ${run.meta.model ?? 'model?'})` : '')
+    );
+    void recordAiRun({
+      transcriptId: row.id,
+      assemblyaiId,
+      kind: 'auto_report',
+      triggeredBy: opts.triggeredBy ?? null,
+      status: 'completed',
+      meta: run.meta,
+      promptChars: prompt.length,
+      resultChars: report.length,
+    });
+
+    report = rewriteFrameRefs(report, assemblyaiId, row.local_audio_path);
+
+    await setAutoReportForUser(ownerUserId, assemblyaiId, {
+      status: 'completed',
+      report,
+      error: null,
+    });
+  } catch (err) {
+    console.error(`[auto-report] ${assemblyaiId}: failed:`, err);
+    void recordAiRun({
+      transcriptId: row.id,
+      assemblyaiId,
+      kind: 'auto_report',
+      triggeredBy: opts.triggeredBy ?? null,
+      status: 'error',
+      error: String(err).slice(0, 1000),
+    });
+    await setAutoReportForUser(ownerUserId, assemblyaiId, {
       status: 'error',
       error: String(err).slice(0, 1000),
     }).catch(() => {});

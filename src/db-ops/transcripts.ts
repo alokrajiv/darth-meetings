@@ -345,6 +345,24 @@ export async function setAutoNotesForUser(
   publishEvent({ kind: 'notes', assemblyaiId });
 }
 
+/** Same status-machine contract as setAutoNotesForUser, for the detailed
+ * report tier. Reuses the 'notes' live event so open pages refresh. */
+export async function setAutoReportForUser(
+  userId: string,
+  assemblyaiId: string,
+  update: { status: string; report?: string | null; error?: string | null }
+): Promise<void> {
+  await sql`
+    UPDATE ${sql(SCHEMA)}.transcripts
+    SET auto_report_status = ${update.status},
+        auto_report = ${update.report !== undefined ? update.report : sql`auto_report`},
+        auto_report_error = ${update.error ?? null},
+        auto_report_at = now()
+    WHERE user_id = ${userId} AND assemblyai_id = ${assemblyaiId}
+  `;
+  publishEvent({ kind: 'notes', assemblyaiId });
+}
+
 export async function setAutoSegmentsForUser(
   userId: string,
   assemblyaiId: string,

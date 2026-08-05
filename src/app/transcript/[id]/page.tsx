@@ -21,6 +21,7 @@ import {
   type TranscriptShare,
 } from '@/lib/format';
 import { AudioPlayer, type AudioPlayerHandle } from '@/components/audio-player';
+import { NotesMarkdown } from '@/components/notes-markdown';
 import { EditableUtterance, type UtteranceHighlight } from '@/components/editable-utterance';
 import { FindReplacePanel } from '@/components/find-replace-panel';
 import { SpeakerSummaryPanel } from '@/components/speaker-summary-panel';
@@ -58,6 +59,7 @@ import {
   Pencil,
   Users,
   ListTree,
+  Film,
   Sparkles,
   MoreHorizontal,
   Video,
@@ -151,6 +153,8 @@ export default function TranscriptDetailPage({ params }: TranscriptDetailPagePro
   const [generatingNotes, setGeneratingNotes] = useState(false);
   const [notesPromptOpen, setNotesPromptOpen] = useState(false);
   const [notesInstructions, setNotesInstructions] = useState('');
+  const [summaryTab, setSummaryTab] = useState<'summary' | 'report'>('summary');
+  const [generatingReport, setGeneratingReport] = useState(false);
   // Non-null = the summary predates a data change; the value is the banner text.
   const [notesStale, setNotesStale] = useState<string | null>(null);
   const [aiStats, setAiStats] = useState<{
@@ -504,6 +508,49 @@ export default function TranscriptDetailPage({ params }: TranscriptDetailPagePro
       setGeneratingNotes(false);
     }
   }, [transcriptId, generatingNotes, bumpActivity]);
+
+  const handleGenerateReport = useCallback(async (instructions?: string, useVideo = true) => {
+    if (generatingReport) return;
+    setGeneratingReport(true);
+    try {
+      const res = await fetch(`/api/transcripts/${transcriptId}/report`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          ...(instructions?.trim() ? { instructions: instructions.trim() } : {}),
+          useVideo,
+        }),
+      });
+      if (res.ok) {
+        setRow((prev) =>
+          prev ? { ...prev, auto_report_status: 'running', auto_report_error: null } : prev
+        );
+        bumpActivity();
+      }
+    } finally {
+      setGeneratingReport(false);
+    }
+  }, [transcriptId, generatingReport, bumpActivity]);
+
+  // Safety net for the report status: live events normally push the refresh,
+  // but poll while running in case the SSE stream is down.
+  useEffect(() => {
+    if (row?.auto_report_status !== 'running') return;
+    const timer = setInterval(async () => {
+      try {
+        const res = await fetch(`/api/transcripts/${transcriptId}`);
+        if (!res.ok) return;
+        const { transcript } = (await res.json()) as { transcript: StoredTranscript };
+        if (transcript.auto_report_status !== 'running') {
+          void loadAll();
+        }
+      } catch {
+        // transient — keep polling
+      }
+    }, 10000);
+    return () => clearInterval(timer);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [row?.auto_report_status, transcriptId]);
 
   // ⌘F / Ctrl+F → toggle find-and-replace panel
   useEffect(() => {
@@ -1493,7 +1540,7 @@ export default function TranscriptDetailPage({ params }: TranscriptDetailPagePro
             ) : (
               <Sparkles className="h-4 w-4 text-primary" />
             )}
-            {row.auto_notes ? 'Regenerate summary' : 'Generate summary'}
+            Summary / report…
           </Button>
         )}
         {canEdit && (content?.utterances?.length ?? 0) > 0 && (
@@ -1972,6 +2019,108 @@ export default function TranscriptDetailPage({ params }: TranscriptDetailPagePro
                 </CardHeader>
                 {!collapsedSections.aiSummary && (
                   <CardContent className="px-4 pb-4">
+                    <div className="mb-3 flex items-center gap-1 rounded-lg bg-muted/60 p-0.5 text-xs w-fit">
+                      <button
+                        type="button"
+                        onClick={() => setSummaryTab('summary')}
+                        className={`rounded-md px-2.5 py-1 font-medium transition-colors ${summaryTab === 'summary' ? 'bg-card shadow-sm' : 'text-muted-foreground hover:text-foreground'}`}
+                      >
+                        Summary
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => setSummaryTab('report')}
+                        className={`flex items-center gap-1 rounded-md px-2.5 py-1 font-medium transition-colors ${summaryTab === 'report' ? 'bg-card shadow-sm' : 'text-muted-foreground hover:text-foreground'}`}
+                      >
+                        Detailed report
+                        {row.auto_report_status === 'running' && (
+                          <RefreshCw className="h-3 w-3 animate-spin text-muted-foreground" />
+                        )}
+                      </button>
+                    </div>
+                    {summaryTab === 'report' ? (
+                      row.auto_report_status === 'running' ? (
+                        <div className="space-y-2 py-2">
+                          {['95%', '100%', '85%', '90%', '70%'].map((w, i) => (
+                            <div key={i} className="h-3 animate-pulse rounded bg-muted" style={{ width: w }} />
+                          ))}
+                          <p className="pt-1 text-xs text-muted-foreground">
+                            Writing the detailed report — high effort, and it reads the video frames, so give it a few minutes.
+                          </p>
+                        </div>
+                      ) : row.auto_report ? (
+                        <>
+                          <div className="markdown-body max-w-[75ch] text-sm">
+                            <NotesMarkdown
+                              markdown={row.auto_report}
+                              transcriptId={row.assemblyai_id}
+                              onSeek={(s) => playerRef.current?.seekToSeconds(s)}
+                            />
+                          </div>
+                          <div className="mt-4 flex items-center gap-2 border-t pt-2.5">
+                            <Button
+                              variant="ghost"
+                              size="sm"
+                              className="h-7 text-xs"
+                              onClick={() => navigator.clipboard.writeText(row.auto_report ?? '')}
+                            >
+                              <Copy className="h-3 w-3" />
+                              Copy
+                            </Button>
+                            {canEdit && (
+                              <Button
+                                variant="ghost"
+                                size="sm"
+                                className="h-7 text-xs"
+                                disabled={generatingReport}
+                                onClick={() => setNotesPromptOpen(true)}
+                              >
+                                <RefreshCw className="h-3 w-3" />
+                                Regenerate
+                              </Button>
+                            )}
+                            {row.auto_report_at && (
+                              <span className="ml-auto text-[11px] text-muted-foreground">
+                                generated {formatDistanceToNow(new Date(row.auto_report_at), { addSuffix: true })}
+                              </span>
+                            )}
+                          </div>
+                        </>
+                      ) : row.auto_report_status === 'error' ? (
+                        <div className="space-y-2 text-sm">
+                          <p className="text-destructive">
+                            Report generation failed: {row.auto_report_error || 'unknown error'}
+                          </p>
+                          {canEdit && (
+                            <Button
+                              variant="outline"
+                              size="sm"
+                              disabled={generatingReport}
+                              onClick={() => void handleGenerateReport()}
+                            >
+                              <RefreshCw className="h-3 w-3" />
+                              Retry
+                            </Button>
+                          )}
+                        </div>
+                      ) : canEdit ? (
+                        <div className="flex flex-col items-center py-6 text-center">
+                          <p className="text-sm text-muted-foreground">No detailed report yet.</p>
+                          <Button size="sm" className="mt-3" disabled={generatingReport} onClick={() => setNotesPromptOpen(true)}>
+                            <Sparkles className="h-4 w-4" />
+                            Generate detailed report
+                          </Button>
+                          <p className="mt-2 max-w-[46ch] text-xs text-muted-foreground">
+                            A wiki-style deep dive: topic sections, tables, screenshots from the
+                            recording, and click-to-jump timestamp citations. Slower and pricier
+                            than the summary — worth it for dense meetings.
+                          </p>
+                        </div>
+                      ) : (
+                        <p className="py-4 text-sm text-muted-foreground">No detailed report yet.</p>
+                      )
+                    ) : (
+                    <>
                     {notesStale && row.auto_notes_status !== 'running' && canEdit && (
                       <div className="mb-3 flex items-center justify-between gap-2 rounded-md border bg-muted/60 px-3 py-2 text-xs">
                         <span className="text-muted-foreground">{notesStale}</span>
@@ -2003,37 +2152,11 @@ export default function TranscriptDetailPage({ params }: TranscriptDetailPagePro
                     ) : row.auto_notes ? (
                       <>
                         <div className="markdown-body max-w-[75ch] text-sm">
-                          <ReactMarkdown
-                            remarkPlugins={[remarkGfm]}
-                            components={{
-                              img: ({ src, alt }) => (
-                                <a href={typeof src === 'string' ? src : undefined} target="_blank" rel="noreferrer" className="my-2 block">
-                                  {/* eslint-disable-next-line @next/next/no-img-element */}
-                                  <img
-                                    src={typeof src === 'string' ? src : undefined}
-                                    alt={alt ?? ''}
-                                    loading="lazy"
-                                    className="max-h-[360px] w-auto max-w-full rounded-md border"
-                                  />
-                                  {alt && (
-                                    <span className="mt-1 block text-[11px] leading-snug text-muted-foreground">
-                                      {alt}
-                                    </span>
-                                  )}
-                                </a>
-                              ),
-                              h1: ({ children }) => <h2 className="text-[15px] font-semibold mt-4 mb-1.5">{children}</h2>,
-                              h2: ({ children }) => <h2 className="text-[15px] font-semibold mt-4 mb-1.5">{children}</h2>,
-                              h3: ({ children }) => <h3 className="text-sm font-semibold mt-3 mb-1">{children}</h3>,
-                              p: ({ children }) => <p className="leading-6 my-2">{children}</p>,
-                              ul: ({ children }) => <ul className="list-disc pl-5 my-2 space-y-1">{children}</ul>,
-                              ol: ({ children }) => <ol className="list-decimal pl-5 my-2 space-y-1">{children}</ol>,
-                              li: ({ children }) => <li className="leading-6">{children}</li>,
-                              strong: ({ children }) => <strong className="font-semibold">{children}</strong>,
-                            }}
-                          >
-                            {row.auto_notes}
-                          </ReactMarkdown>
+                          <NotesMarkdown
+                            markdown={row.auto_notes}
+                            transcriptId={row.assemblyai_id}
+                            onSeek={(s) => playerRef.current?.seekToSeconds(s)}
+                          />
                         </div>
                         <div className="mt-4 flex items-center gap-2 border-t pt-2.5">
                           <Button
@@ -2120,6 +2243,8 @@ export default function TranscriptDetailPage({ params }: TranscriptDetailPagePro
                         </p>
                       </div>
                     ) : null}
+                    </>
+                    )}
                   </CardContent>
                 )}
               </Card>
@@ -2403,11 +2528,9 @@ export default function TranscriptDetailPage({ params }: TranscriptDetailPagePro
         <Dialog open={notesPromptOpen} onOpenChange={setNotesPromptOpen}>
           <DialogContent className="max-w-md">
             <DialogHeader>
-              <DialogTitle className="text-base font-semibold">
-                {row.auto_notes ? 'Regenerate summary' : 'Generate summary'}
-              </DialogTitle>
+              <DialogTitle className="text-base font-semibold">Generate with Claude</DialogTitle>
               <DialogDescription className="text-xs">
-                Optionally steer this run — tone, depth, focus, or language.
+                Optional instructions steer whichever you pick — tone, depth, focus, or language.
               </DialogDescription>
             </DialogHeader>
             <Textarea
@@ -2416,24 +2539,74 @@ export default function TranscriptDetailPage({ params }: TranscriptDetailPagePro
               placeholder={
                 'e.g. "be very detailed", "focus on action items and owners", "keep it to five bullets"'
               }
-              rows={3}
+              rows={2}
               maxLength={2000}
               className="text-sm"
             />
-            <DialogFooter>
-              <Button variant="ghost" size="sm" onClick={() => setNotesPromptOpen(false)}>
-                Cancel
-              </Button>
-              <Button
-                size="sm"
+            <div className="space-y-1.5">
+              <button
+                type="button"
                 disabled={generatingNotes}
                 onClick={() => {
                   setNotesPromptOpen(false);
+                  setSummaryTab('summary');
                   void handleGenerateNotes(notesInstructions);
                 }}
+                className="w-full rounded-md border px-3 py-2 text-left hover:bg-muted disabled:opacity-50"
               >
-                <Sparkles className="h-3.5 w-3.5" />
-                {notesInstructions.trim() ? 'Generate with instructions' : 'Generate'}
+                <span className="flex items-center gap-2 text-sm font-medium">
+                  <Sparkles className="h-4 w-4 text-primary" />
+                  Quick summary
+                </span>
+                <span className="mt-0.5 block text-xs text-muted-foreground">
+                  Fast and clean. Remembers earlier runs of this meeting (speaker fixes, attached
+                  files) when the session is still fresh.
+                </span>
+              </button>
+              {/\.(mp4|webm|mov|mkv|m4v)$/i.test(row.local_audio_path ?? '') && (
+                <button
+                  type="button"
+                  disabled={generatingReport}
+                  onClick={() => {
+                    setNotesPromptOpen(false);
+                    setSummaryTab('report');
+                    void handleGenerateReport(notesInstructions, true);
+                  }}
+                  className="w-full rounded-md border px-3 py-2 text-left hover:bg-muted disabled:opacity-50"
+                >
+                  <span className="flex items-center gap-2 text-sm font-medium">
+                    <Film className="h-4 w-4 text-primary" />
+                    Detailed report — with video frames
+                  </span>
+                  <span className="mt-0.5 block text-xs text-muted-foreground">
+                    Wiki-style deep dive at high effort: Claude looks at the screen shares and
+                    embeds screenshots, tables, and click-to-jump citations. Slower.
+                  </span>
+                </button>
+              )}
+              <button
+                type="button"
+                disabled={generatingReport}
+                onClick={() => {
+                  setNotesPromptOpen(false);
+                  setSummaryTab('report');
+                  void handleGenerateReport(notesInstructions, false);
+                }}
+                className="w-full rounded-md border px-3 py-2 text-left hover:bg-muted disabled:opacity-50"
+              >
+                <span className="flex items-center gap-2 text-sm font-medium">
+                  <FileText className="h-4 w-4 text-primary" />
+                  Detailed report — text only
+                </span>
+                <span className="mt-0.5 block text-xs text-muted-foreground">
+                  Same deep dive without reading the video. Cheaper; use when the meeting had no
+                  screen share worth seeing.
+                </span>
+              </button>
+            </div>
+            <DialogFooter>
+              <Button variant="ghost" size="sm" onClick={() => setNotesPromptOpen(false)}>
+                Cancel
               </Button>
             </DialogFooter>
           </DialogContent>
