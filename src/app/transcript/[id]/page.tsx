@@ -183,6 +183,12 @@ export default function TranscriptDetailPage({ params }: TranscriptDetailPagePro
       model: string | null;
       triggered_by_email: string | null;
     } | null;
+    latestReport: {
+      cost_usd: string | null;
+      duration_ms: number | null;
+      model: string | null;
+      triggered_by_email: string | null;
+    } | null;
     totals: { runs: number; cost_usd: string | null };
   } | null>(null);
 
@@ -435,7 +441,19 @@ export default function TranscriptDetailPage({ params }: TranscriptDetailPagePro
         const completed = (data.runs as Array<Record<string, unknown>> | undefined)?.find(
           (r) => r.status === 'completed' && r.kind === 'auto_notes'
         );
+        const completedReport = (data.runs as Array<Record<string, unknown>> | undefined)?.find(
+          (r) => r.status === 'completed' && r.kind === 'auto_report'
+        );
         setAiStats({
+          latestReport: completedReport
+            ? {
+                cost_usd: (completedReport.cost_usd as string | null) ?? null,
+                duration_ms: (completedReport.duration_ms as number | null) ?? null,
+                model: (completedReport.model as string | null) ?? null,
+                triggered_by_email:
+                  (completedReport.triggered_by_email as string | null) ?? null,
+              }
+            : null,
           latest: completed
             ? {
                 cost_usd: (completed.cost_usd as string | null) ?? null,
@@ -456,7 +474,7 @@ export default function TranscriptDetailPage({ params }: TranscriptDetailPagePro
     return () => {
       cancelled = true;
     };
-  }, [transcriptId, row?.auto_notes_at]);
+  }, [transcriptId, row?.auto_notes_at, row?.auto_report_at]);
 
   // While AAI is still transcribing (fresh upload or a diarization re-run),
   // poll until the status settles, then do a full reload — no more manual
@@ -2095,8 +2113,22 @@ export default function TranscriptDetailPage({ params }: TranscriptDetailPagePro
                               </Button>
                             )}
                             {row.auto_report_at && (
-                              <span className="ml-auto text-[11px] text-muted-foreground">
+                              <span
+                                className="ml-auto text-[11px] text-muted-foreground"
+                                title={
+                                  aiStats?.latestReport
+                                    ? `${aiStats.latestReport.model ?? 'model n/a'}` +
+                                      (aiStats.latestReport.triggered_by_email
+                                        ? ` · by ${aiStats.latestReport.triggered_by_email}`
+                                        : '')
+                                    : undefined
+                                }
+                              >
                                 generated {formatDistanceToNow(new Date(row.auto_report_at), { addSuffix: true })}
+                                {aiStats?.latestReport?.cost_usd != null &&
+                                  ` · $${Number(aiStats.latestReport.cost_usd).toFixed(2)}`}
+                                {aiStats?.latestReport?.duration_ms != null &&
+                                  ` · ${Math.round(aiStats.latestReport.duration_ms / 1000)}s`}
                               </span>
                             )}
                           </div>
