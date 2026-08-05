@@ -149,6 +149,8 @@ export default function TranscriptDetailPage({ params }: TranscriptDetailPagePro
   const [speakerSuggestions, setSpeakerSuggestions] = useState<SpeakerSuggestionMap>({});
   const [transcriptEdits, setTranscriptEdits] = useState<TranscriptEditMap>({});
   const [generatingNotes, setGeneratingNotes] = useState(false);
+  const [notesPromptOpen, setNotesPromptOpen] = useState(false);
+  const [notesInstructions, setNotesInstructions] = useState('');
   // Non-null = the summary predates a data change; the value is the banner text.
   const [notesStale, setNotesStale] = useState<string | null>(null);
   const [aiStats, setAiStats] = useState<{
@@ -477,12 +479,19 @@ export default function TranscriptDetailPage({ params }: TranscriptDetailPagePro
     }
   }, [transcriptId, guessingSpeakers]);
 
-  const handleGenerateNotes = useCallback(async () => {
+  const handleGenerateNotes = useCallback(async (instructions?: string) => {
     if (generatingNotes) return;
     setGeneratingNotes(true);
     try {
+      const trimmed = instructions?.trim();
       const res = await fetch(`/api/transcripts/${transcriptId}/notes`, {
         method: 'POST',
+        ...(trimmed
+          ? {
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ instructions: trimmed }),
+            }
+          : {}),
       });
       if (res.ok) {
         setRow((prev) =>
@@ -1477,7 +1486,7 @@ export default function TranscriptDetailPage({ params }: TranscriptDetailPagePro
             size="sm"
             className="h-8 w-full justify-start gap-2 text-[13px]"
             disabled={notesGenerating || row.status !== 'completed'}
-            onClick={handleGenerateNotes}
+            onClick={() => setNotesPromptOpen(true)}
           >
             {notesGenerating ? (
               <RefreshCw className="h-4 w-4 animate-spin text-muted-foreground" />
@@ -1970,7 +1979,7 @@ export default function TranscriptDetailPage({ params }: TranscriptDetailPagePro
                           size="sm"
                           className="h-6 shrink-0 text-[11px] text-primary hover:text-primary"
                           disabled={generatingNotes}
-                          onClick={handleGenerateNotes}
+                          onClick={() => void handleGenerateNotes()}
                         >
                           <RefreshCw className="h-3 w-3" />
                           Rerun
@@ -2025,7 +2034,7 @@ export default function TranscriptDetailPage({ params }: TranscriptDetailPagePro
                               size="sm"
                               className="h-7 text-xs"
                               disabled={generatingNotes}
-                              onClick={handleGenerateNotes}
+                              onClick={() => setNotesPromptOpen(true)}
                             >
                               <RefreshCw className="h-3 w-3" />
                               Regenerate
@@ -2069,7 +2078,7 @@ export default function TranscriptDetailPage({ params }: TranscriptDetailPagePro
                             variant="outline"
                             size="sm"
                             disabled={generatingNotes}
-                            onClick={handleGenerateNotes}
+                            onClick={() => void handleGenerateNotes()}
                           >
                             <RefreshCw className="h-3 w-3" />
                             Retry
@@ -2083,7 +2092,7 @@ export default function TranscriptDetailPage({ params }: TranscriptDetailPagePro
                           size="sm"
                           className="mt-3"
                           disabled={generatingNotes}
-                          onClick={handleGenerateNotes}
+                          onClick={() => setNotesPromptOpen(true)}
                         >
                           <Sparkles className="h-4 w-4" />
                           Generate with Claude
@@ -2373,6 +2382,45 @@ export default function TranscriptDetailPage({ params }: TranscriptDetailPagePro
           <ListTree className="h-4 w-4" />
           Outline
         </button>
+
+        <Dialog open={notesPromptOpen} onOpenChange={setNotesPromptOpen}>
+          <DialogContent className="max-w-md">
+            <DialogHeader>
+              <DialogTitle className="text-base font-semibold">
+                {row.auto_notes ? 'Regenerate summary' : 'Generate summary'}
+              </DialogTitle>
+              <DialogDescription className="text-xs">
+                Optionally steer this run — tone, depth, focus, or language.
+              </DialogDescription>
+            </DialogHeader>
+            <Textarea
+              value={notesInstructions}
+              onChange={(e) => setNotesInstructions(e.target.value)}
+              placeholder={
+                'e.g. "be very detailed", "focus on action items and owners", "keep it to five bullets"'
+              }
+              rows={3}
+              maxLength={2000}
+              className="text-sm"
+            />
+            <DialogFooter>
+              <Button variant="ghost" size="sm" onClick={() => setNotesPromptOpen(false)}>
+                Cancel
+              </Button>
+              <Button
+                size="sm"
+                disabled={generatingNotes}
+                onClick={() => {
+                  setNotesPromptOpen(false);
+                  void handleGenerateNotes(notesInstructions);
+                }}
+              >
+                <Sparkles className="h-3.5 w-3.5" />
+                {notesInstructions.trim() ? 'Generate with instructions' : 'Generate'}
+              </Button>
+            </DialogFooter>
+          </DialogContent>
+        </Dialog>
 
         <Dialog open={outlineOpenMobile} onOpenChange={setOutlineOpenMobile}>
           <DialogContent className="max-w-sm">

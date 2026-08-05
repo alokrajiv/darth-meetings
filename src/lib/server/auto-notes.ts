@@ -289,6 +289,9 @@ export async function generateAutoNotes(
     force?: boolean;
     /** Who clicked the button — recorded on the ai_runs stats row. */
     triggeredBy?: { userId: string; email: string };
+    /** Free-form user steering for THIS run ("be very detailed", "focus on
+     * action items", …). Appended to the prompt; not persisted. */
+    instructions?: string;
   } = {}
 ): Promise<void> {
   const key = `${ownerUserId}:${assemblyaiId}`;
@@ -318,8 +321,13 @@ export async function generateAutoNotes(
     const meetCrossRef = buildMeetCrossReference(row);
     const peopleContext = await buildPeopleContext(row);
 
+    const instructions = opts.instructions?.trim().slice(0, 2000);
+    const styleContext = instructions
+      ? `\nUSER INSTRUCTIONS for this run — follow them (they may adjust tone, depth, focus, or language, but the TITLE/SPEAKERS/SEGMENTS envelope format is non-negotiable):\n${instructions}\n\n`
+      : '';
+
     const prompt =
-      PROMPT_HEADER + attachmentContext + meetCrossRef + peopleContext + speakerContext + transcriptText;
+      PROMPT_HEADER + styleContext + attachmentContext + meetCrossRef + peopleContext + speakerContext + transcriptText;
 
     // Incremental top-up: a forced regeneration (speaker renamed, context
     // file attached, …) resumes the prior session instead of resending the
@@ -332,6 +340,7 @@ export async function generateAutoNotes(
     const topUpPrompt =
       `The meeting data has been updated since you generated these notes (speaker identifications, attached context files, or the team directory may have changed). Regenerate the notes now, following EXACTLY the same output format as before: the TITLE line, the SPEAKERS line, the SEGMENTS line, a blank line, then the markdown notes.\n\n` +
       `Current context (supersedes earlier versions; the transcript itself is unchanged):\n\n` +
+      styleContext +
       attachmentContext +
       peopleContext +
       speakerContext.replace(/Transcript follows:\n\n$/, '');

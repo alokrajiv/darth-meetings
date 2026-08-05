@@ -13,8 +13,20 @@ export const runtime = 'nodejs';
  * Fire-and-forget: responds immediately with status 'running'; the client
  * polls GET /api/transcripts/:id until auto_notes_status settles.
  */
-export const POST = withAuth(async ({ user }, { params }) => {
+export const POST = withAuth(async ({ user, request }, { params }) => {
   const { id } = await params;
+
+  // Optional body: { instructions?: string } — free-form steering for this
+  // regeneration ("be very detailed", "focus on decisions", …).
+  let instructions: string | undefined;
+  try {
+    const body = (await request.json()) as { instructions?: unknown };
+    if (typeof body.instructions === 'string' && body.instructions.trim()) {
+      instructions = body.instructions.trim().slice(0, 2000);
+    }
+  } catch {
+    // no/invalid body — plain regeneration
+  }
 
   const access = await resolveAccess(user.userId, user.email, id);
   if (!access) {
@@ -33,6 +45,7 @@ export const POST = withAuth(async ({ user }, { params }) => {
   void generateAutoNotes(access.ownerUserId, id, {
     force: true,
     triggeredBy: { userId: user.userId, email: user.email },
+    instructions,
   });
 
   // Also refresh voiceprint suggestions — lets older transcripts (completed
