@@ -1,6 +1,6 @@
 'use client';
 
-import { useState } from 'react';
+import { useRef, useState } from 'react';
 import { Button } from '@/components/ui/button';
 import { getGoogleAccessToken } from '@/lib/google-token';
 import type { SpeakerSuggestionMap, StoredTranscript } from '@/lib/format';
@@ -11,7 +11,11 @@ import {
   FileText,
   Fingerprint,
   Loader2,
+  Upload,
 } from 'lucide-react';
+
+// Keep in sync with `proxyClientMaxBodySize` in next.config.ts / nginx.
+const MAX_UPLOAD_BYTES = 4 * 1024 * 1024 * 1024; // 4GB
 
 interface TranscriptSourcesCardProps {
   row: StoredTranscript;
@@ -39,6 +43,8 @@ export function TranscriptSourcesCard({
 }: TranscriptSourcesCardProps) {
   const [fetching, setFetching] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [uploadPct, setUploadPct] = useState<number | null>(null);
+  const uploadInputRef = useRef<HTMLInputElement>(null);
 
   const isMeetPrimary = row.assemblyai_id.startsWith('gmeet-');
   const ctx = row.gmeet_context;
@@ -53,6 +59,15 @@ export function TranscriptSourcesCard({
     audioAvailable && !!(row.local_audio_path || row.audio_url || row.source === 'uploaded');
   const recordingFileId = ctx?.videoFileId ?? ctx?.actuals?.recordings?.[0]?.fileId;
   const canFetchAudio = !hasAudio && !row.local_audio_path && !!recordingFileId && canEdit;
+  // Text-only imports (Teams export, pasted transcript, …) with no known
+  // recording anywhere: offer to upload the meeting's audio/video and run a
+  // real AAI transcription. New row alongside, this import stays untouched.
+  const canUploadRecording =
+    canEdit &&
+    row.source === 'imported' &&
+    !isMeetPrimary &&
+    !row.local_audio_path &&
+    !recordingFileId;
 
   // Cheap pooled-mic tell on quick imports: Meet's snapshot knows who
   // actually JOINED; if clearly more people joined than Meet heard voices,
@@ -89,6 +104,57 @@ export function TranscriptSourcesCard({
     } finally {
       setFetching(false);
     }
+  };
+
+  const uploadAndRetranscribe = (file: File) => {
+    if (file.size > MAX_UPLOAD_BYTES) {
+      setError('File is larger than the 4GB upload limit.');
+      return;
+    }
+    if (
+      !window.confirm(
+        `Transcribe "${file.name}" with AssemblyAI (voice-level speakers + timings)? ` +
+          'A new transcript is created alongside this one — this import stays untouched.'
+      )
+    ) {
+      return;
+    }
+    setError(null);
+    setUploadPct(0);
+
+    // Raw-body XHR (not fetch): the file IS the body — the server streams it
+    // to disk — and xhr.upload.onprogress gives real progress on multi-GB
+    // sends. Same shape as the home-page uploader.
+    const xhr = new XMLHttpRequest();
+    const qs = new URLSearchParams({ source_id: row.assemblyai_id });
+    xhr.open('POST', `/api/transcripts?${qs}`);
+    xhr.setRequestHeader('content-type', file.type || 'application/octet-stream');
+    xhr.setRequestHeader('x-filename', encodeURIComponent(file.name));
+    xhr.upload.onprogress = (e) => {
+      if (e.lengthComputable && e.total > 0) {
+        setUploadPct(Math.round((e.loaded / e.total) * 100));
+      }
+    };
+    xhr.onload = () => {
+      try {
+        const payload = JSON.parse(xhr.responseText || '{}') as {
+          transcript?: { assemblyai_id?: string };
+          error?: string;
+        };
+        if (xhr.status !== 201 || !payload.transcript?.assemblyai_id) {
+          throw new Error(payload.error || `Upload failed (${xhr.status})`);
+        }
+        window.location.href = `/transcript/${payload.transcript.assemblyai_id}`;
+      } catch (err) {
+        setError(err instanceof Error ? err.message : 'Upload failed');
+        setUploadPct(null);
+      }
+    };
+    xhr.onerror = () => {
+      setError('Upload failed — network error');
+      setUploadPct(null);
+    };
+    xhr.send(file);
   };
 
   const pct = (c: number) => `${Math.round(c * 100)}%`;
@@ -194,6 +260,40 @@ export function TranscriptSourcesCard({
           &ldquo;Diarize with AssemblyAI&rdquo; separates them by voice
           {row.local_audio_path ? '.' : ' (fetch audio first).'}
         </p>
+      )}
+      {canUploadRecording && (
+        <>
+          <input
+            ref={uploadInputRef}
+            type="file"
+            accept="audio/*,video/*,.mp4,.m4a,.mp3,.wav,.webm,.mkv,.mov"
+            className="hidden"
+            onChange={(e) => {
+              const file = e.target.files?.[0];
+              e.target.value = '';
+              if (file) uploadAndRetranscribe(file);
+            }}
+          />
+          <Button
+            variant="outline"
+            size="sm"
+            className="mt-2 h-8 w-full justify-start gap-2 text-[13px]"
+            disabled={uploadPct !== null}
+            onClick={() => uploadInputRef.current?.click()}
+            title="Upload the meeting's recording (audio or video) and transcribe it with AssemblyAI — voice-level speakers and real timings; a new transcript is created alongside this import"
+          >
+            {uploadPct !== null ? (
+              <Loader2 className="h-4 w-4 animate-spin text-muted-foreground" />
+            ) : (
+              <Upload className="h-4 w-4 text-primary" />
+            )}
+            {uploadPct === null
+              ? 'Upload recording & re-transcribe'
+              : uploadPct < 100
+                ? `Uploading… ${uploadPct}%`
+                : 'Submitting to AssemblyAI…'}
+          </Button>
+        </>
       )}
       {canFetchAudio && (
         <Button

@@ -10,6 +10,7 @@ import { deleteForUser as deleteSpeakerMappingsForUser } from '@/db-ops/speaker-
 import { resolveAccess } from '@/db-ops/transcript-access';
 import { logActivity } from '@/db-ops/transcript-activity';
 import { deleteTranscript as aaiDelete } from '@/lib/server/assemblyai';
+import { deleteAudioFile } from '@/lib/server/audio-storage';
 import { refreshIfPending } from '@/lib/server/transcript-sync';
 
 export const runtime = 'nodejs';
@@ -124,6 +125,9 @@ export const DELETE = withAuth(async ({ user }, { params }) => {
   await aaiDelete(id);
   await deleteSpeakerMappingsForUser(access.ownerUserId, id);
   await deleteForUser(access.ownerUserId, id);
+  if (access.row.local_audio_path) {
+    await deleteAudioFile(access.row.local_audio_path);
+  }
 
   return NextResponse.json({ ok: true });
 });
