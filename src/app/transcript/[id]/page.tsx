@@ -155,6 +155,21 @@ export default function TranscriptDetailPage({ params }: TranscriptDetailPagePro
   const [notesInstructions, setNotesInstructions] = useState('');
   const [summaryTab, setSummaryTab] = useState<'summary' | 'report'>('summary');
   const [generatingReport, setGeneratingReport] = useState(false);
+
+  // Deep-linkable tab: ?tab=report selects the report tab on load, and tab
+  // clicks keep the URL in sync so the address bar is always shareable.
+  useEffect(() => {
+    if (new URLSearchParams(window.location.search).get('tab') === 'report') {
+      setSummaryTab('report');
+    }
+  }, []);
+  const selectSummaryTab = useCallback((tab: 'summary' | 'report') => {
+    setSummaryTab(tab);
+    const url = new URL(window.location.href);
+    if (tab === 'report') url.searchParams.set('tab', 'report');
+    else url.searchParams.delete('tab');
+    window.history.replaceState(null, '', url.toString());
+  }, []);
   // Non-null = the summary predates a data change; the value is the banner text.
   const [notesStale, setNotesStale] = useState<string | null>(null);
   const [aiStats, setAiStats] = useState<{
@@ -2022,14 +2037,14 @@ export default function TranscriptDetailPage({ params }: TranscriptDetailPagePro
                     <div className="mb-3 flex items-center gap-1 rounded-lg bg-muted/60 p-0.5 text-xs w-fit">
                       <button
                         type="button"
-                        onClick={() => setSummaryTab('summary')}
+                        onClick={() => selectSummaryTab('summary')}
                         className={`rounded-md px-2.5 py-1 font-medium transition-colors ${summaryTab === 'summary' ? 'bg-card shadow-sm' : 'text-muted-foreground hover:text-foreground'}`}
                       >
                         Summary
                       </button>
                       <button
                         type="button"
-                        onClick={() => setSummaryTab('report')}
+                        onClick={() => selectSummaryTab('report')}
                         className={`flex items-center gap-1 rounded-md px-2.5 py-1 font-medium transition-colors ${summaryTab === 'report' ? 'bg-card shadow-sm' : 'text-muted-foreground hover:text-foreground'}`}
                       >
                         Detailed report
@@ -2549,7 +2564,7 @@ export default function TranscriptDetailPage({ params }: TranscriptDetailPagePro
                 disabled={generatingNotes}
                 onClick={() => {
                   setNotesPromptOpen(false);
-                  setSummaryTab('summary');
+                  selectSummaryTab('summary');
                   void handleGenerateNotes(notesInstructions);
                 }}
                 className="w-full rounded-md border px-3 py-2 text-left hover:bg-muted disabled:opacity-50"
@@ -2569,7 +2584,7 @@ export default function TranscriptDetailPage({ params }: TranscriptDetailPagePro
                   disabled={generatingReport}
                   onClick={() => {
                     setNotesPromptOpen(false);
-                    setSummaryTab('report');
+                    selectSummaryTab('report');
                     void handleGenerateReport(notesInstructions, true);
                   }}
                   className="w-full rounded-md border px-3 py-2 text-left hover:bg-muted disabled:opacity-50"
@@ -2589,7 +2604,7 @@ export default function TranscriptDetailPage({ params }: TranscriptDetailPagePro
                 disabled={generatingReport}
                 onClick={() => {
                   setNotesPromptOpen(false);
-                  setSummaryTab('report');
+                  selectSummaryTab('report');
                   void handleGenerateReport(notesInstructions, false);
                 }}
                 className="w-full rounded-md border px-3 py-2 text-left hover:bg-muted disabled:opacity-50"
