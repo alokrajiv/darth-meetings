@@ -1,6 +1,6 @@
 'use client';
 
-import ReactMarkdown from 'react-markdown';
+import ReactMarkdown, { defaultUrlTransform } from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import { Paperclip, Play } from 'lucide-react';
 
@@ -29,6 +29,11 @@ export function NotesMarkdown({ markdown, transcriptId, onSeek }: NotesMarkdownP
   return (
     <ReactMarkdown
       remarkPlugins={[remarkGfm]}
+      // Default sanitizer strips unknown protocols, which would erase our
+      // t:<ms> and attachment:<id> hrefs before the renderers see them.
+      urlTransform={(url) =>
+        /^(t:\d+|attachment:\d+)$/.test(url) ? url : defaultUrlTransform(url)
+      }
       components={{
         a: ({ href, children }) => {
           const h = typeof href === 'string' ? href : '';
