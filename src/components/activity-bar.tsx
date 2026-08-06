@@ -19,6 +19,7 @@ import {
   UserPlus,
   UserMinus,
   ShieldCheck,
+  Crown,
 } from 'lucide-react';
 
 export type ActivityAction =
@@ -30,6 +31,7 @@ export type ActivityAction =
   | 'share_add'
   | 'share_update'
   | 'share_remove'
+  | 'owner_transfer'
   | 'generate_notes'
   | 'set_notes'
   | 'set_report';
@@ -129,6 +131,10 @@ function actionVerb(row: ActivityRow): string {
       const d = row.details as { withEmail?: string } | null;
       return d?.withEmail ? `removed ${d.withEmail}` : 'removed a collaborator';
     }
+    case 'owner_transfer': {
+      const d = row.details as { toEmail?: string } | null;
+      return d?.toEmail ? `transferred ownership to ${d.toEmail}` : 'transferred ownership';
+    }
     case 'generate_notes':
       return 'generated AI notes';
     case 'set_notes': {
@@ -162,6 +168,8 @@ function actionIcon(action: ActivityAction) {
       return <UserMinus className="h-3.5 w-3.5" />;
     case 'share_update':
       return <ShieldCheck className="h-3.5 w-3.5" />;
+    case 'owner_transfer':
+      return <Crown className="h-3.5 w-3.5" />;
     default:
       return <Eye className="h-3.5 w-3.5" />;
   }

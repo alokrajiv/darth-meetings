@@ -1,20 +1,22 @@
 import { NextResponse } from 'next/server';
 import { withAuth } from '@/lib/auth/with-auth';
 import { resolveAccess } from '@/db-ops/transcript-access';
-import { logActivity } from '@/db-ops/transcript-activity';
+import { identityForUser, logActivity, userIdForEmail } from '@/db-ops/transcript-activity';
 import {
   addShare,
   listByTranscript,
   removeShare,
+  transferOwnership,
   updateAccess,
 } from '@/db-ops/transcript-shares';
 
 export const runtime = 'nodejs';
 
 // Share management for a single transcript.
-//   GET    — list collaborators (any access)
+//   GET    — list collaborators + owner identity (any access)
 //   POST   — add a collaborator (owner or editor)
-//   PATCH  — update a collaborator's access level (owner or editor)
+//   PATCH  — update a collaborator's access level (owner or editor), or
+//            transfer ownership with access: 'owner' (owner only)
 //   DELETE — remove a collaborator (owner or editor)
 
 function canManageShares(access: string): boolean {
@@ -37,8 +39,18 @@ export const GET = withAuth(async ({ user }, { params }) => {
   const access = await resolveAccess(user.userId, user.email, id);
   if (!access) return NextResponse.json({ error: 'Not found' }, { status: 404 });
 
-  const shares = await listByTranscript(access.row.id);
-  return NextResponse.json({ shares });
+  const [shares, ownerIdentity] = await Promise.all([
+    listByTranscript(access.row.id),
+    identityForUser(access.ownerUserId),
+  ]);
+  return NextResponse.json({
+    shares,
+    owner: {
+      email: ownerIdentity?.email ?? null,
+      name: ownerIdentity?.name ?? null,
+      isMe: access.access === 'owner',
+    },
+  });
 });
 
 export const POST = withAuth(async ({ user, request }, { params }) => {
@@ -75,6 +87,16 @@ export const POST = withAuth(async ({ user, request }, { params }) => {
   if (normalized === user.email.trim().toLowerCase()) {
     return NextResponse.json(
       { error: "You can't share a transcript with yourself" },
+      { status: 400 }
+    );
+  }
+
+  // Editors can share, so "yourself" no longer implies "the owner" — block
+  // adding the owner as a collaborator explicitly.
+  const ownerIdentity = await identityForUser(access.ownerUserId);
+  if (ownerIdentity && normalized === ownerIdentity.email.trim().toLowerCase()) {
+    return NextResponse.json(
+      { error: 'That person already owns this transcript' },
       { status: 400 }
     );
   }
@@ -127,6 +149,58 @@ export const PATCH = withAuth(async ({ user, request }, { params }) => {
   if (!isValidEmail(email)) {
     return NextResponse.json({ error: 'email is required' }, { status: 400 });
   }
+
+  if (requestedAccess === 'owner') {
+    if (access.access !== 'owner') {
+      return NextResponse.json(
+        { error: 'Only the owner can transfer ownership' },
+        { status: 403 }
+      );
+    }
+
+    const normalized = email.trim().toLowerCase();
+    const shares = await listByTranscript(access.row.id);
+    const target = shares.find((s) => s.shared_with_email.toLowerCase() === normalized);
+    if (!target) {
+      return NextResponse.json(
+        { error: 'Share the transcript with them first, then transfer ownership' },
+        { status: 404 }
+      );
+    }
+
+    const newOwnerUserId = await userIdForEmail(normalized);
+    if (!newOwnerUserId) {
+      return NextResponse.json(
+        { error: "They haven't opened Darth Meetings yet, so ownership can't be transferred to them" },
+        { status: 400 }
+      );
+    }
+
+    const me = await identityForUser(user.userId);
+    const result = await transferOwnership({
+      transcriptRowId: access.row.id,
+      assemblyaiId: id,
+      oldOwnerUserId: access.ownerUserId,
+      oldOwnerEmail: user.email,
+      oldOwnerName: me?.name ?? null,
+      newOwnerUserId,
+      newOwnerEmail: normalized,
+    });
+    if ('error' in result) {
+      return NextResponse.json({ error: result.error }, { status: 409 });
+    }
+
+    void logActivity({
+      transcriptId: access.row.id,
+      userId: user.userId,
+      email: user.email,
+      action: 'owner_transfer',
+      details: { toEmail: normalized },
+    });
+
+    return NextResponse.json({ transferred: true });
+  }
+
   if (!isValidAccess(requestedAccess)) {
     return NextResponse.json({ error: 'access must be "edit" or "read"' }, { status: 400 });
   }

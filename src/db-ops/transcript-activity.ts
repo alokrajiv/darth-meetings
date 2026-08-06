@@ -29,6 +29,7 @@ export type ActivityAction =
   | 'share_add'
   | 'share_update'
   | 'share_remove'
+  | 'owner_transfer'
   | 'generate_notes'
   | 'set_notes'
   | 'set_report';
@@ -85,6 +86,45 @@ async function resolveDisplayName(email: string): Promise<string | null> {
   }
 
   return null;
+}
+
+export interface UserIdentity {
+  userId: string;
+  email: string;
+  name: string | null;
+}
+
+/**
+ * Latest known identity (email + display name) for an SSO user id. There is
+ * no users table — the activity log is the only place user_id and user_email
+ * appear together, so we take the most recent row.
+ */
+export async function identityForUser(userId: string): Promise<UserIdentity | null> {
+  const rows = await sql<Array<{ user_email: string; user_name: string | null }>>`
+    SELECT user_email, user_name
+    FROM ${sql(SCHEMA)}.transcript_activity
+    WHERE user_id = ${userId}
+    ORDER BY at DESC
+    LIMIT 1
+  `;
+  if (!rows[0]) return null;
+  return { userId, email: rows[0].user_email, name: rows[0].user_name };
+}
+
+/**
+ * Inverse lookup: SSO user id for an email, again via the activity log.
+ * Returns null for people who have never opened the app — they have no
+ * user id yet, so e.g. ownership can't be transferred to them.
+ */
+export async function userIdForEmail(email: string): Promise<string | null> {
+  const rows = await sql<Array<{ user_id: string }>>`
+    SELECT user_id
+    FROM ${sql(SCHEMA)}.transcript_activity
+    WHERE user_email = ${email.trim().toLowerCase()}
+    ORDER BY at DESC
+    LIMIT 1
+  `;
+  return rows[0]?.user_id ?? null;
 }
 
 /**

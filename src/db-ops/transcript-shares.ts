@@ -108,6 +108,85 @@ export async function updateAccess(
   return rows[0] ?? null;
 }
 
+export interface TransferOwnershipInput {
+  transcriptRowId: number;
+  assemblyaiId: string;
+  oldOwnerUserId: string;
+  oldOwnerEmail: string;
+  oldOwnerName: string | null;
+  newOwnerUserId: string;
+  newOwnerEmail: string;
+}
+
+/**
+ * Make an existing collaborator the owner. Moves the transcript row plus the
+ * owner-keyed satellite rows (transcript_edits, speaker_mappings — both keyed
+ * on (user_id, assemblyai_id)) to the new owner, deletes the new owner's
+ * share row, and adds the old owner back as an editor. All in one
+ * transaction so a failure can't leave the transcript half-transferred.
+ */
+export async function transferOwnership(
+  input: TransferOwnershipInput
+): Promise<{ ok: true } | { error: string }> {
+  const newEmail = normEmail(input.newOwnerEmail);
+  const oldEmail = normEmail(input.oldOwnerEmail);
+
+  // UNIQUE(user_id, assemblyai_id) on transcripts: if the target already owns
+  // their own copy of this recording (possible with Meet imports), moving the
+  // row would collide. Bail with a clear error instead.
+  const clash = await sql<{ id: number }[]>`
+    SELECT id FROM ${sql(SCHEMA)}.transcripts
+    WHERE user_id = ${input.newOwnerUserId}
+      AND assemblyai_id = ${input.assemblyaiId}
+      AND id <> ${input.transcriptRowId}
+  `;
+  if (clash.length > 0) {
+    return { error: 'They already own their own copy of this transcript' };
+  }
+
+  await sql.begin(async (tx) => {
+    await tx`
+      UPDATE ${sql(SCHEMA)}.transcripts
+      SET user_id = ${input.newOwnerUserId}
+      WHERE id = ${input.transcriptRowId}
+    `;
+    await tx`
+      UPDATE ${sql(SCHEMA)}.transcript_edits
+      SET user_id = ${input.newOwnerUserId}
+      WHERE user_id = ${input.oldOwnerUserId} AND assemblyai_id = ${input.assemblyaiId}
+    `;
+    await tx`
+      UPDATE ${sql(SCHEMA)}.speaker_mappings
+      SET user_id = ${input.newOwnerUserId}
+      WHERE user_id = ${input.oldOwnerUserId} AND assemblyai_id = ${input.assemblyaiId}
+    `;
+    await tx`
+      UPDATE ${sql(SCHEMA)}.transcript_shares
+      SET owner_user_id = ${input.newOwnerUserId}
+      WHERE transcript_id = ${input.transcriptRowId}
+    `;
+    await tx`
+      DELETE FROM ${sql(SCHEMA)}.transcript_shares
+      WHERE transcript_id = ${input.transcriptRowId}
+        AND shared_with_email = ${newEmail}
+    `;
+    await tx`
+      INSERT INTO ${sql(SCHEMA)}.transcript_shares (
+        transcript_id, owner_user_id, shared_by_user_id,
+        shared_with_email, shared_with_name, shared_with_ppl_id, access
+      ) VALUES (
+        ${input.transcriptRowId}, ${input.newOwnerUserId}, ${input.oldOwnerUserId},
+        ${oldEmail}, ${input.oldOwnerName}, ${null}, 'edit'
+      )
+      ON CONFLICT (transcript_id, shared_with_email) DO UPDATE
+        SET access = 'edit', updated_at = now()
+    `;
+  });
+
+  publishEvent({ kind: 'shares' });
+  return { ok: true };
+}
+
 export async function removeShare(transcriptId: number, email: string): Promise<boolean> {
   const rows = await sql<{ id: number }[]>`
     DELETE FROM ${sql(SCHEMA)}.transcript_shares

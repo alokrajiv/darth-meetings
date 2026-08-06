@@ -11,7 +11,7 @@ import {
 } from '@/components/ui/dialog';
 import { Button } from '@/components/ui/button';
 import { Badge } from '@/components/ui/badge';
-import { Check, Loader2, Trash2, Users } from 'lucide-react';
+import { Check, Crown, Loader2, Trash2, Users } from 'lucide-react';
 import { UserPicker, type PickerPerson } from '@/components/user-picker';
 import type { TranscriptShare, TranscriptAccess } from '@/lib/format';
 
@@ -39,6 +39,7 @@ export function ShareDialog({
   onSharesChanged,
 }: ShareDialogProps) {
   const [shares, setShares] = useState<TranscriptShare[]>([]);
+  const [owner, setOwner] = useState<{ email: string | null; name: string | null } | null>(null);
   const [loading, setLoading] = useState(false);
   const [pendingAccess, setPendingAccess] = useState<'edit' | 'read'>('edit');
   const [pickerKey, setPickerKey] = useState(0); // bump to reset the picker after add
@@ -68,8 +69,12 @@ export function ShareDialog({
         credentials: 'include',
       });
       if (!res.ok) throw new Error(`Failed (${res.status})`);
-      const { shares: rows } = (await res.json()) as { shares: TranscriptShare[] };
+      const { shares: rows, owner: ownerInfo } = (await res.json()) as {
+        shares: TranscriptShare[];
+        owner?: { email: string | null; name: string | null };
+      };
       setShares(rows);
+      setOwner(ownerInfo ?? null);
       onSharesChangedRef.current?.(rows);
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to load');
@@ -163,6 +168,32 @@ export function ShareDialog({
       await loadShares();
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to update access');
+    }
+  };
+
+  const handleTransferOwnership = async (share: TranscriptShare) => {
+    const who = share.shared_with_name || share.shared_with_email;
+    const sure = window.confirm(
+      `Make ${who} the owner of this transcript? You'll stay on as an editor.`
+    );
+    if (!sure) return;
+    try {
+      setError(null);
+      const res = await fetch(`/api/transcripts/${transcriptId}/shares`, {
+        method: 'PATCH',
+        credentials: 'include',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ email: share.shared_with_email, access: 'owner' }),
+      });
+      if (!res.ok) {
+        const body = (await res.json().catch(() => ({}))) as { error?: string };
+        throw new Error(body.error || `Failed (${res.status})`);
+      }
+      // Caller's access level just changed (owner → edit) and lots of parent
+      // state hangs off it — a full reload is the honest refresh.
+      window.location.reload();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Failed to transfer ownership');
     }
   };
 
@@ -269,12 +300,28 @@ export function ShareDialog({
           <div className="border-b px-3 py-2 text-xs font-medium text-muted-foreground">
             {shares.length === 0
               ? 'No collaborators yet'
-              : `${shares.length} ${shares.length === 1 ? 'person has' : 'people have'} access`}
+              : `${shares.length + (owner?.email ? 1 : 0)} ${
+                  shares.length + (owner?.email ? 1 : 0) === 1 ? 'person has' : 'people have'
+                } access`}
           </div>
           <div className="max-h-72 divide-y overflow-auto">
             {loading && shares.length === 0 && (
               <div className="flex items-center justify-center py-6 text-xs text-muted-foreground">
                 <Loader2 className="mr-2 h-3 w-3 animate-spin" /> Loading…
+              </div>
+            )}
+            {owner?.email && (
+              <div className="flex items-center gap-3 px-3 py-2 text-sm">
+                <div className="flex h-7 w-7 shrink-0 items-center justify-center rounded-full bg-muted text-xs font-medium">
+                  {(owner.name || owner.email).charAt(0).toUpperCase()}
+                </div>
+                <div className="min-w-0 flex-1">
+                  <div className="truncate font-medium">{owner.name || owner.email}</div>
+                  <div className="truncate text-xs text-muted-foreground">{owner.email}</div>
+                </div>
+                <Badge variant="outline" className="gap-1 text-[10px]">
+                  <Crown className="h-3 w-3" /> Owner
+                </Badge>
               </div>
             )}
             {shares.map((s) => (
@@ -297,13 +344,21 @@ export function ShareDialog({
                   <div className="flex items-center gap-1">
                     <select
                       value={s.access}
-                      onChange={(e) =>
-                        handleAccessChange(s.shared_with_email, e.target.value as 'edit' | 'read')
-                      }
+                      onChange={(e) => {
+                        if (e.target.value === 'owner') {
+                          // Confirm-or-revert: the select is controlled, so
+                          // snap the DOM back before the dialog pops.
+                          e.target.value = s.access;
+                          void handleTransferOwnership(s);
+                          return;
+                        }
+                        handleAccessChange(s.shared_with_email, e.target.value as 'edit' | 'read');
+                      }}
                       className="h-7 rounded border bg-background px-1.5 text-xs"
                     >
                       <option value="edit">Editor</option>
                       <option value="read">Read-only</option>
+                      {callerAccess === 'owner' && <option value="owner">Make owner…</option>}
                     </select>
                     <Button
                       variant="ghost"

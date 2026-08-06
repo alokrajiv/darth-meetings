@@ -1,6 +1,7 @@
 import { NextResponse } from 'next/server';
 import { withAuth } from '@/lib/auth/with-auth';
 import { resolveAccess } from '@/db-ops/transcript-access';
+import { identityForUser } from '@/db-ops/transcript-activity';
 import { getForUser as getMappingsForUser } from '@/db-ops/speaker-mappings';
 import { listByTranscript as listShares } from '@/db-ops/transcript-shares';
 import { searchPeople } from '@/db-ops/people';
@@ -30,12 +31,16 @@ export const GET = withAuth(async ({ user }, { params }) => {
     return NextResponse.json({ suggestions: [] });
   }
 
-  const [mappings, shares] = await Promise.all([
+  const [mappings, shares, ownerIdentity] = await Promise.all([
     getMappingsForUser(access.ownerUserId, id),
     listShares(access.row.id),
+    identityForUser(access.ownerUserId),
   ]);
 
+  // Exclude the caller, the owner (an editor fetching this is not the owner),
+  // and anyone already shared.
   const excluded = new Set<string>([user.email.trim().toLowerCase()]);
+  if (ownerIdentity) excluded.add(ownerIdentity.email.trim().toLowerCase());
   for (const s of shares) excluded.add(s.shared_with_email.toLowerCase());
 
   const found = new Map<string, { name: string; email: string; reason: string }>();
