@@ -13,9 +13,13 @@ export const runtime = 'nodejs';
 
 // Share management for a single transcript.
 //   GET    — list collaborators (any access)
-//   POST   — add a collaborator (owner only)
-//   PATCH  — update a collaborator's access level (owner only)
-//   DELETE — remove a collaborator (owner only)
+//   POST   — add a collaborator (owner or editor)
+//   PATCH  — update a collaborator's access level (owner or editor)
+//   DELETE — remove a collaborator (owner or editor)
+
+function canManageShares(access: string): boolean {
+  return access === 'owner' || access === 'edit';
+}
 
 function isValidAccess(value: unknown): value is 'edit' | 'read' {
   return value === 'edit' || value === 'read';
@@ -42,8 +46,8 @@ export const POST = withAuth(async ({ user, request }, { params }) => {
 
   const access = await resolveAccess(user.userId, user.email, id);
   if (!access) return NextResponse.json({ error: 'Not found' }, { status: 404 });
-  if (access.access !== 'owner') {
-    return NextResponse.json({ error: 'Only the owner can share' }, { status: 403 });
+  if (!canManageShares(access.access)) {
+    return NextResponse.json({ error: 'Only the owner or an editor can share' }, { status: 403 });
   }
 
   let body: unknown;
@@ -101,8 +105,11 @@ export const PATCH = withAuth(async ({ user, request }, { params }) => {
 
   const access = await resolveAccess(user.userId, user.email, id);
   if (!access) return NextResponse.json({ error: 'Not found' }, { status: 404 });
-  if (access.access !== 'owner') {
-    return NextResponse.json({ error: 'Only the owner can change access' }, { status: 403 });
+  if (!canManageShares(access.access)) {
+    return NextResponse.json(
+      { error: 'Only the owner or an editor can change access' },
+      { status: 403 }
+    );
   }
 
   let body: unknown;
@@ -145,8 +152,11 @@ export const DELETE = withAuth(async ({ user, request }, { params }) => {
 
   const access = await resolveAccess(user.userId, user.email, id);
   if (!access) return NextResponse.json({ error: 'Not found' }, { status: 404 });
-  if (access.access !== 'owner') {
-    return NextResponse.json({ error: 'Only the owner can remove shares' }, { status: 403 });
+  if (!canManageShares(access.access)) {
+    return NextResponse.json(
+      { error: 'Only the owner or an editor can remove shares' },
+      { status: 403 }
+    );
   }
 
   let body: unknown;

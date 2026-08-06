@@ -19,7 +19,7 @@ interface ShareDialogProps {
   open: boolean;
   onOpenChange: (open: boolean) => void;
   transcriptId: string;
-  /** Current caller's access — only 'owner' can mutate shares. */
+  /** Current caller's access — 'owner' and 'edit' can mutate shares. */
   callerAccess: TranscriptAccess;
   /** Fired after a successful add so parent state (e.g. collaborator email
    *  set in the transcript detail page) can update without a full refetch. */
@@ -27,8 +27,9 @@ interface ShareDialogProps {
 }
 
 /**
- * Dialog for managing who has access to a transcript. Owner sees the full
- * picker + per-row access controls; collaborators see a read-only list.
+ * Dialog for managing who has access to a transcript. Owner and editors see
+ * the full picker + per-row access controls; read-only collaborators see a
+ * read-only list.
  */
 export function ShareDialog({
   open,
@@ -47,7 +48,7 @@ export function ShareDialog({
   >([]);
   const [addingSuggestion, setAddingSuggestion] = useState<string | null>(null);
 
-  const canManage = callerAccess === 'owner';
+  const canManage = callerAccess === 'owner' || callerAccess === 'edit';
 
   // Callers pass onSharesChanged inline; keeping it in loadShares' dep array
   // would give the callback a fresh identity on every parent render, which
@@ -191,7 +192,7 @@ export function ShareDialog({
           <DialogDescription className="text-[13px] leading-5">
             {canManage
               ? 'Share this transcript with other people in your organisation. Editors can edit text and speaker names; read-only collaborators can only view.'
-              : 'People with access to this transcript. Only the owner can change sharing.'}
+              : 'People with access to this transcript. Only the owner or an editor can change sharing.'}
           </DialogDescription>
         </DialogHeader>
 

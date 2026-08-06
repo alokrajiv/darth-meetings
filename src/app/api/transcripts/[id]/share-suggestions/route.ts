@@ -20,13 +20,13 @@ const EMAIL_RE = /[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}/i;
  * anyone already shared. Powers the "Suggested from this meeting" section of
  * the share dialog and the nudge dot on Share buttons.
  *
- * Owner-only (only the owner can share); everyone else gets [].
+ * Owner and editors only (they can share); read-only collaborators get [].
  */
 export const GET = withAuth(async ({ user }, { params }) => {
   const { id } = await params;
   const access = await resolveAccess(user.userId, user.email, id);
   if (!access) return NextResponse.json({ error: 'Not found' }, { status: 404 });
-  if (access.access !== 'owner') {
+  if (access.access !== 'owner' && access.access !== 'edit') {
     return NextResponse.json({ suggestions: [] });
   }
 

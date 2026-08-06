@@ -145,7 +145,6 @@ export default function TranscriptDetailPage({ params }: TranscriptDetailPagePro
   const [error, setError] = useState<string | null>(null);
 
   const canEdit = access === 'owner' || access === 'edit';
-  const isOwner = access === 'owner';
 
   const [speakerLabels, setSpeakerLabels] = useState<SpeakerLabel[]>([]);
   const [speakerSuggestions, setSpeakerSuggestions] = useState<SpeakerSuggestionMap>({});
@@ -1121,10 +1120,10 @@ export default function TranscriptDetailPage({ params }: TranscriptDetailPagePro
 
   const handlePickPerson = useCallback(
     (person: PickerPerson) => {
-      if (!isOwner) return;
+      if (!canEdit) return;
       if (!person.email) return;
       const picked = person.email.toLowerCase();
-      // Don't prompt for yourself — you already own the transcript.
+      // Don't prompt for yourself — you already have access.
       if (currentUserEmail && picked === currentUserEmail) return;
       // Don't prompt for people who are already collaborators.
       if (collaboratorEmails.has(picked)) return;
@@ -1136,7 +1135,7 @@ export default function TranscriptDetailPage({ params }: TranscriptDetailPagePro
       setSharingError(null);
     },
     // eslint-disable-next-line react-hooks/exhaustive-deps
-    [isOwner, collaboratorEmails, currentUserEmail]
+    [canEdit, collaboratorEmails, currentUserEmail]
   );
 
   const handleRequestCreatePerson = useCallback(
