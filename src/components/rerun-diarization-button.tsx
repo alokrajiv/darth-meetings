@@ -23,8 +23,8 @@ interface RerunDiarizationButtonProps {
 /**
  * "Diarize with AssemblyAI": upgrade a Meet-transcript-only import (device-
  * level speaker attribution — one room mic = one speaker) to a voice-level
- * AAI transcription. Runs on the audio ALREADY stored by "Fetch audio for
- * playback" — one Drive download total, no Google popup here; the server
+ * AAI transcription. Runs on the recording ALREADY stored by "Fetch video
+ * for playback" — one Drive download total, no Google popup here; the server
  * reuses the stored Meet context (actuals + transcript sidecar) too. A NEW
  * transcript row is created (processing) and we navigate to it; the quick
  * import stays untouched.
@@ -105,7 +105,7 @@ export function RerunDiarizationButton({
         title={
           hasLocalAudio
             ? 'Voice-level speaker separation from the stored audio — for meetings where several people shared one mic'
-            : 'Fetch audio for playback first (Sources card below) — diarization runs on that stored copy'
+            : 'Fetch video for playback first (Sources card below) — diarization runs on that stored copy'
         }
       >
         {busy ? (

@@ -12,6 +12,7 @@ import {
   Fingerprint,
   Loader2,
   Upload,
+  Video,
 } from 'lucide-react';
 
 // Keep in sync with `proxyClientMaxBodySize` in next.config.ts / nginx.
@@ -30,9 +31,9 @@ interface TranscriptSourcesCardProps {
 /**
  * "Sources" rail card: which transcript/diarization sources exist on this
  * row (summaries and name-guessing automatically use everything present),
- * plus whether audio playback is available — with a "Fetch audio" action
- * for Meet quick-imports whose recording is known on Drive but whose bytes
- * were never pulled (transcript-only imports have no audio by design).
+ * plus whether playback is available — with a "Fetch video" action for
+ * Meet quick-imports whose recording is known on Drive but whose bytes
+ * were never pulled (transcript-only imports have no recording by design).
  */
 export function TranscriptSourcesCard({
   row,
@@ -100,7 +101,7 @@ export function TranscriptSourcesCard({
       if (!res.ok) throw new Error(payload.error || `Failed (${res.status})`);
       onAudioFetched();
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Audio fetch failed');
+      setError(err instanceof Error ? err.message : 'Video fetch failed');
     } finally {
       setFetching(false);
     }
@@ -251,7 +252,7 @@ export function TranscriptSourcesCard({
               </>
             ) : recordingFileId ? (
               <span className="text-muted-foreground">
-                No audio stored — the recording is on Drive
+                No recording stored — the video is on Drive
               </span>
             ) : (
               <span className="text-muted-foreground">
@@ -266,7 +267,7 @@ export function TranscriptSourcesCard({
           {joinedCount} people joined but Meet heard only {row.speaker_count} voice
           {(row.speaker_count ?? 0) > 1 ? 's' : ''} — several likely shared one room mic.
           &ldquo;Diarize with AssemblyAI&rdquo; separates them by voice
-          {row.local_audio_path ? '.' : ' (fetch audio first).'}
+          {row.local_audio_path ? '.' : ' (fetch the video first).'}
         </p>
       )}
       {canUploadRecording && (
@@ -310,14 +311,14 @@ export function TranscriptSourcesCard({
           className="mt-2 h-8 w-full justify-start gap-2 text-[13px]"
           disabled={fetching}
           onClick={() => void fetchAudio()}
-          title="Download the recording from Drive to this server so the play bar works — no re-transcription, the transcript stays as-is"
+          title="Download the video from Drive to this server so playback works — no re-transcription, the transcript stays as-is"
         >
           {fetching ? (
             <Loader2 className="h-4 w-4 animate-spin text-muted-foreground" />
           ) : (
-            <AudioLines className="h-4 w-4 text-primary" />
+            <Video className="h-4 w-4 text-primary" />
           )}
-          {fetching ? 'Fetching from Drive…' : 'Fetch audio for playback'}
+          {fetching ? 'Fetching from Drive…' : 'Fetch video for playback'}
         </Button>
       )}
       {error && <p className="mt-1.5 text-xs text-destructive">{error}</p>}

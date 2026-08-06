@@ -69,7 +69,7 @@ export const POST = withAuth(async ({ user, request }, { params }) => {
 
   if (inFlight.has(id)) {
     return NextResponse.json(
-      { error: 'Audio fetch already in progress — try again in a minute.' },
+      { error: 'Recording fetch already in progress — try again in a minute.' },
       { status: 429 }
     );
   }
@@ -111,7 +111,7 @@ export const POST = withAuth(async ({ user, request }, { params }) => {
     }
     console.error('[fetch-audio] failed:', err);
     return NextResponse.json(
-      { error: 'Audio fetch failed', detail: String(err) },
+      { error: 'Recording fetch failed', detail: String(err) },
       { status: 502 }
     );
   } finally {
