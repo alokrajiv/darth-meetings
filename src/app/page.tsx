@@ -4,6 +4,7 @@ import { useEffect, useRef, useState } from 'react';
 import Link from 'next/link';
 import { TranscriptTable } from '@/components/transcript-table';
 import { AudioUpload, AUDIO_UPLOAD_INPUT_ID } from '@/components/audio-upload';
+import { getGoogleAccessToken } from '@/lib/google-token';
 import { LogoutButton } from '@/components/logout-button';
 import { GmeetImportDialog } from '@/components/gmeet-import-dialog';
 import { GmeetRemindersCard, type Reminder } from '@/components/gmeet-reminders-card';
@@ -95,6 +96,13 @@ export default function Home() {
       document.removeEventListener('keydown', onKeyDown);
     };
   }, [reminderMenuOpen]);
+
+  // Warm the Google token cache on landing so the import dialog opens
+  // straight into the calendar instead of flashing the Connect step while
+  // it round-trips /api/google/token. Not-connected users just no-op here.
+  useEffect(() => {
+    void getGoogleAccessToken().catch(() => {});
+  }, []);
 
   // Post-connect landing: the Google callback returns to /?meet=1|sync
   // (&google=connected) so the import dialog the user came from reopens —

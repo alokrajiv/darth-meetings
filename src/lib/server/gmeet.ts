@@ -44,13 +44,14 @@ export interface DriveFileMeta {
   name: string;
   mimeType: string;
   size: number | null;
+  durationMs: number | null;
   canDownload: boolean;
 }
 
 export async function getDriveFileMeta(token: string, fileId: string): Promise<DriveFileMeta> {
   const url =
     `${DRIVE_FILES}/${encodeURIComponent(fileId)}` +
-    `?fields=${encodeURIComponent('id,name,mimeType,size,capabilities/canDownload')}` +
+    `?fields=${encodeURIComponent('id,name,mimeType,size,videoMediaMetadata(durationMillis),capabilities/canDownload')}` +
     `&supportsAllDrives=true`;
   const res = await driveFetch(token, url);
   const j = (await res.json()) as {
@@ -58,6 +59,7 @@ export async function getDriveFileMeta(token: string, fileId: string): Promise<D
     name?: string;
     mimeType?: string;
     size?: string;
+    videoMediaMetadata?: { durationMillis?: string };
     capabilities?: { canDownload?: boolean };
   };
   return {
@@ -65,6 +67,10 @@ export async function getDriveFileMeta(token: string, fileId: string): Promise<D
     name: j.name ?? 'meet-recording',
     mimeType: j.mimeType ?? 'application/octet-stream',
     size: j.size != null ? Number(j.size) : null,
+    durationMs:
+      j.videoMediaMetadata?.durationMillis != null
+        ? Number(j.videoMediaMetadata.durationMillis)
+        : null,
     canDownload: j.capabilities?.canDownload !== false,
   };
 }
@@ -390,6 +396,58 @@ export async function findConferenceRecordName(
     }
   }
   return best.name;
+}
+
+/**
+ * The record's artifact inventory in one shot — recording Drive files and
+ * transcript Doc ids across all transcription sessions. Best-effort like the
+ * rest of the Meet API helpers: an API miss reads as "no artifacts".
+ */
+export async function listRecordArtifacts(
+  token: string,
+  recordName: string
+): Promise<{
+  recordings: Array<{ fileId: string | null; startTime?: string; endTime?: string }>;
+  transcriptDocIds: string[];
+  /** The verbatim API responses — callers that archive structured data keep
+   * every field Google returns, not just what we shape today. */
+  raw: { recordings?: unknown; transcripts?: unknown };
+}> {
+  const [recs, trans] = await Promise.all([
+    tryJson<{
+      recordings?: Array<{
+        driveDestination?: { file?: string };
+        startTime?: string;
+        endTime?: string;
+      }>;
+    }>(token, `${MEET_API}/${recordName}/recordings`),
+    tryJson<{
+      transcripts?: Array<{ startTime?: string; docsDestination?: { document?: string } }>;
+    }>(token, `${MEET_API}/${recordName}/transcripts`),
+  ]);
+  const recordings = (recs?.recordings ?? [])
+    .map((r) => ({
+      fileId: r.driveDestination?.file ?? null,
+      startTime: r.startTime,
+      endTime: r.endTime,
+    }))
+    .sort((a, b) => (a.startTime ?? '').localeCompare(b.startTime ?? ''));
+  const transcriptDocIds = [
+    ...new Set(
+      [...(trans?.transcripts ?? [])]
+        .sort((a, b) => (a.startTime ?? '').localeCompare(b.startTime ?? ''))
+        .map((t) => t.docsDestination?.document)
+        .filter((d): d is string => !!d)
+    ),
+  ];
+  return {
+    recordings,
+    transcriptDocIds,
+    raw: {
+      recordings: recs ?? undefined,
+      transcripts: trans ?? undefined,
+    },
+  };
 }
 
 const MAX_TRANSCRIPT_ENTRIES = 4000;

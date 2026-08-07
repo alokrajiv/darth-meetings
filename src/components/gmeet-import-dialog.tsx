@@ -46,6 +46,11 @@ interface CalendarAttachment {
 interface CalendarEvent {
   id: string;
   summary?: string;
+  /** Series key for recurring events — sturdier identity than the meeting
+   * code (people recycle Meet links across unrelated meetings). */
+  recurringEventId?: string;
+  iCalUID?: string;
+  organizer?: { email?: string; self?: boolean };
   start?: { dateTime?: string; date?: string };
   end?: { dateTime?: string; date?: string };
   attendees?: Array<{
@@ -86,10 +91,13 @@ interface PickedMeeting {
   videoFileId: string | null;
   videoName: string | null;
   videoSize: number | null;
+  videoDurationMs: number | null;
   videoCount: number;
   transcriptDocId: string | null;
   transcriptSource: 'calendar' | 'meet-api' | 'gemini' | null;
   geminiNotes: boolean;
+  /** Poller-cached counts/flags for this occurrence, when we have them. */
+  cacheMeta: MeetingMeta | null;
   enriching: boolean;
   /** Row came from the Meet API with no calendar event — its summary is a
    * synthesized label, never a real title. */
@@ -119,6 +127,24 @@ interface ImportedMark {
   ownerEmail: string | null;
   accessible: boolean;
   mine: boolean;
+}
+
+/** Poller-cached meeting metadata from /api/gmeet/check — display-only
+ * enrichment (badges, instant options step). Access is still proven through
+ * the user's own token at import time. */
+interface MeetingMeta {
+  conferenceRecord: string | null;
+  confStart: string | null;
+  confEnd: string | null;
+  recordingCount: number;
+  videoFileId: string | null;
+  videoSize: number | null;
+  videoDurationMs: number | null;
+  transcriptDocIds: string[] | null;
+  transcriptParseable: boolean | null;
+  utteranceCount: number | null;
+  wordCount: number | null;
+  speakerCount: number | null;
 }
 
 interface SyncInfo {
@@ -254,18 +280,38 @@ function parseMeetCode(input: string): string | null {
 async function fetchDriveMeta(
   token: string,
   fileId: string
-): Promise<{ name: string; size: number | null } | null> {
+): Promise<{ name: string; size: number | null; durationMs: number | null } | null> {
   try {
     const res = await fetch(
-      `https://www.googleapis.com/drive/v3/files/${encodeURIComponent(fileId)}?fields=name,size&supportsAllDrives=true`,
+      `https://www.googleapis.com/drive/v3/files/${encodeURIComponent(fileId)}?fields=${encodeURIComponent('name,size,videoMediaMetadata(durationMillis)')}&supportsAllDrives=true`,
       { headers: { Authorization: `Bearer ${token}` } }
     );
     if (!res.ok) return null;
-    const j = (await res.json()) as { name?: string; size?: string };
-    return { name: j.name ?? 'recording', size: j.size != null ? Number(j.size) : null };
+    const j = (await res.json()) as {
+      name?: string;
+      size?: string;
+      videoMediaMetadata?: { durationMillis?: string };
+    };
+    return {
+      name: j.name ?? 'recording',
+      size: j.size != null ? Number(j.size) : null,
+      durationMs:
+        j.videoMediaMetadata?.durationMillis != null
+          ? Number(j.videoMediaMetadata.durationMillis)
+          : null,
+    };
   } catch {
     return null;
   }
+}
+
+/** 5400000 → "1 h 30 m"; 240000 → "4 min". */
+function fmtDurationMs(ms: number): string {
+  const mins = Math.round(ms / 60_000);
+  if (mins < 60) return `${Math.max(1, mins)} min`;
+  const h = Math.floor(mins / 60);
+  const m = mins % 60;
+  return m > 0 ? `${h} h ${m} m` : `${h} h`;
 }
 
 interface MeetRecordLite {
@@ -362,6 +408,9 @@ export function GmeetImportDialog({
   focusMeeting,
 }: GmeetImportDialogProps) {
   const [step, setStep] = useState<Step>('connect');
+  /** True while the silent token check runs on open — render a spinner, not
+   * the Connect pitch, so connected users never see it flash. */
+  const [probing, setProbing] = useState(false);
   const [tab, setTab] = useState<SourceTab>('calendar');
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
@@ -387,6 +436,8 @@ export function GmeetImportDialog({
    * (any user). Keyed per occurrence, not per code — recurring meetings
    * reuse one code, and one imported date must not mark the whole series. */
   const [importedMap, setImportedMap] = useState<Record<string, ImportedMark>>({});
+  /** Same keys as importedMap → poller-cached metadata (duration, counts). */
+  const [metaMap, setMetaMap] = useState<Record<string, MeetingMeta>>({});
   const [syncFrom, setSyncFrom] = useState<string | null>(null);
 
   /** Mute key: meeting code when there is one, else the calendar event id. */
@@ -420,10 +471,14 @@ export function GmeetImportDialog({
           body: JSON.stringify({ meetings: [...byKey.values()] }),
         });
         if (!res.ok) return;
-        const { imported } = (await res.json()) as {
+        const { imported, meta } = (await res.json()) as {
           imported: Record<string, ImportedMark>;
+          meta?: Record<string, MeetingMeta>;
         };
-        if (!cancelled) setImportedMap((prev) => ({ ...prev, ...imported }));
+        if (!cancelled) {
+          setImportedMap((prev) => ({ ...prev, ...imported }));
+          if (meta) setMetaMap((prev) => ({ ...prev, ...meta }));
+        }
       } catch {
         // markers are cosmetic
       }
@@ -539,7 +594,7 @@ export function GmeetImportDialog({
         orderBy: 'startTime',
         maxResults: '250',
         fields:
-          'items(id,summary,start,end,attendees(email,displayName,responseStatus,self),attachments(fileId,title,mimeType),conferenceData(conferenceId))',
+          'items(id,summary,recurringEventId,iCalUID,organizer(email,self),start,end,attendees(email,displayName,responseStatus,self),attachments(fileId,title,mimeType),conferenceData(conferenceId))',
       });
       const calRes = await fetch(
         `https://www.googleapis.com/calendar/v3/calendars/primary/events?${params}`,
@@ -735,7 +790,7 @@ export function GmeetImportDialog({
           orderBy: 'startTime',
           maxResults: '50',
           fields:
-            'items(id,summary,start,end,attendees(email,displayName,responseStatus,self),attachments(fileId,title,mimeType),conferenceData(conferenceId))',
+            'items(id,summary,recurringEventId,iCalUID,organizer(email,self),start,end,attendees(email,displayName,responseStatus,self),attachments(fileId,title,mimeType),conferenceData(conferenceId))',
         });
         const res = await fetch(
           `https://www.googleapis.com/calendar/v3/calendars/primary/events?${params}`,
@@ -872,12 +927,16 @@ export function GmeetImportDialog({
       return;
     }
     let cancelled = false;
+    setProbing(true);
     getGoogleAccessToken()
       .then(() => {
         if (!cancelled) start();
       })
       .catch(() => {
-        // not connected — leave the connect step showing
+        // not connected — the connect step is the right screen
+      })
+      .finally(() => {
+        if (!cancelled) setProbing(false);
       });
     return () => {
       cancelled = true;
@@ -949,11 +1008,13 @@ export function GmeetImportDialog({
 
       let videoName: string | null = null;
       let videoSize: number | null = null;
+      let videoDurationMs: number | null = null;
       if (videoFileId) {
         const meta = await fetchDriveMeta(token, videoFileId);
         if (meta) {
           videoName = meta.name;
           videoSize = meta.size;
+          videoDurationMs = meta.durationMs;
         }
       }
 
@@ -961,21 +1022,31 @@ export function GmeetImportDialog({
       setPicked((prev) => {
         if (!prev || prev.event.id !== initial.event.id) return prev;
         applied = true;
+        // Live values win, but a failed live fetch must not blank out what
+        // the poller cache already pre-filled.
         return {
           ...prev,
-          conferenceRecordName: recordName,
-          videoFileId,
-          videoName,
-          videoSize,
-          transcriptDocId,
-          transcriptSource,
+          conferenceRecordName: recordName ?? prev.conferenceRecordName,
+          videoFileId: videoFileId ?? prev.videoFileId,
+          videoName: videoName ?? prev.videoName,
+          videoSize: videoSize ?? prev.videoSize,
+          videoDurationMs: videoDurationMs ?? prev.videoDurationMs,
+          transcriptDocId: transcriptDocId ?? prev.transcriptDocId,
+          transcriptSource: transcriptSource ?? prev.transcriptSource,
           enriching: false,
         };
       });
       // Transcript-first default — but only for the row that's still picked,
       // and never over a choice the user already made by hand.
       if (applied && !modeTouchedRef.current) {
-        setMode(transcriptDocId ? 'transcript' : videoFileId ? 'video' : 'transcript');
+        const docKnownBad = initial.cacheMeta?.transcriptParseable === false;
+        setMode(
+          transcriptDocId && !docKnownBad
+            ? 'transcript'
+            : videoFileId
+              ? 'video'
+              : 'transcript'
+        );
       }
     } catch {
       setPicked((prev) =>
@@ -985,20 +1056,27 @@ export function GmeetImportDialog({
   };
 
   const pickEvent = (row: EventRow) => {
-    const videoFileId = row.video?.fileId ?? row.meet?.videoFileId ?? null;
+    // Poller cache fills what the row itself doesn't know yet — the options
+    // step renders complete immediately; enrich() just double-checks live.
+    const key = markKey(row);
+    const cached = key ? (metaMap[key] ?? null) : null;
+    const videoFileId =
+      row.video?.fileId ?? row.meet?.videoFileId ?? cached?.videoFileId ?? null;
     // Transcript source priority: explicit transcript doc → Meet API doc →
     // the Gemini notes doc (its Transcript tab — the server extracts it).
     const transcriptDocId =
       row.transcriptDoc?.fileId ??
       row.meet?.transcriptDocId ??
       row.geminiNotes?.fileId ??
+      cached?.transcriptDocIds?.[0] ??
       null;
     const initial: PickedMeeting = {
       event: row.event,
-      conferenceRecordName: row.meet?.recordName ?? null,
+      conferenceRecordName: row.meet?.recordName ?? cached?.conferenceRecord ?? null,
       videoFileId,
       videoName: row.video?.title ?? null,
-      videoSize: null,
+      videoSize: cached?.videoSize ?? null,
+      videoDurationMs: cached?.videoDurationMs ?? null,
       videoCount: row.videoCount,
       transcriptDocId,
       transcriptSource: row.transcriptDoc
@@ -1007,8 +1085,11 @@ export function GmeetImportDialog({
           ? 'meet-api'
           : row.geminiNotes
             ? 'gemini'
-            : null,
+            : cached?.transcriptDocIds?.length
+              ? 'meet-api'
+              : null,
       geminiNotes: !!row.geminiNotes,
+      cacheMeta: cached,
       enriching: true,
       offCalendar: !!row.offCalendar,
     };
@@ -1016,24 +1097,39 @@ export function GmeetImportDialog({
     setError(null);
     setConflict(null);
     modeTouchedRef.current = false;
-    // Transcript-first default.
-    setMode(transcriptDocId ? 'transcript' : videoFileId ? 'video' : 'transcript');
+    // Transcript-first default — unless the poller already found the Doc
+    // unparseable, in which case re-transcribing is the honest suggestion.
+    const docKnownBad = cached?.transcriptParseable === false;
+    setMode(
+      transcriptDocId && !docKnownBad ? 'transcript' : videoFileId ? 'video' : 'transcript'
+    );
     setStep('options');
     void enrich(initial);
   };
 
   /** Can this row be bulk quick-imported (transcript-only)? Requires real
-   * evidence a transcript can exist: a transcript/Gemini doc, or a conference
-   * record proving the meeting actually happened (server resolves the doc).
-   * A bare Meet link is NOT enough — scheduled-but-never-started meetings
-   * have one too. */
-  const bulkEligible = (row: EventRow): boolean =>
-    !!(
+   * evidence a transcript can exist: a transcript/Gemini doc (from the
+   * calendar, the Meet API, or the poller cache). A bare Meet link is NOT
+   * enough — scheduled-but-never-started meetings have one too. And once
+   * the artifacts HAVE been checked (Meet API row or cache) with no
+   * transcript found, quick import can only fail — asking users to bulk-run
+   * those is the "sync asks you to do gibberish" problem. */
+  const bulkEligible = (row: EventRow): boolean => {
+    const key = markKey(row);
+    const meta = key ? metaMap[key] : undefined;
+    if (
       row.transcriptDoc ||
       row.geminiNotes ||
       row.meet?.transcriptDocId ||
-      row.meet?.recordName
-    );
+      meta?.transcriptDocIds?.length
+    ) {
+      return true;
+    }
+    // Artifacts inventoried and no transcript among them → nothing to
+    // quick-import. Unchecked rows (recents) stay eligible: resolved on run.
+    if (row.meet?.checked || meta) return false;
+    return !!row.meet?.recordName;
+  };
 
   const toggleSelect = (rowId: string) => {
     setSelected((prev) => {
@@ -1077,6 +1173,9 @@ export function GmeetImportDialog({
               startTime: e.start?.dateTime,
               endTime: e.end?.dateTime,
               meetingCode: e.conferenceData?.conferenceId,
+              recurringEventId: e.recurringEventId,
+              iCalUID: e.iCalUID,
+              organizerEmail: e.organizer?.email,
               attendees: (e.attendees ?? [])
                 .filter((a) => a.email)
                 .map((a) => ({
@@ -1167,6 +1266,9 @@ export function GmeetImportDialog({
             startTime: e.start?.dateTime,
             endTime: e.end?.dateTime,
             meetingCode: e.conferenceData?.conferenceId,
+            recurringEventId: e.recurringEventId,
+            iCalUID: e.iCalUID,
+            organizerEmail: e.organizer?.email,
             attendees: (e.attendees ?? [])
               .filter((a) => a.email)
               .map((a) => ({
@@ -1248,7 +1350,14 @@ export function GmeetImportDialog({
           <DialogTitle className="text-base font-semibold">Import from Google Meet</DialogTitle>
         </DialogHeader>
 
-        {step === 'connect' && (
+        {step === 'connect' && probing && (
+          <div className="py-10 text-center">
+            <Loader2 className="h-6 w-6 animate-spin mx-auto text-muted-foreground" />
+            <p className="mt-3 text-sm text-muted-foreground">Checking your Google connection…</p>
+          </div>
+        )}
+
+        {step === 'connect' && !probing && (
           <div className="space-y-4 py-2 min-w-0">
             <div className="rounded-md border bg-muted/40 p-3 text-sm">
               <p className="font-medium mb-1">Pull a meeting straight from your calendar</p>
@@ -1356,7 +1465,10 @@ export function GmeetImportDialog({
                         return (
                           bulkEligible(r) &&
                           !mark &&
-                          !syncInfo?.skips.has(rowKey(r))
+                          !syncInfo?.skips.has(rowKey(r)) &&
+                          // Known-unparseable Docs would just fail the bulk
+                          // run — leave them for a deliberate manual pick.
+                          (key ? metaMap[key]?.transcriptParseable !== false : true)
                         );
                       });
                       setSelected(new Set(pending.slice(0, MAX_BULK).map((r) => r.event.id)));
@@ -1408,22 +1520,34 @@ export function GmeetImportDialog({
               ) : (
                 <ul className="divide-y">
                   {rows.map((row) => {
-                    const hasVideo = !!(row.video || row.meet?.videoFileId);
+                    const key = markKey(row);
+                    const mark = key ? importedMap[key] : undefined;
+                    const meta = key ? metaMap[key] : undefined;
+                    const hasVideo = !!(
+                      row.video ||
+                      row.meet?.videoFileId ||
+                      (meta?.recordingCount ?? 0) > 0
+                    );
                     const hasTranscript = !!(
                       row.transcriptDoc ||
                       row.meet?.transcriptDocId ||
-                      row.geminiNotes
+                      row.geminiNotes ||
+                      meta?.transcriptDocIds?.length
                     );
+                    // Artifacts inventoried (Meet API sweep or poller cache)
+                    // and none found → the meeting ran but produced nothing
+                    // importable. Don't invite a doomed click.
+                    const checkedEmpty =
+                      !!row.meet?.checked && !hasVideo && !hasTranscript;
                     // Before the day sweep confirms which meetings actually
                     // happened, a Meet link is enough to try; after it, a
                     // link with no conference record = never started.
                     const importable =
-                      hasVideo ||
-                      hasTranscript ||
-                      !!row.meet ||
-                      (!sweepDone && !!row.event.conferenceData?.conferenceId);
-                    const key = markKey(row);
-                    const mark = key ? importedMap[key] : undefined;
+                      !checkedEmpty &&
+                      (hasVideo ||
+                        hasTranscript ||
+                        !!row.meet ||
+                        (!sweepDone && !!row.event.conferenceData?.conferenceId));
                     const muted = !!syncInfo?.skips.has(rowKey(row));
                     const focused =
                       !!focusMeeting?.meetingCode &&
@@ -1505,19 +1629,37 @@ export function GmeetImportDialog({
                             <Badge variant="outline" className="text-[10px] gap-1 shrink-0">
                               <Video className="h-3 w-3" />
                               recording{row.videoCount > 1 ? ` ×${row.videoCount}` : ''}
+                              {meta?.videoDurationMs != null &&
+                                ` · ${fmtDurationMs(meta.videoDurationMs)}`}
                             </Badge>
                           )}
-                          {hasTranscript && (
-                            <Badge variant="outline" className="text-[10px] gap-1 shrink-0">
-                              <FileText className="h-3 w-3" />
-                              transcript
+                          {hasTranscript && meta?.transcriptParseable === false ? (
+                            <Badge
+                              variant="outline"
+                              className="text-[10px] gap-1 shrink-0 border-amber-400/60 text-amber-600 dark:text-amber-500"
+                              title="Meet's transcript Doc looks empty or unparseable — quick import will likely fail; re-transcribe the recording instead"
+                            >
+                              <AlertCircle className="h-3 w-3" />
+                              transcript?
                             </Badge>
+                          ) : (
+                            hasTranscript && (
+                              <Badge variant="outline" className="text-[10px] gap-1 shrink-0">
+                                <FileText className="h-3 w-3" />
+                                transcript
+                                {meta?.utteranceCount != null &&
+                                  meta.utteranceCount > 0 &&
+                                  ` · ${meta.utteranceCount} turns`}
+                              </Badge>
+                            )
                           )}
                           {!importable && (
                             <span className="text-[10px] text-muted-foreground shrink-0">
-                              {row.event.conferenceData?.conferenceId
-                                ? 'never started'
-                                : 'no meet link'}
+                              {checkedEmpty
+                                ? 'nothing to import'
+                                : row.event.conferenceData?.conferenceId
+                                  ? 'never started'
+                                  : 'no meet link'}
                             </span>
                           )}
                         </button>
@@ -1664,6 +1806,12 @@ export function GmeetImportDialog({
                               · {fmtBytes(picked.videoSize)}
                             </span>
                           )}
+                          {picked.videoDurationMs != null && (
+                            <span className="text-muted-foreground">
+                              {' '}
+                              · {fmtDurationMs(picked.videoDurationMs)}
+                            </span>
+                          )}
                           {picked.videoCount > 1 && (
                             <span className="text-muted-foreground">
                               {' '}
@@ -1679,6 +1827,16 @@ export function GmeetImportDialog({
                       <p className="text-xs flex items-center gap-1">
                         <FileText className="h-3 w-3 shrink-0" />
                         Meet transcript found
+                        {picked.cacheMeta?.utteranceCount != null &&
+                          picked.cacheMeta.utteranceCount > 0 && (
+                            <span className="text-muted-foreground">
+                              · {picked.cacheMeta.utteranceCount} turns
+                              {picked.cacheMeta.wordCount != null &&
+                                ` · ${picked.cacheMeta.wordCount.toLocaleString()} words`}
+                              {picked.cacheMeta.speakerCount != null &&
+                                ` · ${picked.cacheMeta.speakerCount} speaker${picked.cacheMeta.speakerCount === 1 ? '' : 's'}`}
+                            </span>
+                          )}
                         {picked.transcriptSource === 'meet-api' && (
                           <span className="text-muted-foreground">
                             (via Meet API — not on the calendar event)
@@ -1693,6 +1851,18 @@ export function GmeetImportDialog({
                     ) : (
                       <p className="text-xs text-muted-foreground">
                         No Meet transcript found for this meeting.
+                      </p>
+                    )}
+                    {picked.cacheMeta?.transcriptParseable === false && (
+                      <p className="text-xs text-amber-600 dark:text-amber-500 flex items-start gap-1">
+                        <AlertCircle className="h-3.5 w-3.5 shrink-0 mt-px" />
+                        <span>
+                          Meet&apos;s transcript Doc looked empty or unparseable when we last
+                          checked it — quick import will probably fail.
+                          {picked.videoFileId
+                            ? ' Re-transcribing the recording is pre-selected below.'
+                            : ' There is no recording to fall back on for this meeting.'}
+                        </span>
                       </p>
                     )}
                     <p className="text-xs text-muted-foreground">
@@ -1856,7 +2026,7 @@ export function GmeetImportDialog({
         )}
 
         <DialogFooter>
-          {step === 'connect' && (
+          {step === 'connect' && !probing && (
             <>
               <Button variant="ghost" onClick={handleClose} disabled={busy}>
                 Cancel

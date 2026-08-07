@@ -123,6 +123,14 @@ export interface MeetActuals {
  */
 export interface GmeetContext {
   eventId?: string;
+  /** Calendar's series key — the TRUE identity of a recurring meeting.
+   * Meeting codes get recycled for unrelated meetings (people reuse one
+   * Meet link), so when both exist this outranks meetingCode for "same
+   * series" questions. */
+  recurringEventId?: string;
+  /** RFC-5545 UID — stable across calendar copies of the same event. */
+  iCalUID?: string;
+  organizerEmail?: string;
   eventTitle?: string;
   startTime?: string;
   endTime?: string;

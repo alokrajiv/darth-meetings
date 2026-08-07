@@ -1,6 +1,7 @@
 import { NextResponse } from 'next/server';
 import { withAuth } from '@/lib/auth/with-auth';
 import { findImportedByMeetingCodes } from '@/db-ops/gmeet-sync';
+import { getMeetingCacheByMeetings } from '@/db-ops/gmeet-meeting-cache';
 
 export const runtime = 'nodejs';
 
@@ -16,6 +17,11 @@ export const runtime = 'nodejs';
  * legacy requests) and includes whether the caller can open it and
  * (best-effort) who owns it. Deliberately exposes only owner email +
  * title — enough for a "synced by X" marker.
+ *
+ * Also returns `meta` — the poller's metadata cache for these occurrences
+ * (duration, size, turn/word counts, transcript-parseable flag), keyed the
+ * same way. Display-only enrichment: the IDs in it never grant access, every
+ * import still goes through the caller's own Google token.
  */
 export const POST = withAuth(async ({ user, request }) => {
   const body = (await request.json().catch(() => null)) as {
@@ -33,12 +39,15 @@ export const POST = withAuth(async ({ user, request }) => {
       code: m.code!.trim(),
       startTime: typeof m.startTime === 'string' ? m.startTime : null,
     }));
-  if (meetings.length === 0) return NextResponse.json({ imported: {} });
+  if (meetings.length === 0) return NextResponse.json({ imported: {}, meta: {} });
 
-  const rows = await findImportedByMeetingCodes(meetings, {
-    userId: user.userId,
-    email: user.email,
-  });
+  const [rows, cacheRows] = await Promise.all([
+    findImportedByMeetingCodes(meetings, {
+      userId: user.userId,
+      email: user.email,
+    }),
+    getMeetingCacheByMeetings(meetings).catch(() => meetings.map(() => null)),
+  ]);
   const imported: Record<
     string,
     {
@@ -49,18 +58,53 @@ export const POST = withAuth(async ({ user, request }) => {
       mine: boolean;
     }
   > = {};
+  const meta: Record<
+    string,
+    {
+      conferenceRecord: string | null;
+      confStart: string | null;
+      confEnd: string | null;
+      recordingCount: number;
+      videoFileId: string | null;
+      videoSize: number | null;
+      videoDurationMs: number | null;
+      transcriptDocIds: string[] | null;
+      transcriptParseable: boolean | null;
+      utteranceCount: number | null;
+      wordCount: number | null;
+      speakerCount: number | null;
+    }
+  > = {};
   meetings.forEach((m, i) => {
-    const r = rows[i];
-    if (!r) return;
     const key = legacy ? m.code : `${m.code}|${m.startTime ?? ''}`;
-    imported[key] = {
-      // Don't leak the transcript id unless the caller can actually open it.
-      assemblyaiId: r.accessible ? r.assemblyai_id : null,
-      title: r.accessible ? r.title : null,
-      ownerEmail: r.owner_email,
-      accessible: r.accessible,
-      mine: r.mine,
-    };
+    const r = rows[i];
+    if (r) {
+      imported[key] = {
+        // Don't leak the transcript id unless the caller can actually open it.
+        assemblyaiId: r.accessible ? r.assemblyai_id : null,
+        title: r.accessible ? r.title : null,
+        ownerEmail: r.owner_email,
+        accessible: r.accessible,
+        mine: r.mine,
+      };
+    }
+    const c = cacheRows[i];
+    if (c) {
+      meta[key] = {
+        conferenceRecord: c.conference_record,
+        confStart: c.conf_start,
+        confEnd: c.conf_end,
+        recordingCount: c.recording_count,
+        videoFileId: c.video_file_id,
+        videoSize: c.video_size,
+        videoDurationMs: c.video_duration_ms,
+        transcriptDocIds: c.transcript_doc_ids,
+        transcriptParseable: c.transcript_parseable,
+        utteranceCount: c.utterance_count,
+        wordCount: c.word_count,
+        speakerCount: c.speakers?.length ?? null,
+      };
+    }
   });
-  return NextResponse.json({ imported });
+  return NextResponse.json({ imported, meta });
 });

@@ -11,7 +11,18 @@ import {
   listOpenRemindersRaw,
   resolveReminderByKey,
 } from '@/db-ops/gmeet-reminders';
-import { findConferenceRecordName } from '@/lib/server/gmeet';
+import {
+  findConferenceRecordName,
+  getDriveFileMeta,
+  GoogleApiError,
+  listRecordArtifacts,
+  parseTranscriptDocs,
+} from '@/lib/server/gmeet';
+import {
+  getMeetingCacheByKeys,
+  upsertMeetingCache,
+  type GmeetMeetingCacheRow,
+} from '@/db-ops/gmeet-meeting-cache';
 
 /**
  * Background sync-and-remind poller. Every POLL_MS, for each user with a
@@ -40,6 +51,8 @@ const MEET_CODE_RE = /^[a-z]{3}-[a-z]{4}-[a-z]{3}$/;
 interface CalEvent {
   id: string;
   summary?: string;
+  recurringEventId?: string;
+  iCalUID?: string;
   start?: { dateTime?: string; date?: string };
   end?: { dateTime?: string; date?: string };
   organizer?: { email?: string; self?: boolean };
@@ -101,20 +114,118 @@ function eventKeyOf(code: string, startIso: string | null): string {
   return `${code}|${startIso ?? ''}`;
 }
 
-/** recordings/transcripts existence on the conference record — the signal
- * that there is actually something to import. */
-async function checkArtifacts(
+/**
+ * One-time metadata capture for the meeting cache. Meeting artifacts are
+ * immutable once Meet finishes processing them, so each field is fetched at
+ * most once ever (across all users — the cache is global); later sweeps
+ * only fill gaps, e.g. a recording that finished processing late.
+ *
+ * The Doc parse doubles as validation: parseable=false is the "quick import
+ * would fail" signal the dialog uses to warn BEFORE the user hits Import.
+ * An export failure (403/404) leaves parseable null so the next sweep — or
+ * a colleague whose token can read the Doc — retries.
+ */
+async function captureMeetingMeta(
   token: string,
-  recordName: string
-): Promise<{ hasRecording: boolean; hasTranscript: boolean }> {
-  const [recs, trans] = await Promise.all([
-    apiJson<{ recordings?: unknown[] }>(token, `${MEET_API}/${recordName}/recordings`),
-    apiJson<{ transcripts?: unknown[] }>(token, `${MEET_API}/${recordName}/transcripts`),
-  ]);
-  return {
-    hasRecording: (recs?.recordings?.length ?? 0) > 0,
-    hasTranscript: (trans?.transcripts?.length ?? 0) > 0,
-  };
+  input: {
+    userId: string;
+    eventKey: string;
+    meetingCode: string;
+    eventStart: string | null;
+    event: CalEvent;
+    recordName: string;
+    artifacts: Awaited<ReturnType<typeof listRecordArtifacts>>;
+    existing: GmeetMeetingCacheRow | undefined;
+  }
+): Promise<void> {
+  const { eventKey, meetingCode, eventStart, event, recordName, artifacts, existing } = input;
+  const firstFileId = artifacts.recordings.find((r) => r.fileId)?.fileId ?? null;
+  const needConf = !existing?.conf_start;
+  const needVideo = !!firstFileId && existing?.video_size == null;
+  const needParse = artifacts.transcriptDocIds.length > 0 && existing?.transcript_parseable == null;
+  const needInventory =
+    !existing ||
+    artifacts.recordings.length > existing.recording_count ||
+    (!!firstFileId && !existing.video_file_id) ||
+    (artifacts.transcriptDocIds.length > 0 && !existing.transcript_doc_ids?.length);
+  if (!needConf && !needVideo && !needParse && !needInventory) return;
+
+  // Everything structured the APIs hand back goes into `raw` verbatim —
+  // fields we don't shape today are still on disk when we want them later.
+  const raw: Record<string, unknown> = {};
+  if (artifacts.raw.recordings) raw.recordings = artifacts.raw.recordings;
+  if (artifacts.raw.transcripts) raw.transcripts = artifacts.raw.transcripts;
+
+  let confStart: string | null = null;
+  let confEnd: string | null = null;
+  if (needConf) {
+    const rec = await apiJson<{ startTime?: string; endTime?: string }>(
+      token,
+      `${MEET_API}/${recordName}`
+    );
+    confStart = rec?.startTime ?? null;
+    confEnd = rec?.endTime ?? null;
+    if (rec) raw.conferenceRecord = rec;
+  }
+
+  let videoSize: number | null = null;
+  let videoDurationMs: number | null = null;
+  if (needVideo) {
+    try {
+      const meta = await getDriveFileMeta(token, firstFileId!);
+      videoSize = meta.size;
+      videoDurationMs = meta.durationMs;
+    } catch (err) {
+      // This user may not see the file even though the record lists it —
+      // leave nulls; a sweep under the organizer's token will fill them.
+      console.debug('[gmeet-poller] drive meta miss', firstFileId, err);
+    }
+  }
+
+  let parseable: boolean | null = null;
+  let utteranceCount: number | null = null;
+  let wordCount: number | null = null;
+  let speakers: string[] | null = null;
+  if (needParse) {
+    try {
+      const parsed = await parseTranscriptDocs(token, artifacts.transcriptDocIds);
+      parseable = parsed.utterances.length > 0;
+      utteranceCount = parsed.utterances.length;
+      wordCount = parsed.utterances.reduce(
+        (s, u) => s + (u.text ? u.text.split(/\s+/).length : 0),
+        0
+      );
+      speakers = [...new Set(parsed.utterances.map((u) => u.speaker))];
+    } catch (err) {
+      if (!(err instanceof GoogleApiError)) throw err;
+      // Doc unreadable with THIS token — null means "not checked yet".
+      console.debug('[gmeet-poller] transcript doc miss', eventKey, err.status);
+    }
+  }
+
+  await upsertMeetingCache({
+    eventKey,
+    meetingCode,
+    eventStart,
+    conferenceRecord: recordName,
+    confStart,
+    confEnd,
+    recordingCount: artifacts.recordings.length,
+    videoFileId: firstFileId,
+    videoSize,
+    videoDurationMs,
+    transcriptDocIds:
+      artifacts.transcriptDocIds.length > 0 ? artifacts.transcriptDocIds : null,
+    transcriptParseable: parseable,
+    utteranceCount,
+    wordCount,
+    speakers,
+    recurringEventId: event.recurringEventId ?? null,
+    iCalUID: event.iCalUID ?? null,
+    organizerEmail: event.organizer?.email ?? null,
+    raw: Object.keys(raw).length > 0 ? raw : null,
+    capturedBy: input.userId,
+  });
 }
 
 type ArtifactSetting = 'ON' | 'OFF' | undefined;
@@ -168,6 +279,9 @@ async function sweepUser(account: GoogleAccountRow): Promise<void> {
     startTime: eventStartIso(e),
   }));
   const imported = await findImportedByMeetingCodes(pastMeetings, caller);
+  const cacheRows = await getMeetingCacheByKeys(
+    pastMeetings.map((m) => eventKeyOf(m.code, m.startTime))
+  );
 
   for (let i = 0; i < past.length; i++) {
     const e = past[i]!;
@@ -186,8 +300,24 @@ async function sweepUser(account: GoogleAccountRow): Promise<void> {
     // every poll until the event ages out of the window.
     const recordName = await findConferenceRecordName(token, code, startIso ?? undefined);
     if (!recordName) continue; // never held or nothing captured — nothing to nag about
-    const { hasRecording, hasTranscript } = await checkArtifacts(token, recordName);
+    const artifacts = await listRecordArtifacts(token, recordName);
+    const hasRecording = artifacts.recordings.length > 0;
+    const hasTranscript = artifacts.transcriptDocIds.length > 0;
     if (!hasRecording && !hasTranscript) continue;
+    try {
+      await captureMeetingMeta(token, {
+        userId,
+        eventKey: key,
+        meetingCode: code,
+        eventStart: startIso,
+        event: e,
+        recordName,
+        artifacts,
+        existing: cacheRows.get(key),
+      });
+    } catch (err) {
+      console.warn('[gmeet-poller] meta capture failed for', key, err);
+    }
     await upsertReminder({
       userId,
       kind: 'unimported',

@@ -60,6 +60,9 @@ interface ImportBody {
     startTime?: string;
     endTime?: string;
     meetingCode?: string;
+    recurringEventId?: string;
+    iCalUID?: string;
+    organizerEmail?: string;
     attendees?: GmeetAttendee[];
   };
 }
@@ -298,6 +301,9 @@ export const POST = withAuth(async ({ user, request }) => {
 
   const baseContext: GmeetContext = {
     eventId: event.id,
+    recurringEventId: event.recurringEventId,
+    iCalUID: event.iCalUID,
+    organizerEmail: event.organizerEmail,
     eventTitle: event.title,
     startTime: event.startTime,
     endTime: event.endTime,
