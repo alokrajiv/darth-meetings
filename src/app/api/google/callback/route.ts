@@ -5,6 +5,7 @@ import {
   exchangeCode,
   encryptToken,
   invalidateServerToken,
+  clientKeyForEmail,
 } from '@/lib/server/google-oauth';
 import { upsertGoogleAccount } from '@/db-ops/google-accounts';
 import { config } from '@/config';
@@ -37,13 +38,15 @@ export const GET = withAuth(async ({ user, request, cliScope }) => {
   }
 
   try {
-    const tokens = await exchangeCode(code);
+    const clientKey = clientKeyForEmail(user.email);
+    const tokens = await exchangeCode(code, clientKey);
     await upsertGoogleAccount({
       userId: user.userId,
       userEmail: user.email,
       googleEmail: tokens.email,
       refreshTokenEnc: encryptToken(tokens.refreshToken),
       scopes: tokens.scope,
+      clientKey,
     });
     invalidateServerToken(user.userId);
     return settingsRedirect({ google: 'connected' });

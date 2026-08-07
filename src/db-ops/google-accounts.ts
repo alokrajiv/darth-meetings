@@ -14,6 +14,8 @@ export interface GoogleAccountRow {
   google_email: string | null;
   refresh_token_enc: string;
   scopes: string;
+  /** Which Workspace org's OAuth client issued the refresh token. */
+  client_key: 'sg' | 'eng';
   status: 'ok' | 'revoked' | 'error';
   last_error: string | null;
   connected_at: string;
@@ -24,7 +26,7 @@ export interface GoogleAccountRow {
 export async function getGoogleAccount(userId: string): Promise<GoogleAccountRow | null> {
   const rows = await sql<GoogleAccountRow[]>`
     SELECT user_id, user_email, google_email, refresh_token_enc, scopes,
-           status, last_error, connected_at, last_refresh_at, last_poll_at
+           client_key, status, last_error, connected_at, last_refresh_at, last_poll_at
     FROM ${sql(SCHEMA)}.google_accounts
     WHERE user_id = ${userId}
   `;
@@ -37,19 +39,22 @@ export async function upsertGoogleAccount(input: {
   googleEmail: string | null;
   refreshTokenEnc: string;
   scopes: string;
+  clientKey: 'sg' | 'eng';
 }): Promise<void> {
   await sql`
     INSERT INTO ${sql(SCHEMA)}.google_accounts
       (user_id, user_email, google_email, refresh_token_enc, scopes,
-       status, last_error, connected_at, updated_at)
+       client_key, status, last_error, connected_at, updated_at)
     VALUES
       (${input.userId}, ${input.userEmail}, ${input.googleEmail},
-       ${input.refreshTokenEnc}, ${input.scopes}, 'ok', NULL, now(), now())
+       ${input.refreshTokenEnc}, ${input.scopes}, ${input.clientKey},
+       'ok', NULL, now(), now())
     ON CONFLICT (user_id) DO UPDATE SET
       user_email        = EXCLUDED.user_email,
       google_email      = EXCLUDED.google_email,
       refresh_token_enc = EXCLUDED.refresh_token_enc,
       scopes            = EXCLUDED.scopes,
+      client_key        = EXCLUDED.client_key,
       status            = 'ok',
       last_error        = NULL,
       connected_at      = now(),
@@ -89,7 +94,7 @@ export async function markGoogleAccountPolled(userId: string): Promise<void> {
 export async function listPollableGoogleAccounts(): Promise<GoogleAccountRow[]> {
   return sql<GoogleAccountRow[]>`
     SELECT user_id, user_email, google_email, refresh_token_enc, scopes,
-           status, last_error, connected_at, last_refresh_at, last_poll_at
+           client_key, status, last_error, connected_at, last_refresh_at, last_poll_at
     FROM ${sql(SCHEMA)}.google_accounts
     WHERE status <> 'revoked'
     ORDER BY last_poll_at ASC NULLS FIRST

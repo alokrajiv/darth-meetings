@@ -76,6 +76,15 @@ export const config = {
     get clientSecret() {
       return process.env.GOOGLE_CLIENT_SECRET || '';
     },
+    /** Second Internal OAuth client, owned by the trames-engineering.com
+     * Workspace org — Internal consent can't span orgs, so each workspace
+     * needs its own client. */
+    get clientIdEng() {
+      return process.env.NEXT_PUBLIC_GOOGLE_CLIENT_ID_ENG || '';
+    },
+    get clientSecretEng() {
+      return process.env.GOOGLE_CLIENT_SECRET_ENG || '';
+    },
     /** 32-byte hex key for AES-256-GCM encryption of stored refresh tokens. */
     get tokenEncKey() {
       return process.env.GOOGLE_TOKEN_ENC_KEY || '';

@@ -32,6 +32,36 @@ const AUTH_ENDPOINT = 'https://accounts.google.com/o/oauth2/v2/auth';
 const TOKEN_ENDPOINT = 'https://oauth2.googleapis.com/token';
 const REVOKE_ENDPOINT = 'https://oauth2.googleapis.com/revoke';
 
+/**
+ * One Internal OAuth client per Workspace org (Internal consent can't span
+ * orgs): 'sg' = trames.sg, 'eng' = trames-engineering.com. Refresh tokens
+ * are client-bound at Google, so the issuing client is persisted on the
+ * account row and reused for every refresh.
+ */
+export type GoogleClientKey = 'sg' | 'eng';
+
+export function clientKeyForEmail(email: string): GoogleClientKey {
+  return email.toLowerCase().endsWith('@trames-engineering.com') ? 'eng' : 'sg';
+}
+
+function clientCreds(key: GoogleClientKey): { id: string; secret: string } {
+  const id = key === 'eng' ? config.google.clientIdEng : config.google.clientId;
+  const secret = key === 'eng' ? config.google.clientSecretEng : config.google.clientSecret;
+  if (!id || !secret) {
+    throw new Error(`Google OAuth client '${key}' is not configured on the server`);
+  }
+  return { id, secret };
+}
+
+export function isClientConfigured(key: GoogleClientKey): boolean {
+  try {
+    clientCreds(key);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 /** Thrown when Google says the refresh token is dead (user revoked it). */
 export class GoogleGrantRevokedError extends Error {
   constructor(detail: string) {
@@ -111,9 +141,9 @@ export function redirectUri(): string {
   return `${config.google.appBaseUrl.replace(/\/$/, '')}/api/google/callback`;
 }
 
-export function buildAuthUrl(state: string): string {
+export function buildAuthUrl(state: string, clientKey: GoogleClientKey): string {
   const params = new URLSearchParams({
-    client_id: config.google.clientId,
+    client_id: clientCreds(clientKey).id,
     redirect_uri: redirectUri(),
     response_type: 'code',
     scope: OFFLINE_SCOPES,
@@ -137,14 +167,18 @@ export interface CodeExchangeResult {
   email: string | null;
 }
 
-export async function exchangeCode(code: string): Promise<CodeExchangeResult> {
+export async function exchangeCode(
+  code: string,
+  clientKey: GoogleClientKey
+): Promise<CodeExchangeResult> {
+  const creds = clientCreds(clientKey);
   const res = await fetch(TOKEN_ENDPOINT, {
     method: 'POST',
     headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
     body: new URLSearchParams({
       code,
-      client_id: config.google.clientId,
-      client_secret: config.google.clientSecret,
+      client_id: creds.id,
+      client_secret: creds.secret,
       redirect_uri: redirectUri(),
       grant_type: 'authorization_code',
     }),
@@ -184,15 +218,17 @@ export async function exchangeCode(code: string): Promise<CodeExchangeResult> {
 }
 
 export async function refreshAccessToken(
-  refreshToken: string
+  refreshToken: string,
+  clientKey: GoogleClientKey
 ): Promise<{ accessToken: string; expiresIn: number }> {
+  const creds = clientCreds(clientKey);
   const res = await fetch(TOKEN_ENDPOINT, {
     method: 'POST',
     headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
     body: new URLSearchParams({
       refresh_token: refreshToken,
-      client_id: config.google.clientId,
-      client_secret: config.google.clientSecret,
+      client_id: creds.id,
+      client_secret: creds.secret,
       grant_type: 'refresh_token',
     }),
   });
@@ -256,7 +292,7 @@ export async function getServerAccessToken(
   }
 
   try {
-    const minted = await refreshAccessToken(refreshToken);
+    const minted = await refreshAccessToken(refreshToken, account.client_key);
     const entry = { token: minted.accessToken, expiresAt: Date.now() + minted.expiresIn * 1000 };
     tokenCache.set(userId, entry);
     await markGoogleAccountStatus(userId, 'ok', null);

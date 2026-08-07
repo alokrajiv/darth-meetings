@@ -1,7 +1,11 @@
 import { NextResponse } from 'next/server';
 import { withAuth } from '@/lib/auth/with-auth';
-import { mintState, buildAuthUrl } from '@/lib/server/google-oauth';
-import { config } from '@/config';
+import {
+  mintState,
+  buildAuthUrl,
+  clientKeyForEmail,
+  isClientConfigured,
+} from '@/lib/server/google-oauth';
 
 export const runtime = 'nodejs';
 
@@ -13,8 +17,12 @@ export const GET = withAuth(async ({ user, cliScope }) => {
   if (cliScope) {
     return NextResponse.json({ error: 'Google connect requires a browser session' }, { status: 403 });
   }
-  if (!config.google.clientId || !config.google.clientSecret) {
-    return NextResponse.json({ error: 'Google OAuth is not configured on the server' }, { status: 500 });
+  const clientKey = clientKeyForEmail(user.email);
+  if (!isClientConfigured(clientKey)) {
+    return NextResponse.json(
+      { error: `Google OAuth client for your workspace ('${clientKey}') is not configured` },
+      { status: 500 }
+    );
   }
-  return NextResponse.redirect(buildAuthUrl(mintState(user.userId)));
+  return NextResponse.redirect(buildAuthUrl(mintState(user.userId), clientKey));
 });

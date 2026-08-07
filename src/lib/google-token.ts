@@ -156,6 +156,34 @@ async function tryServerMintedToken(): Promise<string | null> {
   }
 }
 
+/**
+ * One Internal OAuth client per Workspace org: trames-engineering.com users
+ * must consent against THEIR org's client (Internal consent can't span
+ * orgs — the sg client 403s them with org_internal). Resolved once per page
+ * from the session's email.
+ */
+let popupClientIdPromise: Promise<string> | null = null;
+
+function resolvePopupClientId(): Promise<string> {
+  if (popupClientIdPromise) return popupClientIdPromise;
+  popupClientIdPromise = (async () => {
+    const sgId = process.env.NEXT_PUBLIC_GOOGLE_CLIENT_ID || '';
+    const engId = process.env.NEXT_PUBLIC_GOOGLE_CLIENT_ID_ENG || '';
+    if (!engId) return sgId;
+    try {
+      const res = await fetch('/api/whoami');
+      if (res.ok) {
+        const { email } = (await res.json()) as { email?: string };
+        if (email?.toLowerCase().endsWith('@trames-engineering.com')) return engId;
+      }
+    } catch {
+      // fall through to the sg client
+    }
+    return sgId;
+  })();
+  return popupClientIdPromise;
+}
+
 export async function getGoogleAccessToken(
   opts: { selectAccount?: boolean } = {}
 ): Promise<string> {
@@ -166,7 +194,7 @@ export async function getGoogleAccessToken(
     if (serverToken) return serverToken;
   }
 
-  const clientId = process.env.NEXT_PUBLIC_GOOGLE_CLIENT_ID;
+  const clientId = await resolvePopupClientId();
   if (!clientId) {
     throw new Error('NEXT_PUBLIC_GOOGLE_CLIENT_ID is not configured');
   }
