@@ -6,7 +6,7 @@ import { TranscriptTable } from '@/components/transcript-table';
 import { AudioUpload, AUDIO_UPLOAD_INPUT_ID } from '@/components/audio-upload';
 import { LogoutButton } from '@/components/logout-button';
 import { GmeetImportDialog } from '@/components/gmeet-import-dialog';
-import { GmeetRemindersCard } from '@/components/gmeet-reminders-card';
+import { GmeetRemindersCard, type Reminder } from '@/components/gmeet-reminders-card';
 import { TranscriptImportDialog } from '@/components/transcript-import-dialog';
 import { AppHeader } from '@/components/app-header';
 import { AskAiPanel } from '@/components/ask-ai-panel';
@@ -37,21 +37,64 @@ export default function Home() {
   const [askOpen, setAskOpen] = useState(false);
   const importMenuRef = useRef<HTMLDivElement>(null);
 
-  // Reminders banner: dismissable, with a badge icon in the header to bring
-  // it back. Collapsed state sticks across visits (localStorage); count keeps
-  // updating either way since the card fetches even while hidden.
-  const [reminderCount, setReminderCount] = useState(0);
+  // Meeting reminders (the poller's findings). The page owns the data: it
+  // feeds the top banner (dismissable for good, localStorage), the header
+  // badge count, and the header dropdown that the badge icon opens.
+  const [reminders, setReminders] = useState<Reminder[]>([]);
   const [remindersCollapsed, setRemindersCollapsed] = useState(false);
+  const [reminderMenuOpen, setReminderMenuOpen] = useState(false);
+  const reminderMenuRef = useRef<HTMLDivElement>(null);
   useEffect(() => {
     setRemindersCollapsed(localStorage.getItem(REMINDERS_COLLAPSED_KEY) === '1');
   }, []);
-  const toggleReminders = () => {
-    setRemindersCollapsed((prev) => {
-      const next = !prev;
-      localStorage.setItem(REMINDERS_COLLAPSED_KEY, next ? '1' : '0');
-      return next;
-    });
+  useEffect(() => {
+    fetch('/api/gmeet/reminders')
+      .then((r) => (r.ok ? r.json() : null))
+      .then((data) => setReminders(data?.reminders ?? []))
+      .catch(() => {});
+  }, [refreshTrigger]);
+  const reminderCount = reminders.length;
+  const actOnReminder = (r: Reminder, action: 'dismiss' | 'mute') => {
+    setReminders((prev) => prev.filter((x) => x.id !== r.id));
+    void fetch('/api/gmeet/reminders', {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        id: r.id,
+        action,
+        meetingCode: r.meetingCode,
+        title: r.title,
+        eventStart: r.eventStart,
+      }),
+    }).catch(() => {});
   };
+  const dismissBanner = () => {
+    setRemindersCollapsed(true);
+    localStorage.setItem(REMINDERS_COLLAPSED_KEY, '1');
+  };
+  const openMeetingFromReminder = (r: Reminder) => {
+    setReminderMenuOpen(false);
+    setGmeetFocus({ meetingCode: r.meetingCode, eventStart: r.eventStart });
+    setGmeetOpen(true);
+  };
+  // Close the reminders dropdown on outside click / Escape.
+  useEffect(() => {
+    if (!reminderMenuOpen) return;
+    const onPointerDown = (e: MouseEvent) => {
+      if (reminderMenuRef.current && !reminderMenuRef.current.contains(e.target as Node)) {
+        setReminderMenuOpen(false);
+      }
+    };
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') setReminderMenuOpen(false);
+    };
+    document.addEventListener('mousedown', onPointerDown);
+    document.addEventListener('keydown', onKeyDown);
+    return () => {
+      document.removeEventListener('mousedown', onPointerDown);
+      document.removeEventListener('keydown', onKeyDown);
+    };
+  }, [reminderMenuOpen]);
 
   // Post-connect landing: the Google callback returns to /?meet=1|sync
   // (&google=connected) so the import dialog the user came from reopens —
@@ -167,23 +210,39 @@ export default function Home() {
         </Button>
         <div className="h-5 w-px bg-border" />
         {reminderCount > 0 && (
-          <Button
-            variant="ghost"
-            size="sm"
-            className="relative h-8 w-8 p-0"
-            title={
-              remindersCollapsed
-                ? `${reminderCount} meeting${reminderCount === 1 ? '' : 's'} need attention — show`
-                : 'Hide the meetings-need-attention banner'
-            }
-            onClick={toggleReminders}
-          >
-            <CircleAlert className="h-4 w-4 text-primary" />
-            <span className="absolute -right-0.5 -top-0.5 flex h-4 min-w-4 items-center justify-center rounded-full bg-primary px-1 text-[10px] font-semibold leading-none text-primary-foreground">
-              {reminderCount}
-            </span>
-            <span className="sr-only">Meeting reminders</span>
-          </Button>
+          <div className="relative" ref={reminderMenuRef}>
+            <Button
+              variant="ghost"
+              size="sm"
+              className="relative h-8 w-8 p-0"
+              title={`${reminderCount} meeting${reminderCount === 1 ? '' : 's'} need attention`}
+              aria-expanded={reminderMenuOpen}
+              aria-haspopup="menu"
+              onClick={() => setReminderMenuOpen((o) => !o)}
+            >
+              <CircleAlert className="h-4 w-4 text-primary" />
+              <span className="absolute -right-0.5 -top-0.5 flex h-4 min-w-4 items-center justify-center rounded-full bg-primary px-1 text-[10px] font-semibold leading-none text-primary-foreground">
+                {reminderCount}
+              </span>
+              <span className="sr-only">Meeting reminders</span>
+            </Button>
+            {reminderMenuOpen && (
+              <div className="absolute right-0 top-full z-50 mt-1.5 w-[600px] max-w-[92vw]">
+                <GmeetRemindersCard
+                  reminders={reminders}
+                  variant="popover"
+                  onOpenSync={() => {
+                    setReminderMenuOpen(false);
+                    setGmeetSyncMode(true);
+                    setGmeetOpen(true);
+                  }}
+                  onOpenMeeting={openMeetingFromReminder}
+                  onAct={actOnReminder}
+                  onClose={() => setReminderMenuOpen(false)}
+                />
+              </div>
+            )}
+          </div>
         )}
         <Link href="/settings">
           <Button variant="ghost" size="sm" className="h-8 w-8 p-0" title="Settings">
@@ -205,20 +264,18 @@ export default function Home() {
             header button clicks, and in-flight upload progress rows. */}
         <AudioUpload onTranscriptCreated={handleTranscriptCreated} />
 
-        <GmeetRemindersCard
-          refreshTrigger={refreshTrigger}
-          onOpenSync={() => {
-            setGmeetSyncMode(true);
-            setGmeetOpen(true);
-          }}
-          onOpenMeeting={(r) => {
-            setGmeetFocus({ meetingCode: r.meetingCode, eventStart: r.eventStart });
-            setGmeetOpen(true);
-          }}
-          collapsed={remindersCollapsed}
-          onToggleCollapse={toggleReminders}
-          onCountChange={setReminderCount}
-        />
+        {!remindersCollapsed && (
+          <GmeetRemindersCard
+            reminders={reminders}
+            onOpenSync={() => {
+              setGmeetSyncMode(true);
+              setGmeetOpen(true);
+            }}
+            onOpenMeeting={openMeetingFromReminder}
+            onAct={actOnReminder}
+            onClose={dismissBanner}
+          />
+        )}
 
         <TranscriptTable
           refreshTrigger={refreshTrigger}

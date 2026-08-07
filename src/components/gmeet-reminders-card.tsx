@@ -1,6 +1,6 @@
 'use client';
 
-import { useCallback, useEffect, useState } from 'react';
+import { useState } from 'react';
 import { Button } from '@/components/ui/button';
 import { Video, X, BellOff, CircleAlert, FileText, Clapperboard } from 'lucide-react';
 
@@ -26,67 +26,45 @@ function fmtWhen(iso: string | null): string {
 }
 
 /**
- * Home-page surface for the background poller's findings: past meetings with
- * recordings nobody imported, and upcoming organized meetings that won't
- * auto-record. Renders nothing when there's nothing to say.
+ * The background poller's findings: past meetings with recordings nobody
+ * imported, and upcoming organized meetings that won't auto-record.
+ *
+ * Presentational — the home page owns the data (it also drives the header
+ * badge) and renders this either as the top-of-page banner or inside the
+ * header bell dropdown. Renders nothing when there's nothing to say.
  */
 export function GmeetRemindersCard({
-  refreshTrigger,
+  reminders,
+  variant = 'banner',
   onOpenSync,
   onOpenMeeting,
-  collapsed,
-  onToggleCollapse,
-  onCountChange,
+  onAct,
+  onClose,
 }: {
-  refreshTrigger: number;
+  reminders: Reminder[];
+  /** 'banner' = top-of-page callout; 'popover' = header-icon dropdown. */
+  variant?: 'banner' | 'popover';
   onOpenSync: () => void;
   /** Row click — open the import dialog focused on this meeting. */
   onOpenMeeting?: (r: Reminder) => void;
-  /** Hidden by the user — data still loads so the header badge stays live. */
-  collapsed?: boolean;
-  onToggleCollapse?: () => void;
-  /** Reports the reminder count so the header can show a badge. */
-  onCountChange?: (n: number) => void;
+  /** Dismiss/mute a single reminder. */
+  onAct: (r: Reminder, action: 'dismiss' | 'mute') => void;
+  /** Banner: hide it for good. Popover: close the dropdown. */
+  onClose?: () => void;
 }) {
-  const [reminders, setReminders] = useState<Reminder[]>([]);
   const [expanded, setExpanded] = useState(false);
 
-  const load = useCallback(() => {
-    fetch('/api/gmeet/reminders')
-      .then((r) => (r.ok ? r.json() : null))
-      .then((data) => setReminders(data?.reminders ?? []))
-      .catch(() => {});
-  }, []);
-
-  useEffect(() => {
-    load();
-  }, [load, refreshTrigger]);
-
-  useEffect(() => {
-    onCountChange?.(reminders.length);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [reminders.length]);
-
-  const act = async (r: Reminder, action: 'dismiss' | 'mute') => {
-    setReminders((prev) => prev.filter((x) => x.id !== r.id));
-    await fetch('/api/gmeet/reminders', {
-      method: 'PATCH',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        id: r.id,
-        action,
-        meetingCode: r.meetingCode,
-        title: r.title,
-        eventStart: r.eventStart,
-      }),
-    }).catch(() => {});
-  };
-
-  if (reminders.length === 0 || collapsed) return null;
+  if (reminders.length === 0) return null;
   const shown = expanded ? reminders : reminders.slice(0, SHOW_MAX);
 
   return (
-    <div className="mb-4 rounded-lg border border-primary/25 bg-primary/5 px-4 py-3">
+    <div
+      className={
+        variant === 'banner'
+          ? 'mb-4 rounded-lg border border-primary/25 bg-primary/5 px-4 py-3'
+          : 'rounded-lg border bg-popover px-4 py-3 text-popover-foreground shadow-[0_4px_16px_-2px_rgb(0_0_0/0.12),0_1px_2px_0_rgb(0_0_0/0.06)]'
+      }
+    >
       <div className="mb-2 flex items-center justify-between gap-2">
         <div className="flex items-center gap-2 text-sm font-medium">
           <CircleAlert className="h-4 w-4 text-primary" />
@@ -99,13 +77,17 @@ export function GmeetRemindersCard({
             <Video className="h-3.5 w-3.5" />
             Open sync
           </Button>
-          {onToggleCollapse && (
+          {onClose && (
             <Button
               variant="ghost"
               size="sm"
               className="h-7 w-7 p-0"
-              title="Hide — reopen anytime from the alert icon in the header"
-              onClick={onToggleCollapse}
+              title={
+                variant === 'banner'
+                  ? 'Hide this banner — the count stays on the header icon'
+                  : 'Close'
+              }
+              onClick={onClose}
             >
               <X className="h-4 w-4" />
             </Button>
@@ -141,7 +123,7 @@ export function GmeetRemindersCard({
                 size="sm"
                 className="h-6 w-6 p-0"
                 title="Never remind about this meeting"
-                onClick={() => act(r, 'mute')}
+                onClick={() => onAct(r, 'mute')}
               >
                 <BellOff className="h-3.5 w-3.5" />
               </Button>
@@ -150,7 +132,7 @@ export function GmeetRemindersCard({
                 size="sm"
                 className="h-6 w-6 p-0"
                 title="Dismiss"
-                onClick={() => act(r, 'dismiss')}
+                onClick={() => onAct(r, 'dismiss')}
               >
                 <X className="h-3.5 w-3.5" />
               </Button>
