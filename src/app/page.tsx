@@ -10,7 +10,6 @@ import { GmeetImportDialog } from '@/components/gmeet-import-dialog';
 import { GmeetRemindersCard, type Reminder } from '@/components/gmeet-reminders-card';
 import { TranscriptImportDialog } from '@/components/transcript-import-dialog';
 import { AppHeader } from '@/components/app-header';
-import { AskAiPanel } from '@/components/ask-ai-panel';
 import { Button } from '@/components/ui/button';
 import {
   Settings,
@@ -19,7 +18,6 @@ import {
   FileAudio,
   ChevronDown,
   CircleAlert,
-  Sparkles,
 } from 'lucide-react';
 
 const SYNC_NUDGE_AFTER_DAYS = 5;
@@ -35,7 +33,6 @@ export default function Home() {
   } | null>(null);
   const [textImportOpen, setTextImportOpen] = useState(false);
   const [importMenuOpen, setImportMenuOpen] = useState(false);
-  const [askOpen, setAskOpen] = useState(false);
   const importMenuRef = useRef<HTMLDivElement>(null);
 
   // Meeting reminders (the poller's findings). The page owns the data: it
@@ -262,12 +259,6 @@ export default function Home() {
       </AppHeader>
 
       <main className="mx-auto max-w-[1720px] px-6 py-4">
-        {askOpen && (
-          <div className="mb-4">
-            <AskAiPanel onClose={() => setAskOpen(false)} />
-          </div>
-        )}
-
         {/* Renders the page-wide drag-drop overlay, the hidden file input the
             header button clicks, and in-flight upload progress rows. */}
         <AudioUpload onTranscriptCreated={handleTranscriptCreated} />
@@ -309,18 +300,6 @@ export default function Home() {
                     Sync now
                   </Button>
                 </div>
-              )}
-              {!askOpen && (
-                <Button
-                  variant="outline"
-                  size="sm"
-                  className="h-8"
-                  onClick={() => setAskOpen(true)}
-                  title="Ask questions about your meetings — the AI answers with links"
-                >
-                  <Sparkles className="h-4 w-4 text-primary" />
-                  Ask AI
-                </Button>
               )}
             </>
           }
