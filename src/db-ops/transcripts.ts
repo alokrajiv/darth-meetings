@@ -116,6 +116,25 @@ export async function listVisibleToUser(
   });
 }
 
+/**
+ * Owner-agnostic lookup, for the Meet "join existing import" flow ONLY. The
+ * caller has deliberately NOT been granted visibility yet — the join route
+ * proves their access against Google (their own token) before anything from
+ * this row reaches them.
+ */
+export async function getAnyByAssemblyaiId(
+  assemblyaiId: string
+): Promise<TranscriptRow | null> {
+  const rows = await sql<TranscriptRow[]>`
+    SELECT *
+    FROM ${sql(SCHEMA)}.transcripts
+    WHERE assemblyai_id = ${assemblyaiId}
+    ORDER BY created_at ASC
+    LIMIT 1
+  `;
+  return rows[0] ?? null;
+}
+
 export async function getForUser(
   userId: string,
   assemblyaiId: string

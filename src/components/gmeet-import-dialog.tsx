@@ -1321,6 +1321,42 @@ export function GmeetImportDialog({
     }
   };
 
+  /**
+   * Join a colleague's existing import instead of cloning it. The server
+   * verifies — with OUR token — that Google gives us access to the meeting
+   * (we were in it, or its artifacts are shared with us) before granting a
+   * share on the existing row.
+   */
+  const joinExisting = async () => {
+    if (!picked?.event.conferenceData?.conferenceId) return;
+    setBusy(true);
+    setError(null);
+    try {
+      const token = await getGoogleAccessToken();
+      const res = await fetch('/api/gmeet/join', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          meetingCode: picked.event.conferenceData.conferenceId,
+          startTime: picked.event.start?.dateTime ?? null,
+          accessToken: token,
+        }),
+      });
+      const payload = (await res.json().catch(() => ({}))) as {
+        transcriptId?: string;
+        error?: string;
+      };
+      if (!res.ok || !payload.transcriptId) {
+        throw new Error(payload.error || `Join failed (${res.status})`);
+      }
+      onImported?.();
+      window.location.href = `/transcript/${payload.transcriptId}`;
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Join failed');
+      setBusy(false);
+    }
+  };
+
   const connect = async () => {
     setError(null);
     setBusy(true);
@@ -1887,10 +1923,10 @@ export function GmeetImportDialog({
                     </>
                   ) : null}
                   {conflict.accessible === false
-                    ? ". It hasn't been shared with you — ask them for access, or import your own copy."
+                    ? ". It hasn't been shared with you — but if you were in the meeting (or its files are shared with you), you can join their import instead of making a duplicate."
                     : ". It's in your list (invitees are shared in automatically)."}
                 </p>
-                <div className="flex gap-2">
+                <div className="flex gap-2 flex-wrap">
                   {conflict.id && (
                     <a href={`/transcript/${conflict.id}`}>
                       <Button size="sm">
@@ -1899,6 +1935,17 @@ export function GmeetImportDialog({
                       </Button>
                     </a>
                   )}
+                  {conflict.accessible === false &&
+                    picked.event.conferenceData?.conferenceId && (
+                      <Button size="sm" onClick={() => void joinExisting()} disabled={busy}>
+                        {busy ? (
+                          <Loader2 className="h-3.5 w-3.5 mr-1.5 animate-spin" />
+                        ) : (
+                          <CheckCircle2 className="h-3.5 w-3.5 mr-1.5" />
+                        )}
+                        Join their import
+                      </Button>
+                    )}
                   <Button
                     size="sm"
                     variant="outline"
