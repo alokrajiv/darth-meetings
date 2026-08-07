@@ -12,8 +12,8 @@ import { config } from '@/config';
 
 export const runtime = 'nodejs';
 
-function settingsRedirect(params: Record<string, string>): NextResponse {
-  const url = new URL('/settings', config.google.appBaseUrl);
+function doneRedirect(params: Record<string, string>, returnPath = '/settings'): NextResponse {
+  const url = new URL(returnPath, config.google.appBaseUrl);
   for (const [k, v] of Object.entries(params)) url.searchParams.set(k, v);
   return NextResponse.redirect(url);
 }
@@ -28,13 +28,17 @@ export const GET = withAuth(async ({ user, request, cliScope }) => {
     return NextResponse.json({ error: 'Google connect requires a browser session' }, { status: 403 });
   }
   const q = request.nextUrl.searchParams;
-  if (q.get('error')) {
-    return settingsRedirect({ google: 'error', reason: q.get('error')! });
-  }
   const code = q.get('code');
   const state = q.get('state');
-  if (!code || !state || !verifyState(state, user.userId)) {
-    return settingsRedirect({ google: 'error', reason: 'invalid_state' });
+  const verified = state ? verifyState(state, user.userId) : { ok: false as const };
+  if (q.get('error')) {
+    return doneRedirect(
+      { google: 'error', reason: q.get('error')! },
+      verified.ok ? verified.returnPath : undefined
+    );
+  }
+  if (!code || !verified.ok) {
+    return doneRedirect({ google: 'error', reason: 'invalid_state' });
   }
 
   try {
@@ -49,9 +53,9 @@ export const GET = withAuth(async ({ user, request, cliScope }) => {
       clientKey,
     });
     invalidateServerToken(user.userId);
-    return settingsRedirect({ google: 'connected' });
+    return doneRedirect({ google: 'connected' }, verified.returnPath);
   } catch (err) {
     console.error('[google-oauth] callback failed:', err);
-    return settingsRedirect({ google: 'error', reason: 'exchange_failed' });
+    return doneRedirect({ google: 'error', reason: 'exchange_failed' }, verified.returnPath);
   }
 });

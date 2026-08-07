@@ -107,30 +107,44 @@ function stateSig(payload: string): string {
   return crypto.createHmac('sha256', encKey()).update(payload).digest('base64url');
 }
 
-export function mintState(userId: string): string {
+export function mintState(userId: string, returnPath?: string): string {
   const payload = Buffer.from(
-    JSON.stringify({ u: userId, t: Date.now(), n: crypto.randomBytes(8).toString('hex') })
+    JSON.stringify({
+      u: userId,
+      t: Date.now(),
+      n: crypto.randomBytes(8).toString('hex'),
+      // App-relative post-connect destination; leading '/' enforced at both
+      // mint and verify so the callback can never open-redirect.
+      r: returnPath?.startsWith('/') ? returnPath : undefined,
+    })
   ).toString('base64url');
   return `${payload}.${stateSig(payload)}`;
 }
 
-export function verifyState(state: string, expectedUserId: string): boolean {
+export function verifyState(
+  state: string,
+  expectedUserId: string
+): { ok: boolean; returnPath?: string } {
   const dot = state.lastIndexOf('.');
-  if (dot < 0) return false;
+  if (dot < 0) return { ok: false };
   const payload = state.slice(0, dot);
   const sig = state.slice(dot + 1);
   const expected = stateSig(payload);
   const a = Buffer.from(sig);
   const b = Buffer.from(expected);
-  if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) return false;
+  if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) return { ok: false };
   try {
     const parsed = JSON.parse(Buffer.from(payload, 'base64url').toString('utf8')) as {
       u?: string;
       t?: number;
+      r?: string;
     };
-    return parsed.u === expectedUserId && Date.now() - (parsed.t ?? 0) <= STATE_MAX_AGE_MS;
+    if (parsed.u !== expectedUserId || Date.now() - (parsed.t ?? 0) > STATE_MAX_AGE_MS) {
+      return { ok: false };
+    }
+    return { ok: true, returnPath: parsed.r?.startsWith('/') ? parsed.r : undefined };
   } catch {
-    return false;
+    return { ok: false };
   }
 }
 
@@ -148,9 +162,10 @@ export function buildAuthUrl(state: string, clientKey: GoogleClientKey): string 
     response_type: 'code',
     scope: OFFLINE_SCOPES,
     access_type: 'offline',
-    // Force the consent screen so Google re-issues a refresh token even for
-    // users who already granted these scopes to the popup client.
-    prompt: 'consent',
+    // consent: forces re-issue of a refresh token even for prior grants.
+    // select_account: always show the account chooser — this doubles as the
+    // "wrong calendar? switch account" path, connect being a rare act.
+    prompt: 'select_account consent',
     include_granted_scopes: 'true',
     state,
   });

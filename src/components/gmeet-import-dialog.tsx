@@ -16,6 +16,8 @@ import {
   hasValidGoogleToken,
   invalidateGoogleToken,
   switchGoogleAccount,
+  connectGoogle,
+  GoogleNotConnectedError,
 } from '@/lib/google-token';
 import {
   AlertCircle,
@@ -837,13 +839,29 @@ export function GmeetImportDialog({
     }
   }, [paste]);
 
-  // Skip the connect step when a token from earlier in this page session is
-  // still alive.
+  // Skip the connect step whenever a token is obtainable — cached in this
+  // tab, or silently minted server-side for connected users. Only users who
+  // never ran the one-time connect see the connect step.
   useEffect(() => {
-    if (open && step === 'connect' && hasValidGoogleToken()) {
+    if (!(open && step === 'connect')) return;
+    if (hasValidGoogleToken()) {
       if (startInSync) void loadSync();
       else void loadEvents(date);
+      return;
     }
+    let cancelled = false;
+    getGoogleAccessToken()
+      .then(() => {
+        if (cancelled) return;
+        if (startInSync) void loadSync();
+        else void loadEvents(date);
+      })
+      .catch(() => {
+        // not connected — leave the connect step showing
+      });
+    return () => {
+      cancelled = true;
+    };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [open]);
 
@@ -1171,10 +1189,16 @@ export function GmeetImportDialog({
     setError(null);
     setBusy(true);
     try {
-      await getGoogleAccessToken(); // popup — must run inside the click
+      // Already connected (fresh browser, cache empty) → straight through.
+      await getGoogleAccessToken();
       if (startInSync) await loadSync();
       else await loadEvents(date);
     } catch (err) {
+      if (err instanceof GoogleNotConnectedError) {
+        // One-time app-wide connect; the callback reopens this dialog.
+        connectGoogle(startInSync ? '/?meet=sync' : '/?meet=1');
+        return; // navigating away
+      }
       setError(err instanceof Error ? err.message : 'Google sign-in failed');
       setBusy(false);
     }
@@ -1195,9 +1219,10 @@ export function GmeetImportDialog({
             <div className="rounded-md border bg-muted/40 p-3 text-sm">
               <p className="font-medium mb-1">Pull a meeting straight from your calendar</p>
               <p className="text-muted-foreground">
-                Connect your Trames Google account (read-only: Calendar + Drive + Meet +
-                directory), pick the meeting, and we&apos;ll fetch its recording and/or Meet
-                transcript for you — no downloading and re-uploading.
+                Connect your Trames Google account once (read-only: Calendar + Drive + Meet +
+                directory) — imports, background sync and meeting reminders all use it from
+                then on, no repeated sign-in popups. Pick the meeting and we&apos;ll fetch its
+                recording and/or Meet transcript — no downloading and re-uploading.
               </p>
             </div>
             {error && (
@@ -1487,14 +1512,11 @@ export function GmeetImportDialog({
               type="button"
               className="text-[11px] text-muted-foreground underline decoration-dotted underline-offset-2 hover:text-foreground"
               disabled={busy}
-              onClick={async () => {
-                try {
-                  setBusy(true);
-                  await switchGoogleAccount();
-                  await loadEvents(date);
-                } catch {
-                  setBusy(false);
-                }
+              onClick={() => {
+                // Full-page re-connect (forces Google's account chooser);
+                // the callback lands back here with the dialog reopened.
+                setBusy(true);
+                void switchGoogleAccount('/?meet=1');
               }}
             >
               Wrong calendar? Switch Google account

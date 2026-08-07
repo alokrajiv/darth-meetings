@@ -31,6 +31,25 @@ export default function Home() {
   const [askOpen, setAskOpen] = useState(false);
   const importMenuRef = useRef<HTMLDivElement>(null);
 
+  // Post-connect landing: the Google callback returns to /?meet=1|sync
+  // (&google=connected) so the import dialog the user came from reopens —
+  // now with silent server-minted tokens.
+  useEffect(() => {
+    const params = new URLSearchParams(window.location.search);
+    const meet = params.get('meet');
+    if (meet) {
+      setGmeetSyncMode(meet === 'sync');
+      setGmeetOpen(true);
+    }
+    if (meet || params.get('google')) {
+      params.delete('meet');
+      params.delete('google');
+      params.delete('reason');
+      const qs = params.toString();
+      window.history.replaceState(null, '', `${window.location.pathname}${qs ? `?${qs}` : ''}`);
+    }
+  }, []);
+
   // "Don't forget to sync" nudge: fetched once per visit; shows when the
   // user has never run a Meet sync or their last one is getting stale.
   const [lastSyncedAt, setLastSyncedAt] = useState<string | null | undefined>(undefined);

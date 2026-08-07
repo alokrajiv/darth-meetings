@@ -91,7 +91,7 @@ export function TranscriptSourcesCard({
     setFetching(true);
     setError(null);
     try {
-      const token = await getGoogleAccessToken(); // popup — user gesture
+      const token = await getGoogleAccessToken(); // server-minted (one-time connect)
       const res = await fetch(`/api/transcripts/${row.assemblyai_id}/fetch-audio`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },

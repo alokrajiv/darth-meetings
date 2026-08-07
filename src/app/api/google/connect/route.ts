@@ -13,7 +13,7 @@ export const runtime = 'nodejs';
  * Kick off the Google auth-code flow: signed state → Google consent screen.
  * Browser navigation target (window.location), not a fetch.
  */
-export const GET = withAuth(async ({ user, cliScope }) => {
+export const GET = withAuth(async ({ user, request, cliScope }) => {
   if (cliScope) {
     return NextResponse.json({ error: 'Google connect requires a browser session' }, { status: 403 });
   }
@@ -24,5 +24,6 @@ export const GET = withAuth(async ({ user, cliScope }) => {
       { status: 500 }
     );
   }
-  return NextResponse.redirect(buildAuthUrl(mintState(user.userId), clientKey));
+  const returnPath = request.nextUrl.searchParams.get('return') ?? undefined;
+  return NextResponse.redirect(buildAuthUrl(mintState(user.userId, returnPath), clientKey));
 });
