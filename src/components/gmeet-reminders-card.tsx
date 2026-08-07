@@ -4,7 +4,7 @@ import { useCallback, useEffect, useState } from 'react';
 import { Button } from '@/components/ui/button';
 import { Video, X, BellOff, CircleAlert, FileText, Clapperboard } from 'lucide-react';
 
-interface Reminder {
+export interface Reminder {
   id: number;
   kind: 'unimported' | 'autorec_off';
   meetingCode: string | null;
@@ -33,9 +33,12 @@ function fmtWhen(iso: string | null): string {
 export function GmeetRemindersCard({
   refreshTrigger,
   onOpenSync,
+  onOpenMeeting,
 }: {
   refreshTrigger: number;
   onOpenSync: () => void;
+  /** Row click — open the import dialog focused on this meeting. */
+  onOpenMeeting?: (r: Reminder) => void;
 }) {
   const [reminders, setReminders] = useState<Reminder[]>([]);
   const [expanded, setExpanded] = useState(false);
@@ -86,10 +89,15 @@ export function GmeetRemindersCard({
       <ul className="space-y-1">
         {shown.map((r) => (
           <li key={r.id} className="flex items-center gap-2 text-sm">
-            <span className="min-w-0 flex-1 truncate">
+            <button
+              type="button"
+              onClick={() => onOpenMeeting?.(r)}
+              title="See this meeting — opens the import dialog on its day"
+              className="min-w-0 flex-1 truncate text-left hover:underline underline-offset-2"
+            >
               <span className="font-medium">{r.title || r.meetingCode || 'Untitled meeting'}</span>
               <span className="ml-2 text-xs text-muted-foreground">{fmtWhen(r.eventStart)}</span>
-            </span>
+            </button>
             {r.kind === 'unimported' ? (
               <span className="flex shrink-0 items-center gap-1 text-[11px] text-muted-foreground">
                 {r.hasRecording && <Clapperboard className="h-3.5 w-3.5" aria-label="Has recording" />}

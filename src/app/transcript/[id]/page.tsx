@@ -2506,6 +2506,7 @@ export default function TranscriptDetailPage({ params }: TranscriptDetailPagePro
                       ? `/api/transcripts/${row.assemblyai_id}/audio`
                       : null
                   }
+                  hasVideo={/\.(mp4|webm|mov|mkv|m4v)$/i.test(row.local_audio_path ?? '')}
                   collapsed={!!collapsedSections.speakers}
                   onToggleCollapse={() => toggleSection('speakers')}
                   suggestions={speakerSuggestions}

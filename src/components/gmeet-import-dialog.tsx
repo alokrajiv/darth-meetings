@@ -148,10 +148,20 @@ interface GmeetImportDialogProps {
   onImported?: () => void;
   /** Open straight into the "Sync" tab (the last-sync nudge on the archive). */
   startInSync?: boolean;
+  /** Open on this meeting's calendar day, scrolled to + highlighting it
+   *  (reminder-row click). Takes precedence over startInSync. */
+  focusMeeting?: { meetingCode: string | null; eventStart: string | null } | null;
 }
 
 function todayLocalISO(): string {
   const d = new Date();
+  const pad = (n: number) => String(n).padStart(2, '0');
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+}
+
+/** ISO timestamp → local yyyy-mm-dd (the calendar-day picker's format). */
+function isoToLocalDate(iso: string): string {
+  const d = new Date(iso);
   const pad = (n: number) => String(n).padStart(2, '0');
   return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
 }
@@ -349,6 +359,7 @@ export function GmeetImportDialog({
   onClose,
   onImported,
   startInSync,
+  focusMeeting,
 }: GmeetImportDialogProps) {
   const [step, setStep] = useState<Step>('connect');
   const [tab, setTab] = useState<SourceTab>('calendar');
@@ -844,17 +855,26 @@ export function GmeetImportDialog({
   // never ran the one-time connect see the connect step.
   useEffect(() => {
     if (!(open && step === 'connect')) return;
+    const start = () => {
+      if (focusMeeting?.eventStart) {
+        // Reminder-row click: land on that meeting's day.
+        const d = isoToLocalDate(focusMeeting.eventStart);
+        setDate(d);
+        void loadEvents(d);
+      } else if (startInSync) {
+        void loadSync();
+      } else {
+        void loadEvents(date);
+      }
+    };
     if (hasValidGoogleToken()) {
-      if (startInSync) void loadSync();
-      else void loadEvents(date);
+      start();
       return;
     }
     let cancelled = false;
     getGoogleAccessToken()
       .then(() => {
-        if (cancelled) return;
-        if (startInSync) void loadSync();
-        else void loadEvents(date);
+        if (!cancelled) start();
       })
       .catch(() => {
         // not connected — leave the connect step showing
@@ -864,6 +884,20 @@ export function GmeetImportDialog({
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [open]);
+
+  // Scroll the focused meeting into view once its row shows up.
+  const focusScrolledRef = useRef(false);
+  useEffect(() => {
+    if (open) focusScrolledRef.current = false;
+  }, [open]);
+  useEffect(() => {
+    if (!open || !focusMeeting || focusScrolledRef.current) return;
+    const el = document.getElementById('gmeet-focus-row');
+    if (el) {
+      el.scrollIntoView({ block: 'center' });
+      focusScrolledRef.current = true;
+    }
+  }, [open, rows, focusMeeting]);
 
   const changeDate = (next: string) => {
     setDate(next);
@@ -1391,10 +1425,16 @@ export function GmeetImportDialog({
                     const key = markKey(row);
                     const mark = key ? importedMap[key] : undefined;
                     const muted = !!syncInfo?.skips.has(rowKey(row));
+                    const focused =
+                      !!focusMeeting?.meetingCode &&
+                      row.event.conferenceData?.conferenceId === focusMeeting.meetingCode;
                     return (
                       <li
                         key={row.event.id}
-                        className={`flex items-center ${muted ? 'opacity-45' : ''}`}
+                        id={focused ? 'gmeet-focus-row' : undefined}
+                        className={`flex items-center ${muted ? 'opacity-45' : ''} ${
+                          focused ? 'bg-primary/5 ring-1 ring-inset ring-primary/40' : ''
+                        }`}
                       >
                         {bulkEligible(row) && !mark && !muted ? (
                           <input

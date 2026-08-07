@@ -15,10 +15,12 @@ import { Textarea } from '@/components/ui/textarea';
 import {
   ChevronLeft,
   ChevronRight,
+  Film,
   Play,
   Pause,
   Headphones,
   Pencil,
+  X,
 } from 'lucide-react';
 import { formatTime, type SpeakerLabel } from '@/lib/format';
 import { defaultSpeakerLabel } from '@/lib/speaker-display';
@@ -48,6 +50,9 @@ interface SpeakerPreviewDialogProps {
   /** /api/transcripts/[id]/audio — null when the transcript has no playable
    *  audio; the dialog still works for editing names + context. */
   audioSrc: string | null;
+  /** The stored file has a video stream — offer a "Show video" toggle so you
+   *  can see who's talking while identifying speakers. */
+  hasVideo?: boolean;
   canEdit: boolean;
   onSave: (
     originalSpeaker: string,
@@ -104,6 +109,7 @@ export function SpeakerPreviewDialog({
   utterances,
   speakerLabels,
   audioSrc,
+  hasVideo,
   canEdit,
   onSave,
   onPickPerson,
@@ -113,7 +119,37 @@ export function SpeakerPreviewDialog({
   const [cursor, setCursor] = useState(0);
   const [playing, setPlaying] = useState(false);
   const [editingName, setEditingName] = useState(false);
-  const audioRef = useRef<HTMLAudioElement>(null);
+  // Audio or video element, depending on the toggle — same seek/play API.
+  const audioRef = useRef<HTMLMediaElement | null>(null);
+  const [videoOn, setVideoOn] = useState(false);
+  // Carry position/play-state across the audio<->video element swap.
+  const carryRef = useRef<{ t: number; playing: boolean } | null>(null);
+
+  const toggleVideo = () => {
+    const el = audioRef.current;
+    carryRef.current = el
+      ? { t: el.currentTime, playing: !el.paused && !el.ended }
+      : null;
+    setVideoOn((v) => !v);
+  };
+
+  // After the element swap, restore where we were.
+  useEffect(() => {
+    const carried = carryRef.current;
+    const el = audioRef.current;
+    if (!carried || !el) return;
+    carryRef.current = null;
+    const apply = () => {
+      try {
+        el.currentTime = carried.t;
+      } catch {
+        /* ignore */
+      }
+      if (carried.playing) void el.play().catch(() => {});
+    };
+    if (el.readyState >= 1) apply();
+    else el.addEventListener('loadedmetadata', apply, { once: true });
+  }, [videoOn]);
 
   // Reset to the requested speaker each time the dialog opens.
   useEffect(() => {
@@ -368,7 +404,11 @@ export function SpeakerPreviewDialog({
             </div>
 
             <div className="rounded-md border bg-card p-3">
-              <div className="space-y-2 max-h-[42vh] min-h-[200px] overflow-y-auto">
+              <div
+                className={`space-y-2 overflow-y-auto ${
+                  videoOn ? 'max-h-[20vh]' : 'max-h-[42vh] min-h-[200px]'
+                }`}
+              >
                 {currentSegment?.contextIdxs.map((idx) => {
                   const u = utterances[idx];
                   if (!u) return null;
@@ -399,6 +439,21 @@ export function SpeakerPreviewDialog({
               </div>
             </div>
 
+            {videoOn && (
+              <video
+                ref={(el) => {
+                  audioRef.current = el;
+                }}
+                src={audioSrc}
+                preload="auto"
+                controls
+                playsInline
+                className="max-h-[32vh] w-full rounded-md bg-black"
+                onPlay={() => setPlaying(true)}
+                onPause={() => setPlaying(false)}
+                onEnded={() => setPlaying(false)}
+              />
+            )}
             <div className="flex items-center gap-2 rounded-md border bg-muted/30 p-2">
               <Button
                 size="sm"
@@ -408,16 +463,37 @@ export function SpeakerPreviewDialog({
               >
                 {playing ? <Pause className="h-4 w-4" /> : <Play className="h-4 w-4" />}
               </Button>
-              <audio
-                ref={audioRef}
-                src={audioSrc}
-                preload="auto"
-                controls
-                className="h-9 flex-1"
-                onPlay={() => setPlaying(true)}
-                onPause={() => setPlaying(false)}
-                onEnded={() => setPlaying(false)}
-              />
+              {videoOn ? (
+                <span className="flex-1" />
+              ) : (
+                <audio
+                  ref={(el) => {
+                    audioRef.current = el;
+                  }}
+                  src={audioSrc}
+                  preload="auto"
+                  controls
+                  className="h-9 flex-1"
+                  onPlay={() => setPlaying(true)}
+                  onPause={() => setPlaying(false)}
+                  onEnded={() => setPlaying(false)}
+                />
+              )}
+              {hasVideo && (
+                <button
+                  type="button"
+                  onClick={toggleVideo}
+                  title={
+                    videoOn
+                      ? 'Back to audio-only'
+                      : 'See who’s on screen while you identify speakers'
+                  }
+                  className="flex shrink-0 items-center gap-1 rounded-md border px-2 py-1 text-[11px] font-medium text-muted-foreground hover:bg-muted"
+                >
+                  {videoOn ? <X className="h-3 w-3" /> : <Film className="h-3 w-3" />}
+                  {videoOn ? 'Hide video' : 'Show video'}
+                </button>
+              )}
               {focusStartSec != null && (
                 <span className="shrink-0 text-[11px] text-muted-foreground whitespace-nowrap">
                   starts at <span className="font-mono">{fmtHMS(focusStartSec)}</span>

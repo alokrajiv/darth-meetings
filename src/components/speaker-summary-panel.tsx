@@ -29,6 +29,8 @@ interface SpeakerSummaryPanelProps {
   onRequestCreatePerson: (originalSpeaker: string, name: string) => void;
   /** /api/transcripts/[id]/audio — voice samples in the dialog. Null = no audio. */
   audioSrc: string | null;
+  /** The stored recording has video — the dialog offers a "Show video" toggle. */
+  hasVideo?: boolean;
   /** Optional collapse state — when set, the card header becomes a toggle. */
   collapsed?: boolean;
   onToggleCollapse?: () => void;
@@ -53,6 +55,7 @@ export function SpeakerSummaryPanel({
   onPickPerson,
   onRequestCreatePerson,
   audioSrc,
+  hasVideo,
   collapsed,
   onToggleCollapse,
   suggestions,
@@ -275,6 +278,7 @@ export function SpeakerSummaryPanel({
           utterances={utterances}
           speakerLabels={speakerLabels}
           audioSrc={audioSrc}
+          hasVideo={hasVideo}
           canEdit={canEdit}
           onSave={onSave}
           onPickPerson={onPickPerson}

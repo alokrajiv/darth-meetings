@@ -26,6 +26,10 @@ export default function Home() {
   const [refreshTrigger, setRefreshTrigger] = useState(0);
   const [gmeetOpen, setGmeetOpen] = useState(false);
   const [gmeetSyncMode, setGmeetSyncMode] = useState(false);
+  const [gmeetFocus, setGmeetFocus] = useState<{
+    meetingCode: string | null;
+    eventStart: string | null;
+  } | null>(null);
   const [textImportOpen, setTextImportOpen] = useState(false);
   const [importMenuOpen, setImportMenuOpen] = useState(false);
   const [askOpen, setAskOpen] = useState(false);
@@ -170,6 +174,10 @@ export default function Home() {
             setGmeetSyncMode(true);
             setGmeetOpen(true);
           }}
+          onOpenMeeting={(r) => {
+            setGmeetFocus({ meetingCode: r.meetingCode, eventStart: r.eventStart });
+            setGmeetOpen(true);
+          }}
         />
 
         <TranscriptTable
@@ -219,11 +227,13 @@ export default function Home() {
         onClose={() => {
           setGmeetOpen(false);
           setGmeetSyncMode(false);
+          setGmeetFocus(null);
           // Re-check the nudge — a sync pass inside the dialog moves the marker.
           setRefreshTrigger((prev) => prev + 1);
         }}
         onImported={handleTranscriptCreated}
         startInSync={gmeetSyncMode}
+        focusMeeting={gmeetFocus}
       />
       <TranscriptImportDialog
         open={textImportOpen}
