@@ -207,7 +207,7 @@ export default function Home() {
           }
         >
           <FileAudio className="h-4 w-4" />
-          Upload audio
+          Upload media
         </Button>
         <Button size="sm" onClick={() => setGmeetOpen(true)}>
           <Video className="h-4 w-4" />

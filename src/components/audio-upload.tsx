@@ -12,10 +12,28 @@ import {
   DialogFooter,
 } from '@/components/ui/dialog';
 import { Label } from '@/components/ui/label';
-import { Upload, FileAudio, X, CheckCircle, AlertCircle } from 'lucide-react';
+import { Input } from '@/components/ui/input';
+import {
+  Upload,
+  FileAudio,
+  X,
+  CheckCircle,
+  AlertCircle,
+  CalendarDays,
+  ChevronLeft,
+  ChevronRight,
+  Loader2,
+  Sparkles,
+  Film,
+  FileText,
+} from 'lucide-react';
+import {
+  getGoogleAccessToken,
+  GoogleNotConnectedError,
+} from '@/lib/google-token';
 import type { StoredTranscript } from '@/lib/format';
 
-/** DOM id of the hidden file input — lets the page header's "Upload audio"
+/** DOM id of the hidden file input — lets the page header's "Upload media"
  * button trigger the picker without threading refs across components. */
 export const AUDIO_UPLOAD_INPUT_ID = 'audio-upload-file-input';
 
@@ -42,10 +60,59 @@ interface UploadStatus {
   error?: string;
 }
 
+/** What the stepper attaches to the upload when the user links a calendar
+ * event — mirrors the Meet-import event payload so gmeet_context comes out
+ * identical downstream (people context, speaker-ID hints, dedupe). */
+interface LinkedEvent {
+  id: string;
+  title?: string;
+  startTime?: string;
+  endTime?: string;
+  meetingCode?: string;
+  recurringEventId?: string;
+  iCalUID?: string;
+  organizerEmail?: string;
+  attendees: Array<{ email: string; name?: string; responseStatus?: string }>;
+}
+
+interface CalendarEventLite {
+  id: string;
+  summary?: string;
+  recurringEventId?: string;
+  iCalUID?: string;
+  organizer?: { email?: string };
+  start?: { dateTime?: string; date?: string };
+  end?: { dateTime?: string; date?: string };
+  attendees?: Array<{ email?: string; displayName?: string; responseStatus?: string }>;
+  conferenceData?: { conferenceId?: string };
+}
+
+type ReportPref = 'summary' | 'detailed-video' | 'detailed-text' | 'later';
+type DialogStep = 'files' | 'link' | 'process';
+
 const POLL_INTERVAL_MS = 3000;
 
 // Keep in sync with `proxyClientMaxBodySize` in next.config.ts.
 const MAX_FILE_BYTES = 4 * 1024 * 1024 * 1024; // 4GB
+
+const VIDEO_FILE_RE = /\.(mp4|webm|mov|mkv|m4v)$/i;
+
+function localDateOf(d: Date): string {
+  const pad = (n: number) => String(n).padStart(2, '0');
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+}
+
+function shiftDate(dateStr: string, days: number): string {
+  const d = new Date(`${dateStr}T12:00:00`);
+  d.setDate(d.getDate() + days);
+  return localDateOf(d);
+}
+
+function fmtEventTime(e: CalendarEventLite): string {
+  const iso = e.start?.dateTime;
+  if (!iso) return 'all day';
+  return new Date(iso).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+}
 
 export function AudioUpload({ onTranscriptCreated }: AudioUploadProps) {
   const [uploads, setUploads] = useState<UploadStatus[]>([]);
@@ -54,6 +121,17 @@ export function AudioUpload({ onTranscriptCreated }: AudioUploadProps) {
   const [isDialogOpen, setIsDialogOpen] = useState(false);
   const [selectedLanguage, setSelectedLanguage] = useState<string>('');
   const fileInputRef = useRef<HTMLInputElement>(null);
+
+  // --- stepper state ---
+  const [step, setStep] = useState<DialogStep>('files');
+  /** null = unknown (not probed yet); false = Google not connected. */
+  const [googleOk, setGoogleOk] = useState<boolean | null>(null);
+  const [linkDate, setLinkDate] = useState<string>(localDateOf(new Date()));
+  const [dayEvents, setDayEvents] = useState<CalendarEventLite[]>([]);
+  const [eventsBusy, setEventsBusy] = useState(false);
+  const [eventsError, setEventsError] = useState<string | null>(null);
+  const [selectedEventId, setSelectedEventId] = useState<string | null>(null);
+  const [reportPref, setReportPref] = useState<ReportPref>('summary');
 
   const formatFileSize = (bytes: number): string => {
     if (bytes === 0) return '0 Bytes';
@@ -112,16 +190,26 @@ export function AudioUpload({ onTranscriptCreated }: AudioUploadProps) {
   // Raw-body upload via XHR: the file IS the request body (the server
   // streams it to disk — no multipart, no server-side buffering), and
   // xhr.upload.onprogress gives real progress, which matters when a
-  // multi-GB file takes minutes to send.
-  const uploadFile = (file: File, languageCode: string): Promise<StoredTranscript> =>
+  // multi-GB file takes minutes to send. Linked-event context and the
+  // report preference ride along as a header + query param.
+  const uploadFile = (
+    file: File,
+    languageCode: string,
+    linked: LinkedEvent | null,
+    pref: ReportPref
+  ): Promise<StoredTranscript> =>
     new Promise((resolve, reject) => {
       const xhr = new XMLHttpRequest();
-      const qs = languageCode
-        ? `?${new URLSearchParams({ language_code: languageCode })}`
-        : '';
+      const params = new URLSearchParams();
+      if (languageCode) params.set('language_code', languageCode);
+      if (pref !== 'summary') params.set('report_pref', pref);
+      const qs = params.size > 0 ? `?${params}` : '';
       xhr.open('POST', `/api/transcripts${qs}`);
       xhr.setRequestHeader('content-type', file.type || 'application/octet-stream');
       xhr.setRequestHeader('x-filename', encodeURIComponent(file.name));
+      if (linked) {
+        xhr.setRequestHeader('x-linked-event', encodeURIComponent(JSON.stringify(linked)));
+      }
       xhr.upload.onprogress = (e) => {
         if (e.lengthComputable && e.total > 0) {
           // Upload owns the 0–50% band; transcription polling owns the rest.
@@ -152,7 +240,12 @@ export function AudioUpload({ onTranscriptCreated }: AudioUploadProps) {
       xhr.send(file);
     });
 
-  const submitForTranscription = async (file: File, languageCode: string) => {
+  const submitForTranscription = async (
+    file: File,
+    languageCode: string,
+    linked: LinkedEvent | null,
+    pref: ReportPref
+  ) => {
     if (file.size > MAX_FILE_BYTES) {
       throw new Error(
         `File is ${formatFileSize(file.size)} — the upload limit is ${formatFileSize(MAX_FILE_BYTES)}`
@@ -161,7 +254,7 @@ export function AudioUpload({ onTranscriptCreated }: AudioUploadProps) {
 
     updateUpload(file, { status: 'uploading', progress: 0 });
 
-    const transcript = await uploadFile(file, languageCode);
+    const transcript = await uploadFile(file, languageCode, linked, pref);
 
     updateUpload(file, {
       status: 'transcribing',
@@ -176,7 +269,12 @@ export function AudioUpload({ onTranscriptCreated }: AudioUploadProps) {
   };
 
   const startUpload = useCallback(
-    async (files: File[], languageCode: string) => {
+    async (
+      files: File[],
+      languageCode: string,
+      linked: LinkedEvent | null,
+      pref: ReportPref
+    ) => {
       for (const file of files) {
         const uploadStatus: UploadStatus = {
           file,
@@ -186,7 +284,7 @@ export function AudioUpload({ onTranscriptCreated }: AudioUploadProps) {
         setUploads((prev) => [...prev, uploadStatus]);
 
         try {
-          await submitForTranscription(file, languageCode);
+          await submitForTranscription(file, languageCode, linked, pref);
         } catch (error) {
           updateUpload(file, {
             status: 'error',
@@ -200,10 +298,102 @@ export function AudioUpload({ onTranscriptCreated }: AudioUploadProps) {
   );
 
   const handleFilesSelected = useCallback((files: FileList) => {
-    setPendingFiles(Array.from(files));
+    const list = Array.from(files);
+    setPendingFiles(list);
     setSelectedLanguage('');
+    setStep('files');
+    setSelectedEventId(null);
+    setEventsError(null);
+    setDayEvents([]);
+    setReportPref('summary');
+    // Meetings are usually uploaded soon after they happened — the file's
+    // own timestamp is a better first guess for the calendar day than today.
+    const stamp = list[0]?.lastModified;
+    setLinkDate(localDateOf(stamp ? new Date(stamp) : new Date()));
     setIsDialogOpen(true);
   }, []);
+
+  /** Load the day's calendar events for the link step (silent server-minted
+   * token — same as the Meet import dialog). */
+  const loadDayEvents = useCallback(async (forDate: string) => {
+    setEventsBusy(true);
+    setEventsError(null);
+    try {
+      const token = await getGoogleAccessToken();
+      setGoogleOk(true);
+      const params = new URLSearchParams({
+        timeMin: new Date(`${forDate}T00:00:00`).toISOString(),
+        timeMax: new Date(`${forDate}T23:59:59.999`).toISOString(),
+        singleEvents: 'true',
+        orderBy: 'startTime',
+        maxResults: '50',
+        fields:
+          'items(id,summary,recurringEventId,iCalUID,organizer(email),start,end,attendees(email,displayName,responseStatus),conferenceData(conferenceId))',
+      });
+      const res = await fetch(
+        `https://www.googleapis.com/calendar/v3/calendars/primary/events?${params}`,
+        { headers: { Authorization: `Bearer ${token}` } }
+      );
+      if (!res.ok) throw new Error(`Calendar request failed (${res.status})`);
+      const data = (await res.json()) as { items?: CalendarEventLite[] };
+      setDayEvents((data.items ?? []).filter((e) => e.start?.dateTime));
+    } catch (err) {
+      if (err instanceof GoogleNotConnectedError) {
+        setGoogleOk(false);
+      } else {
+        setEventsError(err instanceof Error ? err.message : 'Failed to load calendar');
+      }
+    } finally {
+      setEventsBusy(false);
+    }
+  }, []);
+
+  const changeLinkDate = (next: string) => {
+    setLinkDate(next);
+    setSelectedEventId(null);
+    void loadDayEvents(next);
+  };
+
+  const goToLinkStep = () => {
+    setStep('link');
+    void loadDayEvents(linkDate);
+  };
+
+  const buildLinkedEvent = (): LinkedEvent | null => {
+    if (!selectedEventId) return null;
+    const e = dayEvents.find((ev) => ev.id === selectedEventId);
+    if (!e) return null;
+    return {
+      id: e.id,
+      title: e.summary,
+      startTime: e.start?.dateTime,
+      endTime: e.end?.dateTime,
+      meetingCode: e.conferenceData?.conferenceId,
+      recurringEventId: e.recurringEventId,
+      iCalUID: e.iCalUID,
+      organizerEmail: e.organizer?.email,
+      attendees: (e.attendees ?? [])
+        .filter((a) => a.email)
+        .slice(0, 100)
+        .map((a) => ({
+          email: a.email!,
+          name: a.displayName,
+          responseStatus: a.responseStatus,
+        })),
+    };
+  };
+
+  const handleConfirmUpload = () => {
+    setIsDialogOpen(false);
+    startUpload(pendingFiles, selectedLanguage, buildLinkedEvent(), reportPref);
+    setPendingFiles([]);
+  };
+
+  const handleCancelUpload = () => {
+    setIsDialogOpen(false);
+    setPendingFiles([]);
+    setSelectedLanguage('');
+  };
 
   // Page-wide drag & drop: the visible dropzone strip is gone (it cost a
   // full row of chrome) — instead, dragging files anywhere over the window
@@ -256,18 +446,6 @@ export function AudioUpload({ onTranscriptCreated }: AudioUploadProps) {
     [handleFilesSelected]
   );
 
-  const handleConfirmUpload = () => {
-    setIsDialogOpen(false);
-    startUpload(pendingFiles, selectedLanguage);
-    setPendingFiles([]);
-  };
-
-  const handleCancelUpload = () => {
-    setIsDialogOpen(false);
-    setPendingFiles([]);
-    setSelectedLanguage('');
-  };
-
   const removeUpload = (file: File) => {
     setUploads((prev) => prev.filter((u) => u.file !== file));
   };
@@ -297,6 +475,51 @@ export function AudioUpload({ onTranscriptCreated }: AudioUploadProps) {
         return 'Processing...';
     }
   };
+
+  // Linking one calendar event to a batch makes no sense — the link step
+  // only shows for single-file uploads (the overwhelmingly common case).
+  const canLink = pendingFiles.length === 1;
+  const hasVideoFile = pendingFiles.some(
+    (f) => f.type.startsWith('video/') || VIDEO_FILE_RE.test(f.name)
+  );
+  const selectedEvent = selectedEventId
+    ? dayEvents.find((e) => e.id === selectedEventId)
+    : undefined;
+
+  const reportOptions: Array<{
+    value: ReportPref;
+    icon: React.ReactNode;
+    label: string;
+    detail: string;
+    hidden?: boolean;
+  }> = [
+    {
+      value: 'summary',
+      icon: <Sparkles className="h-4 w-4 text-primary" />,
+      label: 'Quick summary',
+      detail: 'Fast and clean — the default tier.',
+    },
+    {
+      value: 'detailed-video',
+      icon: <Film className="h-4 w-4 text-primary" />,
+      label: 'Detailed report — with video frames',
+      detail:
+        'Wiki-style deep dive: Claude reads the screen shares and embeds screenshots and citations. Slower.',
+      hidden: !hasVideoFile,
+    },
+    {
+      value: 'detailed-text',
+      icon: <FileText className="h-4 w-4 text-primary" />,
+      label: 'Detailed report — text only',
+      detail: 'Same deep dive without reading the video. Cheaper.',
+    },
+    {
+      value: 'later',
+      icon: <CalendarDays className="h-4 w-4 text-muted-foreground" />,
+      label: 'Decide later',
+      detail: 'Nothing generates until you pick on the meeting page.',
+    },
+  ];
 
   return (
     <>
@@ -365,49 +588,231 @@ export function AudioUpload({ onTranscriptCreated }: AudioUploadProps) {
       <Dialog open={isDialogOpen} onOpenChange={setIsDialogOpen}>
         <DialogContent className="rounded-xl shadow-[0_4px_16px_-2px_rgb(0_0_0/0.08),0_1px_2px_0_rgb(0_0_0/0.04)]">
           <DialogHeader>
-            <DialogTitle className="text-base font-semibold">Upload Settings</DialogTitle>
+            <DialogTitle className="text-base font-semibold">
+              {step === 'files' && 'Upload media'}
+              {step === 'link' && 'Link to a calendar meeting?'}
+              {step === 'process' && 'How should it be processed?'}
+            </DialogTitle>
           </DialogHeader>
-          <div className="space-y-4 py-4">
-            <div className="space-y-2">
-              <p className="text-sm text-muted-foreground">
-                {pendingFiles.length} file{pendingFiles.length > 1 ? 's' : ''} selected:
-              </p>
-              <ul className="text-sm space-y-1">
-                {pendingFiles.map((file, i) => (
-                  <li key={i} className="flex items-center gap-2">
-                    <FileAudio className="h-4 w-4 text-muted-foreground" />
-                    <span>{file.name}</span>
-                    <Badge variant="outline" className="text-xs">
-                      {formatFileSize(file.size)}
-                    </Badge>
-                  </li>
-                ))}
-              </ul>
+
+          {step === 'files' && (
+            <div className="space-y-4 py-2">
+              <div className="space-y-2">
+                <p className="text-sm text-muted-foreground">
+                  {pendingFiles.length} file{pendingFiles.length > 1 ? 's' : ''} selected:
+                </p>
+                <ul className="text-sm space-y-1">
+                  {pendingFiles.map((file, i) => (
+                    <li key={i} className="flex items-center gap-2">
+                      <FileAudio className="h-4 w-4 text-muted-foreground" />
+                      <span className="min-w-0 truncate">{file.name}</span>
+                      <Badge variant="outline" className="text-xs shrink-0">
+                        {formatFileSize(file.size)}
+                      </Badge>
+                    </li>
+                  ))}
+                </ul>
+              </div>
+              <div className="space-y-2">
+                <Label htmlFor="language-select">Language</Label>
+                <select
+                  id="language-select"
+                  value={selectedLanguage}
+                  onChange={(e) => setSelectedLanguage(e.target.value)}
+                  className="flex h-9 w-full rounded-md border border-input bg-background px-3 py-1.5 text-sm ring-offset-background focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2"
+                >
+                  {LANGUAGE_OPTIONS.map((lang) => (
+                    <option key={lang.code} value={lang.code}>
+                      {lang.label}
+                    </option>
+                  ))}
+                </select>
+                <p className="text-xs text-muted-foreground">
+                  Select the primary language spoken in the recording, or use Auto Detect.
+                </p>
+              </div>
             </div>
-            <div className="space-y-2">
-              <Label htmlFor="language-select">Language</Label>
-              <select
-                id="language-select"
-                value={selectedLanguage}
-                onChange={(e) => setSelectedLanguage(e.target.value)}
-                className="flex h-9 w-full rounded-md border border-input bg-background px-3 py-1.5 text-sm ring-offset-background focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2"
-              >
-                {LANGUAGE_OPTIONS.map((lang) => (
-                  <option key={lang.code} value={lang.code}>
-                    {lang.label}
-                  </option>
-                ))}
-              </select>
+          )}
+
+          {step === 'link' && (
+            <div className="space-y-3 py-2">
               <p className="text-xs text-muted-foreground">
-                Select the primary language spoken in the audio, or use Auto Detect.
+                Linking pulls in the meeting&apos;s title, time and invitees — speaker
+                name-guessing and the summary get real context, and colleagues browsing
+                the archive see it as the meeting it was.
               </p>
+              {googleOk === false ? (
+                <p className="rounded-md border bg-muted/40 p-3 text-xs text-muted-foreground">
+                  Google isn&apos;t connected, so there&apos;s no calendar to pick from —
+                  you can connect it under the Import-from-Meet flow any time. Skipping
+                  this step.
+                </p>
+              ) : (
+                <>
+                  <div className="flex items-center gap-1">
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      onClick={() => changeLinkDate(shiftDate(linkDate, -1))}
+                      disabled={eventsBusy}
+                    >
+                      <ChevronLeft className="h-4 w-4" />
+                    </Button>
+                    <Input
+                      type="date"
+                      value={linkDate}
+                      onChange={(e) => e.target.value && changeLinkDate(e.target.value)}
+                      className="w-36"
+                      disabled={eventsBusy}
+                    />
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      onClick={() => changeLinkDate(shiftDate(linkDate, 1))}
+                      disabled={eventsBusy}
+                    >
+                      <ChevronRight className="h-4 w-4" />
+                    </Button>
+                    {eventsBusy && (
+                      <Loader2 className="ml-1 h-4 w-4 animate-spin text-muted-foreground" />
+                    )}
+                  </div>
+                  <div className="max-h-[38vh] overflow-y-auto rounded-md border">
+                    <label className="flex cursor-pointer items-center gap-2.5 border-b p-2.5 text-sm hover:bg-muted/50">
+                      <input
+                        type="radio"
+                        name="upload-link-event"
+                        checked={selectedEventId === null}
+                        onChange={() => setSelectedEventId(null)}
+                      />
+                      <span className="text-muted-foreground">
+                        Not from a calendar meeting
+                      </span>
+                    </label>
+                    {dayEvents.length === 0 && !eventsBusy ? (
+                      <p className="p-3 text-xs text-muted-foreground">
+                        No timed events on this day.
+                      </p>
+                    ) : (
+                      dayEvents.map((e) => (
+                        <label
+                          key={e.id}
+                          className="flex cursor-pointer items-center gap-2.5 border-b p-2.5 text-sm last:border-b-0 hover:bg-muted/50"
+                        >
+                          <input
+                            type="radio"
+                            name="upload-link-event"
+                            checked={selectedEventId === e.id}
+                            onChange={() => setSelectedEventId(e.id)}
+                          />
+                          <span className="w-14 shrink-0 text-xs text-muted-foreground">
+                            {fmtEventTime(e)}
+                          </span>
+                          <span className="min-w-0 flex-1 truncate">
+                            {e.summary ?? '(no title)'}
+                          </span>
+                          {(e.attendees?.length ?? 0) > 0 && (
+                            <span className="shrink-0 text-[11px] text-muted-foreground">
+                              {e.attendees!.length} invitee
+                              {e.attendees!.length === 1 ? '' : 's'}
+                            </span>
+                          )}
+                        </label>
+                      ))
+                    )}
+                  </div>
+                  {eventsError && (
+                    <p className="text-xs text-destructive flex items-center gap-1">
+                      <AlertCircle className="h-4 w-4" />
+                      {eventsError}
+                    </p>
+                  )}
+                </>
+              )}
             </div>
-          </div>
+          )}
+
+          {step === 'process' && (
+            <div className="space-y-3 py-2">
+              {selectedEvent && (
+                <p className="rounded-md border bg-muted/40 px-3 py-2 text-xs text-muted-foreground">
+                  <CalendarDays className="mr-1.5 inline h-3.5 w-3.5" />
+                  Linked to <span className="font-medium">{selectedEvent.summary}</span>
+                  {' · '}
+                  {fmtEventTime(selectedEvent)}
+                </p>
+              )}
+              <p className="text-xs text-muted-foreground">
+                First the AI guesses who&apos;s speaking (voiceprints + context), you
+                confirm the names, and only then does this run — so it&apos;s written
+                with real names from the start.
+              </p>
+              <div className="space-y-1.5">
+                {reportOptions
+                  .filter((o) => !o.hidden)
+                  .map((o) => (
+                    <label
+                      key={o.value}
+                      className="flex cursor-pointer items-start gap-2 rounded-md border p-3 has-[:checked]:border-primary"
+                    >
+                      <input
+                        type="radio"
+                        name="upload-report-pref"
+                        className="mt-0.5"
+                        checked={reportPref === o.value}
+                        onChange={() => setReportPref(o.value)}
+                      />
+                      <span className="text-sm">
+                        <span className="flex items-center gap-2 font-medium">
+                          {o.icon}
+                          {o.label}
+                        </span>
+                        <span className="mt-0.5 block text-xs text-muted-foreground">
+                          {o.detail}
+                        </span>
+                      </span>
+                    </label>
+                  ))}
+              </div>
+            </div>
+          )}
+
           <DialogFooter>
             <Button variant="ghost" onClick={handleCancelUpload}>
               Cancel
             </Button>
-            <Button onClick={handleConfirmUpload}>Start Transcription</Button>
+            {step === 'files' && (
+              <Button
+                onClick={() => {
+                  if (canLink) goToLinkStep();
+                  else setStep('process');
+                }}
+                disabled={pendingFiles.length === 0}
+              >
+                Next
+              </Button>
+            )}
+            {step === 'link' && (
+              <>
+                <Button variant="ghost" onClick={() => setStep('files')}>
+                  Back
+                </Button>
+                <Button onClick={() => setStep('process')}>
+                  {selectedEventId ? 'Next' : 'Skip'}
+                </Button>
+              </>
+            )}
+            {step === 'process' && (
+              <>
+                <Button
+                  variant="ghost"
+                  onClick={() => (canLink && googleOk !== false ? setStep('link') : setStep('files'))}
+                >
+                  Back
+                </Button>
+                <Button onClick={handleConfirmUpload}>Start Transcription</Button>
+              </>
+            )}
           </DialogFooter>
         </DialogContent>
       </Dialog>

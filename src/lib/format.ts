@@ -143,6 +143,12 @@ export interface GmeetContext {
     utterances: MeetUtterance[];
   } | null;
   actuals?: MeetActuals | null;
+  /** Upload-time processing choices (upload-media stepper). `report` is what
+   * the speaker-review confirm generates: quick summary (default when
+   * absent), a detailed report, or nothing ('later' = pick on the page). */
+  uploadPrefs?: {
+    report?: 'summary' | 'detailed-video' | 'detailed-text' | 'later';
+  } | null;
 }
 
 /** Access level for the current user on a transcript. */

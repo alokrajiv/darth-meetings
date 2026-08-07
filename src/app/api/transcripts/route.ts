@@ -14,7 +14,41 @@ import {
 } from '@/lib/server/audio-storage';
 import { IngestError, ingestLocalAudio } from '@/lib/server/ingest';
 import { onTranscriptCompleted } from '@/lib/server/post-completion';
-import type { StoredTranscript } from '@/lib/format';
+import type { GmeetAttendee, GmeetContext, StoredTranscript } from '@/lib/format';
+
+/** Calendar event the upload-media stepper linked to this file — rides in
+ * the `x-linked-event` header (URI-encoded JSON) because the body is the
+ * raw file bytes. Shape mirrors the Meet import's event payload. */
+interface LinkedEventHeader {
+  id?: string;
+  title?: string;
+  startTime?: string;
+  endTime?: string;
+  meetingCode?: string;
+  recurringEventId?: string;
+  iCalUID?: string;
+  organizerEmail?: string;
+  attendees?: Array<{ email?: string; name?: string; responseStatus?: string }>;
+}
+
+function parseLinkedEventHeader(raw: string | null): LinkedEventHeader | null {
+  if (!raw) return null;
+  try {
+    const parsed = JSON.parse(decodeURIComponent(raw)) as LinkedEventHeader;
+    if (!parsed || typeof parsed !== 'object') return null;
+    if (parsed.startTime && Number.isNaN(Date.parse(parsed.startTime))) {
+      parsed.startTime = undefined;
+    }
+    if (parsed.endTime && Number.isNaN(Date.parse(parsed.endTime))) {
+      parsed.endTime = undefined;
+    }
+    return parsed;
+  } catch {
+    return null;
+  }
+}
+
+const REPORT_PREFS = new Set(['summary', 'detailed-video', 'detailed-text', 'later']);
 
 export const runtime = 'nodejs';
 // Handler wall-clock budget (only enforced on serverless hosts). Receiving a
@@ -181,6 +215,16 @@ export const POST = withAuth(async ({ user, request }) => {
     }
   }
 
+  // Upload-media stepper extras: a linked calendar event (context for
+  // speaker-ID, people lookup and the archive) and the report preference
+  // the speaker-review confirm should honor.
+  const linkedEvent = parseLinkedEventHeader(request.headers.get('x-linked-event'));
+  const rawPref = request.nextUrl.searchParams.get('report_pref');
+  const reportPref =
+    rawPref && REPORT_PREFS.has(rawPref)
+      ? (rawPref as NonNullable<NonNullable<GmeetContext['uploadPrefs']>['report']>)
+      : null;
+
   // Shared tail: AAI upload (disk-streamed) → vocab-biased submit → DB row →
   // rename temp file to its permanent name. Same path as the Meet import.
   try {
@@ -193,18 +237,54 @@ export const POST = withAuth(async ({ user, request }) => {
           .filter((s): s is string => !!s && s.length > 1 && !/^speaker\s*\d+$/i.test(s))
       ),
     ];
+    // Invitee names from the linked event get the same treatment — they are
+    // exactly the names AAI would otherwise mis-hear.
+    const attendees: GmeetAttendee[] = (linkedEvent?.attendees ?? [])
+      .filter((a): a is { email: string; name?: string; responseStatus?: string } =>
+        typeof a?.email === 'string'
+      )
+      .slice(0, 100)
+      .map((a) => ({ email: a.email, name: a.name, responseStatus: a.responseStatus }));
+    const attendeeNames = attendees
+      .map((a) => a.name?.trim())
+      .filter((n): n is string => !!n && n.length > 1);
+
+    const gmeetContext: GmeetContext | null =
+      linkedEvent || reportPref
+        ? {
+            ...(linkedEvent
+              ? {
+                  eventId: linkedEvent.id,
+                  eventTitle: linkedEvent.title?.slice(0, 300),
+                  startTime: linkedEvent.startTime,
+                  endTime: linkedEvent.endTime,
+                  meetingCode: linkedEvent.meetingCode,
+                  recurringEventId: linkedEvent.recurringEventId,
+                  iCalUID: linkedEvent.iCalUID,
+                  organizerEmail: linkedEvent.organizerEmail,
+                  attendees,
+                }
+              : {}),
+            ...(reportPref ? { uploadPrefs: { report: reportPref } } : {}),
+          }
+        : null;
 
     const row = await ingestLocalAudio(user.userId, tempFilename, {
       originalFilename,
       languageCode,
-      title: sourceRow?.title ?? null,
-      extraKeyterms: sourceSpeakers.length > 0 ? sourceSpeakers : undefined,
+      title: sourceRow?.title ?? linkedEvent?.title?.slice(0, 300) ?? null,
+      extraKeyterms:
+        sourceSpeakers.length > 0 || attendeeNames.length > 0
+          ? [...sourceSpeakers, ...attendeeNames]
+          : undefined,
+      gmeetContext,
     });
-    if (sourceRow?.recorded_at) {
+    const recordedAt = sourceRow?.recorded_at ?? linkedEvent?.startTime;
+    if (recordedAt) {
       await setRecordedAtForUser(
         user.userId,
         row.assemblyai_id,
-        new Date(sourceRow.recorded_at)
+        new Date(recordedAt)
       ).catch(() => {});
     }
     return NextResponse.json({ transcript: row }, { status: 201 });

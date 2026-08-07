@@ -567,6 +567,29 @@ export default function TranscriptDetailPage({ params }: TranscriptDetailPagePro
     return counts;
   }, [content]);
 
+  const handleGenerateReport = useCallback(async (instructions?: string, useVideo = true) => {
+    if (generatingReport) return;
+    setGeneratingReport(true);
+    try {
+      const res = await fetch(`/api/transcripts/${transcriptId}/report`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          ...(instructions?.trim() ? { instructions: instructions.trim() } : {}),
+          useVideo,
+        }),
+      });
+      if (res.ok) {
+        setRow((prev) =>
+          prev ? { ...prev, auto_report_status: 'running', auto_report_error: null } : prev
+        );
+        bumpActivity();
+      }
+    } finally {
+      setGeneratingReport(false);
+    }
+  }, [transcriptId, generatingReport, bumpActivity]);
+
   // Review-dialog confirm: batch-save the finalized names, then kick off the
   // first summary generation — the whole point of the interrupt is that the
   // summary is written with real names from the start.
@@ -604,34 +627,28 @@ export default function TranscriptDetailPage({ params }: TranscriptDetailPagePro
         }
       }
       setReviewOpen(false);
-      selectSummaryTab('summary');
-      await handleGenerateNotes();
-    },
-    [speakerLabels, transcriptId, bumpActivity, loadAll, handleGenerateNotes, selectSummaryTab]
-  );
-
-  const handleGenerateReport = useCallback(async (instructions?: string, useVideo = true) => {
-    if (generatingReport) return;
-    setGeneratingReport(true);
-    try {
-      const res = await fetch(`/api/transcripts/${transcriptId}/report`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          ...(instructions?.trim() ? { instructions: instructions.trim() } : {}),
-          useVideo,
-        }),
-      });
-      if (res.ok) {
-        setRow((prev) =>
-          prev ? { ...prev, auto_report_status: 'running', auto_report_error: null } : prev
-        );
-        bumpActivity();
+      // Honor what the user picked at upload time (upload-media stepper):
+      // a detailed report, nothing ('later'), or the default quick summary.
+      const pref = row?.gmeet_context?.uploadPrefs?.report;
+      if (pref === 'detailed-video' || pref === 'detailed-text') {
+        selectSummaryTab('report');
+        await handleGenerateReport(undefined, pref === 'detailed-video');
+      } else if (pref !== 'later') {
+        selectSummaryTab('summary');
+        await handleGenerateNotes();
       }
-    } finally {
-      setGeneratingReport(false);
-    }
-  }, [transcriptId, generatingReport, bumpActivity]);
+    },
+    [
+      speakerLabels,
+      transcriptId,
+      bumpActivity,
+      loadAll,
+      handleGenerateNotes,
+      handleGenerateReport,
+      selectSummaryTab,
+      row,
+    ]
+  );
 
   // Safety net for the report status: live events normally push the refresh,
   // but poll while running in case the SSE stream is down.
