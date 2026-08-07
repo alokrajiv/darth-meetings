@@ -6,6 +6,7 @@ import { Button } from '@/components/ui/button';
 import { RefreshCw } from 'lucide-react';
 import { AppHeader } from '@/components/app-header';
 import { VocabEditor } from '@/components/vocab-editor';
+import { GoogleAccountCard } from '@/components/google-account-card';
 import type { VocabPayload } from '@/lib/format';
 
 interface OrgVocabMeta {
@@ -102,6 +103,10 @@ export default function SettingsPage() {
         <p className="text-sm text-muted-foreground">
           Key terms and custom spellings — applied at transcription time.
         </p>
+      </div>
+
+      <div className="mb-6">
+        <GoogleAccountCard />
       </div>
 
       {loading && (

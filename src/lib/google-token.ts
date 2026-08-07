@@ -134,10 +134,37 @@ export function invalidateGoogleToken(): void {
   writeStoredToken(null);
 }
 
+/**
+ * Users who connected their Google account in Settings (auth-code flow with
+ * a server-held refresh token) get tokens minted server-side — no popup.
+ * 404 = not connected; fall through to the GIS popup.
+ */
+async function tryServerMintedToken(): Promise<string | null> {
+  try {
+    const res = await fetch('/api/google/token');
+    if (!res.ok) return null;
+    const json = (await res.json()) as { accessToken?: string; expiresAt?: number };
+    if (typeof json.accessToken !== 'string') return null;
+    cached = {
+      token: json.accessToken,
+      expiresAt: typeof json.expiresAt === 'number' ? json.expiresAt : Date.now() + 3300_000,
+    };
+    writeStoredToken(cached);
+    return cached.token;
+  } catch {
+    return null;
+  }
+}
+
 export async function getGoogleAccessToken(
   opts: { selectAccount?: boolean } = {}
 ): Promise<string> {
   if (!opts.selectAccount && hasValidGoogleToken()) return cached!.token;
+
+  if (!opts.selectAccount) {
+    const serverToken = await tryServerMintedToken();
+    if (serverToken) return serverToken;
+  }
 
   const clientId = process.env.NEXT_PUBLIC_GOOGLE_CLIENT_ID;
   if (!clientId) {

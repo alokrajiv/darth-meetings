@@ -6,6 +6,7 @@ import { TranscriptTable } from '@/components/transcript-table';
 import { AudioUpload, AUDIO_UPLOAD_INPUT_ID } from '@/components/audio-upload';
 import { LogoutButton } from '@/components/logout-button';
 import { GmeetImportDialog } from '@/components/gmeet-import-dialog';
+import { GmeetRemindersCard } from '@/components/gmeet-reminders-card';
 import { TranscriptImportDialog } from '@/components/transcript-import-dialog';
 import { AppHeader } from '@/components/app-header';
 import { AskAiPanel } from '@/components/ask-ai-panel';
@@ -143,6 +144,14 @@ export default function Home() {
         {/* Renders the page-wide drag-drop overlay, the hidden file input the
             header button clicks, and in-flight upload progress rows. */}
         <AudioUpload onTranscriptCreated={handleTranscriptCreated} />
+
+        <GmeetRemindersCard
+          refreshTrigger={refreshTrigger}
+          onOpenSync={() => {
+            setGmeetSyncMode(true);
+            setGmeetOpen(true);
+          }}
+        />
 
         <TranscriptTable
           refreshTrigger={refreshTrigger}

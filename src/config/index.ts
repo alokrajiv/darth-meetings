@@ -68,4 +68,22 @@ export const config = {
       return process.env.ASSEMBLYAI_API_KEY || '';
     },
   },
+
+  google: {
+    get clientId() {
+      return process.env.NEXT_PUBLIC_GOOGLE_CLIENT_ID || '';
+    },
+    get clientSecret() {
+      return process.env.GOOGLE_CLIENT_SECRET || '';
+    },
+    /** 32-byte hex key for AES-256-GCM encryption of stored refresh tokens. */
+    get tokenEncKey() {
+      return process.env.GOOGLE_TOKEN_ENC_KEY || '';
+    },
+    /** External origin of this deployment — the OAuth redirect URI is built
+     * from it and must exactly match a URI registered on the GCP client. */
+    get appBaseUrl() {
+      return process.env.APP_BASE_URL || 'https://meetings.darth-internal.trames.io';
+    },
+  },
 } as const;

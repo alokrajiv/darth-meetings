@@ -6,5 +6,7 @@ export async function register() {
   if (process.env.NEXT_RUNTIME === 'nodejs') {
     const { startAutoNotesSweeper } = await import('@/lib/server/auto-notes-sweeper');
     startAutoNotesSweeper();
+    const { startGmeetPoller } = await import('@/lib/server/gmeet-poller');
+    startGmeetPoller();
   }
 }
