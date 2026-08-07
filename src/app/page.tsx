@@ -17,10 +17,12 @@ import {
   FileText,
   FileAudio,
   ChevronDown,
+  CircleAlert,
   Sparkles,
 } from 'lucide-react';
 
 const SYNC_NUDGE_AFTER_DAYS = 5;
+const REMINDERS_COLLAPSED_KEY = 'mw-reminders-collapsed';
 
 export default function Home() {
   const [refreshTrigger, setRefreshTrigger] = useState(0);
@@ -34,6 +36,22 @@ export default function Home() {
   const [importMenuOpen, setImportMenuOpen] = useState(false);
   const [askOpen, setAskOpen] = useState(false);
   const importMenuRef = useRef<HTMLDivElement>(null);
+
+  // Reminders banner: dismissable, with a badge icon in the header to bring
+  // it back. Collapsed state sticks across visits (localStorage); count keeps
+  // updating either way since the card fetches even while hidden.
+  const [reminderCount, setReminderCount] = useState(0);
+  const [remindersCollapsed, setRemindersCollapsed] = useState(false);
+  useEffect(() => {
+    setRemindersCollapsed(localStorage.getItem(REMINDERS_COLLAPSED_KEY) === '1');
+  }, []);
+  const toggleReminders = () => {
+    setRemindersCollapsed((prev) => {
+      const next = !prev;
+      localStorage.setItem(REMINDERS_COLLAPSED_KEY, next ? '1' : '0');
+      return next;
+    });
+  };
 
   // Post-connect landing: the Google callback returns to /?meet=1|sync
   // (&google=connected) so the import dialog the user came from reopens —
@@ -148,6 +166,25 @@ export default function Home() {
           Import from Meet
         </Button>
         <div className="h-5 w-px bg-border" />
+        {reminderCount > 0 && (
+          <Button
+            variant="ghost"
+            size="sm"
+            className="relative h-8 w-8 p-0"
+            title={
+              remindersCollapsed
+                ? `${reminderCount} meeting${reminderCount === 1 ? '' : 's'} need attention — show`
+                : 'Hide the meetings-need-attention banner'
+            }
+            onClick={toggleReminders}
+          >
+            <CircleAlert className="h-4 w-4 text-primary" />
+            <span className="absolute -right-0.5 -top-0.5 flex h-4 min-w-4 items-center justify-center rounded-full bg-primary px-1 text-[10px] font-semibold leading-none text-primary-foreground">
+              {reminderCount}
+            </span>
+            <span className="sr-only">Meeting reminders</span>
+          </Button>
+        )}
         <Link href="/settings">
           <Button variant="ghost" size="sm" className="h-8 w-8 p-0" title="Settings">
             <Settings className="h-4 w-4" />
@@ -178,6 +215,9 @@ export default function Home() {
             setGmeetFocus({ meetingCode: r.meetingCode, eventStart: r.eventStart });
             setGmeetOpen(true);
           }}
+          collapsed={remindersCollapsed}
+          onToggleCollapse={toggleReminders}
+          onCountChange={setReminderCount}
         />
 
         <TranscriptTable

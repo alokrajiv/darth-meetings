@@ -34,11 +34,19 @@ export function GmeetRemindersCard({
   refreshTrigger,
   onOpenSync,
   onOpenMeeting,
+  collapsed,
+  onToggleCollapse,
+  onCountChange,
 }: {
   refreshTrigger: number;
   onOpenSync: () => void;
   /** Row click — open the import dialog focused on this meeting. */
   onOpenMeeting?: (r: Reminder) => void;
+  /** Hidden by the user — data still loads so the header badge stays live. */
+  collapsed?: boolean;
+  onToggleCollapse?: () => void;
+  /** Reports the reminder count so the header can show a badge. */
+  onCountChange?: (n: number) => void;
 }) {
   const [reminders, setReminders] = useState<Reminder[]>([]);
   const [expanded, setExpanded] = useState(false);
@@ -53,6 +61,11 @@ export function GmeetRemindersCard({
   useEffect(() => {
     load();
   }, [load, refreshTrigger]);
+
+  useEffect(() => {
+    onCountChange?.(reminders.length);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [reminders.length]);
 
   const act = async (r: Reminder, action: 'dismiss' | 'mute') => {
     setReminders((prev) => prev.filter((x) => x.id !== r.id));
@@ -69,7 +82,7 @@ export function GmeetRemindersCard({
     }).catch(() => {});
   };
 
-  if (reminders.length === 0) return null;
+  if (reminders.length === 0 || collapsed) return null;
   const shown = expanded ? reminders : reminders.slice(0, SHOW_MAX);
 
   return (
@@ -81,10 +94,23 @@ export function GmeetRemindersCard({
             ? '1 meeting needs attention'
             : `${reminders.length} meetings need attention`}
         </div>
-        <Button size="sm" className="h-7 px-2.5 text-xs" onClick={onOpenSync}>
-          <Video className="h-3.5 w-3.5" />
-          Open sync
-        </Button>
+        <div className="flex items-center gap-1">
+          <Button size="sm" className="h-7 px-2.5 text-xs" onClick={onOpenSync}>
+            <Video className="h-3.5 w-3.5" />
+            Open sync
+          </Button>
+          {onToggleCollapse && (
+            <Button
+              variant="ghost"
+              size="sm"
+              className="h-7 w-7 p-0"
+              title="Hide — reopen anytime from the alert icon in the header"
+              onClick={onToggleCollapse}
+            >
+              <X className="h-4 w-4" />
+            </Button>
+          )}
+        </div>
       </div>
       <ul className="space-y-1">
         {shown.map((r) => (
