@@ -1,12 +1,16 @@
 import 'server-only';
-import { listNotesBacklog } from '@/db-ops/transcripts';
-import { generateAutoNotes } from '@/lib/server/auto-notes';
+import { listNotesBacklog, listSpeakerIdBacklog } from '@/db-ops/transcripts';
+import { generateAutoNotes, identifySpeakers } from '@/lib/server/auto-notes';
 
 /**
- * Watchdog for auto-notes: every SWEEP_MS, pick up completed transcripts
- * whose notes never ran (>10 min old — covers upload paths that skip the
- * post-transcription hook) or whose run died mid-flight (status stuck at
- * 'running' >30 min — pm2 restarts kill in-flight generations).
+ * Watchdog for the AI passes. Every SWEEP_MS:
+ *   - speaker-ID: pick up completed transcripts whose identification pass
+ *     never ran (>10 min old — covers upload paths that skip the
+ *     post-completion hook) or died mid-flight ('running' >30 min).
+ *   - notes: ONLY recover runs stuck at 'running' (>30 min — pm2 restarts
+ *     kill in-flight generations). Never-ran notes are NOT picked up:
+ *     generation waits for a human to review speaker labels and click
+ *     "confirm & generate" on the detail page, however long that takes.
  *
  * Started once per server boot from instrumentation.ts. Serial, capped per
  * sweep, so a backlog drains gently instead of stampeding the model.
@@ -20,26 +24,44 @@ const MAX_PER_SWEEP = 2;
 let started = false;
 
 async function sweep(): Promise<void> {
-  let backlog;
   try {
-    backlog = await listNotesBacklog(GRACE_MINUTES, STUCK_MINUTES, MAX_PER_SWEEP);
-  } catch (err) {
-    console.warn('[notes-sweeper] backlog query failed:', err);
-    return;
-  }
-  if (backlog.length === 0) return;
-  console.log(
-    `[notes-sweeper] picking up ${backlog.length} transcript(s):`,
-    backlog.map((b) => `${b.assemblyai_id} (${b.auto_notes_status ?? 'never-ran'})`).join(', ')
-  );
-  for (const b of backlog) {
-    try {
-      // force so stuck-'running' rows regenerate; the in-flight guard inside
-      // generateAutoNotes still prevents doubling up within this process.
-      await generateAutoNotes(b.user_id, b.assemblyai_id, { force: true });
-    } catch (err) {
-      console.warn(`[notes-sweeper] ${b.assemblyai_id} failed:`, err);
+    const idBacklog = await listSpeakerIdBacklog(GRACE_MINUTES, STUCK_MINUTES, MAX_PER_SWEEP);
+    if (idBacklog.length > 0) {
+      console.log(
+        `[notes-sweeper] speaker-id pickup ${idBacklog.length} transcript(s):`,
+        idBacklog.map((b) => `${b.assemblyai_id} (${b.speaker_id_status ?? 'never-ran'})`).join(', ')
+      );
+      for (const b of idBacklog) {
+        try {
+          // force so stuck-'running' rows re-run; the in-flight guard inside
+          // identifySpeakers still prevents doubling up within this process.
+          await identifySpeakers(b.user_id, b.assemblyai_id, { force: true });
+        } catch (err) {
+          console.warn(`[notes-sweeper] speaker-id ${b.assemblyai_id} failed:`, err);
+        }
+      }
     }
+  } catch (err) {
+    console.warn('[notes-sweeper] speaker-id backlog query failed:', err);
+  }
+
+  try {
+    const backlog = await listNotesBacklog(STUCK_MINUTES, MAX_PER_SWEEP);
+    if (backlog.length > 0) {
+      console.log(
+        `[notes-sweeper] recovering ${backlog.length} stuck notes run(s):`,
+        backlog.map((b) => b.assemblyai_id).join(', ')
+      );
+      for (const b of backlog) {
+        try {
+          await generateAutoNotes(b.user_id, b.assemblyai_id, { force: true });
+        } catch (err) {
+          console.warn(`[notes-sweeper] ${b.assemblyai_id} failed:`, err);
+        }
+      }
+    }
+  } catch (err) {
+    console.warn('[notes-sweeper] notes backlog query failed:', err);
   }
 }
 

@@ -303,8 +303,13 @@ export const setImportedContentForUser = setCachedContentForUser;
  * stuck in 'running' — a pm2 restart kills in-flight generations and nothing
  * else ever retries them.
  */
+/**
+ * Notes runs that died mid-flight (status stuck at 'running' — pm2 restarts
+ * kill in-flight generations). Never-ran transcripts are deliberately NOT
+ * picked up any more: notes generation is human-gated behind the speaker
+ * review step, so only runs a human already triggered get recovered.
+ */
 export async function listNotesBacklog(
-  graceMinutes: number,
   stuckMinutes: number,
   limit: number
 ): Promise<Array<{ user_id: string; assemblyai_id: string; auto_notes_status: string | null }>> {
@@ -312,12 +317,35 @@ export async function listNotesBacklog(
     SELECT user_id, assemblyai_id, auto_notes_status
     FROM ${sql(SCHEMA)}.transcripts
     WHERE status = 'completed'
+      AND auto_notes_status = 'running'
+      AND auto_notes_at < now() - make_interval(mins => ${stuckMinutes})
+    ORDER BY COALESCE(completed_at, created_at) DESC
+    LIMIT ${limit}
+  `;
+}
+
+/**
+ * Speaker-ID passes that never ran (upload paths that skip the
+ * post-completion hook) or died mid-flight. Only transcripts still awaiting
+ * notes are interesting — once notes exist the review moment has passed.
+ */
+export async function listSpeakerIdBacklog(
+  graceMinutes: number,
+  stuckMinutes: number,
+  limit: number
+): Promise<Array<{ user_id: string; assemblyai_id: string; speaker_id_status: string | null }>> {
+  return sql<Array<{ user_id: string; assemblyai_id: string; speaker_id_status: string | null }>>`
+    SELECT user_id, assemblyai_id, speaker_id_status
+    FROM ${sql(SCHEMA)}.transcripts
+    WHERE status = 'completed'
+      AND auto_notes_status IS NULL
       AND (
-        (auto_notes_status IS NULL
-          AND COALESCE(completed_at, created_at) < now() - make_interval(mins => ${graceMinutes}))
+        (speaker_id_status IS NULL
+          AND COALESCE(completed_at, created_at) < now() - make_interval(mins => ${graceMinutes})
+          AND COALESCE(completed_at, created_at) > now() - interval '7 days')
         OR
-        (auto_notes_status = 'running'
-          AND auto_notes_at < now() - make_interval(mins => ${stuckMinutes}))
+        (speaker_id_status = 'running'
+          AND speaker_id_at < now() - make_interval(mins => ${stuckMinutes}))
       )
     ORDER BY COALESCE(completed_at, created_at) DESC
     LIMIT ${limit}
@@ -358,6 +386,22 @@ export async function setAutoReportForUser(
         auto_report = ${update.report !== undefined ? update.report : sql`auto_report`},
         auto_report_error = ${update.error ?? null},
         auto_report_at = now()
+    WHERE user_id = ${userId} AND assemblyai_id = ${assemblyaiId}
+  `;
+  publishEvent({ kind: 'notes', assemblyaiId });
+}
+
+/** Same status-machine contract, for the speaker-identification pass. */
+export async function setSpeakerIdForUser(
+  userId: string,
+  assemblyaiId: string,
+  update: { status: string; error?: string | null }
+): Promise<void> {
+  await sql`
+    UPDATE ${sql(SCHEMA)}.transcripts
+    SET speaker_id_status = ${update.status},
+        speaker_id_error = ${update.error ?? null},
+        speaker_id_at = now()
     WHERE user_id = ${userId} AND assemblyai_id = ${assemblyaiId}
   `;
   publishEvent({ kind: 'notes', assemblyaiId });

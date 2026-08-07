@@ -3,16 +3,17 @@ import { promises as fsp } from 'node:fs';
 import { z } from 'zod';
 import { tool, createSdkMcpServer } from '@anthropic-ai/claude-agent-sdk';
 import { getTranscript } from '@/lib/server/assemblyai';
-import { runClaudeWithMeta } from '@/lib/server/claude-agent';
+import { runClaudeWithMeta, parseJsonFromClaude } from '@/lib/server/claude-agent';
 import { extractFrame, hasVideoStream } from '@/lib/server/video-frames';
 import { recordAiRun, getLatestSessionId } from '@/db-ops/ai-runs';
-import { findPeopleByEmails, type Person } from '@/db-ops/people';
+import { findPeopleByEmails, searchPeople, type Person } from '@/db-ops/people';
 import {
   getForUser,
   setAutoNotesForUser,
   setAutoReportForUser,
   setAutoSegmentsForUser,
   setCachedContentForUser,
+  setSpeakerIdForUser,
   updateMetaForUser,
   type TranscriptRow,
 } from '@/db-ops/transcripts';
@@ -584,6 +585,240 @@ export async function generateAutoNotes(
   } catch (err) {
     console.error(`[auto-notes] ${assemblyaiId}: failed:`, err);
     await setAutoNotesForUser(ownerUserId, assemblyaiId, {
+      status: 'error',
+      error: String(err).slice(0, 1000),
+    }).catch(() => {});
+  } finally {
+    inFlight.delete(key);
+  }
+}
+
+const SPEAKER_ID_PROMPT = `You are identifying the diarized speakers of a meeting transcript BEFORE any summary is written. The anonymous labels (Speaker A, B, …) come from voice-level diarization; your only job is to work out who each unnamed speaker actually is, so a human can confirm your guesses and summary generation can then use real names.
+
+Evidence, strongest first:
+- Transcript text: self-introductions, being addressed by name right before/after a turn ("thanks, Priya" / "Priya, can you…"), sign-offs, first-person claims that match a role in the people directory below.
+- The participant/people directory below: the true roster and spellings — speakers are almost always on it.
+- The search_people tool: the full company directory. Verify each name you intend to propose — a transcript often garbles names ("Blissy" for a person the directory spells differently), so search for likely variants and propose the CANONICAL directory spelling. A guess with no directory match may still be right (external guests) — propose it, but say so in the evidence and lower the confidence.
+- Voiceprint hints below: weak signals to corroborate or reject, NOT ground truth — sub-70% matches are frequently wrong. Overrule them when text or video contradicts.
+- Video frames (when a grab_frames tool is available): the recording may show Meet name tiles, caption bylines, or a presenter's name on screen. YOU decide whether looking will help and how many frames are worth it (usually a handful). IMPORTANT: name tiles show who was IN the call, not which diarized voice is which — a meeting-room device shares one mic among several people. Use tiles for roster and exact spellings; bind a tile to a specific speaker letter only when the transcript supports the mapping (e.g. the named presenter is clearly the one narrating the demo).
+
+Output a single JSON object and NOTHING else:
+{"A": {"name": "Full Name", "confidence": 0.85, "evidence": "short concrete justification (quote, tile, hint corroboration)"}}
+- Keys are raw speaker letters — only ones NOT already confirmed by a human.
+- confidence is your own honest 0-1 estimate; include shaky guesses with low confidence rather than omitting them, but NEVER invent a name that appears nowhere in the evidence.
+- Omit speakers you have nothing for; output {} if none.
+
+`;
+
+/**
+ * In-process MCP server exposing the company people directory to the
+ * speaker-ID pass — lets it canonicalize garbled transcript names against
+ * real directory entries instead of proposing misspellings.
+ */
+function buildPeopleTools() {
+  return createSdkMcpServer({
+    name: 'people',
+    tools: [
+      tool(
+        'search_people',
+        'Search the company people directory by name fragment or email. Returns canonical name, email, team, and role for up to 8 matches. Use it to verify a name you intend to propose and to get its exact spelling.',
+        {
+          query: z.string().min(1).describe('Name fragment or email to look up'),
+        },
+        async ({ query }) => {
+          try {
+            const people = await searchPeople(query, 8);
+            const text =
+              people.length === 0
+                ? `No directory matches for "${query}".`
+                : people
+                    .map(
+                      (p) =>
+                        `- ${p.name}${p.email ? ` <${p.email}>` : ''}${p.team ? ` — team: ${p.team}` : ''}${p.role ? `, role: ${p.role}` : ''}`
+                    )
+                    .join('\n');
+            return { content: [{ type: 'text' as const, text }] };
+          } catch (err) {
+            return {
+              content: [
+                { type: 'text' as const, text: `Directory lookup failed: ${String(err).slice(0, 120)}` },
+              ],
+            };
+          }
+        }
+      ),
+    ],
+  });
+}
+
+/**
+ * Speaker-hint block for the ID pass. Unlike buildSpeakerContext (which
+ * presents voice matches as near-identities for the notes run), hints here
+ * are framed as inputs to evaluate. Excludes the pass's own prior output
+ * (via 'id') so re-runs never self-reinforce.
+ */
+function buildIdPassHints(labels: SpeakerLabel[], suggestions: SpeakerSuggestionMap): string {
+  const lines: string[] = [];
+  const named = new Set<string>();
+  for (const l of labels) {
+    if (!l.customName.trim()) continue;
+    named.add(l.originalSpeaker);
+    lines.push(`- Speaker ${l.originalSpeaker}: ${l.customName.trim()} (CONFIRMED by a human — exclude from your output)`);
+  }
+  for (const [sp, s] of Object.entries(suggestions)) {
+    if (named.has(sp) || s.via === 'id') continue;
+    if (s.source === 'voice') {
+      lines.push(`- Speaker ${sp}: voiceprint matched "${s.name}" at ${Math.round(s.confidence * 100)}% similarity (hint only)`);
+    } else if (s.confidence > 0) {
+      lines.push(`- Speaker ${sp}: possibly "${s.name}" (${s.evidence ?? 'timeline overlap with the Meet transcript'})`);
+    }
+  }
+  if (lines.length === 0) return 'Speaker hints: none yet — work from the transcript, directory, and frames.\n\nTranscript follows:\n\n';
+  return `Speaker hints gathered so far:\n${lines.join('\n')}\n\nTranscript follows:\n\n`;
+}
+
+/**
+ * The dedicated speaker-identification pass: runs once at completion,
+ * BEFORE any summary. Writes its guesses into speaker_mappings.suggestions
+ * (via 'id') for the human review dialog; notes generation is gated on that
+ * review, so good names exist before the first summary is written.
+ */
+export async function identifySpeakers(
+  ownerUserId: string,
+  assemblyaiId: string,
+  opts: {
+    /** re-run even if a prior pass completed/stuck — sweeper recovery + manual retrigger */
+    force?: boolean;
+    triggeredBy?: { userId: string; email: string };
+  } = {}
+): Promise<void> {
+  const key = `spkid:${ownerUserId}:${assemblyaiId}`;
+  if (inFlight.has(key)) return;
+
+  const row = await getForUser(ownerUserId, assemblyaiId);
+  if (!row || row.status !== 'completed') return;
+  // Post-completion fires on every observing request — only the first run
+  // (or an explicit force) does the expensive pass. Errored passes also wait
+  // for a human (the "Guess names" button forces a retry) so a persistent
+  // failure can't burn tokens on every page view.
+  if (!opts.force && row.speaker_id_status != null) return;
+
+  inFlight.add(key);
+  try {
+    // Meet-transcript-only imports carry real names from Meet's own
+    // attribution — nothing to identify.
+    if (assemblyaiId.startsWith('gmeet-')) {
+      await setSpeakerIdForUser(ownerUserId, assemblyaiId, { status: 'completed' });
+      return;
+    }
+
+    const content = await getContentCached(ownerUserId, row);
+    if (!content?.utterances?.length) {
+      throw new Error('no utterances available for this transcript');
+    }
+
+    const mappings = await getMappingsForUser(ownerUserId, assemblyaiId);
+    const labels = mappings?.speaker_labels ?? [];
+    const suggestions = mappings?.suggestions ?? {};
+    const named = new Set(labels.filter((l) => l.customName.trim()).map((l) => l.originalSpeaker));
+    const allSpeakers = new Set(content.utterances.map((u) => u.speaker));
+    const unnamed = [...allSpeakers].filter((sp) => !named.has(sp));
+    if (unnamed.length === 0) {
+      await setSpeakerIdForUser(ownerUserId, assemblyaiId, { status: 'completed' });
+      return;
+    }
+
+    await setSpeakerIdForUser(ownerUserId, assemblyaiId, { status: 'running' });
+
+    const videoOk = row.local_audio_path ? await hasVideoStream(row.local_audio_path) : false;
+    const durationMs = (row.duration ?? content.audio_duration ?? 0) * 1000 || null;
+    const agentOpts = {
+      mcpServers: {
+        people: buildPeopleTools(),
+        ...(videoOk
+          ? { video: buildVideoTools(assemblyaiId, row.local_audio_path!, durationMs) }
+          : {}),
+      },
+      allowedTools: [
+        'mcp__people__search_people',
+        ...(videoOk ? ['mcp__video__grab_frames'] : []),
+      ],
+    };
+
+    const prompt =
+      SPEAKER_ID_PROMPT +
+      (videoOk ? 'THIS MEETING HAS VIDEO and you have the grab_frames tool.\n\n' : '') +
+      buildMeetCrossReference(row) +
+      (await buildPeopleContext(row)) +
+      buildIdPassHints(labels, suggestions) +
+      buildTranscriptText(content, labels);
+
+    const started = Date.now();
+    let run;
+    try {
+      run = await runClaudeWithMeta(prompt, agentOpts);
+      void recordAiRun({
+        transcriptId: row.id,
+        assemblyaiId,
+        kind: 'speaker_id',
+        triggeredBy: opts.triggeredBy ?? null,
+        status: 'completed',
+        meta: run.meta,
+        promptChars: prompt.length,
+        resultChars: run.text.length,
+      });
+    } catch (runErr) {
+      void recordAiRun({
+        transcriptId: row.id,
+        assemblyaiId,
+        kind: 'speaker_id',
+        triggeredBy: opts.triggeredBy ?? null,
+        status: 'error',
+        error: String(runErr).slice(0, 1000),
+        promptChars: prompt.length,
+      });
+      throw runErr;
+    }
+
+    const guessed = parseJsonFromClaude<
+      Record<string, { name?: string; confidence?: number; evidence?: string }>
+    >(run.text);
+
+    // Merge on top of CURRENT state (the voice pass may have written fresh
+    // suggestions while we ran). The ID pass saw the voice hints and more,
+    // so a confident disagreement may override a weak voice match — but a
+    // human-confirmed label is never touched.
+    const current = (await getMappingsForUser(ownerUserId, assemblyaiId))?.suggestions ?? suggestions;
+    const merged: SpeakerSuggestionMap = { ...current };
+    let added = 0;
+    for (const [sp, g] of Object.entries(guessed)) {
+      const name = typeof g?.name === 'string' ? g.name.trim().slice(0, 80) : '';
+      if (!name || named.has(sp) || !allSpeakers.has(sp)) continue;
+      const confidence = Math.max(0, Math.min(1, typeof g?.confidence === 'number' ? g.confidence : 0));
+      const existing = merged[sp];
+      if (existing?.source === 'voice') {
+        if (existing.name.trim().toLowerCase() === name.toLowerCase()) continue; // agreement — keep the voice badge
+        if (confidence < 0.7) continue; // not confident enough to overrule a voiceprint
+      }
+      merged[sp] = {
+        name,
+        confidence,
+        source: 'context',
+        via: 'id',
+        evidence: typeof g?.evidence === 'string' ? g.evidence.slice(0, 300) : undefined,
+      };
+      added++;
+    }
+    if (added > 0) await setSuggestionsForUser(ownerUserId, assemblyaiId, merged);
+
+    console.log(
+      `[speaker-id] ${assemblyaiId}: identified ${added}/${unnamed.length} unnamed speaker(s) in ${Math.round((Date.now() - started) / 1000)}s` +
+        (run.meta.costUsd != null ? ` ($${run.meta.costUsd.toFixed(4)}, ${run.meta.model ?? 'model?'}${videoOk ? ', video' : ''})` : '')
+    );
+    await setSpeakerIdForUser(ownerUserId, assemblyaiId, { status: 'completed', error: null });
+  } catch (err) {
+    console.error(`[speaker-id] ${assemblyaiId}: failed:`, err);
+    await setSpeakerIdForUser(ownerUserId, assemblyaiId, {
       status: 'error',
       error: String(err).slice(0, 1000),
     }).catch(() => {});

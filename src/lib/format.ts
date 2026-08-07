@@ -47,6 +47,11 @@ export interface StoredTranscript {
   auto_report_status: string | null;
   auto_report_error: string | null;
   auto_report_at: string | null;
+  /** Speaker-identification AI pass (runs at completion, before notes).
+   * null = never attempted; 'running' | 'completed' | 'error' */
+  speaker_id_status: string | null;
+  speaker_id_error: string | null;
+  speaker_id_at: string | null;
 }
 
 /** One invitee of the source calendar event (Google Meet import). */
@@ -205,12 +210,16 @@ export interface SpeakerLabel {
  *    (0..1; sub-threshold matches are never stored).
  *  - 'context': inferred by Claude from the transcript text during notes
  *    generation (self-introductions, being addressed by name); `evidence`
- *    is a short quote/justification, `confidence` is 0.
+ *    is a short quote/justification, `confidence` is 0. Entries from the
+ *    dedicated speaker-ID pass carry `via: 'id'` and a real confidence —
+ *    the pass must not be fed its own prior output on re-runs.
  */
 export interface SpeakerSuggestion {
   name: string;
   confidence: number;
   source?: 'voice' | 'context';
+  /** 'id' = written by the dedicated speaker-identification pass */
+  via?: 'id';
   evidence?: string;
 }
 

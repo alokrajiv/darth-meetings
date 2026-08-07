@@ -25,6 +25,7 @@ import { NotesMarkdown } from '@/components/notes-markdown';
 import { EditableUtterance, type UtteranceHighlight } from '@/components/editable-utterance';
 import { FindReplacePanel } from '@/components/find-replace-panel';
 import { SpeakerSummaryPanel } from '@/components/speaker-summary-panel';
+import { SpeakerReviewDialog } from '@/components/speaker-review-dialog';
 import { AttachmentPanel } from '@/components/attachment-panel';
 import { ShareDialog } from '@/components/share-dialog';
 import { LinkEventDialog } from '@/components/link-event-dialog';
@@ -151,6 +152,7 @@ export default function TranscriptDetailPage({ params }: TranscriptDetailPagePro
   const [transcriptEdits, setTranscriptEdits] = useState<TranscriptEditMap>({});
   const [generatingNotes, setGeneratingNotes] = useState(false);
   const [notesPromptOpen, setNotesPromptOpen] = useState(false);
+  const [reviewOpen, setReviewOpen] = useState(false);
   const [notesInstructions, setNotesInstructions] = useState('');
   const [summaryTab, setSummaryTab] = useState<'summary' | 'report'>('summary');
   const [generatingReport, setGeneratingReport] = useState(false);
@@ -390,10 +392,11 @@ export default function TranscriptDetailPage({ params }: TranscriptDetailPagePro
       .catch(() => {});
   }, []);
 
-  // While AI notes are generating server-side, poll the row (and refresh
-  // speaker suggestions, which land just before the notes do).
+  // While AI notes are generating server-side — or the speaker-ID pass is
+  // running (its suggestions feed the review dialog) — poll the row and
+  // refresh speaker suggestions.
   useEffect(() => {
-    if (row?.auto_notes_status !== 'running') return;
+    if (row?.auto_notes_status !== 'running' && row?.speaker_id_status !== 'running') return;
     const timer = setInterval(async () => {
       try {
         const res = await fetch(`/api/transcripts/${transcriptId}`);
@@ -409,6 +412,9 @@ export default function TranscriptDetailPage({ params }: TranscriptDetailPagePro
                 auto_notes_error: transcript.auto_notes_error,
                 auto_notes_at: transcript.auto_notes_at,
                 auto_segments: transcript.auto_segments,
+                speaker_id_status: transcript.speaker_id_status,
+                speaker_id_error: transcript.speaker_id_error,
+                speaker_id_at: transcript.speaker_id_at,
               }
             : prev
         );
@@ -429,7 +435,7 @@ export default function TranscriptDetailPage({ params }: TranscriptDetailPagePro
       }
     }, 5000);
     return () => clearInterval(timer);
-  }, [row?.auto_notes_status, transcriptId, editingTitle]);
+  }, [row?.auto_notes_status, row?.speaker_id_status, transcriptId, editingTitle]);
 
   // AI usage stats for the summary footer ("$0.31 · 52s"). Refetched when a
   // generation completes (auto_notes_at changes).
@@ -544,6 +550,65 @@ export default function TranscriptDetailPage({ params }: TranscriptDetailPagePro
       setGeneratingNotes(false);
     }
   }, [transcriptId, generatingNotes, bumpActivity]);
+
+  // Unique speakers + line counts for the review dialog.
+  const reviewSpeakers = useMemo(
+    () =>
+      content?.utterances
+        ? Array.from(new Set(content.utterances.map((u) => u.speaker))).sort()
+        : [],
+    [content]
+  );
+  const reviewCounts = useMemo(() => {
+    const counts: Record<string, number> = {};
+    for (const u of content?.utterances ?? []) {
+      counts[u.speaker] = (counts[u.speaker] ?? 0) + 1;
+    }
+    return counts;
+  }, [content]);
+
+  // Review-dialog confirm: batch-save the finalized names, then kick off the
+  // first summary generation — the whole point of the interrupt is that the
+  // summary is written with real names from the start.
+  const handleReviewConfirm = useCallback(
+    async (names: Record<string, string>) => {
+      const next = [...speakerLabels];
+      let changed = false;
+      for (const [sp, raw] of Object.entries(names)) {
+        const name = raw.trim();
+        const i = next.findIndex((l) => l.originalSpeaker === sp);
+        if ((i >= 0 ? next[i]!.customName.trim() : '') === name) continue;
+        changed = true;
+        if (i >= 0) next[i] = { ...next[i]!, customName: name };
+        else next.push({ originalSpeaker: sp, customName: name, description: '' });
+      }
+      if (changed) {
+        setSpeakerLabels(next);
+        try {
+          const res = await fetch(`/api/transcripts/${transcriptId}/speakers`, {
+            method: 'PUT',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ speakerLabels: next }),
+          });
+          if (!res.ok) throw new Error(`PUT speakers failed (${res.status})`);
+          const { speakerLabels: saved } = (await res.json()) as {
+            speakerLabels: SpeakerLabel[];
+          };
+          setSpeakerLabels(saved);
+          bumpActivity();
+        } catch (err) {
+          console.error('Failed to save speakers:', err);
+          alert('Failed to save speaker names. Reloading from server.');
+          loadAll();
+          return;
+        }
+      }
+      setReviewOpen(false);
+      selectSummaryTab('summary');
+      await handleGenerateNotes();
+    },
+    [speakerLabels, transcriptId, bumpActivity, loadAll, handleGenerateNotes, selectSummaryTab]
+  );
 
   const handleGenerateReport = useCallback(async (instructions?: string, useVideo = true) => {
     if (generatingReport) return;
@@ -2264,20 +2329,48 @@ export default function TranscriptDetailPage({ params }: TranscriptDetailPagePro
                       </div>
                     ) : canEdit ? (
                       <div className="flex flex-col items-center py-6 text-center">
-                        <p className="text-sm text-muted-foreground">No summary yet.</p>
-                        <Button
-                          size="sm"
-                          className="mt-3"
-                          disabled={generatingNotes}
-                          onClick={() => setNotesPromptOpen(true)}
-                        >
-                          <Sparkles className="h-4 w-4" />
-                          Generate with Claude
-                        </Button>
-                        <p className="mt-2 text-xs text-muted-foreground">
-                          Tip: attach an agenda or deck in the right panel first — it
-                          sharpens the output.
-                        </p>
+                        {row.speaker_id_status === 'running' ? (
+                          <>
+                            <p className="flex items-center gap-2 text-sm text-muted-foreground">
+                              <RefreshCw className="h-3.5 w-3.5 animate-spin" />
+                              Identifying speakers first…
+                            </p>
+                            <p className="mt-1 max-w-[46ch] text-xs text-muted-foreground">
+                              The AI is working out who&apos;s who — transcript, voiceprints,
+                              the people directory{/\.(mp4|webm|mov|mkv|m4v)$/i.test(row.local_audio_path ?? '') ? ', video frames' : ''} — so
+                              the summary can use real names from the start.
+                            </p>
+                            <Button
+                              size="sm"
+                              variant="outline"
+                              className="mt-3"
+                              disabled={generatingNotes || reviewSpeakers.length === 0}
+                              onClick={() => setReviewOpen(true)}
+                            >
+                              Review speakers now
+                            </Button>
+                          </>
+                        ) : (
+                          <>
+                            <p className="text-sm text-muted-foreground">No summary yet.</p>
+                            <Button
+                              size="sm"
+                              className="mt-3"
+                              disabled={generatingNotes}
+                              onClick={() =>
+                                reviewSpeakers.length > 0 ? setReviewOpen(true) : setNotesPromptOpen(true)
+                              }
+                            >
+                              <Sparkles className="h-4 w-4" />
+                              Review speakers &amp; generate
+                            </Button>
+                            <p className="mt-2 max-w-[46ch] text-xs text-muted-foreground">
+                              Confirm who&apos;s who first — the summary is written with those
+                              names. Tip: attach an agenda or deck in the right panel too; it
+                              sharpens the output.
+                            </p>
+                          </>
+                        )}
                       </div>
                     ) : null}
                     </>
@@ -2635,6 +2728,22 @@ export default function TranscriptDetailPage({ params }: TranscriptDetailPagePro
             </div>
           </DialogContent>
         </Dialog>
+
+        <SpeakerReviewDialog
+          open={reviewOpen}
+          onOpenChange={setReviewOpen}
+          speakers={reviewSpeakers}
+          utteranceCounts={reviewCounts}
+          speakerLabels={speakerLabels}
+          suggestions={speakerSuggestions}
+          identifying={row.speaker_id_status === 'running'}
+          onConfirm={handleReviewConfirm}
+          onSkip={() => {
+            setReviewOpen(false);
+            selectSummaryTab('summary');
+            void handleGenerateNotes();
+          }}
+        />
 
         <Dialog open={notesPromptOpen} onOpenChange={setNotesPromptOpen}>
           <DialogContent className="max-w-md">

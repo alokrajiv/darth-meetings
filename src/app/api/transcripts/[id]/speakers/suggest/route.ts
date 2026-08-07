@@ -1,17 +1,19 @@
 import { NextResponse } from 'next/server';
 import { withAuth } from '@/lib/auth/with-auth';
 import { resolveAccess } from '@/db-ops/transcript-access';
-import { getContentCached } from '@/lib/server/auto-notes';
+import { getContentCached, identifySpeakers } from '@/lib/server/auto-notes';
 import { suggestSpeakersForTranscript } from '@/lib/server/voiceprint';
 
 export const runtime = 'nodejs';
 
 /**
  * POST /api/transcripts/:id/speakers/suggest
- * Run voiceprint speaker matching on demand — no Claude involved, just the
- * local embedding sidecar (a few seconds), so this responds synchronously
- * with the fresh suggestion map. Editors only (suggestions persist on the
- * owner's row).
+ * Run voiceprint speaker matching on demand — the local embedding sidecar
+ * (a few seconds), so this responds synchronously with the fresh suggestion
+ * map. Also force-retriggers the speaker-ID AI pass in the background when
+ * it previously errored or never ran (its results land via the usual
+ * suggestions polling). Editors only (suggestions persist on the owner's
+ * row).
  */
 export const POST = withAuth(async ({ user }, { params }) => {
   const { id } = await params;
@@ -44,6 +46,14 @@ export const POST = withAuth(async ({ user }, { params }) => {
       access.row.local_audio_path,
       content
     );
+    // AI pass retry: only when it isn't already running/completed — a manual
+    // "Guess names" click is the recovery path for errored/skipped passes.
+    if (access.row.speaker_id_status !== 'running' && access.row.speaker_id_status !== 'completed') {
+      void identifySpeakers(access.ownerUserId, id, {
+        force: true,
+        triggeredBy: { userId: user.userId, email: user.email },
+      });
+    }
     return NextResponse.json({ suggestions });
   } catch (err) {
     console.error('[speakers/suggest] failed:', err);

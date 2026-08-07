@@ -1,21 +1,25 @@
 import 'server-only';
 import { getForUser } from '@/db-ops/transcripts';
-import { getContentCached } from '@/lib/server/auto-notes';
+import { getContentCached, identifySpeakers } from '@/lib/server/auto-notes';
 import { suggestSpeakersFromMeet } from '@/lib/server/meet-align';
 import { suggestSpeakersForTranscript } from '@/lib/server/voiceprint';
 
 /**
  * Fire-and-forget work that should happen once, when a transcript first
  * transitions to `completed`:
- *   1. auto-generate meeting notes via headless Claude
- *   2. voiceprint-match the diarized speakers and store name suggestions
+ *   1. voiceprint-match the diarized speakers and store name suggestions
+ *   2. Meet↔AAI timeline alignment votes ('both'-mode imports)
+ *   3. the speaker-identification AI pass (text + hints + video frames)
+ * Notes are NOT generated here: they wait for a human to review the
+ * suggested speaker labels ("confirm & generate" on the detail page).
  *
  * There is no job queue in this app — completion is only ever observed
  * inside a request (detail GET / listing GET polling AAI), so this is called
  * from those code paths and must never throw or block the response.
  *
- * Idempotence: auto-notes is guarded by auto_notes_status; suggestions are
- * cheap and just overwrite. Both no-op harmlessly if re-triggered.
+ * Idempotence: the ID pass is guarded by speaker_id_status + an in-flight
+ * set; suggestions are cheap and just overwrite. All no-op harmlessly if
+ * re-triggered.
  */
 export function onTranscriptCompleted(ownerUserId: string, assemblyaiId: string): void {
   setTimeout(() => {
@@ -58,6 +62,12 @@ export function onTranscriptCompleted(ownerUserId: string, assemblyaiId: string)
             meetT.utterances
           ).catch((err) => console.warn('[post-completion] meet-align failed:', err));
         }
+
+        // Speaker-identification AI pass, AFTER the cheap passes so it can
+        // weigh their hints. Guarded by speaker_id_status — runs once.
+        await identifySpeakers(ownerUserId, full.assemblyai_id).catch((err) =>
+          console.warn('[post-completion] speaker-id failed:', err)
+        );
       } catch (err) {
         console.warn('[post-completion] hook failed:', err);
       }
