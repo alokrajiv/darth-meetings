@@ -3,6 +3,7 @@
 import Link from 'next/link';
 import { AudioLines, ChevronRight } from 'lucide-react';
 import type { ReactNode } from 'react';
+import { ThemeToggle } from '@/components/theme-toggle';
 
 interface AppHeaderProps {
   /** Right-aligned actions slot. */
@@ -37,7 +38,10 @@ export function AppHeader({ children, breadcrumb }: AppHeaderProps) {
             </span>
           </nav>
         )}
-        <div className="ml-auto flex items-center gap-2">{children}</div>
+        <div className="ml-auto flex items-center gap-2">
+          {children}
+          <ThemeToggle />
+        </div>
       </div>
     </header>
   );

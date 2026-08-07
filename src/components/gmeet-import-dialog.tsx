@@ -1644,7 +1644,7 @@ export function GmeetImportDialog({
             </div>
 
             {conflict && (
-              <div className="rounded-md border border-amber-400 bg-amber-50 dark:bg-amber-950/30 p-3 space-y-2">
+              <div className="rounded-md border border-amber-400 dark:border-amber-700 bg-amber-50 dark:bg-amber-950/30 p-3 space-y-2">
                 <p className="text-sm">
                   Already imported by{' '}
                   {conflict.own ? 'you' : (conflict.ownerEmail ?? 'a teammate')}

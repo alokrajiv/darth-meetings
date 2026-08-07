@@ -123,7 +123,7 @@ export default function SettingsPage() {
             <CardTitle>Error</CardTitle>
           </CardHeader>
           <CardContent>
-            <p className="text-red-500 mb-4">{error}</p>
+            <p className="text-destructive mb-4">{error}</p>
             <Button onClick={load} variant="outline">
               Retry
             </Button>

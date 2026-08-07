@@ -51,16 +51,16 @@ function LoginInner() {
   }
 
   return (
-    <div className="min-h-screen flex items-center justify-center bg-gradient-to-br from-slate-50 to-slate-100">
-      <div className="w-full max-w-md rounded-xl border bg-white shadow p-6">
+    <div className="min-h-screen flex items-center justify-center bg-background">
+      <div className="w-full max-w-md rounded-xl border bg-card text-card-foreground shadow p-6">
         <div className="flex flex-col space-y-1.5 pb-4">
           <h2 className="text-2xl font-semibold">Darth Meetings</h2>
-          <p className="text-sm text-gray-500">{message}</p>
+          <p className="text-sm text-muted-foreground">{message}</p>
         </div>
         <div className="flex justify-center py-8">
-          <div className="animate-spin rounded-full h-12 w-12 border-b-2 border-blue-600"></div>
+          <div className="animate-spin rounded-full h-12 w-12 border-b-2 border-primary"></div>
         </div>
-        <p className="text-center text-sm text-gray-600">Redirecting to login.trames.io</p>
+        <p className="text-center text-sm text-muted-foreground">Redirecting to login.trames.io</p>
       </div>
     </div>
   );

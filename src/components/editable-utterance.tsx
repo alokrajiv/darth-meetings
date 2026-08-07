@@ -128,8 +128,8 @@ export function EditableUtterance({
           data-current={r.isCurrent || undefined}
           className={
             r.isCurrent
-              ? 'rounded bg-amber-300 text-foreground'
-              : 'rounded bg-yellow-200 text-foreground'
+              ? 'rounded bg-amber-300 text-foreground dark:bg-amber-400/40'
+              : 'rounded bg-yellow-200 text-foreground dark:bg-yellow-300/25'
           }
         >
           {text.substring(r.start, r.end)}

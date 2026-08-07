@@ -67,15 +67,15 @@ interface ActivityBarProps {
 }
 
 const AVATAR_PALETTE = [
-  'bg-rose-200 text-rose-900',
-  'bg-amber-200 text-amber-900',
-  'bg-lime-200 text-lime-900',
-  'bg-emerald-200 text-emerald-900',
-  'bg-cyan-200 text-cyan-900',
-  'bg-sky-200 text-sky-900',
-  'bg-indigo-200 text-indigo-900',
-  'bg-fuchsia-200 text-fuchsia-900',
-  'bg-pink-200 text-pink-900',
+  'bg-rose-200 text-rose-900 dark:bg-rose-900 dark:text-rose-200',
+  'bg-amber-200 text-amber-900 dark:bg-amber-900 dark:text-amber-200',
+  'bg-lime-200 text-lime-900 dark:bg-lime-900 dark:text-lime-200',
+  'bg-emerald-200 text-emerald-900 dark:bg-emerald-900 dark:text-emerald-200',
+  'bg-cyan-200 text-cyan-900 dark:bg-cyan-900 dark:text-cyan-200',
+  'bg-sky-200 text-sky-900 dark:bg-sky-900 dark:text-sky-200',
+  'bg-indigo-200 text-indigo-900 dark:bg-indigo-900 dark:text-indigo-200',
+  'bg-fuchsia-200 text-fuchsia-900 dark:bg-fuchsia-900 dark:text-fuchsia-200',
+  'bg-pink-200 text-pink-900 dark:bg-pink-900 dark:text-pink-200',
 ];
 
 function colorFor(seed: string): string {

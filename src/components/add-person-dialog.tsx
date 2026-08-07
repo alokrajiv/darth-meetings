@@ -190,7 +190,7 @@ export function AddPersonDialog({
                   }}
                 />
               </div>
-              {error && <p className="text-xs text-red-600">{error}</p>}
+              {error && <p className="text-xs text-destructive">{error}</p>}
             </div>
             <DialogFooter className="gap-2">
               <Button

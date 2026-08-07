@@ -381,7 +381,9 @@ export function SpeakerPreviewDialog({
                       type="button"
                       onClick={() => seekTo(idx)}
                       className={`block w-full rounded-md p-2 text-left transition-colors ${
-                        focus ? 'bg-amber-50 ring-1 ring-amber-200' : 'hover:bg-muted/50'
+                        focus
+                          ? 'bg-amber-50 ring-1 ring-amber-200 dark:bg-amber-950/30 dark:ring-amber-800'
+                          : 'hover:bg-muted/50'
                       }`}
                     >
                       <div className="flex items-baseline gap-2 text-xs text-muted-foreground mb-1">

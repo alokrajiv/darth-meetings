@@ -244,7 +244,7 @@ export function UserPicker({
                 cursor === 0 ? 'bg-accent text-accent-foreground' : ''
               }`}
             >
-              <span className="text-green-700">
+              <span className="text-green-700 dark:text-green-400">
                 Use &quot;<span className="font-medium">{query.trim()}</span>&quot;
               </span>
               <Badge variant="outline" className="ml-auto text-[10px]">
