@@ -595,16 +595,19 @@ export function AudioUpload({ onTranscriptCreated }: AudioUploadProps) {
             </DialogTitle>
           </DialogHeader>
 
+          {/* min-w-0 on every step wrapper: DialogContent is a grid, and
+              without it a long filename sizes the item to min-content and
+              paints outside the card. */}
           {step === 'files' && (
-            <div className="space-y-4 py-2">
+            <div className="min-w-0 space-y-4 py-2">
               <div className="space-y-2">
                 <p className="text-sm text-muted-foreground">
                   {pendingFiles.length} file{pendingFiles.length > 1 ? 's' : ''} selected:
                 </p>
                 <ul className="text-sm space-y-1">
                   {pendingFiles.map((file, i) => (
-                    <li key={i} className="flex items-center gap-2">
-                      <FileAudio className="h-4 w-4 text-muted-foreground" />
+                    <li key={i} className="flex min-w-0 items-center gap-2">
+                      <FileAudio className="h-4 w-4 shrink-0 text-muted-foreground" />
                       <span className="min-w-0 truncate">{file.name}</span>
                       <Badge variant="outline" className="text-xs shrink-0">
                         {formatFileSize(file.size)}
@@ -635,7 +638,7 @@ export function AudioUpload({ onTranscriptCreated }: AudioUploadProps) {
           )}
 
           {step === 'link' && (
-            <div className="space-y-3 py-2">
+            <div className="min-w-0 space-y-3 py-2">
               <p className="text-xs text-muted-foreground">
                 Linking pulls in the meeting&apos;s title, time and invitees — speaker
                 name-guessing and the summary get real context, and colleagues browsing
@@ -733,7 +736,7 @@ export function AudioUpload({ onTranscriptCreated }: AudioUploadProps) {
           )}
 
           {step === 'process' && (
-            <div className="space-y-3 py-2">
+            <div className="min-w-0 space-y-3 py-2">
               {selectedEvent && (
                 <p className="rounded-md border bg-muted/40 px-3 py-2 text-xs text-muted-foreground">
                   <CalendarDays className="mr-1.5 inline h-3.5 w-3.5" />

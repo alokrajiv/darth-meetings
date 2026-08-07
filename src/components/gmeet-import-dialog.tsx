@@ -408,9 +408,11 @@ export function GmeetImportDialog({
   focusMeeting,
 }: GmeetImportDialogProps) {
   const [step, setStep] = useState<Step>('connect');
-  /** True while the silent token check runs on open — render a spinner, not
-   * the Connect pitch, so connected users never see it flash. */
-  const [probing, setProbing] = useState(false);
+  /** The connect step shows a SPINNER by default — the Connect pitch renders
+   * only after we have positively confirmed the user is not connected (or a
+   * load failed with a dead token). Anything else flashes the pitch at every
+   * connected user for however long the first calendar load takes. */
+  const [connectPitch, setConnectPitch] = useState(false);
   const [tab, setTab] = useState<SourceTab>('calendar');
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
@@ -672,7 +674,10 @@ export function GmeetImportDialog({
       setStep('pick');
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to load sync view');
-      if (!hasValidGoogleToken()) setStep('connect');
+      if (!hasValidGoogleToken()) {
+        setStep('connect');
+        setConnectPitch(true);
+      }
     } finally {
       setBusy(false);
     }
@@ -680,6 +685,7 @@ export function GmeetImportDialog({
 
   const reset = () => {
     setStep('connect');
+    setConnectPitch(false);
     setTab('calendar');
     setError(null);
     setBusy(false);
@@ -815,7 +821,10 @@ export function GmeetImportDialog({
         void sweepDay(forDate, token);
       } catch (err) {
         setError(err instanceof Error ? err.message : 'Failed to load calendar');
-        if (!hasValidGoogleToken()) setStep('connect');
+        if (!hasValidGoogleToken()) {
+          setStep('connect');
+          setConnectPitch(true);
+        }
       } finally {
         setBusy(false);
       }
@@ -927,16 +936,13 @@ export function GmeetImportDialog({
       return;
     }
     let cancelled = false;
-    setProbing(true);
     getGoogleAccessToken()
       .then(() => {
         if (!cancelled) start();
       })
       .catch(() => {
-        // not connected — the connect step is the right screen
-      })
-      .finally(() => {
-        if (!cancelled) setProbing(false);
+        // Positively not connected — NOW the pitch is the right screen.
+        if (!cancelled) setConnectPitch(true);
       });
     return () => {
       cancelled = true;
@@ -1386,14 +1392,14 @@ export function GmeetImportDialog({
           <DialogTitle className="text-base font-semibold">Import from Google Meet</DialogTitle>
         </DialogHeader>
 
-        {step === 'connect' && probing && (
+        {step === 'connect' && !connectPitch && (
           <div className="py-10 text-center">
             <Loader2 className="h-6 w-6 animate-spin mx-auto text-muted-foreground" />
-            <p className="mt-3 text-sm text-muted-foreground">Checking your Google connection…</p>
+            <p className="mt-3 text-sm text-muted-foreground">Loading your meetings…</p>
           </div>
         )}
 
-        {step === 'connect' && !probing && (
+        {step === 'connect' && connectPitch && (
           <div className="space-y-4 py-2 min-w-0">
             <div className="rounded-md border bg-muted/40 p-3 text-sm">
               <p className="font-medium mb-1">Pull a meeting straight from your calendar</p>
@@ -1824,7 +1830,14 @@ export function GmeetImportDialog({
                 </p>
               )}
               <div className="pt-1 space-y-0.5">
-                {picked.enriching ? (
+                {/* Big loader ONLY when we know nothing at all yet. When the
+                    poller cache (or the row) already told us what exists,
+                    render it immediately — the live re-check happens behind a
+                    one-line spinner instead of blanking the card. */}
+                {picked.enriching &&
+                !picked.videoFileId &&
+                !picked.transcriptDocId &&
+                !picked.cacheMeta ? (
                   <p className="text-xs text-muted-foreground flex items-center gap-1">
                     <Loader2 className="h-3 w-3 animate-spin" />
                     Checking Drive and the Meet API for artifacts…
@@ -1856,7 +1869,7 @@ export function GmeetImportDialog({
                           )}
                         </span>
                       </p>
-                    ) : (
+                    ) : picked.enriching ? null : (
                       <p className="text-xs text-muted-foreground">No recording found.</p>
                     )}
                     {picked.transcriptDocId ? (
@@ -1884,9 +1897,15 @@ export function GmeetImportDialog({
                           </span>
                         )}
                       </p>
-                    ) : (
+                    ) : picked.enriching ? null : (
                       <p className="text-xs text-muted-foreground">
                         No Meet transcript found for this meeting.
+                      </p>
+                    )}
+                    {picked.enriching && (
+                      <p className="text-[11px] text-muted-foreground flex items-center gap-1">
+                        <Loader2 className="h-3 w-3 animate-spin" />
+                        double-checking with Google…
                       </p>
                     )}
                     {picked.cacheMeta?.transcriptParseable === false && (
@@ -2073,7 +2092,7 @@ export function GmeetImportDialog({
         )}
 
         <DialogFooter>
-          {step === 'connect' && !probing && (
+          {step === 'connect' && connectPitch && (
             <>
               <Button variant="ghost" onClick={handleClose} disabled={busy}>
                 Cancel
@@ -2114,8 +2133,10 @@ export function GmeetImportDialog({
               <Button
                 onClick={() => runImport()}
                 disabled={
+                  // Enriching alone doesn't block: once ANY artifact id is
+                  // known (poller cache or calendar row), importing is safe —
+                  // the server re-resolves everything authoritatively anyway.
                   busy ||
-                  picked?.enriching ||
                   (!picked?.videoFileId && !picked?.transcriptDocId) ||
                   !!conflict
                 }
