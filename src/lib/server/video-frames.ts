@@ -17,11 +17,10 @@ const execFileP = promisify(execFile);
 const FRAME_WIDTH = 960; // ~700 tokens/frame for the model; plenty for slides
 const EXEC_OPTS = { timeout: 60_000, maxBuffer: 16 * 1024 * 1024 } as const;
 
-/** File extensions that can plausibly carry a video stream. */
-export function looksLikeVideo(filename: string | null | undefined): boolean {
-  if (!filename) return false;
-  return /\.(mp4|webm|mov|mkv|m4v|avi)$/i.test(filename);
-}
+/** Extensions that can only ever carry audio — skip the probe for these.
+ * Anything else (including the `.bin` fallback for extension-less Drive
+ * names) gets ffprobed: extension is a hint here, never the verdict. */
+const AUDIO_ONLY_EXT = /\.(m4a|mp3|wav|aac|flac|ogg|oga|opus|wma|amr)$/i;
 
 const videoStreamCache = new Map<string, boolean>();
 
@@ -29,7 +28,7 @@ const videoStreamCache = new Map<string, boolean>();
 export async function hasVideoStream(audioFilename: string): Promise<boolean> {
   const cached = videoStreamCache.get(audioFilename);
   if (cached !== undefined) return cached;
-  if (!looksLikeVideo(audioFilename)) {
+  if (AUDIO_ONLY_EXT.test(audioFilename)) {
     videoStreamCache.set(audioFilename, false);
     return false;
   }
@@ -46,6 +45,41 @@ export async function hasVideoStream(audioFilename: string): Promise<boolean> {
   } catch {
     videoStreamCache.set(audioFilename, false);
     return false;
+  }
+}
+
+/**
+ * Sniff a stored file's container with ffprobe and suggest a filename
+ * extension. Used at store time when the original name gives none — Drive
+ * names Meet recordings without an extension, and both playback Content-Type
+ * and the client's "is this a video?" checks key off the stored extension.
+ */
+export async function sniffMediaExtension(filename: string): Promise<string | null> {
+  try {
+    const abs = resolveAudioPath(filename);
+    const { stdout } = await execFileP(
+      'ffprobe',
+      [
+        '-v', 'error',
+        '-select_streams', 'v:0',
+        '-show_entries', 'stream=codec_type:format=format_name',
+        '-of', 'default=noprint_wrappers=1',
+        abs,
+      ],
+      EXEC_OPTS
+    );
+    const fmt = (stdout.match(/^format_name=(.*)$/m)?.[1] ?? '').toLowerCase();
+    const hasVideo = /^codec_type=video$/m.test(stdout);
+    if (fmt.includes('mp4')) return hasVideo ? '.mp4' : '.m4a';
+    if (fmt.includes('webm') || fmt.includes('matroska')) return hasVideo ? '.webm' : '.mka';
+    if (fmt.includes('mp3')) return '.mp3';
+    if (fmt.includes('wav')) return '.wav';
+    if (fmt.includes('ogg')) return '.ogg';
+    if (fmt.includes('flac')) return '.flac';
+    if (fmt.includes('aac')) return '.aac';
+    return null;
+  } catch {
+    return null;
   }
 }
 

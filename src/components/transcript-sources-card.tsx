@@ -2,7 +2,6 @@
 
 import { useRef, useState } from 'react';
 import { Button } from '@/components/ui/button';
-import { getGoogleAccessToken } from '@/lib/google-token';
 import type { SpeakerSuggestionMap, StoredTranscript } from '@/lib/format';
 import {
   AudioLines,
@@ -24,25 +23,30 @@ interface TranscriptSourcesCardProps {
   /** Player-level truth: false once the <audio> element errored. */
   audioAvailable: boolean;
   canEdit: boolean;
-  /** Called after the Drive recording landed on the server. */
-  onAudioFetched: () => void;
+  /** Drive-recording fetch state lives in the page — it auto-fetches on
+   * load, and the report dialog needs to see the same in-flight state. */
+  videoFetching: boolean;
+  videoFetchError: string | null;
+  onFetchVideo: () => void;
 }
 
 /**
  * "Sources" rail card: which transcript/diarization sources exist on this
  * row (summaries and name-guessing automatically use everything present),
- * plus whether playback is available — with a "Fetch video" action for
- * Meet quick-imports whose recording is known on Drive but whose bytes
- * were never pulled (transcript-only imports have no recording by design).
+ * plus whether playback is available — with a "Fetch video" retry action
+ * for Meet quick-imports whose recording is known on Drive but whose bytes
+ * were never pulled (the page auto-fetches on load; transcript-only imports
+ * have no recording by design).
  */
 export function TranscriptSourcesCard({
   row,
   suggestions,
   audioAvailable,
   canEdit,
-  onAudioFetched,
+  videoFetching,
+  videoFetchError,
+  onFetchVideo,
 }: TranscriptSourcesCardProps) {
-  const [fetching, setFetching] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [uploadPct, setUploadPct] = useState<number | null>(null);
   const uploadInputRef = useRef<HTMLInputElement>(null);
@@ -86,26 +90,6 @@ export function TranscriptSourcesCard({
     joinedCount > 0 &&
     (row.speaker_count ?? 0) > 0 &&
     joinedCount - (row.speaker_count ?? 0) >= 2;
-
-  const fetchAudio = async () => {
-    setFetching(true);
-    setError(null);
-    try {
-      const token = await getGoogleAccessToken(); // server-minted (one-time connect)
-      const res = await fetch(`/api/transcripts/${row.assemblyai_id}/fetch-audio`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ accessToken: token }),
-      });
-      const payload = (await res.json().catch(() => ({}))) as { error?: string };
-      if (!res.ok) throw new Error(payload.error || `Failed (${res.status})`);
-      onAudioFetched();
-    } catch (err) {
-      setError(err instanceof Error ? err.message : 'Video fetch failed');
-    } finally {
-      setFetching(false);
-    }
-  };
 
   const uploadAndRetranscribe = (file: File) => {
     if (file.size > MAX_UPLOAD_BYTES) {
@@ -250,6 +234,11 @@ export function TranscriptSourcesCard({
                 <span className="font-medium">Audio available</span>
                 <span className="text-muted-foreground"> — playback &amp; voiceprints work</span>
               </>
+            ) : recordingFileId && videoFetching ? (
+              <span className="text-muted-foreground">
+                Fetching the video from Drive — playback and screen-reading unlock when it
+                lands
+              </span>
             ) : recordingFileId ? (
               <span className="text-muted-foreground">
                 No recording stored — the video is on Drive
@@ -309,18 +298,19 @@ export function TranscriptSourcesCard({
           variant="outline"
           size="sm"
           className="mt-2 h-8 w-full justify-start gap-2 text-[13px]"
-          disabled={fetching}
-          onClick={() => void fetchAudio()}
+          disabled={videoFetching}
+          onClick={onFetchVideo}
           title="Download the video from Drive to this server so playback works — no re-transcription, the transcript stays as-is"
         >
-          {fetching ? (
+          {videoFetching ? (
             <Loader2 className="h-4 w-4 animate-spin text-muted-foreground" />
           ) : (
             <Video className="h-4 w-4 text-primary" />
           )}
-          {fetching ? 'Fetching from Drive…' : 'Fetch video for playback'}
+          {videoFetching ? 'Fetching from Drive…' : 'Fetch video for playback'}
         </Button>
       )}
+      {videoFetchError && <p className="mt-1.5 text-xs text-destructive">{videoFetchError}</p>}
       {error && <p className="mt-1.5 text-xs text-destructive">{error}</p>}
       <p className="mt-2 text-[10px] leading-snug text-muted-foreground">
         Summaries and name guesses automatically use everything listed here.

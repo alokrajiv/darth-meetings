@@ -6,6 +6,8 @@ import { getTranscript } from '@/lib/server/assemblyai';
 import { runClaudeWithMeta, parseJsonFromClaude } from '@/lib/server/claude-agent';
 import { extractFrame, hasVideoStream } from '@/lib/server/video-frames';
 import { recordAiRun, getLatestSessionId } from '@/db-ops/ai-runs';
+import { getServerAccessToken } from '@/lib/server/google-oauth';
+import { fetchRecordingFromDrive } from '@/lib/server/recording-fetch';
 import { findPeopleByEmails, searchPeople, type Person } from '@/db-ops/people';
 import {
   getForUser,
@@ -862,13 +864,40 @@ export async function generateAutoReport(
   const key = `report:${ownerUserId}:${assemblyaiId}`;
   if (inFlight.has(key)) return;
 
-  const row = await getForUser(ownerUserId, assemblyaiId);
+  let row = await getForUser(ownerUserId, assemblyaiId);
   if (!row || row.status !== 'completed') return;
   if (row.auto_report_status === 'running') return;
 
   inFlight.add(key);
   try {
     await setAutoReportForUser(ownerUserId, assemblyaiId, { status: 'running' });
+
+    // A video report on a row whose recording is still only on Drive: pull it
+    // first (joining any fetch already in flight — e.g. the page's auto-fetch)
+    // so the run actually gets the frames instead of silently going text-only.
+    // Own-token rule: the trigger's Google connection does the pull. Any
+    // failure degrades to a text-only report rather than failing the run.
+    const pendingFileId =
+      row.gmeet_context?.videoFileId ?? row.gmeet_context?.actuals?.recordings?.[0]?.fileId;
+    if (opts.useVideo !== false && !row.local_audio_path && pendingFileId) {
+      const requesterId = opts.triggeredBy?.userId ?? ownerUserId;
+      try {
+        const minted = await getServerAccessToken(requesterId);
+        if (!minted) throw new Error('Google not connected for the triggering user');
+        await fetchRecordingFromDrive({
+          ownerUserId,
+          assemblyaiId,
+          fileId: pendingFileId,
+          accessToken: minted.token,
+        });
+        row = (await getForUser(ownerUserId, assemblyaiId)) ?? row;
+      } catch (err) {
+        console.warn(
+          `[auto-report] ${assemblyaiId}: recording fetch failed, continuing text-only:`,
+          err
+        );
+      }
+    }
 
     const content = await getContentCached(ownerUserId, row);
     if (!content?.utterances?.length) {

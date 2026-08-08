@@ -1,37 +1,29 @@
 import { NextResponse } from 'next/server';
 import { withAuth } from '@/lib/auth/with-auth';
 import { resolveAccess } from '@/db-ops/transcript-access';
-import { setLocalAudioPathForUser } from '@/db-ops/transcripts';
+import { GoogleApiError } from '@/lib/server/gmeet';
+import { getServerAccessToken } from '@/lib/server/google-oauth';
 import {
-  GoogleApiError,
-  downloadDriveFileToTemp,
-  getDriveFileMeta,
-} from '@/lib/server/gmeet';
-import {
-  audioFilename,
-  deleteAudioFile,
-  renameAudioFile,
-} from '@/lib/server/audio-storage';
+  RecordingFetchError,
+  fetchRecordingFromDrive,
+} from '@/lib/server/recording-fetch';
 
 export const runtime = 'nodejs';
 // A meeting recording can be multi-GB; the Drive pull takes a while (only
 // enforced on serverless hosts; the VM ignores it).
 export const maxDuration = 900;
 
-/** One Drive pull per transcript at a time — double-clicks and two viewers
- * racing would otherwise download the same multi-hundred-MB file twice. */
-const inFlight = new Set<string>();
-
 /**
  * POST /api/transcripts/:id/fetch-audio
- * Body: { accessToken } — browser-supplied Google token, used in memory only.
+ * Optional body: { accessToken } — otherwise a token is minted server-side
+ * from the caller's stored Google connection (own-token rule either way).
  *
  * Attach playable audio to a Meet quick-import (transcript-only rows have no
  * audio): download the meeting's recording from Drive and store it as the
  * row's local audio. No re-transcription — the Meet transcript stays as-is;
  * /api/transcripts/:id/audio then streams the file with Range support so
  * playback and seeking just work (the <audio> element plays an mp4's audio
- * track natively).
+ * track natively). Concurrent calls join the same in-flight download.
  *
  * Editors only (owner + 'edit' shares) — it mutates the owner's row, and
  * auto-shared invitees get 'edit' anyway.
@@ -41,10 +33,6 @@ export const POST = withAuth(async ({ user, request }, { params }) => {
   const body = (await request.json().catch(() => null)) as {
     accessToken?: string;
   } | null;
-  const accessToken = body?.accessToken;
-  if (typeof accessToken !== 'string' || accessToken.length < 20) {
-    return NextResponse.json({ error: 'accessToken is required' }, { status: 400 });
-  }
 
   const access = await resolveAccess(user.userId, user.email, id);
   if (!access) {
@@ -67,34 +55,32 @@ export const POST = withAuth(async ({ user, request }, { params }) => {
     );
   }
 
-  if (inFlight.has(id)) {
+  let accessToken =
+    typeof body?.accessToken === 'string' && body.accessToken.length >= 20
+      ? body.accessToken
+      : null;
+  if (!accessToken) {
+    accessToken = (await getServerAccessToken(user.userId))?.token ?? null;
+  }
+  if (!accessToken) {
     return NextResponse.json(
-      { error: 'Recording fetch already in progress — try again in a minute.' },
-      { status: 429 }
+      { error: 'Google is not connected — connect Google and try again.' },
+      { status: 401 }
     );
   }
-  inFlight.add(id);
+
   try {
-    const meta = await getDriveFileMeta(accessToken, fileId);
-    if (!meta.canDownload) {
-      return NextResponse.json(
-        {
-          error:
-            'The owner has disabled downloads for viewers on this recording. Ask them for edit access or to lift the restriction (Share → gear icon).',
-        },
-        { status: 403 }
-      );
-    }
-    const dl = await downloadDriveFileToTemp(accessToken, fileId);
-    if (dl.bytes === 0) {
-      await deleteAudioFile(dl.tempFilename);
-      return NextResponse.json({ error: 'Drive returned an empty file' }, { status: 502 });
-    }
-    const filename = audioFilename(id, meta.name);
-    await renameAudioFile(dl.tempFilename, filename);
-    await setLocalAudioPathForUser(access.ownerUserId, id, filename);
-    return NextResponse.json({ ok: true, bytes: dl.bytes });
+    const { bytes } = await fetchRecordingFromDrive({
+      ownerUserId: access.ownerUserId,
+      assemblyaiId: id,
+      fileId,
+      accessToken,
+    });
+    return NextResponse.json({ ok: true, bytes });
   } catch (err) {
+    if (err instanceof RecordingFetchError) {
+      return NextResponse.json({ error: err.message }, { status: err.status });
+    }
     if (err instanceof GoogleApiError) {
       const status = err.status === 401 ? 401 : err.status === 404 ? 404 : 502;
       return NextResponse.json(
@@ -114,7 +100,5 @@ export const POST = withAuth(async ({ user, request }, { params }) => {
       { error: 'Recording fetch failed', detail: String(err) },
       { status: 502 }
     );
-  } finally {
-    inFlight.delete(id);
   }
 });

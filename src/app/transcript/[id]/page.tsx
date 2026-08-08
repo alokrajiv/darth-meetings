@@ -590,6 +590,52 @@ export default function TranscriptDetailPage({ params }: TranscriptDetailPagePro
     }
   }, [transcriptId, generatingReport, bumpActivity]);
 
+  // --- Drive recording fetch (playback + frame-reading AI) ---
+  // A Meet quick-import can know the recording's Drive file without having
+  // the bytes. Pull them automatically once per visit — nobody should have
+  // to click "fetch" for something we already know how to get.
+  const recordingFileId =
+    row?.gmeet_context?.videoFileId ??
+    row?.gmeet_context?.actuals?.recordings?.[0]?.fileId ??
+    null;
+  const hasLocalVideo = /\.(mp4|webm|mov|mkv|m4v)$/i.test(row?.local_audio_path ?? '');
+  const canFetchVideo = !!row && canEdit && !row.local_audio_path && !!recordingFileId;
+  const [videoFetching, setVideoFetching] = useState(false);
+  const [videoFetchError, setVideoFetchError] = useState<string | null>(null);
+  const fetchVideo = useCallback(
+    async (opts?: { auto?: boolean }) => {
+      setVideoFetching(true);
+      setVideoFetchError(null);
+      try {
+        const res = await fetch(`/api/transcripts/${transcriptId}/fetch-audio`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: '{}',
+        });
+        const payload = (await res.json().catch(() => ({}))) as { error?: string };
+        if (!res.ok) {
+          // Auto mode stays quiet when Google simply isn't connected — the
+          // manual button remains for once it is.
+          if (opts?.auto && res.status === 401) return;
+          throw new Error(payload.error || `Failed (${res.status})`);
+        }
+        setAudioAvailable(true);
+        void loadAll({ silent: true });
+      } catch (err) {
+        setVideoFetchError(err instanceof Error ? err.message : 'Video fetch failed');
+      } finally {
+        setVideoFetching(false);
+      }
+    },
+    [transcriptId, loadAll]
+  );
+  const videoAutoFetchTried = useRef(false);
+  useEffect(() => {
+    if (!canFetchVideo || videoAutoFetchTried.current) return;
+    videoAutoFetchTried.current = true;
+    void fetchVideo({ auto: true });
+  }, [canFetchVideo, fetchVideo]);
+
   // Review-dialog confirm: batch-save the finalized names, then kick off the
   // first summary generation — the whole point of the interrupt is that the
   // summary is written with real names from the start.
@@ -2108,7 +2154,7 @@ export default function TranscriptDetailPage({ params }: TranscriptDetailPagePro
                   ref={playerRef}
                   className="h-10 w-full"
                   src={`/api/transcripts/${row.assemblyai_id}/audio`}
-                  hasVideo={/\.(mp4|webm|mov|mkv|m4v)$/i.test(row.local_audio_path ?? '')}
+                  hasVideo={hasLocalVideo}
                   onTimeUpdate={setCurrentTime}
                   onError={() => setAudioAvailable(false)}
                 />
@@ -2354,7 +2400,7 @@ export default function TranscriptDetailPage({ params }: TranscriptDetailPagePro
                             </p>
                             <p className="mt-1 max-w-[46ch] text-xs text-muted-foreground">
                               The AI is working out who&apos;s who — transcript, voiceprints,
-                              the people directory{/\.(mp4|webm|mov|mkv|m4v)$/i.test(row.local_audio_path ?? '') ? ', video frames' : ''} — so
+                              the people directory{hasLocalVideo ? ', video frames' : ''} — so
                               the summary can use real names from the start.
                             </p>
                             <Button
@@ -2523,7 +2569,7 @@ export default function TranscriptDetailPage({ params }: TranscriptDetailPagePro
                       ? `/api/transcripts/${row.assemblyai_id}/audio`
                       : null
                   }
-                  hasVideo={/\.(mp4|webm|mov|mkv|m4v)$/i.test(row.local_audio_path ?? '')}
+                  hasVideo={hasLocalVideo}
                   collapsed={!!collapsedSections.speakers}
                   onToggleCollapse={() => toggleSection('speakers')}
                   suggestions={speakerSuggestions}
@@ -2634,10 +2680,9 @@ export default function TranscriptDetailPage({ params }: TranscriptDetailPagePro
                 suggestions={speakerSuggestions}
                 audioAvailable={audioAvailable}
                 canEdit={canEdit}
-                onAudioFetched={() => {
-                  setAudioAvailable(true);
-                  void loadAll();
-                }}
+                videoFetching={videoFetching}
+                videoFetchError={videoFetchError}
+                onFetchVideo={() => void fetchVideo()}
               />
               <TranscriptOutline
                 durationSec={row.duration ?? null}
@@ -2801,7 +2846,7 @@ export default function TranscriptDetailPage({ params }: TranscriptDetailPagePro
                   files) when the session is still fresh.
                 </span>
               </button>
-              {/\.(mp4|webm|mov|mkv|m4v)$/i.test(row.local_audio_path ?? '') && (
+              {(hasLocalVideo || canFetchVideo) && (
                 <button
                   type="button"
                   disabled={generatingReport}
@@ -2819,6 +2864,10 @@ export default function TranscriptDetailPage({ params }: TranscriptDetailPagePro
                   <span className="mt-0.5 block text-xs text-muted-foreground">
                     Wiki-style deep dive at high effort: Claude looks at the screen shares and
                     embeds screenshots, tables, and click-to-jump citations. Slower.
+                    {!hasLocalVideo &&
+                      (videoFetching
+                        ? ' The recording is still downloading from Drive — the report waits for it, then starts.'
+                        : ' The recording is pulled from Drive first, then the report starts.')}
                   </span>
                 </button>
               )}

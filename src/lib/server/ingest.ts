@@ -14,6 +14,7 @@ import {
 import { getForUser as getUserVocab } from '@/db-ops/user-vocab';
 import { getCurrentPayload as getOrgVocabPayload } from '@/db-ops/org-vocab';
 import { mergeVocabs } from '@/lib/server/vocab-merge';
+import { sniffMediaExtension } from '@/lib/server/video-frames';
 import type { GmeetContext } from '@/lib/format';
 
 /**
@@ -128,7 +129,13 @@ export async function ingestLocalAudio(
   // bytes are already on disk as the temp file — just rename it to its
   // permanent name. We serve it via /api/transcripts/[id]/audio.
   try {
-    const filename = audioFilename(submitted.id, opts.originalFilename);
+    let filename = audioFilename(submitted.id, opts.originalFilename);
+    if (filename.endsWith('.bin')) {
+      // Extension-less original name (Drive names Meet recordings that way):
+      // sniff the container so video detection and playback Content-Type work.
+      const sniffed = await sniffMediaExtension(tempFilename);
+      if (sniffed) filename = `${submitted.id}${sniffed}`;
+    }
     await renameAudioFile(tempFilename, filename);
     await setLocalAudioPathForUser(userId, submitted.id, filename);
     row.local_audio_path = filename;
