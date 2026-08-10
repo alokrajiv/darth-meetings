@@ -95,4 +95,23 @@ export const config = {
       return process.env.APP_BASE_URL || 'https://meetings.darth-internal.trames.io';
     },
   },
+
+  /**
+   * Microsoft Graph, app-only (client credentials — no per-user OAuth).
+   * The "Darth Meetings" Entra registration holds admin-consented application
+   * permissions (Calendars.Read, OnlineMeetings/Recording/Transcript Read.All)
+   * scoped tenant-wide by the MeetingWhisperer-Access application access
+   * policy. Meetings organized outside this tenant are not reachable.
+   */
+  microsoft: {
+    get tenantId() {
+      return process.env.MS_TENANT_ID || '';
+    },
+    get clientId() {
+      return process.env.MS_CLIENT_ID || '';
+    },
+    get clientSecret() {
+      return process.env.MS_CLIENT_SECRET || '';
+    },
+  },
 } as const;
