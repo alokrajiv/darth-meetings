@@ -690,15 +690,12 @@ export function TranscriptTable({ refreshTrigger, toolbarExtra }: TranscriptTabl
             <TableBody>
               {filtered.map((t) => {
                 const { primary, secondary, untitled } = titleOf(t);
-                const disabled = t.status !== 'completed';
-                const processing = t.status === 'processing';
+                const processing = t.status === 'processing' || t.status === 'queued';
                 return (
                   <TableRow
                     key={t.id}
-                    onClick={() => !disabled && router.push(`/transcript/${t.assemblyai_id}`)}
-                    className={`group transition-colors hover:bg-accent/40 ${
-                      disabled ? 'opacity-60' : 'cursor-pointer'
-                    }`}
+                    onClick={() => router.push(`/transcript/${t.assemblyai_id}`)}
+                    className="group cursor-pointer transition-colors hover:bg-accent/40"
                   >
                     <TableCell className="py-1.5">
                       <div className="flex min-w-0 items-center gap-2">
@@ -739,7 +736,7 @@ export function TranscriptTable({ refreshTrigger, toolbarExtra }: TranscriptTabl
                           </div>
                           {processing ? (
                             <div className="truncate font-mono text-[11px] text-muted-foreground">
-                              transcribing…
+                              transcribing… — open it to share or link the calendar event
                             </div>
                           ) : (() => {
                             const hit = query.trim() ? deepHits.get(t.assemblyai_id) : undefined;
@@ -788,11 +785,9 @@ export function TranscriptTable({ refreshTrigger, toolbarExtra }: TranscriptTabl
                             <Trash2 className="h-3.5 w-3.5" />
                           </Button>
                         )}
-                        {!disabled && (
-                          <span className="grid h-7 w-7 place-items-center">
-                            <ChevronRight className="h-4 w-4 text-muted-foreground opacity-0 transition-opacity group-hover:opacity-100" />
-                          </span>
-                        )}
+                        <span className="grid h-7 w-7 place-items-center">
+                          <ChevronRight className="h-4 w-4 text-muted-foreground opacity-0 transition-opacity group-hover:opacity-100" />
+                        </span>
                       </div>
                     </TableCell>
                   </TableRow>

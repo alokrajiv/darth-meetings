@@ -29,6 +29,7 @@ import {
 } from 'lucide-react';
 import {
   getGoogleAccessToken,
+  hasValidGoogleToken,
   connectGoogle,
   GoogleNotConnectedError,
 } from '@/lib/google-token';
@@ -37,6 +38,15 @@ import type { StoredTranscript } from '@/lib/format';
 /** DOM id of the hidden file input — lets the page header's "Upload media"
  * button trigger the picker without threading refs across components. */
 export const AUDIO_UPLOAD_INPUT_ID = 'audio-upload-file-input';
+
+/** Entry point for the header's "Upload media" button. Goes through the
+ * component (not the raw file input) so a not-connected user hits the Google
+ * gate BEFORE the file picker — connecting navigates away, and a file picked
+ * beforehand would be lost with it. */
+export const AUDIO_UPLOAD_OPEN_EVENT = 'mw-upload-media-open';
+export function requestMediaUpload(): void {
+  window.dispatchEvent(new Event(AUDIO_UPLOAD_OPEN_EVENT));
+}
 
 interface AudioUploadProps {
   onTranscriptCreated?: () => void;
@@ -89,7 +99,7 @@ interface CalendarEventLite {
 }
 
 type ReportPref = 'summary' | 'detailed-video' | 'detailed-text' | 'later';
-type DialogStep = 'files' | 'link' | 'process';
+type DialogStep = 'connect' | 'files' | 'link' | 'process';
 
 const POLL_INTERVAL_MS = 3000;
 
@@ -127,6 +137,24 @@ export function AudioUpload({ onTranscriptCreated }: AudioUploadProps) {
   const [step, setStep] = useState<DialogStep>('files');
   /** null = unknown (not probed yet); false = Google not connected. */
   const [googleOk, setGoogleOk] = useState<boolean | null>(null);
+  /** User clicked through the connect gate this session — don't nag again. */
+  const [connectSkipped, setConnectSkipped] = useState(false);
+
+  // Probe Google once on mount — drives the connect gate at flow start.
+  // hasValidGoogleToken() answers instantly off the warm cache (the landing
+  // page pre-warms it); otherwise it's one silent round-trip. Non-connect
+  // errors (network blips) leave googleOk null, which never blocks.
+  useEffect(() => {
+    if (hasValidGoogleToken()) {
+      setGoogleOk(true);
+      return;
+    }
+    getGoogleAccessToken()
+      .then(() => setGoogleOk(true))
+      .catch((err) => {
+        if (err instanceof GoogleNotConnectedError) setGoogleOk(false);
+      });
+  }, []);
   const [linkDate, setLinkDate] = useState<string>(localDateOf(new Date()));
   const [dayEvents, setDayEvents] = useState<CalendarEventLite[]>([]);
   const [eventsBusy, setEventsBusy] = useState(false);
@@ -298,21 +326,44 @@ export function AudioUpload({ onTranscriptCreated }: AudioUploadProps) {
     []
   );
 
-  const handleFilesSelected = useCallback((files: FileList) => {
-    const list = Array.from(files);
-    setPendingFiles(list);
-    setSelectedLanguage('');
-    setStep('files');
-    setSelectedEventId(null);
-    setEventsError(null);
-    setDayEvents([]);
-    setReportPref('summary');
-    // Meetings are usually uploaded soon after they happened — the file's
-    // own timestamp is a better first guess for the calendar day than today.
-    const stamp = list[0]?.lastModified;
-    setLinkDate(localDateOf(stamp ? new Date(stamp) : new Date()));
-    setIsDialogOpen(true);
-  }, []);
+  const handleFilesSelected = useCallback(
+    (files: FileList) => {
+      const list = Array.from(files);
+      setPendingFiles(list);
+      setSelectedLanguage('');
+      // Drag-drop lands here with a file already in hand — a not-connected
+      // user still gets the gate first (with the re-select caveat spelled out).
+      setStep(googleOk === false && !connectSkipped ? 'connect' : 'files');
+      setSelectedEventId(null);
+      setEventsError(null);
+      setDayEvents([]);
+      setReportPref('summary');
+      // Meetings are usually uploaded soon after they happened — the file's
+      // own timestamp is a better first guess for the calendar day than today.
+      const stamp = list[0]?.lastModified;
+      setLinkDate(localDateOf(stamp ? new Date(stamp) : new Date()));
+      setIsDialogOpen(true);
+    },
+    [googleOk, connectSkipped]
+  );
+
+  // The header button dispatches this instead of clicking the file input
+  // directly: not-connected users see the Google gate BEFORE picking a file
+  // (connecting navigates away and would discard the pick). The check is
+  // synchronous off state, so the picker keeps its user-gesture activation.
+  useEffect(() => {
+    const onOpen = () => {
+      if (googleOk === false && !connectSkipped) {
+        setPendingFiles([]);
+        setStep('connect');
+        setIsDialogOpen(true);
+      } else {
+        fileInputRef.current?.click();
+      }
+    };
+    window.addEventListener(AUDIO_UPLOAD_OPEN_EVENT, onOpen);
+    return () => window.removeEventListener(AUDIO_UPLOAD_OPEN_EVENT, onOpen);
+  }, [googleOk, connectSkipped]);
 
   /** Load the day's calendar events for the link step (silent server-minted
    * token — same as the Meet import dialog). */
@@ -590,11 +641,28 @@ export function AudioUpload({ onTranscriptCreated }: AudioUploadProps) {
         <DialogContent className="rounded-xl shadow-[0_4px_16px_-2px_rgb(0_0_0/0.08),0_1px_2px_0_rgb(0_0_0/0.04)]">
           <DialogHeader>
             <DialogTitle className="text-base font-semibold">
+              {step === 'connect' && 'Connect Google Calendar first'}
               {step === 'files' && 'Upload media'}
               {step === 'link' && 'Link to a calendar meeting?'}
               {step === 'process' && 'How should it be processed?'}
             </DialogTitle>
           </DialogHeader>
+
+          {step === 'connect' && (
+            <div className="min-w-0 space-y-3 py-2">
+              <p className="text-sm text-muted-foreground">
+                Uploads work best with your calendar connected: linking the
+                meeting&apos;s invite fills in the title, time and attendees, so
+                speaker name-guessing and the AI summary start with real context.
+              </p>
+              <p className="text-xs text-muted-foreground">
+                It&apos;s a one-time connect — you&apos;ll hop to Google&apos;s
+                consent screen and land right back here.
+                {pendingFiles.length > 0 &&
+                  ' The file you just dropped can’t survive that trip, so you’ll re-select it afterwards.'}
+              </p>
+            </div>
+          )}
 
           {/* min-w-0 on every step wrapper: DialogContent is a grid, and
               without it a long filename sizes the item to min-content and
@@ -800,6 +868,30 @@ export function AudioUpload({ onTranscriptCreated }: AudioUploadProps) {
             <Button variant="ghost" onClick={handleCancelUpload}>
               Cancel
             </Button>
+            {step === 'connect' && (
+              <>
+                <Button
+                  variant="ghost"
+                  onClick={() => {
+                    setConnectSkipped(true);
+                    if (pendingFiles.length > 0) {
+                      setStep('files');
+                    } else {
+                      // Button path: nothing picked yet — close the gate and
+                      // open the picker (still inside this click's gesture).
+                      setIsDialogOpen(false);
+                      fileInputRef.current?.click();
+                    }
+                  }}
+                >
+                  Skip for now
+                </Button>
+                <Button onClick={() => connectGoogle('/')}>
+                  <CalendarDays className="h-4 w-4" />
+                  Connect Google Calendar
+                </Button>
+              </>
+            )}
             {step === 'files' && (
               <Button
                 onClick={() => {

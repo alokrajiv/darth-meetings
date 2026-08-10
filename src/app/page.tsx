@@ -3,7 +3,7 @@
 import { useEffect, useRef, useState } from 'react';
 import Link from 'next/link';
 import { TranscriptTable } from '@/components/transcript-table';
-import { AudioUpload, AUDIO_UPLOAD_INPUT_ID } from '@/components/audio-upload';
+import { AudioUpload, requestMediaUpload } from '@/components/audio-upload';
 import { getGoogleAccessToken } from '@/lib/google-token';
 import { LogoutButton } from '@/components/logout-button';
 import { GmeetImportDialog } from '@/components/gmeet-import-dialog';
@@ -199,13 +199,7 @@ export default function Home() {
             </div>
           )}
         </div>
-        <Button
-          variant="outline"
-          size="sm"
-          onClick={() =>
-            (document.getElementById(AUDIO_UPLOAD_INPUT_ID) as HTMLInputElement | null)?.click()
-          }
-        >
+        <Button variant="outline" size="sm" onClick={requestMediaUpload}>
           <FileAudio className="h-4 w-4" />
           Upload media
         </Button>
