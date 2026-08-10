@@ -1,7 +1,6 @@
 'use client';
 
 import { useCallback, useEffect, useMemo, useState } from 'react';
-import { useRouter } from 'next/navigation';
 import {
   Dialog,
   DialogContent,
@@ -101,7 +100,6 @@ const timeLabel = (iso: string) =>
   new Date(iso).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
 
 export function SeriesDialog({ seriesId, onClose, onChanged }: SeriesDialogProps) {
-  const router = useRouter();
   const [detail, setDetail] = useState<SeriesDetail | null>(null);
   const [occ, setOcc] = useState<OccurrencesResult | null>(null);
   const [occError, setOccError] = useState(false);
@@ -476,15 +474,17 @@ export function SeriesDialog({ seriesId, onClose, onChanged }: SeriesDialogProps
                               o.imported.map((imp) =>
                                 imp.accessible ? (
                                   <span key={imp.assemblyai_id} className="group/imp inline-flex items-center gap-0.5">
-                                    <button
-                                      type="button"
-                                      onClick={() => router.push(`/transcript/${imp.assemblyai_id}`)}
+                                    <a
+                                      href={`/transcript/${imp.assemblyai_id}`}
+                                      target="_blank"
+                                      rel="noopener noreferrer"
+                                      onClick={(e) => e.stopPropagation()}
                                       className="inline-flex items-center gap-1 rounded-full bg-status-ok/10 px-2 py-0.5 text-[11px] text-status-ok hover:bg-status-ok/20"
-                                      title={imp.title ?? 'Open transcript'}
+                                      title={`${imp.title ?? 'Open transcript'} (new tab)`}
                                     >
                                       <Check className="h-3 w-3" /> imported
                                       <ExternalLink className="h-2.5 w-2.5" />
-                                    </button>
+                                    </a>
                                     {detail.members.some((m) => m.assemblyai_id === imp.assemblyai_id) && (
                                       <button
                                         type="button"
@@ -549,13 +549,15 @@ export function SeriesDialog({ seriesId, onClose, onChanged }: SeriesDialogProps
                         {dateLabel(m.recorded_at ?? m.created_at)}
                       </span>
                       {m.accessible ? (
-                        <button
-                          type="button"
-                          onClick={() => router.push(`/transcript/${m.assemblyai_id}`)}
+                        <a
+                          href={`/transcript/${m.assemblyai_id}`}
+                          target="_blank"
+                          rel="noopener noreferrer"
+                          title={`${m.title || 'Untitled meeting'} (new tab)`}
                           className="min-w-0 flex-1 truncate text-left text-sm hover:text-primary"
                         >
                           {m.title || 'Untitled meeting'}
-                        </button>
+                        </a>
                       ) : (
                         <span className="min-w-0 flex-1 truncate text-sm text-muted-foreground">
                           {m.title || 'Untitled meeting'}{' '}
