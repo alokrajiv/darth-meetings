@@ -9,6 +9,8 @@ import { Button } from '@/components/ui/button';
 import { Badge } from '@/components/ui/badge';
 import { Input } from '@/components/ui/input';
 import { Textarea } from '@/components/ui/textarea';
+import { SeriesBadge } from '@/components/series-badge';
+import { SeriesDialog } from '@/components/series-dialog';
 import {
   formatDuration,
   formatTime,
@@ -223,6 +225,21 @@ export default function TranscriptDetailPage({ params }: TranscriptDetailPagePro
   const [editingTitle, setEditingTitle] = useState(false);
   const [editingDescription, setEditingDescription] = useState(false);
   const [savingMeta, setSavingMeta] = useState(false);
+
+  // --- recurring-call series (the badge in the meta row) ---
+  const [seriesMembership, setSeriesMembership] = useState<
+    { series_id: number; title: string } | null | 'loading'
+  >('loading');
+  const [openSeriesId, setOpenSeriesId] = useState<number | null>(null);
+  const loadSeriesInfo = useCallback(() => {
+    fetch(`/api/transcripts/${transcriptId}/series`)
+      .then((r) => (r.ok ? r.json() : null))
+      .then((d) => setSeriesMembership(d?.membership ?? null))
+      .catch(() => setSeriesMembership(null));
+  }, [transcriptId]);
+  useEffect(() => {
+    loadSeriesInfo();
+  }, [loadSeriesInfo]);
 
   // --- audio player state ---
   const playerRef = useRef<AudioPlayerHandle>(null);
@@ -2123,6 +2140,16 @@ export default function TranscriptDetailPage({ params }: TranscriptDetailPagePro
                 </>
               )}
             </span>
+            {seriesMembership !== 'loading' && (
+              <SeriesBadge
+                assemblyaiId={transcriptId}
+                membership={seriesMembership}
+                defaultTitle={title.trim() || row.original_filename}
+                onOpenSeries={setOpenSeriesId}
+                onChanged={loadSeriesInfo}
+                variant="full"
+              />
+            )}
             {dateEditOpen && canEdit ? (
               <span
                 className="inline-flex items-center gap-1.5"
@@ -3116,6 +3143,12 @@ export default function TranscriptDetailPage({ params }: TranscriptDetailPagePro
           onCreated={handlePersonCreated}
           onUseAsLabel={handleUsePersonAsLabel}
           onCancel={() => setPendingCreate(null)}
+        />
+
+        <SeriesDialog
+          seriesId={openSeriesId}
+          onClose={() => setOpenSeriesId(null)}
+          onChanged={loadSeriesInfo}
         />
 
         <Dialog open={!!pendingShare} onOpenChange={(v) => !v && setPendingShare(null)}>

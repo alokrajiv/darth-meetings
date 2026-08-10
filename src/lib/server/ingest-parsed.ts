@@ -6,6 +6,7 @@ import {
 } from '@/db-ops/transcripts';
 import { autoNameSpeakers, registerPeopleFromMeeting } from '@/lib/server/import-helpers';
 import { autoShareToInternalInvitees } from '@/lib/server/auto-share';
+import { autoAttachSeries } from '@/lib/server/series-attach';
 import { onTranscriptCompleted } from '@/lib/server/post-completion';
 import { synthesizeTranscriptResponse, type ParsedMeetTranscript } from '@/lib/server/gmeet';
 import type { GmeetAttendee, GmeetContext, MeetParticipantInfo } from '@/lib/format';
@@ -102,6 +103,14 @@ export async function ingestParsedUtterances(
     autoShared = await autoShareToInternalInvitees(row.id, user.userId, user.email, shareList);
     await registerPeopleFromMeeting(shareList, user.userId);
   }
+
+  await autoAttachSeries({
+    id: row.id,
+    assemblyai_id: row.assemblyai_id,
+    gmeet_context: row.gmeet_context,
+    title: row.title,
+    user_id: row.user_id,
+  });
 
   return { row, autoShared };
 }

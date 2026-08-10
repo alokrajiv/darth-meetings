@@ -16,6 +16,7 @@ import { getForUser as getUserVocab } from '@/db-ops/user-vocab';
 import { getCurrentPayload as getOrgVocabPayload } from '@/db-ops/org-vocab';
 import { mergeVocabs } from '@/lib/server/vocab-merge';
 import { sniffMediaExtension } from '@/lib/server/video-frames';
+import { autoAttachSeries } from '@/lib/server/series-attach';
 import type { GmeetContext } from '@/lib/format';
 
 /**
@@ -142,6 +143,16 @@ export async function ingestLocalAudio(
     await deleteAudioFile(tempFilename);
     throw error;
   }
+
+  // Use the ROW's context, not opts — promoted placeholder rows carry the
+  // linked-event context stamped at upload start.
+  await autoAttachSeries({
+    id: row.id,
+    assemblyai_id: row.assemblyai_id,
+    gmeet_context: row.gmeet_context,
+    title: row.title,
+    user_id: row.user_id,
+  });
 
   // Keep our own copy of the audio. AAI deletes uploaded audio immediately
   // after transcription, so their audio_url is useless for playback. The

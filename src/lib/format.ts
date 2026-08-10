@@ -241,6 +241,9 @@ export interface TranscriptListRow {
   provider?: 'gmeet' | 'teams' | null;
   /** Calendar event linked (gmeet_context.eventId present). */
   has_event?: boolean;
+  /** Recurring-call series membership (the series badge). */
+  series_id?: number | null;
+  series_title?: string | null;
   access: TranscriptAccess;
   owner_email: string | null;
   owner_name: string | null;

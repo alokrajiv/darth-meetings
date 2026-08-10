@@ -104,6 +104,7 @@ export async function listVisibleToUser(
                   OR t.gmeet_context->>'meetingCode' IS NOT NULL THEN 'gmeet'
            END AS provider,
            (t.gmeet_context->>'eventId') IS NOT NULL AS has_event,
+           sm.series_id, se.title AS series_title,
            CASE
              WHEN t.user_id = ${userId} THEN 'owner'
              ELSE s.access
@@ -112,6 +113,8 @@ export async function listVisibleToUser(
     LEFT JOIN ${sql(SCHEMA)}.transcript_shares s
       ON s.transcript_id = t.id
       AND s.shared_with_email = ${normEmail}
+    LEFT JOIN ${sql(SCHEMA)}.series_members sm ON sm.transcript_id = t.id
+    LEFT JOIN ${sql(SCHEMA)}.series se ON se.id = sm.series_id
     WHERE t.user_id = ${userId} OR s.id IS NOT NULL
     ORDER BY t.created_at DESC
   `;
