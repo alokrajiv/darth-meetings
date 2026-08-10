@@ -488,6 +488,21 @@ export function AudioUpload({ onTranscriptCreated }: AudioUploadProps) {
     };
   }, [handleFilesSelected]);
 
+  // Closing the tab kills the in-flight XHR and everything sent so far —
+  // there is no resume. Once the POST returns (status 'transcribing') the
+  // server owns the job and closing is harmless, so only 'uploading' warns.
+  const hasActiveUpload = uploads.some((u) => u.status === 'uploading');
+  useEffect(() => {
+    if (!hasActiveUpload) return;
+    const onBeforeUnload = (e: BeforeUnloadEvent) => {
+      e.preventDefault();
+      // Legacy engines need returnValue set for the prompt to show.
+      e.returnValue = '';
+    };
+    window.addEventListener('beforeunload', onBeforeUnload);
+    return () => window.removeEventListener('beforeunload', onBeforeUnload);
+  }, [hasActiveUpload]);
+
   const handleFileInputChange = useCallback(
     (e: React.ChangeEvent<HTMLInputElement>) => {
       if (e.target.files && e.target.files.length > 0) {
