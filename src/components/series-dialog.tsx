@@ -77,6 +77,8 @@ interface Occurrence {
 interface OccurrencesResult {
   googleConnected: boolean;
   graphChecked: boolean;
+  sweptAt: string;
+  fromCache: boolean;
   occurrences: Occurrence[];
   counts: { total: number; imported: number; importable: number; bare: number; upcoming: number };
 }
@@ -99,6 +101,13 @@ const dateLabel = (iso: string) =>
 const timeLabel = (iso: string) =>
   new Date(iso).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
 
+const sweptAgo = (iso: string) => {
+  const mins = Math.max(0, Math.round((Date.now() - Date.parse(iso)) / 60_000));
+  if (mins < 1) return 'just now';
+  if (mins < 60) return `${mins}m ago`;
+  return `${Math.round(mins / 60)}h ago`;
+};
+
 export function SeriesDialog({ seriesId, onClose, onChanged }: SeriesDialogProps) {
   const [detail, setDetail] = useState<SeriesDetail | null>(null);
   const [occ, setOcc] = useState<OccurrencesResult | null>(null);
@@ -113,17 +122,22 @@ export function SeriesDialog({ seriesId, onClose, onChanged }: SeriesDialogProps
     if (res.ok) setDetail((await res.json()) as SeriesDetail);
   }, [seriesId]);
 
-  const loadOccurrences = useCallback(async () => {
-    if (!seriesId) return;
-    setOccError(false);
-    try {
-      const res = await fetch(`/api/series/${seriesId}/occurrences`);
-      if (!res.ok) throw new Error(String(res.status));
-      setOcc((await res.json()) as OccurrencesResult);
-    } catch {
-      setOccError(true);
-    }
-  }, [seriesId]);
+  const loadOccurrences = useCallback(
+    async (forceRefresh = false) => {
+      if (!seriesId) return;
+      setOccError(false);
+      try {
+        const res = await fetch(
+          `/api/series/${seriesId}/occurrences${forceRefresh ? '?refresh=1' : ''}`
+        );
+        if (!res.ok) throw new Error(String(res.status));
+        setOcc((await res.json()) as OccurrencesResult);
+      } catch {
+        setOccError(true);
+      }
+    },
+    [seriesId]
+  );
 
   useEffect(() => {
     setDetail(null);
@@ -377,6 +391,13 @@ export function SeriesDialog({ seriesId, onClose, onChanged }: SeriesDialogProps
                   <span className="text-[11px] tabular-nums text-muted-foreground">
                     {occ.counts.imported} imported · {occ.counts.importable} importable ·{' '}
                     {occ.counts.bare} without artifacts
+                    <span
+                      className="text-muted-foreground/60"
+                      title="Calendar + Teams sweep time — cached up to 6h; the refresh button re-sweeps"
+                    >
+                      {' '}
+                      · swept {sweptAgo(occ.sweptAt)}
+                    </span>
                   </span>
                 )}
                 <span className="ml-auto" />
@@ -397,10 +418,10 @@ export function SeriesDialog({ seriesId, onClose, onChanged }: SeriesDialogProps
                   variant="ghost"
                   size="sm"
                   className="h-6 w-6 p-0"
-                  title="Re-sweep calendar + Teams"
+                  title="Re-sweep calendar + Teams now (bypasses the 6h cache)"
                   onClick={() => {
                     setOcc(null);
-                    void loadOccurrences();
+                    void loadOccurrences(true);
                   }}
                 >
                   <RefreshCw className="h-3 w-3" />

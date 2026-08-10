@@ -38,6 +38,23 @@ const CAL_API = 'https://www.googleapis.com/calendar/v3';
 const SWEEP_MONTHS_BACK = 12;
 /** Include near-future instances so the dialog shows what's coming. */
 const SWEEP_DAYS_FORWARD = 45;
+/** External sweep results (calendar + Graph) are cached per series+user;
+ * the refresh button forces past this. Only the expensive skeleton is
+ * cached — imported cross-references are recomputed on every request. */
+const SWEEP_TTL_MS = 6 * 3600_000;
+
+interface SweepCacheEntry {
+  at: number;
+  googleConnected: boolean;
+  graphChecked: boolean;
+  occurrences: SeriesOccurrence[];
+}
+
+declare global {
+  var __mwSeriesSweepCache: Map<string, SweepCacheEntry> | undefined;
+}
+const sweepCache: Map<string, SweepCacheEntry> =
+  globalThis.__mwSeriesSweepCache ?? (globalThis.__mwSeriesSweepCache = new Map());
 
 interface CalInstance {
   id?: string;
@@ -86,6 +103,9 @@ export interface SeriesOccurrencesResult {
   seriesTitle: string;
   googleConnected: boolean;
   graphChecked: boolean;
+  /** When the external sweep actually ran (cache timestamp). */
+  sweptAt: string;
+  fromCache: boolean;
   occurrences: SeriesOccurrence[];
   counts: {
     total: number;
@@ -211,10 +231,69 @@ function matchImported(
 
 export async function sweepSeriesOccurrences(
   seriesId: number,
-  caller: { userId: string; email: string }
+  caller: { userId: string; email: string },
+  opts: { forceRefresh?: boolean } = {}
 ): Promise<SeriesOccurrencesResult | null> {
   const series = await getSeries(seriesId);
   if (!series) return null;
+
+  // Serve the external skeleton from cache when it's warm — the DB
+  // cross-reference below always runs fresh, so an import made from the
+  // dialog shows as imported on the very next (instant) refresh.
+  const cacheKey = `${seriesId}:${caller.userId}`;
+  let entry = sweepCache.get(cacheKey);
+  const stale = opts.forceRefresh || !entry || Date.now() - entry.at > SWEEP_TTL_MS;
+  if (stale) {
+    entry = {
+      at: Date.now(),
+      ...(await computeSweepSkeleton(series.title, seriesId, caller)),
+    };
+    sweepCache.set(cacheKey, entry);
+  }
+
+  const candidates = await loadImportedCandidates(seriesId, caller);
+  const nowMs = Date.now();
+  const occurrences: SeriesOccurrence[] = entry!.occurrences.map((o) => ({
+    ...o,
+    // recomputed at serve time — a cached "upcoming" may have happened since
+    upcoming: Date.parse(o.startIso) > nowMs,
+    imported: [],
+  }));
+  for (const occ of occurrences) occ.imported = matchImported(occ, candidates);
+  occurrences.sort((a, b) => Date.parse(b.startIso) - Date.parse(a.startIso));
+
+  const past = occurrences.filter((o) => !o.upcoming);
+  const counts = {
+    total: occurrences.length,
+    imported: past.filter((o) => o.imported.length > 0).length,
+    importable: past.filter((o) => o.imported.length === 0 && (o.hasRecording || o.hasTranscript))
+      .length,
+    bare: past.filter((o) => !o.hasRecording && !o.hasTranscript).length,
+    upcoming: occurrences.filter((o) => o.upcoming).length,
+  };
+
+  return {
+    seriesId,
+    seriesTitle: series.title,
+    googleConnected: entry!.googleConnected,
+    graphChecked: entry!.graphChecked,
+    sweptAt: new Date(entry!.at).toISOString(),
+    fromCache: !stale,
+    occurrences,
+    counts,
+  };
+}
+
+/** The expensive external enumeration: calendar pages + Graph artifacts. */
+async function computeSweepSkeleton(
+  seriesTitle: string,
+  seriesId: number,
+  caller: { userId: string; email: string }
+): Promise<{
+  googleConnected: boolean;
+  graphChecked: boolean;
+  occurrences: SeriesOccurrence[];
+}> {
   const keys = await listKeys(seriesId);
   const byKind = (kind: string) => keys.filter((k) => k.kind === kind).map((k) => k.value);
   const codes = new Set(byKind('meeting-code'));
@@ -234,7 +313,7 @@ export async function sweepSeriesOccurrences(
     const queries: URLSearchParams[] = [];
     queries.push(
       new URLSearchParams({
-        q: series.title,
+        q: seriesTitle,
         timeMin,
         timeMax,
         singleEvents: 'true',
@@ -348,7 +427,7 @@ export async function sweepSeriesOccurrences(
             key: `call-${callId}`,
             startIso: l.start,
             endIso: l.end ?? null,
-            title: series.title,
+            title: seriesTitle,
             source: 'graph',
             upcoming: false,
             meetingCode: null,
@@ -375,28 +454,5 @@ export async function sweepSeriesOccurrences(
     }
   }
 
-  // ---- Imported cross-reference ------------------------------------------
-  const candidates = await loadImportedCandidates(seriesId, caller);
-  for (const occ of occurrences) occ.imported = matchImported(occ, candidates);
-
-  occurrences.sort((a, b) => Date.parse(b.startIso) - Date.parse(a.startIso));
-
-  const past = occurrences.filter((o) => !o.upcoming);
-  const counts = {
-    total: occurrences.length,
-    imported: past.filter((o) => o.imported.length > 0).length,
-    importable: past.filter((o) => o.imported.length === 0 && (o.hasRecording || o.hasTranscript))
-      .length,
-    bare: past.filter((o) => !o.hasRecording && !o.hasTranscript).length,
-    upcoming: occurrences.filter((o) => o.upcoming).length,
-  };
-
-  return {
-    seriesId,
-    seriesTitle: series.title,
-    googleConnected,
-    graphChecked,
-    occurrences,
-    counts,
-  };
+  return { googleConnected, graphChecked, occurrences };
 }

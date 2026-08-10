@@ -7,19 +7,22 @@ export const runtime = 'nodejs';
 export const maxDuration = 120;
 
 /**
- * GET /api/series/:id/occurrences — live sweep of every occurrence we can
- * see for this series (calendar + Graph merged), with artifact presence and
- * already-imported cross-references. Nothing is persisted.
+ * GET /api/series/:id/occurrences — every occurrence we can see for this
+ * series (calendar + Graph merged), with artifact presence and
+ * already-imported cross-references. The external sweep is cached ~6h per
+ * user; `?refresh=1` forces a fresh one. Imported state is always fresh.
  */
-export const GET = withAuth(async ({ user }, { params }) => {
+export const GET = withAuth(async ({ user, request }, { params }) => {
   const id = Number((await params).id);
   if (!Number.isInteger(id) || id <= 0) {
     return NextResponse.json({ error: 'Bad id' }, { status: 400 });
   }
-  const result = await sweepSeriesOccurrences(id, {
-    userId: user.userId,
-    email: user.email,
-  });
+  const forceRefresh = new URL(request.url).searchParams.get('refresh') === '1';
+  const result = await sweepSeriesOccurrences(
+    id,
+    { userId: user.userId, email: user.email },
+    { forceRefresh }
+  );
   if (!result) return NextResponse.json({ error: 'Not found' }, { status: 404 });
   return NextResponse.json(result);
 });
