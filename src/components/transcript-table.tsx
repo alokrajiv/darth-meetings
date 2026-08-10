@@ -1,6 +1,6 @@
 'use client';
 
-import { useState, useEffect, useCallback, useMemo, useRef } from 'react';
+import { Fragment, useState, useEffect, useCallback, useMemo, useRef } from 'react';
 import { useRouter } from 'next/navigation';
 import {
   Table,
@@ -32,9 +32,10 @@ import {
   Inbox,
   Columns3,
   GripVertical,
-  Sparkles,
 } from 'lucide-react';
 import { MeetLogo, TeamsLogo } from '@/components/provider-icon';
+import { SeriesBadge } from '@/components/series-badge';
+import { SeriesDialog } from '@/components/series-dialog';
 
 interface TranscriptTableProps {
   refreshTrigger?: number;
@@ -58,6 +59,42 @@ interface ColPrefs {
   hidden: ColKey[];
   /** Show the description/filename line under titles (default on). */
   showDesc: boolean;
+  /** Section the list into day buckets with sticky-ish header rows (default on). */
+  groupByDay: boolean;
+}
+
+/** Local-timezone day bucket key, e.g. "2026-08-10". */
+function dayKeyOf(iso: string): string {
+  const d = new Date(iso);
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+}
+
+/** Heading for a day bucket: "Today" / "Yesterday" / "Tuesday" (this week,
+ * with the short date as a muted suffix) / "Tue, 4 Aug" (this year) /
+ * "4 Aug 2025". */
+function dayHeading(iso: string): { label: string; sub: string | null } {
+  const d = new Date(iso);
+  const now = new Date();
+  const startOfDay = (x: Date) => new Date(x.getFullYear(), x.getMonth(), x.getDate());
+  const dayDiff = Math.round(
+    (startOfDay(now).getTime() - startOfDay(d).getTime()) / 86_400_000
+  );
+  const shortDate = d.toLocaleDateString([], { day: 'numeric', month: 'short' });
+  if (dayDiff === 0) return { label: 'Today', sub: shortDate };
+  if (dayDiff === 1) return { label: 'Yesterday', sub: shortDate };
+  if (dayDiff > 1 && dayDiff < 7) {
+    return { label: d.toLocaleDateString([], { weekday: 'long' }), sub: shortDate };
+  }
+  if (d.getFullYear() === now.getFullYear()) {
+    return {
+      label: d.toLocaleDateString([], { weekday: 'short', day: 'numeric', month: 'short' }),
+      sub: null,
+    };
+  }
+  return {
+    label: d.toLocaleDateString([], { day: 'numeric', month: 'short', year: 'numeric' }),
+    sub: null,
+  };
 }
 
 /**
@@ -114,18 +151,29 @@ const COL_RESPONSIVE: Record<ColKey, string> = {
 };
 
 function loadColPrefs(): ColPrefs {
+  const defaults: ColPrefs = {
+    order: DEFAULT_COL_ORDER,
+    hidden: DEFAULT_HIDDEN,
+    showDesc: true,
+    groupByDay: true,
+  };
   try {
     const raw = localStorage.getItem(COLS_STORAGE_KEY);
-    if (!raw) return { order: DEFAULT_COL_ORDER, hidden: DEFAULT_HIDDEN, showDesc: true };
+    if (!raw) return defaults;
     const parsed = JSON.parse(raw) as Partial<ColPrefs>;
     const valid = new Set<ColKey>(DEFAULT_COL_ORDER);
     const order = (parsed.order ?? []).filter((k): k is ColKey => valid.has(k as ColKey));
     // Append any columns added after the prefs were saved.
     for (const k of DEFAULT_COL_ORDER) if (!order.includes(k)) order.push(k);
     const hidden = (parsed.hidden ?? []).filter((k): k is ColKey => valid.has(k as ColKey));
-    return { order, hidden, showDesc: parsed.showDesc !== false };
+    return {
+      order,
+      hidden,
+      showDesc: parsed.showDesc !== false,
+      groupByDay: parsed.groupByDay !== false,
+    };
   } catch {
-    return { order: DEFAULT_COL_ORDER, hidden: DEFAULT_HIDDEN, showDesc: true };
+    return defaults;
   }
 }
 
@@ -137,6 +185,7 @@ export function TranscriptTable({ refreshTrigger, toolbarExtra }: TranscriptTabl
   const [tab, setTab] = useState<TabKey>('all');
   const [query, setQuery] = useState('');
   const searchRef = useRef<HTMLInputElement>(null);
+  const [openSeriesId, setOpenSeriesId] = useState<number | null>(null);
 
   // Column prefs (visibility + order) — loaded client-side to avoid SSR
   // localStorage access; saved on every change.
@@ -144,6 +193,7 @@ export function TranscriptTable({ refreshTrigger, toolbarExtra }: TranscriptTabl
     order: DEFAULT_COL_ORDER,
     hidden: DEFAULT_HIDDEN,
     showDesc: true,
+    groupByDay: true,
   });
   const [colsOpen, setColsOpen] = useState(false);
   const colsMenuRef = useRef<HTMLDivElement | null>(null);
@@ -284,6 +334,36 @@ export function TranscriptTable({ refreshTrigger, toolbarExtra }: TranscriptTabl
     return rows;
   }, [transcripts, tab, query, deepHits]);
 
+  // Day sections for the grouped view: bucket by local day of the meeting
+  // time (recorded_at, falling back to upload time), newest day first,
+  // newest meeting first within a day.
+  const dayGroups = useMemo(() => {
+    if (!colPrefs.groupByDay) return null;
+    const when = (t: TranscriptListRow) => t.recorded_at ?? t.created_at;
+    const sorted = [...filtered].sort(
+      (a, b) => new Date(when(b)).getTime() - new Date(when(a)).getTime()
+    );
+    const groups: Array<{
+      key: string;
+      heading: string;
+      sub: string | null;
+      rows: TranscriptListRow[];
+      totalSecs: number;
+    }> = [];
+    for (const t of sorted) {
+      const key = dayKeyOf(when(t));
+      let g = groups[groups.length - 1];
+      if (!g || g.key !== key) {
+        const { label, sub } = dayHeading(when(t));
+        g = { key, heading: label, sub, rows: [], totalSecs: 0 };
+        groups.push(g);
+      }
+      g.rows.push(t);
+      g.totalSecs += t.duration ?? 0;
+    }
+    return groups;
+  }, [filtered, colPrefs.groupByDay]);
+
   const handleDeleteTranscript = async (e: React.MouseEvent, assemblyaiId: string) => {
     e.stopPropagation();
     if (!confirm('Are you sure you want to delete this transcript?')) return;
@@ -412,43 +492,26 @@ export function TranscriptTable({ refreshTrigger, toolbarExtra }: TranscriptTabl
     return { primary: 'Untitled meeting', secondary: desc, untitled: true };
   };
 
-  // Kick off AI summary generation straight from the list — no need to open
-  // the transcript first. The SSE 'notes' events keep the row state fresh.
-  const [generatingIds, setGeneratingIds] = useState<Set<string>>(new Set());
-  const handleGenerateFromList = async (e: React.MouseEvent, t: TranscriptListRow) => {
-    e.stopPropagation();
-    setGeneratingIds((prev) => new Set(prev).add(t.assemblyai_id));
-    setTranscripts((prev) =>
-      prev.map((r) =>
-        r.assemblyai_id === t.assemblyai_id ? { ...r, auto_notes_status: 'running' } : r
-      )
-    );
-    try {
-      await fetch(`/api/transcripts/${t.assemblyai_id}/notes`, { method: 'POST' });
-    } catch {
-      // the silent live reload will restore true state
-    } finally {
-      setGeneratingIds((prev) => {
-        const next = new Set(prev);
-        next.delete(t.assemblyai_id);
-        return next;
-      });
-    }
-  };
-
   const renderColCell = (key: ColKey, t: TranscriptListRow) => {
     switch (key) {
       case 'owner':
         return ownerCell(t);
-      case 'date':
+      case 'date': {
+        const when = t.recorded_at ?? t.created_at;
+        // Grouped view already names the day in the section header — the
+        // column narrows down to time-of-day.
+        const label = colPrefs.groupByDay
+          ? new Date(when).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
+          : formatSmartDate(when);
         return (
           <span
-            className="text-xs text-muted-foreground"
-            title={new Date(t.recorded_at ?? t.created_at).toLocaleString()}
+            className="text-xs tabular-nums text-muted-foreground"
+            title={new Date(when).toLocaleString()}
           >
-            {formatSmartDate(t.recorded_at ?? t.created_at) || 'Unknown'}
+            {label || 'Unknown'}
           </span>
         );
+      }
       case 'duration':
         return (
           <span className="font-mono text-[11px] tabular-nums text-muted-foreground">
@@ -544,7 +607,7 @@ export function TranscriptTable({ refreshTrigger, toolbarExtra }: TranscriptTabl
               </div>
             );
           })}
-          <div className="mt-1 border-t px-2 py-1.5">
+          <div className="mt-1 space-y-0.5 border-t px-2 py-1.5">
             <label className="flex cursor-pointer items-center gap-2 text-sm">
               <input
                 type="checkbox"
@@ -556,11 +619,27 @@ export function TranscriptTable({ refreshTrigger, toolbarExtra }: TranscriptTabl
               />
               Description line
             </label>
+            <label className="flex cursor-pointer items-center gap-2 text-sm">
+              <input
+                type="checkbox"
+                checked={colPrefs.groupByDay}
+                onChange={() =>
+                  saveColPrefs({ ...colPrefs, groupByDay: !colPrefs.groupByDay })
+                }
+                className="h-3.5 w-3.5 accent-primary"
+              />
+              Group by day
+            </label>
           </div>
           <button
             type="button"
             onClick={() =>
-              saveColPrefs({ order: DEFAULT_COL_ORDER, hidden: DEFAULT_HIDDEN, showDesc: true })
+              saveColPrefs({
+                order: DEFAULT_COL_ORDER,
+                hidden: DEFAULT_HIDDEN,
+                showDesc: true,
+                groupByDay: true,
+              })
             }
             className="block w-full rounded border-t px-2 py-1.5 text-left text-xs text-muted-foreground hover:bg-muted hover:text-foreground"
           >
@@ -677,6 +756,116 @@ export function TranscriptTable({ refreshTrigger, toolbarExtra }: TranscriptTabl
 
   const searchEmpty = filtered.length === 0 && query.trim().length > 0;
 
+  /** One listing row — shared by the flat list and the day-grouped view. */
+  const renderRow = (t: TranscriptListRow) => {
+    const { primary, secondary, untitled } = titleOf(t);
+    const processing = t.status === 'processing' || t.status === 'queued';
+    // Placeholder rows have a synthetic `up-…` id — there is no detail page
+    // to open until the upload finishes and the row is promoted to its real
+    // AAI id.
+    const uploading = t.status === 'uploading';
+    return (
+      <TableRow
+        key={t.id}
+        onClick={() => {
+          if (!uploading) router.push(`/transcript/${t.assemblyai_id}`);
+        }}
+        className={`group transition-colors hover:bg-accent/40 ${
+          uploading ? 'cursor-default' : 'cursor-pointer'
+        }`}
+      >
+        <TableCell className="py-2 pl-4">
+          <div className="flex min-w-0 items-center gap-2">
+            {statusDot(t.status)}
+            {sourceIcon(t)}
+            {calendarIcon(t)}
+            <div className="min-w-0 flex-1">
+              <div className="flex min-w-0 items-center gap-2">
+                <div
+                  className={`min-w-0 truncate text-sm font-medium ${
+                    untitled ? 'italic text-muted-foreground' : ''
+                  } ${processing || uploading ? 'text-shimmer' : ''}`}
+                >
+                  {primary}
+                </div>
+                {!uploading && (
+                  <SeriesBadge
+                    assemblyaiId={t.assemblyai_id}
+                    membership={
+                      t.series_id && t.series_title
+                        ? { series_id: t.series_id, title: t.series_title }
+                        : null
+                    }
+                    defaultTitle={t.title}
+                    onOpenSeries={setOpenSeriesId}
+                    onChanged={() => void loadTranscripts({ silent: true })}
+                  />
+                )}
+              </div>
+              {uploading ? (
+                <div className="truncate font-mono text-[11px] text-muted-foreground">
+                  {uploadProgressLine(t)}
+                </div>
+              ) : processing ? (
+                <div className="truncate font-mono text-[11px] text-muted-foreground">
+                  transcribing… — open it to share or link the calendar event
+                </div>
+              ) : (() => {
+                const hit = query.trim() ? deepHits.get(t.assemblyai_id) : undefined;
+                if (hit?.snippet && (hit.matched_in === 'notes' || hit.matched_in === 'content')) {
+                  return (
+                    <div className="truncate text-xs text-muted-foreground">
+                      <span className="italic">…{hit.snippet.trim()}…</span>{' '}
+                      <span className="text-[10px] uppercase tracking-wide">
+                        in {hit.matched_in === 'notes' ? 'summary' : 'transcript'}
+                      </span>
+                    </div>
+                  );
+                }
+                return secondary ? (
+                  <div className="truncate text-xs text-muted-foreground">
+                    {secondary}
+                  </div>
+                ) : null;
+              })()}
+            </div>
+            {t.status === 'error' && (
+              <Badge
+                variant="outline"
+                className="shrink-0 border-destructive/40 text-[10px] text-destructive"
+              >
+                Failed
+              </Badge>
+            )}
+          </div>
+        </TableCell>
+        {visibleCols.map((key) => (
+          <TableCell key={key} className={`py-1.5 ${COL_RESPONSIVE[key]}`}>
+            {renderColCell(key, t)}
+          </TableCell>
+        ))}
+        <TableCell className="py-1.5 pr-3">
+          <div className="flex items-center justify-end gap-0.5">
+            {t.access === 'owner' && !uploading && (
+              <Button
+                size="sm"
+                variant="ghost"
+                className="h-7 w-7 p-0 text-muted-foreground opacity-0 transition-opacity hover:text-destructive group-hover:opacity-100"
+                onClick={(e) => handleDeleteTranscript(e, t.assemblyai_id)}
+                title="Delete"
+              >
+                <Trash2 className="h-3.5 w-3.5" />
+              </Button>
+            )}
+            <span className="grid h-7 w-7 place-items-center">
+              <ChevronRight className="h-4 w-4 text-muted-foreground opacity-0 transition-opacity group-hover:opacity-100" />
+            </span>
+          </div>
+        </TableCell>
+      </TableRow>
+    );
+  };
+
   return (
     <div>
       {toolbar}
@@ -728,128 +917,41 @@ export function TranscriptTable({ refreshTrigger, toolbarExtra }: TranscriptTabl
               </TableRow>
             </TableHeader>
             <TableBody>
-              {filtered.map((t) => {
-                const { primary, secondary, untitled } = titleOf(t);
-                const processing = t.status === 'processing' || t.status === 'queued';
-                // Placeholder rows have a synthetic `up-…` id — there is no
-                // detail page to open until the upload finishes and the row
-                // is promoted to its real AAI id.
-                const uploading = t.status === 'uploading';
-                return (
-                  <TableRow
-                    key={t.id}
-                    onClick={() => {
-                      if (!uploading) router.push(`/transcript/${t.assemblyai_id}`);
-                    }}
-                    className={`group transition-colors hover:bg-accent/40 ${
-                      uploading ? 'cursor-default' : 'cursor-pointer'
-                    }`}
-                  >
-                    <TableCell className="py-1.5">
-                      <div className="flex min-w-0 items-center gap-2">
-                        {t.status === 'completed' && t.auto_notes_status === 'running' ? (
-                          <span
-                            className="grid h-7 w-7 shrink-0 place-items-center"
-                            title="AI summary is being generated…"
-                          >
-                            <Sparkles className="h-3.5 w-3.5 animate-pulse text-primary" />
+              {dayGroups
+                ? dayGroups.map((g) => (
+                    <Fragment key={g.key}>
+                      <TableRow className="hover:bg-transparent">
+                        <TableCell
+                          colSpan={visibleCols.length + 2}
+                          className="bg-muted/40 py-1.5 pl-4"
+                        >
+                          <span className="text-[11px] font-semibold uppercase tracking-wider text-foreground/80">
+                            {g.heading}
                           </span>
-                        ) : t.status === 'completed' && t.access !== 'read' ? (
-                          <Button
-                            size="sm"
-                            variant="ghost"
-                            className="h-7 w-7 shrink-0 p-0 text-muted-foreground/50 hover:text-primary"
-                            disabled={generatingIds.has(t.assemblyai_id)}
-                            onClick={(e) => void handleGenerateFromList(e, t)}
-                            title={
-                              t.auto_notes_status && t.auto_notes_status !== 'error'
-                                ? 'Re-run AI notes for this meeting'
-                                : 'Generate AI notes for this meeting'
-                            }
-                          >
-                            <Sparkles className="h-3.5 w-3.5" />
-                          </Button>
-                        ) : (
-                          <span className="h-7 w-7 shrink-0" />
-                        )}
-                        {statusDot(t.status)}
-                        {sourceIcon(t)}
-                        {calendarIcon(t)}
-                        <div className="min-w-0 flex-1">
-                          <div
-                            className={`truncate text-sm font-medium ${
-                              untitled ? 'italic text-muted-foreground' : ''
-                            } ${processing || uploading ? 'text-shimmer' : ''}`}
-                          >
-                            {primary}
-                          </div>
-                          {uploading ? (
-                            <div className="truncate font-mono text-[11px] text-muted-foreground">
-                              {uploadProgressLine(t)}
-                            </div>
-                          ) : processing ? (
-                            <div className="truncate font-mono text-[11px] text-muted-foreground">
-                              transcribing… — open it to share or link the calendar event
-                            </div>
-                          ) : (() => {
-                            const hit = query.trim() ? deepHits.get(t.assemblyai_id) : undefined;
-                            if (hit?.snippet && (hit.matched_in === 'notes' || hit.matched_in === 'content')) {
-                              return (
-                                <div className="truncate text-xs text-muted-foreground">
-                                  <span className="italic">…{hit.snippet.trim()}…</span>{' '}
-                                  <span className="text-[10px] uppercase tracking-wide">
-                                    in {hit.matched_in === 'notes' ? 'summary' : 'transcript'}
-                                  </span>
-                                </div>
-                              );
-                            }
-                            return secondary ? (
-                              <div className="truncate text-xs text-muted-foreground">
-                                {secondary}
-                              </div>
-                            ) : null;
-                          })()}
-                        </div>
-                        {t.status === 'error' && (
-                          <Badge
-                            variant="outline"
-                            className="shrink-0 border-destructive/40 text-[10px] text-destructive"
-                          >
-                            Failed
-                          </Badge>
-                        )}
-                      </div>
-                    </TableCell>
-                    {visibleCols.map((key) => (
-                      <TableCell key={key} className={`py-1.5 ${COL_RESPONSIVE[key]}`}>
-                        {renderColCell(key, t)}
-                      </TableCell>
-                    ))}
-                    <TableCell className="py-1.5 pr-3">
-                      <div className="flex items-center justify-end gap-0.5">
-                        {t.access === 'owner' && !uploading && (
-                          <Button
-                            size="sm"
-                            variant="ghost"
-                            className="h-7 w-7 p-0 text-muted-foreground opacity-0 transition-opacity hover:text-destructive group-hover:opacity-100"
-                            onClick={(e) => handleDeleteTranscript(e, t.assemblyai_id)}
-                            title="Delete"
-                          >
-                            <Trash2 className="h-3.5 w-3.5" />
-                          </Button>
-                        )}
-                        <span className="grid h-7 w-7 place-items-center">
-                          <ChevronRight className="h-4 w-4 text-muted-foreground opacity-0 transition-opacity group-hover:opacity-100" />
-                        </span>
-                      </div>
-                    </TableCell>
-                  </TableRow>
-                );
-              })}
+                          {g.sub && (
+                            <span className="ml-1.5 text-[11px] text-muted-foreground/70">
+                              {g.sub}
+                            </span>
+                          )}
+                          <span className="ml-2 text-[11px] tabular-nums text-muted-foreground">
+                            {g.rows.length} meeting{g.rows.length === 1 ? '' : 's'}
+                            {g.totalSecs > 0 ? ` · ${formatDuration(g.totalSecs)}` : ''}
+                          </span>
+                        </TableCell>
+                      </TableRow>
+                      {g.rows.map(renderRow)}
+                    </Fragment>
+                  ))
+                : filtered.map(renderRow)}
             </TableBody>
           </Table>
         )
       )}
+      <SeriesDialog
+        seriesId={openSeriesId}
+        onClose={() => setOpenSeriesId(null)}
+        onChanged={() => void loadTranscripts({ silent: true })}
+      />
     </div>
   );
 }
