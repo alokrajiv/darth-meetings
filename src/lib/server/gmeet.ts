@@ -640,30 +640,9 @@ export async function captureMeetActuals(
   };
 }
 
-/**
- * Build display utterances from structured Meet API entries — preferred over
- * Doc parsing when available (precise per-utterance times vs 5-minute
- * blocks). Consecutive same-speaker entries with small gaps are merged so
- * the transcript reads as turns, not sentences.
- */
-export function utterancesFromEntries(entries: MeetTranscriptEntry[]): MeetUtterance[] {
-  const out: MeetUtterance[] = [];
-  for (const e of entries) {
-    const prev = out[out.length - 1];
-    if (
-      prev &&
-      prev.speaker === e.speaker &&
-      e.start - prev.end <= 2000 &&
-      prev.text.length < 600
-    ) {
-      prev.text += ` ${e.text}`;
-      prev.end = e.end;
-    } else {
-      out.push({ speaker: e.speaker, text: e.text, start: e.start, end: e.end });
-    }
-  }
-  return out;
-}
+// Moved to a pure module (Teams VTT parsing shares it and unit tests import
+// it without the server-only guard); re-exported here for existing callers.
+export { utterancesFromEntries } from '@/lib/utterances';
 
 /**
  * Wrap a parsed Meet transcript in the TranscriptResponse shape the rest of

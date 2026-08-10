@@ -1,0 +1,62 @@
+WEBVTT
+
+00:00:03.918 --> 00:00:04.078
+<v Swaralee Kibe>No.</v>
+
+00:00:06.398 --> 00:00:25.158
+<v Swaralee Kibe>Okay, I see the recording is started. Yes, so what I wanted to show you today, Nicholas, is the master data that I was talking about last week, right? That I'll create one for you based on the details that you currently gave me in the call, what needs to be included, what needs to be excluded, what falls under subject to and all that.</v>
+
+00:00:25.318 --> 00:00:40.558
+<v Swaralee Kibe>So we have created a master data over here, right, which is based on carrier or the contract type, the charge code if we have, and if not the charge code, then fall back to the charging, right? And then the bucket it falls under.</v>
+
+00:00:41.558 --> 00:01:00.558
+<v Swaralee Kibe>So as you can see here, this is just to help Alok understand what needs to be added, what needs to fall under subject to, what needs to fall under per BL and what's under included. Yeah. So this, I am just walking you through this because then going forward, if there is any extra</v>
+
+00:01:00.638 --> 00:01:20.198
+<v Swaralee Kibe>codes or any other codes that need to be added or excluded, you can just, we'll give you access to this master data and we'll give you access to edit the master data. So you can just add in the rows for these, right? So just a simple one, the carrier name, the type of contract it is, if there is an, if the charge code, if there is a charge code,</v>
+
+00:01:20.358 --> 00:01:39.518
+<v Swaralee Kibe>And then what's the currency and whether it should fall under an included bucket or it should fall under a hidden bucket. Hidden meaning we won't be showing you these charges at all into the rate card, right, which is like the local charges or additional charges that are there. Anything you see subject to is something like for dangerous goods, it falls under subject.</v>
+
+00:01:39.598 --> 00:01:58.358
+<v Swaralee Kibe>to, then you have the other as heavyweight surcharge that falls under subject to, and whatever falls under per BM. So we have created this database based on the last call that we had. Just one small confirmation. I have a few confirmations to make so that I can</v>
+
+00:01:58.918 --> 00:02:17.638
+<v Swaralee Kibe>make this data table even more accurate, right? Let's say for example, right, we did find some charges that we didn't discuss in the call last week, like for example, the CDD charge, right, that comes under MSC. I do know it is mentioned here as special requirement or remarks. So</v>
+
+00:02:18.038 --> 00:02:23.078
+<v Swaralee Kibe>In this case, do we add this or do we just not exclude it or put it into subject to?</v>
+
+00:02:24.758 --> 00:02:25.358
+<v Nicolas Montero>Which one?</v>
+
+00:02:26.438 --> 00:02:28.758
+<v Swaralee Kibe>This one, the CDD prepaid charges.</v>
+
+00:02:30.918 --> 00:02:33.278
+<v Nicolas Montero>I can't see it. Where is it? Show it to me.</v>
+
+00:02:33.398 --> 00:02:39.958
+<v Swaralee Kibe>Oh, I'm sorry. I wasn't sharing my screen. Let me just share my whole screen for this one.</v>
+
+00:02:41.798 --> 00:02:42.438
+<v Swaralee Kibe>This one.</v>
+
+00:02:43.198 --> 00:02:45.358
+<v Nicolas Montero>CDD prepaid.</v>
+
+00:02:43.398 --> 00:02:45.238
+<v Swaralee Kibe>I know it's written subject to.</v>
+
+00:02:46.438 --> 00:02:49.318
+<v Swaralee Kibe>But I just wanted to take a confirmation from you first.</v>
+
+00:02:53.198 --> 00:02:54.398
+<v Nicolas Montero>I don't know what this is.</v>
+
+00:02:53.238 --> 00:02:59.558
+<v Swaralee Kibe>So we found this under the NAT basket in the Northern Western Country MSC file.</v>
+
+00:03:00.798 --> 00:03:03.998
+<v Nicolas Montero>Mandy, could you tell me for a second, please?</v>
+

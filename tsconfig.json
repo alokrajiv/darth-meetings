@@ -26,7 +26,13 @@
       "@/*": [
         "./src/*"
       ]
-    }
+    },
+    // Keep @types/bun (dev dep for bun:test) out of the app's global type
+    // space — its stream/web globals clash with the DOM lib. Tests get bun
+    // types via src/lib/server/__tests__/tsconfig.json.
+    "types": [
+      "node"
+    ]
   },
   "include": [
     "next-env.d.ts",
@@ -37,6 +43,7 @@
   ],
   "exclude": [
     "node_modules",
-    "cli-subcommand-src"
+    "cli-subcommand-src",
+    "**/__tests__/**"
   ]
 }

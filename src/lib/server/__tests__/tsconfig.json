@@ -1,0 +1,9 @@
+{
+  // Editor/typecheck config for bun tests only — the root tsconfig excludes
+  // this directory so @types/bun's globals never leak into the app build.
+  "extends": "../../../../tsconfig.json",
+  "compilerOptions": {
+    "types": ["bun"]
+  },
+  "include": ["./**/*.ts", "../../../../next-env.d.ts"]
+}
