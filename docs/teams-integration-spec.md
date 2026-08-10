@@ -1,6 +1,6 @@
 # Microsoft Teams integration — implementation spec
 
-**Status:** infra 100% done + E2E-verified 2026-08-10; code not started (only `config.microsoft` block added, uncommitted).
+**Status:** SHIPPED 2026-08-10 — all 7 build steps done and prod-E2E-verified same day (commits `c788c99…4619384`; deviations + implementation facts in project memory `teams-integration-shipped`). Kept as the design record.
 **Goal:** full Google-Meet parity for Teams meetings — auto-discovery from calendars, auto-fetch of speaker-attributed transcripts and MP4 recordings, same import dialog / reminders / sharing / AI pipeline, Teams icon on rows. Zero per-user Microsoft logins.
 **Provenance:** produced by the 2026-08-10 setup session — full transcript (portal steps, PowerShell runs, API probes, codebase-exploration maps) at [`old-session/2. teams-graph-tenant-setup-and-e2e-verification.txt`](../old-session/2.%20teams-graph-tenant-setup-and-e2e-verification.txt); admin/ops runbook in project memory `project_ms_teams_entra_setup.md`.
 
