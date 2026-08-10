@@ -244,6 +244,9 @@ export interface TranscriptListRow {
   /** Recurring-call series membership (the series badge). */
   series_id?: number | null;
   series_title?: string | null;
+  /** Best evidence-key guess for untagged rows (the dashed "…?" chip). */
+  suspected_series_id?: number | null;
+  suspected_series_title?: string | null;
   access: TranscriptAccess;
   owner_email: string | null;
   owner_name: string | null;

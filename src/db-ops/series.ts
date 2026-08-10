@@ -243,9 +243,9 @@ export async function listSuggestedMembers(
     JOIN ${sql(SCHEMA)}.transcripts t ON (
       (k.kind = 'meeting-code' AND t.gmeet_context->>'meetingCode' = k.value) OR
       (k.kind = 'recurring-base-id' AND
-       regexp_replace(COALESCE(t.gmeet_context->>'recurringEventId',''), '_R\d{8}T\d{6}Z?$', '') = k.value) OR
+       regexp_replace(COALESCE(t.gmeet_context->>'recurringEventId',''), '_R\\d{8}T\\d{6}Z?$', '') = k.value) OR
       (k.kind = 'ical-uid-base' AND
-       regexp_replace(regexp_replace(COALESCE(t.gmeet_context->>'iCalUID',''), '@google\.com$', ''), '_R\d{8}T\d{6}Z?$', '') = k.value) OR
+       regexp_replace(regexp_replace(COALESCE(t.gmeet_context->>'iCalUID',''), '@google\\.com$', ''), '_R\\d{8}T\\d{6}Z?$', '') = k.value) OR
       (k.kind = 'teams-join-url' AND t.gmeet_context->'teams'->>'joinWebUrl' = k.value) OR
       (k.kind = 'graph-meeting-id' AND t.gmeet_context->'teams'->>'graphMeetingId' = k.value) OR
       -- mirror lib/series-keys normalizeTitle: strip date tokens, collapse
@@ -253,7 +253,7 @@ export async function listSuggestedMembers(
       (k.kind = 'normalized-title' AND
        btrim(lower(regexp_replace(
          regexp_replace(COALESCE(NULLIF(t.gmeet_context->>'eventTitle',''), t.title, ''),
-                        '\d{1,4}[/.-]\d{1,2}[/.-]\d{1,4}', ' ', 'g'),
+                        '\\d{1,4}[/.-]\\d{1,2}[/.-]\\d{1,4}', ' ', 'g'),
          '[^a-zA-Z0-9]+', ' ', 'g'))) = k.value)
     )
     LEFT JOIN ${sql(SCHEMA)}.series_members m ON m.transcript_id = t.id

@@ -34,6 +34,9 @@ interface SeriesListEntry {
 interface SeriesBadgeProps {
   assemblyaiId: string;
   membership: SeriesMembershipRef | null;
+  /** Weak-evidence guess for untagged rows — renders a dashed "title?" chip
+   * that opens the confirm/deny popover instead of the bare + affordance. */
+  suspected?: SeriesMembershipRef | null;
   /** Default title for "new series" (usually the transcript title). */
   defaultTitle?: string | null;
   onOpenSeries: (seriesId: number) => void;
@@ -45,6 +48,7 @@ interface SeriesBadgeProps {
 export function SeriesBadge({
   assemblyaiId,
   membership,
+  suspected,
   defaultTitle,
   onOpenSeries,
   onChanged,
@@ -182,19 +186,33 @@ export function SeriesBadge({
 
   return (
     <>
-      <button
-        ref={btnRef}
-        type="button"
-        onClick={openPopover}
-        title="Mark as a recurring call"
-        className={`inline-flex shrink-0 items-center gap-0.5 rounded-full border border-dashed border-muted-foreground/30 px-1.5 py-0.5 text-[11px] text-muted-foreground/70 transition-all hover:border-primary/40 hover:text-primary ${
-          variant === 'row' ? 'opacity-0 group-hover:opacity-100' : ''
-        }`}
-      >
-        <Repeat className="h-3 w-3" />
-        <Plus className="h-2.5 w-2.5" />
-        {variant === 'full' && <span className="ml-0.5">Recurring call</span>}
-      </button>
+      {suspected ? (
+        <button
+          ref={btnRef}
+          type="button"
+          onClick={openPopover}
+          title={`Looks like part of "${suspected.title}" — click to confirm or dismiss`}
+          className="inline-flex max-w-44 shrink-0 items-center gap-1 rounded-full border border-dashed border-primary/35 px-2 py-0.5 text-[11px] text-primary/70 transition-colors hover:bg-primary/5 hover:text-primary"
+        >
+          <Repeat className="h-3 w-3 shrink-0" />
+          <span className="truncate">{suspected.title}</span>
+          <span className="shrink-0 font-semibold">?</span>
+        </button>
+      ) : (
+        <button
+          ref={btnRef}
+          type="button"
+          onClick={openPopover}
+          title="Mark as a recurring call"
+          className={`inline-flex shrink-0 items-center gap-0.5 rounded-full border border-dashed border-muted-foreground/30 px-1.5 py-0.5 text-[11px] text-muted-foreground/70 transition-all hover:border-primary/40 hover:text-primary ${
+            variant === 'row' ? 'opacity-0 group-hover:opacity-100' : ''
+          }`}
+        >
+          <Repeat className="h-3 w-3" />
+          <Plus className="h-2.5 w-2.5" />
+          {variant === 'full' && <span className="ml-0.5">Recurring call</span>}
+        </button>
+      )}
       {open && pos && (
         <div
           ref={popRef}

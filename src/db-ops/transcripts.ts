@@ -105,6 +105,7 @@ export async function listVisibleToUser(
            END AS provider,
            (t.gmeet_context->>'eventId') IS NOT NULL AS has_event,
            sm.series_id, se.title AS series_title,
+           sus.series_id AS suspected_series_id, sus.title AS suspected_series_title,
            CASE
              WHEN t.user_id = ${userId} THEN 'owner'
              ELSE s.access
@@ -115,6 +116,33 @@ export async function listVisibleToUser(
       AND s.shared_with_email = ${normEmail}
     LEFT JOIN ${sql(SCHEMA)}.series_members sm ON sm.transcript_id = t.id
     LEFT JOIN ${sql(SCHEMA)}.series se ON se.id = sm.series_id
+    -- Suspected series for untagged rows: any evidence-key match that hasn't
+    -- been excluded — surfaced as a dashed "…?" chip the user confirms/denies.
+    LEFT JOIN LATERAL (
+      SELECT k.series_id, se2.title
+      FROM ${sql(SCHEMA)}.series_keys k
+      JOIN ${sql(SCHEMA)}.series se2 ON se2.id = k.series_id
+      WHERE NOT EXISTS (
+              SELECT 1 FROM ${sql(SCHEMA)}.series_exclusions x
+              WHERE x.series_id = k.series_id AND x.transcript_id = t.id
+            )
+        AND (
+          (k.kind = 'meeting-code' AND t.gmeet_context->>'meetingCode' = k.value) OR
+          (k.kind = 'recurring-base-id' AND
+           regexp_replace(COALESCE(t.gmeet_context->>'recurringEventId',''), '_R\\d{8}T\\d{6}Z?$', '') = k.value) OR
+          (k.kind = 'ical-uid-base' AND
+           regexp_replace(regexp_replace(COALESCE(t.gmeet_context->>'iCalUID',''), '@google\\.com$', ''), '_R\\d{8}T\\d{6}Z?$', '') = k.value) OR
+          (k.kind = 'teams-join-url' AND t.gmeet_context->'teams'->>'joinWebUrl' = k.value) OR
+          (k.kind = 'graph-meeting-id' AND t.gmeet_context->'teams'->>'graphMeetingId' = k.value) OR
+          (k.kind = 'normalized-title' AND
+           btrim(lower(regexp_replace(
+             regexp_replace(COALESCE(NULLIF(t.gmeet_context->>'eventTitle',''), t.title, ''),
+                            '\\d{1,4}[/.-]\\d{1,2}[/.-]\\d{1,4}', ' ', 'g'),
+             '[^a-zA-Z0-9]+', ' ', 'g'))) = k.value)
+        )
+      ORDER BY k.series_id
+      LIMIT 1
+    ) sus ON sm.id IS NULL
     WHERE t.user_id = ${userId} OR s.id IS NOT NULL
     ORDER BY t.created_at DESC
   `;

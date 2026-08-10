@@ -170,7 +170,7 @@ async function loadImportedCandidates(
     LEFT JOIN ${sql(SCHEMA)}.series_keys k ON k.series_id = ${seriesId} AND (
       (k.kind = 'meeting-code' AND t.gmeet_context->>'meetingCode' = k.value) OR
       (k.kind = 'recurring-base-id' AND
-       regexp_replace(COALESCE(t.gmeet_context->>'recurringEventId',''), '_R\d{8}T\d{6}Z?$', '') = k.value) OR
+       regexp_replace(COALESCE(t.gmeet_context->>'recurringEventId',''), '_R\\d{8}T\\d{6}Z?$', '') = k.value) OR
       (k.kind = 'teams-join-url' AND t.gmeet_context->'teams'->>'joinWebUrl' = k.value) OR
       (k.kind = 'graph-meeting-id' AND t.gmeet_context->'teams'->>'graphMeetingId' = k.value)
     )

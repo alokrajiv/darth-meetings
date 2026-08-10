@@ -796,6 +796,11 @@ export function TranscriptTable({ refreshTrigger, toolbarExtra }: TranscriptTabl
                         ? { series_id: t.series_id, title: t.series_title }
                         : null
                     }
+                    suspected={
+                      t.suspected_series_id && t.suspected_series_title
+                        ? { series_id: t.suspected_series_id, title: t.suspected_series_title }
+                        : null
+                    }
                     defaultTitle={t.title}
                     onOpenSeries={setOpenSeriesId}
                     onChanged={() => void loadTranscripts({ silent: true })}
