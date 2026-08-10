@@ -52,8 +52,14 @@ export function TranscriptSourcesCard({
   const uploadInputRef = useRef<HTMLInputElement>(null);
 
   const isMeetPrimary = row.assemblyai_id.startsWith('gmeet-');
+  // Teams quick import: the primary content IS the Teams VTT (no AAI ran).
+  const isTeamsPrimary = row.assemblyai_id.startsWith('teams-');
   const ctx = row.gmeet_context;
-  const hasSidecar = !isMeetPrimary && (ctx?.meetTranscript?.utterances?.length ?? 0) > 0;
+  const isTeams = ctx?.provider === 'teams';
+  // Sidecar cross-check only makes sense when the PRIMARY is diarized audio
+  // (video/both imports) — on quick imports the sidecar is the same content.
+  const hasSidecar =
+    !isMeetPrimary && !isTeamsPrimary && (ctx?.meetTranscript?.utterances?.length ?? 0) > 0;
 
   const voiceMatches = Object.values(suggestions).filter((s) => s.source === 'voice');
   const alignMatches = Object.values(suggestions).filter(
@@ -63,15 +69,19 @@ export function TranscriptSourcesCard({
   const hasAudio =
     audioAvailable && !!(row.local_audio_path || row.audio_url || row.source === 'uploaded');
   const recordingFileId = ctx?.videoFileId ?? ctx?.actuals?.recordings?.[0]?.fileId;
+  const teamsRecordingId = isTeams ? ctx?.teams?.recordingId : undefined;
+  /** A recording we know how to get: Drive file (Meet) or Graph id (Teams). */
+  const knownRecording = recordingFileId ?? teamsRecordingId;
+  const recordingHost = teamsRecordingId && !recordingFileId ? 'Microsoft 365' : 'Drive';
   // Meet recorded the meeting but Google hadn't finished the file at import
   // time — the server re-checks every minute and attaches it automatically.
   const recordingProcessing =
-    !row.local_audio_path && !recordingFileId && ctx?.recordingPending?.status === 'waiting';
+    !row.local_audio_path && !knownRecording && ctx?.recordingPending?.status === 'waiting';
   const recordingNeverCame =
     !row.local_audio_path &&
-    !recordingFileId &&
+    !knownRecording &&
     (ctx?.recordingPending?.status === 'gone' || ctx?.recordingPending?.status === 'gave-up');
-  const canFetchAudio = !hasAudio && !row.local_audio_path && !!recordingFileId && canEdit;
+  const canFetchAudio = !hasAudio && !row.local_audio_path && !!knownRecording && canEdit;
   // Text-only imports (Teams export, pasted transcript, …) with no known
   // recording anywhere: offer to upload the meeting's audio/video and run a
   // real AAI transcription. New row alongside, this import stays untouched.
@@ -80,7 +90,7 @@ export function TranscriptSourcesCard({
     row.source === 'imported' &&
     !isMeetPrimary &&
     !row.local_audio_path &&
-    !recordingFileId;
+    !knownRecording;
 
   // Cheap pooled-mic tell on quick imports: Meet's snapshot knows who
   // actually JOINED; if clearly more people joined than Meet heard voices,
@@ -170,6 +180,15 @@ export function TranscriptSourcesCard({
                   speaker)
                 </span>
               </>
+            ) : isTeamsPrimary ? (
+              <>
+                <span className="font-medium">Microsoft Teams transcript</span>
+                <span className="text-muted-foreground">
+                  {' '}
+                  — Teams&apos; speaker labels (device-level; a shared room mic is one
+                  speaker)
+                </span>
+              </>
             ) : (
               <>
                 <span className="font-medium">Voice-level diarization</span>
@@ -185,11 +204,13 @@ export function TranscriptSourcesCard({
           <li className="flex items-start gap-2">
             <CheckCircle2 className="mt-0.5 h-3.5 w-3.5 shrink-0 text-status-ok" />
             <span>
-              <span className="font-medium">Meet transcript cross-check</span>
+              <span className="font-medium">
+                {isTeams ? 'Teams' : 'Meet'} transcript cross-check
+              </span>
               <span className="text-muted-foreground">
                 {' '}
-                — Google&apos;s transcript rides along; summaries use it to fix names and
-                garbled words
+                — {isTeams ? "Microsoft's" : "Google's"} transcript rides along; summaries
+                use it to fix names and garbled words
               </span>
             </span>
           </li>
@@ -242,14 +263,14 @@ export function TranscriptSourcesCard({
                 <span className="font-medium">Audio available</span>
                 <span className="text-muted-foreground"> — playback &amp; voiceprints work</span>
               </>
-            ) : recordingFileId && videoFetching ? (
+            ) : knownRecording && videoFetching ? (
               <span className="text-muted-foreground">
-                Fetching the video from Drive — playback and screen-reading unlock when it
-                lands
+                Fetching the video from {recordingHost} — playback and screen-reading unlock
+                when it lands
               </span>
-            ) : recordingFileId ? (
+            ) : knownRecording ? (
               <span className="text-muted-foreground">
-                No recording stored — the video is on Drive
+                No recording stored — the video is on {recordingHost}
               </span>
             ) : recordingProcessing ? (
               <span className="text-amber-600 dark:text-amber-500">
@@ -323,14 +344,14 @@ export function TranscriptSourcesCard({
           className="mt-2 h-8 w-full justify-start gap-2 text-[13px]"
           disabled={videoFetching}
           onClick={onFetchVideo}
-          title="Download the video from Drive to this server so playback works — no re-transcription, the transcript stays as-is"
+          title={`Download the video from ${recordingHost} to this server so playback works — no re-transcription, the transcript stays as-is`}
         >
           {videoFetching ? (
             <Loader2 className="h-4 w-4 animate-spin text-muted-foreground" />
           ) : (
             <Video className="h-4 w-4 text-primary" />
           )}
-          {videoFetching ? 'Fetching from Drive…' : 'Fetch video for playback'}
+          {videoFetching ? `Fetching from ${recordingHost}…` : 'Fetch video for playback'}
         </Button>
       )}
       {videoFetchError && <p className="mt-1.5 text-xs text-destructive">{videoFetchError}</p>}

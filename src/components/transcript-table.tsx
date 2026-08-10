@@ -23,9 +23,10 @@ import { useLiveEvents } from '@/hooks/use-live-events';
 import {
   Trash2,
   RefreshCw,
+  CalendarCheck2,
+  CalendarX2,
   FileAudio,
   FileText,
-  Video,
   Search,
   ChevronRight,
   Inbox,
@@ -33,6 +34,7 @@ import {
   GripVertical,
   Sparkles,
 } from 'lucide-react';
+import { MeetLogo, TeamsLogo } from '@/components/provider-icon';
 
 interface TranscriptTableProps {
   refreshTrigger?: number;
@@ -317,10 +319,17 @@ export function TranscriptTable({ refreshTrigger, toolbarExtra }: TranscriptTabl
   };
 
   const sourceIcon = (t: TranscriptListRow) => {
-    if (t.assemblyai_id.startsWith('gmeet-')) {
+    if (t.provider === 'teams') {
       return (
-        <span title="Google Meet" className="shrink-0">
-          <Video className="h-3.5 w-3.5 text-muted-foreground" />
+        <span title="Microsoft Teams meeting" className="shrink-0">
+          <TeamsLogo className="h-3.5 w-3.5" />
+        </span>
+      );
+    }
+    if (t.provider === 'gmeet' || t.assemblyai_id.startsWith('gmeet-')) {
+      return (
+        <span title="Google Meet meeting" className="shrink-0">
+          <MeetLogo className="h-3.5 w-3.5" />
         </span>
       );
     }
@@ -337,6 +346,19 @@ export function TranscriptTable({ refreshTrigger, toolbarExtra }: TranscriptTabl
       </span>
     );
   };
+
+  /** Calendar linkage at a glance: linked rows get share suggestions +
+   * auto-share; unlinked ones can be fixed via "Link calendar event". */
+  const calendarIcon = (t: TranscriptListRow) =>
+    t.has_event ? (
+      <span title="Linked to a calendar event" className="shrink-0">
+        <CalendarCheck2 className="h-3.5 w-3.5 text-status-ok/70" />
+      </span>
+    ) : (
+      <span title="No calendar event linked" className="shrink-0">
+        <CalendarX2 className="h-3.5 w-3.5 text-muted-foreground/40" />
+      </span>
+    );
 
   const ownerCell = (t: TranscriptListRow) => {
     if (t.access === 'owner') {
@@ -752,6 +774,7 @@ export function TranscriptTable({ refreshTrigger, toolbarExtra }: TranscriptTabl
                         )}
                         {statusDot(t.status)}
                         {sourceIcon(t)}
+                        {calendarIcon(t)}
                         <div className="min-w-0 flex-1">
                           <div
                             className={`truncate text-sm font-medium ${

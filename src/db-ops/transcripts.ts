@@ -95,6 +95,15 @@ export async function listVisibleToUser(
            t.source, t.recorded_at, t.auto_notes_status,
            t.upload_bytes_received::float8 AS upload_bytes_received,
            t.upload_bytes_total::float8 AS upload_bytes_total,
+           -- Which conferencing product the source meeting ran on (listing
+           -- provider glyphs). 'teams' is stamped explicitly; anything with
+           -- Meet identity (gmeet- id or a meeting code) is 'gmeet'.
+           CASE
+             WHEN t.gmeet_context->>'provider' = 'teams' THEN 'teams'
+             WHEN t.assemblyai_id LIKE 'gmeet-%'
+                  OR t.gmeet_context->>'meetingCode' IS NOT NULL THEN 'gmeet'
+           END AS provider,
+           (t.gmeet_context->>'eventId') IS NOT NULL AS has_event,
            CASE
              WHEN t.user_id = ${userId} THEN 'owner'
              ELSE s.access

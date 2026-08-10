@@ -236,6 +236,11 @@ export interface TranscriptListRow {
   auto_notes_status: string | null;
   upload_bytes_received: number | null;
   upload_bytes_total: number | null;
+  /** Conferencing product of the source meeting (listing glyphs); null =
+   * plain upload/import with no meeting identity. */
+  provider?: 'gmeet' | 'teams' | null;
+  /** Calendar event linked (gmeet_context.eventId present). */
+  has_event?: boolean;
   access: TranscriptAccess;
   owner_email: string | null;
   owner_name: string | null;
