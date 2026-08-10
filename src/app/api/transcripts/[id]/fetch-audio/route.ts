@@ -6,7 +6,9 @@ import { getServerAccessToken } from '@/lib/server/google-oauth';
 import {
   RecordingFetchError,
   fetchRecordingFromDrive,
+  fetchRecordingFromTeams,
 } from '@/lib/server/recording-fetch';
+import { GraphApiError } from '@/lib/server/ms-graph';
 
 export const runtime = 'nodejs';
 // A meeting recording can be multi-GB; the Drive pull takes a while (only
@@ -47,6 +49,48 @@ export const POST = withAuth(async ({ user, request }, { params }) => {
   }
 
   const ctx = row.gmeet_context;
+
+  // Teams rows fetch app-only from Graph — no Google token involved.
+  if (ctx?.provider === 'teams') {
+    const teams = ctx.teams;
+    if (!teams?.recordingId) {
+      return NextResponse.json(
+        { error: 'No recording is known for this transcript.' },
+        { status: 422 }
+      );
+    }
+    try {
+      const { bytes } = await fetchRecordingFromTeams({
+        ownerUserId: access.ownerUserId,
+        assemblyaiId: id,
+        organizerOid: teams.organizerOid,
+        graphMeetingId: teams.graphMeetingId,
+        recordingId: teams.recordingId,
+      });
+      return NextResponse.json({ ok: true, bytes });
+    } catch (err) {
+      if (err instanceof RecordingFetchError) {
+        return NextResponse.json({ error: err.message }, { status: err.status });
+      }
+      if (err instanceof GraphApiError) {
+        return NextResponse.json(
+          {
+            error:
+              err.status === 404
+                ? 'Recording no longer available on Microsoft 365.'
+                : `Microsoft Graph error: ${err.message}`,
+          },
+          { status: err.status === 404 ? 404 : 502 }
+        );
+      }
+      console.error('[fetch-audio] teams fetch failed:', err);
+      return NextResponse.json(
+        { error: 'Recording fetch failed', detail: String(err) },
+        { status: 502 }
+      );
+    }
+  }
+
   const fileId = ctx?.videoFileId ?? ctx?.actuals?.recordings?.[0]?.fileId;
   if (!fileId) {
     return NextResponse.json(

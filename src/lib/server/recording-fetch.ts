@@ -3,10 +3,12 @@ import {
   downloadDriveFileToTemp,
   getDriveFileMeta,
 } from '@/lib/server/gmeet';
+import { getRecordingStream } from '@/lib/server/ms-graph';
 import {
   audioFilename,
   deleteAudioFile,
   renameAudioFile,
+  saveAudioStreamToTemp,
 } from '@/lib/server/audio-storage';
 import { sniffMediaExtension } from '@/lib/server/video-frames';
 
@@ -43,6 +45,56 @@ export function fetchRecordingFromDrive(opts: {
   const run = doFetch(opts).finally(() => inFlight.delete(opts.assemblyaiId));
   inFlight.set(opts.assemblyaiId, run);
   return run;
+}
+
+/**
+ * Teams twin of fetchRecordingFromDrive: pull the meeting's MP4 from Graph
+ * (app-only — no user token) and store it as the row's local audio. Shares
+ * the same in-flight map, so a sweeper run and a page-load fetch of the same
+ * row join one download.
+ */
+export function fetchRecordingFromTeams(opts: {
+  ownerUserId: string;
+  assemblyaiId: string;
+  organizerOid: string;
+  graphMeetingId: string;
+  recordingId: string;
+}): Promise<{ bytes: number }> {
+  const existing = inFlight.get(opts.assemblyaiId);
+  if (existing) return existing;
+  const run = doFetchTeams(opts).finally(() => inFlight.delete(opts.assemblyaiId));
+  inFlight.set(opts.assemblyaiId, run);
+  return run;
+}
+
+async function doFetchTeams({
+  ownerUserId,
+  assemblyaiId,
+  organizerOid,
+  graphMeetingId,
+  recordingId,
+}: {
+  ownerUserId: string;
+  assemblyaiId: string;
+  organizerOid: string;
+  graphMeetingId: string;
+  recordingId: string;
+}): Promise<{ bytes: number }> {
+  const res = await getRecordingStream(organizerOid, graphMeetingId, recordingId);
+  if (!res.body) {
+    throw new RecordingFetchError('Graph returned an empty recording body', 502);
+  }
+  const dl = await saveAudioStreamToTemp(res.body as ReadableStream<Uint8Array>);
+  if (dl.bytes === 0) {
+    await deleteAudioFile(dl.tempFilename);
+    throw new RecordingFetchError('Graph returned an empty recording', 502);
+  }
+  // Teams recordings are MP4, but sniff anyway — same belt as the Drive path.
+  const sniffed = await sniffMediaExtension(dl.tempFilename);
+  const filename = `${assemblyaiId}${sniffed ?? '.mp4'}`;
+  await renameAudioFile(dl.tempFilename, filename);
+  await setLocalAudioPathForUser(ownerUserId, assemblyaiId, filename);
+  return { bytes: dl.bytes };
 }
 
 async function doFetch({

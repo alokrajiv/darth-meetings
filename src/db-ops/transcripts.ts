@@ -643,6 +643,39 @@ export async function listRecordingPendingRows(limit: number): Promise<
   `;
 }
 
+/**
+ * Rows with a known recording (Meet Drive file or Teams recording id) but no
+ * local audio yet — the video-fetch sweeper's work list. Excludes rows still
+ * waiting on Google to GENERATE the file (recording-poller's job) and rows
+ * the sweeper already gave up on; backoff between attempts is applied by the
+ * sweeper in JS. Recent rows first — that's where people are looking.
+ */
+export async function listVideoFetchCandidates(limit: number): Promise<
+  Array<{
+    id: number;
+    user_id: string;
+    assemblyai_id: string;
+    gmeet_context: GmeetContext;
+  }>
+> {
+  return sql<
+    Array<{ id: number; user_id: string; assemblyai_id: string; gmeet_context: GmeetContext }>
+  >`
+    SELECT id, user_id, assemblyai_id, gmeet_context
+    FROM ${sql(SCHEMA)}.transcripts
+    WHERE local_audio_path IS NULL
+      AND status = 'completed'
+      AND gmeet_context IS NOT NULL
+      AND (gmeet_context->>'videoFileId' IS NOT NULL
+           OR gmeet_context->'teams'->>'recordingId' IS NOT NULL)
+      AND COALESCE(gmeet_context->'recordingPending'->>'status', '') <> 'waiting'
+      AND COALESCE(gmeet_context->'videoAutoFetch'->>'status', 'pending') = 'pending'
+      AND created_at > now() - interval '30 days'
+    ORDER BY created_at DESC
+    LIMIT ${limit}
+  `;
+}
+
 export async function touchLastAccessedForUser(
   userId: string,
   assemblyaiId: string

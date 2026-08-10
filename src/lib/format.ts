@@ -173,6 +173,17 @@ export interface GmeetContext {
     status: 'waiting' | 'fetched' | 'gone' | 'gave-up';
     resolvedAt?: string;
   } | null;
+  /** Background video-fetch bookkeeping: a known-but-undownloaded recording
+   * (videoFileId / teams.recordingId, no local audio) is pulled by the
+   * video-fetch sweeper without waiting for a page visit. Attempts are
+   * capped with backoff; 'gave-up' rows still retry on page-visit/manual
+   * fetch, which clears this on success via local_audio_path. */
+  videoAutoFetch?: {
+    attempts: number;
+    lastAttemptAt: string;
+    status: 'pending' | 'gave-up';
+    lastError?: string;
+  } | null;
   meetTranscript?: {
     attendees: string[];
     utterances: MeetUtterance[];

@@ -10,5 +10,7 @@ export async function register() {
     startGmeetPoller();
     const { startRecordingPoller } = await import('@/lib/server/recording-poller');
     startRecordingPoller();
+    const { startVideoFetchSweeper } = await import('@/lib/server/video-fetch-sweeper');
+    startVideoFetchSweeper();
   }
 }
