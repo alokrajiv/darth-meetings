@@ -127,6 +127,24 @@ export interface MeetActuals {
  * Meet API snapshot (participants, segment times, transcript entries).
  */
 export interface GmeetContext {
+  /** Which conferencing product the source meeting ran on. Absent or
+   * 'gmeet' = Google Meet (backward compat with every pre-Teams row). */
+  provider?: 'gmeet' | 'teams';
+  /** Microsoft Teams source facts (provider === 'teams'). Artifacts are
+   * fetched app-only under the ORGANIZER's AAD id — no per-user Microsoft
+   * auth exists. `callId` keys the specific occurrence of a recurring
+   * series; transcript+recording of one occurrence share it. */
+  teams?: {
+    /** Canonical meetup-join URL (what Graph's $filter matches). */
+    joinWebUrl: string;
+    tenantId: string;
+    organizerOid: string;
+    graphMeetingId: string;
+    callId?: string;
+    transcriptId?: string;
+    /** Presence enables fetch-recording-later, like videoFileId for Meet. */
+    recordingId?: string;
+  } | null;
   eventId?: string;
   /** Calendar's series key — the TRUE identity of a recurring meeting.
    * Meeting codes get recycled for unrelated meetings (people reuse one
