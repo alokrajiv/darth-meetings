@@ -32,10 +32,17 @@ import {
   Link2,
   Loader2,
   RefreshCw,
+  Upload,
   Video,
 } from 'lucide-react';
+import { MeetLogo, TeamsLogo } from '@/components/provider-icon';
+import { requestMediaUpload } from '@/components/audio-upload';
 
 const MEET_API = 'https://meet.googleapis.com/v2';
+
+// Teams meetings scheduled from Google Calendar (GSuite add-on) carry the
+// meetup-join link in location / description / conference entry points.
+const TEAMS_URL_RE = /https:\/\/teams\.microsoft\.com\/l\/meetup-join\/[^\s"'<>\\]+/;
 
 interface CalendarAttachment {
   fileId?: string;
@@ -51,6 +58,8 @@ interface CalendarEvent {
   recurringEventId?: string;
   iCalUID?: string;
   organizer?: { email?: string; self?: boolean };
+  location?: string;
+  description?: string;
   start?: { dateTime?: string; date?: string };
   end?: { dateTime?: string; date?: string };
   attendees?: Array<{
@@ -60,7 +69,18 @@ interface CalendarEvent {
     self?: boolean;
   }>;
   attachments?: CalendarAttachment[];
-  conferenceData?: { conferenceId?: string };
+  conferenceData?: { conferenceId?: string; entryPoints?: Array<{ uri?: string }> };
+}
+
+function teamsUrlOf(e: CalendarEvent): string | null {
+  const hay = [
+    e.location,
+    e.description,
+    ...(e.conferenceData?.entryPoints ?? []).map((p) => p.uri),
+  ]
+    .filter(Boolean)
+    .join('\n');
+  return TEAMS_URL_RE.exec(hay)?.[0] ?? null;
 }
 
 /** Meet API artifact info attached to a row by the day sweep / record pick. */
@@ -82,6 +102,9 @@ interface EventRow {
   geminiNotes: CalendarAttachment | null;
   videoCount: number;
   meet: MeetRowInfo | null;
+  /** Raw Teams meetup-join link found on the event (null = not a Teams
+   * meeting). Canonicalization / tenant checks happen server-side. */
+  teamsUrl?: string | null;
   /** conference record with no matching calendar event (orphan) */
   offCalendar?: boolean;
 }
@@ -122,7 +145,15 @@ interface ConflictInfo {
 }
 
 type Mode = 'video' | 'transcript' | 'both';
-type Step = 'connect' | 'pick' | 'options' | 'importing' | 'done' | 'bulk';
+type Step =
+  | 'connect'
+  | 'pick'
+  | 'options'
+  | 'teams-options'
+  | 'teams-external'
+  | 'importing'
+  | 'done'
+  | 'bulk';
 type SourceTab = 'calendar' | 'recent' | 'sync';
 
 const MAX_BULK = 20;
@@ -157,6 +188,25 @@ interface MeetingMeta {
 interface SyncInfo {
   lastSyncedAt: string | null;
   skips: Set<string>;
+}
+
+/** Per-row result from /api/teams/check, keyed by calendar event id. */
+interface TeamsCheck {
+  external: boolean;
+  tenantId?: string;
+  /** `teams-<hash>` — mute/reminder key (server-computed from the URL). */
+  code?: string;
+  imported?: ImportedMark | null;
+  meta?: {
+    hasTranscript: boolean;
+    hasRecording: boolean;
+    utteranceCount: number | null;
+    wordCount: number | null;
+    speakers: string[] | null;
+    videoDurationMs: number | null;
+    confStart: string | null;
+    confEnd: string | null;
+  } | null;
 }
 
 function relDays(iso: string): string {
@@ -468,10 +518,20 @@ export function GmeetImportDialog({
   /** Same keys as importedMap → poller-cached metadata (duration, counts). */
   const [metaMap, setMetaMap] = useState<Record<string, MeetingMeta>>({});
   const [syncFrom, setSyncFrom] = useState<string | null>(null);
+  /** /api/teams/check results by calendar event id. */
+  const [teamsMap, setTeamsMap] = useState<Record<string, TeamsCheck>>({});
+  const [pickedTeams, setPickedTeams] = useState<{
+    row: EventRow;
+    check: TeamsCheck | null;
+  } | null>(null);
 
-  /** Mute key: meeting code when there is one, else the calendar event id. */
+  /** Mute key: meeting code when there is one (Teams: the server-computed
+   * teams-<hash> code once known), else the calendar event id. The poller
+   * honors either. */
   const rowKey = (row: EventRow): string =>
-    row.event.conferenceData?.conferenceId ?? row.event.id;
+    row.teamsUrl
+      ? (teamsMap[row.event.id]?.code ?? row.event.id)
+      : (row.event.conferenceData?.conferenceId ?? row.event.id);
 
   /** importedMap key for a row — must mirror /api/gmeet/check's response keys. */
   const markKey = (row: EventRow): string | null => {
@@ -508,6 +568,43 @@ export function GmeetImportDialog({
           setImportedMap((prev) => ({ ...prev, ...imported }));
           if (meta) setMetaMap((prev) => ({ ...prev, ...meta }));
         }
+      } catch {
+        // markers are cosmetic
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [rows]);
+
+  // Same for Teams rows: external/imported/artifact facts from the server
+  // (cache-first, no Graph calls in its hot path).
+  useEffect(() => {
+    const targets = rows.filter((r) => r.teamsUrl);
+    if (targets.length === 0) return;
+    let cancelled = false;
+    void (async () => {
+      try {
+        const res = await fetch('/api/teams/check', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            events: targets.map((r) => ({
+              url: r.teamsUrl,
+              startTime: r.event.start?.dateTime ?? null,
+            })),
+          }),
+        });
+        if (!res.ok) return;
+        const { results } = (await res.json()) as { results: (TeamsCheck | null)[] };
+        if (cancelled) return;
+        setTeamsMap((prev) => {
+          const next = { ...prev };
+          targets.forEach((r, i) => {
+            if (results[i]) next[r.event.id] = results[i]!;
+          });
+          return next;
+        });
       } catch {
         // markers are cosmetic
       }
@@ -623,7 +720,7 @@ export function GmeetImportDialog({
         orderBy: 'startTime',
         maxResults: '250',
         fields:
-          'items(id,summary,recurringEventId,iCalUID,organizer(email,self),start,end,attendees(email,displayName,responseStatus,self),attachments(fileId,title,mimeType),conferenceData(conferenceId))',
+          'items(id,summary,recurringEventId,iCalUID,organizer(email,self),location,description,start,end,attendees(email,displayName,responseStatus,self),attachments(fileId,title,mimeType),conferenceData(conferenceId,entryPoints(uri)))',
       });
       const calRes = await fetch(
         `https://www.googleapis.com/calendar/v3/calendars/primary/events?${params}`,
@@ -636,8 +733,13 @@ export function GmeetImportDialog({
       if (!calRes.ok) throw new Error(`Calendar request failed (${calRes.status})`);
       const calData = (await calRes.json()) as { items?: CalendarEvent[] };
       const evRows: EventRow[] = (calData.items ?? [])
-        .filter((e) => e.start?.dateTime && e.conferenceData?.conferenceId)
-        .map((event) => ({ event, ...classifyAttachments(event.attachments), meet: null }));
+        .filter((e) => e.start?.dateTime && (e.conferenceData?.conferenceId || teamsUrlOf(e)))
+        .map((event) => ({
+          event,
+          ...classifyAttachments(event.attachments),
+          meet: null,
+          teamsUrl: teamsUrlOf(event),
+        }));
 
       // 3. Conference records over the window (proves which meetings actually
       // happened + finds their artifacts), joined by exact meeting code.
@@ -721,6 +823,7 @@ export function GmeetImportDialog({
     setRows([]);
     setPaste('');
     setPicked(null);
+    setPickedTeams(null);
     setConflict(null);
     setDoneInfo(null);
     setSelected(new Set());
@@ -827,7 +930,7 @@ export function GmeetImportDialog({
           orderBy: 'startTime',
           maxResults: '50',
           fields:
-            'items(id,summary,recurringEventId,iCalUID,organizer(email,self),start,end,attendees(email,displayName,responseStatus,self),attachments(fileId,title,mimeType),conferenceData(conferenceId))',
+            'items(id,summary,recurringEventId,iCalUID,organizer(email,self),location,description,start,end,attendees(email,displayName,responseStatus,self),attachments(fileId,title,mimeType),conferenceData(conferenceId,entryPoints(uri)))',
         });
         const res = await fetch(
           `https://www.googleapis.com/calendar/v3/calendars/primary/events?${params}`,
@@ -843,7 +946,12 @@ export function GmeetImportDialog({
         const evRows: EventRow[] = (data.items ?? [])
           // Meetings only — skip all-day events (no dateTime).
           .filter((e) => e.start?.dateTime)
-          .map((event) => ({ event, ...classifyAttachments(event.attachments), meet: null }));
+          .map((event) => ({
+            event,
+            ...classifyAttachments(event.attachments),
+            meet: null,
+            teamsUrl: teamsUrlOf(event),
+          }));
         setSweepDone(false);
         setSelected(new Set());
         setRows(evRows);
@@ -1115,6 +1223,29 @@ export function GmeetImportDialog({
   };
 
   const pickEvent = (row: EventRow) => {
+    // Teams rows have their own options step (internal) or a guided manual
+    // panel (external tenant) — nothing Meet-shaped applies to them.
+    if (row.teamsUrl) {
+      const check = teamsMap[row.event.id] ?? null;
+      setPickedTeams({ row, check });
+      setPicked(null);
+      setError(null);
+      setConflict(null);
+      modeTouchedRef.current = false;
+      if (check?.external) {
+        setStep('teams-external');
+        return;
+      }
+      setMode(
+        check?.meta?.hasTranscript
+          ? 'transcript'
+          : check?.meta?.hasRecording
+            ? 'video'
+            : 'transcript'
+      );
+      setStep('teams-options');
+      return;
+    }
     // Poller cache fills what the row itself doesn't know yet — the options
     // step renders complete immediately; enrich() just double-checks live.
     const key = markKey(row);
@@ -1382,6 +1513,110 @@ export function GmeetImportDialog({
     }
   };
 
+  /** Import a Teams meeting — the server resolves artifacts app-only from
+   * the join URL; no Google/Microsoft token leaves the browser. */
+  const runTeamsImport = async (force = false) => {
+    if (!pickedTeams) return;
+    const e = pickedTeams.row.event;
+    setBusy(true);
+    setError(null);
+    setConflict(null);
+    setStep('importing');
+    try {
+      const res = await fetch('/api/teams/import', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          url: pickedTeams.row.teamsUrl,
+          mode,
+          force,
+          event: {
+            id: e.id,
+            title: e.summary,
+            startTime: e.start?.dateTime,
+            endTime: e.end?.dateTime,
+            recurringEventId: e.recurringEventId,
+            iCalUID: e.iCalUID,
+            organizerEmail: e.organizer?.email,
+            attendees: (e.attendees ?? [])
+              .filter((a) => a.email)
+              .map((a) => ({
+                email: a.email!,
+                name: a.displayName,
+                responseStatus: a.responseStatus,
+              })),
+          },
+        }),
+      });
+      if (res.status === 409) {
+        const detail = (await res.json()) as {
+          existing?: {
+            assemblyai_id?: string | null;
+            own?: boolean;
+            title?: string | null;
+            ownerEmail?: string | null;
+            accessible?: boolean;
+          };
+        };
+        setConflict({
+          ownerEmail: detail.existing?.ownerEmail ?? null,
+          accessible: detail.existing?.accessible !== false,
+          id: detail.existing?.assemblyai_id ?? '',
+          title: detail.existing?.title ?? null,
+          own: !!detail.existing?.own,
+        });
+        setStep('teams-options');
+        return;
+      }
+      if (!res.ok) {
+        const detail = await res.json().catch(() => ({}) as { error?: string });
+        throw new Error(detail.error || `Import failed (${res.status})`);
+      }
+      const payload = (await res.json()) as { autoShared?: number };
+      setDoneInfo({
+        mode,
+        title: e.summary ?? 'Untitled meeting',
+        autoShared: payload.autoShared ?? 0,
+      });
+      setStep('done');
+      onImported?.();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Import failed');
+      setStep('teams-options');
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  /** Teams join: access proof is the stored invite list, checked server-side. */
+  const joinTeamsExisting = async () => {
+    if (!pickedTeams?.row.teamsUrl) return;
+    setBusy(true);
+    setError(null);
+    try {
+      const res = await fetch('/api/teams/join', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          url: pickedTeams.row.teamsUrl,
+          startTime: pickedTeams.row.event.start?.dateTime ?? null,
+        }),
+      });
+      const payload = (await res.json().catch(() => ({}))) as {
+        transcriptId?: string;
+        error?: string;
+      };
+      if (!res.ok || !payload.transcriptId) {
+        throw new Error(payload.error || `Join failed (${res.status})`);
+      }
+      onImported?.();
+      window.location.href = `/transcript/${payload.transcriptId}`;
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Join failed');
+      setBusy(false);
+    }
+  };
+
   /**
    * Join a colleague's existing import instead of cloning it. The server
    * verifies — with OUR token — that Google gives us access to the meeting
@@ -1444,7 +1679,11 @@ export function GmeetImportDialog({
           max-w-2xl loses to it and the content overflows the 512px card. */}
       <DialogContent className="sm:max-w-2xl rounded-xl shadow-[0_4px_16px_-2px_rgb(0_0_0/0.08),0_1px_2px_0_rgb(0_0_0/0.04)]">
         <DialogHeader>
-          <DialogTitle className="text-base font-semibold">Import from Google Meet</DialogTitle>
+          <DialogTitle className="text-base font-semibold">
+            {step === 'teams-options' || step === 'teams-external'
+              ? 'Import from Microsoft Teams'
+              : 'Import a meeting'}
+          </DialogTitle>
         </DialogHeader>
 
         {step === 'connect' && !connectPitch && (
@@ -1618,42 +1857,59 @@ export function GmeetImportDialog({
                 <ul className="divide-y">
                   {rows.map((row) => {
                     const key = markKey(row);
-                    const mark = key ? importedMap[key] : undefined;
+                    const isTeams = !!row.teamsUrl;
+                    const teams = isTeams ? (teamsMap[row.event.id] ?? null) : null;
+                    const teamsExternal = teams?.external === true;
+                    const mark = isTeams
+                      ? (teams?.imported ?? undefined)
+                      : key
+                        ? importedMap[key]
+                        : undefined;
                     const meta = key ? metaMap[key] : undefined;
-                    const hasVideo = !!(
-                      row.video ||
-                      row.meet?.videoFileId ||
-                      (meta?.recordingCount ?? 0) > 0
-                    );
-                    const hasTranscript = !!(
-                      row.transcriptDoc ||
-                      row.meet?.transcriptDocId ||
-                      row.geminiNotes ||
-                      meta?.transcriptDocIds?.length
-                    );
+                    const hasVideo = isTeams
+                      ? teams?.meta?.hasRecording === true
+                      : !!(
+                          row.video ||
+                          row.meet?.videoFileId ||
+                          (meta?.recordingCount ?? 0) > 0
+                        );
+                    const hasTranscript = isTeams
+                      ? teams?.meta?.hasTranscript === true
+                      : !!(
+                          row.transcriptDoc ||
+                          row.meet?.transcriptDocId ||
+                          row.geminiNotes ||
+                          meta?.transcriptDocIds?.length
+                        );
                     // Recorded/transcribed, but Google is still generating the
                     // files (state ENDED, no Drive file / Doc id yet).
                     const preparing =
-                      (!hasVideo && !!row.meet?.videoPending) ||
-                      (!hasTranscript && !!row.meet?.transcriptPending);
+                      !isTeams &&
+                      ((!hasVideo && !!row.meet?.videoPending) ||
+                        (!hasTranscript && !!row.meet?.transcriptPending));
                     // Artifacts inventoried (Meet API sweep or poller cache)
                     // and none found → the meeting ran but produced nothing
                     // importable. Don't invite a doomed click.
                     const checkedEmpty =
-                      !!row.meet?.checked && !hasVideo && !hasTranscript && !preparing;
+                      !isTeams && !!row.meet?.checked && !hasVideo && !hasTranscript && !preparing;
                     // Before the day sweep confirms which meetings actually
                     // happened, a Meet link is enough to try; after it, a
-                    // link with no conference record = never started.
+                    // link with no conference record = never started. Teams
+                    // rows are ALWAYS clickable — internal ones import
+                    // (artifacts re-checked server-side), external ones open
+                    // the guided manual panel.
                     const importable =
-                      !checkedEmpty &&
-                      (hasVideo ||
-                        hasTranscript ||
-                        !!row.meet ||
-                        (!sweepDone && !!row.event.conferenceData?.conferenceId));
+                      isTeams ||
+                      (!checkedEmpty &&
+                        (hasVideo ||
+                          hasTranscript ||
+                          !!row.meet ||
+                          (!sweepDone && !!row.event.conferenceData?.conferenceId)));
                     const muted = !!syncInfo?.skips.has(rowKey(row));
                     const focused =
                       !!focusMeeting?.meetingCode &&
-                      row.event.conferenceData?.conferenceId === focusMeeting.meetingCode;
+                      (row.event.conferenceData?.conferenceId === focusMeeting.meetingCode ||
+                        (isTeams && teams?.code === focusMeeting.meetingCode));
                     return (
                       <li
                         key={row.event.id}
@@ -1695,8 +1951,28 @@ export function GmeetImportDialog({
                                 ? fmtDayTime(row.event.start?.dateTime)
                                 : ''}
                           </span>
+                          {/* Provider identity — always visually distinct in
+                              the same list (spec §10.1). */}
+                          {isTeams ? (
+                            <TeamsLogo
+                              className={`h-4 w-4 shrink-0 ${teamsExternal ? 'opacity-60' : ''}`}
+                              muted={teamsExternal}
+                            />
+                          ) : (
+                            (row.event.conferenceData?.conferenceId || row.meet) && (
+                              <MeetLogo className="h-4 w-4 shrink-0" />
+                            )
+                          )}
                           <span className="flex-1 min-w-0 truncate text-sm">
                             {row.event.summary ?? '(no title)'}
+                            {teamsExternal && (
+                              <span className="ml-2 text-[11px] text-muted-foreground">
+                                organized outside Trames
+                                {row.event.organizer?.email?.includes('@') &&
+                                  ` (${row.event.organizer.email.split('@')[1]})`}{' '}
+                                — manual import
+                              </span>
+                            )}
                           </span>
                           {mark && mark.accessible && (
                             <Badge
@@ -1878,6 +2154,241 @@ export function GmeetImportDialog({
                 ))}
               </ul>
             </div>
+          </div>
+        )}
+
+        {step === 'teams-options' && pickedTeams && (
+          <div className="space-y-4 min-w-0">
+            <div className="rounded-md border bg-muted/40 p-3 space-y-1.5">
+              <p className="text-sm font-medium flex items-center gap-2">
+                <TeamsLogo className="h-4 w-4 shrink-0" />
+                {pickedTeams.row.event.summary ?? '(no title)'}
+              </p>
+              <p className="text-xs text-muted-foreground">
+                {fmtEventRange(pickedTeams.row.event)}
+              </p>
+              {(pickedTeams.row.event.attendees ?? []).length > 0 && (
+                <p className="text-xs text-muted-foreground">
+                  <span className="font-medium">
+                    {(pickedTeams.row.event.attendees ?? []).length} invitees:
+                  </span>{' '}
+                  {inviteeSummary(pickedTeams.row.event)}
+                </p>
+              )}
+              <div className="pt-1 space-y-0.5">
+                {pickedTeams.check?.meta ? (
+                  <>
+                    {pickedTeams.check.meta.hasRecording ? (
+                      <p className="text-xs flex items-center gap-1">
+                        <Video className="h-3 w-3 shrink-0" />
+                        Recording available (fetched from Microsoft 365 — no login needed)
+                      </p>
+                    ) : (
+                      <p className="text-xs text-muted-foreground">No recording found yet.</p>
+                    )}
+                    {pickedTeams.check.meta.hasTranscript ? (
+                      <p className="text-xs flex items-center gap-1">
+                        <FileText className="h-3 w-3 shrink-0" />
+                        Teams transcript available (speaker-attributed)
+                      </p>
+                    ) : (
+                      <p className="text-xs text-muted-foreground">No transcript found yet.</p>
+                    )}
+                  </>
+                ) : (
+                  <p className="text-xs text-muted-foreground">
+                    Artifacts are checked at import time — if the call just ended, Microsoft
+                    may still be preparing them for a few minutes.
+                  </p>
+                )}
+              </div>
+            </div>
+
+            {conflict && (
+              <div className="rounded-md border border-amber-400 dark:border-amber-700 bg-amber-50 dark:bg-amber-950/30 p-3 space-y-2">
+                <p className="text-sm">
+                  Already imported by{' '}
+                  {conflict.own ? 'you' : (conflict.ownerEmail ?? 'a teammate')}
+                  {conflict.title ? (
+                    <>
+                      {' '}
+                      — <span className="font-medium">{conflict.title}</span>
+                    </>
+                  ) : null}
+                  {conflict.accessible === false
+                    ? ". It hasn't been shared with you — if you were on the invite, you can join their import instead of making a duplicate."
+                    : ". It's in your list (invitees are shared in automatically)."}
+                </p>
+                <div className="flex gap-2 flex-wrap">
+                  {conflict.id && (
+                    <a href={`/transcript/${conflict.id}`}>
+                      <Button size="sm">
+                        <ExternalLink className="h-3.5 w-3.5 mr-1.5" />
+                        Open transcript
+                      </Button>
+                    </a>
+                  )}
+                  {conflict.accessible === false && (
+                    <Button size="sm" onClick={() => void joinTeamsExisting()} disabled={busy}>
+                      {busy ? (
+                        <Loader2 className="h-3.5 w-3.5 mr-1.5 animate-spin" />
+                      ) : (
+                        <CheckCircle2 className="h-3.5 w-3.5 mr-1.5" />
+                      )}
+                      Join their import
+                    </Button>
+                  )}
+                  <Button
+                    size="sm"
+                    variant="outline"
+                    onClick={() => void runTeamsImport(true)}
+                    disabled={busy}
+                  >
+                    {conflict.own ? 'Re-import (overwrites yours)' : 'Import my own copy anyway'}
+                  </Button>
+                </div>
+              </div>
+            )}
+
+            <div className="space-y-2">
+              <label className="flex items-start gap-2 rounded-md border p-3 cursor-pointer has-[:checked]:border-primary">
+                <input
+                  type="radio"
+                  name="teams-mode"
+                  checked={mode === 'transcript'}
+                  onChange={() => {
+                    modeTouchedRef.current = true;
+                    setMode('transcript');
+                  }}
+                  className="mt-0.5"
+                />
+                <span className="text-sm">
+                  <span className="font-medium">Quick import — Teams transcript only.</span>{' '}
+                  <span className="text-muted-foreground">
+                    Instant and free: real speaker names from Teams, no audio. You can attach
+                    the recording later.
+                  </span>
+                </span>
+              </label>
+              <label className="flex items-start gap-2 rounded-md border p-3 cursor-pointer has-[:checked]:border-primary">
+                <input
+                  type="radio"
+                  name="teams-mode"
+                  checked={mode === 'video'}
+                  onChange={() => {
+                    modeTouchedRef.current = true;
+                    setMode('video');
+                  }}
+                  className="mt-0.5"
+                />
+                <span className="text-sm">
+                  <span className="font-medium">Re-transcribe the recording.</span>{' '}
+                  <span className="text-muted-foreground">
+                    Downloads the MP4 and runs the normal pipeline — acoustic speaker
+                    separation, playback, video features.
+                  </span>
+                </span>
+              </label>
+              <label className="flex items-start gap-2 rounded-md border p-3 cursor-pointer has-[:checked]:border-primary">
+                <input
+                  type="radio"
+                  name="teams-mode"
+                  checked={mode === 'both'}
+                  onChange={() => {
+                    modeTouchedRef.current = true;
+                    setMode('both');
+                  }}
+                  className="mt-0.5"
+                />
+                <span className="text-sm">
+                  <span className="font-medium">Both.</span>{' '}
+                  <span className="text-muted-foreground">
+                    Re-transcribe the recording and keep the Teams transcript as a sidecar
+                    for name cross-referencing.
+                  </span>
+                </span>
+              </label>
+            </div>
+
+            {error && <p className="text-sm text-destructive">{error}</p>}
+
+            <DialogFooter>
+              <Button variant="outline" onClick={() => setStep('pick')} disabled={busy}>
+                <ChevronLeft className="h-4 w-4 mr-1" />
+                Back
+              </Button>
+              <Button onClick={() => void runTeamsImport()} disabled={busy}>
+                {busy ? <Loader2 className="h-4 w-4 mr-1.5 animate-spin" /> : null}
+                Import
+              </Button>
+            </DialogFooter>
+          </div>
+        )}
+
+        {step === 'teams-external' && pickedTeams && (
+          <div className="space-y-4 min-w-0">
+            <div className="rounded-md border bg-muted/40 p-3 space-y-1.5">
+              <p className="text-sm font-medium flex items-center gap-2">
+                <TeamsLogo className="h-4 w-4 shrink-0" muted />
+                {pickedTeams.row.event.summary ?? '(no title)'}
+              </p>
+              <p className="text-xs text-muted-foreground">
+                {fmtEventRange(pickedTeams.row.event)}
+              </p>
+            </div>
+
+            <p className="text-sm">
+              This Teams meeting was organized outside Trames
+              {pickedTeams.row.event.organizer?.email?.includes('@') && (
+                <> (by {pickedTeams.row.event.organizer.email.split('@')[1]})</>
+              )}{' '}
+              — <span className="font-medium">their tenant owns the recording and
+              transcript</span>, so we can&apos;t pull them automatically. Two ways to get it
+              in, best first:
+            </p>
+
+            <div className="space-y-2">
+              <div className="rounded-md border p-3 space-y-1">
+                <p className="text-sm font-medium flex items-center gap-1.5">
+                  <Video className="h-3.5 w-3.5" />
+                  1. Upload the recording video (recommended)
+                </p>
+                <p className="text-xs text-muted-foreground">
+                  Download the MP4 from the meeting&apos;s Teams recap (or ask the organizer
+                  for it), then drop it in the uploader on the home page. The full pipeline
+                  works: speaker identification, playback, frames, video reports. Link this
+                  calendar event to it after upload for auto-sharing.
+                </p>
+              </div>
+              <div className="rounded-md border p-3 space-y-1">
+                <p className="text-sm font-medium flex items-center gap-1.5">
+                  <FileText className="h-3.5 w-3.5" />
+                  2. Upload the transcript file (fallback)
+                </p>
+                <p className="text-xs text-muted-foreground">
+                  Export the transcript from the recap (docx or vtt) and use &quot;Import
+                  transcript text&quot; — text-only import, no media features.
+                </p>
+              </div>
+            </div>
+
+            {error && <p className="text-sm text-destructive">{error}</p>}
+
+            <DialogFooter>
+              <Button variant="outline" onClick={() => setStep('pick')} disabled={busy}>
+                <ChevronLeft className="h-4 w-4 mr-1" />
+                Back
+              </Button>
+              <Button
+                onClick={() => {
+                  handleClose();
+                  requestMediaUpload();
+                }}
+              >
+                <Upload className="h-4 w-4 mr-1.5" />
+                Upload the video
+              </Button>
+            </DialogFooter>
           </div>
         )}
 

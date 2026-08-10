@@ -23,10 +23,27 @@ import {
 interface CalendarEventLite {
   id: string;
   summary?: string;
+  location?: string;
+  description?: string;
   start?: { dateTime?: string; date?: string };
   end?: { dateTime?: string };
   attendees?: Array<{ email?: string; displayName?: string; responseStatus?: string }>;
-  conferenceData?: { conferenceId?: string };
+  conferenceData?: { conferenceId?: string; entryPoints?: Array<{ uri?: string }> };
+}
+
+/** Teams meetup-join link on the event, if any — the server stamps
+ * provider:'teams' + join facts so fetch-recording-later works. */
+function teamsUrlOf(e: CalendarEventLite): string | null {
+  const hay = [
+    e.location,
+    e.description,
+    ...(e.conferenceData?.entryPoints ?? []).map((p) => p.uri),
+  ]
+    .filter(Boolean)
+    .join('\n');
+  return (
+    /https:\/\/teams\.microsoft\.com\/l\/meetup-join\/[^\s"'<>\\]+/.exec(hay)?.[0] ?? null
+  );
 }
 
 interface LinkEventDialogProps {
@@ -86,7 +103,7 @@ export function LinkEventDialog({
         orderBy: 'startTime',
         maxResults: '50',
         fields:
-          'items(id,summary,start,end,attendees(email,displayName,responseStatus),conferenceData(conferenceId))',
+          'items(id,summary,location,description,start,end,attendees(email,displayName,responseStatus),conferenceData(conferenceId,entryPoints(uri)))',
       });
       const res = await fetch(
         `https://www.googleapis.com/calendar/v3/calendars/primary/events?${params}`,
@@ -125,6 +142,7 @@ export function LinkEventDialog({
             startTime: e.start?.dateTime,
             endTime: e.end?.dateTime,
             meetingCode: e.conferenceData?.conferenceId,
+            teamsUrl: teamsUrlOf(e) ?? undefined,
             attendees: (e.attendees ?? [])
               .filter((a) => a.email)
               .map((a) => ({

@@ -67,6 +67,9 @@ export const POST = withAuth(async ({ user, request }) => {
     const cache = cacheRows[qi] ?? null;
     return {
       external: false as const,
+      /** `teams-<hash>` — the mute/reminder key the client can't compute
+       * itself (server-side sha256 of the canonical URL). */
+      code: teamsCacheCode(p.joinWebUrl),
       imported: dupe
         ? {
             assemblyaiId: dupe.accessible ? dupe.assemblyai_id : null,

@@ -14,6 +14,13 @@ import {
   findConferenceRecordName,
   utterancesFromEntries,
 } from '@/lib/server/gmeet';
+import { isOwnTenant, parseTeamsJoinLink, pickOccurrenceArtifacts } from '@/lib/teams-link';
+import {
+  isGraphConfigured,
+  listRecordings,
+  listTranscripts,
+  resolveMeetingByJoinUrl,
+} from '@/lib/server/ms-graph';
 import type { GmeetAttendee, GmeetContext, MeetActuals } from '@/lib/format';
 
 export const runtime = 'nodejs';
@@ -45,6 +52,8 @@ export const POST = withAuth(async ({ user, request }, { params }) => {
       startTime?: string;
       endTime?: string;
       meetingCode?: string;
+      /** Teams meetup-join link found on the event (raw is fine). */
+      teamsUrl?: string;
       attendees?: GmeetAttendee[];
     };
   };
@@ -92,6 +101,49 @@ export const POST = withAuth(async ({ user, request }, { params }) => {
     meetingCode: event.meetingCode,
     attendees,
   };
+
+  // Linked event is a Teams meeting → stamp provider + join facts so the
+  // provider chip renders and fetch-recording-later (page effect + the
+  // video-fetch sweeper) works on this row. Best-effort app-only resolve
+  // pins the occurrence's recordingId; external tenants get the marker only.
+  if (typeof event.teamsUrl === 'string') {
+    const info = parseTeamsJoinLink(event.teamsUrl);
+    if (info) {
+      patch.provider = 'teams';
+      patch.teams = {
+        joinWebUrl: info.joinWebUrl,
+        tenantId: info.tenantId,
+        organizerOid: info.organizerOid,
+        graphMeetingId: '',
+      };
+      if (isOwnTenant(info) && isGraphConfigured()) {
+        try {
+          const meeting = await resolveMeetingByJoinUrl(info.organizerOid, info.joinWebUrl);
+          if (meeting) {
+            const [transcripts, recordings] = await Promise.all([
+              listTranscripts(info.organizerOid, meeting.id),
+              listRecordings(info.organizerOid, meeting.id),
+            ]);
+            const windowStart = event.startTime ?? meeting.startDateTime;
+            const windowEnd = event.endTime ?? meeting.endDateTime ?? windowStart;
+            const picked =
+              windowStart && windowEnd
+                ? pickOccurrenceArtifacts(transcripts, recordings, windowStart, windowEnd)
+                : { transcript: undefined, recording: undefined };
+            patch.teams = {
+              ...patch.teams,
+              graphMeetingId: meeting.id,
+              callId: picked.transcript?.callId ?? picked.recording?.callId,
+              transcriptId: picked.transcript?.id,
+              recordingId: picked.recording?.id,
+            };
+          }
+        } catch (err) {
+          console.warn('[link-event] teams resolution failed (continuing):', err);
+        }
+      }
+    }
+  }
   if (actuals) {
     patch.actuals = actuals;
     if (actuals.transcriptEntries && actuals.transcriptEntries.length > 0) {

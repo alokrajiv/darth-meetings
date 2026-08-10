@@ -3,6 +3,7 @@
 import { useState } from 'react';
 import { Button } from '@/components/ui/button';
 import { Video, X, BellOff, CircleAlert, FileText, Clapperboard } from 'lucide-react';
+import { MeetLogo, TeamsLogo } from '@/components/provider-icon';
 
 export interface Reminder {
   id: number;
@@ -101,10 +102,18 @@ export function GmeetRemindersCard({
               type="button"
               onClick={() => onOpenMeeting?.(r)}
               title="See this meeting — opens the import dialog on its day"
-              className="min-w-0 flex-1 truncate text-left hover:underline underline-offset-2"
+              className="flex min-w-0 flex-1 items-center gap-1.5 truncate text-left hover:underline underline-offset-2"
             >
-              <span className="font-medium">{r.title || r.meetingCode || 'Untitled meeting'}</span>
-              <span className="ml-2 text-xs text-muted-foreground">{fmtWhen(r.eventStart)}</span>
+              {/* Provider marker: teams-… meeting codes are Teams meetings. */}
+              {r.meetingCode?.startsWith('teams-') ? (
+                <TeamsLogo className="h-3.5 w-3.5 shrink-0" />
+              ) : (
+                <MeetLogo className="h-3.5 w-3.5 shrink-0" />
+              )}
+              <span className="min-w-0 truncate">
+                <span className="font-medium">{r.title || r.meetingCode || 'Untitled meeting'}</span>
+                <span className="ml-2 text-xs text-muted-foreground">{fmtWhen(r.eventStart)}</span>
+              </span>
             </button>
             {r.kind === 'unimported' ? (
               <span className="flex shrink-0 items-center gap-1 text-[11px] text-muted-foreground">

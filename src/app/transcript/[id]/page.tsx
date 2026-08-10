@@ -21,6 +21,7 @@ import {
   type TranscriptShare,
 } from '@/lib/format';
 import { AudioPlayer, type AudioPlayerHandle } from '@/components/audio-player';
+import { MeetLogo, TeamsLogo } from '@/components/provider-icon';
 import { NotesMarkdown } from '@/components/notes-markdown';
 import { EditableUtterance, type UtteranceHighlight } from '@/components/editable-utterance';
 import { FindReplacePanel } from '@/components/find-replace-panel';
@@ -644,8 +645,15 @@ export default function TranscriptDetailPage({ params }: TranscriptDetailPagePro
     row?.gmeet_context?.videoFileId ??
     row?.gmeet_context?.actuals?.recordings?.[0]?.fileId ??
     null;
+  // Teams rows fetch app-only from Graph — the stored recordingId is the
+  // whole capability (route branches on provider).
+  const teamsRecordingId =
+    row?.gmeet_context?.provider === 'teams'
+      ? (row.gmeet_context.teams?.recordingId ?? null)
+      : null;
   const hasLocalVideo = /\.(mp4|webm|mov|mkv|m4v)$/i.test(row?.local_audio_path ?? '');
-  const canFetchVideo = !!row && canEdit && !row.local_audio_path && !!recordingFileId;
+  const canFetchVideo =
+    !!row && canEdit && !row.local_audio_path && (!!recordingFileId || !!teamsRecordingId);
   const [videoFetching, setVideoFetching] = useState(false);
   const [videoFetchError, setVideoFetchError] = useState<string | null>(null);
   const fetchVideo = useCallback(
@@ -2093,9 +2101,14 @@ export default function TranscriptDetailPage({ params }: TranscriptDetailPagePro
                 </Badge>
               ))}
             <span className="inline-flex items-center gap-1 rounded-md bg-muted px-1.5 py-0.5 text-[11px]">
-              {row.assemblyai_id.startsWith('gmeet-') ? (
+              {row.gmeet_context?.provider === 'teams' ? (
                 <>
-                  <Video className="h-3 w-3" />
+                  <TeamsLogo className="h-3 w-3" />
+                  Microsoft Teams
+                </>
+              ) : row.assemblyai_id.startsWith('gmeet-') ? (
+                <>
+                  <MeetLogo className="h-3 w-3" />
                   Google Meet
                 </>
               ) : row.source === 'uploaded' ? (

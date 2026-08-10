@@ -205,7 +205,7 @@ export default function Home() {
         </Button>
         <Button size="sm" onClick={() => setGmeetOpen(true)}>
           <Video className="h-4 w-4" />
-          Import from Meet
+          Import meeting
         </Button>
         <div className="h-5 w-px bg-border" />
         {reminderCount > 0 && (
