@@ -68,6 +68,9 @@ interface MeetRowInfo {
   recordName: string;
   videoFileId: string | null;
   transcriptDocId: string | null;
+  /** Artifact exists on the record but Google hasn't finished the file yet. */
+  videoPending: boolean;
+  transcriptPending: boolean;
   /** null = not checked yet (recents rows — resolved on pick) */
   checked: boolean;
 }
@@ -95,6 +98,10 @@ interface PickedMeeting {
   videoCount: number;
   transcriptDocId: string | null;
   transcriptSource: 'calendar' | 'meet-api' | 'gemini' | null;
+  /** Meet says the artifact exists but is still being processed — no file
+   * to import yet, worth re-checking in a few minutes. */
+  videoPending: boolean;
+  transcriptPending: boolean;
   geminiNotes: boolean;
   /** Poller-cached counts/flags for this occurrence, when we have them. */
   cacheMeta: MeetingMeta | null;
@@ -369,27 +376,47 @@ async function fetchMeetingCode(token: string, spaceResource: string): Promise<s
   }
 }
 
-/** Fetch a record's recording + transcript artifact ids. */
+/** Fetch a record's recording + transcript artifact ids.
+ *
+ * Artifacts appear in these lists BEFORE their files exist: right after a
+ * call ends the entry is there with `state: "ENDED"` and an empty
+ * driveDestination/docsDestination, flipping to `FILE_GENERATED` with the id
+ * populated once Google finishes processing. The pending flags carry that
+ * "recorded, still being prepared" state — without them a just-ended meeting
+ * reads as "never recorded". */
 async function recordArtifacts(
   token: string,
   recordName: string
-): Promise<{ videoFileId: string | null; transcriptDocId: string | null }> {
+): Promise<{
+  videoFileId: string | null;
+  transcriptDocId: string | null;
+  videoPending: boolean;
+  transcriptPending: boolean;
+}> {
   const auth = { headers: { Authorization: `Bearer ${token}` } };
   const [recRes, transRes] = await Promise.all([
     fetch(`${MEET_API}/${recordName}/recordings`, auth),
     fetch(`${MEET_API}/${recordName}/transcripts`, auth),
   ]);
   const recs = recRes.ok
-    ? ((await recRes.json()) as { recordings?: Array<{ driveDestination?: { file?: string } }> })
+    ? ((await recRes.json()) as {
+        recordings?: Array<{ state?: string; driveDestination?: { file?: string } }>;
+      })
     : {};
   const trans = transRes.ok
     ? ((await transRes.json()) as {
-        transcripts?: Array<{ docsDestination?: { document?: string } }>;
+        transcripts?: Array<{ state?: string; docsDestination?: { document?: string } }>;
       })
     : {};
+  const recordings = recs.recordings ?? [];
+  const transcripts = trans.transcripts ?? [];
   return {
-    videoFileId: recs.recordings?.[0]?.driveDestination?.file ?? null,
-    transcriptDocId: trans.transcripts?.[0]?.docsDestination?.document ?? null,
+    videoFileId: recordings.find((r) => r.driveDestination?.file)?.driveDestination?.file ?? null,
+    transcriptDocId:
+      transcripts.find((t) => t.docsDestination?.document)?.docsDestination?.document ?? null,
+    videoPending: recordings.length > 0 && !recordings.some((r) => r.driveDestination?.file),
+    transcriptPending:
+      transcripts.length > 0 && !transcripts.some((t) => t.docsDestination?.document),
   };
 }
 
@@ -633,6 +660,8 @@ export function GmeetImportDialog({
             recordName: rec.name,
             videoFileId: rec.videoFileId,
             transcriptDocId: rec.transcriptDocId,
+            videoPending: rec.videoPending,
+            transcriptPending: rec.transcriptPending,
             checked: true,
           };
           const target = rec.code
@@ -742,6 +771,8 @@ export function GmeetImportDialog({
             recordName: rec.name,
             videoFileId: rec.videoFileId,
             transcriptDocId: rec.transcriptDocId,
+            videoPending: rec.videoPending,
+            transcriptPending: rec.transcriptPending,
             checked: true,
           };
           // Join ONLY by exact meeting code. No time-overlap guessing: a
@@ -856,7 +887,14 @@ export function GmeetImportDialog({
           transcriptDoc: null,
           geminiNotes: null,
           videoCount: 0,
-          meet: { recordName: r.name, videoFileId: null, transcriptDocId: null, checked: false },
+          meet: {
+            recordName: r.name,
+            videoFileId: null,
+            transcriptDocId: null,
+            videoPending: false,
+            transcriptPending: false,
+            checked: false,
+          },
           offCalendar: true,
         }))
       );
@@ -903,7 +941,14 @@ export function GmeetImportDialog({
           transcriptDoc: null,
           geminiNotes: null,
           videoCount: 0,
-          meet: { recordName: r.name, videoFileId: null, transcriptDocId: null, checked: false },
+          meet: {
+            recordName: r.name,
+            videoFileId: null,
+            transcriptDocId: null,
+            videoPending: false,
+            transcriptPending: false,
+            checked: false,
+          },
           offCalendar: true,
         }))
       );
@@ -978,6 +1023,8 @@ export function GmeetImportDialog({
       let videoFileId = initial.videoFileId;
       let transcriptDocId = initial.transcriptDocId;
       let transcriptSource = initial.transcriptSource;
+      let videoPending = initial.videoPending;
+      let transcriptPending = initial.transcriptPending;
 
       // Find the conference record if we don't have it yet. The API returns
       // records NEWEST-first — always pick the one NEAREST the event start,
@@ -1010,6 +1057,10 @@ export function GmeetImportDialog({
           transcriptDocId = found.transcriptDocId;
           transcriptSource = 'meet-api';
         }
+        // Live check is authoritative for the pending state either way —
+        // this is also how a re-check clears a stale "still preparing".
+        videoPending = found.videoPending;
+        transcriptPending = found.transcriptPending;
       }
 
       let videoName: string | null = null;
@@ -1039,6 +1090,8 @@ export function GmeetImportDialog({
           videoDurationMs: videoDurationMs ?? prev.videoDurationMs,
           transcriptDocId: transcriptDocId ?? prev.transcriptDocId,
           transcriptSource: transcriptSource ?? prev.transcriptSource,
+          videoPending: !(videoFileId ?? prev.videoFileId) && videoPending,
+          transcriptPending: !(transcriptDocId ?? prev.transcriptDocId) && transcriptPending,
           enriching: false,
         };
       });
@@ -1094,6 +1147,8 @@ export function GmeetImportDialog({
             : cached?.transcriptDocIds?.length
               ? 'meet-api'
               : null,
+      videoPending: !videoFileId && !!row.meet?.videoPending,
+      transcriptPending: !transcriptDocId && !!row.meet?.transcriptPending,
       geminiNotes: !!row.geminiNotes,
       cacheMeta: cached,
       enriching: true,
@@ -1576,11 +1631,16 @@ export function GmeetImportDialog({
                       row.geminiNotes ||
                       meta?.transcriptDocIds?.length
                     );
+                    // Recorded/transcribed, but Google is still generating the
+                    // files (state ENDED, no Drive file / Doc id yet).
+                    const preparing =
+                      (!hasVideo && !!row.meet?.videoPending) ||
+                      (!hasTranscript && !!row.meet?.transcriptPending);
                     // Artifacts inventoried (Meet API sweep or poller cache)
                     // and none found → the meeting ran but produced nothing
                     // importable. Don't invite a doomed click.
                     const checkedEmpty =
-                      !!row.meet?.checked && !hasVideo && !hasTranscript;
+                      !!row.meet?.checked && !hasVideo && !hasTranscript && !preparing;
                     // Before the day sweep confirms which meetings actually
                     // happened, a Meet link is enough to try; after it, a
                     // link with no conference record = never started.
@@ -1673,6 +1733,16 @@ export function GmeetImportDialog({
                               recording{row.videoCount > 1 ? ` ×${row.videoCount}` : ''}
                               {meta?.videoDurationMs != null &&
                                 ` · ${fmtDurationMs(meta.videoDurationMs)}`}
+                            </Badge>
+                          )}
+                          {preparing && (
+                            <Badge
+                              variant="outline"
+                              className="text-[10px] gap-1 shrink-0 border-amber-400/60 text-amber-600 dark:text-amber-500"
+                              title="The meeting was recorded — Google is still preparing the files. They usually land within minutes of the call ending."
+                            >
+                              <Loader2 className="h-3 w-3 animate-spin" />
+                              preparing…
                             </Badge>
                           )}
                           {hasTranscript && meta?.transcriptParseable === false ? (
@@ -1869,7 +1939,12 @@ export function GmeetImportDialog({
                           )}
                         </span>
                       </p>
-                    ) : picked.enriching ? null : (
+                    ) : picked.enriching ? null : picked.videoPending ? (
+                      <p className="text-xs text-amber-600 dark:text-amber-500 flex items-center gap-1">
+                        <Video className="h-3 w-3 shrink-0" />
+                        Recorded — Google is still preparing the video file.
+                      </p>
+                    ) : (
                       <p className="text-xs text-muted-foreground">No recording found.</p>
                     )}
                     {picked.transcriptDocId ? (
@@ -1897,7 +1972,12 @@ export function GmeetImportDialog({
                           </span>
                         )}
                       </p>
-                    ) : picked.enriching ? null : (
+                    ) : picked.enriching ? null : picked.transcriptPending ? (
+                      <p className="text-xs text-amber-600 dark:text-amber-500 flex items-center gap-1">
+                        <FileText className="h-3 w-3 shrink-0" />
+                        Transcribed — Google is still preparing the transcript Doc.
+                      </p>
+                    ) : (
                       <p className="text-xs text-muted-foreground">
                         No Meet transcript found for this meeting.
                       </p>
@@ -2045,12 +2125,47 @@ export function GmeetImportDialog({
                   </span>
                 </label>
               )}
-              {!picked.enriching && !picked.videoFileId && !picked.transcriptDocId && (
-                <p className="text-sm text-muted-foreground p-1">
-                  Nothing importable found for this meeting — it may not have been recorded,
-                  or Meet is still processing the artifacts.
-                </p>
-              )}
+              {!picked.enriching &&
+                !picked.videoFileId &&
+                !picked.transcriptDocId &&
+                (picked.videoPending || picked.transcriptPending ? (
+                  <div className="rounded-md border border-amber-400/60 bg-amber-50 dark:bg-amber-950/30 p-3 space-y-2">
+                    <p className="text-sm">
+                      This meeting was{' '}
+                      {picked.videoPending && picked.transcriptPending
+                        ? 'recorded and transcribed'
+                        : picked.videoPending
+                          ? 'recorded'
+                          : 'transcribed'}{' '}
+                      — Google is still preparing the{' '}
+                      {picked.videoPending && picked.transcriptPending
+                        ? 'files'
+                        : picked.videoPending
+                          ? 'video file'
+                          : 'transcript Doc'}
+                      . This usually takes a few minutes after the call ends (longer for long
+                      recordings).
+                    </p>
+                    <Button
+                      size="sm"
+                      variant="outline"
+                      disabled={busy}
+                      onClick={() => {
+                        const next = { ...picked, enriching: true };
+                        setPicked(next);
+                        void enrich(next);
+                      }}
+                    >
+                      <RefreshCw className="h-3.5 w-3.5 mr-1.5" />
+                      Check again
+                    </Button>
+                  </div>
+                ) : (
+                  <p className="text-sm text-muted-foreground p-1">
+                    Nothing importable found for this meeting — it may not have been recorded,
+                    or Meet is still processing the artifacts.
+                  </p>
+                ))}
             </div>
 
             {error && (
