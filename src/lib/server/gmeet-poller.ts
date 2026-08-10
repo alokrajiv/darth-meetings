@@ -20,9 +20,26 @@ import {
 } from '@/lib/server/gmeet';
 import {
   getMeetingCacheByKeys,
+  getTeamsResolutionByKeys,
   upsertMeetingCache,
   type GmeetMeetingCacheRow,
 } from '@/db-ops/gmeet-meeting-cache';
+import { findImportedByTeamsMeetings } from '@/db-ops/teams-import';
+import {
+  findTeamsJoinUrl,
+  isOwnTenant,
+  parseTeamsJoinLink,
+  pickOccurrenceArtifacts,
+  type TeamsJoinInfo,
+} from '@/lib/teams-link';
+import { teamsCacheCode } from '@/lib/server/teams-ids';
+import {
+  GraphApiError,
+  isGraphConfigured,
+  listRecordings,
+  listTranscripts,
+  resolveMeetingByJoinUrl,
+} from '@/lib/server/ms-graph';
 
 /**
  * Background sync-and-remind poller. Every POLL_MS, for each user with a
@@ -31,6 +48,12 @@ import {
  *  - PAST Meet events (last LOOKBACK_DAYS) that nobody imported and that DO
  *    have a recording/transcript at Google → open an 'unimported' reminder.
  *    Importing stays a human act — the poller never imports anything.
+ *  - PAST own-tenant TEAMS events (same window): resolve app-only via Graph,
+ *    check artifacts, cache metadata, same 'unimported' reminders. The
+ *    reminder's meeting_code carries the `teams-…` cache code — that prefix
+ *    is the provider marker for the UI. External-tenant Teams events are
+ *    skipped here (nothing to check without their tenant's consent); the
+ *    dialog labels them straight from the join URL.
  *  - UPCOMING events (next LOOKAHEAD_H) the user ORGANIZES whose
  *    auto-recording/transcription/notes are ALL off → 'autorec_off' reminder
  *    (artifactConfig is only visible to the organizer, so this is exactly
@@ -38,7 +61,8 @@ import {
  *
  * Also reconciles previously-open reminders (imported / muted / event passed
  * / config fixed → resolved). Serial across users; each user's sweep uses
- * only their own token.
+ * only their own token; Teams artifact checks use the app-only Graph
+ * credential (display/reminder metadata only — imports re-resolve fresh).
  */
 
 const POLL_MS = Number(process.env.GMEET_POLL_MINUTES || 30) * 60 * 1000;
@@ -53,12 +77,15 @@ interface CalEvent {
   summary?: string;
   recurringEventId?: string;
   iCalUID?: string;
+  location?: string;
+  description?: string;
   start?: { dateTime?: string; date?: string };
   end?: { dateTime?: string; date?: string };
   organizer?: { email?: string; self?: boolean };
   conferenceData?: {
     conferenceId?: string;
     conferenceSolution?: { key?: { type?: string } };
+    entryPoints?: Array<{ uri?: string }>;
   };
 }
 
@@ -76,7 +103,7 @@ async function apiJson<T>(token: string, url: string): Promise<T | null> {
   }
 }
 
-async function listMeetEvents(token: string): Promise<CalEvent[]> {
+async function listCalendarEvents(token: string): Promise<CalEvent[]> {
   const timeMin = new Date(Date.now() - LOOKBACK_DAYS * 86_400_000).toISOString();
   const timeMax = new Date(Date.now() + LOOKAHEAD_H * 3_600_000).toISOString();
   const events: CalEvent[] = [];
@@ -99,11 +126,28 @@ async function listMeetEvents(token: string): Promise<CalEvent[]> {
     pageToken = json.nextPageToken;
     if (!pageToken) break;
   }
-  return events.filter(
-    (e) =>
-      e.conferenceData?.conferenceSolution?.key?.type === 'hangoutsMeet' &&
-      MEET_CODE_RE.test(e.conferenceData?.conferenceId ?? '')
+  return events;
+}
+
+function isMeetEvent(e: CalEvent): boolean {
+  return (
+    e.conferenceData?.conferenceSolution?.key?.type === 'hangoutsMeet' &&
+    MEET_CODE_RE.test(e.conferenceData?.conferenceId ?? '')
   );
+}
+
+/** Teams meetings scheduled from Google Calendar (GSuite add-on) carry the
+ * meetup-join link in location / description / conference entry points. */
+function teamsInfoOf(e: CalEvent): TeamsJoinInfo | null {
+  const hay = [
+    e.location,
+    e.description,
+    ...(e.conferenceData?.entryPoints ?? []).map((p) => p.uri),
+  ]
+    .filter(Boolean)
+    .join('\n');
+  const url = findTeamsJoinUrl(hay);
+  return url ? parseTeamsJoinLink(url) : null;
 }
 
 function eventStartIso(e: CalEvent): string | null {
@@ -254,6 +298,151 @@ async function getArtifactConfig(
   };
 }
 
+/**
+ * Teams half of a user's sweep: past own-tenant Teams meetings that nobody
+ * imported and that DO have artifacts at Microsoft → 'unimported' reminders,
+ * plus the metadata cache row the check route serves. App-only Graph; one
+ * resolution per occurrence ever (cached in raw.teamsResolution), and once
+ * both artifacts are known no Graph call is made at all.
+ */
+async function sweepUserTeams(
+  caller: { userId: string; email: string },
+  events: CalEvent[],
+  mutedKeys: Set<string>,
+  now: number
+): Promise<void> {
+  if (!isGraphConfigured()) return;
+  const past: Array<{ e: CalEvent; info: TeamsJoinInfo }> = [];
+  for (const e of events) {
+    const end = e.end?.dateTime ?? e.end?.date;
+    if (!end || Date.parse(end) >= now - 15 * 60_000) continue;
+    const info = teamsInfoOf(e);
+    // External-tenant meetings are unreachable app-only — the dialog labels
+    // them straight from the join URL; nothing to poll for.
+    if (!info || !isOwnTenant(info)) continue;
+    past.push({ e, info });
+  }
+  if (past.length === 0) return;
+
+  const imported = await findImportedByTeamsMeetings(
+    past.map(({ e, info }) => ({ joinWebUrl: info.joinWebUrl, startTime: eventStartIso(e) })),
+    caller
+  );
+  const keys = past.map(({ e, info }) =>
+    eventKeyOf(teamsCacheCode(info.joinWebUrl), eventStartIso(e))
+  );
+  const [cacheRows, resolutions] = await Promise.all([
+    getMeetingCacheByKeys(keys),
+    getTeamsResolutionByKeys(keys),
+  ]);
+
+  for (let i = 0; i < past.length; i++) {
+    const { e, info } = past[i]!;
+    const startIso = eventStartIso(e);
+    const code = teamsCacheCode(info.joinWebUrl);
+    const key = keys[i]!;
+    if (imported[i]) {
+      await resolveReminderByKey(caller.userId, 'unimported', key, 'imported');
+      continue;
+    }
+    if (mutedKeys.has(code) || mutedKeys.has(e.id)) {
+      await resolveReminderByKey(caller.userId, 'unimported', key, 'muted');
+      continue;
+    }
+
+    const existing = cacheRows.get(key);
+    let hasTranscript = existing?.transcript_parseable === true;
+    let hasRecording = (existing?.recording_count ?? 0) > 0;
+    // Artifacts are immutable once present — only hit Graph while one is
+    // still missing (recordings routinely land minutes after transcripts).
+    if (!hasTranscript || !hasRecording) {
+      try {
+        let resolution = resolutions.get(key) ?? null;
+        if (!resolution) {
+          const meeting = await resolveMeetingByJoinUrl(info.organizerOid, info.joinWebUrl);
+          if (!meeting) continue; // deleted or never materialized — retry next sweep
+          resolution = {
+            joinWebUrl: info.joinWebUrl,
+            organizerOid: info.organizerOid,
+            graphMeetingId: meeting.id,
+            meetingCode: meeting.meetingCode,
+          };
+        }
+        const [transcripts, recordings] = await Promise.all([
+          listTranscripts(resolution.organizerOid, resolution.graphMeetingId),
+          listRecordings(resolution.organizerOid, resolution.graphMeetingId),
+        ]);
+        const endIso = e.end?.dateTime ?? e.end?.date ?? startIso;
+        const picked =
+          startIso && endIso
+            ? pickOccurrenceArtifacts(transcripts, recordings, startIso, endIso)
+            : { transcript: undefined, recording: undefined };
+        hasTranscript = !!picked.transcript;
+        hasRecording = !!picked.recording;
+        if (!hasTranscript && !hasRecording) {
+          // Recap artifacts lag the call end by minutes — cache the
+          // resolution so the retry next sweep skips the $filter call.
+          if (!resolutions.get(key)) {
+            await upsertMeetingCache({
+              eventKey: key,
+              meetingCode: code,
+              eventStart: startIso,
+              conferenceRecord: null,
+              raw: { teamsResolution: resolution },
+              capturedBy: caller.userId,
+            });
+          }
+          continue;
+        }
+        await upsertMeetingCache({
+          eventKey: key,
+          meetingCode: code,
+          eventStart: startIso,
+          conferenceRecord: null,
+          confStart:
+            picked.transcript?.createdDateTime ?? picked.recording?.createdDateTime ?? null,
+          confEnd: picked.transcript?.endDateTime ?? picked.recording?.endDateTime ?? null,
+          recordingCount: picked.recording ? 1 : 0,
+          transcriptParseable: hasTranscript ? true : null,
+          recurringEventId: e.recurringEventId ?? null,
+          iCalUID: e.iCalUID ?? null,
+          organizerEmail: e.organizer?.email ?? null,
+          raw: {
+            teamsResolution: resolution,
+            teamsArtifacts: {
+              transcript: picked.transcript ?? null,
+              recording: picked.recording ?? null,
+            },
+          },
+          capturedBy: caller.userId,
+        });
+      } catch (err) {
+        if (err instanceof GraphApiError) {
+          console.warn(
+            '[gmeet-poller] teams artifact check failed for',
+            key,
+            err.status,
+            err.code ?? ''
+          );
+          continue;
+        }
+        throw err;
+      }
+    }
+    await upsertReminder({
+      userId: caller.userId,
+      kind: 'unimported',
+      eventKey: key,
+      meetingCode: code,
+      title: e.summary ?? null,
+      eventStart: startIso,
+      organizerSelf: e.organizer?.self ?? false,
+      hasRecording,
+      hasTranscript,
+    });
+  }
+}
+
 async function sweepUser(account: GoogleAccountRow): Promise<void> {
   const minted = await getServerAccessToken(account.user_id);
   if (!minted) return; // revoked / transient failure — status already recorded
@@ -261,11 +450,12 @@ async function sweepUser(account: GoogleAccountRow): Promise<void> {
   const userId = account.user_id;
   const caller = { userId, email: account.user_email };
 
-  const [events, { skips }, openReminders] = await Promise.all([
-    listMeetEvents(token),
+  const [allEvents, { skips }, openReminders] = await Promise.all([
+    listCalendarEvents(token),
     getSyncState(userId),
     listOpenRemindersRaw(userId),
   ]);
+  const events = allEvents.filter(isMeetEvent);
   const mutedKeys = new Set(skips.map((s) => s.event_key));
   const now = Date.now();
 
@@ -361,11 +551,21 @@ async function sweepUser(account: GoogleAccountRow): Promise<void> {
     }
   }
 
+  // ---- Teams events (own tenant) → 'unimported' reminders + cache ---------
+  try {
+    await sweepUserTeams(caller, allEvents, mutedKeys, now);
+  } catch (err) {
+    console.warn(`[gmeet-poller] teams sweep failed for ${account.user_email}:`, err);
+  }
+
   // ---- reconcile older open reminders -------------------------------------
   // 'autorec_off' whose meeting already started is moot; stale 'unimported'
   // rows (outside the calendar window) still get import/mute resolution so a
   // colleague importing a 3-week-old meeting clears everyone's reminder.
+  // Teams reminders (meeting_code `teams-…`) resolve through the cache row's
+  // stored join URL instead of the Meet meeting-code lookup.
   const staleUnimported: Array<{ key: string; code: string; start: string | null }> = [];
+  const staleTeams: Array<{ key: string; start: string | null }> = [];
   for (const r of openReminders) {
     if (r.kind === 'autorec_off') {
       if (r.event_start && Date.parse(r.event_start) < now) {
@@ -377,7 +577,9 @@ async function sweepUser(account: GoogleAccountRow): Promise<void> {
       await resolveReminderByKey(userId, 'unimported', r.event_key, 'muted');
       continue;
     }
-    if (r.meeting_code) {
+    if (r.meeting_code?.startsWith('teams-')) {
+      staleTeams.push({ key: r.event_key, start: r.event_start });
+    } else if (r.meeting_code) {
       staleUnimported.push({ key: r.event_key, code: r.meeting_code, start: r.event_start });
     }
   }
@@ -389,6 +591,24 @@ async function sweepUser(account: GoogleAccountRow): Promise<void> {
     for (let i = 0; i < staleUnimported.length; i++) {
       if (found[i]) {
         await resolveReminderByKey(userId, 'unimported', staleUnimported[i]!.key, 'imported');
+      }
+    }
+  }
+  if (staleTeams.length > 0) {
+    const resolutions = await getTeamsResolutionByKeys(staleTeams.map((s) => s.key));
+    const withUrl = staleTeams.filter((s) => resolutions.get(s.key)?.joinWebUrl);
+    if (withUrl.length > 0) {
+      const found = await findImportedByTeamsMeetings(
+        withUrl.map((s) => ({
+          joinWebUrl: resolutions.get(s.key)!.joinWebUrl,
+          startTime: s.start,
+        })),
+        caller
+      );
+      for (let i = 0; i < withUrl.length; i++) {
+        if (found[i]) {
+          await resolveReminderByKey(userId, 'unimported', withUrl[i]!.key, 'imported');
+        }
       }
     }
   }

@@ -88,6 +88,30 @@ export async function getMeetingCacheByMeetings(
   });
 }
 
+/** Graph resolution facts the Teams poller stashes in `raw.teamsResolution`
+ * so later sweeps skip the join-URL $filter call (spec §8.4). */
+export interface TeamsResolutionCache {
+  joinWebUrl: string;
+  organizerOid: string;
+  graphMeetingId: string;
+  /** Graph's numeric meetingCode — display/debug only. */
+  meetingCode?: string;
+}
+
+export async function getTeamsResolutionByKeys(
+  keys: string[]
+): Promise<Map<string, TeamsResolutionCache>> {
+  if (keys.length === 0) return new Map();
+  const rows = await sql<Array<{ event_key: string; res: TeamsResolutionCache | null }>>`
+    SELECT event_key, raw->'teamsResolution' AS res
+    FROM ${sql(SCHEMA)}.gmeet_meeting_cache
+    WHERE event_key = ANY(${keys})
+  `;
+  return new Map(
+    rows.filter((r) => r.res?.graphMeetingId).map((r) => [r.event_key, r.res!])
+  );
+}
+
 /**
  * Fill-gaps upsert: null inputs never clobber previously captured values —
  * a sweep that couldn't read the Doc must not erase last week's counts.
