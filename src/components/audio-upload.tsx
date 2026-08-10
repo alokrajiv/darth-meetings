@@ -29,6 +29,7 @@ import {
 } from 'lucide-react';
 import {
   getGoogleAccessToken,
+  connectGoogle,
   GoogleNotConnectedError,
 } from '@/lib/google-token';
 import type { StoredTranscript } from '@/lib/format';
@@ -645,11 +646,26 @@ export function AudioUpload({ onTranscriptCreated }: AudioUploadProps) {
                 the archive see it as the meeting it was.
               </p>
               {googleOk === false ? (
-                <p className="rounded-md border bg-muted/40 p-3 text-xs text-muted-foreground">
-                  Google isn&apos;t connected, so there&apos;s no calendar to pick from —
-                  you can connect it under the Import-from-Meet flow any time. Skipping
-                  this step.
-                </p>
+                <div className="space-y-2.5 rounded-md border bg-muted/40 p-3">
+                  <p className="text-xs text-muted-foreground">
+                    Google isn&apos;t connected yet, so there&apos;s no calendar to pick
+                    from. Connect it once and every future upload (and Meet import) can
+                    link straight to its meeting.
+                  </p>
+                  <Button
+                    size="sm"
+                    variant="outline"
+                    onClick={() => connectGoogle('/')}
+                  >
+                    <CalendarDays className="h-4 w-4" />
+                    Connect Google Calendar
+                  </Button>
+                  <p className="text-[11px] text-muted-foreground">
+                    Connecting leaves this page — you&apos;ll need to re-select the file
+                    afterwards. Or skip for now and link the calendar event later from the
+                    meeting page.
+                  </p>
+                </div>
               ) : (
                 <>
                   <div className="flex items-center gap-1">

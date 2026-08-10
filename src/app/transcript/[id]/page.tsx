@@ -157,22 +157,43 @@ export default function TranscriptDetailPage({ params }: TranscriptDetailPagePro
   const [summaryTab, setSummaryTab] = useState<'summary' | 'report'>('summary');
   const [generatingReport, setGeneratingReport] = useState(false);
 
-  // Deep-linkable tab: ?tab=report selects the report tab on load, and tab
-  // clicks keep the URL in sync so the address bar is always shareable.
+  // Deep-linkable tab: ?tab=report|summary selects on load, and tab clicks
+  // keep the URL in sync so the address bar is always shareable. When neither
+  // the URL nor a click has spoken, the detailed report — the richer read —
+  // is the default whenever one exists (see the effect below).
+  const tabExplicit = useRef(false);
   useEffect(() => {
-    if (new URLSearchParams(window.location.search).get('tab') === 'report') {
-      setSummaryTab('report');
+    const t = new URLSearchParams(window.location.search).get('tab');
+    if (t === 'report' || t === 'summary') {
+      tabExplicit.current = true;
+      setSummaryTab(t);
     }
   }, []);
   const selectSummaryTab = useCallback((tab: 'summary' | 'report') => {
+    tabExplicit.current = true;
     setSummaryTab(tab);
     const url = new URL(window.location.href);
-    if (tab === 'report') url.searchParams.set('tab', 'report');
-    else url.searchParams.delete('tab');
+    // Both values are written explicitly — with report as the default view,
+    // a bare URL must not silently flip a shared "summary" link back.
+    url.searchParams.set('tab', tab);
     window.history.replaceState(null, '', url.toString());
   }, []);
-  // Non-null = the summary predates a data change; the value is the banner text.
-  const [notesStale, setNotesStale] = useState<string | null>(null);
+  useEffect(() => {
+    if (tabExplicit.current) return;
+    if (row?.auto_report) setSummaryTab('report');
+  }, [row?.auto_report]);
+  // Data changes the AI hasn't seen yet (speaker renames, attachments,
+  // calendar link) — keyed so each source registers once. Drives both the
+  // in-tab stale banner and the glimmering nudge in the right panel.
+  const [staleReasons, setStaleReasons] = useState<Record<string, string>>({});
+  const markAiStale = useCallback((key: string, label: string) => {
+    setStaleReasons((prev) => (prev[key] === label ? prev : { ...prev, [key]: label }));
+  }, []);
+  const staleLabels = Object.values(staleReasons);
+  const notesStale =
+    staleLabels.length > 0
+      ? `Changed since the last AI run: ${staleLabels.join(', ')}. Rerun to fold them in.`
+      : null;
   const [aiStats, setAiStats] = useState<{
     latest: {
       cost_usd: string | null;
@@ -543,7 +564,31 @@ export default function TranscriptDetailPage({ params }: TranscriptDetailPagePro
         setRow((prev) =>
           prev ? { ...prev, auto_notes_status: 'running', auto_notes_error: null } : prev
         );
-        setNotesStale(null);
+        setStaleReasons({});
+        bumpActivity();
+      }
+    } finally {
+      setGeneratingNotes(false);
+    }
+  }, [transcriptId, generatingNotes, bumpActivity]);
+
+  /** Rebuild the quick summary by resuming the detailed-report session —
+   * the report run already verified frames/attachments, so the summary
+   * inherits all of it for near-cache-read cost. */
+  const handleTopUpSummary = useCallback(async () => {
+    if (generatingNotes) return;
+    setGeneratingNotes(true);
+    try {
+      const res = await fetch(`/api/transcripts/${transcriptId}/notes`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ fromReport: true }),
+      });
+      if (res.ok) {
+        setRow((prev) =>
+          prev ? { ...prev, auto_notes_status: 'running', auto_notes_error: null } : prev
+        );
+        setStaleReasons({});
         bumpActivity();
       }
     } finally {
@@ -583,6 +628,7 @@ export default function TranscriptDetailPage({ params }: TranscriptDetailPagePro
         setRow((prev) =>
           prev ? { ...prev, auto_report_status: 'running', auto_report_error: null } : prev
         );
+        setStaleReasons({});
         bumpActivity();
       }
     } finally {
@@ -1047,17 +1093,16 @@ export default function TranscriptDetailPage({ params }: TranscriptDetailPagePro
         const { speakerLabels: saved } = (await res.json()) as { speakerLabels: SpeakerLabel[] };
         setSpeakerLabels(saved);
         bumpActivity();
-        // The AI summary was written with the old speaker names — offer a
+        // The AI output was written with the old speaker names — offer a
         // one-click rerun instead of silently going stale.
-        if (row?.auto_notes)
-          setNotesStale('Speaker names changed — the summary still uses the old ones.');
+        if (row?.auto_notes || row?.auto_report) markAiStale('speakers', 'speaker names');
       } catch (err) {
         console.error('Failed to save speaker:', err);
         alert('Failed to save speaker. Reloading from server.');
         loadAll();
       }
     },
-    [speakerLabels, transcriptId, loadAll, bumpActivity, row?.auto_notes]
+    [speakerLabels, transcriptId, loadAll, bumpActivity, row?.auto_notes, row?.auto_report, markAiStale]
   );
 
   // --- find & replace: matches list, derived live from query + content + edits ---
@@ -1691,6 +1736,19 @@ export default function TranscriptDetailPage({ params }: TranscriptDetailPagePro
         Quick actions
       </div>
       <div className="mt-2 space-y-0.5">
+        {canEdit && staleLabels.length > 0 && (row.auto_notes || row.auto_report) && (
+          <Button
+            variant="ghost"
+            size="sm"
+            className="ai-glimmer h-8 w-full justify-start gap-2 text-[13px] font-medium text-primary hover:text-primary"
+            disabled={notesGenerating || generatingReport}
+            onClick={() => setNotesPromptOpen(true)}
+            title={`Changed since the last AI run: ${staleLabels.join(', ')}. One click re-runs with the new context — the AI may well decide nothing needs updating.`}
+          >
+            <Sparkles className="h-4 w-4" />
+            Tell the AI what changed
+          </Button>
+        )}
         {canEdit && (
           <Button
             variant="ghost"
@@ -2184,23 +2242,31 @@ export default function TranscriptDetailPage({ params }: TranscriptDetailPagePro
                 {!collapsedSections.aiSummary && (
                   <CardContent className="px-4 pb-4">
                     <div className="mb-3 flex items-center gap-1 rounded-lg bg-muted/60 p-0.5 text-xs w-fit">
-                      <button
-                        type="button"
-                        onClick={() => selectSummaryTab('summary')}
-                        className={`rounded-md px-2.5 py-1 font-medium transition-colors ${summaryTab === 'summary' ? 'bg-card shadow-sm' : 'text-muted-foreground hover:text-foreground'}`}
-                      >
-                        Summary
-                      </button>
-                      <button
-                        type="button"
-                        onClick={() => selectSummaryTab('report')}
-                        className={`flex items-center gap-1 rounded-md px-2.5 py-1 font-medium transition-colors ${summaryTab === 'report' ? 'bg-card shadow-sm' : 'text-muted-foreground hover:text-foreground'}`}
-                      >
-                        Detailed report
-                        {row.auto_report_status === 'running' && (
-                          <RefreshCw className="h-3 w-3 animate-spin text-muted-foreground" />
-                        )}
-                      </button>
+                      {/* The richer read leads once it exists: report tab first. */}
+                      {[
+                        {
+                          key: 'report' as const,
+                          label: 'Detailed report',
+                          spinning: row.auto_report_status === 'running',
+                        },
+                        { key: 'summary' as const, label: 'Summary', spinning: false },
+                      ]
+                        .sort((a, b) =>
+                          row.auto_report ? (a.key === 'report' ? -1 : 1) : a.key === 'summary' ? -1 : 1
+                        )
+                        .map((t) => (
+                          <button
+                            key={t.key}
+                            type="button"
+                            onClick={() => selectSummaryTab(t.key)}
+                            className={`flex items-center gap-1 rounded-md px-2.5 py-1 font-medium transition-colors ${summaryTab === t.key ? 'bg-card shadow-sm' : 'text-muted-foreground hover:text-foreground'}`}
+                          >
+                            {t.label}
+                            {t.spinning && (
+                              <RefreshCw className="h-3 w-3 animate-spin text-muted-foreground" />
+                            )}
+                          </button>
+                        ))}
                     </div>
                     {summaryTab === 'report' ? (
                       row.auto_report_status === 'running' ? (
@@ -2210,6 +2276,7 @@ export default function TranscriptDetailPage({ params }: TranscriptDetailPagePro
                           ))}
                           <p className="pt-1 text-xs text-muted-foreground">
                             Writing the detailed report — high effort, and it reads the video frames, so give it a few minutes.
+                            The quick summary refreshes right after, distilled from the same session.
                           </p>
                         </div>
                       ) : row.auto_report ? (
@@ -2311,6 +2378,35 @@ export default function TranscriptDetailPage({ params }: TranscriptDetailPagePro
                         </Button>
                       </div>
                     )}
+                    {/* A completed report holds more verified context (frames,
+                        docs) than this summary saw — offer the one-click
+                        distillation whenever the report is the newer artifact. */}
+                    {!notesStale &&
+                      canEdit &&
+                      row.auto_notes &&
+                      row.auto_notes_status !== 'running' &&
+                      row.auto_report &&
+                      row.auto_report_at &&
+                      (!row.auto_notes_at ||
+                        new Date(row.auto_report_at) > new Date(row.auto_notes_at)) && (
+                        <div className="mb-3 flex items-center justify-between gap-2 rounded-md border bg-muted/60 px-3 py-2 text-xs">
+                          <span className="text-muted-foreground">
+                            A newer detailed report exists — this summary can be rebuilt from
+                            everything the AI verified there
+                            {hasLocalVideo ? ' (video frames included)' : ''}.
+                          </span>
+                          <Button
+                            variant="ghost"
+                            size="sm"
+                            className="h-6 shrink-0 text-[11px] text-primary hover:text-primary"
+                            disabled={generatingNotes}
+                            onClick={() => void handleTopUpSummary()}
+                          >
+                            <Sparkles className="h-3 w-3" />
+                            Top up summary
+                          </Button>
+                        </div>
+                      )}
                     {row.auto_notes_status === 'running' ? (
                       <div className="space-y-2 py-2">
                         {['90%', '100%', '80%', '95%', '60%'].map((w, i) => (
@@ -2353,6 +2449,19 @@ export default function TranscriptDetailPage({ params }: TranscriptDetailPagePro
                             >
                               <RefreshCw className="h-3 w-3" />
                               Regenerate
+                            </Button>
+                          )}
+                          {canEdit && row.auto_report && (
+                            <Button
+                              variant="ghost"
+                              size="sm"
+                              className="h-7 text-xs"
+                              disabled={generatingNotes}
+                              title="Rebuild this summary from the detailed-report session — it reuses the video frames and documents the AI already verified there"
+                              onClick={() => void handleTopUpSummary()}
+                            >
+                              <Sparkles className="h-3 w-3" />
+                              Top up from report
                             </Button>
                           )}
                           {row.auto_notes_at && (
@@ -2412,6 +2521,25 @@ export default function TranscriptDetailPage({ params }: TranscriptDetailPagePro
                             >
                               Review speakers now
                             </Button>
+                          </>
+                        ) : row.auto_report ? (
+                          <>
+                            <p className="text-sm text-muted-foreground">No summary yet.</p>
+                            <Button
+                              size="sm"
+                              className="mt-3"
+                              disabled={generatingNotes}
+                              onClick={() => void handleTopUpSummary()}
+                            >
+                              <Sparkles className="h-4 w-4" />
+                              Summarize from the detailed report
+                            </Button>
+                            <p className="mt-2 max-w-[46ch] text-xs text-muted-foreground">
+                              The detailed report already verified this meeting&apos;s context
+                              {hasLocalVideo ? ' — video frames included' : ''} — the quick
+                              summary distills straight from that session, so it&apos;s fast
+                              and cheap.
+                            </p>
                           </>
                         ) : (
                           <>
@@ -2701,7 +2829,11 @@ export default function TranscriptDetailPage({ params }: TranscriptDetailPagePro
               <AttachmentPanel
                 transcriptId={row.assemblyai_id}
                 canEdit={canEdit}
-                onChanged={bumpActivity}
+                onChanged={() => {
+                  bumpActivity();
+                  if (row.auto_notes || row.auto_report)
+                    markAiStale('attachments', 'attached context files');
+                }}
               />
             </div>
           </aside>
@@ -2816,6 +2948,13 @@ export default function TranscriptDetailPage({ params }: TranscriptDetailPagePro
                 Optional instructions steer whichever you pick — tone, depth, focus, or language.
               </DialogDescription>
             </DialogHeader>
+            {staleLabels.length > 0 && (
+              <p className="rounded-md border border-primary/30 bg-primary/5 px-3 py-2 text-xs text-muted-foreground">
+                <Sparkles className="mr-1.5 inline h-3.5 w-3.5 text-primary" />
+                New since the last run: <span className="font-medium text-foreground">{staleLabels.join(', ')}</span>.
+                The AI folds these in — it may decide nothing needs changing.
+              </p>
+            )}
             <Textarea
               value={notesInstructions}
               onChange={(e) => setNotesInstructions(e.target.value)}
@@ -2952,10 +3091,9 @@ export default function TranscriptDetailPage({ params }: TranscriptDetailPagePro
             bumpActivity();
             // Attendees / meeting metadata just changed — the existing
             // summary doesn't know about them. Offer a rerun, never auto-run.
-            if (row?.auto_notes)
-              setNotesStale(
-                'Calendar event linked — attendees and meeting data changed since this summary was generated.'
-              );
+            // (The AI can map calendar attendees to speaker names.)
+            if (row?.auto_notes || row?.auto_report)
+              markAiStale('calendar', 'the linked calendar event (attendees, title, time)');
           }}
         />
 

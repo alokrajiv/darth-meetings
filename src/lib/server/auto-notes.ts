@@ -98,6 +98,33 @@ Rules: do not invent facts, names, or dates not in the transcript/frames/attachm
 
 `;
 
+/**
+ * Summary distilled FROM the detailed-report session: the report run already
+ * verified frames, attachments, and cross-references — resuming that session
+ * gives the quick tier all of it for the price of a cache read. The envelope
+ * spec is restated in full because the report session never saw it.
+ */
+const SUMMARY_FROM_REPORT_PROMPT = `You recently wrote the DETAILED REPORT for this meeting in this session — the transcript, the attached context, and any video frames you examined are all in your context. Now distill the QUICK SUMMARY tier from everything you verified while writing it. The summary is the fast, clean read; deep detail stays in the report.
+
+The FIRST line of your output must be exactly:
+TITLE: <a short, specific meeting title, max 60 characters, no quotes>
+
+The SECOND line must be exactly:
+SPEAKERS: <single-line JSON object, or {} if none>
+Identify unnamed speakers ONLY from clear evidence already in your context (transcript text, frames you actually saw). Keys are the raw speaker letters; values are {"name": "...", "evidence": "<short quote or reason>"}. Do not repeat speakers already identified in the context below, and never invent a name.
+
+The THIRD line must be exactly:
+SEGMENTS: <single-line JSON array>
+Divide the meeting into 3-8 topical segments. Each entry is {"t": "<m:ss timestamp of the utterance where the segment starts>", "title": "<3-6 word section heading>"}. The first segment starts at 0:00.
+
+Then a blank line, then the notes.
+
+Write concise meeting notes in Markdown with these sections (omit a section if the meeting genuinely has nothing for it): ## Summary (2-4 sentences), ## Key Points (grouped by topic, positions attributed by name), ## Decisions, ## Action Items ("**Owner** — action (deadline if mentioned)"), ## Open Questions.
+
+Rules: the same facts discipline as the report — nothing that isn't in the transcript/frames/attachments. Use the real speaker names from the context. Keep the notes under 600 words. NO images and NO embedded frames — this is the text-only quick tier. You may attach a timestamp link to at most ~6 pivotal moments using EXACTLY this markdown form: [m:ss](t:<millisecond offset>) — e.g. [6:59](t:419000). Output ONLY the TITLE line, the SPEAKERS line, the SEGMENTS line, and the markdown notes — no preamble.
+
+`;
+
 const VIDEO_CONTEXT = `
 THIS MEETING HAS VIDEO and you have the grab_frames tool (batch several timestamps per call). Use the workflow described above: locate screen-share moments from the transcript, look at real frames, embed the informative ones as ![caption](frame:<ms>).
 
@@ -390,14 +417,22 @@ export async function generateAutoNotes(
     /** Free-form user steering for THIS run ("be very detailed", "focus on
      * action items", …). Appended to the prompt; not persisted. */
     instructions?: string;
+    /** Distill the summary by resuming the latest completed DETAILED-REPORT
+     * session (frames and all) instead of a plain notes run. Falls back to a
+     * fresh full run if no report session is available. Implies force. */
+    fromReport?: boolean;
+    /** Known report session id (the in-process handoff right after a report
+     * run) — skips the ai_runs lookup, which may not have committed yet. */
+    reportSessionId?: string;
   } = {}
 ): Promise<void> {
   const key = `${ownerUserId}:${assemblyaiId}`;
   if (inFlight.has(key)) return;
 
+  const force = opts.force || opts.fromReport;
   const row = await getForUser(ownerUserId, assemblyaiId);
   if (!row || row.status !== 'completed') return;
-  if (!opts.force && (row.auto_notes_status === 'completed' || row.auto_notes_status === 'running')) {
+  if (!force && (row.auto_notes_status === 'completed' || row.auto_notes_status === 'running')) {
     return;
   }
 
@@ -437,14 +472,23 @@ export async function generateAutoNotes(
     // Prompt regime change (quick summary went back to clean/no-frames):
     // don't resume sessions whose notes still carry embedded frames.
     const staleFormat = (row.auto_notes ?? '').includes('/frames/');
-    const priorSessionId = opts.force && !staleFormat ? await getLatestSessionId(row.id) : null;
-    const topUpPrompt =
-      `The meeting data has been updated since you generated these notes (speaker identifications, attached context files, or the team directory may have changed). Regenerate the notes now, following EXACTLY the same output format as before: the TITLE line, the SPEAKERS line, the SEGMENTS line, a blank line, then the markdown notes.\n\n` +
+    const priorSessionId = opts.fromReport
+      ? (opts.reportSessionId ?? (await getLatestSessionId(row.id, 'auto_report')))
+      : force && !staleFormat
+        ? await getLatestSessionId(row.id, 'auto_notes')
+        : null;
+    // Context refresher appended to either resume prompt: for an older
+    // report session, speakers/attachments may have moved on since.
+    const currentContext =
       `Current context (supersedes earlier versions; the transcript itself is unchanged):\n\n` +
       styleContext +
       attachmentContext +
       peopleContext +
       speakerContext.replace(/Transcript follows:\n\n$/, '');
+    const topUpPrompt = opts.fromReport
+      ? SUMMARY_FROM_REPORT_PROMPT + currentContext
+      : `The meeting data has been updated since you generated these notes (speaker identifications, attached context files, or the team directory may have changed). Regenerate the notes now, following EXACTLY the same output format as before: the TITLE line, the SPEAKERS line, the SEGMENTS line, a blank line, then the markdown notes.\n\n` +
+        currentContext;
 
     const started = Date.now();
     let raw: string;
@@ -970,6 +1014,18 @@ export async function generateAutoReport(
       report,
       error: null,
     });
+
+    // The report pass verified far more than the summary tier ever sees
+    // (frames, attachments, cross-references). Distill/refresh the quick
+    // summary from the same session so both tiers agree — mostly a cache
+    // read. Fire-and-forget; a summary failure never fails the report.
+    void generateAutoNotes(ownerUserId, assemblyaiId, {
+      fromReport: true,
+      reportSessionId: run.meta.sessionId ?? undefined,
+      triggeredBy: opts.triggeredBy,
+    }).catch((err) =>
+      console.warn(`[auto-report] ${assemblyaiId}: follow-up summary failed:`, err)
+    );
   } catch (err) {
     console.error(`[auto-report] ${assemblyaiId}: failed:`, err);
     void recordAiRun({

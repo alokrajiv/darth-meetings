@@ -133,13 +133,22 @@ export async function getRunsForTranscript(
   };
 }
 
-/** Latest completed session id for a transcript — the --resume anchor. */
-export async function getLatestSessionId(transcriptId: number): Promise<string | null> {
+/**
+ * Latest completed session id for a transcript — the --resume anchor.
+ * Pass `kind` to anchor on a specific run type: a summary top-up must
+ * resume a session that actually holds the summary conversation, not
+ * whatever ran last (speaker-ID, report, …).
+ */
+export async function getLatestSessionId(
+  transcriptId: number,
+  kind?: AiRunKind
+): Promise<string | null> {
   const rows = await sql<Array<{ session_id: string | null }>>`
     SELECT session_id FROM ${sql(SCHEMA)}.ai_runs
     WHERE transcript_id = ${transcriptId}
       AND status = 'completed'
       AND session_id IS NOT NULL
+      ${kind ? sql`AND kind = ${kind}` : sql``}
     ORDER BY created_at DESC
     LIMIT 1
   `;

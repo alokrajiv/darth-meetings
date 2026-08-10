@@ -17,14 +17,18 @@ export const runtime = 'nodejs';
 export const POST = withAuth(async ({ user, request }, { params }) => {
   const { id } = await params;
 
-  // Optional body: { instructions?: string } — free-form steering for this
-  // regeneration ("be very detailed", "focus on decisions", …).
+  // Optional body: { instructions?: string, fromReport?: boolean } —
+  // free-form steering, and/or "distill from the detailed-report session"
+  // (the top-up path when a report exists: reuses the frames/context that
+  // session already verified).
   let instructions: string | undefined;
+  let fromReport = false;
   try {
-    const body = (await request.json()) as { instructions?: unknown };
+    const body = (await request.json()) as { instructions?: unknown; fromReport?: unknown };
     if (typeof body.instructions === 'string' && body.instructions.trim()) {
       instructions = body.instructions.trim().slice(0, 2000);
     }
+    if (body.fromReport === true) fromReport = true;
   } catch {
     // no/invalid body — plain regeneration
   }
@@ -45,6 +49,7 @@ export const POST = withAuth(async ({ user, request }, { params }) => {
 
   void generateAutoNotes(access.ownerUserId, id, {
     force: true,
+    fromReport,
     triggeredBy: { userId: user.userId, email: user.email },
     instructions,
   });
