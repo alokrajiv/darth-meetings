@@ -602,14 +602,45 @@ export async function setRecordedAtForUser(
 export async function mergeGmeetContextForUser(
   userId: string,
   assemblyaiId: string,
-  patch: Partial<GmeetContext>
+  patch: Partial<GmeetContext>,
+  opts?: {
+    /** Skip the SSE fan-out — for bookkeeping writes (poller heartbeats)
+     * that shouldn't make every open page re-fetch. */
+    quiet?: boolean;
+  }
 ): Promise<void> {
   await sql`
     UPDATE ${sql(SCHEMA)}.transcripts
     SET gmeet_context = COALESCE(gmeet_context, '{}'::jsonb) || ${sql.json(patch as unknown as never)}
     WHERE user_id = ${userId} AND assemblyai_id = ${assemblyaiId}
   `;
-  publishEvent({ kind: 'meta', assemblyaiId });
+  if (!opts?.quiet) publishEvent({ kind: 'meta', assemblyaiId });
+}
+
+/**
+ * Rows waiting on Google to finish generating a Meet recording file
+ * (gmeet_context.recordingPending.status = 'waiting'). Sequential scan over
+ * the jsonb is fine at this table's size; oldest first so long-waiting rows
+ * aren't starved by fresh imports.
+ */
+export async function listRecordingPendingRows(limit: number): Promise<
+  Array<{
+    id: number;
+    user_id: string;
+    assemblyai_id: string;
+    gmeet_context: GmeetContext;
+  }>
+> {
+  return sql<
+    Array<{ id: number; user_id: string; assemblyai_id: string; gmeet_context: GmeetContext }>
+  >`
+    SELECT id, user_id, assemblyai_id, gmeet_context
+    FROM ${sql(SCHEMA)}.transcripts
+    WHERE gmeet_context->'recordingPending'->>'status' = 'waiting'
+      AND local_audio_path IS NULL
+    ORDER BY created_at ASC
+    LIMIT ${limit}
+  `;
 }
 
 export async function touchLastAccessedForUser(

@@ -143,6 +143,18 @@ export interface GmeetContext {
   attendees?: GmeetAttendee[];
   videoFileId?: string;
   transcriptDocId?: string;
+  /** Set at import time when Meet listed a recording whose file Google was
+   * still generating (state ENDED, no Drive id yet). The recording poller
+   * re-checks every minute and attaches the video when it lands; `status`
+   * leaves 'waiting' exactly once. */
+  recordingPending?: {
+    recordName: string;
+    since: string;
+    lastCheckedAt?: string;
+    attempts?: number;
+    status: 'waiting' | 'fetched' | 'gone' | 'gave-up';
+    resolvedAt?: string;
+  } | null;
   meetTranscript?: {
     attendees: string[];
     utterances: MeetUtterance[];

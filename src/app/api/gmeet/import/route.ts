@@ -263,6 +263,23 @@ export const POST = withAuth(async ({ user, request }) => {
   // The Doc id the client sent, else whatever the actuals capture found.
   const effectiveDocId = transcriptDocId ?? actuals?.transcriptDocIds?.[0] ?? null;
 
+  // Meet listed a recording but Google hasn't generated its file yet (call
+  // just ended). Mark the row so the recording poller re-checks and attaches
+  // the video once it lands — without this, a quick import done minutes after
+  // the call permanently believes the meeting had no recording.
+  const recordingPending: GmeetContext['recordingPending'] =
+    !sourceRow && // re-runs reuse a FROZEN snapshot — its gaps aren't news
+    !videoFileId &&
+    actuals?.conferenceRecordName &&
+    (actuals.recordings?.length ?? 0) > 0 &&
+    !actuals.recordings!.some((r) => r.fileId)
+      ? {
+          recordName: actuals.conferenceRecordName,
+          since: new Date().toISOString(),
+          status: 'waiting',
+        }
+      : undefined;
+
   const baseContext: GmeetContext = {
     eventId: event.id,
     recurringEventId: event.recurringEventId,
@@ -275,6 +292,7 @@ export const POST = withAuth(async ({ user, request }) => {
     attendees,
     videoFileId: videoFileId ?? undefined,
     transcriptDocId: effectiveDocId ?? undefined,
+    recordingPending,
     actuals,
   };
 

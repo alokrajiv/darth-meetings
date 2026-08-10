@@ -8,5 +8,7 @@ export async function register() {
     startAutoNotesSweeper();
     const { startGmeetPoller } = await import('@/lib/server/gmeet-poller');
     startGmeetPoller();
+    const { startRecordingPoller } = await import('@/lib/server/recording-poller');
+    startRecordingPoller();
   }
 }

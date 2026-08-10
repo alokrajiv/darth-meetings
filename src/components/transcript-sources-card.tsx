@@ -63,6 +63,14 @@ export function TranscriptSourcesCard({
   const hasAudio =
     audioAvailable && !!(row.local_audio_path || row.audio_url || row.source === 'uploaded');
   const recordingFileId = ctx?.videoFileId ?? ctx?.actuals?.recordings?.[0]?.fileId;
+  // Meet recorded the meeting but Google hadn't finished the file at import
+  // time — the server re-checks every minute and attaches it automatically.
+  const recordingProcessing =
+    !row.local_audio_path && !recordingFileId && ctx?.recordingPending?.status === 'waiting';
+  const recordingNeverCame =
+    !row.local_audio_path &&
+    !recordingFileId &&
+    (ctx?.recordingPending?.status === 'gone' || ctx?.recordingPending?.status === 'gave-up');
   const canFetchAudio = !hasAudio && !row.local_audio_path && !!recordingFileId && canEdit;
   // Text-only imports (Teams export, pasted transcript, …) with no known
   // recording anywhere: offer to upload the meeting's audio/video and run a
@@ -242,6 +250,21 @@ export function TranscriptSourcesCard({
             ) : recordingFileId ? (
               <span className="text-muted-foreground">
                 No recording stored — the video is on Drive
+              </span>
+            ) : recordingProcessing ? (
+              <span className="text-amber-600 dark:text-amber-500">
+                <span className="font-medium">
+                  Meet recorded this meeting — Google is still preparing the video.
+                </span>{' '}
+                <span className="inline-flex items-center gap-1">
+                  <Loader2 className="h-3 w-3 animate-spin" />
+                  We check every minute and attach it automatically when it lands.
+                </span>
+              </span>
+            ) : recordingNeverCame ? (
+              <span className="text-muted-foreground">
+                Meet recorded this meeting, but the video never appeared on Drive — it may
+                not have been saved
               </span>
             ) : (
               <span className="text-muted-foreground">
