@@ -80,18 +80,25 @@ export async function saveAudioBytes(filename: string, data: Buffer | Uint8Array
  *
  * Returns the temp filename (relative, like all stored filenames) and the
  * byte count actually written.
+ *
+ * `opts.tempFilename` pins the temp name (the upload route derives it from
+ * the placeholder row's uuid so the stale-upload sweeper can find the file);
+ * `opts.onProgress` fires with the running byte count on every chunk — the
+ * caller throttles.
  */
 export async function saveAudioStreamToTemp(
-  stream: ReadableStream<Uint8Array>
+  stream: ReadableStream<Uint8Array>,
+  opts?: { tempFilename?: string; onProgress?: (bytes: number) => void }
 ): Promise<{ tempFilename: string; bytes: number }> {
   await ensureAudioDir();
-  const tempFilename = `upload-${randomUUID()}.part`;
+  const tempFilename = opts?.tempFilename ?? `upload-${randomUUID()}.part`;
   const abs = resolveAudioPath(tempFilename);
 
   let bytes = 0;
   const counter = new Transform({
     transform(chunk: Buffer, _enc, cb) {
       bytes += chunk.length;
+      opts?.onProgress?.(bytes);
       cb(null, chunk);
     },
   });

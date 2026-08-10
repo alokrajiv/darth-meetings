@@ -93,6 +93,8 @@ export async function listVisibleToUser(
            t.created_at, t.completed_at, t.duration, t.speaker_count,
            t.language_code, t.title, t.description, t.last_accessed,
            t.source, t.recorded_at, t.auto_notes_status,
+           t.upload_bytes_received::float8 AS upload_bytes_received,
+           t.upload_bytes_total::float8 AS upload_bytes_total,
            CASE
              WHEN t.user_id = ${userId} THEN 'owner'
              ELSE s.access
@@ -175,6 +177,109 @@ export async function createForUser(
   `;
   publishEvent({ kind: 'created', assemblyaiId: data.assemblyaiId });
   return rows[0]!;
+}
+
+export interface UploadingPlaceholderInsert {
+  /** Synthetic `up-<uuid>` id — rewritten to the real AAI id on promote. */
+  placeholderId: string;
+  originalFilename: string | null;
+  languageCode?: string | null;
+  title?: string | null;
+  gmeetContext?: GmeetContext | null;
+  /** Content-Length of the incoming body; null when the client omitted it. */
+  bytesTotal?: number | null;
+}
+
+/**
+ * Create the row for an upload whose bytes are still arriving. Exists so the
+ * upload is visible (to the owner AND anyone auto-shared) from the first
+ * byte, not only once AAI accepts the job. `upload_progress_at` starts
+ * ticking immediately so the stale-upload sweeper can reap orphans.
+ */
+export async function createUploadingPlaceholder(
+  userId: string,
+  data: UploadingPlaceholderInsert
+): Promise<TranscriptRow> {
+  const rows = await sql<TranscriptRow[]>`
+    INSERT INTO ${sql(SCHEMA)}.transcripts (
+      user_id, assemblyai_id, original_filename, status, language_code, title,
+      source, gmeet_context, upload_bytes_received, upload_bytes_total,
+      upload_progress_at
+    ) VALUES (
+      ${userId}, ${data.placeholderId}, ${data.originalFilename ?? null},
+      'uploading', ${data.languageCode ?? null}, ${data.title ?? null},
+      'uploaded',
+      ${data.gmeetContext ? sql.json(data.gmeetContext as unknown as never) : null},
+      0, ${data.bytesTotal ?? null}, now()
+    )
+    RETURNING *
+  `;
+  publishEvent({ kind: 'created', assemblyaiId: data.placeholderId });
+  return rows[0]!;
+}
+
+/**
+ * Debounced progress write during the byte stream. Called with `bytes` it
+ * also notifies listing pages over SSE; called without (the heartbeat used
+ * during the AAI re-upload leg, where byte count no longer moves) it only
+ * bumps `upload_progress_at` so the sweeper knows the upload is alive.
+ */
+export async function updateUploadProgress(
+  userId: string,
+  placeholderId: string,
+  bytesReceived?: number
+): Promise<void> {
+  await sql`
+    UPDATE ${sql(SCHEMA)}.transcripts
+    SET upload_bytes_received = COALESCE(${bytesReceived ?? null}, upload_bytes_received),
+        upload_progress_at = now()
+    WHERE user_id = ${userId} AND assemblyai_id = ${placeholderId} AND status = 'uploading'
+  `;
+  if (bytesReceived !== undefined) {
+    publishEvent({ kind: 'status', assemblyaiId: placeholderId });
+  }
+}
+
+/**
+ * Swap the placeholder's synthetic id for the real AAI id once the
+ * transcription is accepted. Shares survive (they key on the numeric row id).
+ * Returns null when the row is gone — e.g. the sweeper reaped it as stale —
+ * so the caller can fall back to a fresh insert.
+ */
+export async function promoteUploadingRow(
+  userId: string,
+  placeholderId: string,
+  data: { assemblyaiId: string; status: string; audioUrl?: string | null }
+): Promise<TranscriptRow | null> {
+  const rows = await sql<TranscriptRow[]>`
+    UPDATE ${sql(SCHEMA)}.transcripts
+    SET assemblyai_id = ${data.assemblyaiId},
+        status = ${data.status},
+        audio_url = ${data.audioUrl ?? null}
+    WHERE user_id = ${userId} AND assemblyai_id = ${placeholderId} AND status = 'uploading'
+    RETURNING *
+  `;
+  if (rows[0]) publishEvent({ kind: 'status', assemblyaiId: data.assemblyaiId });
+  return rows[0] ?? null;
+}
+
+/**
+ * Uploads whose heartbeat went quiet — closed tab, network drop, or pm2
+ * restart mid-stream. Nothing is recoverable (the byte stream is gone), so
+ * the sweeper deletes row + temp file.
+ */
+export async function listStaleUploads(
+  stallMinutes: number,
+  limit: number
+): Promise<Array<{ user_id: string; assemblyai_id: string }>> {
+  return sql<Array<{ user_id: string; assemblyai_id: string }>>`
+    SELECT user_id, assemblyai_id
+    FROM ${sql(SCHEMA)}.transcripts
+    WHERE status = 'uploading'
+      AND COALESCE(upload_progress_at, created_at) < now() - make_interval(mins => ${stallMinutes})
+    ORDER BY created_at ASC
+    LIMIT ${limit}
+  `;
 }
 
 /**

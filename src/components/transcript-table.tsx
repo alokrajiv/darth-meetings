@@ -14,6 +14,7 @@ import { Button } from '@/components/ui/button';
 import { Badge } from '@/components/ui/badge';
 import { Input } from '@/components/ui/input';
 import {
+  formatBytes,
   formatDuration,
   formatSmartDate,
   type TranscriptListRow,
@@ -304,6 +305,8 @@ export function TranscriptTable({ refreshTrigger, toolbarExtra }: TranscriptTabl
         return <span className={`${base} bg-status-ok`} aria-label="Completed" />;
       case 'processing':
         return <span className={`${base} bg-status-busy animate-pulse`} aria-label="Processing" />;
+      case 'uploading':
+        return <span className={`${base} bg-primary animate-pulse`} aria-label="Uploading" />;
       case 'queued':
         return <span className={`${base} bg-muted-foreground/40`} aria-label="Queued" />;
       case 'error':
@@ -348,6 +351,21 @@ export function TranscriptTable({ refreshTrigger, toolbarExtra }: TranscriptTabl
         </Badge>
       </span>
     );
+  };
+
+  /** Live progress line for rows mid-upload: server-persisted byte counts,
+   * refreshed by the SSE 'status' events the upload route publishes. */
+  const uploadProgressLine = (t: TranscriptListRow): string => {
+    const received = Number(t.upload_bytes_received ?? 0);
+    const total = Number(t.upload_bytes_total ?? 0);
+    if (total > 0 && received >= total) {
+      return 'upload received — handing off to transcription…';
+    }
+    if (total > 0) {
+      const pct = Math.min(99, Math.floor((received / total) * 100));
+      return `uploading — ${pct}% · ${formatBytes(received)} of ${formatBytes(total)}`;
+    }
+    return received > 0 ? `uploading — ${formatBytes(received)} so far` : 'uploading…';
   };
 
   const titleOf = (
@@ -691,11 +709,19 @@ export function TranscriptTable({ refreshTrigger, toolbarExtra }: TranscriptTabl
               {filtered.map((t) => {
                 const { primary, secondary, untitled } = titleOf(t);
                 const processing = t.status === 'processing' || t.status === 'queued';
+                // Placeholder rows have a synthetic `up-…` id — there is no
+                // detail page to open until the upload finishes and the row
+                // is promoted to its real AAI id.
+                const uploading = t.status === 'uploading';
                 return (
                   <TableRow
                     key={t.id}
-                    onClick={() => router.push(`/transcript/${t.assemblyai_id}`)}
-                    className="group cursor-pointer transition-colors hover:bg-accent/40"
+                    onClick={() => {
+                      if (!uploading) router.push(`/transcript/${t.assemblyai_id}`);
+                    }}
+                    className={`group transition-colors hover:bg-accent/40 ${
+                      uploading ? 'cursor-default' : 'cursor-pointer'
+                    }`}
                   >
                     <TableCell className="py-1.5">
                       <div className="flex min-w-0 items-center gap-2">
@@ -730,11 +756,15 @@ export function TranscriptTable({ refreshTrigger, toolbarExtra }: TranscriptTabl
                           <div
                             className={`truncate text-sm font-medium ${
                               untitled ? 'italic text-muted-foreground' : ''
-                            } ${processing ? 'text-shimmer' : ''}`}
+                            } ${processing || uploading ? 'text-shimmer' : ''}`}
                           >
                             {primary}
                           </div>
-                          {processing ? (
+                          {uploading ? (
+                            <div className="truncate font-mono text-[11px] text-muted-foreground">
+                              {uploadProgressLine(t)}
+                            </div>
+                          ) : processing ? (
                             <div className="truncate font-mono text-[11px] text-muted-foreground">
                               transcribing… — open it to share or link the calendar event
                             </div>
@@ -774,7 +804,7 @@ export function TranscriptTable({ refreshTrigger, toolbarExtra }: TranscriptTabl
                     ))}
                     <TableCell className="py-1.5 pr-3">
                       <div className="flex items-center justify-end gap-0.5">
-                        {t.access === 'owner' && (
+                        {t.access === 'owner' && !uploading && (
                           <Button
                             size="sm"
                             variant="ghost"

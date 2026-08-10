@@ -1,5 +1,11 @@
 import 'server-only';
-import { listNotesBacklog, listSpeakerIdBacklog } from '@/db-ops/transcripts';
+import {
+  deleteForUser,
+  listNotesBacklog,
+  listSpeakerIdBacklog,
+  listStaleUploads,
+} from '@/db-ops/transcripts';
+import { deleteAudioFile } from '@/lib/server/audio-storage';
 import { generateAutoNotes, identifySpeakers } from '@/lib/server/auto-notes';
 
 /**
@@ -20,10 +26,28 @@ const SWEEP_MS = 5 * 60 * 1000;
 const GRACE_MINUTES = 10;
 const STUCK_MINUTES = 30;
 const MAX_PER_SWEEP = 2;
+// Live uploads heartbeat upload_progress_at every ~2s (byte stream) or 60s
+// (AAI re-upload leg); 15 quiet minutes means the handler is dead — closed
+// tab, network drop, or pm2 restart. Nothing is resumable, so delete.
+const UPLOAD_STALL_MINUTES = 15;
 
 let started = false;
 
 async function sweep(): Promise<void> {
+  try {
+    const stale = await listStaleUploads(UPLOAD_STALL_MINUTES, 10);
+    for (const s of stale) {
+      console.log(`[notes-sweeper] reaping orphaned upload ${s.assemblyai_id}`);
+      // Temp file shares the placeholder's uuid: up-<uuid> ↔ upload-<uuid>.part
+      await deleteAudioFile(`upload-${s.assemblyai_id.slice(3)}.part`);
+      await deleteForUser(s.user_id, s.assemblyai_id).catch((err) =>
+        console.warn(`[notes-sweeper] stale upload delete failed ${s.assemblyai_id}:`, err)
+      );
+    }
+  } catch (err) {
+    console.warn('[notes-sweeper] stale-upload query failed:', err);
+  }
+
   try {
     const idBacklog = await listSpeakerIdBacklog(GRACE_MINUTES, STUCK_MINUTES, MAX_PER_SWEEP);
     if (idBacklog.length > 0) {

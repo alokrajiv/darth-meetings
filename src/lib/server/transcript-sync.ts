@@ -15,7 +15,9 @@ export async function refreshIfPending(
   userId: string,
   row: TranscriptRow
 ): Promise<TranscriptRow> {
-  if (row.status === 'completed' || row.status === 'error') {
+  // 'uploading' rows have a synthetic `up-…` id that AAI has never heard of —
+  // nothing to refresh until the upload route promotes them.
+  if (row.status === 'completed' || row.status === 'error' || row.status === 'uploading') {
     return row;
   }
 

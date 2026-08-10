@@ -52,6 +52,11 @@ export interface StoredTranscript {
   speaker_id_status: string | null;
   speaker_id_error: string | null;
   speaker_id_at: string | null;
+  /** Live upload progress (status 'uploading' only): bytes landed on the
+   * server so far / Content-Length total (null when the client didn't send
+   * one). Written debounced during the stream, stale afterwards. */
+  upload_bytes_received: number | null;
+  upload_bytes_total: number | null;
 }
 
 /** One invitee of the source calendar event (Google Meet import). */
@@ -188,6 +193,8 @@ export interface TranscriptListRow {
   source: 'uploaded' | 'imported';
   recorded_at: string | null;
   auto_notes_status: string | null;
+  upload_bytes_received: number | null;
+  upload_bytes_total: number | null;
   access: TranscriptAccess;
   owner_email: string | null;
   owner_name: string | null;
@@ -321,6 +328,15 @@ export interface TranscriptResponse {
     confidence: number;
     speaker?: string;
   }>;
+}
+
+/** "512 MB", "1.2 GB" — for upload sizes/progress in the listing. */
+export function formatBytes(bytes: number): string {
+  if (!Number.isFinite(bytes) || bytes <= 0) return '0 B';
+  const units = ['B', 'KB', 'MB', 'GB'];
+  const i = Math.min(units.length - 1, Math.floor(Math.log(bytes) / Math.log(1024)));
+  const v = bytes / 1024 ** i;
+  return `${v >= 100 || i === 0 ? Math.round(v) : v.toFixed(1)} ${units[i]}`;
 }
 
 export function formatDuration(seconds: number): string {

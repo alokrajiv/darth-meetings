@@ -1,10 +1,14 @@
 import { NextResponse } from 'next/server';
 import { withAuth } from '@/lib/auth/with-auth';
 import {
+  createUploadingPlaceholder,
+  deleteForUser,
   listVisibleToUser,
   setRecordedAtForUser,
   updateStatusForUser,
+  updateUploadProgress,
 } from '@/db-ops/transcripts';
+import { autoShareToInternalInvitees } from '@/lib/server/auto-share';
 import { resolveAccess } from '@/db-ops/transcript-access';
 import { getTranscript } from '@/lib/server/assemblyai';
 import {
@@ -75,8 +79,12 @@ export const GET = withAuth(async ({ user }) => {
   // skip the network hop entirely — refreshIfPending short-circuits on
   // `status === 'completed'`. So for a list of 36 finished transcripts
   // this is still a pure-DB call.
+  // 'uploading' rows are placeholders with synthetic `up-…` ids — AAI has
+  // never heard of them, so they must not join the refresh fan-out.
   const pendingIdx = rows
-    .map((r, i) => (r.status === 'completed' || r.status === 'error' ? -1 : i))
+    .map((r, i) =>
+      r.status === 'completed' || r.status === 'error' || r.status === 'uploading' ? -1 : i
+    )
     .filter((i) => i >= 0);
 
   if (pendingIdx.length > 0) {
@@ -142,10 +150,54 @@ export const GET = withAuth(async ({ user }) => {
 export const POST = withAuth(async ({ user, request }) => {
   const contentType = request.headers.get('content-type') ?? '';
 
+  // Upload-media stepper extras ride in headers/query, so they're available
+  // BEFORE the body is consumed — the live-visibility placeholder row needs
+  // the linked event's title and invitees up front.
+  const linkedEvent = parseLinkedEventHeader(request.headers.get('x-linked-event'));
+  const rawPref = request.nextUrl.searchParams.get('report_pref');
+  const reportPref =
+    rawPref && REPORT_PREFS.has(rawPref)
+      ? (rawPref as NonNullable<NonNullable<GmeetContext['uploadPrefs']>['report']>)
+      : null;
+  // Invitee names from the linked event double as AAI bias keyterms — they
+  // are exactly the names AAI would otherwise mis-hear.
+  const attendees: GmeetAttendee[] = (linkedEvent?.attendees ?? [])
+    .filter((a): a is { email: string; name?: string; responseStatus?: string } =>
+      typeof a?.email === 'string'
+    )
+    .slice(0, 100)
+    .map((a) => ({ email: a.email, name: a.name, responseStatus: a.responseStatus }));
+  const attendeeNames = attendees
+    .map((a) => a.name?.trim())
+    .filter((n): n is string => !!n && n.length > 1);
+
+  const gmeetContext: GmeetContext | null =
+    linkedEvent || reportPref
+      ? {
+          ...(linkedEvent
+            ? {
+                eventId: linkedEvent.id,
+                eventTitle: linkedEvent.title?.slice(0, 300),
+                startTime: linkedEvent.startTime,
+                endTime: linkedEvent.endTime,
+                meetingCode: linkedEvent.meetingCode,
+                recurringEventId: linkedEvent.recurringEventId,
+                iCalUID: linkedEvent.iCalUID,
+                organizerEmail: linkedEvent.organizerEmail,
+                attendees,
+              }
+            : {}),
+          ...(reportPref ? { uploadPrefs: { report: reportPref } } : {}),
+        }
+      : null;
+
   let tempFilename: string;
   let originalFilename: string | null = null;
   let languageCode: string | undefined;
   let sourceRow: StoredTranscript | null = null;
+  /** Set on the raw-body path: the `up-<uuid>` id of the placeholder row
+   * that makes this upload visible in every listing while bytes stream. */
+  let placeholderId: string | null = null;
 
   if (contentType.includes('multipart/form-data')) {
     // Legacy path — whole body in memory. Kept only so an already-open old
@@ -199,11 +251,71 @@ export const POST = withAuth(async ({ user, request }) => {
       languageCode = languageCode ?? sourceRow.language_code ?? undefined;
     }
 
+    // Create the row BEFORE consuming the body so the upload is visible in
+    // the listing (owner + auto-shared invitees) from the first byte. The
+    // temp filename shares the placeholder's uuid so the stale-upload
+    // sweeper can find and delete the file when reaping an orphaned row.
+    const uploadUuid = crypto.randomUUID();
+    placeholderId = `up-${uploadUuid}`;
+    tempFilename = `upload-${uploadUuid}.part`;
+    const rawLen = request.headers.get('content-length');
+    const bytesTotal = rawLen && /^\d+$/.test(rawLen) ? Number(rawLen) : null;
+
+    const placeholder = await createUploadingPlaceholder(user.userId, {
+      placeholderId,
+      originalFilename,
+      languageCode: languageCode ?? null,
+      title: sourceRow?.title ?? linkedEvent?.title?.slice(0, 300) ?? null,
+      gmeetContext,
+      bytesTotal,
+    });
+    // Same "throw them in" rule as the Meet import: internal invitees on the
+    // linked event can see (and follow) the upload from the moment it starts.
+    if (attendees.length > 0) {
+      await autoShareToInternalInvitees(
+        placeholder.id,
+        user.userId,
+        user.email,
+        attendees
+      ).catch((err) => console.warn('[POST /api/transcripts] auto-share failed:', err));
+    }
+    const earlyRecordedAt = sourceRow?.recorded_at ?? linkedEvent?.startTime;
+    if (earlyRecordedAt) {
+      await setRecordedAtForUser(
+        user.userId,
+        placeholderId,
+        new Date(earlyRecordedAt)
+      ).catch(() => {});
+    }
+
+    // Debounced progress writes: at most one UPDATE every ~2s, never more
+    // than one in flight. Each write publishes a 'status' SSE event, and the
+    // listing's own 800ms debounce coalesces the refetches.
+    let lastFlush = 0;
+    let flushing = false;
+    let pendingFlush: Promise<void> = Promise.resolve();
+    const pid = placeholderId;
+    const onProgress = (streamed: number) => {
+      const now = Date.now();
+      if (flushing || now - lastFlush < 2000) return;
+      flushing = true;
+      lastFlush = now;
+      pendingFlush = updateUploadProgress(user.userId, pid, streamed)
+        .catch(() => {})
+        .finally(() => {
+          flushing = false;
+        });
+    };
+
     let bytes: number;
     try {
-      ({ tempFilename, bytes } = await saveAudioStreamToTemp(request.body));
+      ({ bytes } = await saveAudioStreamToTemp(request.body, {
+        tempFilename,
+        onProgress,
+      }));
     } catch (error) {
       console.error('[POST /api/transcripts] body stream failed:', error);
+      await deleteForUser(user.userId, placeholderId).catch(() => {});
       return NextResponse.json(
         { error: 'Upload stream failed', detail: String(error) },
         { status: 400 }
@@ -211,22 +323,18 @@ export const POST = withAuth(async ({ user, request }) => {
     }
     if (bytes === 0) {
       await deleteAudioFile(tempFilename);
+      await deleteForUser(user.userId, placeholderId).catch(() => {});
       return NextResponse.json({ error: 'Empty request body' }, { status: 400 });
     }
+    // Final progress write (after any in-flight throttled one) so viewers see
+    // 100% while the AAI re-upload leg runs.
+    await pendingFlush;
+    await updateUploadProgress(user.userId, placeholderId, bytes).catch(() => {});
   }
 
-  // Upload-media stepper extras: a linked calendar event (context for
-  // speaker-ID, people lookup and the archive) and the report preference
-  // the speaker-review confirm should honor.
-  const linkedEvent = parseLinkedEventHeader(request.headers.get('x-linked-event'));
-  const rawPref = request.nextUrl.searchParams.get('report_pref');
-  const reportPref =
-    rawPref && REPORT_PREFS.has(rawPref)
-      ? (rawPref as NonNullable<NonNullable<GmeetContext['uploadPrefs']>['report']>)
-      : null;
-
-  // Shared tail: AAI upload (disk-streamed) → vocab-biased submit → DB row →
-  // rename temp file to its permanent name. Same path as the Meet import.
+  // Shared tail: AAI upload (disk-streamed) → vocab-biased submit → DB row
+  // (placeholder promoted in place on the raw-body path) → rename temp file
+  // to its permanent name. Same path as the Meet import.
   try {
     // Speaker names from the source import (Teams/Zoom/… labels) are exactly
     // the words AAI tends to mis-hear — feed them in as bias keyterms.
@@ -237,48 +345,32 @@ export const POST = withAuth(async ({ user, request }) => {
           .filter((s): s is string => !!s && s.length > 1 && !/^speaker\s*\d+$/i.test(s))
       ),
     ];
-    // Invitee names from the linked event get the same treatment — they are
-    // exactly the names AAI would otherwise mis-hear.
-    const attendees: GmeetAttendee[] = (linkedEvent?.attendees ?? [])
-      .filter((a): a is { email: string; name?: string; responseStatus?: string } =>
-        typeof a?.email === 'string'
-      )
-      .slice(0, 100)
-      .map((a) => ({ email: a.email, name: a.name, responseStatus: a.responseStatus }));
-    const attendeeNames = attendees
-      .map((a) => a.name?.trim())
-      .filter((n): n is string => !!n && n.length > 1);
 
-    const gmeetContext: GmeetContext | null =
-      linkedEvent || reportPref
-        ? {
-            ...(linkedEvent
-              ? {
-                  eventId: linkedEvent.id,
-                  eventTitle: linkedEvent.title?.slice(0, 300),
-                  startTime: linkedEvent.startTime,
-                  endTime: linkedEvent.endTime,
-                  meetingCode: linkedEvent.meetingCode,
-                  recurringEventId: linkedEvent.recurringEventId,
-                  iCalUID: linkedEvent.iCalUID,
-                  organizerEmail: linkedEvent.organizerEmail,
-                  attendees,
-                }
-              : {}),
-            ...(reportPref ? { uploadPrefs: { report: reportPref } } : {}),
-          }
-        : null;
-
-    const row = await ingestLocalAudio(user.userId, tempFilename, {
-      originalFilename,
-      languageCode,
-      title: sourceRow?.title ?? linkedEvent?.title?.slice(0, 300) ?? null,
-      extraKeyterms:
-        sourceSpeakers.length > 0 || attendeeNames.length > 0
-          ? [...sourceSpeakers, ...attendeeNames]
-          : undefined,
-      gmeetContext,
-    });
+    // The AAI re-upload leg can run many minutes with no byte-count movement;
+    // keep the placeholder's heartbeat alive so the stale-upload sweeper
+    // doesn't reap a live row.
+    const heartbeat = placeholderId
+      ? setInterval(() => {
+          void updateUploadProgress(user.userId, placeholderId!).catch(() => {});
+        }, 60_000)
+      : null;
+    heartbeat?.unref?.();
+    let row;
+    try {
+      row = await ingestLocalAudio(user.userId, tempFilename, {
+        originalFilename,
+        languageCode,
+        title: sourceRow?.title ?? linkedEvent?.title?.slice(0, 300) ?? null,
+        extraKeyterms:
+          sourceSpeakers.length > 0 || attendeeNames.length > 0
+            ? [...sourceSpeakers, ...attendeeNames]
+            : undefined,
+        gmeetContext,
+        placeholderAssemblyaiId: placeholderId,
+      });
+    } finally {
+      if (heartbeat) clearInterval(heartbeat);
+    }
     const recordedAt = sourceRow?.recorded_at ?? linkedEvent?.startTime;
     if (recordedAt) {
       await setRecordedAtForUser(
@@ -289,6 +381,12 @@ export const POST = withAuth(async ({ user, request }) => {
     }
     return NextResponse.json({ transcript: row }, { status: 201 });
   } catch (error) {
+    // A failed ingest leaves the placeholder stuck at 'uploading' — remove it
+    // so viewers see the upload vanish rather than a zombie row. (No-op once
+    // promoted: the row's id is the real AAI one by then.)
+    if (placeholderId) {
+      await deleteForUser(user.userId, placeholderId).catch(() => {});
+    }
     if (error instanceof IngestError) {
       console.error(`[POST /api/transcripts] ${error.stage} failed:`, error.causeErr);
       return NextResponse.json(

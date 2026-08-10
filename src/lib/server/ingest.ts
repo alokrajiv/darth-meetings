@@ -1,6 +1,7 @@
 import 'server-only';
 import {
   createForUser,
+  promoteUploadingRow,
   setLocalAudioPathForUser,
   type TranscriptRow,
 } from '@/db-ops/transcripts';
@@ -53,6 +54,13 @@ export interface IngestOptions {
   extraKeyterms?: string[];
   driveFileId?: string | null;
   gmeetContext?: GmeetContext | null;
+  /**
+   * The `up-<uuid>` id of a live-visibility placeholder row created before
+   * the bytes arrived. When set, the placeholder is promoted in place (its
+   * assemblyai_id rewritten to the real one, shares intact) instead of
+   * inserting a new row.
+   */
+  placeholderAssemblyaiId?: string | null;
 }
 
 export async function ingestLocalAudio(
@@ -107,16 +115,27 @@ export async function ingestLocalAudio(
 
   let row: TranscriptRow;
   try {
-    row = await createForUser(userId, {
-      assemblyaiId: submitted.id,
-      originalFilename: opts.originalFilename,
-      status: submitted.status,
-      languageCode: opts.languageCode ?? null,
-      title: opts.title ?? null,
-      audioUrl: audioUrl,
-      driveFileId: opts.driveFileId ?? null,
-      gmeetContext: opts.gmeetContext ?? null,
-    });
+    let promoted: TranscriptRow | null = null;
+    if (opts.placeholderAssemblyaiId) {
+      promoted = await promoteUploadingRow(userId, opts.placeholderAssemblyaiId, {
+        assemblyaiId: submitted.id,
+        status: submitted.status,
+        audioUrl,
+      });
+    }
+    // No placeholder, or the sweeper reaped it mid-upload → fresh insert.
+    row =
+      promoted ??
+      (await createForUser(userId, {
+        assemblyaiId: submitted.id,
+        originalFilename: opts.originalFilename,
+        status: submitted.status,
+        languageCode: opts.languageCode ?? null,
+        title: opts.title ?? null,
+        audioUrl: audioUrl,
+        driveFileId: opts.driveFileId ?? null,
+        gmeetContext: opts.gmeetContext ?? null,
+      }));
   } catch (error) {
     // Transcription was submitted but we lost the row — don't also leak the
     // temp file on disk.

@@ -6,7 +6,7 @@ import {
   findVisibleByDriveFileId,
   setRecordedAtForUser,
 } from '@/db-ops/transcripts';
-import { addShare } from '@/db-ops/transcript-shares';
+import { autoShareToInternalInvitees } from '@/lib/server/auto-share';
 import { findImportedByMeetingCodes } from '@/db-ops/gmeet-sync';
 import {
   autoNameSpeakers,
@@ -65,42 +65,6 @@ interface ImportBody {
     organizerEmail?: string;
     attendees?: GmeetAttendee[];
   };
-}
-
-// Invitees on these domains get the imported transcript shared to them
-// automatically ("throw them in"): everyone on the invite could have fetched
-// the artifacts from Drive themselves, so gating access behind manual
-// sharing only invites duplicate imports.
-const AUTO_SHARE_DOMAINS = new Set(['trames.sg', 'trames-engineering.com']);
-
-async function autoShareToInternalInvitees(
-  transcriptId: number,
-  ownerUserId: string,
-  ownerEmail: string,
-  candidates: Array<{ email: string; name?: string | null }>
-): Promise<number> {
-  const self = ownerEmail.trim().toLowerCase();
-  let shared = 0;
-  for (const a of candidates) {
-    const email = a.email.trim().toLowerCase();
-    const domain = email.split('@')[1] ?? '';
-    if (email === self || !AUTO_SHARE_DOMAINS.has(domain)) continue;
-    try {
-      await addShare({
-        transcriptId,
-        ownerUserId,
-        sharedByUserId: ownerUserId,
-        sharedWithEmail: email,
-        sharedWithName: a.name ?? null,
-        sharedWithPplId: null,
-        access: 'edit',
-      });
-      shared++;
-    } catch (err) {
-      console.warn('[gmeet/import] auto-share failed for', email, err);
-    }
-  }
-  return shared;
 }
 
 /**
