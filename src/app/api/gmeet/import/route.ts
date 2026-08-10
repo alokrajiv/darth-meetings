@@ -1,17 +1,13 @@
 import { NextResponse } from 'next/server';
 import { withAuth } from '@/lib/auth/with-auth';
 import {
-  createImportedForUser,
   findVisibleByAssemblyaiId,
   findVisibleByDriveFileId,
   setRecordedAtForUser,
 } from '@/db-ops/transcripts';
 import { autoShareToInternalInvitees } from '@/lib/server/auto-share';
 import { findImportedByMeetingCodes } from '@/db-ops/gmeet-sync';
-import {
-  autoNameSpeakers,
-  registerPeopleFromMeeting,
-} from '@/lib/server/import-helpers';
+import { registerPeopleFromMeeting } from '@/lib/server/import-helpers';
 import {
   GoogleApiError,
   captureMeetActuals,
@@ -19,13 +15,12 @@ import {
   findConferenceRecordName,
   getDriveFileMeta,
   parseTranscriptDocs,
-  synthesizeTranscriptResponse,
   utterancesFromEntries,
   type ParsedMeetTranscript,
 } from '@/lib/server/gmeet';
 import { copyAudioToTemp, deleteAudioFile } from '@/lib/server/audio-storage';
 import { IngestError, ingestLocalAudio } from '@/lib/server/ingest';
-import { onTranscriptCompleted } from '@/lib/server/post-completion';
+import { ingestParsedUtterances } from '@/lib/server/ingest-parsed';
 import { resolveAccess } from '@/db-ops/transcript-access';
 import type {
   GmeetAttendee,
@@ -427,56 +422,21 @@ export const POST = withAuth(async ({ user, request }) => {
 
     const startIso = event.startTime ?? actuals?.conferenceStart;
     const endIso = event.endTime ?? actuals?.conferenceEnd;
-    const content = synthesizeTranscriptResponse(syntheticId, parsed!, {
-      createdIso: startIso,
-      completedIso: endIso,
-    });
-    const speakerCount = new Set(parsed!.utterances.map((u) => u.speaker)).size;
-
-    const row = await createImportedForUser(user.userId, {
-      assemblyaiId: syntheticId,
-      originalFilename: null,
-      status: 'completed',
-      createdAt: startIso ? new Date(startIso) : null,
-      completedAt: endIso ? new Date(endIso) : null,
-      duration: content.audio_duration ?? null,
-      speakerCount,
-      languageCode: null,
-      audioUrl: null,
-      importedContent: content,
-      title,
-      gmeetContext: { ...baseContext, meetTranscript: parsed },
-    });
-
-    if (startIso) {
-      await setRecordedAtForUser(user.userId, syntheticId, new Date(startIso)).catch(() => {});
-    }
-
-    // Real names from Meet → name the speakers + register people up front.
-    try {
-      const speakerNames = [...new Set(parsed!.utterances.map((u) => u.speaker))];
-      await autoNameSpeakers(
-        user.userId,
-        syntheticId,
-        speakerNames,
+    const { row, autoShared } = await ingestParsedUtterances(
+      { userId: user.userId, email: user.email },
+      {
+        sourceId: syntheticId,
+        title,
+        parsed: parsed!,
+        recordedAtIso: startIso ?? null,
+        completedAtIso: endIso ?? null,
+        gmeetContext: { ...baseContext, meetTranscript: parsed },
         attendees,
-        actuals?.participants
-      );
-    } catch (err) {
-      console.warn('[gmeet/import] speaker auto-naming failed (continuing):', err);
-    }
-
-    // Post-completion hook (voiceprint matching is skipped automatically —
-    // there's no audio on this row; notes are user-triggered now).
-    onTranscriptCompleted(user.userId, syntheticId);
-
-    const autoShared = await autoShareToInternalInvitees(
-      row.id,
-      user.userId,
-      user.email,
-      shareList
+        participants: actuals?.participants,
+        shareList,
+        logTag: '[gmeet/import]',
+      }
     );
-    await registerPeopleFromMeeting(shareList, user.userId);
 
     return NextResponse.json({ transcript: row, mode, autoShared }, { status: 201 });
   }

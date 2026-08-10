@@ -3,14 +3,11 @@ import { randomUUID } from 'node:crypto';
 import path from 'node:path';
 import { promises as fsp } from 'node:fs';
 import { withAuth } from '@/lib/auth/with-auth';
-import { createImportedForUser } from '@/db-ops/transcripts';
 import { runClaudeWithMeta, parseJsonFromClaude } from '@/lib/server/claude-agent';
 import { recordAiRun } from '@/db-ops/ai-runs';
 import { extractAttachmentText } from '@/lib/server/attachment-extract';
 import { getStorageDir } from '@/lib/server/audio-storage';
-import { autoNameSpeakers } from '@/lib/server/import-helpers';
-import { onTranscriptCompleted } from '@/lib/server/post-completion';
-import type { TranscriptResponse } from '@/lib/format';
+import { ingestParsedUtterances } from '@/lib/server/ingest-parsed';
 
 export const runtime = 'nodejs';
 // The normalization runs a headless-Claude pass — give it room.
@@ -170,32 +167,17 @@ export const POST = withAuth(async ({ user, request }) => {
   });
 
   const syntheticId = `ext-${randomUUID().slice(0, 12)}`;
-  const last = utterances[utterances.length - 1]!;
-  const content: TranscriptResponse = {
-    id: syntheticId,
-    status: 'completed',
-    text: utterances.map((u) => u.text).join(' '),
-    created: new Date().toISOString(),
-    completed: new Date().toISOString(),
-    audio_duration: Math.round(last.end / 1000),
-    language_code: normalized.language ?? undefined,
-    utterances,
-  };
-  const speakerNames = [...new Set(utterances.map((u) => u.speaker))];
-
-  const row = await createImportedForUser(user.userId, {
-    assemblyaiId: syntheticId,
-    originalFilename,
-    status: 'completed',
-    createdAt: null,
-    completedAt: null,
-    duration: content.audio_duration ?? null,
-    speakerCount: speakerNames.length,
-    languageCode: normalized.language ?? null,
-    audioUrl: null,
-    importedContent: content,
-    title: title ?? normalized.title?.trim().slice(0, 200) ?? null,
-  });
+  const { row } = await ingestParsedUtterances(
+    { userId: user.userId, email: user.email },
+    {
+      sourceId: syntheticId,
+      title: title ?? normalized.title?.trim().slice(0, 200) ?? null,
+      parsed: { attendees: normalized.attendees ?? [], utterances },
+      originalFilename,
+      languageCode: normalized.language ?? null,
+      logTag: '[import-text]',
+    }
+  );
 
   void recordAiRun({
     transcriptId: row.id,
@@ -207,14 +189,6 @@ export const POST = withAuth(async ({ user, request }) => {
     promptChars: normalizePrompt.length,
     resultChars: normalizeRun.text.length,
   });
-
-  try {
-    await autoNameSpeakers(user.userId, syntheticId, speakerNames, [], undefined);
-  } catch (err) {
-    console.warn('[import-text] speaker auto-naming failed (continuing):', err);
-  }
-
-  onTranscriptCompleted(user.userId, syntheticId);
 
   return NextResponse.json({ transcript: row }, { status: 201 });
 });
