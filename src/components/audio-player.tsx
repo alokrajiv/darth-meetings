@@ -21,6 +21,9 @@ interface AudioPlayerProps {
   hasVideo?: boolean;
   /** Called every `timeupdate` with the current time in seconds. */
   onTimeUpdate?: (seconds: number) => void;
+  /** Called once the media's metadata is ready — the parent uses this to
+   * apply a pending seek after swapping src (multi-video part switch). */
+  onLoadedMetadata?: () => void;
   /** Called when the audio fails to load (so the parent can hide the player). */
   onError?: () => void;
   /** Optional className for layout. */
@@ -39,7 +42,7 @@ interface AudioPlayerProps {
  * (driven by onTimeUpdate); we own playback.
  */
 export const AudioPlayer = forwardRef<AudioPlayerHandle, AudioPlayerProps>(
-  function AudioPlayer({ src, hasVideo, onTimeUpdate, onError, className }, ref) {
+  function AudioPlayer({ src, hasVideo, onTimeUpdate, onLoadedMetadata, onError, className }, ref) {
     const mediaRef = useRef<HTMLMediaElement | null>(null);
     const [videoOn, setVideoOn] = useState(false);
     // Carry position/play-state across the audio<->video element swap.
@@ -108,6 +111,7 @@ export const AudioPlayer = forwardRef<AudioPlayerHandle, AudioPlayerProps>(
     const mediaEvents = {
       onTimeUpdate: (e: React.SyntheticEvent<HTMLMediaElement>) =>
         onTimeUpdate?.((e.target as HTMLMediaElement).currentTime),
+      onLoadedMetadata: () => onLoadedMetadata?.(),
       onError: () => onError?.(),
     };
 

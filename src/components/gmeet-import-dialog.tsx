@@ -2445,7 +2445,8 @@ export function GmeetImportDialog({
                           {picked.videoCount > 1 && (
                             <span className="text-muted-foreground">
                               {' '}
-                              · {picked.videoCount} recordings, importing the first
+                              · {picked.videoCount} videos (stop-restart recording) — the
+                              first is transcribed, the rest attach automatically
                             </span>
                           )}
                         </span>

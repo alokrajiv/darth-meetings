@@ -3,16 +3,25 @@ import { listRecordingPendingRows, mergeGmeetContextForUser } from '@/db-ops/tra
 import { publishEvent } from '@/lib/server/event-bus';
 import { listRecordArtifacts } from '@/lib/server/gmeet';
 import { getServerAccessToken } from '@/lib/server/google-oauth';
-import { fetchRecordingFromDrive } from '@/lib/server/recording-fetch';
+import { fetchRecordingFromDrive, fetchVideoPartFromDrive } from '@/lib/server/recording-fetch';
 import type { GmeetContext } from '@/lib/format';
 
 /**
- * Watches imports whose Meet recording Google was still generating at import
- * time (gmeet_context.recordingPending) and attaches the video the moment it
- * lands: re-list the record's artifacts with the OWNER's server-minted token
- * (own-token rule — same identity that proved access at import), write the
- * discovered fileId into the context, then pull the bytes from Drive so
- * playback / video reports / frame-reading work without anyone clicking.
+ * Watches imports where Meet listed a recording Google was still generating
+ * at import time (gmeet_context.recordingPending) and attaches each video the
+ * moment it lands: re-list the record's artifacts with the OWNER's
+ * server-minted token (own-token rule — same identity that proved access at
+ * import), diff the listing against what's already attached (primary
+ * videoFileId + videoParts), write newly-available fileIds into the context,
+ * then pull the bytes from Drive so playback / video reports / frame-reading
+ * work without anyone clicking.
+ *
+ * Multi-video meetings (stop-restart recordings → several Drive files, often
+ * finishing at different times): the first file to land on a row with no
+ * video yet becomes the primary; every other file becomes a videoParts entry.
+ * The pending marker stays 'waiting' until NO listed recording is missing its
+ * file, so a second video that finishes an hour after the first still gets
+ * attached.
  *
  * Cadence: young rows (call just ended — the common case) are checked every
  * tick; after FAST_WINDOW they fall back to one check per SLOW_EVERY; after
@@ -63,13 +72,36 @@ async function checkRow(row: {
   if (!minted) return; // owner not connected right now — TTL retires it eventually
 
   const artifacts = await listRecordArtifacts(minted.token, pending.recordName);
-  const fileId = artifacts.recordings.find((r) => r.fileId)?.fileId ?? null;
+  const listed = artifacts.recordings;
 
-  if (!fileId) {
-    // Zero recordings listed = Google no longer acknowledges one (discarded /
-    // never saved) — stop asking. Entries without files = still processing.
-    const gone = artifacts.recordings.length === 0;
-    if (gone) console.log(`[recording-poller] recording gone for ${row.assemblyai_id}`);
+  // Zero recordings listed = Google no longer acknowledges any (discarded /
+  // never saved) — stop asking. Entries without files = still processing.
+  if (listed.length === 0) {
+    console.log(`[recording-poller] recording gone for ${row.assemblyai_id}`);
+    await mergeGmeetContextForUser(row.user_id, row.assemblyai_id, {
+      recordingPending: {
+        ...pending,
+        lastCheckedAt: new Date(now).toISOString(),
+        attempts: (pending.attempts ?? 0) + 1,
+        status: 'gone',
+        resolvedAt: new Date(now).toISOString(),
+      },
+    });
+    return;
+  }
+
+  // Diff the listing against what this row already knows about.
+  const parts = [...(ctx.videoParts ?? [])];
+  const attached = new Set(
+    [ctx.videoFileId, ...parts.map((p) => p.fileId)].filter((x): x is string => !!x)
+  );
+  const newFiles = listed
+    .filter((r) => r.fileId && !attached.has(r.fileId))
+    .sort((a, b) => (a.startTime ?? '').localeCompare(b.startTime ?? ''));
+  const stillGenerating = listed.some((r) => !r.fileId);
+
+  if (newFiles.length === 0 && stillGenerating) {
+    // Nothing new yet — heartbeat only.
     await mergeGmeetContextForUser(
       row.user_id,
       row.assemblyai_id,
@@ -78,24 +110,40 @@ async function checkRow(row: {
           ...pending,
           lastCheckedAt: new Date(now).toISOString(),
           attempts: (pending.attempts ?? 0) + 1,
-          ...(gone ? { status: 'gone' as const, resolvedAt: new Date(now).toISOString() } : {}),
         },
       },
-      { quiet: !gone } // heartbeat writes shouldn't reload every open page
+      { quiet: true } // heartbeat writes shouldn't reload every open page
     );
     return;
   }
 
+  // The earliest new file becomes the primary when the row has none yet;
+  // everything else lands in videoParts (appended — never reordered, part
+  // filenames are index-derived and must stay stable).
+  let primaryFileId = ctx.videoFileId ?? null;
+  let newPrimary: string | null = null;
+  for (const r of newFiles) {
+    if (!primaryFileId) {
+      primaryFileId = r.fileId!;
+      newPrimary = r.fileId!;
+    } else {
+      parts.push({ fileId: r.fileId!, startTime: r.startTime, endTime: r.endTime });
+    }
+  }
+
+  const resolved = !stillGenerating;
   console.log(
-    `[recording-poller] ${row.assemblyai_id}: file ${fileId} ready after ${Math.round(age / 60000)}m, fetching from Drive`
+    `[recording-poller] ${row.assemblyai_id}: ${newFiles.length} new file(s) after ${Math.round(age / 60000)}m` +
+      `${newPrimary ? ' (incl. primary)' : ''}${resolved ? ', all generated' : ', more still generating'}`
   );
   await mergeGmeetContextForUser(row.user_id, row.assemblyai_id, {
-    videoFileId: fileId,
+    ...(newPrimary ? { videoFileId: newPrimary } : {}),
+    ...(parts.length > 0 ? { videoParts: parts } : {}),
     // jsonb || is shallow — carry the whole actuals object, gaps filled.
     actuals: ctx.actuals
       ? {
           ...ctx.actuals,
-          recordings: artifacts.recordings.map((r) => ({
+          recordings: listed.map((r) => ({
             fileId: r.fileId ?? undefined,
             startTime: r.startTime,
             endTime: r.endTime,
@@ -104,28 +152,51 @@ async function checkRow(row: {
       : ctx.actuals,
     recordingPending: {
       ...pending,
-      status: 'fetched',
-      resolvedAt: new Date(now).toISOString(),
+      ...(resolved
+        ? { status: 'fetched' as const, resolvedAt: new Date(now).toISOString() }
+        : {}),
       lastCheckedAt: new Date(now).toISOString(),
       attempts: (pending.attempts ?? 0) + 1,
     },
   });
 
-  try {
-    const { bytes } = await fetchRecordingFromDrive({
-      ownerUserId: row.user_id,
-      assemblyaiId: row.assemblyai_id,
-      fileId,
-      accessToken: minted.token,
-    });
-    console.log(`[recording-poller] ${row.assemblyai_id}: stored ${bytes} bytes`);
-    // setLocalAudioPathForUser doesn't publish — tell open pages the video
-    // is now playable.
-    publishEvent({ kind: 'meta', assemblyaiId: row.assemblyai_id });
-  } catch (err) {
-    // Context already has the fileId — the detail page's auto-fetch on next
-    // visit (or the manual button) retries with the viewer's token.
-    console.warn(`[recording-poller] Drive fetch failed for ${row.assemblyai_id}:`, err);
+  // Bytes, best-effort: context already has every fileId, so the sweeper /
+  // page-visit auto-fetch retries anything that fails here.
+  if (newPrimary) {
+    try {
+      const { bytes } = await fetchRecordingFromDrive({
+        ownerUserId: row.user_id,
+        assemblyaiId: row.assemblyai_id,
+        fileId: newPrimary,
+        accessToken: minted.token,
+      });
+      console.log(`[recording-poller] ${row.assemblyai_id}: stored ${bytes} bytes (primary)`);
+      // setLocalAudioPathForUser doesn't publish — tell open pages the video
+      // is now playable.
+      publishEvent({ kind: 'meta', assemblyaiId: row.assemblyai_id });
+    } catch (err) {
+      console.warn(`[recording-poller] Drive fetch failed for ${row.assemblyai_id}:`, err);
+    }
+  }
+  for (const [i, part] of parts.entries()) {
+    if (part.filename) continue; // already stored (or a prior visit's fetch)
+    try {
+      const { bytes } = await fetchVideoPartFromDrive({
+        ownerUserId: row.user_id,
+        assemblyaiId: row.assemblyai_id,
+        fileId: part.fileId,
+        partNo: i + 2,
+        accessToken: minted.token,
+      });
+      console.log(
+        `[recording-poller] ${row.assemblyai_id}: stored ${bytes} bytes (part ${i + 2})`
+      );
+    } catch (err) {
+      console.warn(
+        `[recording-poller] part ${i + 2} fetch failed for ${row.assemblyai_id}:`,
+        err
+      );
+    }
   }
 }
 

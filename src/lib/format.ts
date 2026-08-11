@@ -160,11 +160,29 @@ export interface GmeetContext {
   meetingCode?: string;
   attendees?: GmeetAttendee[];
   videoFileId?: string;
+  /** Recording segments BEYOND the primary video (someone stopped and
+   * restarted recording mid-meeting — Meet makes one Drive file per run).
+   * The primary (`videoFileId` → `local_audio_path`) is what AAI transcribed;
+   * these are the meeting's other videos, fetched to
+   * `<assemblyaiId>.part<N>.<ext>` sidecar files so nothing silently
+   * disappears. `filename` present = bytes stored and playable via
+   * /audio?part=N. Ordered chronologically; part number = index + 2
+   * (the primary is "Video 1"). */
+  videoParts?: Array<{
+    fileId: string;
+    startTime?: string;
+    endTime?: string;
+    filename?: string;
+    bytes?: number;
+    fetchedAt?: string;
+  }>;
   transcriptDocId?: string;
-  /** Set at import time when Meet listed a recording whose file Google was
-   * still generating (state ENDED, no Drive id yet). The recording poller
-   * re-checks every minute and attaches the video when it lands; `status`
-   * leaves 'waiting' exactly once. */
+  /** Set at import time when Meet listed ANY recording whose file Google was
+   * still generating (state ENDED, no Drive id yet) — including a second/third
+   * segment of a stop-restart recording while the first is already imported.
+   * The recording poller re-checks every minute and attaches each video when
+   * it lands (primary if none yet, else a videoParts entry); `status` leaves
+   * 'waiting' exactly once. */
   recordingPending?: {
     recordName: string;
     since: string;

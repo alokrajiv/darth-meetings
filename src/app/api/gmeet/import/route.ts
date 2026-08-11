@@ -260,20 +260,42 @@ export const POST = withAuth(async ({ user, request }) => {
 
   // Meet listed a recording but Google hasn't generated its file yet (call
   // just ended). Mark the row so the recording poller re-checks and attaches
-  // the video once it lands — without this, a quick import done minutes after
-  // the call permanently believes the meeting had no recording.
+  // each video once it lands — without this, a quick import done minutes
+  // after the call permanently believes the meeting had no recording. This
+  // deliberately fires even when a videoFileId IS being imported: a
+  // stop-restart recording makes several files, and the later ones are often
+  // still generating while the first is ready — dropping them silently loses
+  // the bulk of the meeting (the Alok<>Swaralee two-video incident).
   const recordingPending: GmeetContext['recordingPending'] =
     !sourceRow && // re-runs reuse a FROZEN snapshot — its gaps aren't news
-    !videoFileId &&
     actuals?.conferenceRecordName &&
     (actuals.recordings?.length ?? 0) > 0 &&
-    !actuals.recordings!.some((r) => r.fileId)
+    actuals.recordings!.some((r) => !r.fileId)
       ? {
           recordName: actuals.conferenceRecordName,
           since: new Date().toISOString(),
           status: 'waiting',
         }
       : undefined;
+
+  // Multi-video meetings: every ready recording that is NOT the primary
+  // becomes a videoParts entry up front (bytes pulled by the sweeper/poller),
+  // so no segment is ever invisible. Chronological order.
+  const sortedRecs = [...(actuals?.recordings ?? [])].sort((a, b) =>
+    (a.startTime ?? '').localeCompare(b.startTime ?? '')
+  );
+  const primaryFileId = videoFileId ?? sortedRecs.find((r) => r.fileId)?.fileId;
+  // Re-runs inherit the source's known parts, minus filenames — part files
+  // are keyed by assemblyai_id, so the new row's copies get re-fetched.
+  const videoParts = sourceRow
+    ? (sourceRow.gmeet_context?.videoParts ?? []).map(({ fileId, startTime, endTime }) => ({
+        fileId,
+        startTime,
+        endTime,
+      }))
+    : sortedRecs
+        .filter((r) => r.fileId && r.fileId !== primaryFileId)
+        .map((r) => ({ fileId: r.fileId!, startTime: r.startTime, endTime: r.endTime }));
 
   const baseContext: GmeetContext = {
     eventId: event.id,
@@ -286,6 +308,7 @@ export const POST = withAuth(async ({ user, request }) => {
     meetingCode: event.meetingCode,
     attendees,
     videoFileId: videoFileId ?? undefined,
+    ...(videoParts.length > 0 ? { videoParts } : {}),
     transcriptDocId: effectiveDocId ?? undefined,
     recordingPending,
     actuals,

@@ -64,6 +64,7 @@ import {
   Users,
   ListTree,
   Film,
+  Loader2,
   Sparkles,
   MoreHorizontal,
   Video,
@@ -671,6 +672,84 @@ export default function TranscriptDetailPage({ params }: TranscriptDetailPagePro
   const hasLocalVideo = /\.(mp4|webm|mov|mkv|m4v)$/i.test(row?.local_audio_path ?? '');
   const canFetchVideo =
     !!row && canEdit && !row.local_audio_path && (!!recordingFileId || !!teamsRecordingId);
+
+  // --- Multi-video meetings (stop-restart recordings → several files) ---
+  // The primary video ("Video 1") is local_audio_path; extra segments live in
+  // gmeet_context.videoParts, playable via /audio?part=N. All transcript
+  // times stay in MEETING time (AAI's t=0 = primary video start = anchorIso);
+  // each part's wall-clock start gives its offset, so seeks and the playhead
+  // highlight map across parts with plain arithmetic.
+  const videoParts = useMemo(
+    () => row?.gmeet_context?.videoParts ?? [],
+    [row?.gmeet_context?.videoParts]
+  );
+  const partAnchorMs = useMemo(() => {
+    const g = row?.gmeet_context;
+    const iso =
+      g?.actuals?.anchorIso ??
+      g?.actuals?.recordings?.find((r) => r.fileId && r.fileId === g?.videoFileId)?.startTime ??
+      g?.actuals?.recordings?.[0]?.startTime;
+    const ms = iso ? Date.parse(iso) : NaN;
+    return Number.isNaN(ms) ? null : ms;
+  }, [row?.gmeet_context]);
+  const storedParts = useMemo(
+    () =>
+      videoParts
+        .map((p, i) => {
+          const startMs = p.startTime ? Date.parse(p.startTime) : NaN;
+          const endMs = p.endTime ? Date.parse(p.endTime) : NaN;
+          return {
+            partNo: i + 2,
+            filename: p.filename,
+            offsetSec:
+              partAnchorMs != null && !Number.isNaN(startMs)
+                ? (startMs - partAnchorMs) / 1000
+                : null,
+            durationSec:
+              !Number.isNaN(startMs) && !Number.isNaN(endMs) ? (endMs - startMs) / 1000 : null,
+          };
+        })
+        .filter((p) => !!p.filename),
+    [videoParts, partAnchorMs]
+  );
+  // Segments Google is still generating (recordingPending watches them) or
+  // whose bytes we haven't pulled yet — surfaced so a second video is never
+  // silently invisible.
+  const partsGenerating =
+    row?.gmeet_context?.recordingPending?.status === 'waiting'
+      ? (row.gmeet_context.actuals?.recordings ?? []).filter((r) => !r.fileId).length
+      : 0;
+  const partsFetching = videoParts.filter((p) => !p.filename).length;
+  const [activePart, setActivePart] = useState(1); // 1 = primary video
+  const activePartInfo = activePart === 1 ? null : storedParts.find((p) => p.partNo === activePart);
+  const activePartOffset = activePartInfo?.offsetSec ?? 0;
+  const pendingPartSeekRef = useRef<{ t: number; play: boolean } | null>(null);
+  /**
+   * Seek to a MEETING-time position: picks the video segment containing it
+   * (switching parts when needed — the seek applies after the new media's
+   * metadata loads), then seeks the local position within that segment.
+   */
+  const seekMeetingTime = useCallback(
+    (seconds: number, opts?: { play?: boolean }) => {
+      let target = 1;
+      let offset = 0;
+      for (const p of storedParts) {
+        if (p.offsetSec != null && seconds >= p.offsetSec && p.offsetSec > offset) {
+          target = p.partNo;
+          offset = p.offsetSec;
+        }
+      }
+      const local = Math.max(0, seconds - offset);
+      if (target !== activePart) {
+        pendingPartSeekRef.current = { t: local, play: !!opts?.play };
+        setActivePart(target);
+        return;
+      }
+      if (opts?.play) playerRef.current?.seekToSeconds(local);
+      else playerRef.current?.seekOnly(local);
+    },
+    [storedParts, activePart]
+  );
   const [videoFetching, setVideoFetching] = useState(false);
   const [videoFetchError, setVideoFetchError] = useState<string | null>(null);
   const fetchVideo = useCallback(
@@ -813,9 +892,9 @@ export default function TranscriptDetailPage({ params }: TranscriptDetailPagePro
       if (!u) return;
       // Seek without touching play/pause: if audio was paused it stays
       // paused; if it was playing it keeps playing from the new position.
-      playerRef.current?.seekOnly(u.start / 1000);
+      seekMeetingTime(u.start / 1000);
     },
-    [content?.utterances]
+    [content?.utterances, seekMeetingTime]
   );
 
   /**
@@ -828,7 +907,7 @@ export default function TranscriptDetailPage({ params }: TranscriptDetailPagePro
     (seconds: number) => {
       // seekOnly so playback state isn't toggled — paused stays paused,
       // playing keeps playing from the new position.
-      playerRef.current?.seekOnly(seconds);
+      seekMeetingTime(seconds);
 
       const ms = seconds * 1000;
       const utterances = content?.utterances;
@@ -854,7 +933,7 @@ export default function TranscriptDetailPage({ params }: TranscriptDetailPagePro
       const top = window.scrollY + rect.top - 132;
       window.scrollTo({ top, behavior: 'smooth' });
     },
-    [content?.utterances]
+    [content?.utterances, seekMeetingTime]
   );
 
   // Headings extracted from the description markdown — fed into the right-rail
@@ -2243,18 +2322,84 @@ export default function TranscriptDetailPage({ params }: TranscriptDetailPagePro
               <div
                 className={`sticky top-[60px] z-30 -mx-1 rounded-lg border bg-card/95 px-3 py-2 backdrop-blur ${FLOATING_SHADOW}`}
               >
-                <div className="mb-1 flex items-center justify-between text-[11px] text-muted-foreground">
+                <div className="mb-1 flex items-center justify-between gap-2 text-[11px] text-muted-foreground">
                   <span className="min-w-0 truncate">
                     {nowSegment ? `Now: ${nowSegment.title}` : ''}
                   </span>
+                  {(storedParts.length > 0 || partsGenerating > 0 || partsFetching > 0) && (
+                    <span className="flex shrink-0 items-center gap-1">
+                      {[{ partNo: 1, durationSec: null as number | null }, ...storedParts].map(
+                        (p) => (
+                          <button
+                            key={p.partNo}
+                            type="button"
+                            onClick={() => {
+                              if (p.partNo === activePart) return;
+                              pendingPartSeekRef.current = { t: 0, play: false };
+                              setActivePart(p.partNo);
+                            }}
+                            title={
+                              p.partNo === 1
+                                ? 'The transcribed video'
+                                : 'Extra recording segment — the recording was stopped and restarted'
+                            }
+                            className={`rounded-md border px-1.5 py-0.5 font-medium ${
+                              p.partNo === activePart
+                                ? 'border-primary/50 bg-primary/10 text-primary'
+                                : 'hover:bg-muted'
+                            }`}
+                          >
+                            Video {p.partNo}
+                            {p.durationSec ? ` · ${Math.round(p.durationSec / 60)}m` : ''}
+                          </button>
+                        )
+                      )}
+                      {partsFetching > 0 && (
+                        <span className="inline-flex items-center gap-1 rounded-md border border-amber-400/50 px-1.5 py-0.5 text-amber-600 dark:text-amber-500">
+                          <Loader2 className="h-3 w-3 animate-spin" />
+                          {partsFetching} more fetching
+                        </span>
+                      )}
+                      {partsGenerating > 0 && (
+                        <span
+                          className="inline-flex items-center gap-1 rounded-md border border-amber-400/50 px-1.5 py-0.5 text-amber-600 dark:text-amber-500"
+                          title="Meet recorded another video — Google is still preparing the file. We check every minute and attach it automatically."
+                        >
+                          <Loader2 className="h-3 w-3 animate-spin" />
+                          {partsGenerating} more preparing
+                        </span>
+                      )}
+                    </span>
+                  )}
                 </div>
                 <AudioPlayer
+                  key={activePart}
                   ref={playerRef}
                   className="h-10 w-full"
-                  src={`/api/transcripts/${row.assemblyai_id}/audio`}
-                  hasVideo={hasLocalVideo}
-                  onTimeUpdate={setCurrentTime}
-                  onError={() => setAudioAvailable(false)}
+                  src={
+                    activePart === 1
+                      ? `/api/transcripts/${row.assemblyai_id}/audio`
+                      : `/api/transcripts/${row.assemblyai_id}/audio?part=${activePart}`
+                  }
+                  hasVideo={
+                    activePart === 1
+                      ? hasLocalVideo
+                      : /\.(mp4|webm|mov|mkv|m4v)$/i.test(activePartInfo?.filename ?? '')
+                  }
+                  onTimeUpdate={(t) => setCurrentTime(t + activePartOffset)}
+                  onLoadedMetadata={() => {
+                    const ps = pendingPartSeekRef.current;
+                    if (!ps) return;
+                    pendingPartSeekRef.current = null;
+                    if (ps.play) playerRef.current?.seekToSeconds(ps.t);
+                    else playerRef.current?.seekOnly(ps.t);
+                  }}
+                  onError={() => {
+                    // A broken part falls back to the primary instead of
+                    // hiding the whole player.
+                    if (activePart !== 1) setActivePart(1);
+                    else setAudioAvailable(false);
+                  }}
                 />
               </div>
             )}
@@ -2325,7 +2470,7 @@ export default function TranscriptDetailPage({ params }: TranscriptDetailPagePro
                             <NotesMarkdown
                               markdown={row.auto_report}
                               transcriptId={row.assemblyai_id}
-                              onSeek={(s) => playerRef.current?.seekToSeconds(s)}
+                              onSeek={(s) => seekMeetingTime(s, { play: true })}
                             />
                           </div>
                           <div className="mt-4 flex items-center gap-2 border-t pt-2.5">
@@ -2466,7 +2611,7 @@ export default function TranscriptDetailPage({ params }: TranscriptDetailPagePro
                           <NotesMarkdown
                             markdown={row.auto_notes}
                             transcriptId={row.assemblyai_id}
-                            onSeek={(s) => playerRef.current?.seekToSeconds(s)}
+                            onSeek={(s) => seekMeetingTime(s, { play: true })}
                           />
                         </div>
                         <div className="mt-4 flex items-center gap-2 border-t pt-2.5">

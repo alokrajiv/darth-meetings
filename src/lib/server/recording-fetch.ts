@@ -1,4 +1,4 @@
-import { setLocalAudioPathForUser } from '@/db-ops/transcripts';
+import { setLocalAudioPathForUser, setVideoPartStoredForUser } from '@/db-ops/transcripts';
 import {
   downloadDriveFileToTemp,
   getDriveFileMeta,
@@ -65,6 +65,65 @@ export function fetchRecordingFromTeams(opts: {
   const run = doFetchTeams(opts).finally(() => inFlight.delete(opts.assemblyaiId));
   inFlight.set(opts.assemblyaiId, run);
   return run;
+}
+
+/**
+ * Pull an EXTRA recording segment (gmeet_context.videoParts entry) from
+ * Drive and store it as `<assemblyaiId>.part<N>.<ext>` beside the primary
+ * media — multi-video meetings (stop-restart recordings) keep every segment
+ * playable. Stamps the part's filename/bytes into the context on success.
+ * In-flight keyed per part so the poller and the sweeper join one download.
+ */
+export function fetchVideoPartFromDrive(opts: {
+  ownerUserId: string;
+  assemblyaiId: string;
+  fileId: string;
+  /** Display part number — the primary video is 1, so parts start at 2. */
+  partNo: number;
+  accessToken: string;
+}): Promise<{ bytes: number }> {
+  const key = `${opts.assemblyaiId}#${opts.fileId}`;
+  const existing = inFlight.get(key);
+  if (existing) return existing;
+  const run = doFetchPart(opts).finally(() => inFlight.delete(key));
+  inFlight.set(key, run);
+  return run;
+}
+
+async function doFetchPart({
+  ownerUserId,
+  assemblyaiId,
+  fileId,
+  partNo,
+  accessToken,
+}: {
+  ownerUserId: string;
+  assemblyaiId: string;
+  fileId: string;
+  partNo: number;
+  accessToken: string;
+}): Promise<{ bytes: number }> {
+  const meta = await getDriveFileMeta(accessToken, fileId);
+  if (!meta.canDownload) {
+    throw new RecordingFetchError(
+      'The owner has disabled downloads for viewers on this recording.',
+      403
+    );
+  }
+  const dl = await downloadDriveFileToTemp(accessToken, fileId);
+  if (dl.bytes === 0) {
+    await deleteAudioFile(dl.tempFilename);
+    throw new RecordingFetchError('Drive returned an empty file', 502);
+  }
+  // Meet recordings usually have no extension in their Drive name — sniff.
+  const sniffed = await sniffMediaExtension(dl.tempFilename);
+  const filename = `${assemblyaiId}.part${partNo}${sniffed ?? '.mp4'}`;
+  await renameAudioFile(dl.tempFilename, filename);
+  await setVideoPartStoredForUser(ownerUserId, assemblyaiId, fileId, {
+    filename,
+    bytes: dl.bytes,
+  });
+  return { bytes: dl.bytes };
 }
 
 async function doFetchTeams({

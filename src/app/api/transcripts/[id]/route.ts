@@ -128,6 +128,10 @@ export const DELETE = withAuth(async ({ user }, { params }) => {
   if (access.row.local_audio_path) {
     await deleteAudioFile(access.row.local_audio_path);
   }
+  // Extra recording segments (multi-video meetings) live in sidecar files.
+  for (const part of access.row.gmeet_context?.videoParts ?? []) {
+    if (part.filename) await deleteAudioFile(part.filename);
+  }
 
   return NextResponse.json({ ok: true });
 });

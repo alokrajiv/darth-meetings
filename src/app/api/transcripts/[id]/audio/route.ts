@@ -9,7 +9,11 @@ import { resolveAudioPath } from '@/lib/server/audio-storage';
 export const runtime = 'nodejs';
 
 /**
- * GET /api/transcripts/:id/audio
+ * GET /api/transcripts/:id/audio[?part=N]
+ *
+ * `?part=N` (N >= 2) serves an EXTRA recording segment of a multi-video
+ * meeting — gmeet_context.videoParts[N-2]'s stored file (the primary video
+ * is "part 1" and lives in local_audio_path, served by the plain route).
  *
  * Returns the audio for a transcript. Resolution order:
  *   1. local_audio_path (imported transcripts whose bytes we downloaded) →
@@ -31,6 +35,24 @@ export const GET = withAuth(async ({ user, request }, { params }) => {
     return NextResponse.json({ error: 'Not found' }, { status: 404 });
   }
   const row = access.row;
+
+  // Extra segment of a multi-video meeting.
+  const partParam = new URL(request.url).searchParams.get('part');
+  if (partParam) {
+    const partNo = Number.parseInt(partParam, 10);
+    const part = Number.isInteger(partNo)
+      ? row.gmeet_context?.videoParts?.[partNo - 2]
+      : undefined;
+    if (!part?.filename) {
+      return NextResponse.json({ error: 'No such video part' }, { status: 404 });
+    }
+    try {
+      return await streamLocalFile(request, resolveAudioPath(part.filename));
+    } catch (err) {
+      console.error('[GET /api/transcripts/:id/audio] part stream failed:', err);
+      return NextResponse.json({ error: 'Video part unavailable' }, { status: 404 });
+    }
+  }
 
   // Path 1 — local file (uploaded with bytes saved on the server, or imported)
   if (row.local_audio_path) {

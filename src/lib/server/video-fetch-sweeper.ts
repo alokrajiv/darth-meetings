@@ -6,6 +6,7 @@ import { isGraphConfigured } from '@/lib/server/ms-graph';
 import {
   fetchRecordingFromDrive,
   fetchRecordingFromTeams,
+  fetchVideoPartFromDrive,
 } from '@/lib/server/recording-fetch';
 import type { GmeetContext } from '@/lib/format';
 
@@ -46,11 +47,17 @@ function eligible(ctx: GmeetContext, now: number): boolean {
 async function fetchRow(row: {
   user_id: string;
   assemblyai_id: string;
+  local_audio_path: string | null;
   gmeet_context: GmeetContext;
 }): Promise<void> {
   const ctx = row.gmeet_context;
   const now = Date.now();
   const teams = ctx.provider === 'teams' ? ctx.teams : null;
+
+  // Extra recording segments (multi-video meetings) whose bytes are missing.
+  const missingParts = (ctx.videoParts ?? [])
+    .map((p, i) => ({ ...p, partNo: i + 2 }))
+    .filter((p) => p.fileId && !p.filename);
 
   try {
     let bytes: number;
@@ -65,18 +72,34 @@ async function fetchRow(row: {
       }));
     } else {
       const fileId = ctx.videoFileId ?? ctx.actuals?.recordings?.[0]?.fileId;
-      if (!fileId) return;
+      if (!fileId && missingParts.length === 0) return;
       // Own-token rule: the OWNER's stored Google connection. Not connected
       // right now → skip without burning an attempt; their reconnect or a
       // viewer's page visit picks it up later.
       const minted = await getServerAccessToken(row.user_id);
       if (!minted) return;
-      ({ bytes } = await fetchRecordingFromDrive({
-        ownerUserId: row.user_id,
-        assemblyaiId: row.assemblyai_id,
-        fileId,
-        accessToken: minted.token,
-      }));
+      bytes = 0;
+      if (fileId && !row.local_audio_path) {
+        ({ bytes } = await fetchRecordingFromDrive({
+          ownerUserId: row.user_id,
+          assemblyaiId: row.assemblyai_id,
+          fileId,
+          accessToken: minted.token,
+        }));
+      }
+      for (const part of missingParts) {
+        const res = await fetchVideoPartFromDrive({
+          ownerUserId: row.user_id,
+          assemblyaiId: row.assemblyai_id,
+          fileId: part.fileId,
+          partNo: part.partNo,
+          accessToken: minted.token,
+        });
+        bytes += res.bytes;
+        console.log(
+          `[video-fetch] ${row.assemblyai_id}: stored ${res.bytes} bytes (part ${part.partNo})`
+        );
+      }
     }
     console.log(`[video-fetch] ${row.assemblyai_id}: stored ${bytes} bytes`);
     // setLocalAudioPathForUser doesn't publish — tell open pages the video

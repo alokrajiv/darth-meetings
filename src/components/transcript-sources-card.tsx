@@ -77,6 +77,27 @@ export function TranscriptSourcesCard({
   // time — the server re-checks every minute and attaches it automatically.
   const recordingProcessing =
     !row.local_audio_path && !knownRecording && ctx?.recordingPending?.status === 'waiting';
+  // --- Multi-video meetings (stop-restart recording → several Drive files).
+  // Every segment beyond the primary is tracked in videoParts; segments
+  // Google is still generating are counted from the actuals snapshot while
+  // the pending watch is live. Surfacing these is the whole point — a second
+  // video that exists but isn't shown reads as "the meeting is missing".
+  const videoParts = ctx?.videoParts ?? [];
+  const partsStored = videoParts.filter((p) => p.filename).length;
+  const partsFetching = videoParts.filter((p) => !p.filename).length;
+  const partsGenerating =
+    ctx?.recordingPending?.status === 'waiting'
+      ? (ctx?.actuals?.recordings ?? []).filter((r) => !r.fileId).length
+      : 0;
+  const totalVideos =
+    (row.local_audio_path || knownRecording ? 1 : 0) +
+    videoParts.length +
+    partsGenerating;
+  const multiVideo = totalVideos > 1;
+  // The AAI transcription ran on the primary video only — when other
+  // segments exist, the transcript does NOT cover them. Say so loudly.
+  const transcriptCoversPartOnly =
+    multiVideo && !isMeetPrimary && !isTeamsPrimary;
   const recordingNeverCame =
     !row.local_audio_path &&
     !knownRecording &&
@@ -294,7 +315,48 @@ export function TranscriptSourcesCard({
             )}
           </span>
         </li>
+        {multiVideo && (
+          <li className="flex items-start gap-2">
+            <Video className="mt-0.5 h-3.5 w-3.5 shrink-0 text-muted-foreground" />
+            <span>
+              <span className="font-medium">
+                {totalVideos} videos in this meeting
+              </span>
+              <span className="text-muted-foreground">
+                {' '}
+                — the recording was stopped and restarted, so Meet made separate files.
+                {partsStored > 0 && ' Switch between them in the player.'}
+              </span>
+              {partsFetching > 0 && (
+                <span className="mt-0.5 block text-muted-foreground">
+                  <span className="inline-flex items-center gap-1">
+                    <Loader2 className="h-3 w-3 animate-spin" />
+                    {partsFetching} video{partsFetching > 1 ? 's' : ''} downloading from
+                    Drive…
+                  </span>
+                </span>
+              )}
+              {partsGenerating > 0 && (
+                <span className="mt-0.5 block text-amber-600 dark:text-amber-500">
+                  <span className="inline-flex items-center gap-1">
+                    <Loader2 className="h-3 w-3 animate-spin" />
+                    {partsGenerating} video{partsGenerating > 1 ? 's' : ''} — Google is
+                    still preparing the file; we check every minute and attach it
+                    automatically.
+                  </span>
+                </span>
+              )}
+            </span>
+          </li>
+        )}
       </ul>
+      {transcriptCoversPartOnly && (
+        <p className="mt-2 rounded-md border border-amber-400/50 bg-amber-50 px-2 py-1.5 text-[11px] leading-snug text-amber-900 dark:bg-amber-950/30 dark:text-amber-200">
+          Heads-up: the transcript and AI notes cover <span className="font-semibold">Video 1
+          only</span> — the other video{totalVideos > 2 ? 's are' : ' is'} playable in the
+          player but not transcribed.
+        </p>
+      )}
       {pooledMicSuspected && (
         <p className="mt-2 rounded-md border border-amber-400/50 bg-amber-50 px-2 py-1.5 text-[11px] leading-snug text-amber-900 dark:bg-amber-950/30 dark:text-amber-200">
           {joinedCount} people joined but Meet heard only {row.speaker_count} voice

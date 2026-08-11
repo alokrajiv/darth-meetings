@@ -658,6 +658,41 @@ export async function mergeGmeetContextForUser(
 }
 
 /**
+ * Stamp a videoParts entry (matched by fileId) with its stored filename and
+ * byte count after a successful Drive pull. Atomic in SQL — the poller and
+ * the sweeper both fetch parts, and a read-modify-write in JS could clobber
+ * a concurrent stamp of a DIFFERENT part on the same row.
+ */
+export async function setVideoPartStoredForUser(
+  userId: string,
+  assemblyaiId: string,
+  fileId: string,
+  patch: { filename: string; bytes: number }
+): Promise<void> {
+  await sql`
+    UPDATE ${sql(SCHEMA)}.transcripts
+    SET gmeet_context = jsonb_set(
+      gmeet_context,
+      '{videoParts}',
+      (
+        SELECT jsonb_agg(
+          CASE WHEN p->>'fileId' = ${fileId}
+            THEN p || ${sql.json({ ...patch, fetchedAt: new Date().toISOString() } as unknown as never)}
+            ELSE p
+          END
+          ORDER BY ord
+        )
+        FROM jsonb_array_elements(gmeet_context->'videoParts') WITH ORDINALITY AS t(p, ord)
+      )
+    )
+    WHERE user_id = ${userId} AND assemblyai_id = ${assemblyaiId}
+      AND jsonb_typeof(gmeet_context->'videoParts') = 'array'
+      AND jsonb_array_length(gmeet_context->'videoParts') > 0
+  `;
+  publishEvent({ kind: 'meta', assemblyaiId });
+}
+
+/**
  * Rows waiting on Google to finish generating a Meet recording file
  * (gmeet_context.recordingPending.status = 'waiting'). Sequential scan over
  * the jsonb is fine at this table's size; oldest first so long-waiting rows
@@ -677,40 +712,58 @@ export async function listRecordingPendingRows(limit: number): Promise<
     SELECT id, user_id, assemblyai_id, gmeet_context
     FROM ${sql(SCHEMA)}.transcripts
     WHERE gmeet_context->'recordingPending'->>'status' = 'waiting'
-      AND local_audio_path IS NULL
     ORDER BY created_at ASC
     LIMIT ${limit}
   `;
 }
 
 /**
- * Rows with a known recording (Meet Drive file or Teams recording id) but no
- * local audio yet — the video-fetch sweeper's work list. Excludes rows still
- * waiting on Google to GENERATE the file (recording-poller's job) and rows
- * the sweeper already gave up on; backoff between attempts is applied by the
- * sweeper in JS. Recent rows first — that's where people are looking.
+ * Rows with known-but-unfetched recording bytes — the video-fetch sweeper's
+ * work list: no local audio yet (Meet videoFileId / Teams recordingId), OR
+ * extra videoParts whose files are known on Drive but not stored. Excludes
+ * rows still waiting on Google to GENERATE a file (recording-poller's job)
+ * and rows the sweeper already gave up on; backoff between attempts is
+ * applied by the sweeper in JS. Recent rows first — that's where people are
+ * looking.
  */
 export async function listVideoFetchCandidates(limit: number): Promise<
   Array<{
     id: number;
     user_id: string;
     assemblyai_id: string;
+    local_audio_path: string | null;
     gmeet_context: GmeetContext;
   }>
 > {
   return sql<
-    Array<{ id: number; user_id: string; assemblyai_id: string; gmeet_context: GmeetContext }>
+    Array<{
+      id: number;
+      user_id: string;
+      assemblyai_id: string;
+      local_audio_path: string | null;
+      gmeet_context: GmeetContext;
+    }>
   >`
-    SELECT id, user_id, assemblyai_id, gmeet_context
+    SELECT id, user_id, assemblyai_id, local_audio_path, gmeet_context
     FROM ${sql(SCHEMA)}.transcripts
-    WHERE local_audio_path IS NULL
-      AND status = 'completed'
+    WHERE status = 'completed'
       AND gmeet_context IS NOT NULL
-      AND (gmeet_context->>'videoFileId' IS NOT NULL
-           OR gmeet_context->'teams'->>'recordingId' IS NOT NULL)
       AND COALESCE(gmeet_context->'recordingPending'->>'status', '') <> 'waiting'
       AND COALESCE(gmeet_context->'videoAutoFetch'->>'status', 'pending') = 'pending'
       AND created_at > now() - interval '30 days'
+      AND (
+        (local_audio_path IS NULL
+         AND (gmeet_context->>'videoFileId' IS NOT NULL
+              OR gmeet_context->'teams'->>'recordingId' IS NOT NULL))
+        OR EXISTS (
+          SELECT 1
+          FROM jsonb_array_elements(
+            CASE WHEN jsonb_typeof(gmeet_context->'videoParts') = 'array'
+              THEN gmeet_context->'videoParts' ELSE '[]'::jsonb END
+          ) p
+          WHERE p->>'filename' IS NULL AND p->>'fileId' IS NOT NULL
+        )
+      )
     ORDER BY created_at DESC
     LIMIT ${limit}
   `;
