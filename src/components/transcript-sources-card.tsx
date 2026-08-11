@@ -130,6 +130,55 @@ export function TranscriptSourcesCard({
     (row.speaker_count ?? 0) > 0 &&
     joinedCount - (row.speaker_count ?? 0) >= 2;
 
+  const [combining, setCombining] = useState(false);
+  // One-click fix for the "transcript covers Video 1 only" state: the server
+  // concatenates the stored segments and runs a fresh AAI transcription over
+  // the whole meeting (new row alongside; this one stays untouched).
+  const canCombineRetranscribe =
+    canEdit && transcriptCoversPartOnly && !!row.local_audio_path && partsStored > 0;
+  const combineAndRetranscribe = async () => {
+    if (
+      !window.confirm(
+        `Combine all ${partsStored + 1} videos and transcribe the full meeting with AssemblyAI? ` +
+          'Takes a few minutes and uses transcription credit; a new transcript is created alongside this one.'
+      )
+    ) {
+      return;
+    }
+    setCombining(true);
+    setError(null);
+    try {
+      const res = await fetch('/api/gmeet/import', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          mode: ctx?.meetingCode || ctx?.transcriptDocId ? 'both' : 'video',
+          sourceTranscriptId: row.assemblyai_id,
+          force: true,
+          event: {
+            id: ctx?.eventId,
+            title: ctx?.eventTitle,
+            startTime: ctx?.startTime,
+            endTime: ctx?.endTime,
+            meetingCode: ctx?.meetingCode,
+            attendees: ctx?.attendees ?? [],
+          },
+        }),
+      });
+      const payload = (await res.json().catch(() => ({}))) as {
+        transcript?: { assemblyai_id?: string };
+        error?: string;
+      };
+      if (!res.ok || !payload.transcript?.assemblyai_id) {
+        throw new Error(payload.error || `Failed (${res.status})`);
+      }
+      window.location.href = `/transcript/${payload.transcript.assemblyai_id}`;
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Combine & re-transcribe failed');
+      setCombining(false);
+    }
+  };
+
   const uploadAndRetranscribe = (file: File) => {
     if (file.size > MAX_UPLOAD_BYTES) {
       setError('File is larger than the 4GB upload limit.');
@@ -356,6 +405,25 @@ export function TranscriptSourcesCard({
           only</span> — the other video{totalVideos > 2 ? 's are' : ' is'} playable in the
           player but not transcribed.
         </p>
+      )}
+      {canCombineRetranscribe && (
+        <Button
+          variant="outline"
+          size="sm"
+          className="mt-2 h-8 w-full justify-start gap-2 text-[13px]"
+          disabled={combining}
+          onClick={() => void combineAndRetranscribe()}
+          title="Concatenate every stored video of this meeting and run a fresh AssemblyAI transcription over the whole thing — a new transcript is created alongside this one"
+        >
+          {combining ? (
+            <Loader2 className="h-4 w-4 animate-spin text-muted-foreground" />
+          ) : (
+            <Video className="h-4 w-4 text-primary" />
+          )}
+          {combining
+            ? 'Combining & submitting…'
+            : `Transcribe all ${partsStored + 1} videos together`}
+        </Button>
       )}
       {pooledMicSuspected && (
         <p className="mt-2 rounded-md border border-amber-400/50 bg-amber-50 px-2 py-1.5 text-[11px] leading-snug text-amber-900 dark:bg-amber-950/30 dark:text-amber-200">

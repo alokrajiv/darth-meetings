@@ -177,6 +177,11 @@ export interface GmeetContext {
     fetchedAt?: string;
   }>;
   transcriptDocId?: string;
+  /** This row's media is a CONCATENATION of a multi-video meeting's segments
+   * (re-transcribe-all-videos flow): the number of videos combined. Times in
+   * the transcript are concat-time — inter-segment gaps removed; the carried
+   * meetTranscript sidecar was remapped to match at combine time. */
+  combinedParts?: number;
   /** Set at import time when Meet listed ANY recording whose file Google was
    * still generating (state ENDED, no Drive id yet) — including a second/third
    * segment of a stop-restart recording while the first is already imported.

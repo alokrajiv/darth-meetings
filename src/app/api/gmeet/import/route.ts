@@ -19,6 +19,7 @@ import {
   type ParsedMeetTranscript,
 } from '@/lib/server/gmeet';
 import { copyAudioToTemp, deleteAudioFile } from '@/lib/server/audio-storage';
+import { concatMediaToTemp } from '@/lib/server/media-concat';
 import { IngestError, ingestLocalAudio } from '@/lib/server/ingest';
 import { ingestParsedUtterances } from '@/lib/server/ingest-parsed';
 import { resolveAccess } from '@/db-ops/transcript-access';
@@ -105,6 +106,57 @@ async function checkCrossUserDuplicate(
     console.warn('[gmeet/import] cross-user dedupe check failed:', err);
     return null;
   }
+}
+
+/**
+ * Remap a Meet-transcript sidecar's utterance times (ms since anchorIso =
+ * meeting time) onto the CONCATENATED media's timeline: segments play
+ * back-to-back, so each utterance shifts left by the total gap duration
+ * before it. Falls back to identity when segment windows are unknown.
+ */
+function remapParsedToConcatTime(
+  parsed: ParsedMeetTranscript,
+  sourceCtx: GmeetContext | null,
+  storedParts: NonNullable<GmeetContext['videoParts']>
+): ParsedMeetTranscript {
+  const recs = sourceCtx?.actuals?.recordings ?? [];
+  const primaryRec =
+    recs.find((r) => r.fileId && r.fileId === sourceCtx?.videoFileId) ??
+    recs.find((r) => r.fileId) ??
+    recs[0];
+  const segs = [primaryRec, ...storedParts]
+    .filter((s): s is { startTime: string; endTime: string } => !!s?.startTime && !!s?.endTime)
+    .map((s) => ({ startMs: Date.parse(s.startTime), endMs: Date.parse(s.endTime) }))
+    .filter((s) => !Number.isNaN(s.startMs) && !Number.isNaN(s.endMs))
+    .sort((a, b) => a.startMs - b.startMs);
+  const anchorIso = sourceCtx?.actuals?.anchorIso;
+  const anchorMs = anchorIso ? Date.parse(anchorIso) : segs[0]?.startMs;
+  if (segs.length < 2 || anchorMs == null || Number.isNaN(anchorMs)) return parsed;
+
+  // Concat-timeline start of each segment = cumulative duration before it.
+  let acc = 0;
+  const mapped = segs.map((s) => {
+    const entry = { meetingStartMs: s.startMs - anchorMs, concatStartMs: acc, durMs: s.endMs - s.startMs };
+    acc += entry.durMs;
+    return entry;
+  });
+  const toConcat = (t: number): number => {
+    let seg = mapped[0]!;
+    for (const m of mapped) {
+      if (t >= m.meetingStartMs) seg = m;
+      else break;
+    }
+    const local = Math.min(Math.max(t - seg.meetingStartMs, 0), seg.durMs);
+    return Math.round(seg.concatStartMs + local);
+  };
+  return {
+    ...parsed,
+    utterances: parsed.utterances.map((u) => ({
+      ...u,
+      start: toConcat(u.start),
+      end: toConcat(u.end),
+    })),
+  };
 }
 
 function googleErrorResponse(err: GoogleApiError): NextResponse {
@@ -285,14 +337,23 @@ export const POST = withAuth(async ({ user, request }) => {
     (a.startTime ?? '').localeCompare(b.startTime ?? '')
   );
   const primaryFileId = videoFileId ?? sortedRecs.find((r) => r.fileId)?.fileId;
-  // Re-runs inherit the source's known parts, minus filenames — part files
-  // are keyed by assemblyai_id, so the new row's copies get re-fetched.
+  // Re-runs from a multi-video source COMBINE the stored segments into one
+  // file (below) — the new row has all the content, so it carries no parts.
+  const sourceStoredParts = (sourceRow?.gmeet_context?.videoParts ?? []).filter(
+    (p) => !!p.filename
+  );
+  const combining = !!sourceRow?.local_audio_path && sourceStoredParts.length > 0;
+  // Otherwise re-runs inherit the source's known parts, minus filenames —
+  // part files are keyed by assemblyai_id, so the new row's copies get
+  // re-fetched.
   const videoParts = sourceRow
-    ? (sourceRow.gmeet_context?.videoParts ?? []).map(({ fileId, startTime, endTime }) => ({
-        fileId,
-        startTime,
-        endTime,
-      }))
+    ? combining
+      ? []
+      : (sourceRow.gmeet_context?.videoParts ?? []).map(({ fileId, startTime, endTime }) => ({
+          fileId,
+          startTime,
+          endTime,
+        }))
     : sortedRecs
         .filter((r) => r.fileId && r.fileId !== primaryFileId)
         .map((r) => ({ fileId: r.fileId!, startTime: r.startTime, endTime: r.endTime }));
@@ -309,6 +370,7 @@ export const POST = withAuth(async ({ user, request }) => {
     attendees,
     videoFileId: videoFileId ?? undefined,
     ...(videoParts.length > 0 ? { videoParts } : {}),
+    ...(combining ? { combinedParts: sourceStoredParts.length + 1 } : {}),
     transcriptDocId: effectiveDocId ?? undefined,
     recordingPending,
     actuals,
@@ -494,7 +556,25 @@ export const POST = withAuth(async ({ user, request }) => {
 
   let tempFilename: string;
   let originalFilename: string;
-  if (sourceRow?.local_audio_path) {
+  if (sourceRow?.local_audio_path && combining) {
+    // Multi-video source: concatenate the primary + every stored segment so
+    // the NEW transcription covers the whole meeting — re-transcribing just
+    // the first video would repeat the missing-content confusion this flow
+    // exists to fix.
+    try {
+      tempFilename = await concatMediaToTemp([
+        sourceRow.local_audio_path,
+        ...sourceStoredParts.map((p) => p.filename!),
+      ]);
+    } catch (err) {
+      console.error('[gmeet/import] video concat failed:', err);
+      return NextResponse.json(
+        { error: 'Combining the meeting videos failed', detail: String(err) },
+        { status: 502 }
+      );
+    }
+    originalFilename = `combined-${sourceStoredParts.length + 1}-videos.mp4`;
+  } else if (sourceRow?.local_audio_path) {
     // Re-run from local: the bytes were already fetched (fetch-audio) —
     // copy them so the ingest rename consumes the copy, not the source.
     try {
@@ -552,6 +632,15 @@ export const POST = withAuth(async ({ user, request }) => {
     if (p.displayName && p.displayName !== 'Unknown') keytermNames.add(p.displayName);
   }
 
+  // Combined media has the inter-segment gaps removed, so the carried Meet
+  // sidecar's wall-clock-anchored times must shift to concat time — without
+  // this, everything after the first segment is misaligned by the gap
+  // (breaks speaker Meet-timeline matching and utterance-click seeks).
+  const finalParsed =
+    combining && parsed
+      ? remapParsedToConcatTime(parsed, sourceRow!.gmeet_context, sourceStoredParts)
+      : parsed;
+
   try {
     const row = await ingestLocalAudio(user.userId, tempFilename, {
       originalFilename,
@@ -559,7 +648,7 @@ export const POST = withAuth(async ({ user, request }) => {
       title,
       extraKeyterms: [...keytermNames],
       driveFileId: videoFileId ?? actuals?.recordings?.[0]?.fileId ?? null,
-      gmeetContext: { ...baseContext, meetTranscript: parsed },
+      gmeetContext: { ...baseContext, meetTranscript: finalParsed },
     });
     const meetingStart = event.startTime ?? actuals?.conferenceStart;
     if (meetingStart && !Number.isNaN(Date.parse(meetingStart))) {
