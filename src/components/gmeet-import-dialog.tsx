@@ -499,7 +499,14 @@ export function GmeetImportDialog({
   const [picked, setPicked] = useState<PickedMeeting | null>(null);
   const [mode, setMode] = useState<Mode>('both');
   const [conflict, setConflict] = useState<ConflictInfo | null>(null);
-  const [doneInfo, setDoneInfo] = useState<{ mode: Mode; title: string; autoShared: number } | null>(null);
+  const [doneInfo, setDoneInfo] = useState<{
+    mode: Mode;
+    title: string;
+    autoShared: number;
+    /** Import queued (202) — Google is still preparing this artifact; the
+     * server runs the import automatically once it lands. */
+    deferred?: 'transcript' | 'video' | 'both';
+  } | null>(null);
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [bulkResults, setBulkResults] = useState<BulkResult[]>([]);
   const [bulkProgress, setBulkProgress] = useState<{ done: number; total: number } | null>(null);
@@ -1204,13 +1211,15 @@ export function GmeetImportDialog({
         };
       });
       // Transcript-first default — but only for the row that's still picked,
-      // and never over a choice the user already made by hand.
+      // and never over a choice the user already made by hand. Pending counts
+      // as available: a still-preparing Doc is still the recommended path
+      // (the import queues and runs when it lands).
       if (applied && !modeTouchedRef.current) {
         const docKnownBad = initial.cacheMeta?.transcriptParseable === false;
         setMode(
-          transcriptDocId && !docKnownBad
+          (transcriptDocId || transcriptPending) && !docKnownBad
             ? 'transcript'
-            : videoFileId
+            : videoFileId || videoPending
               ? 'video'
               : 'transcript'
         );
@@ -1291,9 +1300,14 @@ export function GmeetImportDialog({
     modeTouchedRef.current = false;
     // Transcript-first default — unless the poller already found the Doc
     // unparseable, in which case re-transcribing is the honest suggestion.
+    // Pending (still-preparing) artifacts count as available here too.
     const docKnownBad = cached?.transcriptParseable === false;
     setMode(
-      transcriptDocId && !docKnownBad ? 'transcript' : videoFileId ? 'video' : 'transcript'
+      (transcriptDocId || initial.transcriptPending) && !docKnownBad
+        ? 'transcript'
+        : videoFileId || initial.videoPending
+          ? 'video'
+          : 'transcript'
     );
     setStep('options');
     void enrich(initial);
@@ -1452,6 +1466,10 @@ export function GmeetImportDialog({
           transcriptDocId: picked.transcriptDocId ?? undefined,
           conferenceRecordName: picked.conferenceRecordName ?? undefined,
           force,
+          // If the mode's artifact is listed but Google hasn't generated the
+          // file yet, queue the import instead of failing — the server runs
+          // it automatically the moment the file lands.
+          defer: true,
           event: {
             id: e.id,
             title: picked.offCalendar ? undefined : e.summary,
@@ -1497,11 +1515,16 @@ export function GmeetImportDialog({
         throw new Error(detail.error || `Import failed (${res.status})`);
       }
 
-      const payload = (await res.json()) as { autoShared?: number };
+      const payload = (await res.json()) as {
+        autoShared?: number;
+        deferred?: boolean;
+        waitingFor?: 'transcript' | 'video' | 'both';
+      };
       setDoneInfo({
         mode,
         title: e.summary ?? 'Untitled meeting',
         autoShared: payload.autoShared ?? 0,
+        deferred: payload.deferred ? (payload.waitingFor ?? 'both') : undefined,
       });
       setStep('done');
       onImported?.();
@@ -1572,11 +1595,16 @@ export function GmeetImportDialog({
         const detail = await res.json().catch(() => ({}) as { error?: string });
         throw new Error(detail.error || `Import failed (${res.status})`);
       }
-      const payload = (await res.json()) as { autoShared?: number };
+      const payload = (await res.json()) as {
+        autoShared?: number;
+        deferred?: boolean;
+        waitingFor?: 'transcript' | 'video' | 'both';
+      };
       setDoneInfo({
         mode,
         title: e.summary ?? 'Untitled meeting',
         autoShared: payload.autoShared ?? 0,
+        deferred: payload.deferred ? (payload.waitingFor ?? 'both') : undefined,
       });
       setStep('done');
       onImported?.();
@@ -2570,7 +2598,7 @@ export function GmeetImportDialog({
             )}
 
             <div className="space-y-2">
-              {picked.transcriptDocId && (
+              {(picked.transcriptDocId || picked.transcriptPending) && (
                 <label className="flex items-start gap-2 rounded-md border p-3 cursor-pointer has-[:checked]:border-primary">
                   <input
                     type="radio"
@@ -2591,32 +2619,46 @@ export function GmeetImportDialog({
                       one meeting-room mic show up as one speaker, and there&apos;s no audio
                       playback — you can always re-run diarization later if that matters.
                     </span>
+                    {!picked.transcriptDocId && picked.transcriptPending && (
+                      <span className="block text-xs text-amber-600 dark:text-amber-500">
+                        Doc still being prepared — importing now queues it and it runs
+                        automatically when the Doc is ready (usually minutes).
+                      </span>
+                    )}
                   </span>
                 </label>
               )}
-              {picked.videoFileId && picked.transcriptDocId && (
-                <label className="flex items-start gap-2 rounded-md border p-3 cursor-pointer has-[:checked]:border-primary">
-                  <input
-                    type="radio"
-                    name="gmeet-mode"
-                    checked={mode === 'both'}
-                    onChange={() => {
-                      modeTouchedRef.current = true;
-                      setMode('both');
-                    }}
-                    className="mt-0.5"
-                  />
-                  <span className="text-sm">
-                    <span className="font-medium">Re-transcribe + keep Meet transcript</span>
-                    <span className="block text-xs text-muted-foreground">
-                      For when speaker separation matters (pooled meeting-room audio):
-                      voice-level diarization from the video, with Google&apos;s transcript
-                      kept alongside for names. Slower, uses transcription credit.
+              {(picked.videoFileId || picked.videoPending) &&
+                (picked.transcriptDocId || picked.transcriptPending) && (
+                  <label className="flex items-start gap-2 rounded-md border p-3 cursor-pointer has-[:checked]:border-primary">
+                    <input
+                      type="radio"
+                      name="gmeet-mode"
+                      checked={mode === 'both'}
+                      onChange={() => {
+                        modeTouchedRef.current = true;
+                        setMode('both');
+                      }}
+                      className="mt-0.5"
+                    />
+                    <span className="text-sm">
+                      <span className="font-medium">Re-transcribe + keep Meet transcript</span>
+                      <span className="block text-xs text-muted-foreground">
+                        For when speaker separation matters (pooled meeting-room audio):
+                        voice-level diarization from the video, with Google&apos;s transcript
+                        kept alongside for names. Slower, uses transcription credit.
+                      </span>
+                      {(!picked.videoFileId || !picked.transcriptDocId) &&
+                        (picked.videoPending || picked.transcriptPending) && (
+                          <span className="block text-xs text-amber-600 dark:text-amber-500">
+                            Waits for both the video and the transcript Doc — importing now
+                            queues it and it runs automatically when they&apos;re ready.
+                          </span>
+                        )}
                     </span>
-                  </span>
-                </label>
-              )}
-              {picked.videoFileId && (
+                  </label>
+                )}
+              {(picked.videoFileId || picked.videoPending) && (
                 <label className="flex items-start gap-2 rounded-md border p-3 cursor-pointer has-[:checked]:border-primary">
                   <input
                     type="radio"
@@ -2634,6 +2676,12 @@ export function GmeetImportDialog({
                       Exception path: fetch the video from Drive and run our transcription
                       with speaker diarization. Takes a few minutes.
                     </span>
+                    {!picked.videoFileId && picked.videoPending && (
+                      <span className="block text-xs text-amber-600 dark:text-amber-500">
+                        Video still being prepared — importing now queues it and it runs
+                        automatically when the file is ready (longer for long recordings).
+                      </span>
+                    )}
                   </span>
                 </label>
               )}
@@ -2656,7 +2704,8 @@ export function GmeetImportDialog({
                           ? 'video file'
                           : 'transcript Doc'}
                       . This usually takes a few minutes after the call ends (longer for long
-                      recordings).
+                      recordings). You can import anyway — it queues and runs automatically
+                      the moment Google finishes — or check again now.
                     </p>
                     <Button
                       size="sm"
@@ -2702,12 +2751,24 @@ export function GmeetImportDialog({
 
         {step === 'done' && doneInfo && (
           <div className="py-6 text-center space-y-2">
-            <CheckCircle2 className="h-10 w-10 mx-auto text-status-ok" />
+            {doneInfo.deferred ? (
+              <Loader2 className="h-10 w-10 mx-auto animate-spin text-amber-500" />
+            ) : (
+              <CheckCircle2 className="h-10 w-10 mx-auto text-status-ok" />
+            )}
             <p className="text-sm font-medium">{doneInfo.title}</p>
             <p className="text-sm text-muted-foreground">
-              {doneInfo.mode === 'transcript'
-                ? 'Meet transcript imported — it’s ready in your list now.'
-                : 'Recording submitted for transcription — it’ll show up in your list as processing and complete in a few minutes.'}
+              {doneInfo.deferred
+                ? `Import queued — Google is still preparing the ${
+                    doneInfo.deferred === 'both'
+                      ? 'video and transcript'
+                      : doneInfo.deferred === 'video'
+                        ? 'video file'
+                        : 'transcript Doc'
+                  }. It's in your list as waiting; we check every minute and the import runs by itself the moment the file${doneInfo.deferred === 'both' ? 's are' : ' is'} ready. Nothing else to do — you can close this.`
+                : doneInfo.mode === 'transcript'
+                  ? 'Meet transcript imported — it’s ready in your list now.'
+                  : 'Recording submitted for transcription — it’ll show up in your list as processing and complete in a few minutes.'}
             </p>
             {doneInfo.autoShared > 0 && (
               <p className="text-xs text-muted-foreground">
@@ -2763,8 +2824,13 @@ export function GmeetImportDialog({
                   // Enriching alone doesn't block: once ANY artifact id is
                   // known (poller cache or calendar row), importing is safe —
                   // the server re-resolves everything authoritatively anyway.
+                  // Pending artifacts count too: the server queues the import
+                  // (defer) and runs it when Google finishes the file.
                   busy ||
-                  (!picked?.videoFileId && !picked?.transcriptDocId) ||
+                  (!picked?.videoFileId &&
+                    !picked?.transcriptDocId &&
+                    !picked?.videoPending &&
+                    !picked?.transcriptPending) ||
                   !!conflict
                 }
               >

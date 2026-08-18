@@ -265,7 +265,7 @@ export async function listSuggestedMembers(
       AND m.id IS NULL
       AND x.transcript_id IS NULL
       AND (t.user_id = ${caller.userId} OR sh.id IS NOT NULL)
-      AND t.status <> 'uploading'
+      AND t.status NOT IN ('uploading', 'waiting')
     GROUP BY t.id, t.assemblyai_id, t.title, t.recorded_at, t.created_at
     ORDER BY COALESCE(t.recorded_at, t.created_at) DESC
   `;

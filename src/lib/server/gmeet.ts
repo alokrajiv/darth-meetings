@@ -409,6 +409,9 @@ export async function listRecordArtifacts(
 ): Promise<{
   recordings: Array<{ fileId: string | null; startTime?: string; endTime?: string }>;
   transcriptDocIds: string[];
+  /** Transcript SESSIONS listed, generated or not — listed > 0 with no doc
+   * ids = Google is still preparing the transcript Doc. */
+  transcriptsListed: number;
   /** The verbatim API responses — callers that archive structured data keep
    * every field Google returns, not just what we shape today. */
   raw: { recordings?: unknown; transcripts?: unknown };
@@ -443,6 +446,7 @@ export async function listRecordArtifacts(
   return {
     recordings,
     transcriptDocIds,
+    transcriptsListed: (trans?.transcripts ?? []).length,
     raw: {
       recordings: recs ?? undefined,
       transcripts: trans ?? undefined,
@@ -637,6 +641,7 @@ export async function captureMeetActuals(
     transcriptEntries: entries.length > 0 ? entries : undefined,
     entriesTruncated: entriesTruncated || undefined,
     anchorIso,
+    transcriptsListed: transcriptSessions.length || undefined,
   };
 }
 

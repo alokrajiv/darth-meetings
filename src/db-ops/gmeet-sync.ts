@@ -97,7 +97,13 @@ const OCCURRENCE_WINDOW_MS = 12 * 3600_000;
  */
 export async function findImportedByMeetingCodes(
   meetings: MeetingOccurrenceQuery[],
-  caller: { userId: string; email: string }
+  caller: { userId: string; email: string },
+  opts?: {
+    /** Rows to ignore — the deferred-import poller passes its own `defer-…`
+     * placeholder here so executing a queued import doesn't 409 against
+     * itself (the placeholder carries the same meetingCode). */
+    excludeAssemblyaiIds?: string[];
+  }
 ): Promise<(ImportedMeetingInfo | null)[]> {
   const cleaned = meetings.map((m) => ({
     code: m.code.trim(),
@@ -138,9 +144,12 @@ export async function findImportedByMeetingCodes(
     ORDER BY t.created_at ASC
   `;
 
+  const excluded = new Set(opts?.excludeAssemblyaiIds ?? []);
   return cleaned.map(({ code, startTime }) => {
     if (!code) return null;
-    const candidates = rows.filter((r) => r.meeting_code === code);
+    const candidates = rows.filter(
+      (r) => r.meeting_code === code && !excluded.has(r.assemblyai_id)
+    );
     const wanted = startTime ? Date.parse(startTime) : NaN;
     const match = Number.isNaN(wanted)
       ? candidates[0]

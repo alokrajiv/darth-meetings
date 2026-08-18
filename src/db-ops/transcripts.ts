@@ -104,6 +104,10 @@ export async function listVisibleToUser(
                   OR t.gmeet_context->>'meetingCode' IS NOT NULL THEN 'gmeet'
            END AS provider,
            (t.gmeet_context->>'eventId') IS NOT NULL AS has_event,
+           -- Deferred-import placeholders: mode drives the "waiting for
+           -- Google to prepare the X" listing copy; error shows after give-up.
+           t.gmeet_context->'deferredImport'->>'mode' AS deferred_mode,
+           t.gmeet_context->'deferredImport'->>'error' AS deferred_error,
            sm.series_id, se.title AS series_title,
            sus.series_id AS suspected_series_id, sus.title AS suspected_series_title,
            CASE
@@ -219,6 +223,93 @@ export async function createForUser(
   return rows[0]!;
 }
 
+export interface DeferredPlaceholderInsert {
+  /** Synthetic `defer-<uuid>` id. Video-mode executions promote it to the
+   * real AAI id; transcript-mode executions delete it in favor of the
+   * `gmeet-…` imported row. */
+  placeholderId: string;
+  title?: string | null;
+  /** Event start — so the queued row sorts on the meeting's day. */
+  recordedAt?: string | null;
+  /** Must carry `deferredImport` (the poller's work marker). */
+  gmeetContext: GmeetContext;
+}
+
+/**
+ * Create the placeholder row for an import queued while Google is still
+ * preparing the needed artifact (gmeet_context.deferredImport). Status
+ * 'waiting' — a sixth row status alongside uploading/queued/processing/
+ * completed/error; excluded from AAI refresh, series eligibility, and row
+ * navigation the same way 'uploading' is.
+ */
+export async function createDeferredPlaceholder(
+  userId: string,
+  data: DeferredPlaceholderInsert
+): Promise<TranscriptRow> {
+  const recordedAt =
+    data.recordedAt && !Number.isNaN(Date.parse(data.recordedAt))
+      ? new Date(data.recordedAt)
+      : null;
+  const rows = await sql<TranscriptRow[]>`
+    INSERT INTO ${sql(SCHEMA)}.transcripts (
+      user_id, assemblyai_id, original_filename, status, title,
+      source, recorded_at, gmeet_context
+    ) VALUES (
+      ${userId}, ${data.placeholderId}, null,
+      'waiting', ${data.title ?? null},
+      'uploaded', ${recordedAt},
+      ${sql.json(data.gmeetContext as unknown as never)}
+    )
+    RETURNING *
+  `;
+  publishEvent({ kind: 'created', assemblyaiId: data.placeholderId });
+  return rows[0]!;
+}
+
+/**
+ * Deferred imports still waiting on Google (the deferred-import poller's
+ * work list). Same jsonb-scan reasoning as listRecordingPendingRows.
+ */
+export async function listDeferredImportRows(limit: number): Promise<
+  Array<{
+    id: number;
+    user_id: string;
+    assemblyai_id: string;
+    gmeet_context: GmeetContext;
+  }>
+> {
+  return sql<
+    Array<{ id: number; user_id: string; assemblyai_id: string; gmeet_context: GmeetContext }>
+  >`
+    SELECT id, user_id, assemblyai_id, gmeet_context
+    FROM ${sql(SCHEMA)}.transcripts
+    WHERE status = 'waiting'
+      AND gmeet_context->'deferredImport'->>'status' = 'waiting'
+    ORDER BY created_at ASC
+    LIMIT ${limit}
+  `;
+}
+
+/**
+ * Terminal failure for a deferred import: flip the placeholder row to
+ * 'error' (so the listing shows Failed instead of an eternal spinner) and
+ * write the resolved marker in the same statement.
+ */
+export async function markDeferredImportFailed(
+  userId: string,
+  placeholderId: string,
+  marker: NonNullable<GmeetContext['deferredImport']>
+): Promise<void> {
+  await sql`
+    UPDATE ${sql(SCHEMA)}.transcripts
+    SET status = 'error',
+        gmeet_context = COALESCE(gmeet_context, '{}'::jsonb) ||
+          ${sql.json({ deferredImport: marker } as unknown as never)}
+    WHERE user_id = ${userId} AND assemblyai_id = ${placeholderId}
+  `;
+  publishEvent({ kind: 'status', assemblyaiId: placeholderId });
+}
+
 export interface UploadingPlaceholderInsert {
   /** Synthetic `up-<uuid>` id — rewritten to the real AAI id on promote. */
   placeholderId: string;
@@ -283,8 +374,10 @@ export async function updateUploadProgress(
 /**
  * Swap the placeholder's synthetic id for the real AAI id once the
  * transcription is accepted. Shares survive (they key on the numeric row id).
- * Returns null when the row is gone — e.g. the sweeper reaped it as stale —
- * so the caller can fall back to a fresh insert.
+ * Covers both placeholder kinds: `up-…` uploads (status 'uploading') and
+ * `defer-…` deferred imports (status 'waiting'). Returns null when the row
+ * is gone — e.g. the sweeper reaped it, or the user deleted the queued
+ * import — so the caller can fall back to a fresh insert.
  */
 export async function promoteUploadingRow(
   userId: string,
@@ -296,7 +389,8 @@ export async function promoteUploadingRow(
     SET assemblyai_id = ${data.assemblyaiId},
         status = ${data.status},
         audio_url = ${data.audioUrl ?? null}
-    WHERE user_id = ${userId} AND assemblyai_id = ${placeholderId} AND status = 'uploading'
+    WHERE user_id = ${userId} AND assemblyai_id = ${placeholderId}
+      AND status IN ('uploading', 'waiting')
     RETURNING *
   `;
   if (rows[0]) publishEvent({ kind: 'status', assemblyaiId: data.assemblyaiId });

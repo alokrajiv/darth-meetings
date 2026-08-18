@@ -117,6 +117,10 @@ export interface MeetActuals {
   transcriptEntries?: MeetTranscriptEntry[];
   entriesTruncated?: boolean;
   anchorIso?: string;
+  /** How many transcript SESSIONS Meet listed, whether or not their Doc has
+   * been generated yet. transcriptsListed > 0 with no transcriptDocIds =
+   * "Google is still preparing the transcript Doc". */
+  transcriptsListed?: number;
 }
 
 /**
@@ -207,6 +211,49 @@ export interface GmeetContext {
     status: 'pending' | 'gave-up';
     lastError?: string;
   } | null;
+  /** Import queued while Google was still preparing the needed artifact
+   * (transcript Doc for 'transcript' mode, video file for 'video', both for
+   * 'both'). Lives on a `defer-…` placeholder row (status 'waiting'); the
+   * deferred-import poller re-checks every minute and replays the frozen
+   * `request` with the owner's server token the moment the dependency lands.
+   * On success the placeholder is promoted (video modes) or deleted in favor
+   * of the real imported row (transcript mode). */
+  deferredImport?: {
+    mode: 'video' | 'transcript' | 'both';
+    /** Owner's email at queue time (needed for dedupe + share resolution —
+     * there is no users table to look it up from later). */
+    ownerEmail: string;
+    /** The import request frozen at queue time, replayed verbatim (plus the
+     * artifact ids discovered by the poller) when Google finishes. */
+    request: {
+      videoFileId?: string;
+      transcriptDocId?: string;
+      languageCode?: string;
+      conferenceRecordName?: string;
+      force?: boolean;
+      event?: {
+        id?: string;
+        title?: string;
+        startTime?: string;
+        endTime?: string;
+        meetingCode?: string;
+        recurringEventId?: string;
+        iCalUID?: string;
+        organizerEmail?: string;
+        attendees?: GmeetAttendee[];
+      };
+    };
+    since: string;
+    lastCheckedAt?: string;
+    /** Cheap artifact-listing checks. */
+    attempts?: number;
+    /** Full import executions that failed (backed off separately). */
+    execAttempts?: number;
+    lastExecAt?: string;
+    status: 'waiting' | 'done' | 'failed' | 'gave-up';
+    error?: string;
+    resolvedAt?: string;
+  } | null;
   meetTranscript?: {
     attendees: string[];
     utterances: MeetUtterance[];
@@ -270,6 +317,11 @@ export interface TranscriptListRow {
   /** Best evidence-key guess for untagged rows (the dashed "…?" chip). */
   suspected_series_id?: number | null;
   suspected_series_title?: string | null;
+  /** Set on `defer-…` placeholder rows (status 'waiting', or 'error' after
+   * give-up): the queued import's mode, for the listing's waiting/failed
+   * copy. */
+  deferred_mode?: 'video' | 'transcript' | 'both' | null;
+  deferred_error?: string | null;
   access: TranscriptAccess;
   owner_email: string | null;
   owner_name: string | null;

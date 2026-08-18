@@ -79,11 +79,17 @@ export const GET = withAuth(async ({ user }) => {
   // skip the network hop entirely — refreshIfPending short-circuits on
   // `status === 'completed'`. So for a list of 36 finished transcripts
   // this is still a pure-DB call.
-  // 'uploading' rows are placeholders with synthetic `up-…` ids — AAI has
-  // never heard of them, so they must not join the refresh fan-out.
+  // 'uploading' and 'waiting' rows are placeholders with synthetic `up-…` /
+  // `defer-…` ids — AAI has never heard of them, so they must not join the
+  // refresh fan-out.
   const pendingIdx = rows
     .map((r, i) =>
-      r.status === 'completed' || r.status === 'error' || r.status === 'uploading' ? -1 : i
+      r.status === 'completed' ||
+      r.status === 'error' ||
+      r.status === 'uploading' ||
+      r.status === 'waiting'
+        ? -1
+        : i
     )
     .filter((i) => i >= 0);
 

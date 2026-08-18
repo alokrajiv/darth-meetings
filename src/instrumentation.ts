@@ -12,5 +12,7 @@ export async function register() {
     startRecordingPoller();
     const { startVideoFetchSweeper } = await import('@/lib/server/video-fetch-sweeper');
     startVideoFetchSweeper();
+    const { startDeferredImportPoller } = await import('@/lib/server/deferred-import-poller');
+    startDeferredImportPoller();
   }
 }

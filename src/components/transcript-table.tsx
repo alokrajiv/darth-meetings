@@ -389,6 +389,14 @@ export function TranscriptTable({ refreshTrigger, toolbarExtra }: TranscriptTabl
         return <span className={`${base} bg-status-busy animate-pulse`} aria-label="Processing" />;
       case 'uploading':
         return <span className={`${base} bg-primary animate-pulse`} aria-label="Uploading" />;
+      case 'waiting':
+        // Deferred import — queued until Google finishes preparing the files.
+        return (
+          <span
+            className={`${base} bg-amber-500 animate-pulse`}
+            aria-label="Waiting for Google"
+          />
+        );
       case 'queued':
         return <span className={`${base} bg-muted-foreground/40`} aria-label="Queued" />;
       case 'error':
@@ -760,18 +768,21 @@ export function TranscriptTable({ refreshTrigger, toolbarExtra }: TranscriptTabl
   const renderRow = (t: TranscriptListRow) => {
     const { primary, secondary, untitled } = titleOf(t);
     const processing = t.status === 'processing' || t.status === 'queued';
-    // Placeholder rows have a synthetic `up-…` id — there is no detail page
-    // to open until the upload finishes and the row is promoted to its real
-    // AAI id.
+    // Placeholder rows have a synthetic `up-…` / `defer-…` id — there is no
+    // detail page to open until the upload/deferred import finishes and the
+    // row is promoted to (or replaced by) its real id. Failed deferred rows
+    // keep the `defer-…` id, so key off the id, not only the status.
     const uploading = t.status === 'uploading';
+    const waiting = t.status === 'waiting';
+    const placeholder = uploading || t.assemblyai_id.startsWith('defer-');
     return (
       <TableRow
         key={t.id}
         onClick={() => {
-          if (!uploading) router.push(`/transcript/${t.assemblyai_id}`);
+          if (!placeholder) router.push(`/transcript/${t.assemblyai_id}`);
         }}
         className={`group transition-colors hover:bg-accent/40 ${
-          uploading ? 'cursor-default' : 'cursor-pointer'
+          placeholder ? 'cursor-default' : 'cursor-pointer'
         }`}
       >
         <TableCell className="py-2 pl-4">
@@ -784,11 +795,11 @@ export function TranscriptTable({ refreshTrigger, toolbarExtra }: TranscriptTabl
                 <div
                   className={`min-w-0 truncate text-sm font-medium ${
                     untitled ? 'italic text-muted-foreground' : ''
-                  } ${processing || uploading ? 'text-shimmer' : ''}`}
+                  } ${processing || uploading || waiting ? 'text-shimmer' : ''}`}
                 >
                   {primary}
                 </div>
-                {!uploading && (
+                {!uploading && !waiting && (
                   <SeriesBadge
                     assemblyaiId={t.assemblyai_id}
                     membership={
@@ -811,6 +822,18 @@ export function TranscriptTable({ refreshTrigger, toolbarExtra }: TranscriptTabl
                 <div className="truncate font-mono text-[11px] text-muted-foreground">
                   {uploadProgressLine(t)}
                 </div>
+              ) : waiting ? (
+                <div className="truncate font-mono text-[11px] text-muted-foreground">
+                  {`import queued — Google is still preparing the ${
+                    t.deferred_mode === 'video'
+                      ? 'video file'
+                      : t.deferred_mode === 'both'
+                        ? 'video + transcript'
+                        : 'transcript Doc'
+                  }; runs automatically (checked every minute)`}
+                </div>
+              ) : t.status === 'error' && t.deferred_error ? (
+                <div className="truncate text-xs text-destructive/80">{t.deferred_error}</div>
               ) : processing ? (
                 <div className="truncate font-mono text-[11px] text-muted-foreground">
                   transcribing… — open it to share or link the calendar event
@@ -857,7 +880,7 @@ export function TranscriptTable({ refreshTrigger, toolbarExtra }: TranscriptTabl
                 variant="ghost"
                 className="h-7 w-7 p-0 text-muted-foreground opacity-0 transition-opacity hover:text-destructive group-hover:opacity-100"
                 onClick={(e) => handleDeleteTranscript(e, t.assemblyai_id)}
-                title="Delete"
+                title={waiting ? 'Cancel queued import' : 'Delete'}
               >
                 <Trash2 className="h-3.5 w-3.5" />
               </Button>
