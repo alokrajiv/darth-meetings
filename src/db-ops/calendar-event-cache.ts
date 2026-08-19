@@ -215,8 +215,11 @@ export async function countCalendarMeetings(
 ): Promise<{ unimported: number; norec: number }> {
   const range = { ...opts, cursor: null };
   const [u, n] = await Promise.all([
+    // The global cache keys rows by the raw startIso, so the same occurrence
+    // captured from two users' calendars (different tz offsets) yields two
+    // event_keys — count/list one row per (code, instant) pair.
     sql<Array<{ n: number }>>`
-      SELECT count(*)::int AS n
+      SELECT count(DISTINCT (c.meeting_code, COALESCE(c.event_start, c.conf_start)))::int AS n
       FROM ${sql(SCHEMA)}.gmeet_meeting_cache c
       ${unimportedWhere(range)}
     `,
@@ -235,8 +238,11 @@ async function unimportedRows(
   dayKeys: string[]
 ): Promise<CalendarMeetingDbRow[]> {
   const day = unimportedDay(opts.tz);
+  // DISTINCT ON (code, instant): the raw-startIso event_key means one
+  // occurrence can appear under two tz representations — keep one row.
   return sql<CalendarMeetingDbRow[]>`
-    SELECT
+    SELECT * FROM (
+    SELECT DISTINCT ON (c.meeting_code, COALESCE(c.event_start, c.conf_start))
       to_char(${day}, 'YYYY-MM-DD') AS day_key,
       c.event_key AS key,
       c.meeting_code,
@@ -287,7 +293,9 @@ async function unimportedRows(
     ) cal ON true
     ${unimportedWhere(opts)}
       AND to_char(${day}, 'YYYY-MM-DD') = ANY(${dayKeys})
-    ORDER BY COALESCE(c.event_start, c.conf_start) DESC, c.event_key DESC
+    ORDER BY c.meeting_code, COALESCE(c.event_start, c.conf_start), c.event_key DESC
+    ) d
+    ORDER BY d.event_start DESC, d.key DESC
   `;
 }
 
@@ -348,8 +356,14 @@ export async function listCalendarMeetingsPage(
     view === 'unimported' ? unimportedWhere(opts) : norecWhere(caller.userId, opts);
   const table = view === 'unimported' ? sql`gmeet_meeting_cache` : sql`calendar_event_cache`;
 
+  // Per-day row counts drive the minRows accounting — for unimported, count
+  // deduped (code, instant) pairs to match what unimportedRows returns.
+  const dayCount =
+    view === 'unimported'
+      ? sql`count(DISTINCT (c.meeting_code, COALESCE(c.event_start, c.conf_start)))::int`
+      : sql`count(*)::int`;
   const dayRows = await sql<Array<{ key: string; n: number }>>`
-    SELECT to_char(${day}, 'YYYY-MM-DD') AS key, count(*)::int AS n
+    SELECT to_char(${day}, 'YYYY-MM-DD') AS key, ${dayCount} AS n
     FROM ${sql(SCHEMA)}.${table} c
     ${where}
     GROUP BY 1
