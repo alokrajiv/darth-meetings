@@ -1110,7 +1110,12 @@ export function GmeetImportDialog({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [open]);
 
-  // Scroll the focused meeting into view once its row shows up.
+  // Scroll the focused meeting into view once its row shows up — and open
+  // its import options directly: the caller clicked THIS meeting to import
+  // it, so making them click the row a second time is a dead step. The row's
+  // main button is disabled when the meeting isn't importable, so the
+  // programmatic click is safely a no-op in that case (row stays highlighted
+  // for context).
   const focusScrolledRef = useRef(false);
   useEffect(() => {
     if (open) focusScrolledRef.current = false;
@@ -1121,6 +1126,7 @@ export function GmeetImportDialog({
     if (el) {
       el.scrollIntoView({ block: 'center' });
       focusScrolledRef.current = true;
+      el.querySelector('button')?.click();
     }
   }, [open, rows, focusMeeting]);
 
