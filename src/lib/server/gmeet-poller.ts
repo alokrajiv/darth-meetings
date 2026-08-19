@@ -1,5 +1,6 @@
 import 'server-only';
 import {
+  getGoogleAccount,
   listPollableGoogleAccounts,
   markGoogleAccountPolled,
   type GoogleAccountRow,
@@ -703,4 +704,20 @@ export function startGmeetPoller(): void {
 /** One immediate pass — used by the manual "poll now" hook in dev/testing. */
 export function triggerGmeetPoll(): Promise<void> {
   return sweepAll();
+}
+
+/**
+ * Immediate first sweep for a just-connected account. The 30-minute tick is
+ * far too slow for the post-connect experience — until last_poll_at lands,
+ * the listing shows a "still syncing" banner and the calendar layers look
+ * misleadingly empty. Fire-and-forget from the OAuth callback.
+ */
+export async function sweepNewAccount(userId: string): Promise<void> {
+  try {
+    const account = await getGoogleAccount(userId);
+    if (!account) return;
+    await sweepUser(account);
+  } catch (err) {
+    console.warn('[gmeet-poller] post-connect sweep failed:', err);
+  }
 }

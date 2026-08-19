@@ -8,6 +8,7 @@ import {
   clientKeyForEmail,
 } from '@/lib/server/google-oauth';
 import { upsertGoogleAccount } from '@/db-ops/google-accounts';
+import { sweepNewAccount } from '@/lib/server/gmeet-poller';
 import { config } from '@/config';
 
 export const runtime = 'nodejs';
@@ -53,6 +54,10 @@ export const GET = withAuth(async ({ user, request, cliScope }) => {
       clientKey,
     });
     invalidateServerToken(user.userId);
+    // Kick the first calendar/artifact sweep NOW instead of waiting for the
+    // 30-minute poller tick — the listing shows a syncing banner until this
+    // stamps last_poll_at. Fire-and-forget: the redirect must not wait.
+    void sweepNewAccount(user.userId);
     return doneRedirect({ google: 'connected' }, verified.returnPath);
   } catch (err) {
     console.error('[google-oauth] callback failed:', err);

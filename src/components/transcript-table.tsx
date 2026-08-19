@@ -412,6 +412,9 @@ export function TranscriptTable({
     null
   );
   const [calConnected, setCalConnected] = useState(true);
+  /** First-sweep progress after connecting Google — drives the "still
+   * syncing, events may be missing" banner. */
+  const [calSync, setCalSync] = useState<CalendarMeetingsResponse['sync'] | null>(null);
   const calGenRef = useRef<Record<CalendarLayer, number>>({ unimported: 0, norec: 0 });
   const calSrcRef = useRef(calSrc);
   calSrcRef.current = calSrc;
@@ -606,6 +609,7 @@ export function TranscriptTable({
         if (gen !== calGenRef.current[view]) return; // superseded by a newer reset
         setCalCounts(data.counts);
         setCalConnected(data.connected);
+        setCalSync(data.sync ?? null);
         setCalSrc((prev) => {
           const cur = prev[view];
           let nextDays = data.days;
@@ -662,6 +666,7 @@ export function TranscriptTable({
       const data = (await res.json()) as CalendarMeetingsResponse;
       setCalCounts(data.counts);
       setCalConnected(data.connected);
+      setCalSync(data.sync ?? null);
     } catch {
       // quiet — badge just stays stale
     }
@@ -752,6 +757,22 @@ export function TranscriptTable({
     void fetchMutes();
     silentRefetchCalendars();
   }, [fetchMutes, silentRefetchCalendars]);
+
+  // While the first post-connect sweep runs, poll its progress so the
+  // syncing banner clears itself — and refetch the calendar layers the
+  // moment it completes, so the "missing" events appear without a manual
+  // refresh.
+  const wasSyncingRef = useRef(false);
+  useEffect(() => {
+    const syncing = !!calSync?.syncing;
+    if (wasSyncingRef.current && !syncing) {
+      silentRefetchCalendars();
+    }
+    wasSyncingRef.current = syncing;
+    if (!syncing || !mergedMode) return;
+    const t = setInterval(() => void fetchCalCountsRef.current(), 15_000);
+    return () => clearInterval(t);
+  }, [calSync?.syncing, mergedMode, silentRefetchCalendars]);
 
   const handleUnmute = useCallback(
     async (m: CalendarMuteEntry) => {
@@ -1940,6 +1961,20 @@ export function TranscriptTable({
   return (
     <div>
       {toolbar}
+      {renderMerged && calSync?.syncing && (
+        <div className="mb-3 flex items-center gap-2.5 rounded-lg border border-primary/30 bg-primary/5 px-3 py-2 text-sm">
+          <RefreshCw className="h-4 w-4 shrink-0 animate-spin text-primary" />
+          <div>
+            <span className="font-medium">Calendar sync in progress.</span>{' '}
+            <span className="text-muted-foreground">
+              Your Google Calendar and meeting artifacts are being fetched for
+              the first time since connecting — events may still be missing
+              here. This usually finishes within a few minutes; the list
+              updates itself when it does.
+            </span>
+          </div>
+        </div>
+      )}
       {renderMerged ? mergedBody : archiveBody}
       {showSentinel && <div ref={sentinelRef} className="h-1" aria-hidden />}
       {showLoadingMore && (

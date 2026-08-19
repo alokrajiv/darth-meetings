@@ -66,6 +66,14 @@ export interface CalendarMeetingsResponse {
   nextCursor: string | null;
   hasMore: boolean;
   connected: boolean;
+  /** First-sweep progress for the caller's Google account. `syncing` is true
+   * from connect until the poller stamps last_poll_at — the UI shows a
+   * "still syncing, events may be missing" banner while it holds. */
+  sync: {
+    connectedAt: string | null;
+    lastPollAt: string | null;
+    syncing: boolean;
+  };
 }
 
 // Digits included so zones like 'Etc/GMT+8' pass — same allow-list as the
@@ -154,6 +162,17 @@ export const GET = withAuth(async ({ user, request }) => {
     nextCursor: page.nextCursor,
     hasMore: page.hasMore,
     connected: !!account,
+    sync: {
+      connectedAt: account?.connected_at ?? null,
+      lastPollAt: account?.last_poll_at ?? null,
+      // No completed sweep since (re)connecting → the first sweep is still
+      // running (or queued); calendar layers may be missing events.
+      syncing:
+        !!account &&
+        (account.last_poll_at === null ||
+          (account.connected_at !== null &&
+            new Date(account.last_poll_at) < new Date(account.connected_at))),
+    },
   };
   return NextResponse.json(body);
 });
