@@ -178,6 +178,12 @@ function isCacheableEvent(e: CalEvent): boolean {
 function toCalendarUpsert(e: CalEvent): CalendarEventUpsert {
   // Rooms/resources aren't people — drop them where trivially identifiable.
   const people = (e.attendees ?? []).filter((a) => a.email && !a.resource);
+  // Teams events get their `teams-…` cache code so the norec view knows the
+  // event HAS a meeting link (Teams glyph, importable) and can migrate the
+  // row to the unimported view once the Teams sweep records artifacts under
+  // the same code. External-tenant links count too — the import dialog's
+  // guided manual panel is still the right click-through for those.
+  const teamsInfo = isMeetEvent(e) ? null : teamsInfoOf(e);
   return {
     eventKey: `${e.id}|${e.start!.dateTime}`,
     eventId: e.id,
@@ -186,7 +192,11 @@ function toCalendarUpsert(e: CalEvent): CalendarEventUpsert {
     title: e.summary ?? null,
     eventStart: e.start!.dateTime!,
     eventEnd: e.end?.dateTime ?? null,
-    meetingCode: isMeetEvent(e) ? e.conferenceData!.conferenceId! : null,
+    meetingCode: isMeetEvent(e)
+      ? e.conferenceData!.conferenceId!
+      : teamsInfo
+        ? teamsCacheCode(teamsInfo.joinWebUrl)
+        : null,
     organizerEmail: e.organizer?.email ?? null,
     organizerSelf: e.organizer?.self ?? null,
     attendeeCount: people.length,

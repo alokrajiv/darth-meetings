@@ -255,7 +255,12 @@ function unimportedMuteExclusion(userId: string): ReturnType<typeof sql> {
 function unimportedWhere(userId: string, opts: CalendarRangeOpts): ReturnType<typeof sql> {
   return sql`
     WHERE COALESCE(c.event_start, c.conf_start) IS NOT NULL
-      AND (c.recording_count > 0 OR COALESCE(jsonb_array_length(c.transcript_doc_ids), 0) > 0)
+      -- transcript_parseable covers Teams rows: their transcripts live at
+      -- Microsoft, so there are no Doc ids — without it a transcript-only
+      -- Teams meeting never surfaces as importable.
+      AND (c.recording_count > 0
+        OR COALESCE(jsonb_array_length(c.transcript_doc_ids), 0) > 0
+        OR c.transcript_parseable IS TRUE)
       AND NOT EXISTS (
         SELECT 1 FROM ${sql(SCHEMA)}.transcripts t
         WHERE t.deleted_at IS NULL
@@ -289,7 +294,12 @@ function norecWhere(userId: string, opts: CalendarRangeOpts): ReturnType<typeof 
       AND (c.meeting_code IS NULL OR NOT EXISTS (
         SELECT 1 FROM ${sql(SCHEMA)}.gmeet_meeting_cache g
         WHERE g.meeting_code = c.meeting_code
-          AND (g.recording_count > 0 OR COALESCE(jsonb_array_length(g.transcript_doc_ids), 0) > 0)
+          -- transcript_parseable covers Teams cache rows, whose transcripts
+          -- have no Doc ids (must mirror unimportedWhere or a meeting shows
+          -- in both views / neither).
+          AND (g.recording_count > 0
+            OR COALESCE(jsonb_array_length(g.transcript_doc_ids), 0) > 0
+            OR g.transcript_parseable IS TRUE)
           AND abs(extract(epoch FROM (
                 COALESCE(g.event_start, g.conf_start) - c.event_start
               ))) <= ${OCCURRENCE_WINDOW_S}
@@ -461,7 +471,7 @@ async function norecRows(
       c.organizer_email,
       c.organizer_self,
       c.attendee_count,
-      'gmeet' AS provider,
+      CASE WHEN c.meeting_code LIKE 'teams-%' THEN 'teams' ELSE 'gmeet' END AS provider,
       (c.meeting_code IS NOT NULL) AS has_meet,
       EXISTS (
         SELECT 1 FROM ${sql(SCHEMA)}.gmeet_sync_skips s

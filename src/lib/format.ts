@@ -228,8 +228,11 @@ export interface GmeetContext {
      * there is no users table to look it up from later). */
     ownerEmail: string;
     /** The import request frozen at queue time, replayed verbatim (plus the
-     * artifact ids discovered by the poller) when Google finishes. */
+     * artifact ids discovered by the poller) when the provider finishes. */
     request: {
+      /** Teams deferrals only: the canonical meetup-join URL the poller
+       * re-resolves through Graph (Meet deferrals use conferenceRecordName). */
+      url?: string;
       videoFileId?: string;
       transcriptDocId?: string;
       languageCode?: string;

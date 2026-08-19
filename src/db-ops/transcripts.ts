@@ -620,6 +620,31 @@ export async function listDeferredImportRows(limit: number): Promise<
 }
 
 /**
+ * An already-queued Teams deferred import for the same occurrence (join URL
+ * is shared by every occurrence of a recurring meeting, so the event start
+ * disambiguates). Second Import click returns this row instead of queueing a
+ * twin placeholder.
+ */
+export async function findWaitingTeamsDeferred(
+  userId: string,
+  joinWebUrl: string,
+  startTime: string | null
+): Promise<TranscriptRow | null> {
+  const rows = await sql<TranscriptRow[]>`
+    SELECT *
+    FROM ${sql(SCHEMA)}.transcripts
+    WHERE user_id = ${userId}
+      AND status = 'waiting'
+      AND deleted_at IS NULL
+      AND assemblyai_id LIKE 'defer-%'
+      AND gmeet_context->'teams'->>'joinWebUrl' = ${joinWebUrl}
+      AND gmeet_context->>'startTime' IS NOT DISTINCT FROM ${startTime}
+    LIMIT 1
+  `;
+  return rows[0] ?? null;
+}
+
+/**
  * Terminal failure for a deferred import: flip the placeholder row to
  * 'error' (so the listing shows Failed instead of an eternal spinner) and
  * write the resolved marker in the same statement.

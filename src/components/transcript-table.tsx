@@ -948,11 +948,11 @@ export function TranscriptTable({
       case 'uploading':
         return <span className={`${base} bg-primary animate-pulse`} aria-label="Uploading" />;
       case 'waiting':
-        // Deferred import — queued until Google finishes preparing the files.
+        // Deferred import — queued until the provider finishes the files.
         return (
           <span
             className={`${base} bg-amber-500 animate-pulse`}
-            aria-label="Waiting for Google"
+            aria-label="Waiting for files"
           />
         );
       case 'queued':
@@ -1536,12 +1536,14 @@ export function TranscriptTable({
                 </div>
               ) : waiting ? (
                 <div className="truncate font-mono text-[11px] text-muted-foreground">
-                  {`import queued — Google is still preparing the ${
+                  {`import queued — ${t.provider === 'teams' ? 'Microsoft' : 'Google'} is still preparing the ${
                     t.deferred_mode === 'video'
                       ? 'video file'
                       : t.deferred_mode === 'both'
                         ? 'video + transcript'
-                        : 'transcript Doc'
+                        : t.provider === 'teams'
+                          ? 'transcript'
+                          : 'transcript Doc'
                   }; runs automatically (checked every minute)`}
                 </div>
               ) : t.status === 'error' && t.deferred_error ? (

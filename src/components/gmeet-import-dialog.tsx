@@ -503,9 +503,11 @@ export function GmeetImportDialog({
     mode: Mode;
     title: string;
     autoShared: number;
-    /** Import queued (202) — Google is still preparing this artifact; the
-     * server runs the import automatically once it lands. */
+    /** Import queued (202) — the provider is still preparing this artifact;
+     * the server runs the import automatically once it lands. */
     deferred?: 'transcript' | 'video' | 'both';
+    /** Teams import — words the done/queued copy (Microsoft vs Google). */
+    teams?: boolean;
   } | null>(null);
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [bulkResults, setBulkResults] = useState<BulkResult[]>([]);
@@ -1559,6 +1561,9 @@ export function GmeetImportDialog({
           url: pickedTeams.row.teamsUrl,
           mode,
           force,
+          // Microsoft is still processing the artifacts → queue instead of
+          // failing; the deferred-import poller finishes it automatically.
+          defer: true,
           event: {
             id: e.id,
             title: e.summary,
@@ -1611,6 +1616,7 @@ export function GmeetImportDialog({
         title: e.summary ?? 'Untitled meeting',
         autoShared: payload.autoShared ?? 0,
         deferred: payload.deferred ? (payload.waitingFor ?? 'both') : undefined,
+        teams: true,
       });
       setStep('done');
       onImported?.();
@@ -2765,15 +2771,17 @@ export function GmeetImportDialog({
             <p className="text-sm font-medium">{doneInfo.title}</p>
             <p className="text-sm text-muted-foreground">
               {doneInfo.deferred
-                ? `Import queued — Google is still preparing the ${
+                ? `Import queued — ${doneInfo.teams ? 'Microsoft' : 'Google'} is still preparing the ${
                     doneInfo.deferred === 'both'
                       ? 'video and transcript'
                       : doneInfo.deferred === 'video'
                         ? 'video file'
-                        : 'transcript Doc'
+                        : doneInfo.teams
+                          ? 'transcript'
+                          : 'transcript Doc'
                   }. It's in your list as waiting; we check every minute and the import runs by itself the moment the file${doneInfo.deferred === 'both' ? 's are' : ' is'} ready. Nothing else to do — you can close this.`
                 : doneInfo.mode === 'transcript'
-                  ? 'Meet transcript imported — it’s ready in your list now.'
+                  ? `${doneInfo.teams ? 'Teams' : 'Meet'} transcript imported — it’s ready in your list now.`
                   : 'Recording submitted for transcription — it’ll show up in your list as processing and complete in a few minutes.'}
             </p>
             {doneInfo.autoShared > 0 && (
