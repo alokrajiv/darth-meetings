@@ -6,7 +6,9 @@ import type {
   GmeetContext,
   StoredTranscript,
   TranscriptResponse,
+  TranscriptDayGroup,
   TranscriptListRow,
+  TranscriptListV2Response,
   TranscriptSegment,
 } from '@/lib/format';
 
@@ -171,6 +173,321 @@ export async function listVisibleToUser(
       owner_name: null,
     };
   });
+}
+
+/** Minimal row shape the AAI pending-refresh fan-out needs. */
+export type PendingRefreshRow = Pick<
+  TranscriptListRow,
+  'user_id' | 'assemblyai_id' | 'status' | 'completed_at' | 'duration' | 'speaker_count'
+>;
+
+/**
+ * Every visible row still in flight at AssemblyAI (queued/processing),
+ * regardless of which listing page it would land on. Powers the v2 refresh
+ * fan-out, which is decoupled from pagination so pending rows outside the
+ * requested page keep getting refreshed. Synthetic `up-…`/`defer-…`/`ext-…`
+ * placeholder ids never reached AAI, so they are excluded by id as well as
+ * by status ('ext-' rows can sit in 'processing' while a background text
+ * import normalizes).
+ */
+export async function listPendingVisibleToUser(
+  userId: string,
+  email: string
+): Promise<PendingRefreshRow[]> {
+  const normEmail = email.trim().toLowerCase();
+  return sql<PendingRefreshRow[]>`
+    SELECT t.user_id, t.assemblyai_id, t.status, t.completed_at, t.duration,
+           t.speaker_count
+    FROM ${sql(SCHEMA)}.transcripts t
+    LEFT JOIN ${sql(SCHEMA)}.transcript_shares s
+      ON s.transcript_id = t.id
+      AND s.shared_with_email = ${normEmail}
+    WHERE (t.user_id = ${userId} OR s.id IS NOT NULL)
+      AND t.deleted_at IS NULL
+      AND t.status NOT IN ('completed', 'error', 'uploading', 'waiting')
+      AND t.assemblyai_id NOT LIKE 'up-%'
+      AND t.assemblyai_id NOT LIKE 'defer-%'
+      AND t.assemblyai_id NOT LIKE 'ext-%'
+  `;
+}
+
+export interface TranscriptListPageOpts {
+  tab: 'all' | 'mine' | 'shared' | 'trash';
+  /** YYYY-MM-DD inclusive bounds on the day key, interpreted in `tz`. */
+  from: string | null;
+  to: string | null;
+  /** Validated IANA timezone name (caller falls back to 'UTC'). */
+  tz: string;
+  /** Active search text (>= 2 chars) or null. */
+  q: string | null;
+  /** Max day buckets per page (1..60). */
+  days: number;
+  /** Soft row target: stop adding whole days once reached (1..200). */
+  minRows: number;
+  /** Exclusive day-key cursor: only days strictly older. */
+  cursor: string | null;
+}
+
+/** Raw shape of the paged listing query before JS post-mapping. */
+type PagedRawRow = Omit<TranscriptListRow, 'access' | 'owner_email' | 'owner_name'> & {
+  __access: 'owner' | 'edit' | 'read' | null;
+  day_key: string;
+  __total_days: number;
+  __page_days: number;
+};
+
+/**
+ * Day-bucketed page of the listing (GET /api/transcripts?v=2). Same
+ * visibility, skinny column set, and computed columns as listVisibleToUser
+ * (incl. the MATERIALIZED suspected-series fence — applied only to the
+ * page's rows here), but:
+ *  - sort key everywhere is COALESCE(recorded_at, created_at) DESC, id DESC;
+ *  - rows are bucketed by that key's date in the caller's timezone and pages
+ *    NEVER split a day: whole days are added until `minRows` rows or `days`
+ *    buckets are reached;
+ *  - `q` (>= 2 chars) filters server-side across title/filename/description/
+ *    auto_notes/imported text and stamps matched_in + a SQL-cut snippet on
+ *    each row (same approach as searchVisibleTranscripts);
+ *  - tab=trash serves the caller's own soft-deleted rows (owner-only, no
+ *    series joins) with the same bucketing.
+ */
+export async function listPagedForUser(
+  userId: string,
+  email: string,
+  opts: TranscriptListPageOpts
+): Promise<TranscriptListV2Response> {
+  const { tab, from, to, tz, q, days, minRows, cursor } = opts;
+  const normEmail = email.trim().toLowerCase();
+  const isTrash = tab === 'trash';
+  const pattern = q ? `%${q.replace(/[%_\\]/g, (m) => `\\${m}`)}%` : null;
+
+  // Fragment builders (fresh fragment per use site).
+  const dayKey = () => sql`(COALESCE(t.recorded_at, t.created_at) AT TIME ZONE ${tz}::text)::date`;
+  const rangeAndSearch = () => sql`
+    ${from ? sql`AND ${dayKey()} >= ${from}::date` : sql``}
+    ${to ? sql`AND ${dayKey()} <= ${to}::date` : sql``}
+    ${
+      pattern && q
+        ? sql`AND (
+            t.title ILIKE ${pattern}
+            OR t.original_filename ILIKE ${pattern}
+            OR t.description ILIKE ${pattern}
+            OR t.auto_notes ILIKE ${pattern}
+            OR t.imported_content->>'text' ILIKE ${pattern}
+          )`
+        : sql``
+    }
+  `;
+
+  const pagePromise = sql<PagedRawRow[]>`
+    WITH base AS (
+      SELECT t.id, t.user_id, t.assemblyai_id, t.original_filename, t.status,
+             t.created_at, t.completed_at, t.duration, t.speaker_count,
+             t.language_code, t.title, t.description, t.last_accessed,
+             t.source, t.recorded_at, t.auto_notes_status,
+             t.upload_bytes_received::float8 AS upload_bytes_received,
+             t.upload_bytes_total::float8 AS upload_bytes_total,
+             CASE
+               WHEN t.gmeet_context->>'provider' = 'teams' THEN 'teams'
+               WHEN t.assemblyai_id LIKE 'gmeet-%'
+                    OR t.gmeet_context->>'meetingCode' IS NOT NULL THEN 'gmeet'
+             END AS provider,
+             (t.gmeet_context->>'eventId') IS NOT NULL AS has_event,
+             t.gmeet_context->'deferredImport'->>'mode' AS deferred_mode,
+             t.gmeet_context->'deferredImport'->>'error' AS deferred_error,
+             ${isTrash ? sql`t.deleted_at::text` : sql`NULL::text`} AS deleted_at,
+             ${
+               isTrash
+                 ? sql`'owner'`
+                 : sql`CASE WHEN t.user_id = ${userId} THEN 'owner' ELSE s.access END`
+             } AS __access,
+             COALESCE(t.recorded_at, t.created_at) AS sort_key,
+             ${dayKey()} AS day_key,
+             ${
+               pattern && q
+                 ? sql`CASE
+                     WHEN t.title ILIKE ${pattern} THEN 'title'
+                     WHEN t.original_filename ILIKE ${pattern} THEN 'filename'
+                     WHEN t.description ILIKE ${pattern} THEN 'description'
+                     WHEN t.auto_notes ILIKE ${pattern} THEN 'notes'
+                     ELSE 'content'
+                   END`
+                 : sql`NULL::text`
+             } AS matched_in,
+             ${
+               pattern && q
+                 ? sql`CASE
+                     WHEN t.title ILIKE ${pattern} OR t.original_filename ILIKE ${pattern} THEN NULL
+                     WHEN t.description ILIKE ${pattern} THEN
+                       substring(t.description FROM greatest(position(lower(${q}) IN lower(t.description)) - 40, 1) FOR 140)
+                     WHEN t.auto_notes ILIKE ${pattern} THEN
+                       substring(t.auto_notes FROM greatest(position(lower(${q}) IN lower(t.auto_notes)) - 40, 1) FOR 140)
+                     ELSE
+                       substring(t.imported_content->>'text' FROM greatest(position(lower(${q}) IN lower(t.imported_content->>'text')) - 40, 1) FOR 140)
+                   END`
+                 : sql`NULL::text`
+             } AS snippet
+      FROM ${sql(SCHEMA)}.transcripts t
+      ${
+        isTrash
+          ? sql``
+          : sql`LEFT JOIN ${sql(SCHEMA)}.transcript_shares s
+                  ON s.transcript_id = t.id
+                  AND s.shared_with_email = ${normEmail}`
+      }
+      WHERE ${
+        isTrash
+          ? sql`t.user_id = ${userId} AND t.deleted_at IS NOT NULL`
+          : sql`(t.user_id = ${userId} OR s.id IS NOT NULL) AND t.deleted_at IS NULL`
+      }
+        ${tab === 'mine' ? sql`AND t.user_id = ${userId}` : sql``}
+        ${tab === 'shared' ? sql`AND t.user_id <> ${userId}` : sql``}
+        ${rangeAndSearch()}
+        ${cursor ? sql`AND ${dayKey()} < ${cursor}::date` : sql``}
+    ),
+    day_counts AS (
+      SELECT day_key, count(*)::int AS n FROM base GROUP BY day_key
+    ),
+    ordered AS (
+      SELECT day_key, n,
+             sum(n) OVER (ORDER BY day_key DESC) AS cum,
+             row_number() OVER (ORDER BY day_key DESC) AS rn
+      FROM day_counts
+    ),
+    -- Whole days only: keep taking days (newest first) while the running row
+    -- count BEFORE the day is still short of minRows, hard-capped at the
+    -- days param. The first day is always taken even if it alone exceeds
+    -- minRows.
+    page_days AS (
+      SELECT day_key FROM ordered
+      WHERE rn <= ${days}::int AND (rn = 1 OR (cum - n) < ${minRows}::int)
+    )
+    SELECT b.id, b.user_id, b.assemblyai_id, b.original_filename, b.status,
+           b.created_at, b.completed_at, b.duration, b.speaker_count,
+           b.language_code, b.title, b.description, b.last_accessed,
+           b.source, b.recorded_at, b.auto_notes_status,
+           b.upload_bytes_received, b.upload_bytes_total,
+           b.provider, b.has_event, b.deferred_mode, b.deferred_error,
+           b.deleted_at, b.__access, b.matched_in, b.snippet,
+           b.day_key::text AS day_key,
+           ${
+             isTrash
+               ? sql`NULL::int AS series_id, NULL::text AS series_title,
+                     NULL::int AS suspected_series_id, NULL::text AS suspected_series_title,`
+               : sql`sm.series_id, se.title AS series_title,
+                     sus.series_id AS suspected_series_id, sus.title AS suspected_series_title,`
+           }
+           (SELECT count(*)::int FROM day_counts) AS __total_days,
+           (SELECT count(*)::int FROM page_days) AS __page_days
+    FROM base b
+    JOIN page_days pd ON pd.day_key = b.day_key
+    ${
+      isTrash
+        ? sql``
+        : sql`
+          JOIN ${sql(SCHEMA)}.transcripts t ON t.id = b.id
+          LEFT JOIN ${sql(SCHEMA)}.series_members sm ON sm.transcript_id = b.id
+          LEFT JOIN ${sql(SCHEMA)}.series se ON se.id = sm.series_id
+          -- Same suspected-series lookup as listVisibleToUser, applied only to
+          -- the page's rows. The MATERIALIZED fence is load-bearing (see the
+          -- perf note there): without it the planner re-runs the regexps for
+          -- every (row × key) pair.
+          LEFT JOIN LATERAL (
+            WITH norm AS MATERIALIZED (
+              SELECT
+                t.gmeet_context->>'meetingCode' AS meeting_code,
+                regexp_replace(COALESCE(t.gmeet_context->>'recurringEventId',''), '_R\\d{8}T\\d{6}Z?$', '') AS recurring_base,
+                regexp_replace(regexp_replace(COALESCE(t.gmeet_context->>'iCalUID',''), '@google\\.com$', ''), '_R\\d{8}T\\d{6}Z?$', '') AS ical_base,
+                t.gmeet_context->'teams'->>'joinWebUrl' AS teams_join_url,
+                t.gmeet_context->'teams'->>'graphMeetingId' AS graph_meeting_id,
+                btrim(lower(regexp_replace(
+                  regexp_replace(COALESCE(NULLIF(t.gmeet_context->>'eventTitle',''), t.title, ''),
+                                 '\\d{1,4}[/.-]\\d{1,2}[/.-]\\d{1,4}', ' ', 'g'),
+                  '[^a-zA-Z0-9]+', ' ', 'g'))) AS norm_title
+            )
+            SELECT k.series_id, se2.title
+            FROM norm
+            JOIN ${sql(SCHEMA)}.series_keys k ON (
+              (k.kind = 'meeting-code' AND norm.meeting_code = k.value) OR
+              (k.kind = 'recurring-base-id' AND norm.recurring_base = k.value) OR
+              (k.kind = 'ical-uid-base' AND norm.ical_base = k.value) OR
+              (k.kind = 'teams-join-url' AND norm.teams_join_url = k.value) OR
+              (k.kind = 'graph-meeting-id' AND norm.graph_meeting_id = k.value) OR
+              (k.kind = 'normalized-title' AND norm.norm_title = k.value)
+            )
+            JOIN ${sql(SCHEMA)}.series se2 ON se2.id = k.series_id
+            WHERE NOT EXISTS (
+                    SELECT 1 FROM ${sql(SCHEMA)}.series_exclusions x
+                    WHERE x.series_id = k.series_id AND x.transcript_id = b.id
+                  )
+            ORDER BY k.series_id
+            LIMIT 1
+          ) sus ON sm.id IS NULL`
+    }
+    ORDER BY b.sort_key DESC, b.id DESC
+  `;
+
+  // Tab badge counts: all/mine/shared respect the from/to + q filters (they
+  // label the tabs above the FILTERED list); trash is the caller's global
+  // trashed-row count (cheap scalar subquery).
+  const countsPromise = sql<
+    [{ all_count: number; mine_count: number; shared_count: number; trash_count: number }]
+  >`
+    SELECT
+      count(*)::int AS all_count,
+      count(*) FILTER (WHERE t.user_id = ${userId})::int AS mine_count,
+      count(*) FILTER (WHERE t.user_id <> ${userId})::int AS shared_count,
+      (SELECT count(*)::int FROM ${sql(SCHEMA)}.transcripts d
+        WHERE d.user_id = ${userId} AND d.deleted_at IS NOT NULL) AS trash_count
+    FROM ${sql(SCHEMA)}.transcripts t
+    LEFT JOIN ${sql(SCHEMA)}.transcript_shares s
+      ON s.transcript_id = t.id
+      AND s.shared_with_email = ${normEmail}
+    WHERE (t.user_id = ${userId} OR s.id IS NOT NULL)
+      AND t.deleted_at IS NULL
+      ${rangeAndSearch()}
+  `;
+
+  const [raw, countsRows] = await Promise.all([pagePromise, countsPromise]);
+
+  const dayGroups: TranscriptDayGroup[] = [];
+  let current: TranscriptDayGroup | null = null;
+  for (const r of raw) {
+    // __total_days/__page_days are window metadata stamped on every row, not row fields.
+    // eslint-disable-next-line @typescript-eslint/no-unused-vars
+    const { day_key, __access, __total_days: _t, __page_days: _p, matched_in, snippet, deleted_at, ...rest } = r;
+    const row: TranscriptListRow = {
+      ...rest,
+      ...(isTrash ? { deleted_at } : {}),
+      ...(q ? { matched_in, snippet } : {}),
+      access: __access ?? 'read',
+      owner_email: null,
+      owner_name: null,
+    };
+    if (!current || current.key !== day_key) {
+      current = { key: day_key, rows: [], totalSecs: 0 };
+      dayGroups.push(current);
+    }
+    current.rows.push(row);
+    current.totalSecs += Number(row.duration ?? 0) || 0;
+  }
+
+  const totalDays = raw[0]?.__total_days ?? 0;
+  const pageDays = raw[0]?.__page_days ?? 0;
+  const hasMore = totalDays > pageDays;
+  const c = countsRows[0];
+
+  return {
+    days: dayGroups,
+    counts: {
+      all: c?.all_count ?? 0,
+      mine: c?.mine_count ?? 0,
+      shared: c?.shared_count ?? 0,
+      trash: c?.trash_count ?? 0,
+    },
+    nextCursor: hasMore && dayGroups.length > 0 ? dayGroups[dayGroups.length - 1]!.key : null,
+    hasMore,
+  };
 }
 
 /**

@@ -272,6 +272,12 @@ export default function Home() {
 
         <TranscriptTable
           refreshTrigger={refreshTrigger}
+          onImportMeeting={(m) => {
+            // Same focus mechanism as reminder rows: open the import dialog
+            // scrolled to that meeting's day, highlighting the meeting.
+            setGmeetFocus({ meetingCode: m.meetingCode, eventStart: m.eventStart });
+            setGmeetOpen(true);
+          }}
           toolbarExtra={
             <>
               {showSyncNudge && (

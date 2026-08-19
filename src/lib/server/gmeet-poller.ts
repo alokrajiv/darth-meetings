@@ -26,6 +26,10 @@ import {
 } from '@/db-ops/gmeet-meeting-cache';
 import { findImportedByTeamsMeetings } from '@/db-ops/teams-import';
 import {
+  upsertCalendarEvents,
+  type CalendarEventUpsert,
+} from '@/db-ops/calendar-event-cache';
+import {
   findTeamsJoinUrl,
   isOwnTenant,
   parseTeamsJoinLink,
@@ -82,6 +86,12 @@ interface CalEvent {
   start?: { dateTime?: string; date?: string };
   end?: { dateTime?: string; date?: string };
   organizer?: { email?: string; self?: boolean };
+  attendees?: Array<{
+    email?: string;
+    displayName?: string;
+    responseStatus?: string;
+    resource?: boolean;
+  }>;
   conferenceData?: {
     conferenceId?: string;
     conferenceSolution?: { key?: { type?: string } };
@@ -156,6 +166,35 @@ function eventStartIso(e: CalEvent): string | null {
 
 function eventKeyOf(code: string, startIso: string | null): string {
   return `${code}|${startIso ?? ''}`;
+}
+
+/** All-day events carry only start.date — the calendar cache keeps timed
+ * events only (an all-day block is never a "meeting that wasn't recorded"). */
+function isCacheableEvent(e: CalEvent): boolean {
+  return !!e.id && !!e.start?.dateTime;
+}
+
+function toCalendarUpsert(e: CalEvent): CalendarEventUpsert {
+  // Rooms/resources aren't people — drop them where trivially identifiable.
+  const people = (e.attendees ?? []).filter((a) => a.email && !a.resource);
+  return {
+    eventKey: `${e.id}|${e.start!.dateTime}`,
+    eventId: e.id,
+    recurringEventId: e.recurringEventId ?? null,
+    iCalUID: e.iCalUID ?? null,
+    title: e.summary ?? null,
+    eventStart: e.start!.dateTime!,
+    eventEnd: e.end?.dateTime ?? null,
+    meetingCode: isMeetEvent(e) ? e.conferenceData!.conferenceId! : null,
+    organizerEmail: e.organizer?.email ?? null,
+    organizerSelf: e.organizer?.self ?? null,
+    attendeeCount: people.length,
+    attendees: people.slice(0, 50).map((a) => ({
+      email: a.email!,
+      ...(a.displayName ? { displayName: a.displayName } : {}),
+      ...(a.responseStatus ? { responseStatus: a.responseStatus } : {}),
+    })),
+  };
 }
 
 /**
@@ -455,6 +494,16 @@ async function sweepUser(account: GoogleAccountRow): Promise<void> {
     getSyncState(userId),
     listOpenRemindersRaw(userId),
   ]);
+  // Persist ALL timed events (Meet or not) into the per-user calendar cache
+  // BEFORE the Meet filter — this is the only place artifact-less calendar
+  // events ever touch the DB (powers the "no recording" listing view).
+  // A cache write failure must never break the sweep.
+  try {
+    await upsertCalendarEvents(userId, allEvents.filter(isCacheableEvent).map(toCalendarUpsert));
+  } catch (err) {
+    console.warn(`[gmeet-poller] calendar cache write failed for ${account.user_email}:`, err);
+  }
+
   const events = allEvents.filter(isMeetEvent);
   const mutedKeys = new Set(skips.map((s) => s.event_key));
   const now = Date.now();

@@ -4,10 +4,13 @@ import {
   createUploadingPlaceholder,
   deleteForUser,
   listDeletedForUser,
+  listPagedForUser,
+  listPendingVisibleToUser,
   listVisibleToUser,
   setRecordedAtForUser,
   updateStatusForUser,
   updateUploadProgress,
+  type PendingRefreshRow,
 } from '@/db-ops/transcripts';
 import { autoShareToInternalInvitees } from '@/lib/server/auto-share';
 import { resolveAccess } from '@/db-ops/transcript-access';
@@ -62,78 +65,176 @@ export const runtime = 'nodejs';
 export const maxDuration = 900;
 
 /**
+ * Refresh rows still in flight at AssemblyAI, in parallel, patching each
+ * refreshed row in place. Completed/error rows and the synthetic `up-…` /
+ * `defer-…` placeholders (statuses 'uploading' / 'waiting' — AAI has never
+ * heard of their ids) are skipped, so for an all-finished list this is a
+ * no-op with zero network hops. Shared by the legacy full listing (which
+ * passes every row) and the v2 path (which passes a dedicated pending-only
+ * query's rows, decoupled from pagination). First observed completion fires
+ * onTranscriptCompleted (auto-notes + speaker suggestions, fire-and-forget).
+ */
+async function refreshPendingAgainstAai<T extends PendingRefreshRow>(
+  rows: T[]
+): Promise<void> {
+  const pendingIdx = rows
+    .map((r, i) =>
+      r.status === 'completed' ||
+      r.status === 'error' ||
+      r.status === 'uploading' ||
+      r.status === 'waiting' ||
+      r.assemblyai_id.startsWith('up-') ||
+      r.assemblyai_id.startsWith('defer-') ||
+      // Text-import placeholders normalize via the LLM in the background —
+      // they sit in 'processing' but AAI has never heard of their ids.
+      r.assemblyai_id.startsWith('ext-')
+        ? -1
+        : i
+    )
+    .filter((i) => i >= 0);
+
+  if (pendingIdx.length === 0) return;
+
+  await Promise.all(
+    pendingIdx.map(async (i) => {
+      const row = rows[i]!;
+      try {
+        const aai = await getTranscript(row.assemblyai_id);
+        const speakerCount = aai.utterances
+          ? new Set(aai.utterances.map((u) => u.speaker)).size
+          : null;
+        await updateStatusForUser(row.user_id, row.assemblyai_id, {
+          status: aai.status,
+          completedAt: aai.completed ? new Date(aai.completed) : null,
+          duration: aai.audio_duration ?? null,
+          speakerCount,
+          languageCode: aai.language_code ?? null,
+        });
+        rows[i] = {
+          ...row,
+          status: aai.status,
+          completed_at: aai.completed ?? row.completed_at,
+          duration: aai.audio_duration ?? row.duration,
+          speaker_count: speakerCount ?? row.speaker_count,
+        };
+        // First observation of completion → auto-notes + speaker
+        // suggestions (fire-and-forget, owner-scoped).
+        if (aai.status === 'completed') {
+          onTranscriptCompleted(row.user_id, row.assemblyai_id);
+        }
+      } catch (err) {
+        console.warn('[GET /api/transcripts] refresh failed for', row.assemblyai_id, err);
+      }
+    })
+  );
+}
+
+const DAY_KEY_RE = /^\d{4}-\d{2}-\d{2}$/;
+// Conservative allow-list for IANA zone names ('Asia/Singapore',
+// 'America/Port-au-Prince', 'Etc/GMT+8'). Anything else falls back to UTC;
+// the value is additionally proven resolvable before reaching SQL.
+const TZ_RE = /^[A-Za-z0-9_/+-]{1,64}$/;
+
+function clampInt(raw: string | null, dflt: number, min: number, max: number): number {
+  const n = raw === null ? NaN : parseInt(raw, 10);
+  if (!Number.isFinite(n)) return dflt;
+  return Math.min(max, Math.max(min, n));
+}
+
+/**
+ * GET /api/transcripts?v=2 — day-bucketed pagination + unified search.
+ * Params: tab=all|mine|shared|trash, from/to (YYYY-MM-DD in tz), tz (IANA),
+ * q (>= 2 chars → server-side search with matched_in/snippet), days (max day
+ * buckets, default 14 cap 60), minRows (soft row target, default 40 cap 200),
+ * cursor (exclusive day key — only strictly older days). Envelope:
+ * TranscriptListV2Response (src/lib/format.ts).
+ */
+async function listingV2(
+  user: { userId: string; email: string },
+  params: URLSearchParams
+) {
+  const tabRaw = params.get('tab');
+  const tab =
+    tabRaw === 'mine' || tabRaw === 'shared' || tabRaw === 'trash' ? tabRaw : 'all';
+  const fromRaw = params.get('from');
+  const toRaw = params.get('to');
+  const cursorRaw = params.get('cursor');
+  const from = fromRaw && DAY_KEY_RE.test(fromRaw) ? fromRaw : null;
+  const to = toRaw && DAY_KEY_RE.test(toRaw) ? toRaw : null;
+  const cursor = cursorRaw && DAY_KEY_RE.test(cursorRaw) ? cursorRaw : null;
+  let tz = params.get('tz') ?? 'UTC';
+  if (!TZ_RE.test(tz)) {
+    tz = 'UTC';
+  } else {
+    // Reject names Postgres would error on ('Foo/Bar') before they hit SQL.
+    try {
+      new Intl.DateTimeFormat('en-US', { timeZone: tz });
+    } catch {
+      tz = 'UTC';
+    }
+  }
+  const qRaw = (params.get('q') ?? '').trim();
+  const q = qRaw.length >= 2 ? qRaw : null;
+  const days = clampInt(params.get('days'), 14, 1, 60);
+  const minRows = clampInt(params.get('minRows'), 40, 1, 200);
+
+  // Pending-refresh fan-out, decoupled from the page: refresh EVERY visible
+  // in-flight row (usually zero) so rows outside the requested page keep
+  // progressing. The paged query below then reads the fresh statuses.
+  try {
+    const pending = await listPendingVisibleToUser(user.userId, user.email);
+    await refreshPendingAgainstAai(pending);
+  } catch (err) {
+    console.warn('[GET /api/transcripts?v=2] pending refresh failed:', err);
+  }
+
+  const result = await listPagedForUser(user.userId, user.email, {
+    tab,
+    from,
+    to,
+    tz,
+    q,
+    days,
+    minRows,
+    cursor,
+  });
+  return NextResponse.json(result);
+}
+
+/**
  * GET /api/transcripts
  * List every transcript the caller can see: ones they own plus ones shared
  * with their email. Each row carries an `access` field so the UI can render
  * the All / Mine / Shared tabs and gate read-only vs editor controls.
  *
+ * `?v=2` switches to the paginated day-bucketed listing (listingV2 above).
+ * Without it the legacy shape (`{transcripts: [...]}` full array, `?trash=1`)
+ * is preserved byte-for-byte — darth-cli consumes it.
+ *
  * This is a DB-only, pure-Postgres path — no AssemblyAI calls. The query
  * deliberately omits the large `imported_content` JSONB so responses stay
  * small. Pending rows (queued/processing) are the only ones that hit AAI,
- * and only for status/duration/speaker-count. For a 100% DB experience,
- * the user can disable refresh by setting MW_LISTING_REFRESH_PENDING=false.
+ * and only for status/duration/speaker-count.
  */
 export const GET = withAuth(async ({ user, request }) => {
+  const params = new URL(request.url).searchParams;
+
+  if (params.get('v') === '2') {
+    return listingV2(user, params);
+  }
+
   // ?trash=1: the caller's own soft-deleted rows (trash tab). Pure DB —
   // trashed rows never join the AAI refresh fan-out.
-  if (new URL(request.url).searchParams.get('trash') === '1') {
+  if (params.get('trash') === '1') {
     return NextResponse.json({ transcripts: await listDeletedForUser(user.userId) });
   }
 
   const rows = await listVisibleToUser(user.userId, user.email);
 
   // Refresh pending rows in parallel. Completed rows (the common case)
-  // skip the network hop entirely — refreshIfPending short-circuits on
-  // `status === 'completed'`. So for a list of 36 finished transcripts
+  // skip the network hop entirely, so for a list of 36 finished transcripts
   // this is still a pure-DB call.
-  // 'uploading' and 'waiting' rows are placeholders with synthetic `up-…` /
-  // `defer-…` ids — AAI has never heard of them, so they must not join the
-  // refresh fan-out.
-  const pendingIdx = rows
-    .map((r, i) =>
-      r.status === 'completed' ||
-      r.status === 'error' ||
-      r.status === 'uploading' ||
-      r.status === 'waiting'
-        ? -1
-        : i
-    )
-    .filter((i) => i >= 0);
-
-  if (pendingIdx.length > 0) {
-    await Promise.all(
-      pendingIdx.map(async (i) => {
-        const row = rows[i]!;
-        try {
-          const aai = await getTranscript(row.assemblyai_id);
-          const speakerCount = aai.utterances
-            ? new Set(aai.utterances.map((u) => u.speaker)).size
-            : null;
-          await updateStatusForUser(row.user_id, row.assemblyai_id, {
-            status: aai.status,
-            completedAt: aai.completed ? new Date(aai.completed) : null,
-            duration: aai.audio_duration ?? null,
-            speakerCount,
-            languageCode: aai.language_code ?? null,
-          });
-          rows[i] = {
-            ...row,
-            status: aai.status,
-            completed_at: aai.completed ?? row.completed_at,
-            duration: aai.audio_duration ?? row.duration,
-            speaker_count: speakerCount ?? row.speaker_count,
-          };
-          // First observation of completion → auto-notes + speaker
-          // suggestions (fire-and-forget, owner-scoped).
-          if (aai.status === 'completed') {
-            onTranscriptCompleted(row.user_id, row.assemblyai_id);
-          }
-        } catch (err) {
-          console.warn('[GET /api/transcripts] refresh failed for', row.assemblyai_id, err);
-        }
-      })
-    );
-  }
+  await refreshPendingAgainstAai(rows);
 
   return NextResponse.json({ transcripts: rows });
 });

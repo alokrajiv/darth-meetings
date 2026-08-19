@@ -328,9 +328,42 @@ export interface TranscriptListRow {
   deferred_error?: string | null;
   /** Set on trash-view rows only (the main listing never returns them). */
   deleted_at?: string | null;
+  /** v2 listing with `q`: which field the search matched (first-match
+   * priority title→filename→description→notes→content). */
+  matched_in?: 'title' | 'filename' | 'description' | 'notes' | 'content';
+  /** v2 listing with `q`: SQL-cut context around the match (null for
+   * title/filename hits — the match is already visible on the row). */
+  snippet?: string | null;
   access: TranscriptAccess;
   owner_email: string | null;
   owner_name: string | null;
+}
+
+/** One day bucket of the paginated v2 listing. `key` is the day in the
+ * caller's requested timezone (YYYY-MM-DD); days are never split across
+ * pages. `totalSecs` sums `duration` over this day's rows (nulls as 0). */
+export interface TranscriptDayGroup {
+  key: string;
+  rows: TranscriptListRow[];
+  totalSecs: number;
+}
+
+/** Tab badge counts for the v2 listing. all/mine/shared respect the active
+ * from/to + q filters; trash is the caller's global trashed-row count. */
+export interface TranscriptListCounts {
+  all: number;
+  mine: number;
+  shared: number;
+  trash: number;
+}
+
+/** Envelope of GET /api/transcripts?v=2 — day-bucketed pagination. The
+ * cursor is a day key (exclusive): the next page holds strictly older days. */
+export interface TranscriptListV2Response {
+  days: TranscriptDayGroup[];
+  counts: TranscriptListCounts;
+  nextCursor: string | null;
+  hasMore: boolean;
 }
 
 /** A row from `transcript_shares`, as returned by /api/transcripts/:id/shares. */
