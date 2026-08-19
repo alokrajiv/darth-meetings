@@ -148,7 +148,7 @@ export function TranscriptImportDialog({ open, onClose, onImported }: Transcript
               <input
                 ref={fileInputRef}
                 type="file"
-                accept=".txt,.md,.vtt,.srt,.docx,.pdf,.json,.csv,.html"
+                accept=".txt,.md,.rtf,.vtt,.srt,.docx,.pdf,.json,.csv,.html"
                 className="hidden"
                 onChange={(e) => {
                   const f = e.target.files?.[0] ?? null;

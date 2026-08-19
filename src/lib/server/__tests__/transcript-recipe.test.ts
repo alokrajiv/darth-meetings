@@ -1,8 +1,10 @@
 import { describe, expect, test } from 'bun:test';
 import {
   applyAnchorsRecipe,
+  applyDocumentRecipe,
   applyLineRegexRecipe,
   applyRecipeWithValidation,
+  DOCUMENT_SPEAKER,
   MAX_HEADER_REGEX_CHARS,
   type AnchorsRecipe,
   type LineRegexRecipe,
@@ -375,5 +377,47 @@ describe('anchors recipe', () => {
     expect(r.locatedCount).toBe(3);
     expect(r.utterances[1]!.text).toBe('Speaker two replies across lines.');
     expect(r.unlocatedSamples).toEqual(['(empty anchor)']);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// document (no speaker turns at all — minutes, notes, agendas)
+// ---------------------------------------------------------------------------
+
+describe('document recipe', () => {
+  const minutes = `Finalize SIBL Requirements Notes
+Started at 2:31PM on 18 Aug 2026
+
+Action Items
+\t• Aniq to send the requirements file to all participants. - Aniq
+\t• Lucy to confirm the remaining data fields. - Lucy
+
+Key Points
+\t• Commitment made to complete all SIBL configuration by 25 August.
+`;
+
+  test('one Notes utterance per non-blank line, no merging', () => {
+    const v = applyRecipeWithValidation(minutes, { kind: 'document' });
+    expect(v.ok).toBe(true);
+    if (!v.ok) return;
+    expect(v.utterances.length).toBe(7);
+    expect(v.utterances.every((u) => u.speaker === DOCUMENT_SPEAKER)).toBe(true);
+    expect(v.utterances[0]!.text).toBe('Finalize SIBL Requirements Notes');
+    expect(v.utterances[3]!.text).toBe(
+      '• Aniq to send the requirements file to all participants. - Aniq'
+    );
+  });
+
+  test('applyDocumentRecipe drops blank lines and trims', () => {
+    const utts = applyDocumentRecipe('  a  \n\n\n b\n');
+    expect(utts).toEqual([
+      { speaker: DOCUMENT_SPEAKER, text: 'a', startMs: null },
+      { speaker: DOCUMENT_SPEAKER, text: 'b', startMs: null },
+    ]);
+  });
+
+  test('all-blank source rejects', () => {
+    const v = applyRecipeWithValidation('   \n \n', { kind: 'document' });
+    expect(v.ok).toBe(false);
   });
 });

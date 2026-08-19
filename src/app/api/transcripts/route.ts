@@ -58,6 +58,37 @@ function parseLinkedEventHeader(raw: string | null): LinkedEventHeader | null {
 
 const REPORT_PREFS = new Set(['summary', 'detailed-video', 'detailed-text', 'later']);
 
+/** Text documents AAI can't transcode — streaming one here dies minutes
+ * later as an opaque AAI error row (the sibl_minutes.rtf incident). The
+ * client diverts these to /api/transcripts/import-text itself; this is the
+ * belt for older tabs, darth-cli and anything else hitting the API raw. */
+const TEXT_DOC_FILE_RE =
+  /\.(txt|md|markdown|rtf|vtt|srt|docx|doc|pdf|json|csv|tsv|html|htm|log)$/i;
+const TEXT_DOC_MIMES = new Set([
+  'application/rtf',
+  'application/pdf',
+  'application/msword',
+  'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+]);
+
+function textDocRejection(
+  originalFilename: string | null,
+  contentType: string
+): NextResponse | null {
+  const mime = contentType.split(';')[0]?.trim().toLowerCase() ?? '';
+  const isTextDoc =
+    (originalFilename && TEXT_DOC_FILE_RE.test(originalFilename)) ||
+    mime.startsWith('text/') ||
+    TEXT_DOC_MIMES.has(mime);
+  if (!isTextDoc) return null;
+  return NextResponse.json(
+    {
+      error: `${originalFilename ?? 'That file'} is a text document, not a recording — import it via POST /api/transcripts/import-text (the upload dialog's transcript lane) instead.`,
+    },
+    { status: 415 }
+  );
+}
+
 export const runtime = 'nodejs';
 // Handler wall-clock budget (only enforced on serverless hosts). Receiving a
 // multi-GB body over a slow uplink plus re-uploading it to AssemblyAI can
@@ -335,6 +366,9 @@ export const POST = withAuth(async ({ user, request }) => {
       typeof rawLang === 'string' && rawLang.length > 0 ? rawLang : undefined;
     originalFilename = file.name || null;
 
+    const rejected = textDocRejection(originalFilename, file.type || '');
+    if (rejected) return rejected;
+
     tempFilename = `upload-${crypto.randomUUID()}.part`;
     await saveAudioBytes(tempFilename, Buffer.from(await file.arrayBuffer()));
   } else {
@@ -352,6 +386,12 @@ export const POST = withAuth(async ({ user, request }) => {
     }
     const rawLang = request.nextUrl.searchParams.get('language_code');
     languageCode = rawLang && rawLang.length > 0 ? rawLang : undefined;
+
+    // Fail fast on text documents — before the placeholder row exists and
+    // before any bytes stream, so the client gets a clear 415 instead of an
+    // AAI transcoding error minutes later.
+    const rejected = textDocRejection(originalFilename, contentType);
+    if (rejected) return rejected;
 
     // Re-transcription of an existing import: resolve the source row BEFORE
     // consuming the (potentially huge) body so a bad id fails fast.

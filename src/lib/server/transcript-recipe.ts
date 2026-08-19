@@ -51,7 +51,15 @@ export interface AnchorsRecipe {
   turns: AnchorTurn[];
 }
 
-export type ParseRecipe = LineRegexRecipe | AnchorsRecipe;
+/** The content has no speaker turns AT ALL (meeting minutes, notes, an
+ * agenda, a report). Imports as paragraph blocks under a neutral speaker —
+ * the sibl_minutes.rtf case: an honest 1-anchor recipe used to die on the
+ * ≥3-anchor bar because the engine had no way to say "not a conversation". */
+export interface DocumentRecipe {
+  kind: 'document';
+}
+
+export type ParseRecipe = LineRegexRecipe | AnchorsRecipe | DocumentRecipe;
 
 export const MAX_HEADER_REGEX_CHARS = 300;
 export const MAX_ANCHOR_TURNS = 2000;
@@ -235,6 +243,25 @@ export function applyAnchorsRecipe(text: string, recipe: AnchorsRecipe): Anchors
   };
 }
 
+/** Speaker name document imports land under — also whitelisted by the fast
+ * path's attendee filter shape (it's not a real participant). */
+export const DOCUMENT_SPEAKER = 'Notes';
+
+/**
+ * Apply a document recipe: one utterance per non-blank line (minutes and
+ * notes are line/bullet structured, so this reads as scannable blocks), with
+ * run-on paragraphs kept whole. Deliberately NOT merged — every block shares
+ * the same speaker and mergeConsecutive would collapse the lot into one wall.
+ */
+export function applyDocumentRecipe(text: string): ParsedTextUtterance[] {
+  return text
+    .replace(/\r\n/g, '\n')
+    .split('\n')
+    .map((l) => l.trim())
+    .filter(Boolean)
+    .map((line) => ({ speaker: DOCUMENT_SPEAKER, text: line, startMs: null }));
+}
+
 export type RecipeApplication =
   | { ok: true; utterances: ParsedTextUtterance[] }
   | { ok: false; failure: string };
@@ -242,7 +269,8 @@ export type RecipeApplication =
 /**
  * Apply a model-returned recipe and enforce the validation bars:
  * line-regex → ≥5 turns AND matchedLineRatio ≥ 0.6;
- * anchors → ≥3 located turns AND locatedRatio ≥ 0.8.
+ * anchors → ≥3 located turns AND locatedRatio ≥ 0.8;
+ * document → no bars (nothing to game — output is the source verbatim).
  * Never throws — invalid/failed recipes come back as { ok: false, failure }
  * with a report the caller can feed into the model's corrective retry.
  */
@@ -279,6 +307,13 @@ export function applyRecipeWithValidation(text: string, recipe: unknown): Recipe
         };
       }
       return { ok: true, utterances: r.utterances };
+    }
+    if (kind === 'document') {
+      const utterances = applyDocumentRecipe(text);
+      if (utterances.length === 0) {
+        return { ok: false, failure: 'the source has no non-blank content to import as a document' };
+      }
+      return { ok: true, utterances };
     }
     return { ok: false, failure: `unknown recipe kind ${JSON.stringify(kind)}` };
   } catch (err) {

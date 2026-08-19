@@ -358,7 +358,7 @@ export function AttachmentPanel({ transcriptId, canEdit, onChanged }: Attachment
               <input
                 ref={fileInputRef}
                 type="file"
-                accept=".pdf,.pptx,.docx,.txt,.md"
+                accept=".pdf,.pptx,.docx,.txt,.md,.rtf"
                 className="hidden"
                 onChange={handleFileSelected}
               />

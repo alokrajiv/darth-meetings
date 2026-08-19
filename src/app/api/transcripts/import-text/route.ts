@@ -50,7 +50,7 @@ Output EXACTLY one JSON object, no markdown fences, no commentary:
 {"title": <string or null — the meeting title if the document states one>,
  "attendees": <array of participant name strings, [] if unknown>,
  "language": <BCP-47-ish language code of the speech, e.g. "en", or null>,
- "recipe": <recipe object, option A or B below>}
+ "recipe": <recipe object, option A, B or C below>}
 
 Option A — "line-regex" (STRONGLY preferred: use it whenever the file has ANY per-line structure — speaker headers, timestamps, "Name: text" lines, chat-log prefixes):
 
@@ -72,6 +72,12 @@ Option B — "anchors" (ONLY when the text has no per-line structure at all, e.g
 
 - List every speaker turn in source order. Each anchor must be copied character-for-character from the source (a program locates them with indexOf, scanning forward only) and should be distinctive enough to pin down that spot. Keep every anchor short (max 80 chars) — never quote more.
 - If speakers are unnamed, use "Speaker 1", "Speaker 2", ….
+
+Option C — "document" (ONLY when the content is NOT a conversation at all — meeting minutes, notes, an agenda, an action-item list, a report. There are no speaker turns to find, so don't invent them):
+
+{"kind": "document"}
+
+- The program imports the content as-is, split into paragraph blocks. Still fill title/attendees/language from what the document says (attendees = participant names it mentions).
 
 Hard rules:
 - NEVER output the transcript content. The ONLY source text allowed in your output is the short evidence lines / anchors described above.

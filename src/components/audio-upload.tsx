@@ -119,6 +119,23 @@ const MAX_FILE_BYTES = 4 * 1024 * 1024 * 1024; // 4GB
 
 const VIDEO_FILE_RE = /\.(mp4|webm|mov|mkv|m4v)$/i;
 
+/** Text documents that must NEVER be streamed to AssemblyAI as audio (the
+ * sibl_minutes.rtf incident: 8KB of meeting minutes died minutes later as an
+ * opaque transcoding error). These divert to the import-text lane, which
+ * extracts text server-side and parses/normalizes it into a transcript. */
+const TEXT_TRANSCRIPT_FILE_RE =
+  /\.(txt|md|markdown|rtf|vtt|srt|docx|doc|pdf|json|csv|tsv|html|htm|log)$/i;
+const TEXT_TRANSCRIPT_MIMES = new Set([
+  'application/rtf',
+  'application/pdf',
+  'application/msword',
+  'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+]);
+const isTextTranscriptFile = (f: File) =>
+  TEXT_TRANSCRIPT_FILE_RE.test(f.name) ||
+  f.type.startsWith('text/') ||
+  TEXT_TRANSCRIPT_MIMES.has(f.type);
+
 function localDateOf(d: Date): string {
   const pad = (n: number) => String(n).padStart(2, '0');
   return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
@@ -167,6 +184,15 @@ export function AudioUpload({ onTranscriptCreated }: AudioUploadProps) {
     queued: boolean;
     id: string | null;
   } | null>(null);
+
+  // --- text-file import state (the 'pick' step's third lane: a dropped
+  // .rtf/.docx/.txt/… stages here instead of streaming to AAI as audio) ---
+  const [textFiles, setTextFiles] = useState<File[]>([]);
+  const [textBusy, setTextBusy] = useState(false);
+  const [textError, setTextError] = useState<string | null>(null);
+  /** Names of text files dropped alongside media — listed on the files step
+   * so a mixed drop doesn't silently swallow the documents. */
+  const [skippedTextNames, setSkippedTextNames] = useState<string[]>([]);
 
   // --- stepper state ---
   const [step, setStep] = useState<DialogStep>('pick');
@@ -363,8 +389,36 @@ export function AudioUpload({ onTranscriptCreated }: AudioUploadProps) {
 
   const handleFilesSelected = useCallback(
     (files: FileList) => {
-      const list = Array.from(files);
-      if (list.length === 0) return;
+      const all = Array.from(files);
+      if (all.length === 0) return;
+      const texts = all.filter(isTextTranscriptFile);
+      const list = all.filter((f) => !isTextTranscriptFile(f));
+
+      // All-text selection → the import-text lane on the 'pick' step. The
+      // media wizard's language/report steps don't apply to a document.
+      if (list.length === 0) {
+        setTextFiles(texts);
+        setTextError(null);
+        setPasteOpen(false);
+        setPasteResult(null);
+        setPasteError(null);
+        setSkippedTextNames([]);
+        setPendingFiles([]);
+        // Same keep-the-pre-link rule as media: only inside the open dialog,
+        // and only for a single file (one event ↔ one transcript).
+        const keepTextLink = isDialogOpen && texts.length === 1;
+        if (!keepTextLink) {
+          setPrefill(null);
+          setSelectedEventId(null);
+          setDayEvents([]);
+        }
+        setStep(googleOk === false && !connectSkipped ? 'connect' : 'pick');
+        setIsDialogOpen(true);
+        return;
+      }
+
+      setSkippedTextNames(texts.map((f) => f.name));
+      setTextFiles([]);
       setPendingFiles(list);
       setSelectedLanguage('');
       setReportPref('summary');
@@ -466,6 +520,9 @@ export function AudioUpload({ onTranscriptCreated }: AudioUploadProps) {
       setPasteText('');
       setPasteError(null);
       setPasteResult(null);
+      setTextFiles([]);
+      setTextError(null);
+      setSkippedTextNames([]);
       const date = detail?.date ?? localDateOf(new Date());
       setLinkDate(date);
       if (googleOk === false && !connectSkipped) {
@@ -533,6 +590,9 @@ export function AudioUpload({ onTranscriptCreated }: AudioUploadProps) {
     setPasteText('');
     setPasteError(null);
     setPasteResult(null);
+    setTextFiles([]);
+    setTextError(null);
+    setSkippedTextNames([]);
   };
 
   /** The 'pick' step's paste lane: route the text through the same import
@@ -569,6 +629,55 @@ export function AudioUpload({ onTranscriptCreated }: AudioUploadProps) {
       setPasteError(err instanceof Error ? err.message : 'Import failed');
     } finally {
       setPasteBusy(false);
+    }
+  };
+
+  /** The 'pick' step's text-file lane: post the document bytes to the same
+   * import API (it extracts text server-side — rtf/docx/pdf/…), carrying the
+   * pre-linked event when there's exactly one file. Reuses the paste lane's
+   * result panel. */
+  const importTextFiles = async () => {
+    if (textBusy || textFiles.length === 0) return;
+    setTextBusy(true);
+    setTextError(null);
+    try {
+      const linked = textFiles.length === 1 && prefill ? buildLinkedEvent() : null;
+      let anyQueued = false;
+      let lastId: string | null = null;
+      for (const f of textFiles) {
+        const res = await fetch('/api/transcripts/import-text', {
+          method: 'POST',
+          headers: {
+            'Content-Type': f.type || 'application/octet-stream',
+            'x-filename': encodeURIComponent(f.name),
+            ...(linked
+              ? { 'x-linked-event': encodeURIComponent(JSON.stringify(linked)) }
+              : {}),
+          },
+          body: f,
+        });
+        if (!res.ok) {
+          const detail = await res.json().catch(() => ({}) as { error?: string });
+          throw new Error(detail.error || `Import failed (${res.status})`);
+        }
+        const payload = (await res.json()) as {
+          queued?: boolean;
+          assemblyaiId?: string;
+          transcript?: { assemblyai_id?: string };
+        };
+        if (res.status === 202 && payload.queued) anyQueued = true;
+        lastId = payload.transcript?.assemblyai_id ?? payload.assemblyaiId ?? null;
+      }
+      setPasteResult({
+        queued: anyQueued,
+        id: textFiles.length === 1 ? lastId : null,
+      });
+      setTextFiles([]);
+      onTranscriptCreated?.();
+    } catch (err) {
+      setTextError(err instanceof Error ? err.message : 'Import failed');
+    } finally {
+      setTextBusy(false);
     }
   };
 
@@ -671,6 +780,14 @@ export function AudioUpload({ onTranscriptCreated }: AudioUploadProps) {
   // Linking one calendar event to a batch makes no sense — the link step
   // only shows for single-file uploads (the overwhelmingly common case).
   const canLink = pendingFiles.length === 1;
+  // A calendar-row "Upload…" arrives with its event already resolved and
+  // selected — asking "link to a calendar meeting?" again is the one question
+  // the flow already knows the answer to, so those skip the link step (the
+  // process step's banner + Change button keep it editable).
+  const preLinked =
+    !!prefill &&
+    !!selectedEventId &&
+    dayEvents.some((e) => e.id === selectedEventId);
   const hasVideoFile = pendingFiles.some(
     (f) => f.type.startsWith('video/') || VIDEO_FILE_RE.test(f.name)
   );
@@ -732,9 +849,11 @@ export function AudioUpload({ onTranscriptCreated }: AudioUploadProps) {
           <div className="pointer-events-none fixed inset-0 z-50 grid place-items-center bg-background/80 backdrop-blur-sm">
             <div className="rounded-xl border-2 border-dashed border-primary bg-card px-10 py-8 text-center shadow-lg">
               <Upload className="mx-auto h-6 w-6 text-primary" />
-              <p className="mt-3 text-sm font-medium">Drop audio or video to upload</p>
+              <p className="mt-3 text-sm font-medium">
+                Drop a recording or transcript file
+              </p>
               <p className="mt-1 text-xs text-muted-foreground">
-                up to 4 GB · mp3 · m4a · mp4 · wav
+                audio/video up to 4 GB · or .txt · .docx · .pdf · .rtf
               </p>
             </div>
           </div>
@@ -803,7 +922,7 @@ export function AudioUpload({ onTranscriptCreated }: AudioUploadProps) {
               <p className="text-xs text-muted-foreground">
                 It&apos;s a one-time connect — you&apos;ll hop to Google&apos;s
                 consent screen and land right back here.
-                {pendingFiles.length > 0 &&
+                {(pendingFiles.length > 0 || textFiles.length > 0) &&
                   ' The file you just dropped can’t survive that trip, so you’ll re-select it afterwards.'}
               </p>
             </div>
@@ -876,9 +995,63 @@ export function AudioUpload({ onTranscriptCreated }: AudioUploadProps) {
                       Drop a recording here, or click to choose a file
                     </p>
                     <p className="mt-1 text-xs text-muted-foreground">
-                      audio or video · up to 4 GB · mp4 · mp3 · m4a · wav
+                      audio or video · up to 4 GB · mp4 · mp3 · m4a · wav — or a
+                      transcript document (.txt · .docx · .pdf · .rtf)
                     </p>
                   </button>
+                  {textFiles.length > 0 && (
+                    <div className="space-y-2 rounded-md border border-primary/30 bg-primary/5 p-3">
+                      <div className="space-y-1">
+                        {textFiles.map((f, i) => (
+                          <p key={i} className="flex min-w-0 items-center gap-2 text-sm font-medium">
+                            <FileText className="h-4 w-4 shrink-0 text-primary" />
+                            <span className="min-w-0 truncate">{f.name}</span>
+                            <span className="shrink-0 font-mono text-[11px] text-muted-foreground">
+                              {formatFileSize(f.size)}
+                            </span>
+                          </p>
+                        ))}
+                      </div>
+                      <p className="text-xs text-muted-foreground">
+                        {textFiles.length === 1
+                          ? 'This is a text document, not a recording — it’ll import as a transcript (no playback or voice matching).'
+                          : 'These are text documents, not recordings — they’ll import as transcripts (no playback or voice matching).'}
+                      </p>
+                      {textError && (
+                        <p className="flex items-center gap-1 text-xs text-destructive">
+                          <AlertCircle className="h-4 w-4" />
+                          {textError}
+                        </p>
+                      )}
+                      <div className="flex items-center gap-2">
+                        <Button
+                          size="sm"
+                          onClick={() => void importTextFiles()}
+                          // Wait for the pre-link banner to resolve, same as
+                          // the paste lane — no importing without its event.
+                          disabled={textBusy || (!!prefill && eventsBusy)}
+                        >
+                          {textBusy ? (
+                            <Loader2 className="h-4 w-4 animate-spin" />
+                          ) : (
+                            <Sparkles className="h-4 w-4" />
+                          )}
+                          Import as transcript
+                        </Button>
+                        <Button
+                          size="sm"
+                          variant="ghost"
+                          onClick={() => {
+                            setTextFiles([]);
+                            setTextError(null);
+                          }}
+                          disabled={textBusy}
+                        >
+                          Remove
+                        </Button>
+                      </div>
+                    </div>
+                  )}
                   {!pasteOpen ? (
                     <button
                       type="button"
@@ -952,6 +1125,14 @@ export function AudioUpload({ onTranscriptCreated }: AudioUploadProps) {
               paints outside the card. */}
           {step === 'files' && (
             <div className="min-w-0 space-y-4 py-2">
+              {skippedTextNames.length > 0 && (
+                <p className="rounded-md border bg-muted/40 px-3 py-2 text-xs text-muted-foreground">
+                  <FileText className="mr-1.5 inline h-3.5 w-3.5" />
+                  Set aside {skippedTextNames.join(', ')} — text documents import
+                  separately (drop {skippedTextNames.length === 1 ? 'it' : 'them'}{' '}
+                  again on {skippedTextNames.length === 1 ? 'its' : 'their'} own).
+                </p>
+              )}
               <div className="space-y-2">
                 <p className="text-sm text-muted-foreground">
                   {pendingFiles.length} file{pendingFiles.length > 1 ? 's' : ''} selected:
@@ -1105,11 +1286,21 @@ export function AudioUpload({ onTranscriptCreated }: AudioUploadProps) {
           {step === 'process' && (
             <div className="min-w-0 space-y-3 py-2">
               {selectedEvent && (
-                <p className="rounded-md border bg-muted/40 px-3 py-2 text-xs text-muted-foreground">
-                  <CalendarDays className="mr-1.5 inline h-3.5 w-3.5" />
-                  Linked to <span className="font-medium">{selectedEvent.summary}</span>
-                  {' · '}
-                  {fmtEventTime(selectedEvent)}
+                <p className="flex items-center gap-2 rounded-md border bg-muted/40 px-3 py-2 text-xs text-muted-foreground">
+                  <span className="min-w-0 flex-1 truncate">
+                    <CalendarDays className="mr-1.5 inline h-3.5 w-3.5" />
+                    Linked to{' '}
+                    <span className="font-medium">{selectedEvent.summary}</span>
+                    {' · '}
+                    {fmtEventTime(selectedEvent)}
+                  </span>
+                  <button
+                    type="button"
+                    className="shrink-0 underline decoration-dotted underline-offset-2 hover:text-foreground"
+                    onClick={goToLinkStep}
+                  >
+                    Change
+                  </button>
                 </p>
               )}
               <p className="text-xs text-muted-foreground">
@@ -1193,7 +1384,7 @@ export function AudioUpload({ onTranscriptCreated }: AudioUploadProps) {
                 </Button>
                 <Button
                   onClick={() => {
-                    if (canLink) goToLinkStep();
+                    if (canLink && !preLinked) goToLinkStep();
                     else setStep('process');
                   }}
                   disabled={pendingFiles.length === 0}
