@@ -1,0 +1,1283 @@
+ ▐▛███▜▌   Claude Code v2.1.235
+▝▜█████▛▘  Fable 5 · Claude Max
+  ▘▘ ▝▝    ~/workspace/meeting-whisperer
+
+
+❯ Update(/Users/alokrajiv/.claude/projects/-Users-alokrajiv-workspace-meeting-w 
+  hisperer/memory/project_listing_v2_calendar_views.md)                         
+                                                                                
+    that the next session                                                       
+
+  Thought for 9s (ctrl+o to expand)
+
+⏺ It looks like your message got cut off mid-sentence —
+  "Update(…project_listing_v2_calendar_views.md) … that the next session". Let
+  me look at the current state of that memory file so I can act on whatever you
+  meant.
+
+  Thought for 9s, recalled 1 memory (ctrl+o to expand)
+
+⏺ Your message came through truncated — I got
+  Update(…project_listing_v2_calendar_views.md) and the fragment "that the next
+  session", but the middle part with the actual content didn't arrive.
+
+  The file currently ends with the 0351ff6 field-report fixes and already
+  carries the "Series UI: APPROVED, build in a FRESH session" pickup note. What
+  did you want me to add or change — a note that the next session should pick up
+  the Series UI build, or something else from this session? Paste the missing
+  part and I'll make the edit.
+
+✻ Brewed for 20s
+
+❯ read that file                                                                
+
+  Thought for 3s (ctrl+o to expand)
+
+⏺ I did just read it — here's what it contains:
+
+  project_listing_v2_calendar_views.md is the memory for the 2026-08-19 listing
+  revamp, shipped and prod-verified across several batches:
+
+  - Listing v2 API (?v=2): day-bucketed cursor pagination, server-side tabs with
+    counts, unified search, with the legacy no-param response kept
+    byte-compatible because darth-cli depends on it.
+  - Calendar views: migration 022 calendar_event_cache (per-user),
+    unimported/norec views, dual-timezone event_key dedupe gotcha.
+  - Import-text fast path: deterministic parser (~70ms) replacing the 8-minute
+    opus timeout, plus the recipe-normalization rule that the LLM only returns a
+    parsing recipe, never re-emits transcript text.
+  - Merged timeline with three layer chips, calendar mutes (migration 023), the
+    upload popup-first flow, badge deep-links, reader-first detail rail, and
+    post-connect immediate sync.
+  - Series UI plan: approved 2026-08-19, explicitly marked "build in a FRESH
+    session" — slim /series index, merge-series endpoint, retro-attach sweep
+    over 188 unattached transcripts, series chips. Notes the 3 live dupe
+    clusters and open permission questions.
+  - Latest batch (commit 0351ff6): RTF/text-doc uploads (rtfToText,
+    kind:'document' recipes, 415 belt), pre-linked uploads skipping the link
+    step, and the documented error-row recovery flow (trash → re-upload; row 351
+    left for aniq).
+  - Closing gotcha: ${param} inside a SQL -- comment in postgres.js still emits
+    a parameter and breaks the query.
+
+  Your earlier message was cut off at "…that the next session" — what should I
+  add or change in it?
+
+✻ Cooked for 9s
+
+❯ vi think there si somewthing about the series view right                      
+
+  Thought for 3s (ctrl+o to expand)
+
+⏺ Yes — there's a dedicated pickup note near the end of the file (lines 88–99).
+  Verbatim gist:
+
+  ▎ Series UI: APPROVED 2026-08-19, build in a FRESH session. MVP (zero 
+  ▎ migrations):
+  ▎ - slim /series index (name / members / cadence / last-meeting / dup-flag)
+  ▎ - merge-series — POST /api/series/:id/merge, one transaction, keys can't 
+  ▎ conflict per UNIQUE
+  ▎ - retro-attach sweep over the 188 unattached transcripts (reuse 
+  ▎ maybeAutoAttach minus the create-new branch)
+  ▎ - calendar-row series chips + coverage dot-strip in SeriesDialog
+
+  Plus the supporting context it recorded:
+
+  - The full proposal with 3 design-lens outputs was a workflow output at
+    /private/tmp/claude-501/.../tasks/w202vmc99.output — flagged as "may be
+    gone", with the synthesis meant to be summarized in the old-session index
+    when archived.
+  - 3 dupe clusters live: Integration Cadence ids 6(48)+1(5), Good Spanish 
+    Perfume ids 2/10/11.
+  - Permissions: you asked what "destructive" meant; the recommended (not yet
+    confirmed) answer was to leave merge/delete open to all 7 users with a loud
+    confirm dialog + logging who did it.
+  - Still open for V2: auto-import token identity, transcript-only unattended
+    imports.
+
+  So the pickup point is already in memory. Is this the thing your truncated
+  message was about — did you want me to start building it, or amend that note?
+
+✻ Cooked for 7s
+
+※ recap: We're checking the meeting-whisperer memory file about the listing v2 revamp; it already contains the approved Series UI plan marked "build in a fresh session". Next: tell me whether to start that build or edit the note. (disable recaps in /config)
+
+❯ ok do it                                                                      
+
+  Thought for 9s (ctrl+o to expand)
+
+⏺ On it — building the Series UI MVP. First let me recover the context: the full
+  proposal file (if it survived), the series schema memory, and the relevant
+  code.
+
+  Thought for 5s, listed 1 directory, recalled 1 memory (ctrl+o to expand)
+
+⏺ The workflow output survived. Reading the full proposal now.
+
+  Thought for 1m 25s, searched for 2 patterns, read 13 files, listed 3 directories (ctrl+o to expand)
+
+⏺ I have the full picture now. Building the MVP: merge API + retro-attach +
+  /series index + calendar-row chips + coverage strip. Checking the migration
+  schema and transaction idiom first.
+
+  Thought for 29s, read 1 file, ran 2 shell commands (ctrl+o to expand)
+
+⏺ Now writing the backend. First the db-ops: merge, cadence-aware index listing,
+  unattached lookup, and the recurring-base-id lookup for calendar chips.
+
+⏺ Update(src/db-ops/series.ts)
+  ⎿  Added 2 lines
+      35    title: string;
+      36    member_count: number;
+      37    last_recorded_at: string | null;
+      38 +  /** Median gap between member occurrences, seconds — null und
+         +er 2 members. */                                               
+      39 +  median_gap_secs: number | null;                              
+      40  }
+      41  
+      42  export interface SeriesMemberEntry {
+
+⏺ Update(src/db-ops/series.ts)
+  ⎿  Added 110 lines, removed 2 lines
+       91  
+       92  export async function listSeries(): Promise<SeriesListEntry[]>
+            {
+       93    return sql<SeriesListEntry[]>`
+       94 +    WITH gaps AS (                                            
+       95 +      SELECT m.series_id,                                     
+       96 +             extract(epoch FROM (                             
+       97 +               lead(COALESCE(t.recorded_at, t.created_at)) OVE
+          +R (                                                           
+       98 +                 PARTITION BY m.series_id                     
+       99 +                 ORDER BY COALESCE(t.recorded_at, t.created_at
+          +)                                                             
+      100 +               ) - COALESCE(t.recorded_at, t.created_at)      
+      101 +             ))::float8 AS gap                                
+      102 +      FROM ${sql(SCHEMA)}.series_members m                    
+      103 +      JOIN ${sql(SCHEMA)}.transcripts t                       
+      104 +        ON t.id = m.transcript_id AND t.deleted_at IS NULL    
+      105 +    ),                                                        
+      106 +    cadence AS (                                              
+      107 +      SELECT series_id,                                       
+      108 +             percentile_cont(0.5) WITHIN GROUP (ORDER BY gap) 
+          +AS median_gap_secs                                            
+      109 +      FROM gaps WHERE gap IS NOT NULL                         
+      110 +      GROUP BY series_id                                      
+      111 +    )                                                         
+      112      SELECT s.id, s.title,
+      113             count(m.id)::int AS member_count,
+       96 -           max(COALESCE(t.recorded_at, t.created_at))::text AS
+          - last_recorded_at                                             
+      114 +           max(COALESCE(t.recorded_at, t.created_at))::text AS
+          + last_recorded_at,                                            
+      115 +           c.median_gap_secs                                  
+      116      FROM ${sql(SCHEMA)}.series s
+      117      LEFT JOIN ${sql(SCHEMA)}.series_members m ON m.series_id =
+            s.id
+      118      LEFT JOIN ${sql(SCHEMA)}.transcripts t
+      119        ON t.id = m.transcript_id AND t.deleted_at IS NULL
+      101 -    GROUP BY s.id, s.title                                    
+      120 +    LEFT JOIN cadence c ON c.series_id = s.id                 
+      121 +    GROUP BY s.id, s.title, c.median_gap_secs                 
+      122      ORDER BY max(COALESCE(t.recorded_at, t.created_at)) DESC N
+           ULLS LAST
+      123    `;
+      124  }
+      125  
+      126 +/** Live memberships + transcripts outside any series — the in
+          +dex footer. */                                                
+      127 +export async function seriesTotals(): Promise<{ memberships: n
+          +umber; unattached: number }> {                                
+      128 +  const [row] = await sql<Array<{ memberships: number; unattac
+          +hed: number }>>`                                              
+      129 +    SELECT                                                    
+      130 +      count(m.id)::int AS memberships,                        
+      131 +      count(t.id) FILTER (WHERE m.id IS NULL)::int AS unattach
+          +ed                                                            
+      132 +    FROM ${sql(SCHEMA)}.transcripts t                         
+      133 +    LEFT JOIN ${sql(SCHEMA)}.series_members m ON m.transcript_
+          +id = t.id                                                     
+      134 +    WHERE t.deleted_at IS NULL                                
+      135 +      AND t.status NOT IN ('uploading', 'waiting')            
+      136 +  `;                                                          
+      137 +  return row ?? { memberships: 0, unattached: 0 };            
+      138 +}                                                             
+      139 +                                                              
+      140 +/**                                                           
+      141 + * Fold one series into another (dupe repair): keys, members, 
+          +and exclusions                                                
+      142 + * move to the survivor, the loser is deleted — all in one tra
+          +nsaction. Keys                                                
+      143 + * can't collide (UNIQUE(kind,value) means a value lives in ex
+          +actly one                                                     
+      144 + * series) and members can't either (transcript_id UNIQUE, ser
+          +ies_id is the                                                 
+      145 + * moving part); exclusions may exist on both sides → keep-fir
+          +st.                                                           
+      146 + */                                                           
+      147 +export async function mergeSeries(                            
+      148 +  intoId: number,                                             
+      149 +  fromId: number                                              
+      150 +): Promise<{ movedMembers: number; movedKeys: number }> {     
+      151 +  return sql.begin(async (tx) => {                            
+      152 +    const keys = await tx`                                    
+      153 +      UPDATE ${sql(SCHEMA)}.series_keys SET series_id = ${into
+          +Id}                                                           
+      154 +      WHERE series_id = ${fromId} RETURNING id                
+      155 +    `;                                                        
+      156 +    const members = await tx`                                 
+      157 +      UPDATE ${sql(SCHEMA)}.series_members SET series_id = ${i
+          +ntoId}                                                        
+      158 +      WHERE series_id = ${fromId} RETURNING id                
+      159 +    `;                                                        
+      160 +    await tx`                                                 
+      161 +      INSERT INTO ${sql(SCHEMA)}.series_exclusions (series_id,
+          + transcript_id, excluded_by)                                  
+      162 +      SELECT ${intoId}, transcript_id, excluded_by            
+      163 +      FROM ${sql(SCHEMA)}.series_exclusions WHERE series_id = 
+          +${fromId}                                                     
+      164 +      ON CONFLICT DO NOTHING                                  
+      165 +    `;                                                        
+      166 +    await tx`DELETE FROM ${sql(SCHEMA)}.series WHERE id = ${fr
+          +omId}`;                                                       
+      167 +    return { movedMembers: members.length, movedKeys: keys.len
+          +gth };                                                        
+      168 +  });                                                         
+      169 +}                                                             
+      170 +                                                              
+      171 +/** Transcripts in no series — the retro-attach sweep's work l
+          +ist. */                                                       
+      172 +export async function listUnattachedTranscripts(): Promise<   
+      173 +  Array<{                                                     
+      174 +    id: number;                                               
+      175 +    assemblyai_id: string;                                    
+      176 +    title: string | null;                                     
+      177 +    gmeet_context: GmeetContext | null;                       
+      178 +    user_id: string;                                          
+      179 +  }>                                                          
+      180 +> {                                                           
+      181 +  return sql<                                                 
+      182 +    Array<{                                                   
+      183 +      id: number;                                             
+      184 +      assemblyai_id: string;                                  
+      185 +      title: string | null;                                   
+      186 +      gmeet_context: GmeetContext | null;                     
+      187 +      user_id: string;                                        
+      188 +    }>                                                        
+      189 +  >`                                                          
+      190 +    SELECT t.id, t.assemblyai_id, t.title, t.gmeet_context, t.
+          +user_id                                                       
+      191 +    FROM ${sql(SCHEMA)}.transcripts t                         
+      192 +    LEFT JOIN ${sql(SCHEMA)}.series_members m ON m.transcript_
+          +id = t.id                                                     
+      193 +    WHERE m.id IS NULL                                        
+      194 +      AND t.deleted_at IS NULL                                
+      195 +      AND t.status NOT IN ('uploading', 'waiting')            
+      196 +    ORDER BY COALESCE(t.recorded_at, t.created_at) DESC       
+      197 +  `;                                                          
+      198 +}                                                             
+      199 +                                                              
+      200 +/** Batch series lookup for calendar rows by stripped recurrin
+          +gEventId. */                                                  
+      201 +export async function findSeriesByRecurringBaseIds(           
+      202 +  baseIds: string[]                                           
+      203 +): Promise<Map<string, { series_id: number; title: string }>> 
+          +{                                                             
+      204 +  if (baseIds.length === 0) return new Map();                 
+      205 +  const rows = await sql<Array<{ value: string; series_id: num
+          +ber; title: string }>>`                                       
+      206 +    SELECT k.value, k.series_id, s.title                      
+      207 +    FROM ${sql(SCHEMA)}.series_keys k                         
+      208 +    JOIN ${sql(SCHEMA)}.series s ON s.id = k.series_id        
+      209 +    WHERE k.kind = 'recurring-base-id' AND k.value = ANY(${bas
+          +eIds})                                                        
+      210 +  `;                                                          
+      211 +  return new Map(rows.map((r) => [r.value, { series_id: r.seri
+          +es_id, title: r.title }]));                                   
+      212 +}                                                             
+      213 +                                                              
+      214  export async function listKeys(seriesId: number): Promise<Seri
+           esKeyRow[]> {
+      215    return sql<SeriesKeyRow[]>`
+      216      SELECT id, series_id, kind, value, source
+
+  Thought for 4s (ctrl+o to expand)
+
+⏺ Now the retro-attach sweep in series-attach.ts:
+
+⏺ Update(src/lib/server/series-attach.ts)
+  ⎿  Added 1 line
+       5    createSeries,
+       6    findSeriesByKeys,
+       7    isExcluded,
+       8 +  listUnattachedTranscripts,                                   
+       9  } from '@/db-ops/series';
+      10  import { publishEvent } from '@/lib/server/event-bus';
+      11  import { keysFromContext, strongKeys, STRONG_KINDS } from '@/li
+          b/series-keys';
+
+⏺ Update(src/lib/server/series-attach.ts)
+  ⎿  Added 43 lines
+       57      console.warn('[series] auto-attach failed (import unaffect
+           ed):', err);
+       58    }
+       59  }
+       60 +                                                              
+       61 +/**                                                           
+       62 + * Retro-attach sweep: re-run strong-key matching over every t
+          +ranscript that                                                
+       63 + * belongs to no series — catches rows imported before their s
+          +eries existed                                                 
+       64 + * or before a merge unified the key bags. Same rules as impor
+          +t-time attach,                                                
+       65 + * minus the create-new branch: old rows only ever join EXISTI
+          +NG series                                                     
+       66 + * (nobody wants a merge to spawn series from a year of one-of
+          +fs).                                                          
+       67 + *                                                            
+       68 + * Weak-only matches are counted, not acted on — those rows al
+          +ready surface                                                 
+       69 + * as dashed "?" chips in the listing.                        
+       70 + */                                                           
+       71 +export async function retroAttachSweep(                       
+       72 +  runBy: string                                               
+       73 +): Promise<{ scanned: number; attached: number; suggestions: n
+          +umber }> {                                                    
+       74 +  const rows = await listUnattachedTranscripts();             
+       75 +  let attached = 0;                                           
+       76 +  let suggestions = 0;                                        
+       77 +  for (const row of rows) {                                   
+       78 +    try {                                                     
+       79 +      const keys = keysFromContext(row.gmeet_context, row.titl
+          +e);                                                           
+       80 +      if (keys.length === 0) continue;                        
+       81 +      const matches = await findSeriesByKeys(keys);           
+       82 +      if (matches.length === 0) continue;                     
+       83 +      const strongSet = new Set(strongKeys(keys).map((k) => k.
+          +kind as string));                                             
+       84 +      const strongMatch = matches.find((m) => m.matched_kinds.
+          +some((k) => strongSet.has(k)));                               
+       85 +      if (!strongMatch) {                                     
+       86 +        suggestions++;                                        
+       87 +        continue;                                             
+       88 +      }                                                       
+       89 +      if (await isExcluded(strongMatch.series_id, row.id)) con
+          +tinue;                                                        
+       90 +      await addKeys(strongMatch.series_id, keys, 'import', row
+          +.user_id);                                                    
+       91 +      await addMember(strongMatch.series_id, row.id, 'auto', r
+          +ow.user_id);                                                  
+       92 +      publishEvent({ kind: 'meta', assemblyaiId: row.assemblya
+          +i_id });                                                      
+       93 +      attached++;                                             
+       94 +    } catch (err) {                                           
+       95 +      console.warn(`[series] retro-attach skipped transcript $
+          +{row.id}:`, err);                                             
+       96 +    }                                                         
+       97 +  }                                                           
+       98 +  if (attached > 0) {                                         
+       99 +    console.log(`[series] retro-attach by ${runBy}: ${attached
+          +} attached of ${rows.length} scanned`);                       
+      100 +  }                                                           
+      101 +  return { scanned: rows.length, attached, suggestions };     
+      102 +}                                                             
+
+⏺ Now the two new API routes — merge and retro-attach:
+
+⏺ Write(src/app/api/series/[id]/merge/route.ts)
+  ⎿  Wrote 48 lines to src/app/api/series/[id]/merge/route.ts
+       1 import { NextResponse } from 'next/server';
+       2 import { withAuth } from '@/lib/auth/with-auth';
+       3 import { getSeries, mergeSeries } from '@/db-ops/series';
+       5 
+       6 export const runtime = 'nodejs';
+       7 
+       8 /**
+         Id into :id
+      10  * (dupe repair: keys, members, exclusions move; the loser is de
+         leted). Open
+     … +52 lines (ctrl+o to expand)
+
+⏺ Write(src/app/api/series/retro-attach/route.ts)  ⎿  Wrote 19 lines to src/app/api/series/retro-attach/route.ts
+      1 import { NextResponse } from 'next/server';
+      2 import { withAuth } from '@/lib/auth/with-auth';
+      3 import { retroAttachSweep } from '@/lib/server/series-attach';
+      4 
+      5 export const runtime = 'nodejs';
+      6 
+      7 // The sweep walks every unattached transcript with one key query
+         each —
+      8 // ~200 rows today, well under a minute, but give it headroom.
+      9 export const maxDuration = 120;
+     … +14 lines (ctrl+o to expand)
+
+  Thought for 3s (ctrl+o to expand)
+
+⏺ Now extend GET /api/series with cadence, dup flags, and totals:
+
+⏺ Update(src/app/api/series/route.ts)
+  ⎿  Added 34 lines, removed 4 lines
+       1  import { NextResponse } from 'next/server';
+       2  import { withAuth } from '@/lib/auth/with-auth';
+       3  import { resolveAccess } from '@/db-ops/transcript-access';
+       4 -import { addKeys, addMember, createSeries, listSeries } from '@
+         -/db-ops/series';                                               
+       5 -import { keysFromContext } from '@/lib/series-keys';           
+       4 +import { addKeys, addMember, createSeries, listSeries, seriesTo
+         +tals } from '@/db-ops/series';                                 
+       5 +import { keysFromContext, normalizeTitle } from '@/lib/series-k
+         +eys';                                                          
+       6  import { publishEvent } from '@/lib/server/event-bus';
+       7  
+       8  export const runtime = 'nodejs';
+       9  
+      10 -/** GET /api/series — all series with member counts (org-global
+         -). */                                                          
+      10 +export type SeriesCadence = 'daily' | 'weekly' | 'biweekly' | '
+         +monthly' | null;                                               
+      11 +                                                               
+      12 +/** Median inter-occurrence gap → a human cadence label (null =
+         + no pattern). */                                               
+      13 +function cadenceOf(medianGapSecs: number | null): SeriesCadence
+         + {                                                             
+      14 +  if (medianGapSecs == null) return null;                      
+      15 +  const days = medianGapSecs / 86_400;                         
+      16 +  if (days <= 1.5) return 'daily';                             
+      17 +  if (days <= 10) return 'weekly';                             
+      18 +  if (days <= 20) return 'biweekly';                           
+      19 +  if (days <= 45) return 'monthly';                            
+      20 +  return null;                                                 
+      21 +}                                                              
+      22 +                                                               
+      23 +/**                                                            
+      24 + * GET /api/series — all series with member counts (org-global)
+         +, plus                                                         
+      25 + * cadence, a same-normalized-title dup flag (the merge prompt)
+         +, and the                                                      
+      26 + * memberships/unattached totals for the index footer.         
+      27 + */                                                            
+      28  export const GET = withAuth(async () => {
+      12 -  return NextResponse.json({ series: await listSeries() });    
+      29 +  const [series, totals] = await Promise.all([listSeries(), ser
+         +iesTotals()]);                                                 
+      30 +  const titleCounts = new Map<string, number>();               
+      31 +  for (const s of series) {                                    
+      32 +    const norm = normalizeTitle(s.title);                      
+      33 +    titleCounts.set(norm, (titleCounts.get(norm) ?? 0) + 1);   
+      34 +  }                                                            
+      35 +  return NextResponse.json({                                   
+      36 +    series: series.map((s) => ({                               
+      37 +      ...s,                                                    
+      38 +      cadence: cadenceOf(s.median_gap_secs),                   
+      39 +      dup: (titleCounts.get(normalizeTitle(s.title)) ?? 0) > 1,
+      40 +    })),                                                       
+      41 +    totals,                                                    
+      42 +  });                                                          
+      43  });
+      44  
+      45  /**
+
+  Thought for 4s (ctrl+o to expand)
+
+⏺ Now the calendar-meetings route — series chip data per row:
+
+⏺ Update(src/app/api/calendar-meetings/route.ts)
+  ⎿  Added 2 lines
+       7    type CalendarMeetingDbRow,
+       8    type CalendarMeetingView,
+       9  } from '@/db-ops/calendar-event-cache';
+      10 +import { findSeriesByRecurringBaseIds } from '@/db-ops/series';
+      11 +import { recurringBaseId } from '@/lib/series-keys';           
+      12  
+      13  export const runtime = 'nodejs';
+      14  
+
+⏺ Update(src/app/api/calendar-meetings/route.ts)
+  ⎿  Added 4 lines
+      60    recurringEventId: string | null;
+      61    /** Cached occurrences of the series ("Hide all N…"); null = 
+          not recurring. */
+      62    seriesCount: number | null;
+      63 +  /** App-level series this occurrence belongs to (recurring-ba
+         +se-id match) —                                                 
+      64 +   * renders the same member chip archive rows get; click opens
+         + SeriesDialog. */                                              
+      65 +  seriesId: number | null;                                     
+      66 +  seriesTitle: string | null;                                  
+      67  }
+      68  
+      69  export interface CalendarMeetingsResponse {
+
+⏺ Update(src/app/api/calendar-meetings/route.ts)
+  ⎿  Added 7 lines, removed 1 line
+      112    return v instanceof Date ? v.toISOString() : new Date(v).toI
+           SOString();
+      113  }
+      114  
+      115 -function toRow(r: CalendarMeetingDbRow): CalendarMeetingRow { 
+      115 +function toRow(                                               
+      116 +  r: CalendarMeetingDbRow,                                    
+      117 +  seriesByBase: Map<string, { series_id: number; title: string
+          + }>                                                           
+      118 +): CalendarMeetingRow {                                       
+      119 +  const series = r.recurring_event_id                         
+      120 +    ? (seriesByBase.get(recurringBaseId(r.recurring_event_id))
+          + ?? null)                                                     
+      121 +    : null;                                                   
+      122    return {
+      123      key: r.key,
+      124      meetingCode: r.meeting_code,
+
+⏺ Update(src/app/api/calendar-meetings/route.ts)
+  ⎿  Added 2 lines
+      141      transcriptDocId: r.transcript_doc_id,
+      142      recurringEventId: r.recurring_event_id,
+      143      seriesCount: r.series_count,
+      144 +    seriesId: series?.series_id ?? null,                      
+      145 +    seriesTitle: series?.title ?? null,                       
+      146    };
+      147  }
+      148  
+
+⏺ Update(src/app/api/calendar-meetings/route.ts)
+  ⎿  Added 11 lines, removed 1 line
+      170      }),
+      171    ]);
+      172  
+      173 +  // One batch lookup maps this page's recurring events onto a
+          +pp-level series.                                              
+      174 +  const baseIds = [                                           
+      175 +    ...new Set(                                               
+      176 +      page.days.flatMap((d) =>                                
+      177 +        d.rows.flatMap((r) => (r.recurring_event_id ? [recurri
+          +ngBaseId(r.recurring_event_id)] : []))                        
+      178 +      )                                                       
+      179 +    ),                                                        
+      180 +  ];                                                          
+      181 +  const seriesByBase = await findSeriesByRecurringBaseIds(base
+          +Ids);                                                         
+      182 +                                                              
+      183    const body: CalendarMeetingsResponse = {
+      174 -    days: page.days.map((d) => ({ key: d.key, rows: d.rows.map
+          -(toRow) })),                                                  
+      184 +    days: page.days.map((d) => ({ key: d.key, rows: d.rows.map
+          +((r) => toRow(r, seriesByBase)) })),                          
+      185      counts,
+      186      nextCursor: page.nextCursor,
+      187      hasMore: page.hasMore,
+
+  Thought for 4s (ctrl+o to expand)
+
+⏺ Backend done. Now the frontend — starting with the header nav:
+
+⏺ Update(src/components/app-header.tsx)
+  ⎿  Added 1 line
+      1  'use client';
+      2  
+      3  import Link from 'next/link';
+      4 +import { usePathname } from 'next/navigation';                  
+      5  import { AudioLines, ChevronRight } from 'lucide-react';
+      6  import type { ReactNode } from 'react';
+      7  import { ThemeToggle } from '@/components/theme-toggle';
+
+⏺ Update(src/components/app-header.tsx)
+  ⎿  Added 21 lines
+      18   * slot differs per page); layout.tsx stays uninvolved.
+      19   */
+      20  export function AppHeader({ children, breadcrumb }: AppHeaderPr
+          ops) {
+      21 +  const pathname = usePathname();                              
+      22    return (
+      23      <header className="sticky top-0 z-40 h-14 border-b bg-backg
+          round/85 backdrop-blur">
+      24        <div className="mx-auto flex h-14 max-w-[1720px] items-ce
+          nter gap-3 px-6">
+     ...
+      28            </span>
+      29            <span className="text-sm font-semibold tracking-tight
+          ">Darth Meetings</span>
+      30          </Link>
+      31 +        {!breadcrumb && (                                      
+      32 +          <nav className="flex items-center gap-1 text-sm">    
+      33 +            {[                                                 
+      34 +              { href: '/', label: 'Meetings' },                
+      35 +              { href: '/series', label: 'Series' },            
+      36 +            ].map((l) => (                                     
+      37 +              <Link                                            
+      38 +                key={l.href}                                   
+      39 +                href={l.href}                                  
+      40 +                className={`rounded-md px-2 py-1 transition-col
+         +ors ${                                                         
+      41 +                  pathname === l.href                          
+      42 +                    ? 'bg-muted font-medium text-foreground'   
+      43 +                    : 'text-muted-foreground hover:text-foregro
+         +und'                                                           
+      44 +                }`}                                            
+      45 +              >                                                
+      46 +                {l.label}                                      
+      47 +              </Link>                                          
+      48 +            ))}                                                
+      49 +          </nav>                                               
+      50 +        )}                                                     
+      51          {breadcrumb && (
+      52            <nav className="flex min-w-0 items-center gap-1 text-
+          sm text-muted-foreground">
+      53              <ChevronRight className="h-3.5 w-3.5 shrink-0" />
+
+  Thought for 8s (ctrl+o to expand)
+
+⏺ Now the /series index page:
+
+⏺ Write(src/app/series/page.tsx)
+  ⎿  Wrote 214 lines to src/app/series/page.tsx
+       1 'use client';
+       2 
+       3 import { useCallback, useEffect, useState } from 'react';
+       4 import { AppHeader } from '@/components/app-header';
+       5 import { SeriesDialog } from '@/components/series-dialog';
+       6 import { Button } from '@/components/ui/button';
+       7 import { Badge } from '@/components/ui/badge';
+       8 import {
+       9   Table,
+      10   TableBody,
+     … +239 lines (ctrl+o to expand)
+
+  Thought for 15s (ctrl+o to expand)
+
+⏺ Now the SeriesDialog additions — merge UI, coverage strip, onMerged:
+
+⏺ Update(src/components/series-dialog.tsx)
+  ⎿  Added 1 line
+      23    Download,
+      24    ExternalLink,
+      25    CalendarClock,
+      26 +  Merge,                                                       
+      27  } from 'lucide-react';
+      28  
+      29  /**
+
+⏺ Update(src/components/series-dialog.tsx)
+  ⎿  Added 3 lines
+      89    onClose: () => void;
+      90    /** Membership/import changed — parents refresh their lists. 
+          */
+      91    onChanged: () => void;
+      92 +  /** This series was merged INTO targetSeriesId — hosts that c
+         +an switch the                                                  
+      93 +   * open dialog to the survivor pass this; otherwise the dialo
+         +g just closes. */                                              
+      94 +  onMerged?: (targetSeriesId: number) => void;                 
+      95  }
+      96  
+      97  const dateLabel = (iso: string) =>
+
+  Thought for 20s (ctrl+o to expand)
+
+⏺ Update(src/components/series-dialog.tsx)
+  ⎿  Added 104 lines
+      112    return `${Math.round(mins / 60)}h ago`;
+      113  };
+      114  
+      115 +const gapLabel = (ms: number) => {                            
+      116 +  const days = ms / 86_400_000;                               
+      117 +  if (days < 10) return `${Math.round(days)}d`;               
+      118 +  if (days < 60) return `${Math.round(days / 7)} wks`;        
+      119 +  return `${Math.round(days / 30)} mo`;                       
+      120 +};                                                            
+      121 +                                                              
+      122 +/**                                                           
+      123 + * Coverage dot-strip: one dot per occurrence, oldest → newest
+          +. Solid =                                                     
+      124 + * imported, ring = importable, hollow = no artifacts, dashed 
+          += upcoming; a                                                 
+      125 + * ⌇ marks a break in the series' own cadence (gap > 1.75× the
+          + median                                                       
+      126 + * inter-occurrence interval). Pure render over the sweep resu
+          +lt — hidden                                                   
+      127 + * under 4 occurrences so 1-member stubs stay clean.          
+      128 + */                                                           
+      129 +function CoverageStrip({ occurrences }: { occurrences: Occurre
+          +nce[] }) {                                                    
+      130 +  if (occurrences.length < 4) return null;                    
+      131 +  const chrono = [...occurrences].sort((a, b) => Date.parse(a.
+          +startIso) - Date.parse(b.startIso));                          
+      132 +  const past = chrono.filter((o) => !o.upcoming);             
+      133 +                                                              
+      134 +  const gaps: number[] = [];                                  
+      135 +  for (let i = 1; i < past.length; i++) {                     
+      136 +    gaps.push(Date.parse(past[i]!.startIso) - Date.parse(past[
+          +i - 1]!.startIso));                                           
+      137 +  }                                                           
+      138 +  const sortedGaps = [...gaps].sort((a, b) => a - b);         
+      139 +  const median = sortedGaps.length > 0 ? sortedGaps[Math.floor
+          +(sortedGaps.length / 2)]! : 0;                                
+      140 +  const isBreak = (gap: number) => median > 0 && gap > 1.75 * 
+          +median;                                                       
+      141 +                                                              
+      142 +  let longest = 0;                                            
+      143 +  let longestAt: string | null = null;                        
+      144 +  for (let i = 1; i < past.length; i++) {                     
+      145 +    const g = Date.parse(past[i]!.startIso) - Date.parse(past[
+          +i - 1]!.startIso);                                            
+      146 +    if (g > longest) {                                        
+      147 +      longest = g;                                            
+      148 +      longestAt = past[i - 1]!.startIso;                      
+      149 +    }                                                         
+      150 +  }                                                           
+      151 +                                                              
+      152 +  const imported = past.filter((o) => o.imported.length > 0).l
+          +ength;                                                        
+      153 +  const importable = past.filter(                             
+      154 +    (o) => o.imported.length === 0 && (o.hasTranscript || o.ha
+          +sRecording)                                                   
+      155 +  ).length;                                                   
+      156 +                                                              
+      157 +  const dotClass = (o: Occurrence) => {                       
+      158 +    if (o.upcoming) return 'border border-dashed border-muted-
+          +foreground/50';                                               
+      159 +    if (o.imported.length > 0) return 'bg-status-ok';         
+      160 +    if (o.hasTranscript || o.hasRecording)                    
+      161 +      return 'border-[1.5px] border-amber-500 dark:border-ambe
+          +r-400';                                                       
+      162 +    return 'border border-muted-foreground/40';               
+      163 +  };                                                          
+      164 +  const dotTitle = (o: Occurrence) => {                       
+      165 +    const status = o.upcoming                                 
+      166 +      ? 'upcoming'                                            
+      167 +      : o.imported.length > 0                                 
+      168 +        ? 'imported'                                          
+      169 +        : o.hasTranscript || o.hasRecording                   
+      170 +          ? 'importable'                                      
+      171 +          : 'no artifacts';                                   
+      172 +    return `${dateLabel(o.startIso)} · ${status}`;            
+      173 +  };                                                          
+      174 +  const jumpTo = (key: string) =>                             
+      175 +    document                                                  
+      176 +      .getElementById(`series-occ-${key}`)                    
+      177 +      ?.scrollIntoView({ behavior: 'smooth', block: 'center' }
+          +);                                                            
+      178 +                                                              
+      179 +  return (                                                    
+      180 +    <div className="mb-1.5 rounded-lg border px-2.5 py-2">    
+      181 +      <div className="flex flex-wrap items-center gap-y-1.5"> 
+      182 +        {chrono.map((o, i) => {                               
+      183 +          const gap = i > 0 ? Date.parse(o.startIso) - Date.pa
+          +rse(chrono[i - 1]!.startIso) : 0;                             
+      184 +          return (                                            
+      185 +            <span key={o.key} className="flex items-center">  
+      186 +              {i > 0 && !o.upcoming && isBreak(gap) && (      
+      187 +                <span                                         
+      188 +                  className="mx-0.5 text-[10px] leading-none t
+          +ext-muted-foreground/60"                                      
+      189 +                  title={`${gapLabel(gap)} gap`}              
+      190 +                >                                             
+      191 +                  ⌇                                           
+      192 +                </span>                                       
+      193 +              )}                                              
+      194 +              <button                                         
+      195 +                type="button"                                 
+      196 +                className={`mx-[1.5px] h-2 w-2 shrink-0 rounde
+          +d-full ${dotClass(o)}`}                                       
+      197 +                title={dotTitle(o)}                           
+      198 +                onClick={() => jumpTo(o.key)}                 
+      199 +              />                                              
+      200 +            </span>                                           
+      201 +          );                                                  
+      202 +        })}                                                   
+      203 +      </div>                                                  
+      204 +      <p className="mt-1.5 text-[11px] text-muted-foreground">
+      205 +        {imported} of {past.length} imported                  
+      206 +        {importable > 0 && <> · {importable} importable</>}   
+      207 +        {longestAt !== null && isBreak(longest) && (          
+      208 +          <>                                                  
+      209 +            {' '}                                             
+      210 +            · longest gap {gapLabel(longest)} (               
+      211 +            {new Date(longestAt).toLocaleDateString([], { mont
+          +h: 'short' })})                                               
+      212 +          </>                                                 
+      213 +        )}                                                    
+      214 +      </p>                                                    
+      215 +    </div>                                                    
+      216 +  );                                                          
+      217 +}                                                             
+      218 +                                                              
+      219  export function SeriesDialog({ seriesId, onClose, onChanged }:
+            SeriesDialogProps) {
+      220    const [detail, setDetail] = useState<SeriesDetail | null>(nu
+           ll);
+      221    const [occ, setOcc] = useState<OccurrencesResult | null>(nul
+           l);
+
+  Thought for 4s (ctrl+o to expand)
+
+⏺ Update(src/components/series-dialog.tsx)
+  ⎿  Added 7 lines, removed 1 line
+      216    );
+      217  }
+      218  
+      219 -export function SeriesDialog({ seriesId, onClose, onChanged }:
+          - SeriesDialogProps) {                                         
+      219 +export function SeriesDialog({ seriesId, onClose, onChanged, o
+          +nMerged }: SeriesDialogProps) {                               
+      220    const [detail, setDetail] = useState<SeriesDetail | null>(nu
+           ll);
+      221    const [occ, setOcc] = useState<OccurrencesResult | null>(nul
+           l);
+      222    const [occError, setOccError] = useState(false);
+      223    const [busyIds, setBusyIds] = useState<Set<string>>(new Set(
+           ));
+      224    const [importErrors, setImportErrors] = useState<Map<string,
+            string>>(new Map());
+      225    const [massProgress, setMassProgress] = useState<{ done: num
+           ber; total: number } | null>(null);
+      226 +  const [mergeOpen, setMergeOpen] = useState(false);          
+      227 +  const [mergeTargets, setMergeTargets] = useState<           
+      228 +    Array<{ id: number; title: string; member_count: number }>
+          + | null                                                       
+      229 +  >(null);                                                    
+      230 +  const [mergeBusy, setMergeBusy] = useState(false);          
+      231 +  const [mergeError, setMergeError] = useState<string | null>(
+          +null);                                                        
+      232  
+      233    const loadDetail = useCallback(async () => {
+      234      if (!seriesId) return;
+
+⏺ Update(src/components/series-dialog.tsx)  ⎿  Added 3 lines
+      258      setOcc(null);
+      259      setImportErrors(new Map());
+      260      setMassProgress(null);
+      261 +    setMergeOpen(false);                                      
+      262 +    setMergeTargets(null);                                    
+      263 +    setMergeError(null);                                      
+      264      if (seriesId) {
+      265        void loadDetail();
+      266        void loadOccurrences();
+
+⏺ Now the merge handlers after deleteSeries, and the footer + strip wiring:
+
+⏺ Update(src/components/series-dialog.tsx)
+  ⎿  Added 49 lines
+      320      onClose();
+      321    };
+      322  
+      323 +  // ---- merging --------------------------------------------
+          +----------------                                              
+      324 +  const openMergePicker = async () => {                       
+      325 +    setMergeOpen(true);                                       
+      326 +    setMergeError(null);                                      
+      327 +    if (mergeTargets === null) {                              
+      328 +      const res = await fetch('/api/series');                 
+      329 +      if (res.ok) {                                           
+      330 +        const j = (await res.json()) as {                     
+      331 +          series: Array<{ id: number; title: string; member_co
+          +unt: number }>;                                               
+      332 +        };                                                    
+      333 +        setMergeTargets(j.series.filter((s) => s.id !== series
+          +Id));                                                         
+      334 +      } else {                                                
+      335 +        setMergeTargets([]);                                  
+      336 +      }                                                       
+      337 +    }                                                         
+      338 +  };                                                          
+      339 +                                                              
+      340 +  const mergeInto = async (target: { id: number; title: string
+          +; member_count: number }) => {                                
+      341 +    if (!seriesId || !detail) return;                         
+      342 +    const ok = confirm(                                       
+      343 +      `Merge "${detail.series.title}" (${detail.members.length
+          +} meeting${                                                   
+      344 +        detail.members.length === 1 ? '' : 's'                
+      345 +      }) into "${target.title}" (${target.member_count})?\n\n`
+          + +                                                            
+      346 +        `All meetings and matching rules move to "${target.tit
+          +le}", and ` +                                                 
+      347 +        `"${detail.series.title}" is deleted. This cannot be u
+          +ndone.`                                                       
+      348 +    );                                                        
+      349 +    if (!ok) return;                                          
+      350 +    setMergeBusy(true);                                       
+      351 +    setMergeError(null);                                      
+      352 +    try {                                                     
+      353 +      const res = await fetch(`/api/series/${target.id}/merge`
+          +, {                                                           
+      354 +        method: 'POST',                                       
+      355 +        headers: { 'Content-Type': 'application/json' },      
+      356 +        body: JSON.stringify({ fromSeriesId: seriesId }),     
+      357 +      });                                                     
+      358 +      if (!res.ok) {                                          
+      359 +        const j = (await res.json().catch(() => null)) as { er
+          +ror?: string } | null;                                        
+      360 +        throw new Error(j?.error ?? `Merge failed (${res.statu
+          +s})`);                                                        
+      361 +      }                                                       
+      362 +      onChanged();                                            
+      363 +      if (onMerged) onMerged(target.id);                      
+      364 +      else onClose();                                         
+      365 +    } catch (err) {                                           
+      366 +      setMergeError(err instanceof Error ? err.message : 'Merg
+          +e failed');                                                   
+      367 +    } finally {                                               
+      368 +      setMergeBusy(false);                                    
+      369 +    }                                                         
+      370 +  };                                                          
+      371 +                                                              
+      372    // ---- importing ------------------------------------------
+           ----------------
+      373    const importOne = useCallback(
+      374      async (o: Occurrence): Promise<string | null> => {
+
+  Thought for 4s (ctrl+o to expand)
+
+⏺ Update(src/components/series-dialog.tsx)
+  ⎿  Added 2 lines
+      594                  </Button>
+      595                </div>
+      596  
+      597 +              {occ && <CoverageStrip occurrences={occ.occurren
+          +ces} />}                                                      
+      598 +                                                              
+      599                {!occ && !occError ? (
+      600                  <div className="flex items-center gap-2 rounde
+           d-lg border py-4 pl-3 text-xs text-muted-foreground">
+      601                    <Loader2 className="h-3.5 w-3.5 animate-spin
+           " />
+
+⏺ Update(src/components/series-dialog.tsx)
+  ⎿  Added 5 lines, removed 1 line
+      621                        const busy = busyIds.has(o.key);
+      622                        const error = importErrors.get(o.key);
+      623                        return (
+      624 -                        <div key={o.key} className="flex items
+          --center gap-2 px-2.5 py-1.5">                                 
+      624 +                        <div                                  
+      625 +                          key={o.key}                         
+      626 +                          id={`series-occ-${o.key}`}          
+      627 +                          className="flex items-center gap-2 p
+          +x-2.5 py-1.5"                                                 
+      628 +                        >                                     
+      629                            <span className="w-28 shrink-0 text-
+           xs tabular-nums text-muted-foreground">
+      630                              {dateLabel(o.startIso)}
+      631                            </span>
+
+⏺ Now the footer with the Merge button and picker panel:
+
+⏺ Update(src/components/series-dialog.tsx)
+  ⎿  Added 61 lines, removed 9 lines
+      772                </div>
+      773              )}
+      774  
+      775 +            {/* ---- merge picker ----------------------------
+          +------------ */}                                              
+      776 +            {mergeOpen && (                                   
+      777 +              <div className="rounded-lg border border-primary
+          +/20 bg-primary/[0.03] p-2.5">                                 
+      778 +                <p className="mb-1.5 text-[11px] font-medium u
+          +ppercase tracking-wider text-primary/80">                     
+      779 +                  Merge “{detail.series.title}” into…         
+      780 +                </p>                                          
+      781 +                {mergeTargets === null ? (                    
+      782 +                  <div className="flex items-center gap-2 py-2
+          + text-xs text-muted-foreground">                              
+      783 +                    <Loader2 className="h-3.5 w-3.5 animate-sp
+          +in" /> Loading series…                                        
+      784 +                  </div>                                      
+      785 +                ) : mergeTargets.length === 0 ? (             
+      786 +                  <p className="py-1 text-xs text-muted-foregr
+          +ound">No other series to merge into.</p>                      
+      787 +                ) : (                                         
+      788 +                  <div className="max-h-48 space-y-0.5 overflo
+          +w-y-auto">                                                    
+      789 +                    {mergeTargets.map((t) => (                
+      790 +                      <button                                 
+      791 +                        key={t.id}                            
+      792 +                        type="button"                         
+      793 +                        disabled={mergeBusy}                  
+      794 +                        onClick={() => void mergeInto(t)}     
+      795 +                        className="flex w-full items-center ga
+          +p-2 rounded px-1.5 py-1 text-left text-sm hover:bg-muted disab
+          +led:opacity-50"                                               
+      796 +                      >                                       
+      797 +                        <Repeat className="h-3 w-3 shrink-0 te
+          +xt-primary/70" />                                             
+      798 +                        <span className="min-w-0 flex-1 trunca
+          +te">{t.title}</span>                                          
+      799 +                        <span className="shrink-0 text-[11px] 
+          +tabular-nums text-muted-foreground">                          
+      800 +                          {t.member_count}                    
+      801 +                        </span>                               
+      802 +                      </button>                               
+      803 +                    ))}                                       
+      804 +                  </div>                                      
+      805 +                )}                                            
+      806 +                {mergeBusy && (                               
+      807 +                  <div className="flex items-center gap-2 pt-1
+          +.5 text-xs text-muted-foreground">                            
+      808 +                    <Loader2 className="h-3.5 w-3.5 animate-sp
+          +in" /> Merging…                                               
+      809 +                  </div>                                      
+      810 +                )}                                            
+      811 +                {mergeError && <p className="pt-1.5 text-xs te
+          +xt-destructive">{mergeError}</p>}                             
+      812 +              </div>                                          
+      813 +            )}                                                
+      814 +                                                              
+      815              {/* ---- footer ----------------------------------
+           ------------ */}
+      816              <div className="flex items-center justify-between 
+           border-t pt-3">
+      777 -              <Button                                         
+      778 -                variant="ghost"                               
+      779 -                size="sm"                                     
+      780 -                className="h-7 px-2 text-xs text-muted-foregro
+          -und hover:text-destructive"                                   
+      781 -                onClick={() => void deleteSeries()}           
+      782 -              >                                               
+      783 -                <Trash2 className="h-3 w-3" />                
+      784 -                Delete series                                 
+      785 -              </Button>                                       
+      817 +              <div className="flex items-center gap-1">       
+      818 +                <Button                                       
+      819 +                  variant="ghost"                             
+      820 +                  size="sm"                                   
+      821 +                  className="h-7 px-2 text-xs text-muted-foreg
+          +round hover:text-destructive"                                 
+      822 +                  onClick={() => void deleteSeries()}         
+      823 +                >                                             
+      824 +                  <Trash2 className="h-3 w-3" />              
+      825 +                  Delete series                               
+      826 +                </Button>                                     
+      827 +                <Button                                       
+      828 +                  variant="ghost"                             
+      829 +                  size="sm"                                   
+      830 +                  className="h-7 px-2 text-xs text-muted-foreg
+          +round"                                                        
+      831 +                  title="Fold this series into another one (du
+          +pe repair)"                                                   
+      832 +                  onClick={() => (mergeOpen ? setMergeOpen(fal
+          +se) : void openMergePicker())}                                
+      833 +                >                                             
+      834 +                  <Merge className="h-3 w-3" />               
+      835 +                  Merge…                                      
+      836 +                </Button>                                     
+      837 +              </div>                                          
+      838                <span className="text-[11px] text-muted-foregrou
+           nd">
+      839                  {detail.members.length} meeting{detail.members
+           .length === 1 ? '' : 's'} in this
+      840                  series
+
+  Thought for 5s (ctrl+o to expand)
+
+⏺ Now the calendar-row series chip. Checking the exact member-chip styling in
+  SeriesBadge first:
+
+  Ran 1 shell command (ctrl+o to expand)
+
+⏺ Update(src/components/calendar-meeting-rows.tsx)
+  ⎿  Added 1 line, removed 1 line
+       5  import { Button } from '@/components/ui/button';
+       6  import { Badge } from '@/components/ui/badge';
+       7  import { formatDuration } from '@/lib/format';
+       8 -import { ExternalLink, EyeOff, FileText, Loader2, Settings2, Up
+         -load, Video, VideoOff } from 'lucide-react';                   
+       8 +import { ExternalLink, EyeOff, FileText, Loader2, Repeat, Setti
+         +ngs2, Upload, Video, VideoOff } from 'lucide-react';           
+       9  import { MeetLogo, TeamsLogo } from '@/components/provider-icon
+          ';
+      10  import { requestMediaUpload } from '@/components/audio-upload';
+      11  
+
+⏺ Update(src/components/calendar-meeting-rows.tsx)
+  ⎿  Added 2 lines
+      389    /** A mute was added from this row — host silently refetches
+            the calendar
+      390     * layers + its hidden-list state. */
+      391    onMuteChanged?: () => void;
+      392 +  /** The row's series chip was clicked — host opens its Serie
+          +sDialog. */                                                   
+      393 +  onOpenSeries?: (seriesId: number) => void;                  
+      394  }
+      395  
+      396  /**
+
+⏺ Update(src/components/calendar-meeting-rows.tsx)
+  ⎿  Added 1 line
+      408    colClass,
+      409    onImportMeeting,
+      410    onMuteChanged,
+      411 +  onOpenSeries,                                               
+      412  }: CalendarEventRowProps) {
+      413    const canImport =
+      414      !!r.meetingCode && (layer === 'unimported' || r.hasMeet) &
+           & !!onImportMeeting;
+
+⏺ Update(src/components/calendar-meeting-rows.tsx)
+  ⎿  Added 14 lines
+      504                    className="shrink-0 border-amber-500/50 text
+           -[10px] text-amber-600 dark:text-amber-500"
+      505                  />
+      506                )}
+      507 +              {r.seriesId !== null && (                       
+      508 +                <button                                       
+      509 +                  type="button"                               
+      510 +                  onClick={(e) => {                           
+      511 +                    e.stopPropagation();                      
+      512 +                    onOpenSeries?.(r.seriesId!);              
+      513 +                  }}                                          
+      514 +                  title={`Recurring call: ${r.seriesTitle} — c
+          +lick to see the whole series`}                                
+      515 +                  className="inline-flex max-w-44 shrink-0 ite
+          +ms-center gap-1 rounded-full border border-primary/25 bg-prima
+          +ry/5 px-2 py-0.5 text-[11px] text-primary transition-colors ho
+          +ver:bg-primary/10"                                            
+      516 +                >                                             
+      517 +                  <Repeat className="h-3 w-3 shrink-0" />     
+      518 +                  <span className="truncate">{r.seriesTitle}</
+          +span>                                                         
+      519 +                </button>                                     
+      520 +              )}                                              
+      521                {r.muted && (
+      522                  <Badge
+      523                    variant="outline"
+
+⏺ Thread onOpenSeries through the transcript-table render site:
+
+⏺ Update(src/components/transcript-table.tsx)
+  ⎿  Added 1 line
+      1936                        colClass={(key) => COL_RESPONSIVE[key a
+            s ColKey] ?? ''}
+      1937                        onImportMeeting={onImportMeeting}
+      1938                        onMuteChanged={handleMuteChanged}
+      1939 +                      onOpenSeries={setOpenSeriesId}         
+      1940                      />
+      1941                    )
+      1942                  )}
+
+  Thought for 5s (ctrl+o to expand)
+
+⏺ Update(src/components/transcript-table.tsx)
+  ⎿  Added 1 line
+      1987          seriesId={openSeriesId}
+      1988          onClose={() => setOpenSeriesId(null)}
+      1989          onChanged={() => void fetchArchiveRef.current('silent
+            ')}
+      1990 +        onMerged={setOpenSeriesId}                           
+      1991        />
+      1992      </div>
+      1993    );
+
+  Thought for 8s (ctrl+o to expand)
+
+⏺ All wired. Now verifying with a build:
+
+  Thought for 6s, searched for 1 pattern, ran 1 shell command (ctrl+o to expand)
+
+⏺ Build passes with the new /series route. Now testing against the real app —
+  following the local-dev recipe from memory:
+
+  Thought for 27s, ran 2 shell commands, recalled 1 memory (ctrl+o to expand)
+
+⏺ Dev server is up and authenticated against the real (prod-schema) DB. Testing
+  the new APIs:
+
+  Thought for 5s, ran 2 shell commands (ctrl+o to expand)
+
+⏺ Cadence, dup flags, and totals all live — the dup badge correctly pairs
+  Integration Cadence (6+1) and Data Cadence (9+4). Now the calendar-row series
+  lookup:
+
+  Thought for 3s, ran 1 shell command (ctrl+o to expand)
+
+⏺ Both layers resolve series chips. Now the merge transaction — using two
+  throwaway series so no real data is touched:
+
+  Thought for 4s, ran 1 shell command (ctrl+o to expand)
+⏺ Merge verified end-to-end. Now the real retro-attach sweep over the 190
+  unattached transcripts:
+
+  Thought for 6s, ran 1 shell command (ctrl+o to expand)
+
+⏺ Sweep works: 190 scanned, 0 auto-attached (import-time attach has kept up), 3
+  weak-key suggestions — matching the 3 known "?"-chip rows. Now visual
+  verification via Playwright:
+
+  Thought for 5s, read 1 file, called playwright 3 times, ran 1 shell command (ctrl+o to expand)
+
+⏺ The index looks exactly like the proposal mock. Opening Integration Cadence
+  (48 members) to check the coverage strip and merge picker:
+
+  Thought for 12s, read 2 files, called playwright 3 times (ctrl+o to expand)
+
+⏺ Merge picker works. Last visual check — the series chips on calendar rows in
+  the main listing:
+
+  Thought for 5s, read 1 file, called playwright (ctrl+o to expand)
+
+⏺ Everything renders. One functional check — clicking a calendar row's chip
+  should open the SeriesDialog:
+
+  Thought for 7s, called playwright (ctrl+o to expand)
+
+⏺ All UI paths verified locally against real data. Now committing and deploying
+  — checking the deploy recipe first:
+
+  Thought for 11s, committed ebc7bb4, ran 3 shell commands, recalled 2 memories (ctrl+o to expand)
+
+⏺ Deploying with the guarded recipe (never restart while agent runs are live):
+
+  Thought for 4s, made 1 scratchpad edit +42, ran 1 shell command (ctrl+o to expand)
+
+⏺ Deployed cleanly. Prod E2E verification:
+
+  Thought for 6s, ran 1 shell command (ctrl+o to expand)
+
+⏺ All prod checks pass. Cleaning up and updating memory:
+
+  Thought for 11s, ran 1 shell command, wrote 3 memories (ctrl+o to expand)
+
+⏺ Series UI MVP is built, deployed to prod, and E2E-verified — commit ebc7bb4,
+  all five approved pieces, zero migrations. I recovered the full workflow
+  proposal (it was still on disk) and followed it.
+
+  What shipped:
+
+  - /series index page — new "Meetings · Series" nav in the header. A
+    comparative table of every series: members, cadence (computed from the
+    median gap between occurrences — "weekly" for Integration Cadence, "daily"
+    for Hypercare, etc.), last meeting, and an amber dup badge on same-title
+    collisions. It correctly flags both Integration Cadence rows (48 + 5) and
+    both Data Cadence rows. Footer shows the honest totals: 18 series · 83
+    memberships · 190 meetings in no series. Row click opens the existing
+    SeriesDialog; header has "+ New series" and "Re-scan attachments".
+  - Merge series — POST /api/series/:id/merge, one transaction moving keys,
+    members, and exclusions to the survivor, then deleting the loser and logging
+    who did it. The SeriesDialog footer gained a "Merge…" picker with a loud
+    confirm; after merging, the dialog switches to the surviving series, and a
+    retro-attach sweep runs automatically. Verified end-to-end with two
+    throwaway series (guards, transaction, 404 for the deleted one), then
+    cleaned up — I did not touch your real dupes; merging Integration Cadence 
+    1→6 etc. is now one click for you.
+  - Retro-attach sweep — POST /api/series/retro-attach, strong-key re-match of
+    every unattached transcript against existing series only (never creates
+    one). Prod run: 190 scanned, 0 attached, 3 suggestions — exactly the 3 known
+    "?"-chip rows, confirming import-time attach has kept up; the sweep's
+    payoff comes after merges combine key bags.
+  - Calendar-row series chips — both calendar layers now show the member-style
+    series chip (6 unimported + 4 norec rows currently), clicking through to the
+    SeriesDialog.
+  - Coverage dot-strip — in the dialog, above the occurrence list: Integration
+    Cadence renders "47 of 51 imported · 3 importable · longest gap 2 wks (Dec)"
+    with green/amber/hollow/dashed dots, cadence-break marks, and dot-click
+    jumping to that occurrence's row. Hidden for series under 4 occurrences so
+    stubs stay clean.
+
+  Verified locally against the prod schema, then deployed via the guarded recipe
+  (agent-probe was quiet both times) and re-verified every endpoint plus the
+  page against meetings.darth-internal.trames.io. Memory is updated; the pickup
+  note now points at the shipped state, with the V2 open questions (auto-import
+  token identity, transcript-only unattended imports) still flagged for you.
+
+✻ Cooked for 13m 25s
+
+※ recap: The Series UI MVP (series index page, merge, retro-attach, calendar chips, coverage strip) is built, deployed to prod, and verified. Next action is yours: merge the real duplicate series like Integration Cadence via the new Merge button. (disable recaps in /config)

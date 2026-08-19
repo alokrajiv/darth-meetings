@@ -132,3 +132,58 @@ retriggered and completed. Gating must be a script that reads the count.
 4. Deferred-import edge not yet exercised live: 'both'-mode 6h transcript-wait
    cap, and the 24h give-up path (flips row to error with reason).
 5. Memories written: `project_deferred_imports.md`, `project_soft_delete_trash.md`.
+
+## 4. Series UI: index, merge, retro-attach, coverage strip — 2026-08-19
+
+**File:** [4. series-ui-index-merge-retro-attach-coverage-strip.txt](4.%20series-ui-index-merge-retro-attach-coverage-strip.txt)
+
+Built the approved Series UI MVP in one pass (commit `ebc7bb4`), deployed via
+the guarded recipe and prod-E2E-verified. Zero migrations. Session started from
+a truncated prompt; the full workflow proposal (3 design lenses + synthesis)
+was recovered intact from the prior session's task output and followed as spec.
+
+1. **`/series` index page** — new Meetings|Series nav in AppHeader (hidden when
+   a breadcrumb renders). Table: members / cadence / last meeting + amber `dup`
+   badge on same-normalized-title collisions (flags Integration Cadence 6+1 and
+   Data Cadence 9+4 — NOT the Spanish Perfume trio, whose titles normalize
+   differently). Cadence = median inter-occurrence gap via `percentile_cont`
+   window CTE, classified in the route (≤1.5d/10d/20d/45d). Footer totals from
+   new `seriesTotals()`: 18 series · 83 memberships · 190 unattached. Row click
+   → existing SeriesDialog (deliberately no /series/:id page). Header actions:
+   "+ New series" (prompt) and "Re-scan attachments".
+2. **Merge series** — `POST /api/series/:id/merge {fromSeriesId}`: one
+   `sql.begin` transaction (keys+members plain UPDATEs — their UNIQUEs can't
+   conflict on a series_id change; exclusions INSERT…ON CONFLICT DO NOTHING;
+   loser deleted), logs who did it, auto-runs retro-attach after. Dialog footer
+   "Merge…" opens an inline picker + loud confirm; new `onMerged(targetId)`
+   prop switches the open dialog to the survivor in both hosts. Permissions per
+   Alok's leaning: open to all users, confirm + log (not gated).
+3. **Retro-attach sweep** — `retroAttachSweep()` in series-attach.ts +
+   `POST /api/series/retro-attach`: strong-key re-match over
+   `listUnattachedTranscripts()`, attaches to EXISTING series only (no
+   create-new), weak-only matches counted as suggestions. Prod: 190 scanned /
+   0 attached / 3 suggestions (exactly the 3 pending "?"-chips — import-time
+   attach has kept up; the sweep pays off after merges).
+4. **Calendar-row series chips** — `/api/calendar-meetings` rows gained
+   seriesId/seriesTitle via batch `findSeriesByRecurringBaseIds` (route-level
+   enrichment; the big SQL untouched); CalendarEventRow renders the
+   member-style chip → SeriesDialog. Verified: 6 unimported + 4 norec rows.
+5. **Coverage dot-strip** in SeriesDialog (hidden <4 occurrences): chronological
+   dots (solid=imported, amber ring=importable, hollow=bare, dashed=upcoming),
+   ⌇ break at gaps >1.75× median, caption ("47 of 51 imported · longest gap
+   2 wks (Dec)"), dot click scrolls to its occurrence row (`series-occ-<key>`).
+
+Tested locally against the prod schema (tunnel 5433 + scrubbed-env dev +
+cookie-injected Playwright), merge exercised with two throwaway series only.
+
+**Next session pickup points:**
+1. **Real dupe merges are Alok's click**: Integration Cadence 1(5)→6(48), Data
+   Cadence 9/4, Spanish Perfumes 2/10/11 — then re-run Re-scan attachments.
+2. V2 backlog (proposal order): series-scoped Ask AI → delta brief ("since last
+   time", approved-summaries only) → per-series auto-import off|remind|import
+   (BLOCKED on Alok: token identity + transcript-only question) → keys &
+   exclusions drawer → promote dialog to /series/:id when it outgrows.
+3. Dup badge is same-normalized-title only — the Spanish Perfume trio needs the
+   human eye (visible adjacent in the index anyway).
+4. Memory updated: `project_series_recurring_calls.md` (full ship details),
+   pickup note in `project_listing_v2_calendar_views.md` collapsed to a pointer.
