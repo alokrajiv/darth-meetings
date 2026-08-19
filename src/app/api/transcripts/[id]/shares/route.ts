@@ -1,5 +1,6 @@
 import { NextResponse } from 'next/server';
 import { withAuth } from '@/lib/auth/with-auth';
+import { sendDarthDm } from '@/lib/server/darth-notify';
 import { resolveAccess } from '@/db-ops/transcript-access';
 import { identityForUser, logActivity, userIdForEmail } from '@/db-ops/transcript-activity';
 import {
@@ -118,6 +119,21 @@ export const POST = withAuth(async ({ user, request }, { params }) => {
     action: 'share_add',
     details: { withEmail: normalized, accessLevel: requestedAccess },
   });
+
+  // Slack-DM the recipient — deliberate human shares only (auto-share on
+  // import stays silent by design). addShare is an upsert: a fresh INSERT has
+  // shared_at === updated_at, an access-level bump does not — only the former
+  // notifies, and the dedupe key means at most one DM ever per (transcript,
+  // recipient). Fire-and-forget: the share result never waits on this.
+  if (new Date(share.shared_at as unknown as string).getTime() === new Date(share.updated_at as unknown as string).getTime()) {
+    const title = access.row.title?.trim() || 'Untitled meeting';
+    void sendDarthDm({
+      toEmail: normalized,
+      text: `*${user.email}* shared a meeting with you: *${title}* → <https://meetings.darth-internal.trames.io/transcript/${access.row.assemblyai_id}|open>`,
+      dedupeKey: `mw-share:${access.row.id}:${normalized}`,
+      onBehalfOf: user.userId,
+    });
+  }
 
   return NextResponse.json({ share }, { status: 201 });
 });
