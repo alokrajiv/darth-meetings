@@ -38,6 +38,7 @@ import { TranscriptOutline } from '@/components/transcript-outline';
 import { AppHeader } from '@/components/app-header';
 import { RerunDiarizationButton } from '@/components/rerun-diarization-button';
 import { TranscriptSourcesCard } from '@/components/transcript-sources-card';
+import { MeetingInfoCard } from '@/components/meeting-info-card';
 import type { PickerPerson } from '@/components/user-picker';
 import {
   Dialog,
@@ -3060,16 +3061,19 @@ export default function TranscriptDetailPage({ params }: TranscriptDetailPagePro
           </div>
 
           <aside className="hidden lg:block">
+            {/* Reader-first order: what/when/who first, navigation next,
+                interactive analysis details after, actions LAST — most
+                people read; only a few edit. */}
             <div className="sticky top-[72px] max-h-[calc(100vh-88px)] space-y-4 overflow-y-auto pr-1">
-              {renderQuickActions()}
-              <TranscriptSourcesCard
+              <MeetingInfoCard
                 row={row}
-                suggestions={speakerSuggestions}
-                audioAvailable={audioAvailable}
+                speakerLabels={speakerLabels}
                 canEdit={canEdit}
+                audioAvailable={audioAvailable}
                 videoFetching={videoFetching}
                 videoFetchError={videoFetchError}
                 onFetchVideo={() => void fetchVideo()}
+                onLinkEvent={() => setLinkEventOpen(true)}
               />
               <TranscriptOutline
                 durationSec={row.duration ?? null}
@@ -3085,6 +3089,11 @@ export default function TranscriptDetailPage({ params }: TranscriptDetailPagePro
                 activeAnchor={activeAnchor}
                 segments={row.auto_segments}
               />
+              <TranscriptSourcesCard
+                row={row}
+                suggestions={speakerSuggestions}
+                canEdit={canEdit}
+              />
               <AttachmentPanel
                 transcriptId={row.assemblyai_id}
                 canEdit={canEdit}
@@ -3094,6 +3103,7 @@ export default function TranscriptDetailPage({ params }: TranscriptDetailPagePro
                     markAiStale('attachments', 'attached context files');
                 }}
               />
+              {renderQuickActions()}
             </div>
           </aside>
         </div>
@@ -3305,25 +3315,56 @@ export default function TranscriptDetailPage({ params }: TranscriptDetailPagePro
             <DialogHeader>
               <DialogTitle className="text-base font-semibold">Outline</DialogTitle>
             </DialogHeader>
-            {renderQuickActions(true)}
-            <div onClick={() => setOutlineOpenMobile(false)}>
-              <TranscriptOutline
-                durationSec={row.duration ?? null}
-                hasNotes={!!description || canEdit}
-                hasSpeakers={
-                  viewMode === 'edited' &&
-                  !!content?.utterances &&
-                  content.utterances.length > 0
-                }
-                notesHeadings={notesHeadings}
-                currentTimeSec={outlineTimeSec}
-                onJumpToSeconds={(s) => {
-                  handleOutlineJump(s);
+            {/* Same reader-first order as the desktop rail: info → outline →
+                sources → attachments → actions last. */}
+            <div className="max-h-[70vh] space-y-4 overflow-y-auto pr-1">
+              <MeetingInfoCard
+                row={row}
+                speakerLabels={speakerLabels}
+                canEdit={canEdit}
+                audioAvailable={audioAvailable}
+                videoFetching={videoFetching}
+                videoFetchError={videoFetchError}
+                onFetchVideo={() => void fetchVideo()}
+                onLinkEvent={() => {
                   setOutlineOpenMobile(false);
+                  setLinkEventOpen(true);
                 }}
-                activeAnchor={activeAnchor}
-                segments={row.auto_segments}
               />
+              <div onClick={() => setOutlineOpenMobile(false)}>
+                <TranscriptOutline
+                  durationSec={row.duration ?? null}
+                  hasNotes={!!description || canEdit}
+                  hasSpeakers={
+                    viewMode === 'edited' &&
+                    !!content?.utterances &&
+                    content.utterances.length > 0
+                  }
+                  notesHeadings={notesHeadings}
+                  currentTimeSec={outlineTimeSec}
+                  onJumpToSeconds={(s) => {
+                    handleOutlineJump(s);
+                    setOutlineOpenMobile(false);
+                  }}
+                  activeAnchor={activeAnchor}
+                  segments={row.auto_segments}
+                />
+              </div>
+              <TranscriptSourcesCard
+                row={row}
+                suggestions={speakerSuggestions}
+                canEdit={canEdit}
+              />
+              <AttachmentPanel
+                transcriptId={row.assemblyai_id}
+                canEdit={canEdit}
+                onChanged={() => {
+                  bumpActivity();
+                  if (row.auto_notes || row.auto_report)
+                    markAiStale('attachments', 'attached context files');
+                }}
+              />
+              {renderQuickActions(true)}
             </div>
           </DialogContent>
         </Dialog>
