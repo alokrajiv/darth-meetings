@@ -1340,6 +1340,9 @@ export function TranscriptTable({
         }`}
       >
         <TableCell className="py-2 pl-4">
+          {/* w-0 + min-w-full: zero min-content contribution, so long nowrap
+              titles/series chips can't widen the table past its container. */}
+          <div className="w-0 min-w-full">
           <div className="flex min-w-0 items-center gap-2">
             {statusDot(t.status)}
             {sourceIcon(t)}
@@ -1428,6 +1431,7 @@ export function TranscriptTable({
                 Failed
               </Badge>
             )}
+          </div>
           </div>
         </TableCell>
         {visibleCols.map((key) => (
