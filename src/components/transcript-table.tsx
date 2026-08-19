@@ -21,6 +21,7 @@ import {
 } from '@/lib/format';
 import { useLiveEvents } from '@/hooks/use-live-events';
 import {
+  RotateCcw,
   Trash2,
   RefreshCw,
   CalendarCheck2,
@@ -43,7 +44,7 @@ interface TranscriptTableProps {
   toolbarExtra?: React.ReactNode;
 }
 
-type TabKey = 'all' | 'mine' | 'shared';
+type TabKey = 'all' | 'mine' | 'shared' | 'trash';
 
 const RESTING_SHADOW = 'shadow-[0_1px_2px_0_rgb(0_0_0/0.04)]';
 
@@ -284,6 +285,23 @@ export function TranscriptTable({ refreshTrigger, toolbarExtra }: TranscriptTabl
     };
   }, [transcripts]);
 
+  // Trash tab: the caller's own soft-deleted rows, fetched lazily on first
+  // visit (null = not loaded yet — the tab badge stays hidden until then).
+  const [trashRows, setTrashRows] = useState<TranscriptListRow[] | null>(null);
+  const loadTrash = useCallback(async () => {
+    try {
+      const res = await fetch('/api/transcripts?trash=1');
+      if (!res.ok) return;
+      const data = (await res.json()) as { transcripts: TranscriptListRow[] };
+      setTrashRows(data.transcripts);
+    } catch {
+      // keep whatever we had — the tab shows an empty list at worst
+    }
+  }, []);
+  useEffect(() => {
+    if (tab === 'trash') void loadTrash();
+  }, [tab, loadTrash]);
+
   // Deep search: debounced server-side pass over summaries + full transcript
   // text (the client filter below only sees listing fields). Results merge
   // into `filtered`, with a snippet shown under the title.
@@ -319,7 +337,7 @@ export function TranscriptTable({ refreshTrigger, toolbarExtra }: TranscriptTabl
   }, [query]);
 
   const filtered = useMemo(() => {
-    let rows = transcripts;
+    let rows = tab === 'trash' ? (trashRows ?? []) : transcripts;
     if (tab === 'mine') rows = rows.filter((t) => t.access === 'owner');
     else if (tab === 'shared') rows = rows.filter((t) => t.access !== 'owner');
     const q = query.trim().toLowerCase();
@@ -332,7 +350,7 @@ export function TranscriptTable({ refreshTrigger, toolbarExtra }: TranscriptTabl
       );
     }
     return rows;
-  }, [transcripts, tab, query, deepHits]);
+  }, [transcripts, trashRows, tab, query, deepHits]);
 
   // Day sections for the grouped view: bucket by local day of the meeting
   // time (recorded_at, falling back to upload time), newest day first,
@@ -364,19 +382,52 @@ export function TranscriptTable({ refreshTrigger, toolbarExtra }: TranscriptTabl
     return groups;
   }, [filtered, colPrefs.groupByDay]);
 
-  const handleDeleteTranscript = async (e: React.MouseEvent, assemblyaiId: string) => {
+  /**
+   * Delete semantics follow the row's state: a normal row moves to the
+   * trash without confirmation (it's restorable from the Trash tab); a row
+   * already in the trash is deleted forever (confirmed); a queued deferred
+   * import is cancelled (confirmed — the server hard-deletes placeholders).
+   */
+  const handleDeleteTranscript = async (e: React.MouseEvent, t: TranscriptListRow) => {
     e.stopPropagation();
-    if (!confirm('Are you sure you want to delete this transcript?')) return;
+    const trashed = !!t.deleted_at;
+    const queued = t.status === 'waiting';
+    if (trashed && !confirm('Delete forever? This cannot be undone.')) return;
+    if (queued && !confirm('Cancel this queued import?')) return;
 
     try {
-      const res = await fetch(`/api/transcripts/${assemblyaiId}`, { method: 'DELETE' });
+      const res = await fetch(
+        `/api/transcripts/${t.assemblyai_id}${trashed ? '?permanent=1' : ''}`,
+        { method: 'DELETE' }
+      );
       if (!res.ok) {
         const detail = await res.text().catch(() => res.statusText);
         throw new Error(detail || `Delete failed (${res.status})`);
       }
-      setTranscripts((prev) => prev.filter((t) => t.assemblyai_id !== assemblyaiId));
+      if (trashed) {
+        setTrashRows((prev) => prev?.filter((r) => r.assemblyai_id !== t.assemblyai_id) ?? prev);
+      } else {
+        setTranscripts((prev) => prev.filter((r) => r.assemblyai_id !== t.assemblyai_id));
+        // Force a refetch next time the Trash tab opens — it has a new row.
+        if (!queued) setTrashRows(null);
+      }
     } catch (err) {
       alert('Failed to delete transcript: ' + (err instanceof Error ? err.message : 'Unknown error'));
+    }
+  };
+
+  const handleRestoreTranscript = async (e: React.MouseEvent, assemblyaiId: string) => {
+    e.stopPropagation();
+    try {
+      const res = await fetch(`/api/transcripts/${assemblyaiId}/restore`, { method: 'POST' });
+      if (!res.ok) {
+        const detail = await res.text().catch(() => res.statusText);
+        throw new Error(detail || `Restore failed (${res.status})`);
+      }
+      setTrashRows((prev) => prev?.filter((r) => r.assemblyai_id !== assemblyaiId) ?? prev);
+      void loadTranscripts({ silent: true });
+    } catch (err) {
+      alert('Failed to restore transcript: ' + (err instanceof Error ? err.message : 'Unknown error'));
     }
   };
 
@@ -658,7 +709,7 @@ export function TranscriptTable({ refreshTrigger, toolbarExtra }: TranscriptTabl
     </div>
   );
 
-  const tabButton = (key: TabKey, label: string, count: number) => (
+  const tabButton = (key: TabKey, label: string, count?: number) => (
     <button
       key={key}
       type="button"
@@ -670,9 +721,11 @@ export function TranscriptTable({ refreshTrigger, toolbarExtra }: TranscriptTabl
       }`}
     >
       {label}
-      <span className="ml-1.5 rounded-full bg-muted px-1.5 py-0.5 text-[11px] tabular-nums">
-        {count}
-      </span>
+      {count !== undefined && (
+        <span className="ml-1.5 rounded-full bg-muted px-1.5 py-0.5 text-[11px] tabular-nums">
+          {count}
+        </span>
+      )}
     </button>
   );
 
@@ -682,6 +735,7 @@ export function TranscriptTable({ refreshTrigger, toolbarExtra }: TranscriptTabl
         {tabButton('all', 'All', counts.all)}
         {tabButton('mine', 'Mine', counts.mine)}
         {tabButton('shared', 'Shared', counts.shared)}
+        {tabButton('trash', 'Trash', trashRows?.length)}
       </div>
       <div className="ml-auto flex items-center gap-1.5 pb-2">
         {toolbarExtra}
@@ -775,6 +829,7 @@ export function TranscriptTable({ refreshTrigger, toolbarExtra }: TranscriptTabl
     const uploading = t.status === 'uploading';
     const waiting = t.status === 'waiting';
     const placeholder = uploading || t.assemblyai_id.startsWith('defer-');
+    const trashed = !!t.deleted_at;
     return (
       <TableRow
         key={t.id}
@@ -799,7 +854,7 @@ export function TranscriptTable({ refreshTrigger, toolbarExtra }: TranscriptTabl
                 >
                   {primary}
                 </div>
-                {!uploading && !waiting && (
+                {!uploading && !waiting && !trashed && (
                   <SeriesBadge
                     assemblyaiId={t.assemblyai_id}
                     membership={
@@ -818,7 +873,12 @@ export function TranscriptTable({ refreshTrigger, toolbarExtra }: TranscriptTabl
                   />
                 )}
               </div>
-              {uploading ? (
+              {trashed ? (
+                <div className="truncate text-xs text-muted-foreground">
+                  deleted {new Date(t.deleted_at!).toLocaleString()} — restore, or delete
+                  forever
+                </div>
+              ) : uploading ? (
                 <div className="truncate font-mono text-[11px] text-muted-foreground">
                   {uploadProgressLine(t)}
                 </div>
@@ -874,13 +934,24 @@ export function TranscriptTable({ refreshTrigger, toolbarExtra }: TranscriptTabl
         ))}
         <TableCell className="py-1.5 pr-3">
           <div className="flex items-center justify-end gap-0.5">
+            {trashed && t.access === 'owner' && (
+              <Button
+                size="sm"
+                variant="ghost"
+                className="h-7 w-7 p-0 text-muted-foreground opacity-0 transition-opacity hover:text-foreground group-hover:opacity-100"
+                onClick={(e) => handleRestoreTranscript(e, t.assemblyai_id)}
+                title="Restore"
+              >
+                <RotateCcw className="h-3.5 w-3.5" />
+              </Button>
+            )}
             {t.access === 'owner' && !uploading && (
               <Button
                 size="sm"
                 variant="ghost"
                 className="h-7 w-7 p-0 text-muted-foreground opacity-0 transition-opacity hover:text-destructive group-hover:opacity-100"
-                onClick={(e) => handleDeleteTranscript(e, t.assemblyai_id)}
-                title={waiting ? 'Cancel queued import' : 'Delete'}
+                onClick={(e) => handleDeleteTranscript(e, t)}
+                title={trashed ? 'Delete forever' : waiting ? 'Cancel queued import' : 'Move to trash'}
               >
                 <Trash2 className="h-3.5 w-3.5" />
               </Button>
@@ -906,6 +977,12 @@ export function TranscriptTable({ refreshTrigger, toolbarExtra }: TranscriptTabl
               deepSearching
                 ? null
                 : 'Searched titles, filenames, descriptions, summaries, and full transcript text.'
+            )
+          ) : tab === 'trash' ? (
+            emptyState(
+              <Trash2 className="h-5 w-5 text-muted-foreground" />,
+              'Trash is empty',
+              'Deleted transcripts land here and can be restored or removed forever.'
             )
           ) : tab === 'shared' ? (
             emptyState(

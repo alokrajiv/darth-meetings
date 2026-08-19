@@ -3,6 +3,7 @@ import { withAuth } from '@/lib/auth/with-auth';
 import {
   deleteForUser,
   setRecordedAtForUser,
+  softDeleteForUser,
   touchLastAccessedForUser,
   updateMetaForUser,
 } from '@/db-ops/transcripts';
@@ -108,10 +109,15 @@ export const PATCH = withAuth(async ({ user, request }, { params }) => {
 
 /**
  * DELETE /api/transcripts/:id
- * Owner-only. Removes the row (and its speaker mappings + any shares via
- * the FK cascade) and asks AAI to delete the underlying transcript.
+ * Owner-only. Default is a SOFT delete (trash): the row is stamped
+ * deleted_at and disappears from listings/search/series/dedupe/background
+ * jobs, but the AAI transcript, audio, shares, and notes survive —
+ * restorable via POST :id/restore. Permanent delete (row + speaker mappings
+ * + shares via FK cascade + AAI transcript + audio files) happens when the
+ * row is already in the trash, when it's a placeholder (`up-…`/`defer-…` —
+ * nothing worth keeping), or on ?permanent=1.
  */
-export const DELETE = withAuth(async ({ user }, { params }) => {
+export const DELETE = withAuth(async ({ user, request }, { params }) => {
   const { id } = await params;
 
   const access = await resolveAccess(user.userId, user.email, id);
@@ -120,6 +126,16 @@ export const DELETE = withAuth(async ({ user }, { params }) => {
   }
   if (access.access !== 'owner') {
     return NextResponse.json({ error: 'Only the owner can delete' }, { status: 403 });
+  }
+
+  const isPlaceholder = access.row.status === 'uploading' || access.row.status === 'waiting';
+  const permanent =
+    isPlaceholder ||
+    !!access.row.deleted_at ||
+    new URL(request.url).searchParams.get('permanent') === '1';
+  if (!permanent) {
+    await softDeleteForUser(access.ownerUserId, id);
+    return NextResponse.json({ ok: true, trashed: true });
   }
 
   await aaiDelete(id);

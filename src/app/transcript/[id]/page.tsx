@@ -73,6 +73,7 @@ import {
   Headphones,
   CalendarSearch,
   ExternalLink,
+  Trash2,
 } from 'lucide-react';
 
 /**
@@ -1826,6 +1827,43 @@ export default function TranscriptDetailPage({ params }: TranscriptDetailPagePro
   const headerTitle = title.trim() || row.original_filename || 'Untitled transcript';
   const notesGenerating = generatingNotes || row.auto_notes_status === 'running';
 
+  /** Soft delete: the row moves to the Trash tab (restorable) — nothing is
+   * destroyed. Owner-only; navigates back to the (now row-less) list. */
+  const handleMoveToTrash = async () => {
+    try {
+      const res = await fetch(`/api/transcripts/${row.assemblyai_id}`, { method: 'DELETE' });
+      if (!res.ok) throw new Error(await res.text().catch(() => `Delete failed (${res.status})`));
+      router.push('/');
+    } catch (err) {
+      alert('Failed to move to trash: ' + (err instanceof Error ? err.message : 'Unknown error'));
+    }
+  };
+
+  const handleRestore = async () => {
+    try {
+      const res = await fetch(`/api/transcripts/${row.assemblyai_id}/restore`, {
+        method: 'POST',
+      });
+      if (!res.ok) throw new Error(await res.text().catch(() => `Restore failed (${res.status})`));
+      await loadAll({ silent: true });
+    } catch (err) {
+      alert('Failed to restore: ' + (err instanceof Error ? err.message : 'Unknown error'));
+    }
+  };
+
+  const handleTrashDelete = async () => {
+    if (!confirm('Delete forever? This cannot be undone.')) return;
+    try {
+      const res = await fetch(`/api/transcripts/${row.assemblyai_id}?permanent=1`, {
+        method: 'DELETE',
+      });
+      if (!res.ok) throw new Error(await res.text().catch(() => `Delete failed (${res.status})`));
+      router.push('/');
+    } catch (err) {
+      alert('Failed to delete: ' + (err instanceof Error ? err.message : 'Unknown error'));
+    }
+  };
+
   /**
    * Quick-actions stack. Rendered in the desktop rail AND inside the mobile
    * outline drawer — always via this function so each spot gets fresh
@@ -2018,6 +2056,21 @@ export default function TranscriptDetailPage({ params }: TranscriptDetailPagePro
             ))}
           </>
         )}
+        {access === 'owner' && !row.deleted_at && (
+          <>
+            <div className="my-1.5 border-t" />
+            <Button
+              variant="ghost"
+              size="sm"
+              className="h-8 w-full justify-start gap-2 text-[13px] text-muted-foreground hover:text-destructive"
+              onClick={() => void handleMoveToTrash()}
+              title="Move to trash — restorable from the Trash tab on the listing page"
+            >
+              <Trash2 className="h-4 w-4" />
+              Move to trash
+            </Button>
+          </>
+        )}
       </div>
     </div>
   );
@@ -2153,6 +2206,26 @@ export default function TranscriptDetailPage({ params }: TranscriptDetailPagePro
       </AppHeader>
 
       <div className="mx-auto max-w-[1200px] px-6 py-6">
+        {row.deleted_at && (
+          <div className="mb-4 flex flex-wrap items-center gap-3 rounded-md border border-amber-400/60 bg-amber-50 p-3 text-sm dark:bg-amber-950/30">
+            <Trash2 className="h-4 w-4 shrink-0 text-amber-600 dark:text-amber-500" />
+            <span>
+              This transcript is in the trash (deleted{' '}
+              {new Date(row.deleted_at).toLocaleString()}) — hidden from every list and
+              search until restored.
+            </span>
+            {access === 'owner' && (
+              <span className="ml-auto flex gap-2">
+                <Button size="sm" variant="outline" onClick={() => void handleRestore()}>
+                  Restore
+                </Button>
+                <Button size="sm" variant="destructive" onClick={() => void handleTrashDelete()}>
+                  Delete forever
+                </Button>
+              </span>
+            )}
+          </div>
+        )}
         {/* Page header: title (inline editable) + meta row */}
         <div className="mb-6">
           {editingTitle && canEdit ? (

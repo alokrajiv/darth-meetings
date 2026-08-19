@@ -63,7 +63,7 @@ export async function listForUser(userId: string): Promise<TranscriptRow[]> {
   const rows = await sql<TranscriptRow[]>`
     SELECT *
     FROM ${sql(SCHEMA)}.transcripts
-    WHERE user_id = ${userId}
+    WHERE user_id = ${userId} AND deleted_at IS NULL
     ORDER BY created_at DESC
   `;
   return rows;
@@ -147,7 +147,8 @@ export async function listVisibleToUser(
       ORDER BY k.series_id
       LIMIT 1
     ) sus ON sm.id IS NULL
-    WHERE t.user_id = ${userId} OR s.id IS NOT NULL
+    WHERE (t.user_id = ${userId} OR s.id IS NOT NULL)
+      AND t.deleted_at IS NULL
     ORDER BY t.created_at DESC
   `;
 
@@ -174,7 +175,7 @@ export async function getAnyByAssemblyaiId(
   const rows = await sql<TranscriptRow[]>`
     SELECT *
     FROM ${sql(SCHEMA)}.transcripts
-    WHERE assemblyai_id = ${assemblyaiId}
+    WHERE assemblyai_id = ${assemblyaiId} AND deleted_at IS NULL
     ORDER BY created_at ASC
     LIMIT 1
   `;
@@ -284,6 +285,7 @@ export async function listDeferredImportRows(limit: number): Promise<
     SELECT id, user_id, assemblyai_id, gmeet_context
     FROM ${sql(SCHEMA)}.transcripts
     WHERE status = 'waiting'
+      AND deleted_at IS NULL
       AND gmeet_context->'deferredImport'->>'status' = 'waiting'
     ORDER BY created_at ASC
     LIMIT ${limit}
@@ -410,6 +412,7 @@ export async function listStaleUploads(
     SELECT user_id, assemblyai_id
     FROM ${sql(SCHEMA)}.transcripts
     WHERE status = 'uploading'
+      AND deleted_at IS NULL
       AND COALESCE(upload_progress_at, created_at) < now() - make_interval(mins => ${stallMinutes})
     ORDER BY created_at ASC
     LIMIT ${limit}
@@ -484,6 +487,7 @@ export async function findVisibleByDriveFileId(
       ON s.transcript_id = t.id
       AND s.shared_with_email = ${normEmail}
     WHERE t.drive_file_id = ${driveFileId}
+      AND t.deleted_at IS NULL
       AND (t.user_id = ${userId} OR s.id IS NOT NULL)
     ORDER BY (t.user_id = ${userId}) DESC, t.created_at DESC
     LIMIT 1
@@ -509,6 +513,7 @@ export async function findVisibleByAssemblyaiId(
       ON s.transcript_id = t.id
       AND s.shared_with_email = ${normEmail}
     WHERE t.assemblyai_id = ${assemblyaiId}
+      AND t.deleted_at IS NULL
       AND (t.user_id = ${userId} OR s.id IS NOT NULL)
     ORDER BY (t.user_id = ${userId}) DESC, t.created_at DESC
     LIMIT 1
@@ -575,6 +580,7 @@ export async function listNotesBacklog(
     SELECT user_id, assemblyai_id, auto_notes_status
     FROM ${sql(SCHEMA)}.transcripts
     WHERE status = 'completed'
+      AND deleted_at IS NULL
       AND auto_notes_status = 'running'
       AND auto_notes_at < now() - make_interval(mins => ${stuckMinutes})
     ORDER BY COALESCE(completed_at, created_at) DESC
@@ -596,6 +602,7 @@ export async function listSpeakerIdBacklog(
     SELECT user_id, assemblyai_id, speaker_id_status
     FROM ${sql(SCHEMA)}.transcripts
     WHERE status = 'completed'
+      AND deleted_at IS NULL
       AND auto_notes_status IS NULL
       AND (
         (speaker_id_status IS NULL
@@ -806,6 +813,7 @@ export async function listRecordingPendingRows(limit: number): Promise<
     SELECT id, user_id, assemblyai_id, gmeet_context
     FROM ${sql(SCHEMA)}.transcripts
     WHERE gmeet_context->'recordingPending'->>'status' = 'waiting'
+      AND deleted_at IS NULL
     ORDER BY created_at ASC
     LIMIT ${limit}
   `;
@@ -841,6 +849,7 @@ export async function listVideoFetchCandidates(limit: number): Promise<
     SELECT id, user_id, assemblyai_id, local_audio_path, gmeet_context
     FROM ${sql(SCHEMA)}.transcripts
     WHERE status = 'completed'
+      AND deleted_at IS NULL
       AND gmeet_context IS NOT NULL
       AND COALESCE(gmeet_context->'recordingPending'->>'status', '') <> 'waiting'
       AND COALESCE(gmeet_context->'videoAutoFetch'->>'status', 'pending') = 'pending'
@@ -885,4 +894,68 @@ export async function deleteForUser(
   `;
   if (rows.length > 0) publishEvent({ kind: 'deleted', assemblyaiId });
   return rows.length > 0;
+}
+
+/**
+ * Soft delete: stamp deleted_at so the row vanishes from listings, search,
+ * series, dedupe, and every background job, while keeping the AAI
+ * transcript, audio files, shares, and notes intact for restore. Publishes
+ * 'deleted' so open listings drop the row like a hard delete.
+ */
+export async function softDeleteForUser(
+  userId: string,
+  assemblyaiId: string
+): Promise<boolean> {
+  const rows = await sql<{ id: number }[]>`
+    UPDATE ${sql(SCHEMA)}.transcripts
+    SET deleted_at = now()
+    WHERE user_id = ${userId} AND assemblyai_id = ${assemblyaiId} AND deleted_at IS NULL
+    RETURNING id
+  `;
+  if (rows.length > 0) publishEvent({ kind: 'deleted', assemblyaiId });
+  return rows.length > 0;
+}
+
+/** Undo a soft delete. Publishes 'created' so open listings pick it back up. */
+export async function restoreForUser(
+  userId: string,
+  assemblyaiId: string
+): Promise<boolean> {
+  const rows = await sql<{ id: number }[]>`
+    UPDATE ${sql(SCHEMA)}.transcripts
+    SET deleted_at = NULL
+    WHERE user_id = ${userId} AND assemblyai_id = ${assemblyaiId} AND deleted_at IS NOT NULL
+    RETURNING id
+  `;
+  if (rows.length > 0) publishEvent({ kind: 'created', assemblyaiId });
+  return rows.length > 0;
+}
+
+/**
+ * The trash view: the caller's OWN soft-deleted rows, newest deletion first.
+ * Sharees never see trashed rows anywhere — trash is owner-only. Same skinny
+ * column set as listVisibleToUser (no imported_content).
+ */
+export async function listDeletedForUser(userId: string): Promise<TranscriptListRow[]> {
+  const rows = await sql<TranscriptListRow[]>`
+    SELECT t.id, t.user_id, t.assemblyai_id, t.original_filename, t.status,
+           t.created_at, t.completed_at, t.duration, t.speaker_count,
+           t.language_code, t.title, t.description, t.last_accessed,
+           t.source, t.recorded_at, t.auto_notes_status,
+           t.upload_bytes_received::float8 AS upload_bytes_received,
+           t.upload_bytes_total::float8 AS upload_bytes_total,
+           CASE
+             WHEN t.gmeet_context->>'provider' = 'teams' THEN 'teams'
+             WHEN t.assemblyai_id LIKE 'gmeet-%'
+                  OR t.gmeet_context->>'meetingCode' IS NOT NULL THEN 'gmeet'
+           END AS provider,
+           (t.gmeet_context->>'eventId') IS NOT NULL AS has_event,
+           t.gmeet_context->'deferredImport'->>'mode' AS deferred_mode,
+           t.gmeet_context->'deferredImport'->>'error' AS deferred_error,
+           t.deleted_at::text AS deleted_at
+    FROM ${sql(SCHEMA)}.transcripts t
+    WHERE t.user_id = ${userId} AND t.deleted_at IS NOT NULL
+    ORDER BY t.deleted_at DESC
+  `;
+  return rows.map((r) => ({ ...r, access: 'owner' as const, owner_email: null, owner_name: null }));
 }

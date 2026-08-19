@@ -94,7 +94,8 @@ export async function listSeries(): Promise<SeriesListEntry[]> {
            max(COALESCE(t.recorded_at, t.created_at))::text AS last_recorded_at
     FROM ${sql(SCHEMA)}.series s
     LEFT JOIN ${sql(SCHEMA)}.series_members m ON m.series_id = s.id
-    LEFT JOIN ${sql(SCHEMA)}.transcripts t ON t.id = m.transcript_id
+    LEFT JOIN ${sql(SCHEMA)}.transcripts t
+      ON t.id = m.transcript_id AND t.deleted_at IS NULL
     GROUP BY s.id, s.title
     ORDER BY max(COALESCE(t.recorded_at, t.created_at)) DESC NULLS LAST
   `;
@@ -212,6 +213,7 @@ export async function listMembers(
     LEFT JOIN ${sql(SCHEMA)}.transcript_shares sh
       ON sh.transcript_id = t.id AND sh.shared_with_email = ${normEmail}
     WHERE m.series_id = ${seriesId}
+      AND t.deleted_at IS NULL
     ORDER BY COALESCE(t.recorded_at, t.created_at) DESC
   `;
 }
@@ -266,6 +268,7 @@ export async function listSuggestedMembers(
       AND x.transcript_id IS NULL
       AND (t.user_id = ${caller.userId} OR sh.id IS NOT NULL)
       AND t.status NOT IN ('uploading', 'waiting')
+      AND t.deleted_at IS NULL
     GROUP BY t.id, t.assemblyai_id, t.title, t.recorded_at, t.created_at
     ORDER BY COALESCE(t.recorded_at, t.created_at) DESC
   `;

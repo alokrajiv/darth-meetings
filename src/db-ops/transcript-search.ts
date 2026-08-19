@@ -52,6 +52,7 @@ export async function searchVisibleTranscripts(
         ON s.transcript_id = t.id
        AND s.shared_with_email = ${normEmail}
       WHERE (t.user_id = ${userId} OR s.id IS NOT NULL)
+        AND t.deleted_at IS NULL
         AND (
           t.title ILIKE ${pattern}
           OR t.original_filename ILIKE ${pattern}

@@ -3,6 +3,7 @@ import { withAuth } from '@/lib/auth/with-auth';
 import {
   createUploadingPlaceholder,
   deleteForUser,
+  listDeletedForUser,
   listVisibleToUser,
   setRecordedAtForUser,
   updateStatusForUser,
@@ -72,7 +73,13 @@ export const maxDuration = 900;
  * and only for status/duration/speaker-count. For a 100% DB experience,
  * the user can disable refresh by setting MW_LISTING_REFRESH_PENDING=false.
  */
-export const GET = withAuth(async ({ user }) => {
+export const GET = withAuth(async ({ user, request }) => {
+  // ?trash=1: the caller's own soft-deleted rows (trash tab). Pure DB —
+  // trashed rows never join the AAI refresh fan-out.
+  if (new URL(request.url).searchParams.get('trash') === '1') {
+    return NextResponse.json({ transcripts: await listDeletedForUser(user.userId) });
+  }
+
   const rows = await listVisibleToUser(user.userId, user.email);
 
   // Refresh pending rows in parallel. Completed rows (the common case)

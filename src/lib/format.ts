@@ -57,6 +57,10 @@ export interface StoredTranscript {
    * one). Written debounced during the stream, stale afterwards. */
   upload_bytes_received: number | null;
   upload_bytes_total: number | null;
+  /** Soft delete (trash): set = hidden from listings/search/series/dedupe
+   * and every background job; restore clears it. Row, AAI transcript,
+   * audio, shares, and notes all survive until a permanent delete. */
+  deleted_at: string | null;
 }
 
 /** One invitee of the source calendar event (Google Meet import). */
@@ -322,6 +326,8 @@ export interface TranscriptListRow {
    * copy. */
   deferred_mode?: 'video' | 'transcript' | 'both' | null;
   deferred_error?: string | null;
+  /** Set on trash-view rows only (the main listing never returns them). */
+  deleted_at?: string | null;
   access: TranscriptAccess;
   owner_email: string | null;
   owner_name: string | null;

@@ -141,6 +141,7 @@ export async function findImportedByMeetingCodes(
       LIMIT 1
     ) AS owner_act ON true
     WHERE t.gmeet_context->>'meetingCode' = ANY(${codes})
+      AND t.deleted_at IS NULL
     ORDER BY t.created_at ASC
   `;
 

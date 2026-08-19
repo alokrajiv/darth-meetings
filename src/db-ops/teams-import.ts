@@ -62,6 +62,7 @@ export async function findImportedByTeamsMeetings(
   const rows = await sql<TeamsImportedRow[]>`
     ${LOOKUP_SELECT(caller)}
     WHERE t.gmeet_context->'teams'->>'joinWebUrl' = ANY(${urls})
+      AND t.deleted_at IS NULL
     ORDER BY t.created_at ASC
   `;
 
@@ -95,6 +96,7 @@ export async function findImportedByTeamsCallId(
   const rows = await sql<TeamsImportedRow[]>`
     ${LOOKUP_SELECT(caller)}
     WHERE t.gmeet_context->'teams'->>'callId' = ${callId}
+      AND t.deleted_at IS NULL
     ORDER BY t.created_at ASC
     LIMIT 1
   `;
