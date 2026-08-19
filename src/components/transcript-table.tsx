@@ -28,6 +28,7 @@ import {
   RefreshCw,
   CalendarCheck2,
   CalendarX2,
+  Check,
   ChevronLeft,
   FileAudio,
   FileText,
@@ -42,9 +43,10 @@ import { MeetLogo, TeamsLogo } from '@/components/provider-icon';
 import { SeriesBadge } from '@/components/series-badge';
 import { SeriesDialog } from '@/components/series-dialog';
 import {
-  CalendarMeetingsTable,
+  CalendarEventRow,
   type CalendarDayGroup,
-  type CalendarHeadedGroup,
+  type CalendarLayer,
+  type CalendarMeetingRow,
   type CalendarMeetingsResponse,
 } from '@/components/calendar-meeting-rows';
 
@@ -59,8 +61,62 @@ interface TranscriptTableProps {
 
 type TabKey = 'all' | 'mine' | 'shared' | 'trash';
 
-/** Which listing the table shows: transcript archive vs calendar views. */
-type SourceView = 'archive' | 'unimported' | 'norec';
+/**
+ * The merged timeline's multi-select layers. 'archive' = imported rows
+ * (listing v2); the other two are the calendar-backed views. All on by
+ * default — unticking a chip hides that layer's rows.
+ */
+type LayerKey = 'archive' | CalendarLayer;
+
+interface LayerPrefs {
+  archive: boolean;
+  unimported: boolean;
+  norec: boolean;
+}
+
+const DEFAULT_LAYERS: LayerPrefs = { archive: true, unimported: true, norec: true };
+const LAYERS_STORAGE_KEY = 'mw:layers:v1';
+const CAL_VIEWS = ['unimported', 'norec'] as const;
+
+function loadLayerPrefs(): LayerPrefs {
+  try {
+    const raw = localStorage.getItem(LAYERS_STORAGE_KEY);
+    if (!raw) return DEFAULT_LAYERS;
+    const parsed = JSON.parse(raw) as Partial<LayerPrefs>;
+    const next: LayerPrefs = {
+      archive: parsed.archive !== false,
+      unimported: parsed.unimported !== false,
+      norec: parsed.norec !== false,
+    };
+    // At least one layer must stay on — a corrupt all-off set resets.
+    if (!next.archive && !next.unimported && !next.norec) return DEFAULT_LAYERS;
+    return next;
+  } catch {
+    return DEFAULT_LAYERS;
+  }
+}
+
+/** Per-source paging state for the two calendar layers. `loaded` = the
+ * first page for the CURRENT filters landed (merge-blocking until then). */
+interface CalSourceState {
+  days: CalendarDayGroup[];
+  cursor: string | null;
+  hasMore: boolean;
+  loaded: boolean;
+  loading: boolean;
+  loadingMore: boolean;
+  error: string | null;
+}
+
+const EMPTY_CAL_SOURCE: CalSourceState = {
+  days: [],
+  cursor: null,
+  hasMore: false,
+  loaded: false,
+  loading: false,
+  loadingMore: false,
+  error: null,
+};
 
 type RangePreset = 'all' | 'thisWeek' | 'lastWeek' | 'thisMonth' | 'lastMonth' | 'month';
 
@@ -69,6 +125,19 @@ type ListRow = TranscriptListRow & {
   matched_in?: string | null;
   snippet?: string | null;
 };
+
+/** One row of a merged day group, tagged with its source layer. */
+type MergedItem =
+  | { at: number; kind: 'archive'; row: ListRow }
+  | { at: number; kind: 'cal'; layer: CalendarLayer; row: CalendarMeetingRow };
+
+interface MergedGroup {
+  key: string;
+  heading: string;
+  sub: string | null;
+  items: MergedItem[];
+  totalSecs: number;
+}
 
 const RESTING_SHADOW = 'shadow-[0_1px_2px_0_rgb(0_0_0/0.04)]';
 
@@ -267,14 +336,42 @@ export function TranscriptTable({
   onImportMeeting,
 }: TranscriptTableProps) {
   const router = useRouter();
-  const [sourceView, setSourceView] = useState<SourceView>('archive');
   const [tab, setTab] = useState<TabKey>('all');
   const [query, setQuery] = useState('');
   const [debouncedQ, setDebouncedQ] = useState('');
   const searchRef = useRef<HTMLInputElement>(null);
   const [openSeriesId, setOpenSeriesId] = useState<number | null>(null);
 
-  // Date-range filter — shared by the archive and both calendar views.
+  // Layer chips (multi-select, all on by default). Loaded client-side to
+  // avoid SSR localStorage access; `layersLoaded` gates the lazy calendar
+  // fetches so a stored "off" layer isn't fetched on first paint.
+  const [layers, setLayers] = useState<LayerPrefs>(DEFAULT_LAYERS);
+  const [layersLoaded, setLayersLoaded] = useState(false);
+  useEffect(() => {
+    setLayers(loadLayerPrefs());
+    setLayersLoaded(true);
+  }, []);
+  const toggleLayer = useCallback((key: LayerKey) => {
+    setLayers((prev) => {
+      const next = { ...prev, [key]: !prev[key] };
+      // At least one layer must stay on.
+      if (!next.archive && !next.unimported && !next.norec) return prev;
+      try {
+        localStorage.setItem(LAYERS_STORAGE_KEY, JSON.stringify(next));
+      } catch {
+        // storage full/blocked — prefs just won't persist
+      }
+      return next;
+    });
+  }, []);
+
+  // Tabs (Mine/Shared/Trash) and search are ARCHIVE-ONLY concepts — while
+  // either is active the calendar layers hide entirely and the table
+  // behaves like the plain archive view.
+  const mergedMode = tab === 'all' && debouncedQ.length === 0;
+  const renderMerged = mergedMode && (layers.unimported || layers.norec);
+
+  // Date-range filter — shared by the archive and both calendar layers.
   const [rangePreset, setRangePreset] = useState<RangePreset>('all');
   const [pickedMonth, setPickedMonth] = useState<{ y: number; m: number } | null>(null);
   const { from, to } = useMemo(
@@ -300,22 +397,18 @@ export function TranscriptTable({
   const nextCursorRef = useRef<string | null>(null);
   nextCursorRef.current = nextCursor;
 
-  // ---- Calendar views state (/api/calendar-meetings) ----
-  const [calDays, setCalDays] = useState<CalendarDayGroup[]>([]);
+  // ---- Calendar layers state (/api/calendar-meetings, one per view) ----
+  const [calSrc, setCalSrc] = useState<Record<CalendarLayer, CalSourceState>>({
+    unimported: EMPTY_CAL_SOURCE,
+    norec: EMPTY_CAL_SOURCE,
+  });
   const [calCounts, setCalCounts] = useState<{ unimported: number; norec: number } | null>(
     null
   );
   const [calConnected, setCalConnected] = useState(true);
-  const [calCursor, setCalCursor] = useState<string | null>(null);
-  const [calHasMore, setCalHasMore] = useState(false);
-  const [calLoading, setCalLoading] = useState(false);
-  const [calLoadingMore, setCalLoadingMore] = useState(false);
-  const [calError, setCalError] = useState<string | null>(null);
-  const calGenRef = useRef(0);
-  const calDaysRef = useRef<CalendarDayGroup[]>([]);
-  calDaysRef.current = calDays;
-  const calCursorRef = useRef<string | null>(null);
-  calCursorRef.current = calCursor;
+  const calGenRef = useRef<Record<CalendarLayer, number>>({ unimported: 0, norec: 0 });
+  const calSrcRef = useRef(calSrc);
+  calSrcRef.current = calSrc;
 
   // Column prefs (visibility + order) — loaded client-side to avoid SSR
   // localStorage access; saved on every change.
@@ -432,72 +525,111 @@ export function TranscriptTable({
   );
 
   /**
-   * Calendar-meetings fetch. Modes as fetchArchive, plus:
-   *  - counts: minimal request (days=1) just to keep the source-radio badge
-   *    and `connected` fresh while the archive view is active.
+   * Calendar-layer fetch (one paged source per view). Modes as fetchArchive.
+   * Every response also refreshes the chip badge counts + `connected`.
    */
   const fetchCalendar = useCallback(
-    async (mode: 'reset' | 'more' | 'silent' | 'counts') => {
-      const gen = mode === 'reset' ? ++calGenRef.current : calGenRef.current;
-      const view = sourceView === 'norec' ? 'norec' : 'unimported';
+    async (view: CalendarLayer, mode: 'reset' | 'more' | 'silent') => {
+      const gen = mode === 'reset' ? ++calGenRef.current[view] : calGenRef.current[view];
+      const src = calSrcRef.current[view];
       const params = new URLSearchParams({ view, tz });
       if (from) params.set('from', from);
       if (to) params.set('to', to);
-      if (mode === 'counts') {
-        params.set('days', '1');
-        params.set('minRows', '1');
-      } else if (mode === 'more') {
-        if (!calCursorRef.current) return;
+      if (mode === 'more') {
+        if (!src.cursor) return;
         params.set('days', String(PAGE_DAYS));
         params.set('minRows', String(PAGE_MIN_ROWS));
-        params.set('cursor', calCursorRef.current);
+        params.set('cursor', src.cursor);
       } else if (mode === 'silent') {
-        const loadedDays = calDaysRef.current.length;
-        const loadedRows = calDaysRef.current.reduce((n, g) => n + g.rows.length, 0);
+        const loadedDays = src.days.length;
+        const loadedRows = src.days.reduce((n, g) => n + g.rows.length, 0);
         params.set('days', String(Math.min(loadedDays || PAGE_DAYS, 60)));
         params.set('minRows', String(Math.min(loadedRows || PAGE_MIN_ROWS, 200)));
       } else {
         params.set('days', String(PAGE_DAYS));
         params.set('minRows', String(PAGE_MIN_ROWS));
       }
+      const patch = (p: Partial<CalSourceState>) =>
+        setCalSrc((prev) => ({ ...prev, [view]: { ...prev[view], ...p } }));
+      if (mode === 'reset') {
+        // Mark loading in the ref synchronously too, so the lazy-load
+        // effect can't double-fire a reset within the same commit.
+        calSrcRef.current = {
+          ...calSrcRef.current,
+          [view]: { ...src, loading: true },
+        };
+        patch({ loading: true, error: null });
+      }
+      if (mode === 'more') patch({ loadingMore: true });
       try {
-        if (mode === 'reset') {
-          setCalLoading(true);
-          setCalError(null);
-        }
-        if (mode === 'more') setCalLoadingMore(true);
         const res = await fetch(`/api/calendar-meetings?${params.toString()}`, {
           credentials: 'include',
         });
         if (!res.ok) throw new Error(`Failed to load calendar meetings (${res.status})`);
         const data = (await res.json()) as CalendarMeetingsResponse;
-        if (gen !== calGenRef.current) return;
-        setCalError(null);
+        if (gen !== calGenRef.current[view]) return; // superseded by a newer reset
         setCalCounts(data.counts);
         setCalConnected(data.connected);
-        if (mode !== 'counts') {
-          setCalCursor(data.nextCursor);
-          setCalHasMore(data.hasMore);
-          setCalDays((prev) => {
-            if (mode !== 'more') return data.days;
-            const fresh = data.days.filter((d) => !prev.some((p) => p.key === d.key));
-            return fresh.length ? [...prev, ...fresh] : prev;
-          });
-        }
+        setCalSrc((prev) => {
+          const cur = prev[view];
+          let nextDays = data.days;
+          if (mode === 'more') {
+            const fresh = data.days.filter((d) => !cur.days.some((p) => p.key === d.key));
+            nextDays = fresh.length ? [...cur.days, ...fresh] : cur.days;
+          }
+          return {
+            ...prev,
+            [view]: {
+              days: nextDays,
+              cursor: data.nextCursor,
+              hasMore: data.hasMore,
+              loaded: true,
+              loading: false,
+              loadingMore: false,
+              error: null,
+            },
+          };
+        });
       } catch (err) {
-        if (gen !== calGenRef.current) return;
+        if (gen !== calGenRef.current[view]) return;
         if (mode === 'reset') {
-          setCalError(
-            err instanceof Error ? err.message : 'Failed to load calendar meetings'
-          );
+          patch({
+            loading: false,
+            error:
+              err instanceof Error ? err.message : 'Failed to load calendar meetings',
+          });
+        } else if (mode === 'more') {
+          patch({ loadingMore: false });
         }
-      } finally {
-        if (gen === calGenRef.current && mode === 'reset') setCalLoading(false);
-        if (mode === 'more') setCalLoadingMore(false);
+        // silent failures are quiet — the loaded window stays usable
       }
     },
-    [sourceView, from, to, tz]
+    [from, to, tz]
   );
+
+  /** Minimal request just to keep the "Not imported (n)" chip badge and
+   * `connected` fresh while the full unimported layer isn't being fetched. */
+  const fetchCalCounts = useCallback(async () => {
+    const params = new URLSearchParams({
+      view: 'unimported',
+      tz,
+      days: '1',
+      minRows: '1',
+    });
+    if (from) params.set('from', from);
+    if (to) params.set('to', to);
+    try {
+      const res = await fetch(`/api/calendar-meetings?${params.toString()}`, {
+        credentials: 'include',
+      });
+      if (!res.ok) return;
+      const data = (await res.json()) as CalendarMeetingsResponse;
+      setCalCounts(data.counts);
+      setCalConnected(data.connected);
+    } catch {
+      // quiet — badge just stays stale
+    }
+  }, [from, to, tz]);
 
   // Latest-fn refs so long-lived callbacks (SSE, observer, refreshTrigger)
   // always call the current filters without re-subscribing.
@@ -505,8 +637,12 @@ export function TranscriptTable({
   fetchArchiveRef.current = fetchArchive;
   const fetchCalendarRef = useRef(fetchCalendar);
   fetchCalendarRef.current = fetchCalendar;
-  const sourceViewRef = useRef(sourceView);
-  sourceViewRef.current = sourceView;
+  const fetchCalCountsRef = useRef(fetchCalCounts);
+  fetchCalCountsRef.current = fetchCalCounts;
+  const layersRef = useRef(layers);
+  layersRef.current = layers;
+  const mergedModeRef = useRef(mergedMode);
+  mergedModeRef.current = mergedMode;
 
   // Filters changed (tab / search / range) or first mount → reset the
   // archive listing. Pagination restarts from the top.
@@ -514,22 +650,49 @@ export function TranscriptTable({
     void fetchArchive('reset');
   }, [fetchArchive]);
 
-  // Calendar views load on entry + whenever the range changes while active.
+  // Range/tz changed → the calendar windows are stale. Drop them (bumping
+  // gens so in-flight responses discard) and let the lazy loader below
+  // refetch whichever layers are enabled.
   useEffect(() => {
-    if (sourceView === 'archive') return;
-    void fetchCalendar('reset');
-  }, [fetchCalendar, sourceView]);
+    calGenRef.current.unimported++;
+    calGenRef.current.norec++;
+    setCalSrc({ unimported: EMPTY_CAL_SOURCE, norec: EMPTY_CAL_SOURCE });
+  }, [from, to, tz]);
 
-  // Keep the "Not imported (n)" radio badge fresh while in the archive.
+  // Lazy layer loading: an enabled-but-never-fetched calendar layer fetches
+  // on entry to merged mode / on toggle-on / after a filter reset. Toggling
+  // OFF hides rows but keeps the data. Errors don't auto-retry (the error
+  // strip has an explicit Retry).
   useEffect(() => {
-    if (sourceView !== 'archive') return;
-    void fetchCalendar('counts');
-  }, [fetchCalendar, sourceView]);
+    if (!layersLoaded || !mergedMode) return;
+    for (const v of CAL_VIEWS) {
+      if (!layers[v]) continue;
+      const s = calSrcRef.current[v];
+      if (!s.loaded && !s.loading && !s.error) void fetchCalendar(v, 'reset');
+    }
+  }, [fetchCalendar, layers, layersLoaded, mergedMode, calSrc]);
 
-  /** Silent refetch of everything currently on screen (+ radio counts). */
+  // Keep the "Not imported (n)" chip badge fresh when the full unimported
+  // layer isn't being fetched (layer off, or archive-only mode).
+  useEffect(() => {
+    if (!layersLoaded) return;
+    if (mergedMode && layers.unimported) return; // full fetch carries counts
+    void fetchCalCounts();
+  }, [fetchCalCounts, layersLoaded, mergedMode, layers.unimported]);
+
+  /** Silent refetch of everything currently on screen (+ chip counts). */
   const silentRefetchAll = useCallback(() => {
     void fetchArchiveRef.current('silent');
-    void fetchCalendarRef.current(sourceViewRef.current === 'archive' ? 'counts' : 'silent');
+    let didCal = false;
+    if (mergedModeRef.current) {
+      for (const v of CAL_VIEWS) {
+        if (layersRef.current[v] && calSrcRef.current[v].loaded) {
+          didCal = true;
+          void fetchCalendarRef.current(v, 'silent');
+        }
+      }
+    }
+    if (!didCal) void fetchCalCountsRef.current();
   }, []);
 
   // Import dialogs closing / uploads created bump refreshTrigger — refetch
@@ -572,15 +735,22 @@ export function TranscriptTable({
     return () => window.removeEventListener('keydown', onKeyDown);
   }, []);
 
-  // Infinite scroll: a sentinel below the table loads the next page when it
-  // approaches the viewport. Callback-ref so the observer follows the
-  // sentinel through conditional renders.
+  // Infinite scroll: a sentinel below the table loads the next page from
+  // EVERY enabled source that still has more (each with its own cursor).
+  // Callback-ref so the observer follows the sentinel through conditional
+  // renders.
   const loadMoreRef = useRef<() => void>(() => {});
   loadMoreRef.current = () => {
-    if (sourceView === 'archive') {
+    if (!renderMerged || layers.archive) {
       if (hasMore && !loading && !loadingMore && !error) void fetchArchive('more');
-    } else if (calHasMore && !calLoading && !calLoadingMore && !calError) {
-      void fetchCalendar('more');
+    }
+    if (renderMerged) {
+      for (const v of CAL_VIEWS) {
+        const s = calSrc[v];
+        if (layers[v] && s.loaded && s.hasMore && !s.loading && !s.loadingMore && !s.error) {
+          void fetchCalendar(v, 'more');
+        }
+      }
     }
   };
   const sentinelObserverRef = useRef<IntersectionObserver | null>(null);
@@ -606,7 +776,7 @@ export function TranscriptTable({
   // next load explicitly.
   useEffect(() => {
     if (sentinelVisibleRef.current) loadMoreRef.current();
-  }, [days, calDays]);
+  }, [days, calSrc]);
 
   /** Optimistic local removal (delete/restore) — the follow-up silent
    * refetch reconciles counts and day totals. */
@@ -798,9 +968,10 @@ export function TranscriptTable({
         const when = t.recorded_at ?? t.created_at;
         // Grouped view already names the day in the section header — the
         // column narrows down to time-of-day.
-        const label = colPrefs.groupByDay
-          ? new Date(when).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
-          : formatSmartDate(when);
+        const label =
+          colPrefs.groupByDay || renderMerged
+            ? new Date(when).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
+            : formatSmartDate(when);
         return (
           <span
             className="text-xs tabular-nums text-muted-foreground"
@@ -968,21 +1139,46 @@ export function TranscriptTable({
     </button>
   );
 
-  const sourceRadioButton = (key: SourceView, label: string) => (
-    <button
-      key={key}
-      type="button"
-      onClick={() => setSourceView(key)}
-      aria-pressed={sourceView === key}
-      className={`rounded-md px-2.5 py-1 text-xs transition-colors ${
-        sourceView === key
-          ? 'bg-background font-medium text-foreground shadow-sm'
-          : 'text-muted-foreground hover:text-foreground'
-      }`}
-    >
-      {label}
-    </button>
-  );
+  const enabledLayerCount =
+    Number(layers.archive) + Number(layers.unimported) + Number(layers.norec);
+
+  /** Checkbox-style layer chip (replaces the old exclusive source radio). */
+  const layerChip = (key: LayerKey, label: string) => {
+    const on = layers[key];
+    // Tabs/search force the plain archive view — chips freeze, calendar
+    // chips read as off, the archive one as on.
+    const inactive = !mergedMode;
+    const lastOn = on && enabledLayerCount === 1;
+    const effectiveOn = inactive ? key === 'archive' : on;
+    const title = inactive
+      ? 'Layers apply on the All tab with no search active'
+      : lastOn
+        ? 'At least one layer must stay on'
+        : effectiveOn
+          ? `Hide these rows`
+          : `Show these rows`;
+    return (
+      <button
+        key={key}
+        type="button"
+        onClick={() => toggleLayer(key)}
+        disabled={inactive || lastOn}
+        aria-pressed={effectiveOn}
+        title={title}
+        className={`flex items-center gap-1 rounded-md px-2 py-1 text-xs transition-colors ${
+          effectiveOn
+            ? 'bg-background font-medium text-foreground shadow-sm'
+            : 'text-muted-foreground hover:text-foreground'
+        } ${inactive ? 'opacity-50' : ''}`}
+      >
+        <Check
+          className={`h-3 w-3 ${effectiveOn ? 'text-primary' : 'invisible'}`}
+          aria-hidden
+        />
+        {label}
+      </button>
+    );
+  };
 
   const monthLabel = useMemo(() => {
     const now = new Date();
@@ -1049,54 +1245,41 @@ export function TranscriptTable({
     </div>
   );
 
-  const manualRefresh = () => {
-    if (sourceView === 'archive') {
-      void fetchArchive('silent');
-      void fetchCalendar('counts');
-    } else {
-      void fetchCalendar('silent');
-    }
-  };
-
   const toolbar = (
     <div className="mb-3 flex flex-wrap items-center gap-x-3 gap-y-1 border-b">
       <div className="mb-2 mt-0.5 flex items-center gap-0.5 rounded-lg border bg-muted/40 p-0.5">
-        {sourceRadioButton('archive', 'Archive')}
-        {sourceRadioButton(
+        {layerChip('archive', 'Imported')}
+        {layerChip(
           'unimported',
           `Not imported${calCounts ? ` (${calCounts.unimported})` : ''}`
         )}
-        {sourceRadioButton('norec', 'No recording')}
+        {layerChip('norec', 'No recording')}
       </div>
-      {sourceView === 'archive' && (
-        <div className="flex items-center">
-          {tabButton('all', 'All', counts?.all)}
-          {tabButton('mine', 'Mine', counts?.mine)}
-          {tabButton('shared', 'Shared', counts?.shared)}
-          {tabButton('trash', 'Trash', counts?.trash)}
-        </div>
-      )}
+      <div className="flex items-center">
+        {tabButton('all', 'All', counts?.all)}
+        {tabButton('mine', 'Mine', counts?.mine)}
+        {tabButton('shared', 'Shared', counts?.shared)}
+        {tabButton('trash', 'Trash', counts?.trash)}
+      </div>
       <div className="ml-auto flex flex-wrap items-center gap-1.5 pb-2">
         {toolbarExtra}
         {rangePicker}
-        {sourceView === 'archive' && (
-          <div className="relative">
-            <Search className="pointer-events-none absolute left-2.5 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-muted-foreground" />
-            <Input
-              ref={searchRef}
-              value={query}
-              onChange={(e) => setQuery(e.target.value)}
-              placeholder="Search meetings…"
-              className="h-8 w-64 pl-8 pr-8"
-            />
-            <kbd className="pointer-events-none absolute right-2 top-1/2 -translate-y-1/2 rounded border bg-muted px-1.5 font-mono text-[10px] text-muted-foreground">
-              /
-            </kbd>
-          </div>
-        )}
-        {sourceView === 'archive' && columnChooser}
+        <div className="relative">
+          <Search className="pointer-events-none absolute left-2.5 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-muted-foreground" />
+          <Input
+            ref={searchRef}
+            value={query}
+            onChange={(e) => setQuery(e.target.value)}
+            placeholder="Search meetings…"
+            className="h-8 w-64 pl-8 pr-8"
+          />
+          <kbd className="pointer-events-none absolute right-2 top-1/2 -translate-y-1/2 rounded border bg-muted px-1.5 font-mono text-[10px] text-muted-foreground">
+            /
+          </kbd>
+        </div>
+        {columnChooser}
         <Button
-          onClick={manualRefresh}
+          onClick={silentRefetchAll}
           variant="ghost"
           size="sm"
           className="h-8 w-8 p-0"
@@ -1133,7 +1316,8 @@ export function TranscriptTable({
     </div>
   );
 
-  /** One listing row — shared by the flat list and the day-grouped view. */
+  /** One listing row — shared by the flat list, the day-grouped view, and
+   * the merged timeline. */
   const renderRow = (t: ListRow) => {
     const { primary, secondary, untitled } = titleOf(t);
     const processing = t.status === 'processing' || t.status === 'queued';
@@ -1295,17 +1479,123 @@ export function TranscriptTable({
     [days]
   );
   const flatRows = useMemo(() => days.flatMap((g) => g.rows as ListRow[]), [days]);
-  const calGroups = useMemo<CalendarHeadedGroup[]>(
-    () =>
-      calDays.map((g) => {
-        const { label, sub } = dayHeading(parseDayKey(g.key));
-        return { ...g, heading: label, sub };
-      }),
-    [calDays]
-  );
+
+  /**
+   * The merged timeline: interleave archive rows and calendar events inside
+   * shared day groups, newest day first, time-desc within a day.
+   *
+   * Day watermark: a day is renderable only when EVERY enabled source has
+   * fully covered it. A source with more pages covers all days >= its
+   * nextCursor (day keys are YYYY-MM-DD — string compare works); one with
+   * hasMore=false covers everything. Days beyond the watermark stay
+   * buffered until every enabled source reaches them — no half-days.
+   *
+   * null = blocked: an enabled calendar layer hasn't finished its first
+   * load yet (errored layers don't block — they just contribute nothing).
+   */
+  const mergedGroups = useMemo<MergedGroup[] | null>(() => {
+    if (!renderMerged) return null;
+    for (const v of CAL_VIEWS) {
+      if (layers[v] && !calSrc[v].loaded && !calSrc[v].error) return null;
+    }
+    let watermark: string | null = null;
+    const consider = (srcHasMore: boolean, cursor: string | null) => {
+      if (srcHasMore && cursor && (watermark === null || cursor > watermark)) {
+        watermark = cursor;
+      }
+    };
+    if (layers.archive) consider(hasMore, nextCursor);
+    for (const v of CAL_VIEWS) {
+      if (layers[v] && calSrc[v].loaded) consider(calSrc[v].hasMore, calSrc[v].cursor);
+    }
+    const covered = (key: string) => watermark === null || key >= watermark;
+    const byKey = new Map<string, { items: MergedItem[]; totalSecs: number }>();
+    const bucket = (key: string) => {
+      let b = byKey.get(key);
+      if (!b) {
+        b = { items: [], totalSecs: 0 };
+        byKey.set(key, b);
+      }
+      return b;
+    };
+    if (layers.archive) {
+      for (const g of days) {
+        if (!covered(g.key)) continue;
+        const b = bucket(g.key);
+        b.totalSecs += g.totalSecs ?? 0;
+        for (const r of g.rows as ListRow[]) {
+          b.items.push({
+            at: new Date(r.recorded_at ?? r.created_at).getTime(),
+            kind: 'archive',
+            row: r,
+          });
+        }
+      }
+    }
+    for (const v of CAL_VIEWS) {
+      if (!layers[v]) continue;
+      for (const g of calSrc[v].days) {
+        if (!covered(g.key)) continue;
+        const b = bucket(g.key);
+        for (const r of g.rows) {
+          b.totalSecs += r.durationSecs ?? 0;
+          b.items.push({ at: new Date(r.eventStart).getTime(), kind: 'cal', layer: v, row: r });
+        }
+      }
+    }
+    return [...byKey.entries()]
+      .sort(([a], [b]) => (a < b ? 1 : -1))
+      .map(([key, g]) => {
+        g.items.sort((x, y) => y.at - x.at);
+        const { label, sub } = dayHeading(parseDayKey(key));
+        return { key, heading: label, sub, items: g.items, totalSecs: g.totalSecs };
+      });
+  }, [renderMerged, layers, calSrc, days, hasMore, nextCursor]);
 
   const rowCount = flatRows.length;
   const searchEmpty = rowCount === 0 && debouncedQ.length > 0;
+
+  const archiveTableHeader = (
+    <TableHeader>
+      <TableRow className="hover:bg-transparent">
+        <TableHead className="h-9 bg-muted/50 text-[11px] font-medium uppercase tracking-wider text-muted-foreground">
+          Title
+        </TableHead>
+        {visibleCols.map((key) => (
+          <TableHead
+            key={key}
+            className={`h-9 ${COL_HEAD_WIDTH[key]} bg-muted/50 text-[11px] font-medium uppercase tracking-wider text-muted-foreground ${COL_RESPONSIVE[key]}`}
+          >
+            {COL_LABELS[key]}
+          </TableHead>
+        ))}
+        <TableHead className="h-9 w-[72px] bg-muted/50">&nbsp;</TableHead>
+      </TableRow>
+    </TableHeader>
+  );
+
+  const dayHeaderRow = (g: {
+    key: string;
+    heading: string;
+    sub: string | null;
+    count: number;
+    totalSecs: number;
+  }) => (
+    <TableRow className="hover:bg-transparent">
+      <TableCell colSpan={visibleCols.length + 2} className="bg-muted/40 py-1.5 pl-4">
+        <span className="text-[11px] font-semibold uppercase tracking-wider text-foreground/80">
+          {g.heading}
+        </span>
+        {g.sub && (
+          <span className="ml-1.5 text-[11px] text-muted-foreground/70">{g.sub}</span>
+        )}
+        <span className="ml-2 text-[11px] tabular-nums text-muted-foreground">
+          {g.count} meeting{g.count === 1 ? '' : 's'}
+          {g.totalSecs > 0 ? ` · ${formatDuration(g.totalSecs)}` : ''}
+        </span>
+      </TableCell>
+    </TableRow>
+  );
 
   const archiveBody = loading ? (
     container(spinner)
@@ -1361,45 +1651,18 @@ export function TranscriptTable({
         )
       ) : (
         <Table>
-          <TableHeader>
-            <TableRow className="hover:bg-transparent">
-              <TableHead className="h-9 bg-muted/50 text-[11px] font-medium uppercase tracking-wider text-muted-foreground">
-                Title
-              </TableHead>
-              {visibleCols.map((key) => (
-                <TableHead
-                  key={key}
-                  className={`h-9 ${COL_HEAD_WIDTH[key]} bg-muted/50 text-[11px] font-medium uppercase tracking-wider text-muted-foreground ${COL_RESPONSIVE[key]}`}
-                >
-                  {COL_LABELS[key]}
-                </TableHead>
-              ))}
-              <TableHead className="h-9 w-[72px] bg-muted/50">&nbsp;</TableHead>
-            </TableRow>
-          </TableHeader>
+          {archiveTableHeader}
           <TableBody>
             {colPrefs.groupByDay
               ? archiveGroups.map((g) => (
                   <Fragment key={g.key}>
-                    <TableRow className="hover:bg-transparent">
-                      <TableCell
-                        colSpan={visibleCols.length + 2}
-                        className="bg-muted/40 py-1.5 pl-4"
-                      >
-                        <span className="text-[11px] font-semibold uppercase tracking-wider text-foreground/80">
-                          {g.heading}
-                        </span>
-                        {g.sub && (
-                          <span className="ml-1.5 text-[11px] text-muted-foreground/70">
-                            {g.sub}
-                          </span>
-                        )}
-                        <span className="ml-2 text-[11px] tabular-nums text-muted-foreground">
-                          {g.rows.length} meeting{g.rows.length === 1 ? '' : 's'}
-                          {g.totalSecs > 0 ? ` · ${formatDuration(g.totalSecs)}` : ''}
-                        </span>
-                      </TableCell>
-                    </TableRow>
+                    {dayHeaderRow({
+                      key: g.key,
+                      heading: g.heading,
+                      sub: g.sub,
+                      count: g.rows.length,
+                      totalSecs: g.totalSecs,
+                    })}
                     {(g.rows as ListRow[]).map(renderRow)}
                   </Fragment>
                 ))
@@ -1410,67 +1673,139 @@ export function TranscriptTable({
     )
   );
 
-  const calView = sourceView === 'norec' ? 'norec' : 'unimported';
-  const calendarBody = calLoading ? (
-    container(spinner)
-  ) : calError ? (
-    container(
-      <div className="flex flex-col items-center py-16 text-center">
-        <p className="text-sm font-medium">Couldn&apos;t load calendar meetings</p>
-        <p className="mt-1 text-xs text-destructive">{calError}</p>
-        <Button
-          onClick={() => void fetchCalendar('reset')}
-          variant="outline"
-          size="sm"
-          className="mt-4"
+  /** Merged timeline body (tab=all, no search, ≥1 calendar layer on). */
+  const mergedBody = (() => {
+    if (loading || mergedGroups === null) return container(spinner);
+    if (error) {
+      return container(
+        <div className="flex flex-col items-center py-16 text-center">
+          <p className="text-sm font-medium">Couldn&apos;t load transcripts</p>
+          <p className="mt-1 text-xs text-destructive">{error}</p>
+          <Button
+            onClick={() => void fetchArchive('reset')}
+            variant="outline"
+            size="sm"
+            className="mt-4"
+          >
+            <RefreshCw className="h-4 w-4" />
+            Retry
+          </Button>
+        </div>
+      );
+    }
+    const strips: React.ReactNode[] = [];
+    if (!calConnected) {
+      strips.push(
+        <div
+          key="connect"
+          className="flex items-center gap-2 border-b bg-muted/30 px-4 py-2 text-xs text-muted-foreground"
         >
-          <RefreshCw className="h-4 w-4" />
-          Retry
-        </Button>
-      </div>
-    )
-  ) : !calConnected ? (
-    container(
-      emptyState(
-        <Video className="h-5 w-5 text-muted-foreground" />,
-        'Connect Google to see your calendar here',
-        'Use "Import meeting" in the header to connect your Google account.'
-      )
-    )
-  ) : calGroups.length === 0 ? (
-    container(
-      calView === 'unimported'
-        ? emptyState(
-            <Video className="h-5 w-5 text-muted-foreground" />,
-            'Everything with a recording is already imported 🎉',
-            null
-          )
-        : emptyState(
-            <CalendarX2 className="h-5 w-5 text-muted-foreground" />,
-            'No unrecorded meetings found in this range',
-            'Data accumulates from calendar sweeps going forward.'
-          )
-    )
-  ) : (
-    container(
-      <CalendarMeetingsTable
-        view={calView}
-        groups={calGroups}
-        onImportMeeting={onImportMeeting}
-      />
-    )
-  );
+          <Video className="h-3.5 w-3.5 shrink-0" />
+          Connect Google to see calendar meetings in this timeline — use &quot;Import
+          meeting&quot; in the header.
+        </div>
+      );
+    }
+    for (const v of CAL_VIEWS) {
+      if (!layers[v] || !calSrc[v].error) continue;
+      strips.push(
+        <div
+          key={`err-${v}`}
+          className="flex items-center justify-between gap-2 border-b bg-destructive/5 px-4 py-1.5 text-xs text-destructive"
+        >
+          <span className="min-w-0 truncate">
+            Couldn&apos;t load the {v === 'unimported' ? 'Not imported' : 'No recording'}{' '}
+            layer — {calSrc[v].error}
+          </span>
+          <Button
+            variant="outline"
+            size="sm"
+            className="h-6 shrink-0 px-2 text-xs"
+            onClick={() => void fetchCalendar(v, 'reset')}
+          >
+            Retry
+          </Button>
+        </div>
+      );
+    }
+    const totalItems = mergedGroups.reduce((n, g) => n + g.items.length, 0);
+    if (totalItems === 0) {
+      return container(
+        <>
+          {strips}
+          {!calConnected && !layers.archive ? (
+            emptyState(
+              <Video className="h-5 w-5 text-muted-foreground" />,
+              'Connect Google to see your calendar here',
+              'Use "Import meeting" in the header to connect your Google account.'
+            )
+          ) : layers.archive ? (
+            emptyState(
+              <FileAudio className="h-5 w-5 text-muted-foreground" />,
+              'No meetings here yet',
+              'Drag a file anywhere on this page, or use Upload audio in the header.'
+            )
+          ) : (
+            emptyState(
+              <CalendarX2 className="h-5 w-5 text-muted-foreground" />,
+              'No calendar meetings found in this range',
+              'Data accumulates from calendar sweeps going forward.'
+            )
+          )}
+        </>
+      );
+    }
+    return container(
+      <>
+        {strips}
+        <Table>
+          {archiveTableHeader}
+          <TableBody>
+            {mergedGroups.map((g) => (
+              <Fragment key={g.key}>
+                {dayHeaderRow({
+                  key: g.key,
+                  heading: g.heading,
+                  sub: g.sub,
+                  count: g.items.length,
+                  totalSecs: g.totalSecs,
+                })}
+                {g.items.map((it) =>
+                  it.kind === 'archive' ? (
+                    renderRow(it.row)
+                  ) : (
+                    <CalendarEventRow
+                      key={`cal-${it.layer}-${it.row.key}`}
+                      row={it.row}
+                      layer={it.layer}
+                      colSpan={visibleCols.length + 2}
+                      onImportMeeting={onImportMeeting}
+                    />
+                  )
+                )}
+              </Fragment>
+            ))}
+          </TableBody>
+        </Table>
+      </>
+    );
+  })();
 
-  const showSentinel =
-    sourceView === 'archive'
-      ? !loading && !error && hasMore
-      : !calLoading && !calError && calConnected && calHasMore;
-  const showLoadingMore = sourceView === 'archive' ? loadingMore : calLoadingMore;
+  const archiveMoreEligible =
+    (!renderMerged || layers.archive) && !loading && !error && hasMore;
+  const calMoreEligible =
+    renderMerged &&
+    CAL_VIEWS.some(
+      (v) => layers[v] && calSrc[v].loaded && calSrc[v].hasMore && !calSrc[v].error
+    );
+  const showSentinel = archiveMoreEligible || calMoreEligible;
+  const showLoadingMore =
+    loadingMore || calSrc.unimported.loadingMore || calSrc.norec.loadingMore;
 
   return (
     <div>
       {toolbar}
-      {sourceView === 'archive' ? archiveBody : calendarBody}
+      {renderMerged ? mergedBody : archiveBody}
       {showSentinel && <div ref={sentinelRef} className="h-1" aria-hidden />}
       {showLoadingMore && (
         <div className="flex items-center justify-center py-3 text-muted-foreground">

@@ -1,14 +1,6 @@
 'use client';
 
-import { Fragment } from 'react';
-import {
-  Table,
-  TableBody,
-  TableCell,
-  TableHead,
-  TableHeader,
-  TableRow,
-} from '@/components/ui/table';
+import { TableCell, TableRow } from '@/components/ui/table';
 import { Button } from '@/components/ui/button';
 import { Badge } from '@/components/ui/badge';
 import { formatDuration } from '@/lib/format';
@@ -28,17 +20,9 @@ export type { CalendarMeetingRow, CalendarMeetingsResponse };
 
 export type CalendarDayGroup = CalendarMeetingsResponse['days'][number];
 
-/** A day group with the pre-computed heading (Today/Yesterday/…). */
-export interface CalendarHeadedGroup extends CalendarDayGroup {
-  heading: string;
-  sub: string | null;
-}
-
-interface CalendarMeetingsTableProps {
-  view: 'unimported' | 'norec';
-  groups: CalendarHeadedGroup[];
-  onImportMeeting?: (m: { meetingCode: string; eventStart: string }) => void;
-}
+/** Which calendar-meetings view a row came from — controls importability
+ * rules and the "No Meet link" badge. */
+export type CalendarLayer = 'unimported' | 'norec';
 
 function statusGlyph(r: CalendarMeetingRow) {
   if (r.hasRecording) {
@@ -80,81 +64,94 @@ function providerGlyph(r: CalendarMeetingRow) {
   return null;
 }
 
+interface CalendarEventRowProps {
+  row: CalendarMeetingRow;
+  layer: CalendarLayer;
+  /** Total column count of the host table — the row spans all of them. */
+  colSpan: number;
+  onImportMeeting?: (m: { meetingCode: string; eventStart: string }) => void;
+}
+
 /**
- * Table of calendar meetings for the "Not imported" / "No recording" source
- * views. Pure presentation — fetching, day-heading computation, infinite
- * scroll, and empty states live in TranscriptTable.
+ * One calendar-event row, rendered INSIDE the merged listing table (it spans
+ * the full width — calendar rows keep their own simpler layout rather than
+ * following the archive column chooser). A subtle tinted background keeps
+ * imported vs not-imported readable at a glance. Pure presentation —
+ * fetching, day grouping, and merging live in TranscriptTable.
  */
-export function CalendarMeetingsTable({
-  view,
-  groups,
+export function CalendarEventRow({
+  row: r,
+  layer,
+  colSpan,
   onImportMeeting,
-}: CalendarMeetingsTableProps) {
-  const renderRow = (r: CalendarMeetingRow) => {
-    const canImport =
-      !!r.meetingCode && (view === 'unimported' || r.hasMeet) && !!onImportMeeting;
-    return (
-      <TableRow
-        key={r.key}
-        className={`transition-colors hover:bg-accent/40 ${r.muted ? 'opacity-60' : ''}`}
-      >
-        <TableCell className="py-2 pl-4">
-          <div className="flex min-w-0 items-center gap-2">
-            {statusGlyph(r)}
-            {providerGlyph(r)}
-            <div className="min-w-0 flex-1">
-              <div className="flex min-w-0 items-center gap-2">
-                <div
-                  className={`min-w-0 truncate text-sm font-medium ${
-                    r.title?.trim() ? '' : 'italic text-muted-foreground'
-                  }`}
-                >
-                  {r.title?.trim() || '(untitled meeting)'}
-                </div>
-                {r.hasRecording && (
-                  <Badge variant="outline" className="shrink-0 text-[10px]">
-                    Recording{r.recordingCount > 1 ? ` ×${r.recordingCount}` : ''}
-                  </Badge>
-                )}
-                {r.hasTranscript && (
-                  <Badge variant="outline" className="shrink-0 text-[10px]">
-                    Transcript
-                  </Badge>
-                )}
-                {r.transcriptParseable === false && (
-                  <Badge
-                    variant="outline"
-                    className="shrink-0 border-amber-500/50 text-[10px] text-amber-600 dark:text-amber-500"
-                  >
-                    transcript unparseable
-                  </Badge>
-                )}
-                {r.muted && (
-                  <Badge variant="outline" className="shrink-0 text-[10px] text-muted-foreground">
-                    muted
-                  </Badge>
-                )}
-                {view === 'norec' && !r.hasMeet && (
-                  <Badge
-                    variant="outline"
-                    className="shrink-0 text-[10px] text-muted-foreground/70"
-                  >
-                    No Meet link
-                  </Badge>
-                )}
+}: CalendarEventRowProps) {
+  const canImport =
+    !!r.meetingCode && (layer === 'unimported' || r.hasMeet) && !!onImportMeeting;
+  return (
+    <TableRow
+      className={`bg-muted/30 transition-colors hover:bg-accent/30 ${
+        r.muted ? 'opacity-60' : ''
+      }`}
+    >
+      <TableCell colSpan={colSpan} className="py-2 pl-4 pr-3">
+        <div className="flex min-w-0 items-center gap-2">
+          {statusGlyph(r)}
+          {providerGlyph(r)}
+          <div className="min-w-0 flex-1">
+            <div className="flex min-w-0 items-center gap-2">
+              <div
+                className={`min-w-0 truncate text-sm ${
+                  r.title?.trim()
+                    ? 'font-medium text-foreground/80'
+                    : 'italic text-muted-foreground'
+                }`}
+              >
+                {r.title?.trim() || '(untitled meeting)'}
               </div>
-              {r.organizerEmail && (
-                <div className="truncate text-xs text-muted-foreground">
-                  {r.organizerSelf ? 'Organized by you' : r.organizerEmail}
-                  {r.attendeeCount ? ` · ${r.attendeeCount} attendees` : ''}
-                </div>
+              {r.hasRecording && (
+                <Badge variant="outline" className="shrink-0 text-[10px]">
+                  Recording{r.recordingCount > 1 ? ` ×${r.recordingCount}` : ''}
+                </Badge>
+              )}
+              {r.hasTranscript && (
+                <Badge variant="outline" className="shrink-0 text-[10px]">
+                  Transcript
+                </Badge>
+              )}
+              {r.transcriptParseable === false && (
+                <Badge
+                  variant="outline"
+                  className="shrink-0 border-amber-500/50 text-[10px] text-amber-600 dark:text-amber-500"
+                >
+                  transcript unparseable
+                </Badge>
+              )}
+              {r.muted && (
+                <Badge
+                  variant="outline"
+                  className="shrink-0 text-[10px] text-muted-foreground"
+                >
+                  muted
+                </Badge>
+              )}
+              {layer === 'norec' && !r.hasMeet && (
+                <Badge
+                  variant="outline"
+                  className="shrink-0 text-[10px] text-muted-foreground/70"
+                >
+                  No Meet link
+                </Badge>
               )}
             </div>
+            {r.organizerEmail && (
+              <div className="truncate text-xs text-muted-foreground">
+                {r.organizerSelf ? 'Organized by you' : r.organizerEmail}
+                {r.attendeeCount ? ` · ${r.attendeeCount} attendees` : ''}
+              </div>
+            )}
           </div>
-        </TableCell>
-        <TableCell className="hidden py-1.5 md:table-cell">
           <span
-            className="text-xs tabular-nums text-muted-foreground"
+            className="hidden shrink-0 text-xs tabular-nums text-muted-foreground md:inline"
             title={new Date(r.eventStart).toLocaleString()}
           >
             {new Date(r.eventStart).toLocaleTimeString([], {
@@ -162,14 +159,10 @@ export function CalendarMeetingsTable({
               minute: '2-digit',
             })}
           </span>
-        </TableCell>
-        <TableCell className="hidden py-1.5 sm:table-cell">
-          <span className="font-mono text-[11px] tabular-nums text-muted-foreground">
+          <span className="hidden w-14 shrink-0 text-right font-mono text-[11px] tabular-nums text-muted-foreground sm:inline">
             {r.durationSecs ? formatDuration(r.durationSecs) : '—'}
           </span>
-        </TableCell>
-        <TableCell className="py-1.5 pr-3">
-          <div className="flex items-center justify-end">
+          <span className="flex w-[84px] shrink-0 items-center justify-end">
             {canImport && (
               <Button
                 size="sm"
@@ -186,52 +179,9 @@ export function CalendarMeetingsTable({
                 Import…
               </Button>
             )}
-          </div>
-        </TableCell>
-      </TableRow>
-    );
-  };
-
-  return (
-    <Table>
-      <TableHeader>
-        <TableRow className="hover:bg-transparent">
-          <TableHead className="h-9 bg-muted/50 text-[11px] font-medium uppercase tracking-wider text-muted-foreground">
-            Meeting
-          </TableHead>
-          <TableHead className="hidden h-9 w-[14%] bg-muted/50 text-[11px] font-medium uppercase tracking-wider text-muted-foreground md:table-cell">
-            Time
-          </TableHead>
-          <TableHead className="hidden h-9 w-[11%] bg-muted/50 text-[11px] font-medium uppercase tracking-wider text-muted-foreground sm:table-cell">
-            Duration
-          </TableHead>
-          <TableHead className="h-9 w-[96px] bg-muted/50">&nbsp;</TableHead>
-        </TableRow>
-      </TableHeader>
-      <TableBody>
-        {groups.map((g) => {
-          const totalSecs = g.rows.reduce((n, r) => n + (r.durationSecs ?? 0), 0);
-          return (
-            <Fragment key={g.key}>
-              <TableRow className="hover:bg-transparent">
-                <TableCell colSpan={4} className="bg-muted/40 py-1.5 pl-4">
-                  <span className="text-[11px] font-semibold uppercase tracking-wider text-foreground/80">
-                    {g.heading}
-                  </span>
-                  {g.sub && (
-                    <span className="ml-1.5 text-[11px] text-muted-foreground/70">{g.sub}</span>
-                  )}
-                  <span className="ml-2 text-[11px] tabular-nums text-muted-foreground">
-                    {g.rows.length} meeting{g.rows.length === 1 ? '' : 's'}
-                    {totalSecs > 0 ? ` · ${formatDuration(totalSecs)}` : ''}
-                  </span>
-                </TableCell>
-              </TableRow>
-              {g.rows.map(renderRow)}
-            </Fragment>
-          );
-        })}
-      </TableBody>
-    </Table>
+          </span>
+        </div>
+      </TableCell>
+    </TableRow>
   );
 }
