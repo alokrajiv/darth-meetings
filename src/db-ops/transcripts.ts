@@ -122,28 +122,38 @@ export async function listVisibleToUser(
     LEFT JOIN ${sql(SCHEMA)}.series se ON se.id = sm.series_id
     -- Suspected series for untagged rows: any evidence-key match that hasn't
     -- been excluded — surfaced as a dashed "…?" chip the user confirms/denies.
+    -- The row's normalized values are computed ONCE in a MATERIALIZED CTE:
+    -- without the fence the planner inlines them into the key predicates and
+    -- re-runs the regexps for every (row × key) pair — measured 194ms vs
+    -- 33ms for this whole listing query at 184 rows × 60 keys (2026-08-19).
     LEFT JOIN LATERAL (
+      WITH norm AS MATERIALIZED (
+        SELECT
+          t.gmeet_context->>'meetingCode' AS meeting_code,
+          regexp_replace(COALESCE(t.gmeet_context->>'recurringEventId',''), '_R\\d{8}T\\d{6}Z?$', '') AS recurring_base,
+          regexp_replace(regexp_replace(COALESCE(t.gmeet_context->>'iCalUID',''), '@google\\.com$', ''), '_R\\d{8}T\\d{6}Z?$', '') AS ical_base,
+          t.gmeet_context->'teams'->>'joinWebUrl' AS teams_join_url,
+          t.gmeet_context->'teams'->>'graphMeetingId' AS graph_meeting_id,
+          btrim(lower(regexp_replace(
+            regexp_replace(COALESCE(NULLIF(t.gmeet_context->>'eventTitle',''), t.title, ''),
+                           '\\d{1,4}[/.-]\\d{1,2}[/.-]\\d{1,4}', ' ', 'g'),
+            '[^a-zA-Z0-9]+', ' ', 'g'))) AS norm_title
+      )
       SELECT k.series_id, se2.title
-      FROM ${sql(SCHEMA)}.series_keys k
+      FROM norm
+      JOIN ${sql(SCHEMA)}.series_keys k ON (
+        (k.kind = 'meeting-code' AND norm.meeting_code = k.value) OR
+        (k.kind = 'recurring-base-id' AND norm.recurring_base = k.value) OR
+        (k.kind = 'ical-uid-base' AND norm.ical_base = k.value) OR
+        (k.kind = 'teams-join-url' AND norm.teams_join_url = k.value) OR
+        (k.kind = 'graph-meeting-id' AND norm.graph_meeting_id = k.value) OR
+        (k.kind = 'normalized-title' AND norm.norm_title = k.value)
+      )
       JOIN ${sql(SCHEMA)}.series se2 ON se2.id = k.series_id
       WHERE NOT EXISTS (
               SELECT 1 FROM ${sql(SCHEMA)}.series_exclusions x
               WHERE x.series_id = k.series_id AND x.transcript_id = t.id
             )
-        AND (
-          (k.kind = 'meeting-code' AND t.gmeet_context->>'meetingCode' = k.value) OR
-          (k.kind = 'recurring-base-id' AND
-           regexp_replace(COALESCE(t.gmeet_context->>'recurringEventId',''), '_R\\d{8}T\\d{6}Z?$', '') = k.value) OR
-          (k.kind = 'ical-uid-base' AND
-           regexp_replace(regexp_replace(COALESCE(t.gmeet_context->>'iCalUID',''), '@google\\.com$', ''), '_R\\d{8}T\\d{6}Z?$', '') = k.value) OR
-          (k.kind = 'teams-join-url' AND t.gmeet_context->'teams'->>'joinWebUrl' = k.value) OR
-          (k.kind = 'graph-meeting-id' AND t.gmeet_context->'teams'->>'graphMeetingId' = k.value) OR
-          (k.kind = 'normalized-title' AND
-           btrim(lower(regexp_replace(
-             regexp_replace(COALESCE(NULLIF(t.gmeet_context->>'eventTitle',''), t.title, ''),
-                            '\\d{1,4}[/.-]\\d{1,2}[/.-]\\d{1,4}', ' ', 'g'),
-             '[^a-zA-Z0-9]+', ' ', 'g'))) = k.value)
-        )
       ORDER BY k.series_id
       LIMIT 1
     ) sus ON sm.id IS NULL
