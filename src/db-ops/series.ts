@@ -35,6 +35,8 @@ export interface SeriesListEntry {
   title: string;
   member_count: number;
   last_recorded_at: string | null;
+  /** Median gap between member occurrences, seconds — null under 2 members. */
+  median_gap_secs: number | null;
 }
 
 export interface SeriesMemberEntry {
@@ -89,16 +91,124 @@ export async function deleteSeries(id: number): Promise<void> {
 
 export async function listSeries(): Promise<SeriesListEntry[]> {
   return sql<SeriesListEntry[]>`
+    WITH gaps AS (
+      SELECT m.series_id,
+             extract(epoch FROM (
+               lead(COALESCE(t.recorded_at, t.created_at)) OVER (
+                 PARTITION BY m.series_id
+                 ORDER BY COALESCE(t.recorded_at, t.created_at)
+               ) - COALESCE(t.recorded_at, t.created_at)
+             ))::float8 AS gap
+      FROM ${sql(SCHEMA)}.series_members m
+      JOIN ${sql(SCHEMA)}.transcripts t
+        ON t.id = m.transcript_id AND t.deleted_at IS NULL
+    ),
+    cadence AS (
+      SELECT series_id,
+             percentile_cont(0.5) WITHIN GROUP (ORDER BY gap) AS median_gap_secs
+      FROM gaps WHERE gap IS NOT NULL
+      GROUP BY series_id
+    )
     SELECT s.id, s.title,
            count(m.id)::int AS member_count,
-           max(COALESCE(t.recorded_at, t.created_at))::text AS last_recorded_at
+           max(COALESCE(t.recorded_at, t.created_at))::text AS last_recorded_at,
+           c.median_gap_secs
     FROM ${sql(SCHEMA)}.series s
     LEFT JOIN ${sql(SCHEMA)}.series_members m ON m.series_id = s.id
     LEFT JOIN ${sql(SCHEMA)}.transcripts t
       ON t.id = m.transcript_id AND t.deleted_at IS NULL
-    GROUP BY s.id, s.title
+    LEFT JOIN cadence c ON c.series_id = s.id
+    GROUP BY s.id, s.title, c.median_gap_secs
     ORDER BY max(COALESCE(t.recorded_at, t.created_at)) DESC NULLS LAST
   `;
+}
+
+/** Live memberships + transcripts outside any series — the index footer. */
+export async function seriesTotals(): Promise<{ memberships: number; unattached: number }> {
+  const [row] = await sql<Array<{ memberships: number; unattached: number }>>`
+    SELECT
+      count(m.id)::int AS memberships,
+      count(t.id) FILTER (WHERE m.id IS NULL)::int AS unattached
+    FROM ${sql(SCHEMA)}.transcripts t
+    LEFT JOIN ${sql(SCHEMA)}.series_members m ON m.transcript_id = t.id
+    WHERE t.deleted_at IS NULL
+      AND t.status NOT IN ('uploading', 'waiting')
+  `;
+  return row ?? { memberships: 0, unattached: 0 };
+}
+
+/**
+ * Fold one series into another (dupe repair): keys, members, and exclusions
+ * move to the survivor, the loser is deleted — all in one transaction. Keys
+ * can't collide (UNIQUE(kind,value) means a value lives in exactly one
+ * series) and members can't either (transcript_id UNIQUE, series_id is the
+ * moving part); exclusions may exist on both sides → keep-first.
+ */
+export async function mergeSeries(
+  intoId: number,
+  fromId: number
+): Promise<{ movedMembers: number; movedKeys: number }> {
+  return sql.begin(async (tx) => {
+    const keys = await tx`
+      UPDATE ${sql(SCHEMA)}.series_keys SET series_id = ${intoId}
+      WHERE series_id = ${fromId} RETURNING id
+    `;
+    const members = await tx`
+      UPDATE ${sql(SCHEMA)}.series_members SET series_id = ${intoId}
+      WHERE series_id = ${fromId} RETURNING id
+    `;
+    await tx`
+      INSERT INTO ${sql(SCHEMA)}.series_exclusions (series_id, transcript_id, excluded_by)
+      SELECT ${intoId}, transcript_id, excluded_by
+      FROM ${sql(SCHEMA)}.series_exclusions WHERE series_id = ${fromId}
+      ON CONFLICT DO NOTHING
+    `;
+    await tx`DELETE FROM ${sql(SCHEMA)}.series WHERE id = ${fromId}`;
+    return { movedMembers: members.length, movedKeys: keys.length };
+  });
+}
+
+/** Transcripts in no series — the retro-attach sweep's work list. */
+export async function listUnattachedTranscripts(): Promise<
+  Array<{
+    id: number;
+    assemblyai_id: string;
+    title: string | null;
+    gmeet_context: GmeetContext | null;
+    user_id: string;
+  }>
+> {
+  return sql<
+    Array<{
+      id: number;
+      assemblyai_id: string;
+      title: string | null;
+      gmeet_context: GmeetContext | null;
+      user_id: string;
+    }>
+  >`
+    SELECT t.id, t.assemblyai_id, t.title, t.gmeet_context, t.user_id
+    FROM ${sql(SCHEMA)}.transcripts t
+    LEFT JOIN ${sql(SCHEMA)}.series_members m ON m.transcript_id = t.id
+    WHERE m.id IS NULL
+      AND t.deleted_at IS NULL
+      AND t.status NOT IN ('uploading', 'waiting')
+    ORDER BY COALESCE(t.recorded_at, t.created_at) DESC
+  `;
+}
+
+/** Batch series lookup for calendar rows by stripped recurringEventId. */
+export async function findSeriesByRecurringBaseIds(
+  baseIds: string[]
+): Promise<Map<string, { series_id: number; title: string }>> {
+  if (baseIds.length === 0) return new Map();
+  const rows = await sql<Array<{ value: string; series_id: number; title: string }>>`
+    SELECT k.value, k.series_id, s.title
+    FROM ${sql(SCHEMA)}.series_keys k
+    JOIN ${sql(SCHEMA)}.series s ON s.id = k.series_id
+    WHERE k.kind = 'recurring-base-id' AND k.value = ANY(${baseIds})
+  `;
+  return new Map(rows.map((r) => [r.value, { series_id: r.series_id, title: r.title }]));
 }
 
 export async function listKeys(seriesId: number): Promise<SeriesKeyRow[]> {

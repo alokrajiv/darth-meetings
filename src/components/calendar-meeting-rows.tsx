@@ -5,7 +5,7 @@ import { TableCell, TableRow } from '@/components/ui/table';
 import { Button } from '@/components/ui/button';
 import { Badge } from '@/components/ui/badge';
 import { formatDuration } from '@/lib/format';
-import { ExternalLink, EyeOff, FileText, Loader2, Settings2, Upload, Video, VideoOff } from 'lucide-react';
+import { ExternalLink, EyeOff, FileText, Loader2, Repeat, Settings2, Upload, Video, VideoOff } from 'lucide-react';
 import { MeetLogo, TeamsLogo } from '@/components/provider-icon';
 import { requestMediaUpload } from '@/components/audio-upload';
 
@@ -389,6 +389,8 @@ interface CalendarEventRowProps {
   /** A mute was added from this row — host silently refetches the calendar
    * layers + its hidden-list state. */
   onMuteChanged?: () => void;
+  /** The row's series chip was clicked — host opens its SeriesDialog. */
+  onOpenSeries?: (seriesId: number) => void;
 }
 
 /**
@@ -406,6 +408,7 @@ export function CalendarEventRow({
   colClass,
   onImportMeeting,
   onMuteChanged,
+  onOpenSeries,
 }: CalendarEventRowProps) {
   const canImport =
     !!r.meetingCode && (layer === 'unimported' || r.hasMeet) && !!onImportMeeting;
@@ -500,6 +503,20 @@ export function CalendarEventRow({
                   destination="the transcript Doc in Google Docs"
                   className="shrink-0 border-amber-500/50 text-[10px] text-amber-600 dark:text-amber-500"
                 />
+              )}
+              {r.seriesId !== null && (
+                <button
+                  type="button"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    onOpenSeries?.(r.seriesId!);
+                  }}
+                  title={`Recurring call: ${r.seriesTitle} — click to see the whole series`}
+                  className="inline-flex max-w-44 shrink-0 items-center gap-1 rounded-full border border-primary/25 bg-primary/5 px-2 py-0.5 text-[11px] text-primary transition-colors hover:bg-primary/10"
+                >
+                  <Repeat className="h-3 w-3 shrink-0" />
+                  <span className="truncate">{r.seriesTitle}</span>
+                </button>
               )}
               {r.muted && (
                 <Badge

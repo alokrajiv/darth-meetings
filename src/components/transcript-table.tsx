@@ -1936,6 +1936,7 @@ export function TranscriptTable({
                       colClass={(key) => COL_RESPONSIVE[key as ColKey] ?? ''}
                       onImportMeeting={onImportMeeting}
                       onMuteChanged={handleMuteChanged}
+                      onOpenSeries={setOpenSeriesId}
                     />
                   )
                 )}
@@ -1986,6 +1987,7 @@ export function TranscriptTable({
         seriesId={openSeriesId}
         onClose={() => setOpenSeriesId(null)}
         onChanged={() => void fetchArchiveRef.current('silent')}
+        onMerged={setOpenSeriesId}
       />
     </div>
   );

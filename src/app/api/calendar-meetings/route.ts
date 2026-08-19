@@ -7,6 +7,8 @@ import {
   type CalendarMeetingDbRow,
   type CalendarMeetingView,
 } from '@/db-ops/calendar-event-cache';
+import { findSeriesByRecurringBaseIds } from '@/db-ops/series';
+import { recurringBaseId } from '@/lib/series-keys';
 
 export const runtime = 'nodejs';
 
@@ -58,6 +60,10 @@ export interface CalendarMeetingRow {
   recurringEventId: string | null;
   /** Cached occurrences of the series ("Hide all N…"); null = not recurring. */
   seriesCount: number | null;
+  /** App-level series this occurrence belongs to (recurring-base-id match) —
+   * renders the same member chip archive rows get; click opens SeriesDialog. */
+  seriesId: number | null;
+  seriesTitle: string | null;
 }
 
 export interface CalendarMeetingsResponse {
@@ -106,7 +112,13 @@ function isoOf(v: string | Date): string {
   return v instanceof Date ? v.toISOString() : new Date(v).toISOString();
 }
 
-function toRow(r: CalendarMeetingDbRow): CalendarMeetingRow {
+function toRow(
+  r: CalendarMeetingDbRow,
+  seriesByBase: Map<string, { series_id: number; title: string }>
+): CalendarMeetingRow {
+  const series = r.recurring_event_id
+    ? (seriesByBase.get(recurringBaseId(r.recurring_event_id)) ?? null)
+    : null;
   return {
     key: r.key,
     meetingCode: r.meeting_code,
@@ -129,6 +141,8 @@ function toRow(r: CalendarMeetingDbRow): CalendarMeetingRow {
     transcriptDocId: r.transcript_doc_id,
     recurringEventId: r.recurring_event_id,
     seriesCount: r.series_count,
+    seriesId: series?.series_id ?? null,
+    seriesTitle: series?.title ?? null,
   };
 }
 
@@ -156,8 +170,18 @@ export const GET = withAuth(async ({ user, request }) => {
     }),
   ]);
 
+  // One batch lookup maps this page's recurring events onto app-level series.
+  const baseIds = [
+    ...new Set(
+      page.days.flatMap((d) =>
+        d.rows.flatMap((r) => (r.recurring_event_id ? [recurringBaseId(r.recurring_event_id)] : []))
+      )
+    ),
+  ];
+  const seriesByBase = await findSeriesByRecurringBaseIds(baseIds);
+
   const body: CalendarMeetingsResponse = {
-    days: page.days.map((d) => ({ key: d.key, rows: d.rows.map(toRow) })),
+    days: page.days.map((d) => ({ key: d.key, rows: d.rows.map((r) => toRow(r, seriesByBase)) })),
     counts,
     nextCursor: page.nextCursor,
     hasMore: page.hasMore,
