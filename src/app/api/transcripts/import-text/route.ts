@@ -1,5 +1,5 @@
 import { NextResponse } from 'next/server';
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import path from 'node:path';
 import { promises as fsp } from 'node:fs';
 import { withAuth } from '@/lib/auth/with-auth';
@@ -7,14 +7,25 @@ import { runClaudeWithMeta, parseJsonFromClaude } from '@/lib/server/claude-agen
 import { recordAiRun } from '@/db-ops/ai-runs';
 import { extractAttachmentText } from '@/lib/server/attachment-extract';
 import { getStorageDir } from '@/lib/server/audio-storage';
-import { ingestParsedUtterances } from '@/lib/server/ingest-parsed';
+import {
+  createTextImportPlaceholder,
+  ingestParsedUtterances,
+} from '@/lib/server/ingest-parsed';
+import { tryParseTranscriptText } from '@/lib/server/transcript-text-parse';
+import { updateMetaForUser, updateStatusForUser, type TranscriptRow } from '@/db-ops/transcripts';
+import { publishEvent } from '@/lib/server/event-bus';
+import type { MeetUtterance } from '@/lib/format';
 
 export const runtime = 'nodejs';
-// The normalization runs a headless-Claude pass — give it room.
+// Known formats import synchronously in milliseconds; the LLM fallback runs
+// in the background — the request itself only creates a placeholder row.
 export const maxDuration = 600;
 
 const MAX_INPUT_CHARS = 400_000;
 const CHARS_PER_SECOND = 14; // fallback timing when the source has no timestamps
+// The LLM pass is mechanical reformatting — a fast model on low effort is
+// plenty (the opus/medium default was the 2026-08-18 timeout incident).
+const NORMALIZE_TIMEOUT_MS = 900 * 1000;
 
 const NORMALIZE_PROMPT = `You are a meeting-transcript format normalizer.
 
@@ -49,13 +60,132 @@ interface NormalizedTranscript {
 }
 
 /**
+ * Fill timing: keep source timestamps where sane, estimate the rest so
+ * ordering and the outline still work.
+ */
+function fillTiming(
+  utts: Array<{ speaker: string; text: string; startMs?: number | null; endMs?: number | null }>
+): MeetUtterance[] {
+  let cursor = 0;
+  return utts.map((u) => {
+    const est = Math.max(800, Math.round((u.text.length / CHARS_PER_SECOND) * 1000));
+    let start = typeof u.startMs === 'number' && u.startMs >= 0 ? Math.round(u.startMs) : cursor;
+    if (start < cursor - 60_000) start = cursor; // wildly backwards → resequence
+    const end = typeof u.endMs === 'number' && u.endMs > start ? Math.round(u.endMs) : start + est;
+    cursor = end;
+    return {
+      speaker: u.speaker.trim().slice(0, 80) || 'Speaker 1',
+      text: u.text.trim(),
+      start,
+      end,
+    };
+  });
+}
+
+/**
+ * In-flight async normalizations keyed by sha256(userId + text): a second
+ * identical request while one runs gets the SAME 202 row instead of
+ * double-running the model (the incident's overlapping-retry failure mode).
+ * On globalThis so dev hot-reloads don't strand entries; the deployment is a
+ * single pm2 process, so in-process is sufficient.
+ */
+declare global {
+  var __mwImportNormalizeInflight:
+    | Map<string, Promise<{ id: number; assemblyaiId: string }>>
+    | undefined;
+}
+const inFlight: Map<string, Promise<{ id: number; assemblyaiId: string }>> =
+  globalThis.__mwImportNormalizeInflight ?? (globalThis.__mwImportNormalizeInflight = new Map());
+
+/** Background LLM normalization filling a pre-created placeholder row. */
+async function normalizeTextInBackground(
+  user: { userId: string; email: string },
+  row: TranscriptRow,
+  sourceText: string,
+  title: string | null,
+  originalFilename: string | null
+): Promise<void> {
+  const sourceId = row.assemblyai_id;
+  const normalizePrompt = NORMALIZE_PROMPT + sourceText;
+  let normalizeRun: Awaited<ReturnType<typeof runClaudeWithMeta>> | null = null;
+  try {
+    normalizeRun = await runClaudeWithMeta(normalizePrompt, {
+      timeoutMs: NORMALIZE_TIMEOUT_MS,
+      model: process.env.MW_IMPORT_NORMALIZE_MODEL || 'sonnet',
+      effort: process.env.MW_IMPORT_NORMALIZE_EFFORT || 'low',
+    });
+    const normalized = parseJsonFromClaude<NormalizedTranscript>(normalizeRun.text);
+    const rawUtterances = (normalized.utterances ?? []).filter(
+      (u) => typeof u.text === 'string' && u.text.trim().length > 0
+    );
+    if (rawUtterances.length === 0) {
+      throw new Error('No utterances could be recognised in that content.');
+    }
+    const utterances = fillTiming(
+      rawUtterances.map((u) => ({
+        speaker: u.speaker ?? 'Speaker 1',
+        text: u.text!,
+        startMs: u.start_ms,
+        endMs: u.end_ms,
+      }))
+    );
+
+    // Same-id upsert fills the placeholder in place (content, duration,
+    // speaker_count, title, status 'completed') and publishes 'created'.
+    await ingestParsedUtterances(user, {
+      sourceId,
+      title: title ?? normalized.title?.trim().slice(0, 200) ?? null,
+      parsed: { attendees: normalized.attendees ?? [], utterances },
+      originalFilename,
+      languageCode: normalized.language ?? null,
+      logTag: '[import-text]',
+    });
+    publishEvent({ kind: 'status', assemblyaiId: sourceId });
+    publishEvent({ kind: 'meta', assemblyaiId: sourceId });
+
+    void recordAiRun({
+      transcriptId: row.id,
+      assemblyaiId: sourceId,
+      kind: 'import_normalize',
+      triggeredBy: { userId: user.userId, email: user.email },
+      status: 'completed',
+      meta: normalizeRun.meta,
+      promptChars: normalizePrompt.length,
+      resultChars: normalizeRun.text.length,
+    });
+  } catch (err) {
+    console.error('[import-text] async normalization failed:', err);
+    // Flip the placeholder to 'error' with the reason where the listing's
+    // error rendering can surface it (description subline).
+    await updateStatusForUser(user.userId, sourceId, { status: 'error' }).catch(() => {});
+    await updateMetaForUser(user.userId, sourceId, {
+      description: `AI normalization failed: ${String(err).slice(0, 300)}`,
+    }).catch(() => {});
+    void recordAiRun({
+      transcriptId: row.id,
+      assemblyaiId: sourceId,
+      kind: 'import_normalize',
+      triggeredBy: { userId: user.userId, email: user.email },
+      status: 'error',
+      error: String(err).slice(0, 1000),
+      meta: normalizeRun?.meta ?? null,
+      promptChars: normalizePrompt.length,
+    });
+  }
+}
+
+/**
  * POST /api/transcripts/import-text
  *
  * Import a transcript from ANY format. Body: JSON { text, title?, filename? }
  * for pasted content, or raw file bytes with an `x-filename` header (docx /
- * pdf / vtt / srt / txt — text is extracted server-side). A headless-Claude
- * pass normalizes the content to utterances; the result is stored as a
- * completed imported transcript (no audio), speakers named from the source.
+ * pdf / vtt / srt / txt — text is extracted server-side).
+ *
+ * Known machine-regular formats (VTT, SRT, "Name | MM:SS", …) are parsed
+ * deterministically and ingest synchronously → 201 with `fastPath` set.
+ * Unknown formats fall back to a background headless-Claude normalization →
+ * 202 with a 'processing' placeholder row that fills in when the model
+ * finishes (the listing shows it immediately and flips over SSE).
  */
 export const POST = withAuth(async ({ user, request }) => {
   const contentType = request.headers.get('content-type') ?? '';
@@ -120,75 +250,80 @@ export const POST = withAuth(async ({ user, request }) => {
     sourceText = sourceText.slice(0, MAX_INPUT_CHARS);
   }
 
-  // Headless-Claude normalization pass.
-  let normalized: NormalizedTranscript;
-  let normalizeRun: Awaited<ReturnType<typeof runClaudeWithMeta>> | null = null;
-  const normalizePrompt = NORMALIZE_PROMPT + sourceText;
-  try {
-    normalizeRun = await runClaudeWithMeta(normalizePrompt, { timeoutMs: 8 * 60 * 1000 });
-    normalized = parseJsonFromClaude<NormalizedTranscript>(normalizeRun.text);
-  } catch (err) {
-    console.error('[import-text] normalization failed:', err);
-    void recordAiRun({
-      kind: 'import_normalize',
-      triggeredBy: { userId: user.userId, email: user.email },
-      status: 'error',
-      error: String(err).slice(0, 1000),
-      meta: normalizeRun?.meta ?? null,
-      promptChars: normalizePrompt.length,
-    });
-    return NextResponse.json(
-      { error: 'AI normalization failed', detail: String(err).slice(0, 300) },
-      { status: 502 }
+  // Deterministic fast path: known formats never touch the model.
+  const parsed = tryParseTranscriptText(sourceText);
+  if (parsed) {
+    const utterances = fillTiming(parsed.utterances);
+    const attendees = [...new Set(utterances.map((u) => u.speaker))].filter(
+      (s) => !/^Speaker(\s+\d+)?$/i.test(s)
     );
+    const syntheticId = `ext-${randomUUID().slice(0, 12)}`;
+    const { row } = await ingestParsedUtterances(
+      { userId: user.userId, email: user.email },
+      {
+        sourceId: syntheticId,
+        title,
+        parsed: { attendees, utterances },
+        originalFilename,
+        logTag: '[import-text]',
+      }
+    );
+    return NextResponse.json({ transcript: row, fastPath: parsed.format }, { status: 201 });
   }
 
-  const rawUtterances = (normalized.utterances ?? []).filter(
-    (u) => typeof u.text === 'string' && u.text.trim().length > 0
-  );
-  if (rawUtterances.length === 0) {
-    return NextResponse.json(
-      { error: 'No utterances could be recognised in that content.' },
-      { status: 422 }
-    );
-  }
+  // Unknown format → async LLM normalization behind a placeholder row.
+  const dedupeKey = createHash('sha256')
+    .update(user.userId)
+    .update('\0')
+    .update(sourceText)
+    .digest('hex');
 
-  // Fill timing: keep source timestamps where sane, estimate the rest so
-  // ordering and the outline still work.
-  let cursor = 0;
-  const utterances = rawUtterances.map((u) => {
-    const est = Math.max(800, Math.round((u.text!.length / CHARS_PER_SECOND) * 1000));
-    let start = typeof u.start_ms === 'number' && u.start_ms >= 0 ? Math.round(u.start_ms) : cursor;
-    if (start < cursor - 60_000) start = cursor; // wildly backwards → resequence
-    const end =
-      typeof u.end_ms === 'number' && u.end_ms > start ? Math.round(u.end_ms) : start + est;
-    cursor = end;
-    return { speaker: (u.speaker ?? 'Speaker 1').trim().slice(0, 80) || 'Speaker 1', text: u.text!.trim(), start, end };
-  });
+  const existing = inFlight.get(dedupeKey);
+  if (existing) {
+    try {
+      const info = await existing;
+      return NextResponse.json({ queued: true, ...info }, { status: 202 });
+    } catch {
+      // The original attempt failed before its placeholder existed — start fresh.
+    }
+  }
 
   const syntheticId = `ext-${randomUUID().slice(0, 12)}`;
-  const { row } = await ingestParsedUtterances(
-    { userId: user.userId, email: user.email },
-    {
-      sourceId: syntheticId,
-      title: title ?? normalized.title?.trim().slice(0, 200) ?? null,
-      parsed: { attendees: normalized.attendees ?? [], utterances },
-      originalFilename,
-      languageCode: normalized.language ?? null,
-      logTag: '[import-text]',
-    }
+  const placeholderPromise = createTextImportPlaceholder(
+    { userId: user.userId },
+    { sourceId: syntheticId, title, originalFilename }
   );
+  const infoPromise = placeholderPromise.then((r) => ({
+    id: r.id,
+    assemblyaiId: r.assemblyai_id,
+  }));
+  inFlight.set(dedupeKey, infoPromise);
 
-  void recordAiRun({
-    transcriptId: row.id,
-    assemblyaiId: syntheticId,
-    kind: 'import_normalize',
-    triggeredBy: { userId: user.userId, email: user.email },
-    status: 'completed',
-    meta: normalizeRun.meta,
-    promptChars: normalizePrompt.length,
-    resultChars: normalizeRun.text.length,
-  });
+  // Fire-and-forget (same pattern as onTranscriptCompleted): the entry stays
+  // in the map for the whole run so identical retries keep landing on this row.
+  void (async () => {
+    try {
+      const row = await placeholderPromise;
+      await normalizeTextInBackground(
+        { userId: user.userId, email: user.email },
+        row,
+        sourceText,
+        title,
+        originalFilename
+      );
+    } catch (err) {
+      console.error('[import-text] background normalization wrapper failed:', err);
+    } finally {
+      inFlight.delete(dedupeKey);
+    }
+  })();
 
-  return NextResponse.json({ transcript: row }, { status: 201 });
+  let info: { id: number; assemblyaiId: string };
+  try {
+    info = await infoPromise;
+  } catch (err) {
+    console.error('[import-text] placeholder creation failed:', err);
+    return NextResponse.json({ error: 'Could not start the import' }, { status: 500 });
+  }
+  return NextResponse.json({ queued: true, ...info }, { status: 202 });
 });

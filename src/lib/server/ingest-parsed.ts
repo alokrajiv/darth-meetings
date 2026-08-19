@@ -43,6 +43,33 @@ export interface IngestParsedOptions {
   logTag?: string;
 }
 
+/**
+ * Placeholder row for an async text import: the LLM normalization now runs in
+ * the background, so the row must exist (status 'processing', empty content)
+ * before the model call starts. On completion the caller runs
+ * `ingestParsedUtterances` with the SAME sourceId — `createImportedForUser`'s
+ * ON CONFLICT (user_id, assemblyai_id) upsert fills this row in place
+ * (content, duration, speaker_count, title, status 'completed').
+ */
+export async function createTextImportPlaceholder(
+  user: { userId: string },
+  opts: { sourceId: string; title?: string | null; originalFilename?: string | null }
+): Promise<TranscriptRow> {
+  return createImportedForUser(user.userId, {
+    assemblyaiId: opts.sourceId,
+    originalFilename: opts.originalFilename ?? null,
+    status: 'processing',
+    createdAt: null,
+    completedAt: null,
+    duration: null,
+    speakerCount: null,
+    languageCode: null,
+    audioUrl: null,
+    importedContent: synthesizeTranscriptResponse(opts.sourceId, { attendees: [], utterances: [] }),
+    title: opts.title ?? null,
+  });
+}
+
 export async function ingestParsedUtterances(
   user: { userId: string; email: string },
   opts: IngestParsedOptions

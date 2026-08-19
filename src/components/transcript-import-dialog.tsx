@@ -43,6 +43,8 @@ export function TranscriptImportDialog({ open, onClose, onImported }: Transcript
   const [file, setFile] = useState<File | null>(null);
   const [doneId, setDoneId] = useState<string | null>(null);
   const [doneTitle, setDoneTitle] = useState<string | null>(null);
+  const [doneFormat, setDoneFormat] = useState<string | null>(null);
+  const [queued, setQueued] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
   const reset = () => {
@@ -54,6 +56,8 @@ export function TranscriptImportDialog({ open, onClose, onImported }: Transcript
     setFile(null);
     setDoneId(null);
     setDoneTitle(null);
+    setDoneFormat(null);
+    setQueued(false);
   };
 
   const handleClose = () => {
@@ -62,6 +66,7 @@ export function TranscriptImportDialog({ open, onClose, onImported }: Transcript
   };
 
   const runImport = async () => {
+    if (busy) return; // double-submit guard — one request per click
     if (!file && pasted.trim().length < 20) {
       setError('Pick a file or paste the transcript text first.');
       return;
@@ -96,9 +101,21 @@ export function TranscriptImportDialog({ open, onClose, onImported }: Transcript
       }
       const payload = (await res.json()) as {
         transcript?: { assemblyai_id?: string; title?: string | null };
+        fastPath?: string;
+        queued?: boolean;
+        assemblyaiId?: string;
       };
-      setDoneId(payload.transcript?.assemblyai_id ?? null);
-      setDoneTitle(payload.transcript?.title ?? null);
+      if (res.status === 202 && payload.queued) {
+        // Unknown format → AI normalizes in the background behind a
+        // placeholder row that's already visible in the list.
+        setQueued(true);
+        setDoneId(null);
+        setDoneTitle(null);
+      } else {
+        setDoneId(payload.transcript?.assemblyai_id ?? null);
+        setDoneTitle(payload.transcript?.title ?? null);
+        setDoneFormat(payload.fastPath ?? null);
+      }
       setStep('done');
       onImported?.();
     } catch (err) {
@@ -196,18 +213,31 @@ export function TranscriptImportDialog({ open, onClose, onImported }: Transcript
           <div className="py-8 text-center space-y-3">
             <Sparkles className="h-10 w-10 mx-auto text-primary animate-pulse" />
             <p className="text-sm text-muted-foreground">
-              AI is reading the format and normalizing the transcript — usually under a
-              minute. Keep this tab open.
+              Checking the transcript format…
             </p>
           </div>
         )}
 
-        {step === 'done' && (
+        {step === 'done' && queued && (
+          <div className="py-6 text-center space-y-2">
+            <Sparkles className="h-10 w-10 mx-auto text-primary" />
+            <p className="text-sm font-medium">Import queued</p>
+            <p className="text-sm text-muted-foreground">
+              AI is normalizing this transcript in the background — usually a few minutes
+              for large files. It already appears in your list and will flip to ready
+              automatically. You can close this dialog.
+            </p>
+          </div>
+        )}
+
+        {step === 'done' && !queued && (
           <div className="py-6 text-center space-y-2">
             <CheckCircle2 className="h-10 w-10 mx-auto text-status-ok" />
             <p className="text-sm font-medium">{doneTitle ?? 'Transcript imported'}</p>
             <p className="text-sm text-muted-foreground">
-              Imported with named speakers — it&apos;s in your list now.
+              {doneFormat
+                ? `Imported instantly — recognized ${doneFormat}.`
+                : 'Imported with named speakers — it’s in your list now.'}
             </p>
             {doneId && (
               <a href={`/transcript/${doneId}`} className="inline-block">

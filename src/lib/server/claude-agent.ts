@@ -53,6 +53,8 @@ export interface RunClaudeOpts {
   resumeSessionId?: string;
   /** Per-call effort override (low|medium|high|xhigh|max) — beats the env. */
   effort?: string;
+  /** Per-call model override (e.g. 'sonnet') — beats MW_CLAUDE_MODEL. */
+  model?: string;
   /** In-process MCP servers (createSdkMcpServer) keyed by server name. */
   mcpServers?: Record<string, McpServerConfig>;
   /** Tool allowlist, e.g. ['mcp__archive__search_transcripts']. */
@@ -75,7 +77,7 @@ export async function runClaudeWithMeta(
       : CLAUDE_EFFORT;
 
   const options: Options = {
-    model: CLAUDE_MODEL,
+    model: opts.model || CLAUDE_MODEL,
     effort,
     // Run from the storage dir, not the repo — headless mode denies tool
     // permission requests anyway, but don't even tempt it with a codebase.
