@@ -88,3 +88,47 @@ pipeline) are embedded in the transcript.
    occurrence callId `3b465b7d-…`; compare against manual row 219 (`ext-eaced482`).
 4. Verification curls + all tenant IDs/gotchas: memory `project_ms_teams_entra_setup.md`.
 5. Secret expires 2028-08-09 (rotation note in runbook).
+
+## 3. Deferred imports, soft-delete trash, and listing perf — 2026-08-19
+
+**File:** [3. deferred-imports-soft-delete-trash-and-listing-perf.txt](3.%20deferred-imports-soft-delete-trash-and-listing-perf.txt)
+
+Three ships, all deployed + prod-E2E-verified:
+1. **Deferred imports** (commit 587bace): import while Google is still preparing
+   artifacts — `defer-<uuid>` placeholder rows (status `'waiting'`), the import
+   route's core extracted to `lib/server/gmeet-import-core.ts`, new 60s
+   deferred-import poller replays the frozen request with the owner's server
+   token. Per-mode deps: transcript→Doc, video→file, both→both (6h cap).
+   Verified end-to-end on the real "alok <> intraa integrations" meeting: video
+   deferral queued → auto-ran 29 min later unattended (row `164a4de9…`).
+   Finding: transcript quick-import rarely defers — Meet's structured API
+   entries land before the Doc is generated.
+2. **Soft delete / trash** (commit 67f5689, migration 021 `deleted_at`): DELETE
+   soft-deletes by default; Trash tab with restore + delete-forever;
+   Move-to-trash button on the detail page + in-trash banner; `deleted_at IS
+   NULL` guards across all readers/pollers/dedupe. The E2E-test duplicate was
+   left in Alok's trash for him to keep or purge.
+3. **Listing perf** (commit 78637ae): `/api/transcripts` was ~195ms server-side —
+   194ms was the suspected-series LATERAL running normalization regexps per
+   (row × key) (~11k evals/call). `WITH norm AS MATERIALIZED` fence → 33ms
+   query, 46-54ms endpoint. Plain subquery hoisting does NOT work (planner
+   inlines it). No indexes needed at this table size.
+
+Ops incident: an ungated `pgrep && pm2 restart` chain killed a live Telefonica
+auto-report mid-run (exit-0 trap — pgrep FINDING processes exits 0); it was
+retriggered and completed. Gating must be a script that reads the count.
+
+**Next session pickup points:**
+1. **Enable gzip on the meetings nginx vhost** — API responses are served
+   uncompressed (280KB JSON, would be ~40KB). Alok was offered this and the
+   session ended before a go-ahead; edit `deploy/nginx-meetings.conf` in-repo,
+   deploy to `/etc/nginx/sites-available/meetings`, `nginx -t && reload`.
+2. Later perf stages (only when scale demands): precompute normalized series
+   keys at write time once ~1k un-attached rows (chip cost is O(rows)); real
+   pagination bundle (cursor by day + server-side tabs/search + ETag/304 on
+   SSE refetches) at ~2-3k rows. Growth: 116 rows in Aug, accelerating.
+3. Cosmetic: video-mode force button says "Re-import (overwrites yours)" but
+   creates a SEPARATE row (only transcript-mode truly overwrites) — label lies.
+4. Deferred-import edge not yet exercised live: 'both'-mode 6h transcript-wait
+   cap, and the 24h give-up path (flips row to error with reason).
+5. Memories written: `project_deferred_imports.md`, `project_soft_delete_trash.md`.
