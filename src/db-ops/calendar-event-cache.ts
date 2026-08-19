@@ -300,6 +300,15 @@ function norecWhere(userId: string, opts: CalendarRangeOpts): ReturnType<typeof 
           AND t.gmeet_context->>'meetingCode' = c.meeting_code
           AND abs(extract(epoch FROM (${IMPORT_OCCURRENCE} - c.event_start))) <= ${OCCURRENCE_WINDOW_S}
       ))
+      -- No-Meet events can still get imports: uploads and pasted transcripts
+      -- link by calendar eventId (an occurrence-specific instance id, so no
+      -- time window is needed). Without this check a linked import leaves the
+      -- event stranded in "No recording".
+      AND NOT EXISTS (
+        SELECT 1 FROM ${sql(SCHEMA)}.transcripts t
+        WHERE t.deleted_at IS NULL
+          AND t.gmeet_context->>'eventId' = c.event_id
+      )
       AND NOT EXISTS (
         SELECT 1 FROM ${sql(SCHEMA)}.calendar_event_mutes m
         WHERE m.user_id = ${userId}
