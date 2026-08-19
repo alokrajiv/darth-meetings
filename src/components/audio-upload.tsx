@@ -44,8 +44,19 @@ export const AUDIO_UPLOAD_INPUT_ID = 'audio-upload-file-input';
  * gate BEFORE the file picker — connecting navigates away, and a file picked
  * beforehand would be lost with it. */
 export const AUDIO_UPLOAD_OPEN_EVENT = 'mw-upload-media-open';
-export function requestMediaUpload(): void {
-  window.dispatchEvent(new Event(AUDIO_UPLOAD_OPEN_EVENT));
+
+/** Optional pre-link: the calendar layers' "Upload…" action passes the event
+ * it was clicked on, so the link step lands pre-selected on that meeting. */
+export interface MediaUploadPrefill {
+  /** Local YYYY-MM-DD of the event. */
+  date: string;
+  eventId: string;
+}
+
+export function requestMediaUpload(prefill?: MediaUploadPrefill): void {
+  window.dispatchEvent(
+    new CustomEvent(AUDIO_UPLOAD_OPEN_EVENT, { detail: prefill ?? null })
+  );
 }
 
 interface AudioUploadProps {
@@ -132,6 +143,8 @@ export function AudioUpload({ onTranscriptCreated }: AudioUploadProps) {
   const [isDialogOpen, setIsDialogOpen] = useState(false);
   const [selectedLanguage, setSelectedLanguage] = useState<string>('');
   const fileInputRef = useRef<HTMLInputElement>(null);
+  /** Event to pre-select on the link step (calendar-row "Upload…" entry). */
+  const prefillRef = useRef<MediaUploadPrefill | null>(null);
 
   // --- stepper state ---
   const [step, setStep] = useState<DialogStep>('files');
@@ -338,10 +351,15 @@ export function AudioUpload({ onTranscriptCreated }: AudioUploadProps) {
       setEventsError(null);
       setDayEvents([]);
       setReportPref('summary');
-      // Meetings are usually uploaded soon after they happened — the file's
-      // own timestamp is a better first guess for the calendar day than today.
-      const stamp = list[0]?.lastModified;
-      setLinkDate(localDateOf(stamp ? new Date(stamp) : new Date()));
+      // A calendar-row "Upload…" arrives with the event to link already
+      // known; otherwise the file's own timestamp is a better first guess
+      // for the calendar day than today.
+      if (prefillRef.current) {
+        setLinkDate(prefillRef.current.date);
+      } else {
+        const stamp = list[0]?.lastModified;
+        setLinkDate(localDateOf(stamp ? new Date(stamp) : new Date()));
+      }
       setIsDialogOpen(true);
     },
     [googleOk, connectSkipped]
@@ -352,7 +370,9 @@ export function AudioUpload({ onTranscriptCreated }: AudioUploadProps) {
   // (connecting navigates away and would discard the pick). The check is
   // synchronous off state, so the picker keeps its user-gesture activation.
   useEffect(() => {
-    const onOpen = () => {
+    const onOpen = (e: Event) => {
+      prefillRef.current =
+        ((e as CustomEvent).detail as MediaUploadPrefill | null) ?? null;
       if (googleOk === false && !connectSkipped) {
         setPendingFiles([]);
         setStep('connect');
@@ -388,7 +408,14 @@ export function AudioUpload({ onTranscriptCreated }: AudioUploadProps) {
       );
       if (!res.ok) throw new Error(`Calendar request failed (${res.status})`);
       const data = (await res.json()) as { items?: CalendarEventLite[] };
-      setDayEvents((data.items ?? []).filter((e) => e.start?.dateTime));
+      const items = (data.items ?? []).filter((e) => e.start?.dateTime);
+      setDayEvents(items);
+      // Calendar-row entry: land pre-selected on the event that was clicked.
+      const want = prefillRef.current?.eventId;
+      if (want && items.some((e) => e.id === want)) {
+        setSelectedEventId(want);
+        prefillRef.current = null;
+      }
     } catch (err) {
       if (err instanceof GoogleNotConnectedError) {
         setGoogleOk(false);
@@ -445,6 +472,7 @@ export function AudioUpload({ onTranscriptCreated }: AudioUploadProps) {
     setIsDialogOpen(false);
     setPendingFiles([]);
     setSelectedLanguage('');
+    prefillRef.current = null;
   };
 
   // Page-wide drag & drop: the visible dropzone strip is gone (it cost a

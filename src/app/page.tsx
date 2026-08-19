@@ -199,7 +199,7 @@ export default function Home() {
             </div>
           )}
         </div>
-        <Button variant="outline" size="sm" onClick={requestMediaUpload}>
+        <Button variant="outline" size="sm" onClick={() => requestMediaUpload()}>
           <FileAudio className="h-4 w-4" />
           Upload media
         </Button>

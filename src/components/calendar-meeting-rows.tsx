@@ -5,8 +5,9 @@ import { TableCell, TableRow } from '@/components/ui/table';
 import { Button } from '@/components/ui/button';
 import { Badge } from '@/components/ui/badge';
 import { formatDuration } from '@/lib/format';
-import { EyeOff, FileText, Loader2, Video, VideoOff } from 'lucide-react';
+import { EyeOff, FileText, Loader2, Settings2, Upload, Video, VideoOff } from 'lucide-react';
 import { MeetLogo, TeamsLogo } from '@/components/provider-icon';
+import { requestMediaUpload } from '@/components/audio-upload';
 
 // Server-declared shapes (type-only import — erased at build, no server
 // code is pulled into the client bundle). Display-only data: importing
@@ -65,19 +66,29 @@ function providerGlyph(r: CalendarMeetingRow) {
   return null;
 }
 
+/** Local YYYY-MM-DD of an ISO instant — matches the upload stepper's day. */
+function localDayOf(iso: string): string {
+  const d = new Date(iso);
+  const p = (n: number) => String(n).padStart(2, '0');
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`;
+}
+
 /**
- * Hover-revealed "hide from this list" control. Opens a small fixed-position
- * popover (same idiom as SeriesBadge — position:fixed escapes the listing
- * table's overflow-hidden container) offering "hide this occurrence" and,
- * for recurring events, "hide all N + future ones". Confirming POSTs
- * /api/calendar-mutes and lets the host silently refetch the calendar
- * layers via onMuteChanged.
+ * Per-event settings gear. Opens a fixed-position popover (same idiom as
+ * SeriesBadge — position:fixed escapes the listing table's overflow-hidden
+ * container) with the event's key facts (time, organizer, attendees,
+ * recurring info) and its actions: hide this occurrence, hide the whole
+ * recurring series + future ones, and — for events with no artifacts —
+ * upload a recording pre-linked to this event. Hides POST
+ * /api/calendar-mutes and let the host silently refetch via onMuteChanged.
  */
-function HideButton({
+function EventGearMenu({
   row: r,
+  layer,
   onMuteChanged,
 }: {
   row: CalendarMeetingRow;
+  layer: CalendarLayer;
   onMuteChanged?: () => void;
 }) {
   const [open, setOpen] = useState(false);
@@ -150,6 +161,16 @@ function HideButton({
     }
   };
 
+  const canUpload = layer === 'norec' && !!r.eventId;
+  const startTs = new Date(r.eventStart);
+  const timeLine =
+    startTs.toLocaleDateString([], { weekday: 'short', day: 'numeric', month: 'short' }) +
+    ' · ' +
+    startTs.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) +
+    (r.eventEnd
+      ? '–' + new Date(r.eventEnd).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
+      : '');
+
   return (
     <>
       <Button
@@ -157,29 +178,74 @@ function HideButton({
         size="sm"
         variant="ghost"
         className="h-7 w-7 p-0 text-muted-foreground opacity-0 transition-opacity hover:text-foreground group-hover:opacity-100"
-        title="Hide from this list"
+        title="Event settings"
         onClick={openPopover}
       >
-        <EyeOff className="h-3.5 w-3.5" />
-        <span className="sr-only">Hide from this list</span>
+        <Settings2 className="h-3.5 w-3.5" />
+        <span className="sr-only">Event settings</span>
       </Button>
       {open && pos && (
         <div
           ref={popRef}
           onClick={(e) => e.stopPropagation()}
-          style={{ position: 'fixed', top: pos.top, left: pos.left, width: 264 }}
+          style={{ position: 'fixed', top: pos.top, left: pos.left, width: 288 }}
           className="z-50 rounded-lg border bg-popover p-2 text-popover-foreground shadow-[0_4px_16px_-2px_rgb(0_0_0/0.12),0_1px_2px_0_rgb(0_0_0/0.04)]"
         >
-          <p className="truncate px-1 pb-1.5 text-xs font-medium">
+          <p className="truncate px-1 text-xs font-medium">
             {r.title?.trim() || '(untitled meeting)'}
           </p>
-          <div className="space-y-0.5">
+          <div className="space-y-0.5 px-1 pb-1.5 pt-0.5 text-[11px] text-muted-foreground">
+            <p>{timeLine}</p>
+            {r.organizerEmail && (
+              <p className="truncate">
+                {r.organizerSelf ? 'Organized by you' : r.organizerEmail}
+                {r.attendeeCount ? ` · ${r.attendeeCount} attendees` : ''}
+              </p>
+            )}
+            <p>
+              {r.provider === 'teams'
+                ? 'Microsoft Teams'
+                : r.hasMeet || r.meetingCode
+                  ? 'Google Meet'
+                  : 'No conferencing link'}
+              {r.hasRecording
+                ? ` · recording ×${r.recordingCount}`
+                : r.hasTranscript
+                  ? ' · transcript only'
+                  : ' · no artifacts'}
+            </p>
+            {r.recurringEventId && (
+              <p>
+                Recurring series
+                {r.seriesCount ? ` · ${r.seriesCount} occurrences seen` : ''}
+              </p>
+            )}
+          </div>
+          <div className="space-y-0.5 border-t pt-1.5">
+            {canUpload && (
+              <button
+                type="button"
+                disabled={busy}
+                onClick={() => {
+                  close();
+                  requestMediaUpload({
+                    date: localDayOf(r.eventStart),
+                    eventId: r.eventId!,
+                  });
+                }}
+                className="flex w-full items-center gap-1.5 rounded px-1.5 py-1 text-left text-sm hover:bg-muted disabled:opacity-50"
+              >
+                <Upload className="h-3.5 w-3.5 text-muted-foreground" />
+                Upload a recording for this meeting…
+              </button>
+            )}
             <button
               type="button"
               disabled={busy}
               onClick={() => void mute('occurrence', r.key)}
-              className="block w-full rounded px-1.5 py-1 text-left text-sm hover:bg-muted disabled:opacity-50"
+              className="flex w-full items-center gap-1.5 rounded px-1.5 py-1 text-left text-sm hover:bg-muted disabled:opacity-50"
             >
+              <EyeOff className="h-3.5 w-3.5 text-muted-foreground" />
               Hide this occurrence
             </button>
             {r.recurringEventId && (
@@ -187,8 +253,9 @@ function HideButton({
                 type="button"
                 disabled={busy}
                 onClick={() => void mute('series', r.recurringEventId!)}
-                className="block w-full rounded px-1.5 py-1 text-left text-sm hover:bg-muted disabled:opacity-50"
+                className="flex w-full items-center gap-1.5 rounded px-1.5 py-1 text-left text-sm hover:bg-muted disabled:opacity-50"
               >
+                <EyeOff className="h-3.5 w-3.5 text-muted-foreground" />
                 Hide all{r.seriesCount ? ` ${r.seriesCount}` : ''} occurrence
                 {r.seriesCount === 1 ? '' : 's'} + future ones
               </button>
@@ -209,8 +276,11 @@ function HideButton({
 interface CalendarEventRowProps {
   row: CalendarMeetingRow;
   layer: CalendarLayer;
-  /** Total column count of the host table — the row spans all of them. */
-  colSpan: number;
+  /** The host table's visible middle columns, in order — calendar rows render
+   * a cell per column so they line up with the archive rows' grid. */
+  visibleCols: string[];
+  /** Responsive-hiding class per column key (the host's COL_RESPONSIVE). */
+  colClass: (key: string) => string;
   onImportMeeting?: (m: { meetingCode: string; eventStart: string }) => void;
   /** A mute was added from this row — host silently refetches the calendar
    * layers + its hidden-list state. */
@@ -218,28 +288,73 @@ interface CalendarEventRowProps {
 }
 
 /**
- * One calendar-event row, rendered INSIDE the merged listing table (it spans
- * the full width — calendar rows keep their own simpler layout rather than
- * following the archive column chooser). A subtle tinted background keeps
- * imported vs not-imported readable at a glance. Pure presentation —
- * fetching, day grouping, and merging live in TranscriptTable.
+ * One calendar-event row, rendered INSIDE the merged listing table. It emits
+ * a cell per visible archive column so organizer/time/duration/attendees sit
+ * in the same grid as the archive rows' Owner/Date/Duration/Speakers. A
+ * subtle tinted background keeps imported vs not-imported readable at a
+ * glance. Pure presentation — fetching, day grouping, and merging live in
+ * TranscriptTable.
  */
 export function CalendarEventRow({
   row: r,
   layer,
-  colSpan,
+  visibleCols,
+  colClass,
   onImportMeeting,
   onMuteChanged,
 }: CalendarEventRowProps) {
   const canImport =
     !!r.meetingCode && (layer === 'unimported' || r.hasMeet) && !!onImportMeeting;
+  const canUpload = !canImport && layer === 'norec' && !!r.eventId;
+
+  const middleCell = (key: string) => {
+    switch (key) {
+      case 'owner':
+        return r.organizerEmail ? (
+          <span className="block max-w-[16ch] truncate text-xs text-muted-foreground">
+            {r.organizerSelf ? 'You' : r.organizerEmail}
+          </span>
+        ) : (
+          <span className="text-xs text-muted-foreground">—</span>
+        );
+      case 'date':
+        // Calendar rows only exist in the merged (day-grouped) view, where
+        // the Date column shows time-of-day — same as archive rows there.
+        return (
+          <span
+            className="text-xs tabular-nums text-muted-foreground"
+            title={new Date(r.eventStart).toLocaleString()}
+          >
+            {new Date(r.eventStart).toLocaleTimeString([], {
+              hour: '2-digit',
+              minute: '2-digit',
+            })}
+          </span>
+        );
+      case 'duration':
+        return (
+          <span className="font-mono text-[11px] tabular-nums text-muted-foreground">
+            {r.durationSecs ? formatDuration(r.durationSecs) : '—'}
+          </span>
+        );
+      case 'speakers':
+        return (
+          <span className="text-xs tabular-nums text-muted-foreground">
+            {r.attendeeCount ?? '—'}
+          </span>
+        );
+      default:
+        return <span className="text-xs text-muted-foreground">—</span>;
+    }
+  };
+
   return (
     <TableRow
       className={`group bg-muted/30 transition-colors hover:bg-accent/30 ${
         r.muted ? 'opacity-60' : ''
       }`}
     >
-      <TableCell colSpan={colSpan} className="py-2 pl-4 pr-3">
+      <TableCell className="py-2 pl-4">
         {/* w-0 + min-w-full: the cell contributes zero min-content width, so
             long nowrap titles can't inflate the table's column layout — the
             content still renders at the cell's full width and truncates. */}
@@ -293,45 +408,51 @@ export function CalendarEventRow({
                 </Badge>
               )}
             </div>
-            {r.organizerEmail && (
-              <div className="truncate text-xs text-muted-foreground">
-                {r.organizerSelf ? 'Organized by you' : r.organizerEmail}
-                {r.attendeeCount ? ` · ${r.attendeeCount} attendees` : ''}
-              </div>
-            )}
           </div>
-          <span
-            className="hidden shrink-0 text-xs tabular-nums text-muted-foreground md:inline"
-            title={new Date(r.eventStart).toLocaleString()}
-          >
-            {new Date(r.eventStart).toLocaleTimeString([], {
-              hour: '2-digit',
-              minute: '2-digit',
-            })}
-          </span>
-          <span className="hidden w-14 shrink-0 text-right font-mono text-[11px] tabular-nums text-muted-foreground sm:inline">
-            {r.durationSecs ? formatDuration(r.durationSecs) : '—'}
-          </span>
-          <span className="flex w-[116px] shrink-0 items-center justify-end gap-0.5">
-            <HideButton row={r} onMuteChanged={onMuteChanged} />
-            {canImport && (
-              <Button
-                size="sm"
-                variant="outline"
-                className="h-7 px-2.5 text-xs"
-                onClick={(e) => {
-                  e.stopPropagation();
-                  onImportMeeting?.({
-                    meetingCode: r.meetingCode!,
-                    eventStart: r.eventStart,
-                  });
-                }}
-              >
-                Import…
-              </Button>
-            )}
-          </span>
         </div>
+        </div>
+      </TableCell>
+      {visibleCols.map((key) => (
+        <TableCell key={key} className={`py-1.5 ${colClass(key)}`}>
+          {middleCell(key)}
+        </TableCell>
+      ))}
+      <TableCell className="py-1.5 pr-3">
+        <div className="flex items-center justify-end gap-0.5">
+          <EventGearMenu row={r} layer={layer} onMuteChanged={onMuteChanged} />
+          {canImport && (
+            <Button
+              size="sm"
+              variant="outline"
+              className="h-7 px-2.5 text-xs"
+              onClick={(e) => {
+                e.stopPropagation();
+                onImportMeeting?.({
+                  meetingCode: r.meetingCode!,
+                  eventStart: r.eventStart,
+                });
+              }}
+            >
+              Import…
+            </Button>
+          )}
+          {canUpload && (
+            <Button
+              size="sm"
+              variant="outline"
+              className="h-7 px-2.5 text-xs"
+              onClick={(e) => {
+                e.stopPropagation();
+                requestMediaUpload({
+                  date: localDayOf(r.eventStart),
+                  eventId: r.eventId!,
+                });
+              }}
+              title="Upload your own recording for this meeting"
+            >
+              Upload…
+            </Button>
+          )}
         </div>
       </TableCell>
     </TableRow>

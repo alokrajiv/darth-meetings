@@ -1911,7 +1911,8 @@ export function TranscriptTable({
                       key={`cal-${it.layer}-${it.row.key}`}
                       row={it.row}
                       layer={it.layer}
-                      colSpan={visibleCols.length + 2}
+                      visibleCols={visibleCols}
+                      colClass={(key) => COL_RESPONSIVE[key as ColKey] ?? ''}
                       onImportMeeting={onImportMeeting}
                       onMuteChanged={handleMuteChanged}
                     />
