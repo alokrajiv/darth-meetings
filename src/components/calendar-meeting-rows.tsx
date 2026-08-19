@@ -5,7 +5,7 @@ import { TableCell, TableRow } from '@/components/ui/table';
 import { Button } from '@/components/ui/button';
 import { Badge } from '@/components/ui/badge';
 import { formatDuration } from '@/lib/format';
-import { EyeOff, FileText, Loader2, Settings2, Upload, Video, VideoOff } from 'lucide-react';
+import { ExternalLink, EyeOff, FileText, Loader2, Settings2, Upload, Video, VideoOff } from 'lucide-react';
 import { MeetLogo, TeamsLogo } from '@/components/provider-icon';
 import { requestMediaUpload } from '@/components/audio-upload';
 
@@ -64,6 +64,110 @@ function providerGlyph(r: CalendarMeetingRow) {
     );
   }
   return null;
+}
+
+/**
+ * Artifact badge that deep-links to the underlying Google artifact — via a
+ * small confirm popover (never a silent jump to another site), so e.g. an
+ * unparseable transcript is one click from diagnosis in Google Docs.
+ * Without a target id it renders as a plain static badge.
+ */
+function ArtifactBadge({
+  label,
+  href,
+  destination,
+  className,
+}: {
+  label: string;
+  href: string | null;
+  destination: string;
+  className: string;
+}) {
+  const [open, setOpen] = useState(false);
+  const [pos, setPos] = useState<{ top: number; left: number } | null>(null);
+  const popRef = useRef<HTMLDivElement>(null);
+  const btnRef = useRef<HTMLButtonElement>(null);
+
+  useEffect(() => {
+    if (!open) return;
+    const onDown = (e: MouseEvent) => {
+      if (
+        popRef.current &&
+        !popRef.current.contains(e.target as Node) &&
+        !btnRef.current?.contains(e.target as Node)
+      ) {
+        setOpen(false);
+      }
+    };
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') setOpen(false);
+    };
+    const onScroll = () => setOpen(false);
+    document.addEventListener('mousedown', onDown);
+    document.addEventListener('keydown', onKey);
+    window.addEventListener('scroll', onScroll, true);
+    return () => {
+      document.removeEventListener('mousedown', onDown);
+      document.removeEventListener('keydown', onKey);
+      window.removeEventListener('scroll', onScroll, true);
+    };
+  }, [open]);
+
+  if (!href) {
+    return (
+      <Badge variant="outline" className={className}>
+        {label}
+      </Badge>
+    );
+  }
+  return (
+    <>
+      <button
+        ref={btnRef}
+        type="button"
+        className="shrink-0"
+        title={`Open ${destination}`}
+        onClick={(e) => {
+          e.stopPropagation();
+          const rect = (e.currentTarget as HTMLElement).getBoundingClientRect();
+          const width = 256;
+          setPos({
+            top: rect.bottom + 6,
+            left: Math.max(8, Math.min(rect.left, window.innerWidth - width - 8)),
+          });
+          setOpen(true);
+        }}
+      >
+        <Badge variant="outline" className={`${className} cursor-pointer hover:bg-muted`}>
+          {label}
+        </Badge>
+      </button>
+      {open && pos && (
+        <div
+          ref={popRef}
+          onClick={(e) => e.stopPropagation()}
+          style={{ position: 'fixed', top: pos.top, left: pos.left, width: 256 }}
+          className="z-50 rounded-lg border bg-popover p-2 text-popover-foreground shadow-[0_4px_16px_-2px_rgb(0_0_0/0.12),0_1px_2px_0_rgb(0_0_0/0.04)]"
+        >
+          <p className="px-1 pb-1.5 text-xs text-muted-foreground">
+            This opens {destination} in a new tab. Google checks your access
+            when it loads.
+          </p>
+          <button
+            type="button"
+            onClick={() => {
+              setOpen(false);
+              window.open(href, '_blank', 'noopener,noreferrer');
+            }}
+            className="flex w-full items-center gap-1.5 rounded px-1.5 py-1 text-left text-sm hover:bg-muted"
+          >
+            <ExternalLink className="h-3.5 w-3.5 text-muted-foreground" />
+            Open {destination}
+          </button>
+        </div>
+      )}
+    </>
+  );
 }
 
 /** Local YYYY-MM-DD of an ISO instant — matches the upload stepper's day. */
@@ -374,22 +478,28 @@ export function CalendarEventRow({
                 {r.title?.trim() || '(untitled meeting)'}
               </div>
               {r.hasRecording && (
-                <Badge variant="outline" className="shrink-0 text-[10px]">
-                  Recording{r.recordingCount > 1 ? ` ×${r.recordingCount}` : ''}
-                </Badge>
+                <ArtifactBadge
+                  label={`Recording${r.recordingCount > 1 ? ` ×${r.recordingCount}` : ''}`}
+                  href={r.videoFileId ? `https://drive.google.com/file/d/${r.videoFileId}/view` : null}
+                  destination="the recording in Google Drive"
+                  className="shrink-0 text-[10px]"
+                />
               )}
               {r.hasTranscript && (
-                <Badge variant="outline" className="shrink-0 text-[10px]">
-                  Transcript
-                </Badge>
+                <ArtifactBadge
+                  label="Transcript"
+                  href={r.transcriptDocId ? `https://docs.google.com/document/d/${r.transcriptDocId}/edit` : null}
+                  destination="the transcript Doc in Google Docs"
+                  className="shrink-0 text-[10px]"
+                />
               )}
               {r.transcriptParseable === false && (
-                <Badge
-                  variant="outline"
+                <ArtifactBadge
+                  label="transcript unparseable"
+                  href={r.transcriptDocId ? `https://docs.google.com/document/d/${r.transcriptDocId}/edit` : null}
+                  destination="the transcript Doc in Google Docs"
                   className="shrink-0 border-amber-500/50 text-[10px] text-amber-600 dark:text-amber-500"
-                >
-                  transcript unparseable
-                </Badge>
+                />
               )}
               {r.muted && (
                 <Badge

@@ -165,6 +165,9 @@ export interface CalendarMeetingDbRow {
   has_meet: boolean;
   muted: boolean;
   event_id: string | null;
+  /** Drive file / Google Doc ids for artifact deep links (unimported only). */
+  video_file_id: string | null;
+  transcript_doc_id: string | null;
   recurring_event_id: string | null;
   /** Occurrences currently cached for the row's recurring series (null when
    * the event isn't recurring) — powers "Hide all N + future ones". */
@@ -370,6 +373,10 @@ async function unimportedRows(
           AND s.event_key IN (c.meeting_code, c.event_key)
       ) AS muted,
       cal.event_id,
+      -- Artifact deep links (display-only ids; Google enforces access when
+      -- the link is opened — same exposure as the gmeet/check meta).
+      c.video_file_id,
+      c.transcript_doc_ids->>0 AS transcript_doc_id,
       COALESCE(c.recurring_event_id, cal.recurring_event_id) AS recurring_event_id,
       -- "Hide all N": occurrences currently cached for the series. The
       -- artifact cache is global, so count deduped (code, instant) pairs;
@@ -440,6 +447,8 @@ async function norecRows(
       false AS has_transcript,
       0 AS recording_count,
       NULL::boolean AS transcript_parseable,
+      NULL::text AS video_file_id,
+      NULL::text AS transcript_doc_id,
       c.organizer_email,
       c.organizer_self,
       c.attendee_count,

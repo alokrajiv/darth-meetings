@@ -49,6 +49,11 @@ export interface CalendarMeetingRow {
   /** Calendar event id (unimported rows: from the caller's own calendar row
    * for the occurrence, when they have one). */
   eventId: string | null;
+  /** Drive file id of the first recording — deep link for diagnosis.
+   * Display-only: Google enforces access when the link is opened. */
+  videoFileId: string | null;
+  /** First transcript Google-Doc id — deep link for diagnosis. */
+  transcriptDocId: string | null;
   /** Stable series id — the "Hide all + future" mute value. */
   recurringEventId: string | null;
   /** Cached occurrences of the series ("Hide all N…"); null = not recurring. */
@@ -112,6 +117,8 @@ function toRow(r: CalendarMeetingDbRow): CalendarMeetingRow {
     hasMeet: r.has_meet,
     muted: r.muted,
     eventId: r.event_id,
+    videoFileId: r.video_file_id,
+    transcriptDocId: r.transcript_doc_id,
     recurringEventId: r.recurring_event_id,
     seriesCount: r.series_count,
   };
