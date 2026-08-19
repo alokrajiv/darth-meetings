@@ -46,6 +46,13 @@ export interface CalendarMeetingRow {
   /** norec rows: whether the event even had a Meet link. */
   hasMeet: boolean;
   muted: boolean;
+  /** Calendar event id (unimported rows: from the caller's own calendar row
+   * for the occurrence, when they have one). */
+  eventId: string | null;
+  /** Stable series id — the "Hide all + future" mute value. */
+  recurringEventId: string | null;
+  /** Cached occurrences of the series ("Hide all N…"); null = not recurring. */
+  seriesCount: number | null;
 }
 
 export interface CalendarMeetingsResponse {
@@ -104,6 +111,9 @@ function toRow(r: CalendarMeetingDbRow): CalendarMeetingRow {
     attendeeCount: r.attendee_count,
     hasMeet: r.has_meet,
     muted: r.muted,
+    eventId: r.event_id,
+    recurringEventId: r.recurring_event_id,
+    seriesCount: r.series_count,
   };
 }
 

@@ -30,6 +30,7 @@ import {
   CalendarX2,
   Check,
   ChevronLeft,
+  EyeOff,
   FileAudio,
   FileText,
   Search,
@@ -38,6 +39,7 @@ import {
   Columns3,
   GripVertical,
   Video,
+  X,
 } from 'lucide-react';
 import { MeetLogo, TeamsLogo } from '@/components/provider-icon';
 import { SeriesBadge } from '@/components/series-badge';
@@ -49,6 +51,10 @@ import {
   type CalendarMeetingRow,
   type CalendarMeetingsResponse,
 } from '@/components/calendar-meeting-rows';
+import type {
+  CalendarMuteEntry,
+  CalendarMutesResponse,
+} from '@/app/api/calendar-mutes/route';
 
 interface TranscriptTableProps {
   refreshTrigger?: number;
@@ -410,6 +416,36 @@ export function TranscriptTable({
   const calSrcRef = useRef(calSrc);
   calSrcRef.current = calSrc;
 
+  // ---- Calendar-event mutes (hidden rows) — /api/calendar-mutes ----
+  // Fetched once on mount (drives the "Hidden (n)" count), refreshed on
+  // popover open and after every add/remove.
+  const [mutes, setMutes] = useState<CalendarMuteEntry[]>([]);
+  const [hiddenOpen, setHiddenOpen] = useState(false);
+  const hiddenMenuRef = useRef<HTMLDivElement | null>(null);
+  const fetchMutes = useCallback(async () => {
+    try {
+      const res = await fetch('/api/calendar-mutes', { credentials: 'include' });
+      if (!res.ok) return;
+      const data = (await res.json()) as CalendarMutesResponse;
+      setMutes(data.mutes);
+    } catch {
+      // quiet — the hidden list just stays stale
+    }
+  }, []);
+  useEffect(() => {
+    void fetchMutes();
+  }, [fetchMutes]);
+  useEffect(() => {
+    if (!hiddenOpen) return;
+    const onDown = (e: MouseEvent) => {
+      if (hiddenMenuRef.current && !hiddenMenuRef.current.contains(e.target as Node)) {
+        setHiddenOpen(false);
+      }
+    };
+    document.addEventListener('mousedown', onDown);
+    return () => document.removeEventListener('mousedown', onDown);
+  }, [hiddenOpen]);
+
   // Column prefs (visibility + order) — loaded client-side to avoid SSR
   // localStorage access; saved on every change.
   const [colPrefs, setColPrefs] = useState<ColPrefs>({
@@ -694,6 +730,47 @@ export function TranscriptTable({
     }
     if (!didCal) void fetchCalCountsRef.current();
   }, []);
+
+  /** Silent refetch of just the calendar layers (+ chip counts) — used
+   * after a mute add/remove: hidden rows must leave/re-enter the timeline
+   * immediately, but the archive layer is unaffected. */
+  const silentRefetchCalendars = useCallback(() => {
+    let didCal = false;
+    if (mergedModeRef.current) {
+      for (const v of CAL_VIEWS) {
+        if (layersRef.current[v] && calSrcRef.current[v].loaded) {
+          didCal = true;
+          void fetchCalendarRef.current(v, 'silent');
+        }
+      }
+    }
+    if (!didCal) void fetchCalCountsRef.current();
+  }, []);
+
+  /** A hide was confirmed from a calendar row's popover. */
+  const handleMuteChanged = useCallback(() => {
+    void fetchMutes();
+    silentRefetchCalendars();
+  }, [fetchMutes, silentRefetchCalendars]);
+
+  const handleUnmute = useCallback(
+    async (m: CalendarMuteEntry) => {
+      try {
+        const res = await fetch(
+          `/api/calendar-mutes?kind=${encodeURIComponent(m.kind)}&value=${encodeURIComponent(m.value)}`,
+          { method: 'DELETE', credentials: 'include' }
+        );
+        if (!res.ok) return;
+        setMutes((prev) =>
+          prev.filter((x) => !(x.kind === m.kind && x.value === m.value))
+        );
+        silentRefetchCalendars();
+      } catch {
+        // quiet — the entry stays listed, retry works
+      }
+    },
+    [silentRefetchCalendars]
+  );
 
   // Import dialogs closing / uploads created bump refreshTrigger — refetch
   // the loaded windows silently (an imported meeting must leave "Not
@@ -1255,6 +1332,58 @@ export function TranscriptTable({
         )}
         {layerChip('norec', 'No recording')}
       </div>
+      {mutes.length > 0 && (
+        <div className="relative mb-2 mt-0.5" ref={hiddenMenuRef}>
+          <button
+            type="button"
+            onClick={() => {
+              setHiddenOpen((v) => {
+                if (!v) void fetchMutes();
+                return !v;
+              });
+            }}
+            aria-expanded={hiddenOpen}
+            title="Calendar rows you've hidden — review or undo"
+            className="flex items-center gap-1 rounded-md px-2 py-1 text-xs text-muted-foreground transition-colors hover:text-foreground"
+          >
+            <EyeOff className="h-3 w-3" />
+            Hidden ({mutes.length})
+          </button>
+          {hiddenOpen && (
+            <div className="absolute left-0 top-full z-50 mt-1 w-72 rounded-md border bg-popover p-1 shadow-md">
+              <p className="px-2 pb-1 pt-1.5 text-[10px] font-medium uppercase tracking-wider text-muted-foreground">
+                Hidden calendar meetings
+              </p>
+              <div className="max-h-64 overflow-y-auto">
+                {mutes.map((m) => (
+                  <div
+                    key={`${m.kind}:${m.value}`}
+                    className="flex items-center gap-1.5 rounded px-2 py-1 hover:bg-muted"
+                  >
+                    <div className="min-w-0 flex-1">
+                      <div className="truncate text-sm">
+                        {m.title?.trim() || m.value}
+                      </div>
+                      <div className="text-[10px] uppercase tracking-wide text-muted-foreground">
+                        {m.kind === 'series' ? 'series + future' : 'occurrence'}
+                      </div>
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() => void handleUnmute(m)}
+                      title="Unhide"
+                      className="rounded p-1 text-muted-foreground hover:bg-muted-foreground/10 hover:text-foreground"
+                    >
+                      <X className="h-3.5 w-3.5" />
+                      <span className="sr-only">Unhide</span>
+                    </button>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+        </div>
+      )}
       <div className="flex items-center">
         {tabButton('all', 'All', counts?.all)}
         {tabButton('mine', 'Mine', counts?.mine)}
@@ -1784,6 +1913,7 @@ export function TranscriptTable({
                       layer={it.layer}
                       colSpan={visibleCols.length + 2}
                       onImportMeeting={onImportMeeting}
+                      onMuteChanged={handleMuteChanged}
                     />
                   )
                 )}

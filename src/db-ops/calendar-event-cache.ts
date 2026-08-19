@@ -84,6 +84,63 @@ export async function upsertCalendarEvents(
 }
 
 // ---------------------------------------------------------------------------
+// Calendar-event mutes (migration 023) — per-user HIDE of calendar rows.
+// Personal blocks ("my lunch", focus time) aren't real meetings; a mute
+// removes them from BOTH calendar layers (norec and unimported). Distinct
+// from gmeet_sync_skips' 'muted' flag, which only de-emphasizes.
+//
+//  - kind='occurrence': value = the row's event_key (one occurrence).
+//  - kind='series':     value = recurring_event_id (falling back to
+//    event_id for non-recurring events) — stable across future poller
+//    rows, so new occurrences are excluded automatically.
+// ---------------------------------------------------------------------------
+
+export type CalendarMuteKind = 'occurrence' | 'series';
+
+export interface CalendarEventMuteRow {
+  kind: CalendarMuteKind;
+  value: string;
+  title: string | null;
+  created_at: string;
+}
+
+export async function addCalendarEventMute(
+  userId: string,
+  kind: CalendarMuteKind,
+  value: string,
+  title: string | null
+): Promise<void> {
+  await sql`
+    INSERT INTO ${sql(SCHEMA)}.calendar_event_mutes (user_id, kind, value, title)
+    VALUES (${userId}, ${kind}, ${value}, ${title})
+    ON CONFLICT (user_id, kind, value) DO UPDATE SET
+      title = COALESCE(EXCLUDED.title, calendar_event_mutes.title)
+  `;
+}
+
+export async function removeCalendarEventMute(
+  userId: string,
+  kind: CalendarMuteKind,
+  value: string
+): Promise<void> {
+  await sql`
+    DELETE FROM ${sql(SCHEMA)}.calendar_event_mutes
+    WHERE user_id = ${userId} AND kind = ${kind} AND value = ${value}
+  `;
+}
+
+export async function listCalendarEventMutes(
+  userId: string
+): Promise<CalendarEventMuteRow[]> {
+  return sql<CalendarEventMuteRow[]>`
+    SELECT kind, value, title, created_at
+    FROM ${sql(SCHEMA)}.calendar_event_mutes
+    WHERE user_id = ${userId}
+    ORDER BY created_at DESC, kind, value
+  `;
+}
+
+// ---------------------------------------------------------------------------
 // /api/calendar-meetings listing queries
 // ---------------------------------------------------------------------------
 
@@ -107,6 +164,11 @@ export interface CalendarMeetingDbRow {
   provider: 'gmeet' | 'teams';
   has_meet: boolean;
   muted: boolean;
+  event_id: string | null;
+  recurring_event_id: string | null;
+  /** Occurrences currently cached for the row's recurring series (null when
+   * the event isn't recurring) — powers "Hide all N + future ones". */
+  series_count: number | null;
 }
 
 export interface CalendarRangeOpts {
@@ -156,7 +218,38 @@ function unimportedDay(tz: string): ReturnType<typeof sql> {
   return sql`(COALESCE(c.event_start, c.conf_start) AT TIME ZONE ${tz})::date`;
 }
 
-function unimportedWhere(opts: CalendarRangeOpts): ReturnType<typeof sql> {
+/** Caller-scoped mute exclusion for the unimported view. A mute hides the
+ * row when it matches the gmeet cache row directly (occurrence → its
+ * event_key, series → its recurring_event_id) OR through the caller's own
+ * calendar row for the same occurrence — so a mute created from the norec
+ * layer keeps hiding the meeting after artifacts appear and it migrates to
+ * the unimported layer (hiding is layer-agnostic). */
+function unimportedMuteExclusion(userId: string): ReturnType<typeof sql> {
+  return sql`
+    AND NOT EXISTS (
+      SELECT 1 FROM ${sql(SCHEMA)}.calendar_event_mutes m
+      WHERE m.user_id = ${userId}
+        AND (
+          (m.kind = 'occurrence' AND m.value = c.event_key)
+          OR (m.kind = 'series' AND m.value = c.recurring_event_id)
+          OR EXISTS (
+            SELECT 1 FROM ${sql(SCHEMA)}.calendar_event_cache ce
+            WHERE ce.user_id = ${userId}
+              AND ce.meeting_code = c.meeting_code
+              AND abs(extract(epoch FROM (
+                    ce.event_start - COALESCE(c.event_start, c.conf_start)
+                  ))) <= ${OCCURRENCE_WINDOW_S}
+              AND (
+                (m.kind = 'occurrence' AND m.value = ce.event_key)
+                OR (m.kind = 'series' AND m.value = COALESCE(ce.recurring_event_id, ce.event_id))
+              )
+          )
+        )
+    )
+  `;
+}
+
+function unimportedWhere(userId: string, opts: CalendarRangeOpts): ReturnType<typeof sql> {
   return sql`
     WHERE COALESCE(c.event_start, c.conf_start) IS NOT NULL
       AND (c.recording_count > 0 OR COALESCE(jsonb_array_length(c.transcript_doc_ids), 0) > 0)
@@ -174,6 +267,7 @@ function unimportedWhere(opts: CalendarRangeOpts): ReturnType<typeof sql> {
                 ${IMPORT_OCCURRENCE} - COALESCE(c.event_start, c.conf_start)
               ))) <= ${OCCURRENCE_WINDOW_S}
       )
+      ${unimportedMuteExclusion(userId)}
       ${dayFilters(unimportedDay(opts.tz), opts)}
   `;
 }
@@ -203,6 +297,14 @@ function norecWhere(userId: string, opts: CalendarRangeOpts): ReturnType<typeof 
           AND t.gmeet_context->>'meetingCode' = c.meeting_code
           AND abs(extract(epoch FROM (${IMPORT_OCCURRENCE} - c.event_start))) <= ${OCCURRENCE_WINDOW_S}
       ))
+      AND NOT EXISTS (
+        SELECT 1 FROM ${sql(SCHEMA)}.calendar_event_mutes m
+        WHERE m.user_id = ${userId}
+          AND (
+            (m.kind = 'occurrence' AND m.value = c.event_key)
+            OR (m.kind = 'series' AND m.value = COALESCE(c.recurring_event_id, c.event_id))
+          )
+      )
       ${dayFilters(norecDay(opts.tz), opts)}
   `;
 }
@@ -221,7 +323,7 @@ export async function countCalendarMeetings(
     sql<Array<{ n: number }>>`
       SELECT count(DISTINCT (c.meeting_code, COALESCE(c.event_start, c.conf_start)))::int AS n
       FROM ${sql(SCHEMA)}.gmeet_meeting_cache c
-      ${unimportedWhere(range)}
+      ${unimportedWhere(caller.userId, range)}
     `,
     sql<Array<{ n: number }>>`
       SELECT count(*)::int AS n
@@ -266,7 +368,26 @@ async function unimportedRows(
         SELECT 1 FROM ${sql(SCHEMA)}.gmeet_sync_skips s
         WHERE s.user_id = ${caller.userId}
           AND s.event_key IN (c.meeting_code, c.event_key)
-      ) AS muted
+      ) AS muted,
+      cal.event_id,
+      COALESCE(c.recurring_event_id, cal.recurring_event_id) AS recurring_event_id,
+      -- "Hide all N": occurrences currently cached for the series. The
+      -- artifact cache is global, so count deduped (code, instant) pairs;
+      -- when only the caller's calendar row knows the recurring id, count
+      -- their own calendar rows instead.
+      CASE
+        WHEN c.recurring_event_id IS NOT NULL THEN (
+          SELECT count(DISTINCT (g2.meeting_code, COALESCE(g2.event_start, g2.conf_start)))::int
+          FROM ${sql(SCHEMA)}.gmeet_meeting_cache g2
+          WHERE g2.recurring_event_id = c.recurring_event_id
+        )
+        WHEN cal.recurring_event_id IS NOT NULL THEN (
+          SELECT count(*)::int
+          FROM ${sql(SCHEMA)}.calendar_event_cache ce2
+          WHERE ce2.user_id = ${caller.userId}
+            AND ce2.recurring_event_id = cal.recurring_event_id
+        )
+      END AS series_count
     FROM ${sql(SCHEMA)}.gmeet_meeting_cache c
     -- Titles live in reminder rows, not the artifact cache. Any user's row
     -- works — display-only per the own-token rule.
@@ -279,7 +400,8 @@ async function unimportedRows(
     -- The caller's own calendar row for the same occurrence enriches with
     -- attendee count / organizer_self / title+end fallbacks.
     LEFT JOIN LATERAL (
-      SELECT ce.title, ce.event_end, ce.organizer_email, ce.organizer_self, ce.attendee_count
+      SELECT ce.title, ce.event_end, ce.organizer_email, ce.organizer_self,
+             ce.attendee_count, ce.event_id, ce.recurring_event_id
       FROM ${sql(SCHEMA)}.calendar_event_cache ce
       WHERE ce.user_id = ${caller.userId}
         AND ce.meeting_code = c.meeting_code
@@ -291,7 +413,7 @@ async function unimportedRows(
       )))
       LIMIT 1
     ) cal ON true
-    ${unimportedWhere(opts)}
+    ${unimportedWhere(caller.userId, opts)}
       AND to_char(${day}, 'YYYY-MM-DD') = ANY(${dayKeys})
     ORDER BY c.meeting_code, COALESCE(c.event_start, c.conf_start), c.event_key DESC
     ) d
@@ -327,7 +449,15 @@ async function norecRows(
         SELECT 1 FROM ${sql(SCHEMA)}.gmeet_sync_skips s
         WHERE s.user_id = c.user_id
           AND s.event_key IN (c.meeting_code, c.event_id, c.event_key)
-      ) AS muted
+      ) AS muted,
+      c.event_id,
+      c.recurring_event_id,
+      CASE WHEN c.recurring_event_id IS NOT NULL THEN (
+        SELECT count(*)::int
+        FROM ${sql(SCHEMA)}.calendar_event_cache ce2
+        WHERE ce2.user_id = c.user_id
+          AND ce2.recurring_event_id = c.recurring_event_id
+      ) END AS series_count
     FROM ${sql(SCHEMA)}.calendar_event_cache c
     ${norecWhere(userId, opts)}
       AND to_char(${day}, 'YYYY-MM-DD') = ANY(${dayKeys})
@@ -353,7 +483,9 @@ export async function listCalendarMeetingsPage(
 ): Promise<CalendarMeetingsPage> {
   const day = view === 'unimported' ? unimportedDay(opts.tz) : norecDay(opts.tz);
   const where =
-    view === 'unimported' ? unimportedWhere(opts) : norecWhere(caller.userId, opts);
+    view === 'unimported'
+      ? unimportedWhere(caller.userId, opts)
+      : norecWhere(caller.userId, opts);
   const table = view === 'unimported' ? sql`gmeet_meeting_cache` : sql`calendar_event_cache`;
 
   // Per-day row counts drive the minRows accounting — for unimported, count
