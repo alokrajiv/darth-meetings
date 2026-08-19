@@ -2533,7 +2533,7 @@ export default function TranscriptDetailPage({ params }: TranscriptDetailPagePro
                             <div key={i} className="h-3 animate-pulse rounded bg-muted" style={{ width: w }} />
                           ))}
                           <p className="pt-1 text-xs text-muted-foreground">
-                            Writing the detailed report — high effort, and it reads the video frames, so give it a few minutes.
+                            Writing the detailed report — high effort, so give it a few minutes.
                             The quick summary refreshes right after, distilled from the same session.
                           </p>
                         </div>
@@ -2611,8 +2611,9 @@ export default function TranscriptDetailPage({ params }: TranscriptDetailPagePro
                             Generate detailed report
                           </Button>
                           <p className="mt-2 max-w-[46ch] text-xs text-muted-foreground">
-                            A wiki-style deep dive: topic sections, tables, screenshots from the
-                            recording, and click-to-jump timestamp citations. Slower and pricier
+                            A wiki-style deep dive: topic sections, tables,
+                            {hasLocalVideo || canFetchVideo ? ' screenshots from the recording,' : ''}{' '}
+                            and click-to-jump timestamp citations. Slower and pricier
                             than the summary — worth it for dense meetings.
                           </p>
                         </div>
@@ -3280,11 +3281,14 @@ export default function TranscriptDetailPage({ params }: TranscriptDetailPagePro
               >
                 <span className="flex items-center gap-2 text-sm font-medium">
                   <FileText className="h-4 w-4 text-primary" />
-                  Detailed report — text only
+                  {hasLocalVideo || canFetchVideo
+                    ? 'Detailed report — text only'
+                    : 'Detailed report'}
                 </span>
                 <span className="mt-0.5 block text-xs text-muted-foreground">
-                  Same deep dive without reading the video. Cheaper; use when the meeting had no
-                  screen share worth seeing.
+                  {hasLocalVideo || canFetchVideo
+                    ? 'Same deep dive without reading the video. Cheaper; use when the meeting had no screen share worth seeing.'
+                    : 'Wiki-style deep dive at high effort: topic sections, tables, and click-to-jump citations. Slower.'}
                 </span>
               </button>
             </div>

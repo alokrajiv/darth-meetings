@@ -18,6 +18,11 @@ import {
   createTextImportPlaceholder,
   ingestParsedUtterances,
 } from '@/lib/server/ingest-parsed';
+import {
+  linkedEventIngestFields,
+  sanitizeLinkedEvent,
+  type LinkedEventIngestFields,
+} from '@/lib/server/linked-event';
 import { tryParseTranscriptText } from '@/lib/server/transcript-text-parse';
 import { updateMetaForUser, updateStatusForUser, type TranscriptRow } from '@/db-ops/transcripts';
 import { publishEvent } from '@/lib/server/event-bus';
@@ -167,7 +172,8 @@ async function normalizeTextInBackground(
   row: TranscriptRow,
   sourceText: string,
   title: string | null,
-  originalFilename: string | null
+  originalFilename: string | null,
+  link: LinkedEventIngestFields | null
 ): Promise<void> {
   const sourceId = row.assemblyai_id;
   const basePrompt = RECIPE_PROMPT + sourceText;
@@ -216,10 +222,14 @@ async function normalizeTextInBackground(
     // speaker_count, title, status 'completed') and publishes 'created'.
     await ingestParsedUtterances(user, {
       sourceId,
-      title: title ?? normalized.title?.trim().slice(0, 200) ?? null,
+      title:
+        title ?? normalized.title?.trim().slice(0, 200) ?? link?.eventTitle ?? null,
       parsed: { attendees: normalized.attendees ?? [], utterances },
       originalFilename,
+      recordedAtIso: link?.recordedAtIso ?? null,
       languageCode: normalized.language ?? null,
+      gmeetContext: link?.gmeetContext ?? null,
+      attendees: link?.attendees ?? [],
       logTag: '[import-text]',
     });
     publishEvent({ kind: 'status', assemblyaiId: sourceId });
@@ -259,9 +269,14 @@ async function normalizeTextInBackground(
 /**
  * POST /api/transcripts/import-text
  *
- * Import a transcript from ANY format. Body: JSON { text, title?, filename? }
- * for pasted content, or raw file bytes with an `x-filename` header (docx /
- * pdf / vtt / srt / txt — text is extracted server-side).
+ * Import a transcript from ANY format. Body: JSON { text, title?, filename?,
+ * linkedEvent? } for pasted content, or raw file bytes with an `x-filename`
+ * header (docx / pdf / vtt / srt / txt — text is extracted server-side; an
+ * optional `x-linked-event` header carries the linkage, same encoding as the
+ * media-upload route). `linkedEvent` is the calendar event this transcript
+ * belongs to — it's stamped into gmeet_context exactly like an uploaded
+ * recording's link (title/recorded_at fallbacks, invitee context for speaker
+ * naming, series auto-attach).
  *
  * Known machine-regular formats (VTT, SRT, "Name | MM:SS", …) are parsed
  * deterministically and ingest synchronously → 201 with `fastPath` set.
@@ -275,9 +290,10 @@ export const POST = withAuth(async ({ user, request }) => {
   let sourceText = '';
   let title: string | null = null;
   let originalFilename: string | null = null;
+  let linkedEventRaw: unknown = null;
 
   if (contentType.includes('application/json')) {
-    let body: { text?: string; title?: string; filename?: string };
+    let body: { text?: string; title?: string; filename?: string; linkedEvent?: unknown };
     try {
       body = (await request.json()) as typeof body;
     } catch {
@@ -286,7 +302,16 @@ export const POST = withAuth(async ({ user, request }) => {
     sourceText = typeof body.text === 'string' ? body.text : '';
     title = body.title?.trim() || null;
     originalFilename = body.filename?.trim() || null;
+    linkedEventRaw = body.linkedEvent ?? null;
   } else {
+    const rawLinked = request.headers.get('x-linked-event');
+    if (rawLinked) {
+      try {
+        linkedEventRaw = JSON.parse(decodeURIComponent(rawLinked));
+      } catch {
+        linkedEventRaw = null;
+      }
+    }
     const rawName = request.headers.get('x-filename');
     if (rawName) {
       try {
@@ -321,6 +346,9 @@ export const POST = withAuth(async ({ user, request }) => {
     }
   }
 
+  const linkedEvent = sanitizeLinkedEvent(linkedEventRaw);
+  const link = linkedEvent ? linkedEventIngestFields(linkedEvent) : null;
+
   sourceText = sourceText.trim();
   if (sourceText.length < 20) {
     return NextResponse.json(
@@ -344,9 +372,12 @@ export const POST = withAuth(async ({ user, request }) => {
       { userId: user.userId, email: user.email },
       {
         sourceId: syntheticId,
-        title,
+        title: title ?? link?.eventTitle ?? null,
         parsed: { attendees, utterances },
         originalFilename,
+        recordedAtIso: link?.recordedAtIso ?? null,
+        gmeetContext: link?.gmeetContext ?? null,
+        attendees: link?.attendees ?? [],
         logTag: '[import-text]',
       }
     );
@@ -356,6 +387,9 @@ export const POST = withAuth(async ({ user, request }) => {
   // Unknown format → async LLM normalization behind a placeholder row.
   const dedupeKey = createHash('sha256')
     .update(user.userId)
+    .update('\0')
+    // Same text linked to a different event is a distinct import.
+    .update(linkedEvent?.id ?? '')
     .update('\0')
     .update(sourceText)
     .digest('hex');
@@ -373,7 +407,7 @@ export const POST = withAuth(async ({ user, request }) => {
   const syntheticId = `ext-${randomUUID().slice(0, 12)}`;
   const placeholderPromise = createTextImportPlaceholder(
     { userId: user.userId },
-    { sourceId: syntheticId, title, originalFilename }
+    { sourceId: syntheticId, title: title ?? link?.eventTitle ?? null, originalFilename }
   );
   const infoPromise = placeholderPromise.then((r) => ({
     id: r.id,
@@ -391,7 +425,8 @@ export const POST = withAuth(async ({ user, request }) => {
         row,
         sourceText,
         title,
-        originalFilename
+        originalFilename,
+        link
       );
     } catch (err) {
       console.error('[import-text] background normalization wrapper failed:', err);

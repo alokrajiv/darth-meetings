@@ -35,18 +35,18 @@ import {
 } from '@/lib/google-token';
 import type { StoredTranscript } from '@/lib/format';
 
-/** DOM id of the hidden file input — lets the page header's "Upload media"
- * button trigger the picker without threading refs across components. */
+/** DOM id of the hidden file input (kept for tests/debug hooks). */
 export const AUDIO_UPLOAD_INPUT_ID = 'audio-upload-file-input';
 
-/** Entry point for the header's "Upload media" button. Goes through the
- * component (not the raw file input) so a not-connected user hits the Google
- * gate BEFORE the file picker — connecting navigates away, and a file picked
- * beforehand would be lost with it. */
+/** Entry point for the header's "Upload media" button and the calendar rows'
+ * "Upload…" actions. Opens the dialog at the 'pick' step (drop zone + paste
+ * lane) — a not-connected user hits the Google gate first, since connecting
+ * navigates away and would discard anything picked beforehand. */
 export const AUDIO_UPLOAD_OPEN_EVENT = 'mw-upload-media-open';
 
 /** Optional pre-link: the calendar layers' "Upload…" action passes the event
- * it was clicked on, so the link step lands pre-selected on that meeting. */
+ * it was clicked on — the 'pick' step shows it as a banner and the link step
+ * lands pre-selected on that meeting. */
 export interface MediaUploadPrefill {
   /** Local YYYY-MM-DD of the event. */
   date: string;
@@ -110,7 +110,7 @@ interface CalendarEventLite {
 }
 
 type ReportPref = 'summary' | 'detailed-video' | 'detailed-text' | 'later';
-type DialogStep = 'connect' | 'files' | 'link' | 'process';
+type DialogStep = 'connect' | 'pick' | 'files' | 'link' | 'process';
 
 const POLL_INTERVAL_MS = 3000;
 
@@ -136,6 +136,16 @@ function fmtEventTime(e: CalendarEventLite): string {
   return new Date(iso).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
 }
 
+function fmtEventDay(e: CalendarEventLite): string {
+  const iso = e.start?.dateTime;
+  if (!iso) return '';
+  return new Date(iso).toLocaleDateString([], {
+    weekday: 'short',
+    day: 'numeric',
+    month: 'short',
+  });
+}
+
 export function AudioUpload({ onTranscriptCreated }: AudioUploadProps) {
   const [uploads, setUploads] = useState<UploadStatus[]>([]);
   const [isDragging, setIsDragging] = useState(false);
@@ -143,11 +153,23 @@ export function AudioUpload({ onTranscriptCreated }: AudioUploadProps) {
   const [isDialogOpen, setIsDialogOpen] = useState(false);
   const [selectedLanguage, setSelectedLanguage] = useState<string>('');
   const fileInputRef = useRef<HTMLInputElement>(null);
-  /** Event to pre-select on the link step (calendar-row "Upload…" entry). */
-  const prefillRef = useRef<MediaUploadPrefill | null>(null);
+  /** Event to pre-link (calendar-row "Upload…" entry). Plain state, captured
+   * when the dialog opens — the old ref-across-the-native-chooser approach
+   * arrived null at handleFilesSelected, so the pre-link never applied. */
+  const [prefill, setPrefill] = useState<MediaUploadPrefill | null>(null);
+
+  // --- paste-a-transcript state (the 'pick' step's second lane) ---
+  const [pasteOpen, setPasteOpen] = useState(false);
+  const [pasteText, setPasteText] = useState('');
+  const [pasteBusy, setPasteBusy] = useState(false);
+  const [pasteError, setPasteError] = useState<string | null>(null);
+  const [pasteResult, setPasteResult] = useState<{
+    queued: boolean;
+    id: string | null;
+  } | null>(null);
 
   // --- stepper state ---
-  const [step, setStep] = useState<DialogStep>('files');
+  const [step, setStep] = useState<DialogStep>('pick');
   /** null = unknown (not probed yet); false = Google not connected. */
   const [googleOk, setGoogleOk] = useState<boolean | null>(null);
   /** User clicked through the connect gate this session — don't nag again. */
@@ -342,90 +364,122 @@ export function AudioUpload({ onTranscriptCreated }: AudioUploadProps) {
   const handleFilesSelected = useCallback(
     (files: FileList) => {
       const list = Array.from(files);
+      if (list.length === 0) return;
       setPendingFiles(list);
       setSelectedLanguage('');
-      // Drag-drop lands here with a file already in hand — a not-connected
-      // user still gets the gate first (with the re-select caveat spelled out).
-      setStep(googleOk === false && !connectSkipped ? 'connect' : 'files');
-      setSelectedEventId(null);
-      setEventsError(null);
-      setDayEvents([]);
       setReportPref('summary');
-      // A calendar-row "Upload…" arrives with the event to link already
-      // known; otherwise the file's own timestamp is a better first guess
-      // for the calendar day than today.
-      if (prefillRef.current) {
-        setLinkDate(prefillRef.current.date);
+      setEventsError(null);
+      // Coming from the 'pick' step, the pre-link banner's selection carries
+      // straight into the link step. Page-wide drag-drop (dialog closed)
+      // starts fresh — and linking one event to a multi-file batch makes no
+      // sense, so that clears the link too.
+      const keepLink = isDialogOpen && list.length === 1;
+      if (!keepLink) {
+        setPrefill(null);
+        setSelectedEventId(null);
+        setDayEvents([]);
+      }
+      // A calendar-row "Upload…" arrives with the event's day already known;
+      // otherwise the file's own timestamp is a better first guess for the
+      // calendar day than today.
+      const activePrefill = keepLink ? prefill : null;
+      if (activePrefill) {
+        setLinkDate(activePrefill.date);
       } else {
         const stamp = list[0]?.lastModified;
         setLinkDate(localDateOf(stamp ? new Date(stamp) : new Date()));
       }
+      // Drag-drop lands here with a file already in hand — a not-connected
+      // user still gets the gate first (with the re-select caveat spelled out).
+      setStep(googleOk === false && !connectSkipped ? 'connect' : 'files');
       setIsDialogOpen(true);
     },
-    [googleOk, connectSkipped]
+    [googleOk, connectSkipped, isDialogOpen, prefill]
   );
 
-  // The header button dispatches this instead of clicking the file input
-  // directly: not-connected users see the Google gate BEFORE picking a file
-  // (connecting navigates away and would discard the pick). The check is
-  // synchronous off state, so the picker keeps its user-gesture activation.
+  /** Load the day's calendar events for the link step and the 'pick' step's
+   * pre-link banner (silent server-minted token — same as the Meet import
+   * dialog). `preselect` lands the selection on that event when it exists on
+   * the day; when it doesn't (or the calendar is unreachable), any active
+   * pre-link is dropped so the banner never promises a link it can't make. */
+  const loadDayEvents = useCallback(
+    async (forDate: string, preselect?: string | null) => {
+      setEventsBusy(true);
+      setEventsError(null);
+      try {
+        const token = await getGoogleAccessToken();
+        setGoogleOk(true);
+        const params = new URLSearchParams({
+          timeMin: new Date(`${forDate}T00:00:00`).toISOString(),
+          timeMax: new Date(`${forDate}T23:59:59.999`).toISOString(),
+          singleEvents: 'true',
+          orderBy: 'startTime',
+          maxResults: '50',
+          fields:
+            'items(id,summary,recurringEventId,iCalUID,organizer(email),start,end,attendees(email,displayName,responseStatus),conferenceData(conferenceId))',
+        });
+        const res = await fetch(
+          `https://www.googleapis.com/calendar/v3/calendars/primary/events?${params}`,
+          { headers: { Authorization: `Bearer ${token}` } }
+        );
+        if (!res.ok) throw new Error(`Calendar request failed (${res.status})`);
+        const data = (await res.json()) as { items?: CalendarEventLite[] };
+        const items = (data.items ?? []).filter((e) => e.start?.dateTime);
+        setDayEvents(items);
+        if (preselect) {
+          if (items.some((e) => e.id === preselect)) {
+            setSelectedEventId(preselect);
+          } else {
+            setPrefill(null);
+          }
+        }
+      } catch (err) {
+        if (preselect) setPrefill(null);
+        if (err instanceof GoogleNotConnectedError) {
+          setGoogleOk(false);
+        } else {
+          setEventsError(err instanceof Error ? err.message : 'Failed to load calendar');
+        }
+      } finally {
+        setEventsBusy(false);
+      }
+    },
+    []
+  );
+
+  // The calendar rows' "Upload…" entries and the header's "Upload media"
+  // button dispatch this. It opens the dialog at the 'pick' step (drop zone +
+  // paste lane) — never the native picker directly, so the pre-link survives
+  // in React state instead of dying across the native-chooser boundary.
+  // Not-connected users see the Google gate first (connecting navigates away).
   useEffect(() => {
     const onOpen = (e: Event) => {
-      prefillRef.current =
-        ((e as CustomEvent).detail as MediaUploadPrefill | null) ?? null;
+      const detail = ((e as CustomEvent).detail as MediaUploadPrefill | null) ?? null;
+      setPrefill(detail);
+      setPendingFiles([]);
+      setSelectedLanguage('');
+      setReportPref('summary');
+      setSelectedEventId(null);
+      setDayEvents([]);
+      setEventsError(null);
+      setPasteOpen(false);
+      setPasteText('');
+      setPasteError(null);
+      setPasteResult(null);
+      const date = detail?.date ?? localDateOf(new Date());
+      setLinkDate(date);
       if (googleOk === false && !connectSkipped) {
-        setPendingFiles([]);
         setStep('connect');
-        setIsDialogOpen(true);
       } else {
-        fileInputRef.current?.click();
+        setStep('pick');
+        // Resolve the pre-link banner's title/time from the day's events.
+        if (detail) void loadDayEvents(date, detail.eventId);
       }
+      setIsDialogOpen(true);
     };
     window.addEventListener(AUDIO_UPLOAD_OPEN_EVENT, onOpen);
     return () => window.removeEventListener(AUDIO_UPLOAD_OPEN_EVENT, onOpen);
-  }, [googleOk, connectSkipped]);
-
-  /** Load the day's calendar events for the link step (silent server-minted
-   * token — same as the Meet import dialog). */
-  const loadDayEvents = useCallback(async (forDate: string) => {
-    setEventsBusy(true);
-    setEventsError(null);
-    try {
-      const token = await getGoogleAccessToken();
-      setGoogleOk(true);
-      const params = new URLSearchParams({
-        timeMin: new Date(`${forDate}T00:00:00`).toISOString(),
-        timeMax: new Date(`${forDate}T23:59:59.999`).toISOString(),
-        singleEvents: 'true',
-        orderBy: 'startTime',
-        maxResults: '50',
-        fields:
-          'items(id,summary,recurringEventId,iCalUID,organizer(email),start,end,attendees(email,displayName,responseStatus),conferenceData(conferenceId))',
-      });
-      const res = await fetch(
-        `https://www.googleapis.com/calendar/v3/calendars/primary/events?${params}`,
-        { headers: { Authorization: `Bearer ${token}` } }
-      );
-      if (!res.ok) throw new Error(`Calendar request failed (${res.status})`);
-      const data = (await res.json()) as { items?: CalendarEventLite[] };
-      const items = (data.items ?? []).filter((e) => e.start?.dateTime);
-      setDayEvents(items);
-      // Calendar-row entry: land pre-selected on the event that was clicked.
-      const want = prefillRef.current?.eventId;
-      if (want && items.some((e) => e.id === want)) {
-        setSelectedEventId(want);
-        prefillRef.current = null;
-      }
-    } catch (err) {
-      if (err instanceof GoogleNotConnectedError) {
-        setGoogleOk(false);
-      } else {
-        setEventsError(err instanceof Error ? err.message : 'Failed to load calendar');
-      }
-    } finally {
-      setEventsBusy(false);
-    }
-  }, []);
+  }, [googleOk, connectSkipped, loadDayEvents]);
 
   const changeLinkDate = (next: string) => {
     setLinkDate(next);
@@ -435,7 +489,9 @@ export function AudioUpload({ onTranscriptCreated }: AudioUploadProps) {
 
   const goToLinkStep = () => {
     setStep('link');
-    void loadDayEvents(linkDate);
+    // Keep the pre-link (or an earlier manual pick) selected across the
+    // reload — state-driven, so it survives however the files arrived.
+    void loadDayEvents(linkDate, selectedEventId ?? prefill?.eventId ?? null);
   };
 
   const buildLinkedEvent = (): LinkedEvent | null => {
@@ -472,7 +528,48 @@ export function AudioUpload({ onTranscriptCreated }: AudioUploadProps) {
     setIsDialogOpen(false);
     setPendingFiles([]);
     setSelectedLanguage('');
-    prefillRef.current = null;
+    setPrefill(null);
+    setPasteOpen(false);
+    setPasteText('');
+    setPasteError(null);
+    setPasteResult(null);
+  };
+
+  /** The 'pick' step's paste lane: route the text through the same import
+   * API as the "Import a transcript" dialog, carrying the pre-linked event
+   * along so the transcript lands with the meeting's title and invitees. */
+  const importPastedText = async () => {
+    if (pasteBusy) return;
+    setPasteBusy(true);
+    setPasteError(null);
+    try {
+      const linked = prefill ? buildLinkedEvent() : null;
+      const res = await fetch('/api/transcripts/import-text', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          text: pasteText,
+          ...(linked ? { linkedEvent: linked } : {}),
+        }),
+      });
+      if (!res.ok) {
+        const detail = await res.json().catch(() => ({}) as { error?: string });
+        throw new Error(detail.error || `Import failed (${res.status})`);
+      }
+      const payload = (await res.json()) as {
+        queued?: boolean;
+        transcript?: { assemblyai_id?: string };
+      };
+      setPasteResult({
+        queued: res.status === 202 && !!payload.queued,
+        id: payload.transcript?.assemblyai_id ?? null,
+      });
+      onTranscriptCreated?.();
+    } catch (err) {
+      setPasteError(err instanceof Error ? err.message : 'Import failed');
+    } finally {
+      setPasteBusy(false);
+    }
   };
 
   // Page-wide drag & drop: the visible dropzone strip is gone (it cost a
@@ -605,8 +702,12 @@ export function AudioUpload({ onTranscriptCreated }: AudioUploadProps) {
     {
       value: 'detailed-text',
       icon: <FileText className="h-4 w-4 text-primary" />,
-      label: 'Detailed report — text only',
-      detail: 'Same deep dive without reading the video. Cheaper.',
+      // The comparative phrasing only makes sense when the video option is
+      // showing above it — with audio-only files this IS the detailed report.
+      label: hasVideoFile ? 'Detailed report — text only' : 'Detailed report',
+      detail: hasVideoFile
+        ? 'Same deep dive without reading the video. Cheaper.'
+        : 'Wiki-style deep dive with tables and click-to-jump citations. Slower.',
     },
     {
       value: 'later',
@@ -680,11 +781,12 @@ export function AudioUpload({ onTranscriptCreated }: AudioUploadProps) {
         )}
       </div>
 
-      <Dialog open={isDialogOpen} onOpenChange={setIsDialogOpen}>
+      <Dialog open={isDialogOpen} onOpenChange={(o) => !o && handleCancelUpload()}>
         <DialogContent className="rounded-xl shadow-[0_4px_16px_-2px_rgb(0_0_0/0.08),0_1px_2px_0_rgb(0_0_0/0.04)]">
           <DialogHeader>
             <DialogTitle className="text-base font-semibold">
               {step === 'connect' && 'Connect Google Calendar first'}
+              {step === 'pick' && 'Add a meeting recording'}
               {step === 'files' && 'Upload media'}
               {step === 'link' && 'Link to a calendar meeting?'}
               {step === 'process' && 'How should it be processed?'}
@@ -704,6 +806,144 @@ export function AudioUpload({ onTranscriptCreated }: AudioUploadProps) {
                 {pendingFiles.length > 0 &&
                   ' The file you just dropped can’t survive that trip, so you’ll re-select it afterwards.'}
               </p>
+            </div>
+          )}
+
+          {step === 'pick' && (
+            <div className="min-w-0 space-y-3 py-2">
+              {pasteResult ? (
+                <div className="space-y-2 py-4 text-center">
+                  {pasteResult.queued ? (
+                    <Sparkles className="mx-auto h-10 w-10 text-primary" />
+                  ) : (
+                    <CheckCircle className="mx-auto h-10 w-10 text-status-ok" />
+                  )}
+                  <p className="text-sm font-medium">
+                    {pasteResult.queued ? 'Import started' : 'Transcript imported'}
+                  </p>
+                  <p className="text-sm text-muted-foreground">
+                    {pasteResult.queued
+                      ? 'AI is tidying the text into a proper transcript — usually under a minute. It already shows in your list and will flip to ready on its own.'
+                      : 'It’s in your list now, with named speakers.'}
+                  </p>
+                  {pasteResult.id && (
+                    <a href={`/transcript/${pasteResult.id}`} className="inline-block">
+                      <Button size="sm" variant="outline">
+                        Open transcript
+                      </Button>
+                    </a>
+                  )}
+                </div>
+              ) : (
+                <>
+                  {prefill && (
+                    <div className="flex items-start justify-between gap-2 rounded-md border border-primary/30 bg-primary/5 px-3 py-2">
+                      <p className="min-w-0 text-xs text-muted-foreground">
+                        <CalendarDays className="mr-1.5 inline h-3.5 w-3.5 text-primary" />
+                        {selectedEvent ? (
+                          <>
+                            Linking to{' '}
+                            <span className="font-medium text-foreground">
+                              {selectedEvent.summary ?? '(no title)'}
+                            </span>
+                            {' — '}
+                            {fmtEventDay(selectedEvent)}, {fmtEventTime(selectedEvent)}
+                          </>
+                        ) : (
+                          'Finding this meeting on your calendar…'
+                        )}
+                      </p>
+                      <button
+                        type="button"
+                        className="shrink-0 rounded p-0.5 text-muted-foreground hover:bg-muted hover:text-foreground"
+                        title="Don’t link to this meeting"
+                        onClick={() => {
+                          setPrefill(null);
+                          setSelectedEventId(null);
+                        }}
+                      >
+                        <X className="h-3.5 w-3.5" />
+                      </button>
+                    </div>
+                  )}
+                  <button
+                    type="button"
+                    onClick={() => fileInputRef.current?.click()}
+                    className="w-full rounded-xl border-2 border-dashed p-6 text-center transition-colors hover:border-primary hover:bg-muted/40"
+                  >
+                    <Upload className="mx-auto h-6 w-6 text-primary" />
+                    <p className="mt-2 text-sm font-medium">
+                      Drop a recording here, or click to choose a file
+                    </p>
+                    <p className="mt-1 text-xs text-muted-foreground">
+                      audio or video · up to 4 GB · mp4 · mp3 · m4a · wav
+                    </p>
+                  </button>
+                  {!pasteOpen ? (
+                    <button
+                      type="button"
+                      onClick={() => setPasteOpen(true)}
+                      className="w-full rounded-md border p-2.5 text-left text-sm text-muted-foreground hover:bg-muted/50"
+                    >
+                      <FileText className="mr-2 inline h-4 w-4" />
+                      …or paste a transcript instead
+                    </button>
+                  ) : (
+                    <div className="space-y-2">
+                      <textarea
+                        autoFocus
+                        value={pasteText}
+                        onChange={(e) => setPasteText(e.target.value)}
+                        placeholder={'e.g.\n[10:02] Jane Tan: morning everyone…\nJohn: shall we start?'}
+                        className="h-28 w-full resize-y rounded-md border bg-transparent p-2 font-mono text-sm"
+                        disabled={pasteBusy}
+                      />
+                      {pasteError && (
+                        <p className="flex items-center gap-1 text-xs text-destructive">
+                          <AlertCircle className="h-4 w-4" />
+                          {pasteError}
+                        </p>
+                      )}
+                      <Button
+                        size="sm"
+                        onClick={() => void importPastedText()}
+                        // Also wait for the pre-link banner to resolve, so a
+                        // fast paste doesn't import without its event link.
+                        disabled={
+                          pasteBusy ||
+                          pasteText.trim().length < 20 ||
+                          (!!prefill && eventsBusy)
+                        }
+                      >
+                        {pasteBusy ? (
+                          <Loader2 className="h-4 w-4 animate-spin" />
+                        ) : (
+                          <Sparkles className="h-4 w-4" />
+                        )}
+                        Import text
+                      </Button>
+                    </div>
+                  )}
+                  <div className="space-y-1 rounded-md bg-muted/40 px-3 py-2 text-xs text-muted-foreground">
+                    <p>
+                      <Film className="mr-1.5 inline h-3.5 w-3.5" />
+                      <span className="font-medium text-foreground">Video</span> is best —
+                      detailed reports can read screen shares and include screenshots.
+                    </p>
+                    <p>
+                      <FileAudio className="mr-1.5 inline h-3.5 w-3.5" />
+                      <span className="font-medium text-foreground">Audio</span> gets full
+                      transcription, speaker voice matching, and playback.
+                    </p>
+                    <p>
+                      <FileText className="mr-1.5 inline h-3.5 w-3.5" />
+                      <span className="font-medium text-foreground">Pasted text</span>{' '}
+                      imports instantly — but with no recording there’s no voice matching
+                      or playback.
+                    </p>
+                  </div>
+                </>
+              )}
             </div>
           )}
 
@@ -908,22 +1148,27 @@ export function AudioUpload({ onTranscriptCreated }: AudioUploadProps) {
           )}
 
           <DialogFooter>
-            <Button variant="ghost" onClick={handleCancelUpload}>
-              Cancel
-            </Button>
+            {!(step === 'pick' && pasteResult) && (
+              <Button variant="ghost" onClick={handleCancelUpload}>
+                Cancel
+              </Button>
+            )}
+            {step === 'pick' && pasteResult && (
+              <Button onClick={handleCancelUpload}>Done</Button>
+            )}
             {step === 'connect' && (
               <>
                 <Button
                   variant="ghost"
                   onClick={() => {
                     setConnectSkipped(true);
-                    if (pendingFiles.length > 0) {
-                      setStep('files');
-                    } else {
-                      // Button path: nothing picked yet — close the gate and
-                      // open the picker (still inside this click's gesture).
-                      setIsDialogOpen(false);
-                      fileInputRef.current?.click();
+                    // Drag-drop path arrives with the file in hand; the
+                    // button/menu path continues to the drop-zone step.
+                    setStep(pendingFiles.length > 0 ? 'files' : 'pick');
+                    // A pre-link can't resolve without Google — this probe
+                    // fails fast and drops the banner honestly.
+                    if (pendingFiles.length === 0 && prefill) {
+                      void loadDayEvents(prefill.date, prefill.eventId);
                     }
                   }}
                 >
@@ -936,15 +1181,26 @@ export function AudioUpload({ onTranscriptCreated }: AudioUploadProps) {
               </>
             )}
             {step === 'files' && (
-              <Button
-                onClick={() => {
-                  if (canLink) goToLinkStep();
-                  else setStep('process');
-                }}
-                disabled={pendingFiles.length === 0}
-              >
-                Next
-              </Button>
+              <>
+                <Button
+                  variant="ghost"
+                  onClick={() => {
+                    setPendingFiles([]);
+                    setStep('pick');
+                  }}
+                >
+                  Back
+                </Button>
+                <Button
+                  onClick={() => {
+                    if (canLink) goToLinkStep();
+                    else setStep('process');
+                  }}
+                  disabled={pendingFiles.length === 0}
+                >
+                  Next
+                </Button>
+              </>
             )}
             {step === 'link' && (
               <>
