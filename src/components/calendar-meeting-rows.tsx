@@ -94,6 +94,10 @@ export function CalendarEventRow({
       }`}
     >
       <TableCell colSpan={colSpan} className="py-2 pl-4 pr-3">
+        {/* w-0 + min-w-full: the cell contributes zero min-content width, so
+            long nowrap titles can't inflate the table's column layout — the
+            content still renders at the cell's full width and truncates. */}
+        <div className="w-0 min-w-full">
         <div className="flex min-w-0 items-center gap-2">
           {statusGlyph(r)}
           {providerGlyph(r)}
@@ -180,6 +184,7 @@ export function CalendarEventRow({
               </Button>
             )}
           </span>
+        </div>
         </div>
       </TableCell>
     </TableRow>
