@@ -3,7 +3,14 @@ import { createHash, randomUUID } from 'node:crypto';
 import path from 'node:path';
 import { promises as fsp } from 'node:fs';
 import { withAuth } from '@/lib/auth/with-auth';
-import { runClaudeWithMeta, parseJsonFromClaude } from '@/lib/server/claude-agent';
+import {
+  runClaudeWithMeta,
+  parseJsonFromClaude,
+  type ClaudeRunMeta,
+  type ClaudeRunResult,
+} from '@/lib/server/claude-agent';
+import { applyRecipeWithValidation } from '@/lib/server/transcript-recipe';
+import type { ParsedTextUtterance } from '@/lib/server/transcript-text-parse';
 import { recordAiRun } from '@/db-ops/ai-runs';
 import { extractAttachmentText } from '@/lib/server/attachment-extract';
 import { getStorageDir } from '@/lib/server/audio-storage';
@@ -23,40 +30,89 @@ export const maxDuration = 600;
 
 const MAX_INPUT_CHARS = 400_000;
 const CHARS_PER_SECOND = 14; // fallback timing when the source has no timestamps
-// The LLM pass is mechanical reformatting — a fast model on low effort is
-// plenty (the opus/medium default was the 2026-08-18 timeout incident).
+// The LLM pass only emits a tiny parsing RECIPE (never the transcript text —
+// the verbatim-echo prompt was the 2026-08-18 timeout incident: output tokens
+// scaled 1:1 with file size). A fast model on low effort is plenty; the
+// generous timeout stays as a belt-and-suspenders bound.
 const NORMALIZE_TIMEOUT_MS = 900 * 1000;
 
-const NORMALIZE_PROMPT = `You are a meeting-transcript format normalizer.
+const RECIPE_PROMPT = `You are a meeting-transcript format analyst.
 
-Below is the raw content of a meeting transcript exported from some tool (Microsoft Teams, Zoom, Webex, a VTT/SRT caption file, a chat log, pasted notes — the format is unknown). Convert it to EXACTLY this JSON shape and output ONLY the JSON, no markdown fences, no commentary:
+Below is the raw content of a meeting transcript exported from some tool (Microsoft Teams, Zoom, Webex, a caption file, a chat log, pasted notes — the format is unknown). DO NOT re-emit, transcribe, or reformat the content itself. Instead, analyze its STRUCTURE and return ONLY a small JSON "parsing recipe" that a program will apply to the original text to split it into speaker turns.
+
+Output EXACTLY one JSON object, no markdown fences, no commentary:
 
 {"title": <string or null — the meeting title if the document states one>,
  "attendees": <array of participant name strings, [] if unknown>,
  "language": <BCP-47-ish language code of the speech, e.g. "en", or null>,
- "utterances": [{"speaker": <string>, "text": <string>, "start_ms": <integer or null>, "end_ms": <integer or null>}]}
+ "recipe": <recipe object, option A or B below>}
 
-Rules:
-- Preserve utterance order exactly. Do not summarize, translate, correct, or invent anything — the text must be verbatim from the source (you may repair obvious mojibake/encoding artifacts).
-- Caption formats (VTT/SRT) split one sentence across many cues: merge consecutive cues of the SAME speaker into one utterance when they clearly form continuous speech; use the first cue's start and last cue's end.
-- Timestamps: convert whatever format the source uses (hh:mm:ss.mmm, mm:ss, "5m 2s", absolute clock times) to integer milliseconds from meeting start. If the source has none, use null.
-- Speaker: the name as written in the source. If a line has no speaker, attribute it to the most recent speaker; if there is genuinely no speaker information at all, use "Speaker 1".
-- Skip non-speech furniture: headers, page numbers, "recording started", timestamps-only lines, disclaimers.
+Option A — "line-regex" (STRONGLY preferred: use it whenever the file has ANY per-line structure — speaker headers, timestamps, "Name: text" lines, chat-log prefixes):
+
+{"kind": "line-regex",
+ "headerRegex": <JavaScript regex source, no surrounding slashes, max 300 chars>,
+ "headerStyle": "own-line" | "inline-prefix",
+ "flags": <optional flags string, e.g. "i">,
+ "evidence": [<1-2 example lines from the source that the regex matches — for debuggability>]}
+
+- headerRegex MUST use named capture groups: (?<speaker>…) is required; add (?<h>…), (?<m>…), (?<s>…) for hour/minute/second timestamp digits when the format has timestamps; for inline-prefix you may add (?<text>…) for the speech on the header line.
+- "own-line": the speaker/timestamp header is a line of its own; a line matching headerRegex starts a new turn and the following non-matching lines are that turn's speech.
+- "inline-prefix": headerRegex matches at the START of a line (anchor it with ^); the rest of the line (or the (?<text>) group) is the turn's speech; following non-matching lines continue the same turn.
+- The regex is applied to each individual trimmed line. Make it strict enough that ordinary speech lines do NOT match it.
+
+Option B — "anchors" (ONLY when the text has no per-line structure at all, e.g. flowing prose):
+
+{"kind": "anchors",
+ "turns": [{"speaker": <string>, "anchor": <verbatim quote of the FIRST few words of that turn, max 80 chars>}, …]}
+
+- List every speaker turn in source order. Each anchor must be copied character-for-character from the source (a program locates them with indexOf, scanning forward only) and should be distinctive enough to pin down that spot. Keep every anchor short (max 80 chars) — never quote more.
+- If speakers are unnamed, use "Speaker 1", "Speaker 2", ….
+
+Hard rules:
+- NEVER output the transcript content. The ONLY source text allowed in your output is the short evidence lines / anchors described above.
+- Your entire output must stay small — a recipe, not a transcript.
 
 Source content follows:
 
 `;
 
-interface NormalizedTranscript {
+interface RecipeResponse {
   title?: string | null;
   attendees?: string[];
   language?: string | null;
-  utterances?: Array<{
-    speaker?: string;
-    text?: string;
-    start_ms?: number | null;
-    end_ms?: number | null;
-  }>;
+  recipe?: unknown;
+}
+
+/** Combine per-attempt usage so both the first try and the corrective retry
+ * land in ONE ai_run (sums the additive fields, keeps the final model/session). */
+function combineRunMeta(runs: ClaudeRunResult[]): ClaudeRunMeta | null {
+  if (runs.length === 0) return null;
+  if (runs.length === 1) return runs[0]!.meta;
+  const last = runs[runs.length - 1]!.meta;
+  const sum = (pick: (m: ClaudeRunMeta) => number | null): number | null => {
+    let any = false;
+    let total = 0;
+    for (const r of runs) {
+      const v = pick(r.meta);
+      if (v != null) {
+        any = true;
+        total += v;
+      }
+    }
+    return any ? total : null;
+  };
+  return {
+    sessionId: last.sessionId,
+    model: last.model,
+    costUsd: sum((m) => m.costUsd),
+    durationMs: sum((m) => m.durationMs),
+    apiDurationMs: sum((m) => m.apiDurationMs),
+    numTurns: sum((m) => m.numTurns),
+    inputTokens: sum((m) => m.inputTokens),
+    outputTokens: sum((m) => m.outputTokens),
+    cacheReadTokens: sum((m) => m.cacheReadTokens),
+    cacheCreationTokens: sum((m) => m.cacheCreationTokens),
+  };
 }
 
 /**
@@ -97,7 +153,15 @@ declare global {
 const inFlight: Map<string, Promise<{ id: number; assemblyaiId: string }>> =
   globalThis.__mwImportNormalizeInflight ?? (globalThis.__mwImportNormalizeInflight = new Map());
 
-/** Background LLM normalization filling a pre-created placeholder row. */
+/**
+ * Background LLM normalization filling a pre-created placeholder row.
+ *
+ * The model only returns a small parsing RECIPE (line-regex or anchors, see
+ * transcript-recipe.ts) which is applied to the source text in pure code. A
+ * recipe that fails the validation bars gets ONE corrective retry (same
+ * prompt + a short failure report); if that also fails the row flips to
+ * 'error' with an honest message. Both attempts' usage lands in one ai_run.
+ */
 async function normalizeTextInBackground(
   user: { userId: string; email: string },
   row: TranscriptRow,
@@ -106,29 +170,47 @@ async function normalizeTextInBackground(
   originalFilename: string | null
 ): Promise<void> {
   const sourceId = row.assemblyai_id;
-  const normalizePrompt = NORMALIZE_PROMPT + sourceText;
-  let normalizeRun: Awaited<ReturnType<typeof runClaudeWithMeta>> | null = null;
+  const basePrompt = RECIPE_PROMPT + sourceText;
+  const runs: ClaudeRunResult[] = [];
+  let promptCharsTotal = 0;
   try {
-    normalizeRun = await runClaudeWithMeta(normalizePrompt, {
-      timeoutMs: NORMALIZE_TIMEOUT_MS,
-      model: process.env.MW_IMPORT_NORMALIZE_MODEL || 'sonnet',
-      effort: process.env.MW_IMPORT_NORMALIZE_EFFORT || 'low',
-    });
-    const normalized = parseJsonFromClaude<NormalizedTranscript>(normalizeRun.text);
-    const rawUtterances = (normalized.utterances ?? []).filter(
-      (u) => typeof u.text === 'string' && u.text.trim().length > 0
-    );
-    if (rawUtterances.length === 0) {
+    let recipeUtterances: ParsedTextUtterance[] | null = null;
+    let normalized: RecipeResponse = {};
+    let prompt = basePrompt;
+    for (let attempt = 0; attempt < 2; attempt++) {
+      promptCharsTotal += prompt.length;
+      const run = await runClaudeWithMeta(prompt, {
+        timeoutMs: NORMALIZE_TIMEOUT_MS,
+        model: process.env.MW_IMPORT_NORMALIZE_MODEL || 'sonnet',
+        effort: process.env.MW_IMPORT_NORMALIZE_EFFORT || 'low',
+      });
+      runs.push(run);
+
+      let failure: string;
+      try {
+        normalized = parseJsonFromClaude<RecipeResponse>(run.text);
+        const applied = applyRecipeWithValidation(sourceText, normalized.recipe);
+        if (applied.ok) {
+          recipeUtterances = applied.utterances;
+          break;
+        }
+        failure = applied.failure;
+      } catch (parseErr) {
+        failure = `your response was not parseable JSON: ${String(
+          parseErr instanceof Error ? parseErr.message : parseErr
+        ).slice(0, 200)}`;
+      }
+      if (attempt === 0) {
+        console.warn(`[import-text] recipe attempt 1 failed (${sourceId}): ${failure}`);
+        prompt = `${basePrompt}\n\n---\nA previous attempt at this task returned a recipe that failed validation: ${failure}.\nAnalyze the structure again and return a corrected recipe — same JSON shape, ONLY the JSON object.`;
+      } else {
+        throw new Error(`Could not derive a working parsing recipe: ${failure}`);
+      }
+    }
+    if (!recipeUtterances || recipeUtterances.length === 0) {
       throw new Error('No utterances could be recognised in that content.');
     }
-    const utterances = fillTiming(
-      rawUtterances.map((u) => ({
-        speaker: u.speaker ?? 'Speaker 1',
-        text: u.text!,
-        startMs: u.start_ms,
-        endMs: u.end_ms,
-      }))
-    );
+    const utterances = fillTiming(recipeUtterances);
 
     // Same-id upsert fills the placeholder in place (content, duration,
     // speaker_count, title, status 'completed') and publishes 'created'.
@@ -149,9 +231,9 @@ async function normalizeTextInBackground(
       kind: 'import_normalize',
       triggeredBy: { userId: user.userId, email: user.email },
       status: 'completed',
-      meta: normalizeRun.meta,
-      promptChars: normalizePrompt.length,
-      resultChars: normalizeRun.text.length,
+      meta: combineRunMeta(runs),
+      promptChars: promptCharsTotal,
+      resultChars: runs.reduce((n, r) => n + r.text.length, 0),
     });
   } catch (err) {
     console.error('[import-text] async normalization failed:', err);
@@ -168,8 +250,8 @@ async function normalizeTextInBackground(
       triggeredBy: { userId: user.userId, email: user.email },
       status: 'error',
       error: String(err).slice(0, 1000),
-      meta: normalizeRun?.meta ?? null,
-      promptChars: normalizePrompt.length,
+      meta: combineRunMeta(runs),
+      promptChars: promptCharsTotal || basePrompt.length,
     });
   }
 }

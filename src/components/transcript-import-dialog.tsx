@@ -223,8 +223,8 @@ export function TranscriptImportDialog({ open, onClose, onImported }: Transcript
             <Sparkles className="h-10 w-10 mx-auto text-primary" />
             <p className="text-sm font-medium">Import queued</p>
             <p className="text-sm text-muted-foreground">
-              AI is normalizing this transcript in the background — usually a few minutes
-              for large files. It already appears in your list and will flip to ready
+              AI is normalizing this transcript in the background — usually under a
+              minute. It already appears in your list and will flip to ready
               automatically. You can close this dialog.
             </p>
           </div>

@@ -209,8 +209,9 @@ function tryVtt(text: string): ParsedTextUtterance[] | null {
 }
 
 /** Merge consecutive same-speaker utterances into one turn — keep the FIRST
- * timestamp, join texts verbatim with a space. */
-function mergeConsecutive(utts: ParsedTextUtterance[]): ParsedTextUtterance[] {
+ * timestamp, join texts verbatim with a space. Exported for the LLM recipe
+ * engine (transcript-recipe.ts), which reuses the exact same merge. */
+export function mergeConsecutive(utts: ParsedTextUtterance[]): ParsedTextUtterance[] {
   const out: ParsedTextUtterance[] = [];
   for (const u of utts) {
     const prev = out[out.length - 1];
