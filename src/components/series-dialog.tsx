@@ -1114,6 +1114,15 @@ export function SeriesDialog({ seriesId, onClose, onChanged, onMerged }: SeriesD
                             </>
                           )}
                         </span>
+                        <a
+                          href={`/series?series=${d.id}`}
+                          target="_blank"
+                          rel="noopener noreferrer"
+                          className="inline-flex items-center gap-1 text-xs text-primary hover:underline"
+                          title="Open the other series in a new tab to compare before merging"
+                        >
+                          View it <ExternalLink className="h-3 w-3" />
+                        </a>
                         <Button
                           size="sm"
                           variant="outline"

@@ -130,6 +130,15 @@ export default function SeriesIndexPage() {
     void load();
   }, [load]);
 
+  // Deep link: /series?series=<id> opens that series' dialog on load (the
+  // dup banner's "View it" link and anything else that wants to point at a
+  // series from another tab). Read once from the URL — no Suspense dance.
+  useEffect(() => {
+    const raw = new URLSearchParams(window.location.search).get('series');
+    const id = raw ? Number(raw) : NaN;
+    if (Number.isInteger(id) && id > 0) setOpenSeriesId(id);
+  }, []);
+
   // Importable column: sweep every series' occurrences in small chunks
   // (server caches the external part per user for 6h, so re-visits are
   // instant). Re-runs when the series set changes (new series / merge).
