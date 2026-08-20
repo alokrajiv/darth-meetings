@@ -418,6 +418,17 @@ export interface SeriesSuggestion {
   recorded_at: string | null;
   created_at: string;
   matched_kinds: string[];
+  /** Context so the "confirm?" row can say WHAT this meeting is. */
+  status: string;
+  duration: number | null;
+  source: 'uploaded' | 'imported';
+  /** Caller owns it (vs shared with them). */
+  owned: boolean;
+  provider: 'gmeet' | 'teams' | null;
+  event_title: string | null;
+  event_start: string | null;
+  organizer_email: string | null;
+  attendee_count: number;
 }
 
 /**
@@ -433,7 +444,20 @@ export async function listSuggestedMembers(
   return sql<SeriesSuggestion[]>`
     SELECT t.id AS transcript_id, t.assemblyai_id, t.title,
            t.recorded_at::text AS recorded_at, t.created_at::text AS created_at,
-           array_agg(DISTINCT k.kind) AS matched_kinds
+           array_agg(DISTINCT k.kind) AS matched_kinds,
+           t.status, t.duration, t.source,
+           (t.user_id = ${caller.userId}) AS owned,
+           CASE
+             WHEN t.gmeet_context->>'provider' = 'teams' THEN 'teams'
+             WHEN t.assemblyai_id LIKE 'gmeet-%'
+                  OR t.gmeet_context->>'meetingCode' IS NOT NULL THEN 'gmeet'
+           END AS provider,
+           NULLIF(t.gmeet_context->>'eventTitle', '') AS event_title,
+           NULLIF(t.gmeet_context->>'startTime', '') AS event_start,
+           NULLIF(t.gmeet_context->>'organizerEmail', '') AS organizer_email,
+           COALESCE(jsonb_array_length(
+             CASE WHEN jsonb_typeof(t.gmeet_context->'attendees') = 'array'
+                  THEN t.gmeet_context->'attendees' END), 0)::int AS attendee_count
     FROM ${sql(SCHEMA)}.series_keys k
     JOIN ${sql(SCHEMA)}.transcripts t ON (
       (k.kind = 'meeting-code' AND t.gmeet_context->>'meetingCode' = k.value) OR
@@ -462,7 +486,7 @@ export async function listSuggestedMembers(
       AND (t.user_id = ${caller.userId} OR sh.id IS NOT NULL)
       AND t.status NOT IN ('uploading', 'waiting')
       AND t.deleted_at IS NULL
-    GROUP BY t.id, t.assemblyai_id, t.title, t.recorded_at, t.created_at
+    GROUP BY t.id
     ORDER BY COALESCE(t.recorded_at, t.created_at) DESC
   `;
 }

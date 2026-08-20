@@ -60,6 +60,7 @@ interface CalInstance {
   id?: string;
   status?: string;
   summary?: string;
+  htmlLink?: string;
   recurringEventId?: string;
   iCalUID?: string;
   organizer?: { email?: string };
@@ -95,6 +96,8 @@ export interface SeriesOccurrence {
   videoFileId: string | null;
   transcriptDocId: string | null;
   teams: { joinWebUrl: string; callId: string | null } | null;
+  /** Google Calendar "open event" link (calendar-sourced occurrences). */
+  calendarUrl: string | null;
   imported: OccurrenceImportedRef[];
 }
 
@@ -117,7 +120,7 @@ export interface SeriesOccurrencesResult {
 }
 
 const FIELDS =
-  'items(id,status,summary,recurringEventId,iCalUID,organizer(email),start,end,' +
+  'items(id,status,summary,htmlLink,recurringEventId,iCalUID,organizer(email),start,end,' +
   'attendees(email,displayName,responseStatus),attachments(fileId,title,mimeType),' +
   'conferenceData(conferenceId)),nextPageToken';
 
@@ -371,6 +374,7 @@ async function computeSweepSkeleton(
       videoFileId,
       transcriptDocId,
       teams: null,
+      calendarUrl: inst.htmlLink ?? null,
       imported: [],
     });
   }
@@ -441,6 +445,7 @@ async function computeSweepSkeleton(
             videoFileId: null,
             transcriptDocId: null,
             teams: { joinWebUrl: info.joinWebUrl, callId },
+            calendarUrl: null,
             imported: [],
           });
         }
