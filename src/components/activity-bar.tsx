@@ -330,6 +330,19 @@ function groupByDay(events: ActivityRow[]): DayGroup[] {
   return groups;
 }
 
+/** Squash consecutive rows by the same person with the same verb ("edited
+ *  speakers" ×7 in a row) into one row with a count; time = the latest. */
+interface Run { row: ActivityRow; count: number }
+function collapseRuns(rows: ActivityRow[]): Run[] {
+  const out: Run[] = [];
+  for (const row of rows) {
+    const prev = out[out.length - 1];
+    if (prev && prev.row.user_id === row.user_id && actionVerb(prev.row) === actionVerb(row)) prev.count += 1;
+    else out.push({ row, count: 1 });
+  }
+  return out;
+}
+
 function viewersSentence(viewers: DayGroup['viewers']): string {
   const parts = viewers.map((v) => (v.count > 1 ? `${firstName(v.name)} ×${v.count}` : firstName(v.name)));
   if (parts.length <= 1) return parts.join('');
@@ -570,13 +583,14 @@ function PersonDetail({ person, onClear }: { person: Person; onClear: () => void
         </p>
       ) : (
         <ol className="space-y-1.5">
-          {person.events.map((row) => (
+          {collapseRuns(person.events).map(({ row, count }) => (
             <li key={row.id} className="flex items-center gap-2 text-sm">
               <span className="flex h-5 w-5 shrink-0 items-center justify-center rounded-full bg-muted text-muted-foreground">
                 {actionIcon(row.action)}
               </span>
               <span className={`min-w-0 flex-1 truncate ${row.action === 'view' ? 'text-muted-foreground' : ''}`}>
                 {actionVerb(row)}
+                {count > 1 && <span className="text-muted-foreground"> ×{count}</span>}
               </span>
               <span
                 className="shrink-0 text-[11px] text-muted-foreground tabular-nums"
@@ -604,7 +618,7 @@ function Timeline({ days }: { days: DayGroup[] }) {
             {g.label}
           </h3>
           <ol className="space-y-1.5">
-            {g.edits.map((row) => {
+            {collapseRuns(g.edits).map(({ row, count }) => {
               const n = displayName({ name: row.user_name, email: row.user_email });
               return (
                 <li key={row.id} className="flex items-center gap-2">
@@ -621,7 +635,10 @@ function Timeline({ days }: { days: DayGroup[] }) {
                   </span>
                   <span className="min-w-0 flex-1 truncate text-sm">
                     <span className="font-medium">{firstName(n)}</span>{' '}
-                    <span className="text-muted-foreground">{actionVerb(row)}</span>
+                    <span className="text-muted-foreground">
+                      {actionVerb(row)}
+                      {count > 1 ? ` ×${count}` : ''}
+                    </span>
                   </span>
                   <span
                     className="shrink-0 text-[11px] text-muted-foreground tabular-nums"
