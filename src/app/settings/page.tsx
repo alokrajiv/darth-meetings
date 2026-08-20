@@ -7,6 +7,7 @@ import { RefreshCw } from 'lucide-react';
 import { AppHeader } from '@/components/app-header';
 import { VocabEditor } from '@/components/vocab-editor';
 import { GoogleAccountCard } from '@/components/google-account-card';
+import { MicrosoftAccountCard } from '@/components/microsoft-account-card';
 import { NotifyPrefsCard } from '@/components/notify-prefs-card';
 import type { VocabPayload } from '@/lib/format';
 
@@ -102,12 +103,13 @@ export default function SettingsPage() {
       <div className="mb-5">
         <h1 className="text-2xl font-semibold tracking-tight leading-tight">Settings</h1>
         <p className="text-sm text-muted-foreground">
-          Key terms and custom spellings — applied at transcription time.
+          Connected accounts, notifications, and key terms / custom spellings applied at transcription time.
         </p>
       </div>
 
       <div className="mb-6 space-y-6">
         <GoogleAccountCard />
+        <MicrosoftAccountCard />
         <NotifyPrefsCard />
       </div>
 

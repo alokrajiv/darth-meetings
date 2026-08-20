@@ -12,6 +12,36 @@ Formerly known as *Meeting Whisperer*.
   speaker-named text, search, audio/frame/attachment download, notes/report
   write-back) and the calling AI agent brings its own model.
 
+## Darth family
+
+| Member | Web | CLI | Repo |
+|---|---|---|---|
+| darth-auth (login, tokens, installer) | `auth.darth-internal.trames.io` | `darth-cli login` | `darth-cli/auth-service` |
+| Darth Tasks (plagueis) | `tasks.darth-internal.trames.io` | `darth-cli tasks` | `darth-plagueis` |
+| Darth Artifacts | `artifacts.darth-internal.trames.io` | `darth-cli artifacts` | `darth-artifacts` |
+| Darth Meetings | `meetings.darth-internal.trames.io` | `darth-cli meetings` | `darth-meetings` (dir `meeting-whisperer`) |
+
+All members share: Trames SSO (`trames-auth-session` cookie, lowercased SSO
+email is the cross-app join key), one `darth-cli` with `dth_` user tokens /
+`dapp_` app tokens resolved via darth-auth introspection, hosting on the .6 VM
+behind one nginx under the `*.darth-internal.trames.io` wildcard, and the rule
+**one owner per external account link — siblings surface and deep-link, never
+re-grant**. The full map (who holds Google / the two Microsoft registrations /
+Slack, every cross-member call, the add-a-member checklist) is
+[`darth-cli/DARTH-FAMILY.md`](https://github.com/alokrajiv/darth-cli/blob/main/DARTH-FAMILY.md).
+
+What **this** member owns / consumes:
+
+- **Owns** the Google account link (per-user OAuth, Settings page) and the
+  app-only "Darth Meetings" Entra registration used for Teams *meeting*
+  transcripts/recordings (no per-user step).
+- **Surfaces** the Microsoft *Teams chat* link owned by Darth Tasks on its
+  Settings page (status / connect / disconnect proxied to
+  `tasks…/api/ms/*` with the caller's SSO cookie; connect round-trips back via
+  `?return=`). Meeting imports never need that link.
+- **Calls** Darth Tasks `POST /api/notify` (`DARTH_APP_TOKEN`) for Slack DMs,
+  and reads `darth_plagueis.ppl/emails` read-only for people lookups.
+
 ## What it does
 
 - Upload any recording (multi-GB streaming) or import Google Meet
