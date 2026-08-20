@@ -226,6 +226,8 @@ export interface DupSibling {
   id: number;
   title: string;
   member_count: number;
+  /** Newest member's date — disambiguates same-named siblings in the UI. */
+  last_recorded_at: string | null;
   reason: DupReason;
 }
 
@@ -287,10 +289,14 @@ export async function findDuplicateSeries(): Promise<Map<number, DupSibling[]>> 
     JOIN sig b ON b.kind = a.kind AND b.value = a.value AND b.series_id > a.series_id
     WHERE a.value IS NOT NULL AND a.value <> ''
   `;
-  const series = await sql<Array<{ id: number; title: string; member_count: number }>>`
-    SELECT s.id, s.title, count(m.id)::int AS member_count
+  const series = await sql<
+    Array<{ id: number; title: string; member_count: number; last_recorded_at: string | null }>
+  >`
+    SELECT s.id, s.title, count(m.id)::int AS member_count,
+           max(COALESCE(t.recorded_at, t.created_at))::text AS last_recorded_at
     FROM ${sql(SCHEMA)}.series s
     LEFT JOIN ${sql(SCHEMA)}.series_members m ON m.series_id = s.id
+    LEFT JOIN ${sql(SCHEMA)}.transcripts t ON t.id = m.transcript_id AND t.deleted_at IS NULL
     GROUP BY s.id, s.title
   `;
   const byId = new Map(series.map((s) => [s.id, s]));

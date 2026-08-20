@@ -81,7 +81,13 @@ interface SeriesDetail {
   }>;
   /** Probable-duplicate sibling series (shared Meet code / recurring event /
    * Teams meeting / name) — the one-click merge prompt. */
-  dupes: Array<{ id: number; title: string; member_count: number; reason: string }>;
+  dupes: Array<{
+    id: number;
+    title: string;
+    member_count: number;
+    last_recorded_at: string | null;
+    reason: string;
+  }>;
 }
 
 interface Occurrence {
@@ -1081,13 +1087,32 @@ export function SeriesDialog({ seriesId, onClose, onChanged, onMerged }: SeriesD
                 <div className="mt-1 space-y-1">
                   {detail.dupes.map((d) => {
                     const thisBigger = detail.members.length > d.member_count;
+                    const sameName =
+                      d.title.trim().toLowerCase() === detail.series.title.trim().toLowerCase();
+                    const mine = detail.members.length;
+                    const otherLast = d.last_recorded_at ? dateLabel(d.last_recorded_at) : null;
                     return (
                       <div key={d.id} className="flex flex-wrap items-center gap-x-2 gap-y-1 text-xs">
                         <span className="min-w-0">
-                          <span className="font-medium">“{d.title}”</span>{' '}
-                          <span className="text-muted-foreground">
-                            ({d.member_count} meeting{d.member_count === 1 ? '' : 's'}) — {d.reason}
-                          </span>
+                          {sameName ? (
+                            <>
+                              <span className="font-medium">Another series with the same name</span>{' '}
+                              <span className="text-muted-foreground">
+                                (#{d.id}, {d.member_count} meeting{d.member_count === 1 ? '' : 's'}
+                                {otherLast ? `, last ${otherLast}` : ''}) is the {d.reason} as this one
+                                ({mine} meeting{mine === 1 ? '' : 's'}).
+                              </span>
+                            </>
+                          ) : (
+                            <>
+                              <span className="font-medium">“{d.title}”</span>{' '}
+                              <span className="text-muted-foreground">
+                                ({d.member_count} meeting{d.member_count === 1 ? '' : 's'}
+                                {otherLast ? `, last ${otherLast}` : ''}) is the {d.reason} as this one
+                                ({mine} meeting{mine === 1 ? '' : 's'}).
+                              </span>
+                            </>
+                          )}
                         </span>
                         <Button
                           size="sm"
@@ -1102,7 +1127,7 @@ export function SeriesDialog({ seriesId, onClose, onChanged, onMerged }: SeriesD
                           onClick={() => void mergeInto(d)}
                         >
                           <Merge className="h-3 w-3" />
-                          Merge into it
+                          Merge this one into it
                         </Button>
                         {thisBigger && (
                           <span className="text-[11px] text-muted-foreground">
