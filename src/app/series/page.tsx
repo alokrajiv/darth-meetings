@@ -13,7 +13,7 @@ import {
   TableHeader,
   TableRow,
 } from '@/components/ui/table';
-import { Loader2, Plus, Repeat, ScanSearch, Zap } from 'lucide-react';
+import { CornerDownRight, Loader2, Plus, Repeat, ScanSearch, Zap } from 'lucide-react';
 
 /**
  * The series index: every series in one comparative table (the surface that
@@ -22,14 +22,23 @@ import { Loader2, Plus, Repeat, ScanSearch, Zap } from 'lucide-react';
  * import, and membership edits.
  */
 
-interface SeriesIndexEntry {
+interface DupSibling {
   id: number;
   title: string;
   member_count: number;
+  reason: string;
+}
+
+interface SeriesIndexEntry {
+  id: number;
+  title: string;
+  /** Imported meetings attached to this series. */
+  member_count: number;
   last_recorded_at: string | null;
   cadence: 'daily' | 'weekly' | 'biweekly' | 'monthly' | null;
-  /** Another series normalizes to the same title — probable dupe, merge me. */
+  /** Another series shares evidence with this one — probable dupe, merge me. */
   dup: boolean;
+  dup_with: DupSibling[];
   /** Auto-import is switched on for this series. */
   auto_enabled: boolean;
 }
@@ -37,6 +46,59 @@ interface SeriesIndexEntry {
 interface SeriesIndexResponse {
   series: SeriesIndexEntry[];
   totals: { memberships: number; unattached: number };
+}
+
+/** Per-series result of the occurrence sweep (calendar + Teams), fetched
+ * after the list in small chunks so the Importable column fills in
+ * progressively. 'error' = that sweep failed; undefined = not fetched yet. */
+interface OccCounts {
+  total: number;
+  imported: number;
+  importable: number;
+  bare: number;
+  upcoming: number;
+  external: number;
+  googleConnected: boolean;
+}
+type OccCell = OccCounts | 'error' | undefined;
+
+const COUNTS_CHUNK = 4;
+
+/**
+ * Row order: newest series first, but probable duplicates are pulled
+ * together — when the first member of a dup group is reached, the whole
+ * group is emitted (largest first), siblings marked so the table reads
+ * "this one, and these are the same meeting".
+ */
+function orderWithDupGroups(
+  series: SeriesIndexEntry[]
+): Array<{ s: SeriesIndexEntry; sibling: boolean }> {
+  const byId = new Map(series.map((s) => [s.id, s]));
+  const emitted = new Set<number>();
+  const out: Array<{ s: SeriesIndexEntry; sibling: boolean }> = [];
+  for (const s of series) {
+    if (emitted.has(s.id)) continue;
+    if (s.dup_with.length === 0) {
+      emitted.add(s.id);
+      out.push({ s, sibling: false });
+      continue;
+    }
+    // Transitive closure: A~B, B~C → one group.
+    const group: SeriesIndexEntry[] = [];
+    const stack = [s.id];
+    while (stack.length > 0) {
+      const id = stack.pop()!;
+      if (emitted.has(id)) continue;
+      const entry = byId.get(id);
+      if (!entry) continue;
+      emitted.add(id);
+      group.push(entry);
+      for (const d of entry.dup_with) if (!emitted.has(d.id)) stack.push(d.id);
+    }
+    group.sort((a, b) => b.member_count - a.member_count);
+    group.forEach((g, i) => out.push({ s: g, sibling: i > 0 }));
+  }
+  return out;
 }
 
 const dateLabel = (iso: string | null) =>
@@ -50,6 +112,8 @@ export default function SeriesIndexPage() {
   const [openSeriesId, setOpenSeriesId] = useState<number | null>(null);
   const [sweeping, setSweeping] = useState(false);
   const [sweepResult, setSweepResult] = useState<string | null>(null);
+  const [occ, setOcc] = useState<Record<number, OccCell>>({});
+  const [occLoading, setOccLoading] = useState(false);
 
   const load = useCallback(async () => {
     try {
@@ -65,6 +129,44 @@ export default function SeriesIndexPage() {
   useEffect(() => {
     void load();
   }, [load]);
+
+  // Importable column: sweep every series' occurrences in small chunks
+  // (server caches the external part per user for 6h, so re-visits are
+  // instant). Re-runs when the series set changes (new series / merge).
+  const seriesIds = data?.series.map((s) => s.id).join(',') ?? '';
+  useEffect(() => {
+    if (!seriesIds) return;
+    let cancelled = false;
+    const ids = seriesIds.split(',').map(Number);
+    (async () => {
+      setOccLoading(true);
+      for (let i = 0; i < ids.length; i += COUNTS_CHUNK) {
+        const chunk = ids.slice(i, i + COUNTS_CHUNK);
+        try {
+          const res = await fetch(`/api/series/occurrence-counts?ids=${chunk.join(',')}`);
+          if (cancelled) return;
+          if (!res.ok) throw new Error(String(res.status));
+          const j = (await res.json()) as { counts: Record<number, OccCounts | 'error' | null> };
+          setOcc((prev) => {
+            const next = { ...prev };
+            for (const id of chunk) next[id] = j.counts[id] ?? 'error';
+            return next;
+          });
+        } catch {
+          if (cancelled) return;
+          setOcc((prev) => {
+            const next = { ...prev };
+            for (const id of chunk) next[id] = 'error';
+            return next;
+          });
+        }
+      }
+      if (!cancelled) setOccLoading(false);
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [seriesIds]);
 
   const runRetroAttach = async () => {
     setSweeping(true);
@@ -151,59 +253,147 @@ export default function SeriesIndexPage() {
                   <TableHeader>
                     <TableRow>
                       <TableHead className="pl-4">Series</TableHead>
-                      <TableHead className="w-24 text-right">Members</TableHead>
-                      <TableHead className="w-28">Cadence</TableHead>
-                      <TableHead className="w-36">Last meeting</TableHead>
+                      <TableHead
+                        className="w-24 text-right"
+                        title="Meetings already imported into this app and attached to the series"
+                      >
+                        Imported
+                      </TableHead>
+                      <TableHead
+                        className="w-28 text-right"
+                        title="Occurrences on your calendar / Teams that have a recording or transcript but aren’t imported yet. Swept from YOUR Google Calendar, so a meeting you weren’t invited to shows “—”."
+                      >
+                        Importable
+                      </TableHead>
+                      <TableHead className="w-24">Cadence</TableHead>
+                      <TableHead className="w-32">Last meeting</TableHead>
                     </TableRow>
                   </TableHeader>
                   <TableBody>
-                    {data.series.map((s) => (
-                      <TableRow
-                        key={s.id}
-                        className="cursor-pointer"
-                        onClick={() => setOpenSeriesId(s.id)}
-                      >
-                        <TableCell className="py-2.5 pl-4">
-                          <div className="flex min-w-0 items-center gap-2">
-                            <Repeat className="h-3.5 w-3.5 shrink-0 text-primary/70" />
-                            <span className="min-w-0 truncate text-sm font-medium">{s.title}</span>
-                            {s.auto_enabled && (
+                    {orderWithDupGroups(data.series).map(({ s, sibling }) => {
+                      const c = occ[s.id];
+                      const dupReason = s.dup_with[0]?.reason ?? null;
+                      const dupTitle =
+                        s.dup_with.length > 0
+                          ? `Probably the same meeting as ${s.dup_with
+                              .map((d) => `“${d.title}” (${d.member_count})`)
+                              .join(', ')} — ${dupReason}. Open one and use Merge.`
+                          : undefined;
+                      return (
+                        <TableRow
+                          key={s.id}
+                          className={`cursor-pointer ${sibling ? 'bg-amber-500/[0.04]' : ''}`}
+                          onClick={() => setOpenSeriesId(s.id)}
+                        >
+                          <TableCell className={`py-2.5 ${sibling ? 'pl-7' : 'pl-4'}`}>
+                            <div className="flex min-w-0 items-center gap-2">
+                              {sibling ? (
+                                <CornerDownRight
+                                  className="h-3.5 w-3.5 shrink-0 text-amber-600/70 dark:text-amber-500/70"
+                                  aria-label="duplicate of the series above"
+                                />
+                              ) : (
+                                <Repeat className="h-3.5 w-3.5 shrink-0 text-primary/70" />
+                              )}
+                              <span className="min-w-0 truncate text-sm font-medium">{s.title}</span>
+                              {s.auto_enabled && (
+                                <span
+                                  title="Auto-import is on — new occurrences import themselves"
+                                  className="shrink-0"
+                                >
+                                  <Zap className="h-3 w-3 text-blue-500" />
+                                </span>
+                              )}
+                              {s.dup_with.length > 0 && (
+                                <Badge
+                                  variant="outline"
+                                  className="shrink-0 border-amber-500/50 text-[10px] font-normal text-amber-600 dark:text-amber-500"
+                                  title={dupTitle}
+                                >
+                                  dup · {dupReason}
+                                </Badge>
+                              )}
+                            </div>
+                          </TableCell>
+                          <TableCell className="py-2.5 text-right text-sm tabular-nums">
+                            {s.member_count}
+                          </TableCell>
+                          <TableCell className="py-2.5 text-right text-sm tabular-nums">
+                            {c === undefined ? (
+                              occLoading ? (
+                                <Loader2 className="ml-auto h-3 w-3 animate-spin text-muted-foreground/50" />
+                              ) : (
+                                <span className="text-muted-foreground/50">—</span>
+                              )
+                            ) : c === 'error' ? (
+                              <span className="text-xs text-muted-foreground/60" title="Sweep failed">
+                                ?
+                              </span>
+                            ) : !c.googleConnected ? (
                               <span
-                                title="Auto-import is on — new occurrences import themselves"
-                                className="shrink-0"
+                                className="text-muted-foreground/50"
+                                title="Connect Google (Import meeting → Connect) to see importable occurrences"
                               >
-                                <Zap className="h-3 w-3 text-blue-500" />
+                                —
+                              </span>
+                            ) : c.external === 0 ? (
+                              <span
+                                className="text-muted-foreground/50"
+                                title="Not on your calendar — occurrences are swept from your own Google Calendar / Teams"
+                              >
+                                —
+                              </span>
+                            ) : (
+                              <span
+                                className={
+                                  c.importable > 0
+                                    ? 'font-medium text-amber-600 dark:text-amber-500'
+                                    : 'text-muted-foreground'
+                                }
+                                title={
+                                  `${c.external} occurrence${c.external === 1 ? '' : 's'} on your calendar in the last 12 months: ` +
+                                  `${c.imported} imported · ${c.importable} importable · ${c.bare} without artifacts` +
+                                  (c.upcoming > 0 ? ` · ${c.upcoming} upcoming` : '')
+                                }
+                              >
+                                {c.importable}
                               </span>
                             )}
-                            {s.dup && (
-                              <Badge
-                                variant="outline"
-                                className="shrink-0 border-amber-500/50 text-[10px] text-amber-600 dark:text-amber-500"
-                                title="Another series has the same name — probably a duplicate. Open one and use Merge."
-                              >
-                                dup
-                              </Badge>
-                            )}
-                          </div>
-                        </TableCell>
-                        <TableCell className="py-2.5 text-right text-sm tabular-nums">
-                          {s.member_count}
-                        </TableCell>
-                        <TableCell className="py-2.5 text-xs text-muted-foreground">
-                          {s.cadence ?? '—'}
-                        </TableCell>
-                        <TableCell className="py-2.5 text-xs tabular-nums text-muted-foreground">
-                          {dateLabel(s.last_recorded_at)}
-                        </TableCell>
-                      </TableRow>
-                    ))}
+                          </TableCell>
+                          <TableCell className="py-2.5 text-xs text-muted-foreground">
+                            {s.cadence ?? '—'}
+                          </TableCell>
+                          <TableCell className="py-2.5 text-xs tabular-nums text-muted-foreground">
+                            {dateLabel(s.last_recorded_at)}
+                          </TableCell>
+                        </TableRow>
+                      );
+                    })}
                   </TableBody>
                 </Table>
               </div>
               <p className="mt-2.5 px-1 text-[11px] text-muted-foreground">
-                {data.series.length} series · {data.totals.memberships} membership
-                {data.totals.memberships === 1 ? '' : 's'} · {data.totals.unattached} meeting
+                {data.series.length} series · {data.totals.memberships} imported meeting
+                {data.totals.memberships === 1 ? '' : 's'} in series · {data.totals.unattached} meeting
                 {data.totals.unattached === 1 ? '' : 's'} in no series
+
+                {Object.values(occ).some((c) => c && c !== 'error' && c.googleConnected && c.external === 0) && (
+                  <>
+                    {' '}
+                    · Importable “—” = not on your calendar (occurrences are swept from your own
+                    Google Calendar / Teams)
+                  </>
+                )}
+                {(() => {
+                  const groups = orderWithDupGroups(data.series).filter((r) => r.sibling).length;
+                  return groups > 0 ? (
+                    <>
+                      {' '}
+                      · <span className="text-amber-600 dark:text-amber-500">{groups} probable duplicate{groups === 1 ? '' : 's'}</span> — open
+                      one and Merge
+                    </>
+                  ) : null;
+                })()}
               </p>
             </>
           )

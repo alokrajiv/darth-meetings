@@ -83,7 +83,9 @@ export interface SeriesOccurrence {
   startIso: string;
   endIso: string | null;
   title: string | null;
-  source: 'calendar' | 'graph' | 'both';
+  /** 'imported' = a member transcript no calendar/Graph occurrence matched
+   * (caller isn't on the event, outside the sweep window, or an upload). */
+  source: 'calendar' | 'graph' | 'both' | 'imported';
   upcoming: boolean;
   meetingCode: string | null;
   eventId: string | null;
@@ -116,6 +118,10 @@ export interface SeriesOccurrencesResult {
     importable: number;
     bare: number;
     upcoming: number;
+    /** Occurrences the calendar/Graph sweep actually saw (excludes the
+     * member-only 'imported' rows) — 0 with members present means "this
+     * meeting isn't on the caller's calendar". */
+    external: number;
   };
 }
 
@@ -169,6 +175,7 @@ interface ImportedRow {
   teams_call_id: string | null;
   meeting_code: string | null;
   accessible: boolean;
+  is_member: boolean;
 }
 
 /** Everything imported that could belong to this series: members plus rows
@@ -187,7 +194,8 @@ async function loadImportedCandidates(
            t.gmeet_context->>'videoFileId' AS video_file_id,
            t.gmeet_context->'teams'->>'callId' AS teams_call_id,
            t.gmeet_context->>'meetingCode' AS meeting_code,
-           (t.user_id = ${caller.userId} OR sh.id IS NOT NULL) AS accessible
+           (t.user_id = ${caller.userId} OR sh.id IS NOT NULL) AS accessible,
+           COALESCE(m.series_id = ${seriesId}, false) AS is_member
     FROM ${sql(SCHEMA)}.transcripts t
     LEFT JOIN ${sql(SCHEMA)}.series_members m ON m.transcript_id = t.id
     LEFT JOIN ${sql(SCHEMA)}.series_keys k ON k.series_id = ${seriesId} AND (
@@ -199,7 +207,8 @@ async function loadImportedCandidates(
     )
     LEFT JOIN ${sql(SCHEMA)}.transcript_shares sh
       ON sh.transcript_id = t.id AND sh.shared_with_email = ${normEmail}
-    WHERE m.series_id = ${seriesId} OR k.id IS NOT NULL
+    WHERE t.deleted_at IS NULL
+      AND (m.series_id = ${seriesId} OR k.id IS NOT NULL)
   `;
 }
 
@@ -263,15 +272,49 @@ export async function sweepSeriesOccurrences(
     imported: [],
   }));
   for (const occ of occurrences) occ.imported = matchImported(occ, candidates);
+  const external = occurrences.length;
+
+  // Members no external occurrence claimed still ARE occurrences of this
+  // series (the caller may simply not be on the calendar event — e.g. a
+  // colleague's import in a series they were never invited to). Fold them
+  // in so the list and counts agree with "N meetings in this series".
+  const linked = new Set(occurrences.flatMap((o) => o.imported.map((i) => i.assemblyai_id)));
+  for (const c of candidates) {
+    if (!c.is_member || linked.has(c.assemblyai_id)) continue;
+    linked.add(c.assemblyai_id);
+    const startIso = new Date(c.recorded_at ?? c.created_at).toISOString();
+    occurrences.push({
+      key: `imp-${c.assemblyai_id}`,
+      startIso,
+      endIso: null,
+      title: c.title,
+      source: 'imported',
+      upcoming: false,
+      meetingCode: c.meeting_code,
+      eventId: c.event_id,
+      recurringEventId: null,
+      iCalUID: null,
+      organizerEmail: null,
+      attendees: [],
+      hasRecording: Boolean(c.drive_file_id || c.video_file_id),
+      hasTranscript: Boolean(c.transcript_doc_id),
+      videoFileId: c.video_file_id ?? c.drive_file_id,
+      transcriptDocId: c.transcript_doc_id,
+      teams: null,
+      calendarUrl: null,
+      imported: [{ assemblyai_id: c.assemblyai_id, title: c.title, accessible: c.accessible }],
+    });
+  }
   occurrences.sort((a, b) => Date.parse(b.startIso) - Date.parse(a.startIso));
 
   const past = occurrences.filter((o) => !o.upcoming);
   const counts = {
+    external,
     total: occurrences.length,
     imported: past.filter((o) => o.imported.length > 0).length,
     importable: past.filter((o) => o.imported.length === 0 && (o.hasRecording || o.hasTranscript))
       .length,
-    bare: past.filter((o) => !o.hasRecording && !o.hasTranscript).length,
+    bare: past.filter((o) => o.imported.length === 0 && !o.hasRecording && !o.hasTranscript).length,
     upcoming: occurrences.filter((o) => o.upcoming).length,
   };
 

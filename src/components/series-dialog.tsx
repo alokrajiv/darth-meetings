@@ -79,6 +79,9 @@ interface SeriesDetail {
     organizer_email: string | null;
     attendee_count: number;
   }>;
+  /** Probable-duplicate sibling series (shared Meet code / recurring event /
+   * Teams meeting / name) — the one-click merge prompt. */
+  dupes: Array<{ id: number; title: string; member_count: number; reason: string }>;
 }
 
 interface Occurrence {
@@ -86,7 +89,9 @@ interface Occurrence {
   startIso: string;
   endIso: string | null;
   title: string | null;
-  source: 'calendar' | 'graph' | 'both';
+  /** 'imported' = a member no calendar/Teams occurrence matched (you aren't
+   * on the event, it's outside the 12-month window, or it was uploaded). */
+  source: 'calendar' | 'graph' | 'both' | 'imported';
   upcoming: boolean;
   meetingCode: string | null;
   eventId: string | null;
@@ -109,7 +114,14 @@ interface OccurrencesResult {
   sweptAt: string;
   fromCache: boolean;
   occurrences: Occurrence[];
-  counts: { total: number; imported: number; importable: number; bare: number; upcoming: number };
+  counts: {
+    total: number;
+    imported: number;
+    importable: number;
+    bare: number;
+    upcoming: number;
+    external: number;
+  };
 }
 
 interface SeriesDialogProps {
@@ -624,6 +636,10 @@ export function SeriesDialog({ seriesId, onClose, onChanged, onMerged }: SeriesD
             body: JSON.stringify({
               url: o.teams.joinWebUrl,
               mode: o.hasTranscript ? 'transcript' : 'video',
+              // Still-processing artifacts queue; ready videos pull in the
+              // background — either way this request returns in seconds.
+              defer: true,
+              background: true,
               event,
             }),
           });
@@ -637,6 +653,10 @@ export function SeriesDialog({ seriesId, onClose, onChanged, onMerged }: SeriesD
               mode: o.transcriptDocId ? 'transcript' : 'video',
               transcriptDocId: o.transcriptDocId ?? undefined,
               videoFileId: o.transcriptDocId ? undefined : (o.videoFileId ?? undefined),
+              // Still-processing artifacts queue; ready videos pull in the
+              // background — either way this request returns in seconds.
+              defer: true,
+              background: true,
               event,
             }),
           });
@@ -704,15 +724,13 @@ export function SeriesDialog({ seriesId, onClose, onChanged, onMerged }: SeriesD
     refresh();
   };
 
-  // Members that no occurrence row links to (outside the sweep window, or
-  // key-less manual adds) still need to be visible + removable.
+  // The sweep folds every member into the occurrence list (server side), so
+  // this is only the fallback when the sweep itself failed: members must
+  // still be visible + removable.
   const unmatchedMembers = useMemo(() => {
-    if (!detail) return [];
-    const linked = new Set(
-      (occ?.occurrences ?? []).flatMap((o) => o.imported.map((i) => i.assemblyai_id))
-    );
-    return detail.members.filter((m) => !linked.has(m.assemblyai_id));
-  }, [detail, occ]);
+    if (!detail || !occError) return [];
+    return detail.members;
+  }, [detail, occError]);
 
   const open = seriesId !== null;
   return (
@@ -1054,6 +1072,51 @@ export function SeriesDialog({ seriesId, onClose, onChanged, onMerged }: SeriesD
               );
             })()}
 
+            {/* ---- probable duplicate → one-click merge ---------------- */}
+            {detail.dupes.length > 0 && !mergeOpen && (
+              <div className="rounded-lg border border-amber-500/40 bg-amber-500/[0.06] px-3 py-2">
+                <p className="text-[11px] font-medium uppercase tracking-wider text-amber-700 dark:text-amber-400">
+                  Probably a duplicate
+                </p>
+                <div className="mt-1 space-y-1">
+                  {detail.dupes.map((d) => {
+                    const thisBigger = detail.members.length > d.member_count;
+                    return (
+                      <div key={d.id} className="flex flex-wrap items-center gap-x-2 gap-y-1 text-xs">
+                        <span className="min-w-0">
+                          <span className="font-medium">“{d.title}”</span>{' '}
+                          <span className="text-muted-foreground">
+                            ({d.member_count} meeting{d.member_count === 1 ? '' : 's'}) — {d.reason}
+                          </span>
+                        </span>
+                        <Button
+                          size="sm"
+                          variant="outline"
+                          className="h-6 border-amber-500/50 px-2 text-xs"
+                          disabled={mergeBusy}
+                          title={
+                            thisBigger
+                              ? `This series has more meetings — open “${d.title}” and merge it into this one instead, or merge anyway.`
+                              : `Move this series’ ${detail.members.length} meeting${detail.members.length === 1 ? '' : 's'} and matching rules into “${d.title}” and delete this one`
+                          }
+                          onClick={() => void mergeInto(d)}
+                        >
+                          <Merge className="h-3 w-3" />
+                          Merge into it
+                        </Button>
+                        {thisBigger && (
+                          <span className="text-[11px] text-muted-foreground">
+                            (this one is bigger — usually merge the smaller into the larger)
+                          </span>
+                        )}
+                      </div>
+                    );
+                  })}
+                </div>
+                {mergeError && <p className="pt-1 text-xs text-destructive">{mergeError}</p>}
+              </div>
+            )}
+
             {/* ---- occurrence sweep ------------------------------------ */}
             <div>
               <div className="mb-1.5 flex items-center gap-2">
@@ -1064,6 +1127,15 @@ export function SeriesDialog({ seriesId, onClose, onChanged, onMerged }: SeriesD
                   <span className="text-[11px] tabular-nums text-muted-foreground">
                     {occ.counts.imported} imported · {occ.counts.importable} importable ·{' '}
                     {occ.counts.bare} without artifacts
+                    {occ.googleConnected && occ.counts.external === 0 && (
+                      <span
+                        className="text-amber-600 dark:text-amber-500"
+                        title="Your Google Calendar has no instances of this meeting in the last 12 months (you may not be invited) — only imported copies are listed"
+                      >
+                        {' '}
+                        · not on your calendar
+                      </span>
+                    )}
                     <span
                       className="text-muted-foreground/60"
                       title="Calendar + Teams sweep time — cached up to 6h; the refresh button re-sweeps"
@@ -1118,7 +1190,7 @@ export function SeriesDialog({ seriesId, onClose, onChanged, onMerged }: SeriesD
               ) : occ && occ.occurrences.length === 0 ? (
                 <div className="rounded-lg border py-4 text-center text-xs text-muted-foreground">
                   {occ.googleConnected
-                    ? 'No occurrences found in the last 12 months.'
+                    ? 'Nothing yet — no meetings imported into this series, and your Google Calendar has no instances of it in the last 12 months (occurrences come from your own calendar, so you may simply not be invited).'
                     : 'Connect Google (Import meeting → Connect) to sweep your calendar.'}
                 </div>
               ) : (
@@ -1136,7 +1208,9 @@ export function SeriesDialog({ seriesId, onClose, onChanged, onMerged }: SeriesD
                           ? 'Google Calendar + Microsoft Teams'
                           : o.source === 'graph'
                             ? 'Microsoft Teams (Graph)'
-                            : 'Google Calendar';
+                            : o.source === 'imported'
+                              ? 'Imported meeting only — not on your calendar'
+                              : 'Google Calendar';
                       const accepted = o.attendees.filter((a) => a.responseStatus === 'accepted').length;
                       const driveUrl = o.videoFileId
                         ? `https://drive.google.com/file/d/${o.videoFileId}/view`
@@ -1208,12 +1282,20 @@ export function SeriesDialog({ seriesId, onClose, onChanged, onMerged }: SeriesD
                                       <FileText className="h-3 w-3" /> transcript
                                     </span>
                                   )}
-                                  {!o.hasRecording && !o.hasTranscript && (
+                                  {!o.hasRecording && !o.hasTranscript && o.imported.length === 0 && (
                                     <span
                                       className="text-[11px] text-muted-foreground/60"
                                       title="Meet/Teams didn’t produce (or you can’t see) a recording or transcript for this occurrence"
                                     >
                                       no recording or transcript
+                                    </span>
+                                  )}
+                                  {o.source === 'imported' && (
+                                    <span
+                                      className="text-[11px] text-muted-foreground/60"
+                                      title="This meeting isn’t on your calendar — occurrences are swept from your own Google Calendar / Teams, so only the imported copy is known"
+                                    >
+                                      not on your calendar
                                     </span>
                                   )}
                                 </>
@@ -1233,7 +1315,7 @@ export function SeriesDialog({ seriesId, onClose, onChanged, onMerged }: SeriesD
                               )}
                             </span>
                             <span
-                              className="flex shrink-0 items-center gap-1"
+                              className="flex max-w-[60%] flex-wrap items-center justify-end gap-1"
                               onClick={(e) => e.stopPropagation()}
                               onKeyDown={(e) => e.stopPropagation()}
                             >
@@ -1456,7 +1538,7 @@ export function SeriesDialog({ seriesId, onClose, onChanged, onMerged }: SeriesD
             {unmatchedMembers.length > 0 && (
               <div>
                 <p className="mb-1.5 text-[11px] font-medium uppercase tracking-wider text-muted-foreground">
-                  Also in this series
+                  Meetings in this series
                 </p>
                 <div className="divide-y rounded-lg border">
                   {unmatchedMembers.map((m) => (

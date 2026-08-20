@@ -2,6 +2,7 @@ import { NextResponse } from 'next/server';
 import { withAuth } from '@/lib/auth/with-auth';
 import {
   deleteSeries,
+  findDuplicateSeries,
   getSeries,
   listKeys,
   listMembers,
@@ -20,7 +21,8 @@ function parseId(raw: string): number | null {
 
 /**
  * GET /api/series/:id — the series, its evidence keys, members (with
- * caller-visibility flags), and suggested members awaiting confirmation.
+ * caller-visibility flags), suggested members awaiting confirmation, and
+ * probable-duplicate sibling series (the one-click merge prompt).
  */
 export const GET = withAuth(async ({ user }, { params }) => {
   const id = parseId((await params).id);
@@ -29,12 +31,13 @@ export const GET = withAuth(async ({ user }, { params }) => {
   if (!series) return NextResponse.json({ error: 'Not found' }, { status: 404 });
 
   const caller = { userId: user.userId, email: user.email };
-  const [keys, members, suggestions] = await Promise.all([
+  const [keys, members, suggestions, dupMap] = await Promise.all([
     listKeys(id),
     listMembers(id, caller),
     listSuggestedMembers(id, caller),
+    findDuplicateSeries(),
   ]);
-  return NextResponse.json({ series, keys, members, suggestions });
+  return NextResponse.json({ series, keys, members, suggestions, dupes: dupMap.get(id) ?? [] });
 });
 
 const AUTO_MODES = ['transcript', 'video', 'both'] as const;

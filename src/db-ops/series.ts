@@ -1,7 +1,7 @@
 import 'server-only';
 import { sql } from '@/lib/db';
 import { SCHEMAS } from '@/lib/constants/database';
-import { keysFromContext, strongKeys, type SeriesKeyInput } from '@/lib/series-keys';
+import { keysFromContext, normalizeTitle, strongKeys, type SeriesKeyInput } from '@/lib/series-keys';
 import type { GmeetContext } from '@/lib/format';
 
 /**
@@ -218,6 +218,121 @@ export async function seriesTotals(): Promise<{ memberships: number; unattached:
       AND t.status NOT IN ('uploading', 'waiting')
   `;
   return row ?? { memberships: 0, unattached: 0 };
+}
+
+export type DupReason = 'same Meet code' | 'same recurring event' | 'same Teams meeting' | 'same name';
+
+export interface DupSibling {
+  id: number;
+  title: string;
+  member_count: number;
+  reason: DupReason;
+}
+
+const DUP_REASON_BY_KIND: Record<string, DupReason> = {
+  'meeting-code': 'same Meet code',
+  'recurring-base-id': 'same recurring event',
+  'ical-uid-base': 'same recurring event',
+  'teams-join-url': 'same Teams meeting',
+  'graph-meeting-id': 'same Teams meeting',
+  'normalized-title': 'same name',
+};
+const DUP_REASON_RANK: DupReason[] = [
+  'same recurring event',
+  'same Meet code',
+  'same Teams meeting',
+  'same name',
+];
+
+/**
+ * Probable-duplicate series, keyed by series id → its siblings. Two series
+ * are siblings when they share evidence: a series key of the same kind+value,
+ * OR their MEMBER transcripts point at the same Meet code / recurring event /
+ * Teams meeting (series split by the backfill often differ only in which
+ * keys got claimed — e.g. one holds the recurring-base-id, the other the
+ * meeting code, while every member on both sides carries both). Title-only
+ * matches are reported too, ranked last.
+ */
+export async function findDuplicateSeries(): Promise<Map<number, DupSibling[]>> {
+  const pairs = await sql<Array<{ a: number; b: number; kind: string }>>`
+    WITH sig AS (
+      SELECT series_id, kind, value FROM ${sql(SCHEMA)}.series_keys
+      UNION
+      SELECT m.series_id, 'meeting-code', t.gmeet_context->>'meetingCode'
+      FROM ${sql(SCHEMA)}.series_members m
+      JOIN ${sql(SCHEMA)}.transcripts t ON t.id = m.transcript_id AND t.deleted_at IS NULL
+      WHERE t.gmeet_context->>'meetingCode' IS NOT NULL
+      UNION
+      SELECT m.series_id, 'recurring-base-id',
+             regexp_replace(t.gmeet_context->>'recurringEventId', '_R\\d{8}T\\d{6}Z?$', '')
+      FROM ${sql(SCHEMA)}.series_members m
+      JOIN ${sql(SCHEMA)}.transcripts t ON t.id = m.transcript_id AND t.deleted_at IS NULL
+      WHERE t.gmeet_context->>'recurringEventId' IS NOT NULL
+      UNION
+      -- recurring instance ids are '<base>_YYYYMMDDTHHMMSSZ' — the base is
+      -- the series even when recurringEventId was never captured
+      SELECT m.series_id, 'recurring-base-id',
+             regexp_replace(t.gmeet_context->>'eventId', '_\\d{8}T\\d{6}Z?$', '')
+      FROM ${sql(SCHEMA)}.series_members m
+      JOIN ${sql(SCHEMA)}.transcripts t ON t.id = m.transcript_id AND t.deleted_at IS NULL
+      WHERE t.gmeet_context->>'eventId' ~ '_\\d{8}T\\d{6}Z?$'
+      UNION
+      SELECT m.series_id, 'teams-join-url', t.gmeet_context->'teams'->>'joinWebUrl'
+      FROM ${sql(SCHEMA)}.series_members m
+      JOIN ${sql(SCHEMA)}.transcripts t ON t.id = m.transcript_id AND t.deleted_at IS NULL
+      WHERE t.gmeet_context->'teams'->>'joinWebUrl' IS NOT NULL
+    )
+    SELECT DISTINCT a.series_id AS a, b.series_id AS b, a.kind
+    FROM sig a
+    JOIN sig b ON b.kind = a.kind AND b.value = a.value AND b.series_id > a.series_id
+    WHERE a.value IS NOT NULL AND a.value <> ''
+  `;
+  const series = await sql<Array<{ id: number; title: string; member_count: number }>>`
+    SELECT s.id, s.title, count(m.id)::int AS member_count
+    FROM ${sql(SCHEMA)}.series s
+    LEFT JOIN ${sql(SCHEMA)}.series_members m ON m.series_id = s.id
+    GROUP BY s.id, s.title
+  `;
+  const byId = new Map(series.map((s) => [s.id, s]));
+
+  // Best reason per unordered pair (strong evidence beats a shared name).
+  const best = new Map<string, { a: number; b: number; reason: DupReason }>();
+  const consider = (a: number, b: number, reason: DupReason) => {
+    const k = a < b ? `${a}:${b}` : `${b}:${a}`;
+    const cur = best.get(k);
+    if (!cur || DUP_REASON_RANK.indexOf(reason) < DUP_REASON_RANK.indexOf(cur.reason)) {
+      best.set(k, { a: Math.min(a, b), b: Math.max(a, b), reason });
+    }
+  };
+  for (const p of pairs) {
+    const reason = DUP_REASON_BY_KIND[p.kind];
+    if (reason) consider(p.a, p.b, reason);
+  }
+  // Title-only matches (series_keys only hold normalized-title when a
+  // transcript contributed one — the series' own title is checked here).
+  const byNorm = new Map<string, number[]>();
+  for (const s of series) {
+    const n = normalizeTitle(s.title);
+    if (n.length < 4) continue;
+    byNorm.set(n, [...(byNorm.get(n) ?? []), s.id]);
+  }
+  for (const ids of byNorm.values()) {
+    for (let i = 0; i < ids.length; i++)
+      for (let j = i + 1; j < ids.length; j++) consider(ids[i]!, ids[j]!, 'same name');
+  }
+
+  const out = new Map<number, DupSibling[]>();
+  const push = (from: number, to: number, reason: DupReason) => {
+    const s = byId.get(to);
+    if (!s) return;
+    out.set(from, [...(out.get(from) ?? []), { ...s, reason }]);
+  };
+  for (const { a, b, reason } of best.values()) {
+    push(a, b, reason);
+    push(b, a, reason);
+  }
+  for (const list of out.values()) list.sort((x, y) => y.member_count - x.member_count);
+  return out;
 }
 
 /**

@@ -1,8 +1,15 @@
 import { NextResponse } from 'next/server';
 import { withAuth } from '@/lib/auth/with-auth';
 import { resolveAccess } from '@/db-ops/transcript-access';
-import { addKeys, addMember, createSeries, listSeries, seriesTotals } from '@/db-ops/series';
-import { keysFromContext, normalizeTitle } from '@/lib/series-keys';
+import {
+  addKeys,
+  addMember,
+  createSeries,
+  findDuplicateSeries,
+  listSeries,
+  seriesTotals,
+} from '@/db-ops/series';
+import { keysFromContext } from '@/lib/series-keys';
 import { publishEvent } from '@/lib/server/event-bus';
 
 export const runtime = 'nodejs';
@@ -22,22 +29,26 @@ function cadenceOf(medianGapSecs: number | null): SeriesCadence {
 
 /**
  * GET /api/series — all series with member counts (org-global), plus
- * cadence, a same-normalized-title dup flag (the merge prompt), and the
- * memberships/unattached totals for the index footer.
+ * cadence, probable-duplicate siblings (shared Meet code / recurring event /
+ * Teams meeting / name — the merge prompt), and the memberships/unattached
+ * totals for the index footer.
  */
 export const GET = withAuth(async () => {
-  const [series, totals] = await Promise.all([listSeries(), seriesTotals()]);
-  const titleCounts = new Map<string, number>();
-  for (const s of series) {
-    const norm = normalizeTitle(s.title);
-    titleCounts.set(norm, (titleCounts.get(norm) ?? 0) + 1);
-  }
+  const [series, totals, dupes] = await Promise.all([
+    listSeries(),
+    seriesTotals(),
+    findDuplicateSeries(),
+  ]);
   return NextResponse.json({
-    series: series.map((s) => ({
-      ...s,
-      cadence: cadenceOf(s.median_gap_secs),
-      dup: (titleCounts.get(normalizeTitle(s.title)) ?? 0) > 1,
-    })),
+    series: series.map((s) => {
+      const dup_with = dupes.get(s.id) ?? [];
+      return {
+        ...s,
+        cadence: cadenceOf(s.median_gap_secs),
+        dup: dup_with.length > 0,
+        dup_with,
+      };
+    }),
     totals,
   });
 });
