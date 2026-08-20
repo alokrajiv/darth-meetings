@@ -37,6 +37,7 @@ import {
   ChevronRight,
   Inbox,
   Columns3,
+  Film,
   GripVertical,
   Video,
   X,
@@ -1006,6 +1007,40 @@ export function TranscriptTable({
       </span>
     );
 
+  /** "N recordings" chip: extra Meet segments, a stitched multi-file upload,
+   * or a combined re-transcription — one meeting, several source videos. */
+  const recordingsChip = (t: ListRow) =>
+    (t.recording_count ?? 1) > 1 ? (
+      <span
+        title={`${t.recording_count} recordings in this meeting`}
+        className="inline-flex shrink-0 items-center gap-0.5 rounded border px-1 text-[10px] text-muted-foreground"
+      >
+        <Film className="h-3 w-3" />
+        {t.recording_count}
+      </span>
+    ) : null;
+
+  /** Series auto-import dot: blue = fully unattended (speakers
+   * auto-identified, report generated without review), amber = auto-imported
+   * but waiting on human speaker review. */
+  const autoDot = (t: ListRow) =>
+    t.auto_state === 'passed' ? (
+      <span
+        title="Auto-imported — speakers auto-identified and summary generated without review"
+        className="inline-block h-2 w-2 shrink-0 rounded-full bg-blue-500"
+      />
+    ) : t.auto_state === 'gated' ? (
+      <span
+        title="Auto-imported — waiting on speaker review before the summary"
+        className="inline-block h-2 w-2 shrink-0 rounded-full bg-amber-500"
+      />
+    ) : t.auto_state === 'auto' ? (
+      <span
+        title="Auto-imported from a series"
+        className="inline-block h-2 w-2 shrink-0 rounded-full border border-blue-500"
+      />
+    ) : null;
+
   const ownerCell = (t: ListRow) => {
     if (t.access === 'owner') {
       return <span className="text-xs text-muted-foreground">You</span>;
@@ -1524,6 +1559,8 @@ export function TranscriptTable({
                     onChanged={() => void fetchArchiveRef.current('silent')}
                   />
                 )}
+                {!uploading && !waiting && !trashed && recordingsChip(t)}
+                {!trashed && autoDot(t)}
               </div>
               {trashed ? (
                 <div className="truncate text-xs text-muted-foreground">

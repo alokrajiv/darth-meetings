@@ -24,6 +24,7 @@ import {
   ExternalLink,
   CalendarClock,
   Merge,
+  Zap,
 } from 'lucide-react';
 
 /**
@@ -33,8 +34,19 @@ import {
  * them is persisted.
  */
 
+interface AutoImportCfg {
+  enabled: boolean;
+  byUserId: string;
+  byEmail: string;
+  mode: 'transcript' | 'video' | 'both';
+  report: 'summary' | 'detailed-video' | 'detailed-text' | 'later';
+  since: string;
+  lastSweepAt?: string;
+  lastError?: string | null;
+}
+
 interface SeriesDetail {
-  series: { id: number; title: string; notes: string | null };
+  series: { id: number; title: string; notes: string | null; auto_import: AutoImportCfg | null };
   members: Array<{
     transcript_id: number;
     assemblyai_id: string;
@@ -311,6 +323,27 @@ export function SeriesDialog({ seriesId, onClose, onChanged, onMerged }: SeriesD
     });
     refresh();
   };
+  // ---- auto-import config -------------------------------------------------
+  const [autoBusy, setAutoBusy] = useState(false);
+  const saveAutoImport = async (patch: {
+    enabled: boolean;
+    mode?: AutoImportCfg['mode'];
+    report?: AutoImportCfg['report'];
+  }) => {
+    if (!seriesId || autoBusy) return;
+    setAutoBusy(true);
+    try {
+      const res = await fetch(`/api/series/${seriesId}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ autoImport: patch }),
+      });
+      if (res.ok) await loadDetail();
+    } finally {
+      setAutoBusy(false);
+    }
+  };
+
   const deleteSeries = async () => {
     if (!seriesId) return;
     if (!confirm('Delete this series? Transcripts are kept — only the grouping goes away.'))
@@ -546,6 +579,113 @@ export function SeriesDialog({ seriesId, onClose, onChanged, onMerged }: SeriesD
                 </div>
               </div>
             )}
+
+            {/* ---- auto-import ----------------------------------------- */}
+            {(() => {
+              const ai = detail.series.auto_import;
+              const on = ai?.enabled ?? false;
+              return (
+                <div
+                  className={`rounded-lg border p-2.5 ${on ? 'border-blue-500/30 bg-blue-500/[0.04]' : ''}`}
+                >
+                  <div className="flex items-center gap-2">
+                    <Zap
+                      className={`h-3.5 w-3.5 shrink-0 ${on ? 'text-blue-500' : 'text-muted-foreground'}`}
+                    />
+                    <p className="text-[11px] font-medium uppercase tracking-wider text-muted-foreground">
+                      Auto-import
+                    </p>
+                    {on && (
+                      <span className="truncate text-[11px] text-muted-foreground">
+                        as {ai!.byEmail}
+                        {ai!.lastSweepAt ? ` · checked ${sweptAgo(ai!.lastSweepAt)}` : ''}
+                      </span>
+                    )}
+                    <span className="ml-auto" />
+                    <Button
+                      size="sm"
+                      variant={on ? 'outline' : 'default'}
+                      className="h-6 px-2 text-xs"
+                      disabled={autoBusy}
+                      onClick={() =>
+                        void saveAutoImport({
+                          enabled: !on,
+                          mode: ai?.mode,
+                          report: ai?.report,
+                        })
+                      }
+                    >
+                      {autoBusy ? (
+                        <Loader2 className="h-3 w-3 animate-spin" />
+                      ) : on ? (
+                        'Turn off'
+                      ) : (
+                        'Turn on'
+                      )}
+                    </Button>
+                  </div>
+                  {on ? (
+                    <div className="mt-2 flex flex-wrap items-center gap-x-4 gap-y-1.5 text-xs">
+                      <label className="flex items-center gap-1.5">
+                        <span className="text-muted-foreground">Import</span>
+                        <select
+                          className="rounded border bg-background px-1 py-0.5 text-xs"
+                          value={ai!.mode}
+                          disabled={autoBusy}
+                          onChange={(e) =>
+                            void saveAutoImport({
+                              enabled: true,
+                              mode: e.target.value as AutoImportCfg['mode'],
+                              report: ai!.report,
+                            })
+                          }
+                        >
+                          <option value="both">video + transcript</option>
+                          <option value="video">video (re-diarized)</option>
+                          <option value="transcript">transcript only (fast, no AAI)</option>
+                        </select>
+                      </label>
+                      <label className="flex items-center gap-1.5">
+                        <span className="text-muted-foreground">then generate</span>
+                        <select
+                          className="rounded border bg-background px-1 py-0.5 text-xs"
+                          value={ai!.report}
+                          disabled={autoBusy}
+                          onChange={(e) =>
+                            void saveAutoImport({
+                              enabled: true,
+                              mode: ai!.mode,
+                              report: e.target.value as AutoImportCfg['report'],
+                            })
+                          }
+                        >
+                          <option value="summary">quick summary</option>
+                          <option value="detailed-text">detailed report</option>
+                          <option value="detailed-video">detailed report + video frames</option>
+                          <option value="later">nothing (decide later)</option>
+                        </select>
+                      </label>
+                      <span className="basis-full text-[11px] text-muted-foreground">
+                        Checks every ~30 min for new occurrences (from{' '}
+                        {dateLabel(ai!.since)} on). When every speaker is identified with high
+                        confidence the summary generates unattended; otherwise you get a Slack DM
+                        to review speakers first.
+                      </span>
+                      {ai!.lastError && (
+                        <span className="basis-full text-[11px] text-destructive">
+                          Last sweep problem: {ai!.lastError}
+                        </span>
+                      )}
+                    </div>
+                  ) : (
+                    <p className="mt-1 text-[11px] text-muted-foreground">
+                      Import every new occurrence of this series automatically, with your chosen
+                      report kind — you’ll be DMed as things land.
+                    </p>
+                  )}
+                </div>
+              );
+            })()}
 
             {/* ---- occurrence sweep ------------------------------------ */}
             <div>

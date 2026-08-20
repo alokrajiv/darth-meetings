@@ -13,11 +13,29 @@ import type { GmeetContext } from '@/lib/format';
 
 const SCHEMA = SCHEMAS.MEETING_WHISPERER;
 
+/**
+ * Per-series auto-import config (series.auto_import jsonb). The sweep runs
+ * as the enabler (their Google connection / identity), only fires on
+ * occurrences that START after `since`, and never re-fires an occurrence
+ * thanks to series_auto_import_log.
+ */
+export interface SeriesAutoImportCfg {
+  enabled: boolean;
+  byUserId: string;
+  byEmail: string;
+  mode: 'transcript' | 'video' | 'both';
+  report: 'summary' | 'detailed-video' | 'detailed-text' | 'later';
+  since: string;
+  lastSweepAt?: string;
+  lastError?: string | null;
+}
+
 export interface SeriesRow {
   id: number;
   title: string;
   created_by: string;
   notes: string | null;
+  auto_import: SeriesAutoImportCfg | null;
   created_at: string;
   updated_at: string;
 }
@@ -37,6 +55,8 @@ export interface SeriesListEntry {
   last_recorded_at: string | null;
   /** Median gap between member occurrences, seconds — null under 2 members. */
   median_gap_secs: number | null;
+  /** Auto-import is switched on for this series (index badge). */
+  auto_enabled: boolean;
 }
 
 export interface SeriesMemberEntry {
@@ -112,14 +132,77 @@ export async function listSeries(): Promise<SeriesListEntry[]> {
     SELECT s.id, s.title,
            count(m.id)::int AS member_count,
            max(COALESCE(t.recorded_at, t.created_at))::text AS last_recorded_at,
-           c.median_gap_secs
+           c.median_gap_secs,
+           COALESCE((s.auto_import->>'enabled')::boolean, false) AS auto_enabled
     FROM ${sql(SCHEMA)}.series s
     LEFT JOIN ${sql(SCHEMA)}.series_members m ON m.series_id = s.id
     LEFT JOIN ${sql(SCHEMA)}.transcripts t
       ON t.id = m.transcript_id AND t.deleted_at IS NULL
     LEFT JOIN cadence c ON c.series_id = s.id
-    GROUP BY s.id, s.title, c.median_gap_secs
+    GROUP BY s.id, s.title, c.median_gap_secs, s.auto_import
     ORDER BY max(COALESCE(t.recorded_at, t.created_at)) DESC NULLS LAST
+  `;
+}
+
+export async function setSeriesAutoImport(
+  id: number,
+  cfg: SeriesAutoImportCfg | null
+): Promise<void> {
+  await sql`
+    UPDATE ${sql(SCHEMA)}.series
+    SET auto_import = ${cfg ? sql.json(cfg as unknown as never) : null}, updated_at = NOW()
+    WHERE id = ${id}
+  `;
+}
+
+export async function listAutoImportEnabledSeries(): Promise<SeriesRow[]> {
+  return sql<SeriesRow[]>`
+    SELECT * FROM ${sql(SCHEMA)}.series
+    WHERE COALESCE((auto_import->>'enabled')::boolean, false)
+    ORDER BY id
+  `;
+}
+
+export interface AutoImportLogRow {
+  occ_key: string;
+  occ_start: string | null;
+  title: string | null;
+  outcome: string;
+  assemblyai_id: string | null;
+  detail: string | null;
+  fired_at: string;
+}
+
+/** Everything the sweep has fired for this series, keyed by occurrence. */
+export async function listAutoImportLog(seriesId: number): Promise<Map<string, AutoImportLogRow>> {
+  const rows = await sql<AutoImportLogRow[]>`
+    SELECT occ_key, occ_start::text, title, outcome, assemblyai_id, detail, fired_at::text
+    FROM ${sql(SCHEMA)}.series_auto_import_log
+    WHERE series_id = ${seriesId}
+  `;
+  return new Map(rows.map((r) => [r.occ_key, r]));
+}
+
+export async function recordAutoImportFire(input: {
+  seriesId: number;
+  occKey: string;
+  occStart: string | null;
+  title: string | null;
+  outcome: 'imported' | 'deferred' | 'already' | 'failed';
+  assemblyaiId?: string | null;
+  detail?: string | null;
+}): Promise<void> {
+  await sql`
+    INSERT INTO ${sql(SCHEMA)}.series_auto_import_log
+      (series_id, occ_key, occ_start, title, outcome, assemblyai_id, detail)
+    VALUES
+      (${input.seriesId}, ${input.occKey}, ${input.occStart}, ${input.title},
+       ${input.outcome}, ${input.assemblyaiId ?? null}, ${input.detail ?? null})
+    ON CONFLICT (series_id, occ_key) DO UPDATE SET
+      outcome       = EXCLUDED.outcome,
+      assemblyai_id = EXCLUDED.assemblyai_id,
+      detail        = EXCLUDED.detail,
+      fired_at      = now()
   `;
 }
 

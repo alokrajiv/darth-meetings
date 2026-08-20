@@ -295,6 +295,23 @@ export async function listPagedForUser(
              (t.gmeet_context->>'eventId') IS NOT NULL AS has_event,
              t.gmeet_context->'deferredImport'->>'mode' AS deferred_mode,
              t.gmeet_context->'deferredImport'->>'error' AS deferred_error,
+             -- Meetings with more than one recording: extra Meet segments
+             -- (videoParts, on top of the primary), a stitched multi-file
+             -- upload (uploadedParts), or a combined re-transcription.
+             GREATEST(
+               1 + COALESCE(jsonb_array_length(t.gmeet_context->'videoParts'), 0),
+               COALESCE(jsonb_array_length(t.gmeet_context->'uploadedParts'), 0),
+               COALESCE((t.gmeet_context->>'combinedParts')::int, 0)
+             )::int AS recording_count,
+             -- Series auto-import lifecycle: 'passed' = imported AND speaker
+             -- review jumped through automatically (report generated
+             -- unattended — the blue dot), 'gated' = auto-imported but held
+             -- for human review, 'auto' = auto-imported, not yet evaluated.
+             CASE
+               WHEN (t.gmeet_context->'autoReview'->>'passed')::boolean THEN 'passed'
+               WHEN t.gmeet_context ? 'autoReview' THEN 'gated'
+               WHEN t.gmeet_context ? 'autoImport' THEN 'auto'
+             END AS auto_state,
              ${isTrash ? sql`t.deleted_at::text` : sql`NULL::text`} AS deleted_at,
              ${
                isTrash
@@ -368,7 +385,7 @@ export async function listPagedForUser(
            b.source, b.recorded_at, b.auto_notes_status,
            b.upload_bytes_received, b.upload_bytes_total,
            b.provider, b.has_event, b.deferred_mode, b.deferred_error,
-           b.deleted_at, b.__access, b.matched_in, b.snippet,
+           b.recording_count, b.auto_state, b.deleted_at, b.__access, b.matched_in, b.snippet,
            b.day_key::text AS day_key,
            ${
              isTrash
@@ -748,6 +765,25 @@ export async function promoteUploadingRow(
     RETURNING *
   `;
   if (rows[0]) publishEvent({ kind: 'status', assemblyaiId: data.assemblyaiId });
+  return rows[0] ?? null;
+}
+
+/**
+ * The live placeholder row of a multi-file single-meeting upload group
+ * (gmeet_context.uploadGroup.id). Parts 2..N of the group land on this row.
+ */
+export async function findUploadGroupRow(
+  userId: string,
+  groupId: string
+): Promise<TranscriptRow | null> {
+  const rows = await sql<TranscriptRow[]>`
+    SELECT * FROM ${sql(SCHEMA)}.transcripts
+    WHERE user_id = ${userId}
+      AND status = 'uploading'
+      AND deleted_at IS NULL
+      AND gmeet_context->'uploadGroup'->>'id' = ${groupId}
+    LIMIT 1
+  `;
   return rows[0] ?? null;
 }
 

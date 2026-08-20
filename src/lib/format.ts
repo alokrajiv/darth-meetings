@@ -215,6 +215,43 @@ export interface GmeetContext {
     status: 'pending' | 'gave-up';
     lastError?: string;
   } | null;
+  /** A "detailed report — with video frames" requested while the recording
+   * was still being prepared (recordingPending 'waiting', no fileId to pull
+   * yet). The recording poller fires the report the moment the video lands
+   * and clears this; if the recording never materializes (gone / gave-up)
+   * the report still runs, degraded to text-only. */
+  pendingVideoReport?: {
+    instructions?: string;
+    triggeredBy?: { userId: string; email: string };
+    requestedAt: string;
+  } | null;
+  /** Multi-file single-meeting upload, in flight: bookkeeping while the
+   * group's files stream in one by one (part k>1 lands as
+   * `upload-<uuid>.part<k>`). Cleared when the last part triggers the
+   * stitch + ingest; the durable record is `uploadedParts`. */
+  uploadGroup?: {
+    id: string;
+    total: number;
+    parts: Array<{
+      index: number;
+      tempFilename: string;
+      originalFilename?: string;
+      comment?: string;
+      bytes?: number;
+    }>;
+  } | null;
+  /** The stitched-media map of a multi-file upload: one entry per source
+   * file in stitch order, with the user's per-file comment. `offsetSec` is
+   * where the file starts on the combined timeline. Fed into the AI prompts
+   * so the model understands the stitch points and any per-file caveats
+   * ("room mic", "Zoom rejoin after the drop"). */
+  uploadedParts?: Array<{
+    index: number;
+    originalFilename?: string;
+    comment?: string;
+    durationSec?: number;
+    offsetSec?: number;
+  }> | null;
   /** Import queued while Google was still preparing the needed artifact
    * (transcript Doc for 'transcript' mode, video file for 'video', both for
    * 'both'). Lives on a `defer-…` placeholder row (status 'waiting'); the
@@ -249,6 +286,13 @@ export interface GmeetContext {
         organizerEmail?: string;
         attendees?: GmeetAttendee[];
       };
+      /** Extra gmeet_context fields to stamp on the row the replay creates
+       * (series auto-import marker + report pref) — frozen with the request
+       * so they survive the placeholder→real-row promotion in every mode. */
+      contextExtra?: {
+        autoImport?: GmeetContext['autoImport'];
+        uploadPrefs?: GmeetContext['uploadPrefs'];
+      };
     };
     since: string;
     lastCheckedAt?: string;
@@ -271,6 +315,29 @@ export interface GmeetContext {
    * absent), a detailed report, or nothing ('later' = pick on the page). */
   uploadPrefs?: {
     report?: 'summary' | 'detailed-video' | 'detailed-text' | 'later';
+  } | null;
+  /** Stamped by the series auto-import sweep on rows it fires: which series
+   * occurrence this import came from and whose connection ran it. Presence
+   * of this marker is what arms the automatic speaker-review evaluation. */
+  autoImport?: {
+    seriesId: number;
+    seriesTitle?: string;
+    occKey: string;
+    byUserId: string;
+    byEmail: string;
+    at: string;
+  } | null;
+  /** Outcome of the automatic speaker-review evaluation that runs after the
+   * speaker-ID pass on auto-imported rows. passed=true → suggested names
+   * were applied and generation fired unattended (rendered as the "auto"
+   * dot in the listing); passed=false → the normal human review gate holds
+   * and the owner got a needs-review DM. */
+  autoReview?: {
+    evaluatedAt: string;
+    passed: boolean;
+    reason?: string;
+    /** What was generated unattended (mirrors uploadPrefs.report). */
+    generated?: 'summary' | 'detailed-video' | 'detailed-text' | null;
   } | null;
 }
 
@@ -329,6 +396,15 @@ export interface TranscriptListRow {
    * copy. */
   deferred_mode?: 'video' | 'transcript' | 'both' | null;
   deferred_error?: string | null;
+  /** Meetings with more than one recording: extra Meet segments beyond the
+   * primary, a stitched multi-file upload, or a combined re-transcription.
+   * 1 (or absent — legacy/v1 payloads) = single recording. */
+  recording_count?: number;
+  /** Series auto-import lifecycle: 'passed' = fully unattended (imported +
+   * speakers auto-identified + report generated — the blue dot), 'gated' =
+   * auto-imported but waiting on human speaker review, 'auto' = imported by
+   * the sweep, review not yet evaluated. Absent = manual import/upload. */
+  auto_state?: 'passed' | 'gated' | 'auto' | null;
   /** Set on trash-view rows only (the main listing never returns them). */
   deleted_at?: string | null;
   /** v2 listing with `q`: which field the search matched (first-match

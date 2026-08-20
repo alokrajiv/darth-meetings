@@ -13,7 +13,7 @@ import {
   TableHeader,
   TableRow,
 } from '@/components/ui/table';
-import { Loader2, Plus, Repeat, ScanSearch } from 'lucide-react';
+import { Loader2, Plus, Repeat, ScanSearch, Zap } from 'lucide-react';
 
 /**
  * The series index: every series in one comparative table (the surface that
@@ -30,6 +30,8 @@ interface SeriesIndexEntry {
   cadence: 'daily' | 'weekly' | 'biweekly' | 'monthly' | null;
   /** Another series normalizes to the same title — probable dupe, merge me. */
   dup: boolean;
+  /** Auto-import is switched on for this series. */
+  auto_enabled: boolean;
 }
 
 interface SeriesIndexResponse {
@@ -165,6 +167,14 @@ export default function SeriesIndexPage() {
                           <div className="flex min-w-0 items-center gap-2">
                             <Repeat className="h-3.5 w-3.5 shrink-0 text-primary/70" />
                             <span className="min-w-0 truncate text-sm font-medium">{s.title}</span>
+                            {s.auto_enabled && (
+                              <span
+                                title="Auto-import is on — new occurrences import themselves"
+                                className="shrink-0"
+                              >
+                                <Zap className="h-3 w-3 text-blue-500" />
+                              </span>
+                            )}
                             {s.dup && (
                               <Badge
                                 variant="outline"

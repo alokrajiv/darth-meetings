@@ -26,6 +26,7 @@ import {
   type GmeetMeetingCacheRow,
 } from '@/db-ops/gmeet-meeting-cache';
 import { findImportedByTeamsMeetings } from '@/db-ops/teams-import';
+import { sweepAutoImportSeries } from '@/lib/server/series-auto-import';
 import {
   upsertCalendarEvents,
   type CalendarEventUpsert,
@@ -694,6 +695,9 @@ async function sweepAll(): Promise<void> {
     if (accounts.length > 0) {
       console.log(`[gmeet-poller] swept ${accounts.length} account(s)`);
     }
+    // Series auto-import rides the same 30-minute cadence — after the
+    // per-account sweeps so freshly-cached calendar data is available.
+    await sweepAutoImportSeries();
   } catch (err) {
     console.warn('[gmeet-poller] sweep pass failed:', err);
   } finally {

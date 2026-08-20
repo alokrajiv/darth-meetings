@@ -8,6 +8,7 @@ import { listRecordArtifacts } from '@/lib/server/gmeet';
 import { getServerAccessToken } from '@/lib/server/google-oauth';
 import { executeGmeetImport } from '@/lib/server/gmeet-import-core';
 import { executeTeamsImport } from '@/lib/server/teams-import-core';
+import { notifyUser, APP_URL } from '@/lib/server/darth-notify';
 import type { GmeetContext } from '@/lib/format';
 
 /**
@@ -89,6 +90,7 @@ async function settleExecOutcome(
   outcome: { status: number; body: Record<string, unknown> },
   terminalStatuses: number[] = [409]
 ): Promise<void> {
+  const title = marker.request.event?.title?.trim() || 'a queued meeting import';
   if (outcome.status === 201) {
     const imported = outcome.body.transcript as { assemblyai_id?: string } | undefined;
     console.log(
@@ -104,6 +106,12 @@ async function settleExecOutcome(
         },
       });
     }
+    void notifyUser({
+      kind: 'deferred_import',
+      toEmail: marker.ownerEmail,
+      text: `Your queued import landed: *${title}* → <${APP_URL}/transcript/${imported?.assemblyai_id ?? row.assemblyai_id}|open>`,
+      dedupeKey: `mw-deferred-landed:${row.assemblyai_id}`,
+    });
     return;
   }
 
@@ -119,6 +127,16 @@ async function settleExecOutcome(
       error: errText,
       resolvedAt: nowIso,
     });
+    if (outcome.status !== 409) {
+      // 409 means the meeting IS in the app (someone else beat the queue) —
+      // nothing for the owner to act on, so stay quiet.
+      void notifyUser({
+        kind: 'deferred_import',
+        toEmail: marker.ownerEmail,
+        text: `Your queued import for *${title}* failed for good: ${errText}`,
+        dedupeKey: `mw-deferred-failed:${row.assemblyai_id}`,
+      });
+    }
     return;
   }
 
@@ -200,6 +218,7 @@ async function checkRow(row: {
         languageCode: marker.request.languageCode,
         force: marker.request.force,
         event: marker.request.event,
+        contextExtra: marker.request.contextExtra,
       },
       { placeholderAssemblyaiId: row.assemblyai_id }
     );

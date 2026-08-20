@@ -11,7 +11,12 @@
  * a share must never fail on notification plumbing.
  */
 
+import { isNotifyKindEnabled, type NotifyKind } from '@/db-ops/notify-prefs';
+
 const NOTIFY_URL = process.env.DARTH_NOTIFY_URL || 'https://tasks.darth-internal.trames.io/api/notify';
+
+/** Base URL for links inside DMs (and the settings-page footer). */
+export const APP_URL = process.env.MW_PUBLIC_URL || 'https://meetings.darth-internal.trames.io';
 
 export interface DarthDmInput {
   toEmail: string;
@@ -56,4 +61,21 @@ export async function sendDarthDm(input: DarthDmInput): Promise<void> {
   } catch (e) {
     console.error(`[darth-notify] failed for ${input.toEmail}:`, e instanceof Error ? e.message : e);
   }
+}
+
+/**
+ * Preference-aware DM: checks the recipient's notify_prefs for `kind` and
+ * appends a settings-page footer so every DM links to where it can be turned
+ * off. Use this (not sendDarthDm directly) for every recurring notification
+ * kind; raw sendDarthDm remains for one-off plumbing.
+ */
+export async function notifyUser(
+  input: DarthDmInput & { kind: NotifyKind }
+): Promise<void> {
+  if (!process.env.DARTH_APP_TOKEN) return;
+  if (!(await isNotifyKindEnabled(input.toEmail, input.kind))) return;
+  await sendDarthDm({
+    ...input,
+    text: `${input.text}\n<${APP_URL}/settings#notifications|⚙ notification settings>`,
+  });
 }

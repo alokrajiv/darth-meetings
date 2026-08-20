@@ -59,6 +59,13 @@ export interface TeamsImportBody {
     organizerEmail?: string;
     attendees?: GmeetAttendee[];
   };
+  /** Extra gmeet_context to stamp on the created row (series auto-import
+   * marker + report pref). Also lands on defer placeholders and survives
+   * promotion via the frozen request. */
+  contextExtra?: {
+    autoImport?: GmeetContext['autoImport'];
+    uploadPrefs?: GmeetContext['uploadPrefs'];
+  };
 }
 
 export interface TeamsExecuteOptions {
@@ -205,10 +212,17 @@ export async function executeTeamsImport(
           startTime: event.startTime,
           endTime: event.endTime,
           attendees,
+          ...(body.contextExtra ?? {}),
           deferredImport: {
             mode,
             ownerEmail: user.email,
-            request: { url: info.joinWebUrl, languageCode, force, event },
+            request: {
+              url: info.joinWebUrl,
+              languageCode,
+              force,
+              event,
+              contextExtra: body.contextExtra,
+            },
             since: new Date().toISOString(),
             status: 'waiting',
           },
@@ -306,6 +320,7 @@ export async function executeTeamsImport(
     startTime: event.startTime,
     endTime: event.endTime,
     attendees,
+    ...(body.contextExtra ?? {}),
   };
   const title = event.title ?? meeting.subject ?? null;
   const shareList = attendees.map((a) => ({ email: a.email, name: a.name }));

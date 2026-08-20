@@ -6,7 +6,9 @@ import {
   listKeys,
   listMembers,
   listSuggestedMembers,
+  setSeriesAutoImport,
   updateSeries,
+  type SeriesAutoImportCfg,
 } from '@/db-ops/series';
 
 export const runtime = 'nodejs';
@@ -35,14 +37,25 @@ export const GET = withAuth(async ({ user }, { params }) => {
   return NextResponse.json({ series, keys, members, suggestions });
 });
 
-/** PATCH /api/series/:id — rename / edit notes. */
-export const PATCH = withAuth(async ({ request }, { params }) => {
+const AUTO_MODES = ['transcript', 'video', 'both'] as const;
+const AUTO_REPORTS = ['summary', 'detailed-video', 'detailed-text', 'later'] as const;
+
+/** PATCH /api/series/:id — rename / edit notes / configure auto-import. */
+export const PATCH = withAuth(async ({ user, request }, { params }) => {
   const id = parseId((await params).id);
   if (!id) return NextResponse.json({ error: 'Bad id' }, { status: 400 });
   const series = await getSeries(id);
   if (!series) return NextResponse.json({ error: 'Not found' }, { status: 404 });
 
-  let body: { title?: string; notes?: string | null };
+  let body: {
+    title?: string;
+    notes?: string | null;
+    autoImport?: {
+      enabled: boolean;
+      mode?: SeriesAutoImportCfg['mode'];
+      report?: SeriesAutoImportCfg['report'];
+    };
+  };
   try {
     body = (await request.json()) as typeof body;
   } catch {
@@ -52,7 +65,37 @@ export const PATCH = withAuth(async ({ request }, { params }) => {
   if (body.title !== undefined && !title) {
     return NextResponse.json({ error: 'title cannot be empty' }, { status: 400 });
   }
-  await updateSeries(id, { title, notes: body.notes });
+  if (body.title !== undefined || body.notes !== undefined) {
+    await updateSeries(id, { title, notes: body.notes });
+  }
+
+  if (body.autoImport !== undefined) {
+    const ai = body.autoImport;
+    if (typeof ai?.enabled !== 'boolean') {
+      return NextResponse.json({ error: 'autoImport.enabled must be a boolean' }, { status: 400 });
+    }
+    const mode = ai.mode ?? series.auto_import?.mode ?? 'both';
+    const report = ai.report ?? series.auto_import?.report ?? 'summary';
+    if (!AUTO_MODES.includes(mode) || !AUTO_REPORTS.includes(report)) {
+      return NextResponse.json({ error: 'Invalid autoImport mode/report' }, { status: 400 });
+    }
+    // Enabling (re)binds the sweep to the CALLER — their Google connection
+    // does the imports and they own + get DMs for the resulting rows. The
+    // watch window starts at first enablement and survives re-toggles (the
+    // fire-once log prevents duplicates regardless).
+    const cfg: SeriesAutoImportCfg = {
+      enabled: ai.enabled,
+      byUserId: ai.enabled ? user.userId : (series.auto_import?.byUserId ?? user.userId),
+      byEmail: ai.enabled ? user.email : (series.auto_import?.byEmail ?? user.email),
+      mode,
+      report,
+      since: series.auto_import?.since ?? new Date().toISOString(),
+      lastSweepAt: series.auto_import?.lastSweepAt,
+      lastError: null,
+    };
+    await setSeriesAutoImport(id, cfg);
+    return NextResponse.json({ ok: true, autoImport: cfg });
+  }
   return NextResponse.json({ ok: true });
 });
 

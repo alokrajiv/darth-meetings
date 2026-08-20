@@ -70,6 +70,13 @@ export interface ImportBody {
    * placeholder row) instead of failing — the deferred-import poller runs
    * it the moment Google finishes. */
   defer?: boolean;
+  /** Extra gmeet_context to stamp on the created row (series auto-import
+   * marker + report pref). Merged into the base context, so it also lands on
+   * defer placeholders and survives promotion via the frozen request. */
+  contextExtra?: {
+    autoImport?: GmeetContext['autoImport'];
+    uploadPrefs?: GmeetContext['uploadPrefs'];
+  };
   event?: {
     id?: string;
     title?: string;
@@ -386,6 +393,7 @@ export async function executeGmeetImport(
     transcriptDocId: effectiveDocId ?? undefined,
     recordingPending,
     actuals,
+    ...(body.contextExtra ?? {}),
   };
 
   // Orphan imports (pasted link / recents) have no calendar event — fall
@@ -496,6 +504,7 @@ export async function executeGmeetImport(
               conferenceRecordName: actuals.conferenceRecordName,
               force,
               event,
+              contextExtra: body.contextExtra,
             },
             since: new Date().toISOString(),
             status: 'waiting',

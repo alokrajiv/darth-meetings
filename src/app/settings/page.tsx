@@ -7,6 +7,7 @@ import { RefreshCw } from 'lucide-react';
 import { AppHeader } from '@/components/app-header';
 import { VocabEditor } from '@/components/vocab-editor';
 import { GoogleAccountCard } from '@/components/google-account-card';
+import { NotifyPrefsCard } from '@/components/notify-prefs-card';
 import type { VocabPayload } from '@/lib/format';
 
 interface OrgVocabMeta {
@@ -105,8 +106,9 @@ export default function SettingsPage() {
         </p>
       </div>
 
-      <div className="mb-6">
+      <div className="mb-6 space-y-6">
         <GoogleAccountCard />
+        <NotifyPrefsCard />
       </div>
 
       {loading && (

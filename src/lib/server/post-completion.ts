@@ -1,6 +1,7 @@
 import 'server-only';
 import { getForUser } from '@/db-ops/transcripts';
 import { getContentCached, identifySpeakers } from '@/lib/server/auto-notes';
+import { maybeAutoReview } from '@/lib/server/auto-review';
 import { suggestSpeakersFromMeet } from '@/lib/server/meet-align';
 import { suggestSpeakersForTranscript } from '@/lib/server/voiceprint';
 
@@ -67,6 +68,14 @@ export function onTranscriptCompleted(ownerUserId: string, assemblyaiId: string)
         // weigh their hints. Guarded by speaker_id_status — runs once.
         await identifySpeakers(ownerUserId, full.assemblyai_id).catch((err) =>
           console.warn('[post-completion] speaker-id failed:', err)
+        );
+
+        // Series-auto-imported rows only: when every speaker that matters is
+        // identified with high confidence, apply the names and generate the
+        // configured summary/report unattended; otherwise DM the owner to
+        // come review. No-op without the gmeet_context.autoImport marker.
+        await maybeAutoReview(ownerUserId, full.assemblyai_id).catch((err) =>
+          console.warn('[post-completion] auto-review failed:', err)
         );
       } catch (err) {
         console.warn('[post-completion] hook failed:', err);
