@@ -10,6 +10,7 @@ import {
   resolveMeetingByJoinUrl,
 } from '@/lib/server/ms-graph';
 import { parseTeamsJoinLink, pickOccurrenceArtifacts } from '@/lib/teams-link';
+import { listConferenceRecordsByCode, listRecordArtifacts } from '@/lib/server/gmeet';
 import { listKeys, getSeries } from '@/db-ops/series';
 import { recurringBaseId } from '@/lib/series-keys';
 import type { GmeetAttendee } from '@/lib/format';
@@ -24,6 +25,13 @@ import type { GmeetAttendee } from '@/lib/format';
  *    following" edits (verified: one series → 6 variants), hence the
  *    belt-and-suspenders union. Attachments ride the user's own event copy
  *    and never expire — this is what sees months-old recordings.
+ *  - Google Meet REST API (caller's token): conferenceRecords filtered by
+ *    the series' meeting code(s) — every call Google still holds (~30 days)
+ *    with its recording/transcript inventory. This is what the import
+ *    dialog uses too, and it sees artifacts the calendar copy does NOT
+ *    carry: Meet attaches files to the event only for some attendees
+ *    (verified 2026-08-21: DevOps Scrum, 112 calendar instances, 1 with an
+ *    attachment, while Meet listed transcripts for the recent occurrences).
  *  - Microsoft Graph (Teams series): the series meeting object lists every
  *    occurrence's transcript/recording keyed by callId — including
  *    occurrences from before the caller was invited (verified: calendar saw
@@ -46,6 +54,7 @@ const SWEEP_TTL_MS = 6 * 3600_000;
 interface SweepCacheEntry {
   at: number;
   googleConnected: boolean;
+  meetChecked: boolean;
   graphChecked: boolean;
   occurrences: SeriesOccurrence[];
 }
@@ -83,9 +92,12 @@ export interface SeriesOccurrence {
   startIso: string;
   endIso: string | null;
   title: string | null;
-  /** 'imported' = a member transcript no calendar/Graph occurrence matched
-   * (caller isn't on the event, outside the sweep window, or an upload). */
-  source: 'calendar' | 'graph' | 'both' | 'imported';
+  /** 'meet' = a Meet conference record no calendar instance matched (the
+   * caller's calendar copy is gone or they were never on that instance);
+   * 'imported' = a member transcript no calendar/Graph/Meet occurrence
+   * matched (caller isn't on the event, outside the sweep window, or an
+   * upload). */
+  source: 'calendar' | 'graph' | 'both' | 'meet' | 'imported';
   upcoming: boolean;
   meetingCode: string | null;
   eventId: string | null;
@@ -97,7 +109,18 @@ export interface SeriesOccurrence {
   hasTranscript: boolean;
   videoFileId: string | null;
   transcriptDocId: string | null;
+  /** transcriptDocId is a "Notes by Gemini" Doc (transcript lives in its
+   * Transcript tab) rather than a classic transcript Doc. */
+  geminiNotes: boolean;
   teams: { joinWebUrl: string; callId: string | null } | null;
+  /** Google Meet conference record that backs this occurrence (Meet API
+   * side). `*Pending` = Google lists the artifact but the file isn't
+   * generated yet — still importable (the import defers until it lands). */
+  meet: {
+    recordName: string;
+    videoPending: boolean;
+    transcriptPending: boolean;
+  } | null;
   /** Google Calendar "open event" link (calendar-sourced occurrences). */
   calendarUrl: string | null;
   imported: OccurrenceImportedRef[];
@@ -107,6 +130,9 @@ export interface SeriesOccurrencesResult {
   seriesId: number;
   seriesTitle: string;
   googleConnected: boolean;
+  /** The Meet REST API conferenceRecords pass ran (needs Google + a
+   * meeting-code key). */
+  meetChecked: boolean;
   graphChecked: boolean;
   /** When the external sweep actually ran (cache timestamp). */
   sweptAt: string;
@@ -147,19 +173,29 @@ async function calList(token: string, params: URLSearchParams): Promise<CalInsta
   return out;
 }
 
-/** Strict artifact classification (never counts Gemini-notes docs). */
+/** Artifact classification — same rules as the import dialog: a classic
+ * "… - Transcript" Doc wins; otherwise a "Notes by Gemini" Doc counts as the
+ * transcript source (Gemini keeps the transcript in that Doc's "Transcript"
+ * tab, which the import extracts). Series that run Gemini notes instead of
+ * plain transcription only ever get the Gemini Doc attached — verified
+ * 2026-08-21 on DevOps Scrum (the Meet API's own transcript docId IS the
+ * Gemini Doc). Other docs (agendas, "Notes - <title>") are ignored. */
 function classifyAttachments(e: CalInstance): {
   videoFileId: string | null;
   transcriptDocId: string | null;
+  geminiNotes: boolean;
 } {
   const atts = e.attachments ?? [];
   const video = atts.find((a) => /^video\//.test(a.mimeType ?? ''));
-  const doc = atts.find(
-    (a) =>
-      a.mimeType === 'application/vnd.google-apps.document' &&
-      /transcript\s*$/i.test(a.title ?? '')
-  );
-  return { videoFileId: video?.fileId ?? null, transcriptDocId: doc?.fileId ?? null };
+  const docs = atts.filter((a) => a.mimeType === 'application/vnd.google-apps.document' && a.fileId);
+  const transcriptDoc = docs.find((a) => /transcript\s*$/i.test(a.title ?? ''));
+  const geminiDoc = docs.find((a) => /gemini/i.test(a.title ?? ''));
+  const doc = transcriptDoc ?? geminiDoc ?? null;
+  return {
+    videoFileId: video?.fileId ?? null,
+    transcriptDocId: doc?.fileId ?? null,
+    geminiNotes: !transcriptDoc && Boolean(geminiDoc),
+  };
 }
 
 interface ImportedRow {
@@ -213,6 +249,8 @@ async function loadImportedCandidates(
 }
 
 const DAY_MS = 86_400_000;
+/** Meet artifact lookups per parallel batch (2 API calls each). */
+const MEET_BATCH = 6;
 
 function matchImported(
   occ: SeriesOccurrence,
@@ -300,7 +338,9 @@ export async function sweepSeriesOccurrences(
       hasTranscript: Boolean(c.transcript_doc_id),
       videoFileId: c.video_file_id ?? c.drive_file_id,
       transcriptDocId: c.transcript_doc_id,
+      geminiNotes: false,
       teams: null,
+      meet: null,
       calendarUrl: null,
       imported: [{ assemblyai_id: c.assemblyai_id, title: c.title, accessible: c.accessible }],
     });
@@ -322,6 +362,7 @@ export async function sweepSeriesOccurrences(
     seriesId,
     seriesTitle: series.title,
     googleConnected: entry!.googleConnected,
+    meetChecked: entry!.meetChecked,
     graphChecked: entry!.graphChecked,
     sweptAt: new Date(entry!.at).toISOString(),
     fromCache: !stale,
@@ -337,6 +378,7 @@ async function computeSweepSkeleton(
   caller: { userId: string; email: string }
 ): Promise<{
   googleConnected: boolean;
+  meetChecked: boolean;
   graphChecked: boolean;
   occurrences: SeriesOccurrence[];
 }> {
@@ -396,7 +438,7 @@ async function computeSweepSkeleton(
   for (const inst of instances.values()) {
     const startIso = inst.start?.dateTime ?? inst.start?.date;
     if (!startIso) continue;
-    const { videoFileId, transcriptDocId } = classifyAttachments(inst);
+    const { videoFileId, transcriptDocId, geminiNotes } = classifyAttachments(inst);
     occurrences.push({
       key: inst.id!,
       startIso,
@@ -416,10 +458,101 @@ async function computeSweepSkeleton(
       hasTranscript: Boolean(transcriptDocId),
       videoFileId,
       transcriptDocId,
+      geminiNotes,
       teams: null,
+      meet: null,
       calendarUrl: inst.htmlLink ?? null,
       imported: [],
     });
+  }
+
+  // ---- Google Meet REST API side (conference records per meeting code) ----
+  // Calendar attachments are per-copy and frequently absent on the caller's
+  // event; Meet's own record of each call is authoritative for "was this
+  // recorded / transcribed". Enrich matching calendar instances, surface
+  // the rest as Meet-only occurrences. Records not recorded at all add no
+  // occurrence (the calendar already lists the instance as bare).
+  let meetChecked = false;
+  if (minted && codes.size > 0) {
+    for (const code of codes) {
+      const records = await listConferenceRecordsByCode(minted.token, code);
+      if (records.length === 0) continue;
+      meetChecked = true;
+      const sameCode = occurrences.filter((o) => o.meetingCode === code && !o.teams);
+      // Artifacts in small parallel batches — two calls per record.
+      for (let i = 0; i < records.length; i += MEET_BATCH) {
+        const batch = records.slice(i, i + MEET_BATCH);
+        const inventories = await Promise.all(
+          batch.map((r) => listRecordArtifacts(minted.token, r.name))
+        );
+        batch.forEach((rec, j) => {
+          const inv = inventories[j]!;
+          if (!rec.startTime) return;
+          const hasRec = inv.recordings.length > 0;
+          const hasTr = inv.transcriptsListed > 0;
+          if (!hasRec && !hasTr) return;
+          const fileId = inv.recordings.find((r) => r.fileId)?.fileId ?? null;
+          const docId = inv.transcriptDocIds[0] ?? null;
+          const meet = {
+            recordName: rec.name,
+            videoPending: hasRec && !fileId,
+            transcriptPending: hasTr && !docId,
+          };
+          const recStart = Date.parse(rec.startTime);
+          // Nearest calendar instance of the same code within half a day
+          // (the /api/gmeet/check ±12h convention — codes are reused across
+          // the series, so time is the only disambiguator).
+          let best: SeriesOccurrence | null = null;
+          let bestDelta = DAY_MS / 2;
+          for (const o of sameCode) {
+            const delta = Math.abs(Date.parse(o.startIso) - recStart);
+            if (delta < bestDelta) {
+              bestDelta = delta;
+              best = o;
+            }
+          }
+          if (best) {
+            best.hasRecording = best.hasRecording || hasRec;
+            best.hasTranscript = best.hasTranscript || hasTr;
+            best.videoFileId = best.videoFileId ?? fileId;
+            best.transcriptDocId = best.transcriptDocId ?? docId;
+            // Earliest record wins for a same-day stop/restart; keep the
+            // first recordName, OR the pending flags.
+            best.meet = best.meet
+              ? {
+                  recordName: best.meet.recordName,
+                  videoPending: best.meet.videoPending || meet.videoPending,
+                  transcriptPending: best.meet.transcriptPending || meet.transcriptPending,
+                }
+              : meet;
+            return;
+          }
+          occurrences.push({
+            key: `meet-${rec.name.replace(/^conferenceRecords\//, '')}`,
+            startIso: rec.startTime,
+            endIso: rec.endTime ?? null,
+            title: seriesTitle,
+            source: 'meet',
+            upcoming: false,
+            meetingCode: code,
+            eventId: null,
+            recurringEventId: null,
+            iCalUID: null,
+            organizerEmail: null,
+            attendees: [],
+            hasRecording: hasRec,
+            hasTranscript: hasTr,
+            videoFileId: fileId,
+            transcriptDocId: docId,
+            geminiNotes: false,
+            teams: null,
+            meet,
+            calendarUrl: null,
+            imported: [],
+          });
+        });
+      }
+    }
   }
 
   // ---- Microsoft Graph side (Teams series) --------------------------------
@@ -487,7 +620,9 @@ async function computeSweepSkeleton(
             hasTranscript: l.tr,
             videoFileId: null,
             transcriptDocId: null,
+            geminiNotes: false,
             teams: { joinWebUrl: info.joinWebUrl, callId },
+            meet: null,
             calendarUrl: null,
             imported: [],
           });
@@ -502,5 +637,5 @@ async function computeSweepSkeleton(
     }
   }
 
-  return { googleConnected, graphChecked, occurrences };
+  return { googleConnected, meetChecked, graphChecked, occurrences };
 }

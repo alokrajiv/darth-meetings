@@ -95,9 +95,11 @@ interface Occurrence {
   startIso: string;
   endIso: string | null;
   title: string | null;
-  /** 'imported' = a member no calendar/Teams occurrence matched (you aren't
-   * on the event, it's outside the 12-month window, or it was uploaded). */
-  source: 'calendar' | 'graph' | 'both' | 'imported';
+  /** 'meet' = a Meet conference record with no calendar instance on your
+   * side; 'imported' = a member no calendar/Teams/Meet occurrence matched
+   * (you aren't on the event, it's outside the 12-month window, or it was
+   * uploaded). */
+  source: 'calendar' | 'graph' | 'both' | 'meet' | 'imported';
   upcoming: boolean;
   meetingCode: string | null;
   eventId: string | null;
@@ -109,13 +111,19 @@ interface Occurrence {
   hasTranscript: boolean;
   videoFileId: string | null;
   transcriptDocId: string | null;
+  /** transcriptDocId is a "Notes by Gemini" Doc (Transcript tab). */
+  geminiNotes: boolean;
   teams: { joinWebUrl: string; callId: string | null } | null;
+  /** Meet conference record backing this occurrence; `*Pending` = Google
+   * lists the artifact but hasn't generated the file yet. */
+  meet: { recordName: string; videoPending: boolean; transcriptPending: boolean } | null;
   calendarUrl: string | null;
   imported: Array<{ assemblyai_id: string; title: string | null; accessible: boolean }>;
 }
 
 interface OccurrencesResult {
   googleConnected: boolean;
+  meetChecked: boolean;
   graphChecked: boolean;
   sweptAt: string;
   fromCache: boolean;
@@ -656,9 +664,11 @@ export function SeriesDialog({ seriesId, onClose, onChanged, onMerged }: SeriesD
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
               accessToken,
-              mode: o.transcriptDocId ? 'transcript' : 'video',
+              // Transcript when Meet/calendar says one exists — even if the
+              // Doc isn't generated yet (the import defers on meetingCode).
+              mode: o.hasTranscript ? 'transcript' : 'video',
               transcriptDocId: o.transcriptDocId ?? undefined,
-              videoFileId: o.transcriptDocId ? undefined : (o.videoFileId ?? undefined),
+              videoFileId: o.hasTranscript ? undefined : (o.videoFileId ?? undefined),
               // Still-processing artifacts queue; ready videos pull in the
               // background — either way this request returns in seconds.
               defer: true,
@@ -1242,9 +1252,13 @@ export function SeriesDialog({ seriesId, onClose, onChanged, onMerged }: SeriesD
                           ? 'Google Calendar + Microsoft Teams'
                           : o.source === 'graph'
                             ? 'Microsoft Teams (Graph)'
-                            : o.source === 'imported'
-                              ? 'Imported meeting only — not on your calendar'
-                              : 'Google Calendar';
+                            : o.source === 'meet'
+                              ? 'Google Meet record only — not on your calendar'
+                              : o.source === 'imported'
+                                ? 'Imported meeting only — not on your calendar'
+                                : o.meet
+                                  ? 'Google Calendar + Google Meet'
+                                  : 'Google Calendar';
                       const accepted = o.attendees.filter((a) => a.responseStatus === 'accepted').length;
                       const driveUrl = o.videoFileId
                         ? `https://drive.google.com/file/d/${o.videoFileId}/view`
@@ -1298,10 +1312,13 @@ export function SeriesDialog({ seriesId, onClose, onChanged, onMerged }: SeriesD
                                       title={
                                         o.teams
                                           ? 'Teams recording available'
-                                          : 'Recording available on Drive'
+                                          : o.meet?.videoPending
+                                            ? 'Meet recorded this call — Google is still preparing the video (import queues until it lands)'
+                                            : 'Recording available on Drive'
                                       }
                                     >
                                       <Video className="h-3 w-3" /> recording
+                                      {o.meet?.videoPending && !o.videoFileId ? '…' : ''}
                                     </span>
                                   )}
                                   {o.hasTranscript && (
@@ -1310,10 +1327,15 @@ export function SeriesDialog({ seriesId, onClose, onChanged, onMerged }: SeriesD
                                       title={
                                         o.teams
                                           ? 'Teams transcript available'
-                                          : 'Meet transcript Doc available'
+                                          : o.meet?.transcriptPending && !o.transcriptDocId
+                                            ? 'Meet transcribed this call — Google is still preparing the Doc (import queues until it lands)'
+                                            : o.geminiNotes
+                                              ? 'Notes by Gemini Doc attached — the transcript is in its Transcript tab (import extracts it)'
+                                              : 'Meet transcript Doc available'
                                       }
                                     >
                                       <FileText className="h-3 w-3" /> transcript
+                                      {o.meet?.transcriptPending && !o.transcriptDocId ? '…' : ''}
                                     </span>
                                   )}
                                   {!o.hasRecording && !o.hasTranscript && o.imported.length === 0 && (

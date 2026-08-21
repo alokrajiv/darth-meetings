@@ -196,7 +196,10 @@ const CHARS_PER_SECOND = 14;
  * ordering; not sample-accurate.
  */
 export function parseMeetTranscriptDoc(text: string): ParsedMeetTranscript {
-  const lines = text.replace(/\r\n/g, '\n').split('\n');
+  // Older "Notes by Gemini" Transcript tabs use vertical tabs (\x0b, Docs'
+  // soft line break) between utterances instead of newlines — verified on
+  // DevOps Scrum 2026-04-02 (27K chars parsed as 27 utterances until this).
+  const lines = text.replace(/\r\n/g, '\n').replace(/[\x0b\u2028]/g, '\n').split('\n');
 
   const attendees: string[] = [];
   interface RawUtterance {
@@ -396,6 +399,44 @@ export async function findConferenceRecordName(
     }
   }
   return best.name;
+}
+
+export interface ConferenceRecordLite {
+  name: string;
+  startTime?: string;
+  endTime?: string;
+}
+
+/**
+ * Every conference record Google still holds for a meeting code (codes are
+ * reused across a recurring series, so this IS the series' occurrence log as
+ * Meet saw it). Records age out after ~30 days, so this is the recent tail.
+ * Best-effort like the rest: a miss reads as an empty list.
+ */
+export async function listConferenceRecordsByCode(
+  token: string,
+  meetingCode: string,
+  maxPages = 4
+): Promise<ConferenceRecordLite[]> {
+  const filter = `space.meeting_code = "${meetingCode}"`;
+  const out: ConferenceRecordLite[] = [];
+  let pageToken: string | undefined;
+  for (let p = 0; p < maxPages; p++) {
+    const url =
+      `${MEET_API}/conferenceRecords?filter=${encodeURIComponent(filter)}&pageSize=50` +
+      (pageToken ? `&pageToken=${encodeURIComponent(pageToken)}` : '');
+    const j = await tryJson<{
+      conferenceRecords?: ConferenceRecordLite[];
+      nextPageToken?: string;
+    }>(token, url);
+    if (!j) break;
+    for (const r of j.conferenceRecords ?? []) {
+      out.push({ name: r.name, startTime: r.startTime, endTime: r.endTime });
+    }
+    pageToken = j.nextPageToken;
+    if (!pageToken) break;
+  }
+  return out;
 }
 
 /**
