@@ -142,9 +142,14 @@ async function settleExecOutcome(
       error: errText,
       resolvedAt: nowIso,
     });
-    if (outcome.status !== 409) {
-      // 409 means the meeting IS in the app (someone else beat the queue) —
-      // nothing for the owner to act on, so stay quiet.
+    // 409 = the meeting IS in the app (someone else beat the queue); a
+    // background 422 = the Doc was there but unusable (empty Transcript tab —
+    // a meeting with no conversation), which a series "Import all" hits for
+    // every such occurrence and the series dialog already badges as failed.
+    // Neither is something the owner can act on — stay quiet. Every other
+    // failure DMs.
+    const quiet = outcome.status === 409 || (marker.background && outcome.status === 422);
+    if (!quiet) {
       void notifyUser({
         kind: 'deferred_import',
         toEmail: marker.ownerEmail,
