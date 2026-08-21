@@ -74,7 +74,10 @@ export interface ImportBody {
    * inline — queue the same `defer-…` placeholder and let the poller run the
    * heavy download/AAI submit server-side. The request returns in seconds
    * and the browser tab is free (closing it no longer kills the import).
-   * Only affects video/'both' modes; quick transcript imports stay inline. */
+   * Transcript mode: when the Doc id is known the quick import is queued the
+   * same way (one row per occurrence in PG, poller-driven — a series "Import
+   * all" of dozens of transcripts survives a closed tab or a restart); a
+   * transcript import with no Doc id yet stays inline. */
   background?: boolean;
   /** Extra gmeet_context to stamp on the created row (series auto-import
    * marker + report pref). Merged into the base context, so it also lands on
@@ -632,6 +635,98 @@ export async function executeGmeetImport(
         autoShared,
       });
     }
+  }
+
+  // ---- Background transcript import: the Doc is known (calendar
+  // attachment / Gemini notes Doc / Meet listing) so there is nothing to wait
+  // for — but a series "Import all" is dozens of these driven by a browser
+  // loop that dies with the tab. Queue the same durable placeholder row the
+  // deferred path uses (PG; survives restarts) and let the deferred-import
+  // poller run the quick import server-side with the owner's minted token.
+  // Dedupe HERE so a second click, an already-queued twin, or a colleague's
+  // import 409s now instead of a minute later. No conference record needed
+  // (months-old Gemini Docs have none) — the poller executes on sight.
+  if (
+    body.background &&
+    mode === 'transcript' &&
+    !sourceRow &&
+    !opts?.placeholderAssemblyaiId &&
+    effectiveDocId
+  ) {
+    if (!force) {
+      const recordId = actuals?.conferenceRecordName?.split('/').pop() ?? null;
+      const dupe = await findVisibleByAssemblyaiId(
+        user.userId,
+        user.email,
+        `gmeet-${recordId ?? effectiveDocId}`
+      );
+      if (dupe) {
+        return out(409, {
+          error: 'This meeting was already imported.',
+          existing: {
+            assemblyai_id: dupe.assemblyai_id,
+            title: dupe.title,
+            created_at: dupe.created_at,
+            own: dupe.user_id === user.userId,
+            accessible: true,
+          },
+        });
+      }
+      if (event.meetingCode) {
+        // Also catches our own still-queued placeholder for this occurrence
+        // (it carries the meetingCode + startTime) — idempotent queueing.
+        const conflictOut = await checkCrossUserDuplicate(
+          event.meetingCode,
+          event.startTime ?? actuals?.conferenceStart ?? null,
+          user
+        );
+        if (conflictOut) return conflictOut;
+      }
+    }
+    const placeholderId = `defer-${randomUUID()}`;
+    const { recordingPending: _dropped, ...ctxForPlaceholder } = baseContext;
+    void _dropped;
+    const placeholder = await createDeferredPlaceholder(user.userId, {
+      placeholderId,
+      title,
+      recordedAt: event.startTime ?? actuals?.conferenceStart ?? null,
+      gmeetContext: {
+        ...ctxForPlaceholder,
+        deferredImport: {
+          mode,
+          ownerEmail: user.email,
+          background: true,
+          request: {
+            transcriptDocId: effectiveDocId,
+            languageCode,
+            conferenceRecordName: actuals?.conferenceRecordName,
+            force,
+            event,
+            contextExtra: body.contextExtra,
+          },
+          since: new Date().toISOString(),
+          status: 'waiting',
+        },
+      },
+    });
+    const autoShared = await autoShareToInternalInvitees(
+      placeholder.id,
+      user.userId,
+      user.email,
+      shareList
+    );
+    await registerPeopleFromMeeting(shareList, user.userId);
+    console.log(
+      `[gmeet/import] background transcript import queued as ${placeholderId} (doc ready)`
+    );
+    return out(202, {
+      deferred: true,
+      background: true,
+      waitingFor: 'transcript',
+      transcript: placeholder,
+      mode,
+      autoShared,
+    });
   }
 
   // ---- Meet transcript content when the mode wants it ---------------------

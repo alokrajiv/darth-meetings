@@ -57,6 +57,8 @@ const MAX_EXEC_ATTEMPTS = 4;
 // Imports are heavy (a video execution downloads gigabytes) — keep the
 // per-tick batch small; the queue drains across ticks.
 const MAX_PER_TICK = 5;
+/** Rounds of MAX_PER_TICK a single tick may drain (see tick()). */
+const MAX_ROUNDS_PER_TICK = 12;
 
 // Guard state lives on globalThis, NOT in module scope: Next.js compiles
 // instrumentation.ts and each API route into separate bundles that can each
@@ -255,8 +257,16 @@ async function checkRow(row: {
   const minted = await getServerAccessToken(row.user_id);
   if (!minted) return; // owner not connected right now — TTL retires it eventually
 
+  // Background rows whose artifact id was frozen at queue time have nothing
+  // to wait for — run on sight. (Transcript rows may have NO conference
+  // record at all: months-old Gemini Docs outlive the Meet API's records.)
+  const mode = marker.mode;
+  const readyAtQueue =
+    !!marker.background &&
+    (!!marker.request.videoFileId || (mode === 'transcript' && !!marker.request.transcriptDocId));
+
   const recordName = marker.request.conferenceRecordName;
-  if (!recordName) {
+  if (!recordName && !readyAtQueue) {
     // Can't happen (deferral requires a record) — but never loop on it.
     await markDeferredImportFailed(row.user_id, row.assemblyai_id, {
       ...marker,
@@ -274,10 +284,9 @@ async function checkRow(row: {
   // under their token, which reads as "the recording never appeared" and
   // would kill a perfectly good import (the Drive download itself works —
   // Drive sharing, not Meet API access, is what gates the file).
-  const mode = marker.mode;
   let readyVideo: string | null = null;
-  if (!(marker.background && marker.request.videoFileId)) {
-    const artifacts = await listRecordArtifacts(minted.token, recordName);
+  if (!readyAtQueue) {
+    const artifacts = await listRecordArtifacts(minted.token, recordName!);
     readyVideo = artifacts.recordings.find((r) => r.fileId)?.fileId ?? null;
     const videoGone = artifacts.recordings.length === 0;
     const transcriptReady = artifacts.transcriptDocIds.length > 0;
@@ -348,20 +357,36 @@ async function checkRow(row: {
     },
     { placeholderAssemblyaiId: row.assemblyai_id }
   );
-  await settleExecOutcome(row, marker, nowIso, outcome);
+  // 422 = the artifact is there but unusable (empty Transcript tab — a
+  // meeting with no conversation — or unidentifiable meeting): retrying
+  // can't change it, fail now with the message instead of 4 backoff runs.
+  await settleExecOutcome(row, marker, nowIso, outcome, [409, 422]);
 }
 
 async function tick(): Promise<void> {
   if (pollerState.ticking) return; // a video execution can far outlive the interval
   pollerState.ticking = true;
   try {
-    const rows = await listDeferredImportRows(MAX_PER_TICK);
-    for (const row of rows) {
-      try {
-        await checkRow(row);
-      } catch (err) {
-        console.warn(`[deferred-import] check failed for ${row.assemblyai_id}:`, err);
+    // Drain in rounds: a series "Import all" queues dozens of ~2s transcript
+    // imports and waiting a minute per 5 would take a quarter hour. Each
+    // round re-lists the oldest waiting rows and skips the ones already
+    // touched this tick (not-ready rows stay 'waiting' after a heartbeat and
+    // must not be re-polled in a loop); stops when a round comes back short.
+    const seen = new Set<string>();
+    for (let round = 0; round < MAX_ROUNDS_PER_TICK; round++) {
+      const rows = (await listDeferredImportRows(MAX_PER_TICK + seen.size))
+        .filter((r) => !seen.has(r.assemblyai_id))
+        .slice(0, MAX_PER_TICK);
+      if (rows.length === 0) break;
+      for (const row of rows) {
+        seen.add(row.assemblyai_id);
+        try {
+          await checkRow(row);
+        } catch (err) {
+          console.warn(`[deferred-import] check failed for ${row.assemblyai_id}:`, err);
+        }
       }
+      if (rows.length < MAX_PER_TICK) break;
     }
   } catch (err) {
     console.warn('[deferred-import] tick failed:', err);

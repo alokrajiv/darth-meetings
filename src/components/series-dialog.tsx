@@ -118,7 +118,15 @@ interface Occurrence {
    * lists the artifact but hasn't generated the file yet. */
   meet: { recordName: string; videoPending: boolean; transcriptPending: boolean } | null;
   calendarUrl: string | null;
-  imported: Array<{ assemblyai_id: string; title: string | null; accessible: boolean }>;
+  imported: Array<{
+    assemblyai_id: string;
+    title: string | null;
+    accessible: boolean;
+    /** Queued (deferred/background) — import hasn't run yet. */
+    queued: boolean;
+    /** Import failed for good (row in error) — trash it to retry. */
+    failed: boolean;
+  }>;
 }
 
 interface OccurrencesResult {
@@ -723,10 +731,13 @@ export function SeriesDialog({ seriesId, onClose, onChanged, onMerged }: SeriesD
     const videoOnly = targets.filter((t) => !t.hasTranscript && t.hasRecording).length;
     const msg =
       `Import ${targets.length} occurrence${targets.length === 1 ? '' : 's'}?\n\n` +
-      `${targets.length - videoOnly} transcript import${targets.length - videoOnly === 1 ? '' : 's'} (fast, free)` +
+      `${targets.length - videoOnly} transcript import${targets.length - videoOnly === 1 ? '' : 's'} (free, no audio)` +
       (videoOnly > 0
-        ? `\n${videoOnly} video import${videoOnly === 1 ? '' : 's'} (slow — full download + transcription cost)`
-        : '');
+        ? `\n${videoOnly} video import${videoOnly === 1 ? '' : 's'} (full download + transcription cost)`
+        : '') +
+      `\n\nEverything is queued on the server and runs in the background — ` +
+      `you can close this once the queueing finishes. Occurrences a colleague already ` +
+      `imported are skipped automatically.`;
     if (!confirm(msg)) return;
     setMassProgress({ done: 0, total: targets.length });
     // Sequential on purpose: video imports are heavy, and the server dedupes
@@ -1424,7 +1435,29 @@ export function SeriesDialog({ seriesId, onClose, onChanged, onMerged }: SeriesD
                               </InfoHover>
                               {o.imported.length > 0 ? (
                                 o.imported.map((imp) =>
-                                  imp.accessible ? (
+                                  imp.queued ? (
+                                    <a
+                                      key={imp.assemblyai_id}
+                                      href={`/transcript/${imp.assemblyai_id}`}
+                                      target="_blank"
+                                      rel="noopener noreferrer"
+                                      className="inline-flex items-center gap-1 rounded-full bg-primary/10 px-2 py-0.5 text-[11px] text-primary"
+                                      title="Import queued — runs on the server (safe to close this tab); lands within a few minutes"
+                                    >
+                                      <Loader2 className="h-3 w-3 animate-spin" /> queued
+                                    </a>
+                                  ) : imp.failed && imp.accessible ? (
+                                    <a
+                                      key={imp.assemblyai_id}
+                                      href={`/transcript/${imp.assemblyai_id}`}
+                                      target="_blank"
+                                      rel="noopener noreferrer"
+                                      className="inline-flex items-center gap-1 rounded-full bg-destructive/10 px-2 py-0.5 text-[11px] text-destructive"
+                                      title="Import failed — open the row to see why (e.g. the Transcript tab was empty); trash it to retry"
+                                    >
+                                      <X className="h-3 w-3" /> failed
+                                    </a>
+                                  ) : imp.accessible ? (
                                     <span key={imp.assemblyai_id} className="group/imp inline-flex items-center gap-0.5">
                                       <a
                                         href={`/transcript/${imp.assemblyai_id}`}

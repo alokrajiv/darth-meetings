@@ -84,6 +84,12 @@ export interface OccurrenceImportedRef {
   assemblyai_id: string;
   title: string | null;
   accessible: boolean;
+  /** A queued import (deferred/background placeholder) — the row exists but
+   * the import hasn't run yet. Still "claimed": not importable again. */
+  queued: boolean;
+  /** The import failed for good (row is in 'error') — still claims the
+   * occurrence; trash the row to retry. */
+  failed: boolean;
 }
 
 export interface SeriesOccurrence {
@@ -210,6 +216,7 @@ interface ImportedRow {
   video_file_id: string | null;
   teams_call_id: string | null;
   meeting_code: string | null;
+  status: string;
   accessible: boolean;
   is_member: boolean;
 }
@@ -230,6 +237,7 @@ async function loadImportedCandidates(
            t.gmeet_context->>'videoFileId' AS video_file_id,
            t.gmeet_context->'teams'->>'callId' AS teams_call_id,
            t.gmeet_context->>'meetingCode' AS meeting_code,
+           t.status,
            (t.user_id = ${caller.userId} OR sh.id IS NOT NULL) AS accessible,
            COALESCE(m.series_id = ${seriesId}, false) AS is_member
     FROM ${sql(SCHEMA)}.transcripts t
@@ -276,7 +284,13 @@ function matchImported(
       }
       return false;
     })
-    .map((c) => ({ assemblyai_id: c.assemblyai_id, title: c.title, accessible: c.accessible }));
+    .map((c) => ({
+      assemblyai_id: c.assemblyai_id,
+      title: c.title,
+      accessible: c.accessible,
+      queued: c.status === 'waiting',
+      failed: c.status === 'error',
+    }));
 }
 
 export async function sweepSeriesOccurrences(
@@ -342,7 +356,15 @@ export async function sweepSeriesOccurrences(
       teams: null,
       meet: null,
       calendarUrl: null,
-      imported: [{ assemblyai_id: c.assemblyai_id, title: c.title, accessible: c.accessible }],
+      imported: [
+        {
+          assemblyai_id: c.assemblyai_id,
+          title: c.title,
+          accessible: c.accessible,
+          queued: c.status === 'waiting',
+          failed: c.status === 'error',
+        },
+      ],
     });
   }
   occurrences.sort((a, b) => Date.parse(b.startIso) - Date.parse(a.startIso));
