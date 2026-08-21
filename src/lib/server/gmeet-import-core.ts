@@ -776,8 +776,9 @@ export async function executeGmeetImport(
     }
     if (mode === 'transcript' && (!parsed || parsed.utterances.length === 0)) {
       return out(422, {
-        error:
-          'Could not parse any utterances out of the transcript Doc. It may be empty or in an unexpected format — try re-transcribing the video instead.',
+        error: parsed?.endedAfter
+          ? `Google's transcript for this meeting is empty — the Transcript tab only says "Transcription ended after ${parsed.endedAfter}" (no speech was captured / not enough conversation). Nothing to import.`
+          : 'Could not parse any utterances out of the transcript Doc. It may be empty or in an unexpected format — try re-transcribing the video instead.',
       });
     }
   }

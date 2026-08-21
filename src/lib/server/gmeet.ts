@@ -163,6 +163,10 @@ export async function exportTranscriptText(token: string, docId: string): Promis
 export interface ParsedMeetTranscript {
   attendees: string[];
   utterances: MeetUtterance[];
+  /** Gemini-notes Transcript tabs carry "Transcription ended after
+   * HH:MM:SS" — with zero utterances that means Google captured no speech
+   * (too little conversation), not a parse failure. */
+  endedAfter?: string;
 }
 
 // A block timestamp line: "00:05:00" (Meet drops one every few minutes).
@@ -200,6 +204,7 @@ export function parseMeetTranscriptDoc(text: string): ParsedMeetTranscript {
   // soft line break) between utterances instead of newlines — verified on
   // DevOps Scrum 2026-04-02 (27K chars parsed as 27 utterances until this).
   const lines = text.replace(/\r\n/g, '\n').replace(/[\x0b\u2028]/g, '\n').split('\n');
+  const endedAfter = /Transcription ended after (\d{1,2}:\d{2}:\d{2})/.exec(text)?.[1];
 
   const attendees: string[] = [];
   interface RawUtterance {
@@ -299,7 +304,7 @@ export function parseMeetTranscriptDoc(text: string): ParsedMeetTranscript {
     }
   }
 
-  return { attendees, utterances };
+  return { attendees, utterances, ...(endedAfter ? { endedAfter } : {}) };
 }
 
 /**
@@ -325,7 +330,8 @@ export function mergeParsedTranscripts(parts: ParsedMeetTranscript[]): ParsedMee
     }
     if (part.utterances.length > 0) offsetMs = segmentEnd + 5 * 60_000;
   }
-  return { attendees, utterances };
+  const endedAfter = parts.find((p) => p.endedAfter)?.endedAfter;
+  return { attendees, utterances, ...(endedAfter ? { endedAfter } : {}) };
 }
 
 /**
