@@ -155,3 +155,17 @@ export async function deleteAudioFile(filename: string): Promise<void> {
     // ignore — best-effort
   }
 }
+
+/** Best-effort delete of every audio-dir file whose name starts with the
+ * prefix — multi-part upload temps (`upload-<uuid>.part`, `.part2`, …). */
+export async function deleteAudioFilesByPrefix(prefix: string): Promise<void> {
+  if (!prefix || prefix.includes('/') || prefix.includes('..')) return;
+  try {
+    const entries = await fsp.readdir(getAudioDir());
+    await Promise.all(
+      entries.filter((f) => f.startsWith(prefix)).map((f) => deleteAudioFile(f))
+    );
+  } catch {
+    // ignore — best-effort
+  }
+}

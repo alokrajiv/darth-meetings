@@ -76,6 +76,14 @@ export function SpeakerReviewDialog({
   }, [initialNames, speakers, dirty]);
 
   const filledCount = speakers.filter((sp) => (names[sp] ?? '').trim()).length;
+  // Every name was already human-confirmed (a rerun after an earlier
+  // generation): the gate stays — the summary is still written with these
+  // names — but "the AI guessed" would be wrong, so the copy changes.
+  const allConfirmed =
+    speakers.length > 0 &&
+    speakers.every(
+      (sp) => !!speakerLabels.find((l) => l.originalSpeaker === sp)?.customName.trim()
+    );
 
   return (
     <Dialog open={open} onOpenChange={(v) => !submitting && onOpenChange(v)}>
@@ -85,9 +93,9 @@ export function SpeakerReviewDialog({
             Who&apos;s who in this meeting?
           </DialogTitle>
           <DialogDescription className="text-xs">
-            The AI guessed names from the transcript{identifying ? '' : ', voiceprints, and video'} —
-            fix anything wrong, then generate. The summary is written with these names, so a minute
-            here beats regenerating later.
+            {allConfirmed
+              ? 'All names were confirmed earlier — a quick glance is enough. The summary is written with these names, so fix anything that looks off before generating.'
+              : `The AI guessed names from the transcript${identifying ? '' : ', voiceprints, and video'} — fix anything wrong, then generate. The summary is written with these names, so a minute here beats regenerating later.`}
           </DialogDescription>
         </DialogHeader>
 
@@ -181,7 +189,9 @@ export function SpeakerReviewDialog({
             <Sparkles className="h-4 w-4" />
             {submitting
               ? 'Saving…'
-              : `Confirm ${filledCount}/${speakers.length} & generate summary`}
+              : allConfirmed
+                ? 'Looks right — generate summary'
+                : `Confirm ${filledCount}/${speakers.length} & generate summary`}
           </Button>
         </DialogFooter>
       </DialogContent>

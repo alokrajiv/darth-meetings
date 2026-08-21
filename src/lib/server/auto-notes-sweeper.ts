@@ -5,7 +5,7 @@ import {
   listSpeakerIdBacklog,
   listStaleUploads,
 } from '@/db-ops/transcripts';
-import { deleteAudioFile } from '@/lib/server/audio-storage';
+import { deleteAudioFilesByPrefix } from '@/lib/server/audio-storage';
 import { generateAutoNotes, identifySpeakers } from '@/lib/server/auto-notes';
 
 /**
@@ -38,8 +38,9 @@ async function sweep(): Promise<void> {
     const stale = await listStaleUploads(UPLOAD_STALL_MINUTES, 10);
     for (const s of stale) {
       console.log(`[notes-sweeper] reaping orphaned upload ${s.assemblyai_id}`);
-      // Temp file shares the placeholder's uuid: up-<uuid> ↔ upload-<uuid>.part
-      await deleteAudioFile(`upload-${s.assemblyai_id.slice(3)}.part`);
+      // Temp files share the placeholder's uuid: up-<uuid> ↔ upload-<uuid>.part
+      // (plus .part2, .part3… for multi-file single-meeting groups).
+      await deleteAudioFilesByPrefix(`upload-${s.assemblyai_id.slice(3)}.part`);
       await deleteForUser(s.user_id, s.assemblyai_id).catch((err) =>
         console.warn(`[notes-sweeper] stale upload delete failed ${s.assemblyai_id}:`, err)
       );

@@ -1,0 +1,189 @@
+ ▐▛███▛█   Claude Code v2.1.237
+▝▜██████▀  Fable 5 · Claude Max
+  ▝▝ ▝▝    ~/workspace/meeting-whisperer
+
+
+❯ [Image #1] what is this? amd i seeing series - with nothign - this entire UI  
+  is stupid                                                                     
+                                                                                
+  can u show like show how many meeting are inside imported vs improtable etc   
+                                                                                
+  alsolike in integration candence i see dup - but i cant see anythging with    
+  smae - i mean this enite thing looks messy                                    
+  ⎿  [Image #1]
+
+⏺ I'll dig into the series page + dialog code to explain what you're seeing and
+  then fix the listing so it actually shows useful counts.
+
+  Searched for 2 patterns, listed 2 directories, ran 2 shell commands (ctrl+o to expand)
+
+⏺ Found the mechanics. Now pulling the actual prod data (which series are dups,
+  why MCAP shows 1 member but 0 occurrences) and the occurrences route in one
+  go.
+
+  Ran 9 shell commands (ctrl+o to expand)
+
+⏺ Writing the server pieces first: dup detection in db-ops, member-folding in
+  the occurrence sweep, and the batched counts route.
+
+  Ran 2 shell commands (ctrl+o to expand)
+
+⏺ Server side compiles. Now the index page (Imported / Importable columns,
+  adjacent dup rows) and the dialog (dup-merge banner, imported source handling,
+  clearer empty state).
+
+  Ran 1 shell command (ctrl+o to expand)
+
+⏺ Now the dialog patches.
+
+  Ran 1 shell command (ctrl+o to expand)
+
+⏺ Compiles + lints clean. Now testing against the real data — reading the
+  local-dev recipe and spinning up a dev server.
+
+  Ran 4 shell commands (ctrl+o to expand)
+
+⏺ Endpoints work (series 1 & 6 both see the same 57 calendar occurrences —
+  confirms they're one meeting). Now the visual check via Playwright.
+
+  Called playwright, ran 2 shell commands (ctrl+o to expand)
+
+⏺ Another session's Playwright holds the shared browser; I'll drive a headless
+  Chromium directly with playwright-core instead of stealing it.
+  Read 3 files, listed 1 directory, ran 2 shell commands (ctrl+o to expand)
+
+⏺ Both dialogs now read coherently. Two polish items (dialog chip overflow on
+  multi-import rows, a legend for "—" in the footer), then build + deploy.
+
+  Ran 3 shell commands (ctrl+o to expand)
+
+⏺ VM already carries the rest of the working tree (md5s match) and no AI runs
+  are in flight — safe to deploy.
+
+  Ran 1 shell command (ctrl+o to expand)
+
+⏺ Deployed. Verifying on prod (API + headless screenshot) and killing my local
+  dev server.
+
+  Read 1 file, ran 1 shell command (ctrl+o to expand)
+
+⏺ Prod verified. Now committing — checking the diffs for hunks that aren't mine
+  first (shared working tree rule).
+
+  Ran 2 shell commands (ctrl+o to expand)
+
+⏺ All mine. Committing just these files.
+
+  Ran 2 shell commands (ctrl+o to expand)
+
+⏺ Done — deployed to prod (8c31738) and verified there.
+
+  What you were actually seeing
+
+  - MCAP "0 occurrences" but "1 meeting in this series": the Occurrences panel
+    is swept from your own Google Calendar / Teams. That MCAP meeting was
+    imported by a colleague (c478bf8e…), you're not on the calendar event, so
+    the sweep found nothing — while the member list (DB) had 1. Two sources of
+    truth shown as if they were one.
+  - "dup" with nothing matching nearby: dup detection was title-only, and the
+    list is sorted by last meeting — so the other "Integration Cadence" was 12
+    rows down, hidden behind the dialog. Worse: the two Integration Cadence
+    series (#6 = 49 meetings, #1 = 5) and the two Data Cadence (#4/#9) are
+    literally the same Meet (ook-esgs-wkf / vnm-gyww-fiy) split across keys —
+    one side only held the recurring-base id, the other only the meeting code.
+
+  What changed (live now)
+
+  /series index
+  - Members → Imported; new Importable column (calendar/Teams occurrences with a
+    recording/transcript not yet imported) — fills in progressively after the
+    list loads (batched GET /api/series/occurrence-counts?ids=…, same 6h cache
+    as the dialog). Amber when > 0; hover shows the full breakdown (on calendar
+    / imported / importable / no artifacts / upcoming). — = not on your calendar
+    (legend in the footer).
+  - Dup detection now uses evidence (shared Meet code, recurring event, Teams
+    meeting; name-only last), dup siblings are pulled adjacent (largest first, ↳
+    tinted row), badge says why (dup · same recurring event), footer says "N
+    probable duplicates".
+
+  Series dialog
+  - Members the calendar can't see are folded into the occurrence list as "not 
+    on your calendar · imported" rows, so counts and "N meetings in this series"
+    always agree. Header shows · not on your calendar when your calendar has
+    zero instances.
+  - "Probably a duplicate → Merge into it" banner, one click (existing merge
+    txn; confirms first).
+  - Fixed the right-side chip overflow on rows with multiple imports.
+
+  Real numbers from your account right now: Weekly Tressa Review 16 importable,
+  Data Cadence 21 + 23, Good Spanish Perfume w/ Monday reviews 5, Integration
+  Cadence 2.
+
+  Left for you
+
+  The two real dupe merges are one click away in the dialog — open the smaller
+  one (Integration Cadence (5) → merge into the 49, Data Cadence (1) → into the
+  2). I didn't merge them since that's irreversible and you'd earlier kept
+  merges for yourself.
+
+✻ Crunched for 11m 26s
+
+※ recap: Reworked and deployed the /series UI: Imported/Importable columns, duplicates paired by shared Meet evidence, and dialog occurrences now include members you're not invited to. Next: open the smaller Integration Cadence (5) and Data Cadence (1) and click "Merge into it". (disable recaps in /config)
+
+❯ [Image #2] this also is weird right                                           
+  ⎿  [Image #2]
+
+⏺ Yes — it's naming the other series, but both are called "Data Cadence", so it
+  reads like it's talking about itself. Fixing the copy to say explicitly
+  "another series with the same name", with meeting counts for both sides and
+  the other one's last meeting date so you can tell them apart.
+
+  Read 1 file, ran 3 shell commands (ctrl+o to expand)
+
+⏺ Reads clearly now. Committing.
+
+  Ran 1 shell command (ctrl+o to expand)
+
+⏺ Agreed, it was ambiguous — both series are called "Data Cadence", so the
+  banner looked like it was describing itself.
+
+  Fixed, deployed, and verified on prod (6e5becb). It now reads:
+
+  ▎ Another series with the same name (#4, 2 meetings, last Fri, Jul 24) is the 
+  ▎ same recurring event as this one (1 meeting).
+  ▎ [Merge this one into it]
+
+  When the names differ it says “X” (N meetings, last …) is the same Meet code 
+  as this one (M meetings). — the other side's last-meeting date is included
+  specifically so same-named twins are distinguishable.
+
+✻ Baked for 1m 51s
+
+※ recap: Reworking the Series page so it shows Imported/Importable counts, pairs duplicate series, and explains dialog states; all deployed to prod and committed. Next: open the smaller Data Cadence and Integration Cadence and click "Merge this one into it". (disable recaps in /config)
+
+❯ does it open up a new tab or something to show the info of it like - merge is 
+  compplex yea                                                                  
+
+⏺ Not yet — the banner only has the merge button. I'll add a "View it ↗" link
+  that opens the other series in a new tab (/series?series=<id> deep-link, which
+  the index will learn to open on load), so you can compare before merging.
+
+  Ran 3 shell commands (ctrl+o to expand)
+
+⏺ Now it does — deployed and verified on prod (e868401).
+
+  The banner now reads:
+
+  ▎ Another series with the same name (#4, 2 meetings, last Fri, Jul 24) is the 
+  ▎ same recurring event as this one (1 meeting). View it ↗ · [Merge this one 
+  ▎ into it]
+
+  - View it ↗ opens /series?series=4 in a new tab — the index now understands
+    that deep link and opens the other series' dialog on load, so you can
+    compare both side by side before deciding.
+  - Merge itself is unchanged: still a confirm prompt, then the existing
+    transactional move (members + matching rules → survivor, loser deleted).
+    Rule of thumb: open the smaller one and merge it into the larger.
+
+✻ Worked for 1m 32s
+※ recap: Reworked the /series page: Imported/Importable columns, dup series paired with a clear "same recurring event" banner plus View it link and one-click merge, all deployed to prod. Next: you merge the two Integration Cadence / Data Cadence dupes when ready. (disable recaps in /config)

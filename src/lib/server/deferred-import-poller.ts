@@ -58,8 +58,16 @@ const MAX_EXEC_ATTEMPTS = 4;
 // per-tick batch small; the queue drains across ticks.
 const MAX_PER_TICK = 5;
 
-let started = false;
-let ticking = false;
+// Guard state lives on globalThis, NOT in module scope: Next.js compiles
+// instrumentation.ts and each API route into separate bundles that can each
+// load their own COPY of this module, so module-level flags give every copy
+// its own `ticking` guard. Observed 2026-08-20: a route-kicked tick (route
+// bundle's copy) and the interval tick (instrumentation's copy) each saw a
+// queued row still 'waiting' — the marker only resolves after execution —
+// and imported the same meeting twice. globalThis is per-process and
+// therefore genuinely shared across bundle copies.
+const pollerState = ((globalThis as unknown as Record<string, { started: boolean; ticking: boolean }>)
+  .__mwDeferredImportPoller ??= { started: false, ticking: false });
 
 type DeferredMarker = NonNullable<GmeetContext['deferredImport']>;
 
@@ -106,12 +114,17 @@ async function settleExecOutcome(
         },
       });
     }
-    void notifyUser({
-      kind: 'deferred_import',
-      toEmail: marker.ownerEmail,
-      text: `Your queued import landed: *${title}* → <${APP_URL}/transcript/${imported?.assemblyai_id ?? row.assemblyai_id}|open>`,
-      dedupeKey: `mw-deferred-landed:${row.assemblyai_id}`,
-    });
+    // Background imports land minutes after the user clicked Import and the
+    // listing shows the progress — a "landed" DM would be noise. Deferred
+    // imports resolve hours later, so those DO get told. Failures always DM.
+    if (!marker.background) {
+      void notifyUser({
+        kind: 'deferred_import',
+        toEmail: marker.ownerEmail,
+        text: `Your queued import landed: *${title}* → <${APP_URL}/transcript/${imported?.assemblyai_id ?? row.assemblyai_id}|open>`,
+        dedupeKey: `mw-deferred-landed:${row.assemblyai_id}`,
+      });
+    }
     return;
   }
 
@@ -254,58 +267,68 @@ async function checkRow(row: {
     return;
   }
 
-  const artifacts = await listRecordArtifacts(minted.token, recordName);
-  const readyVideo = artifacts.recordings.find((r) => r.fileId)?.fileId ?? null;
-  const videoGone = artifacts.recordings.length === 0;
-  const transcriptReady = artifacts.transcriptDocIds.length > 0;
-  const transcriptGone = artifacts.transcriptsListed === 0;
-
+  // Background rows were queued with the artifacts ALREADY ready and the
+  // file id frozen in the request — there is nothing to wait for, so skip
+  // the artifact-listing gate entirely. The gate would even lie here: for a
+  // meeting the owner didn't organize, the Meet API lists zero artifacts
+  // under their token, which reads as "the recording never appeared" and
+  // would kill a perfectly good import (the Drive download itself works —
+  // Drive sharing, not Meet API access, is what gates the file).
   const mode = marker.mode;
-  let ready = false;
-  let terminalError: string | null = null;
-  if (mode === 'transcript') {
-    if (transcriptReady) ready = true;
-    else if (transcriptGone) {
-      terminalError =
-        'The transcript never appeared — Google stopped listing it (discarded or never saved).';
-    }
-  } else if (mode === 'video') {
-    if (readyVideo) ready = true;
-    else if (videoGone) {
-      terminalError =
-        'The recording never appeared — Google stopped listing it (discarded or never saved).';
-    }
-  } else {
-    // 'both'
-    if (videoGone) {
-      terminalError =
-        'The recording never appeared — Google stopped listing it (discarded or never saved).';
-    } else if (readyVideo) {
-      // Hold for the Doc, but not forever: gone or overdue → video-only run
-      // (executeGmeetImport swallows a missing transcript in 'both' mode).
-      ready = transcriptReady || transcriptGone || age > BOTH_TRANSCRIPT_WAIT_MS;
-    }
-  }
+  let readyVideo: string | null = null;
+  if (!(marker.background && marker.request.videoFileId)) {
+    const artifacts = await listRecordArtifacts(minted.token, recordName);
+    readyVideo = artifacts.recordings.find((r) => r.fileId)?.fileId ?? null;
+    const videoGone = artifacts.recordings.length === 0;
+    const transcriptReady = artifacts.transcriptDocIds.length > 0;
+    const transcriptGone = artifacts.transcriptsListed === 0;
 
-  if (terminalError) {
-    console.log(`[deferred-import] ${row.assemblyai_id}: ${terminalError}`);
-    await markDeferredImportFailed(row.user_id, row.assemblyai_id, {
-      ...marker,
-      lastCheckedAt: nowIso,
-      attempts: (marker.attempts ?? 0) + 1,
-      status: 'failed',
-      error: terminalError,
-      resolvedAt: nowIso,
-    });
-    return;
-  }
+    let ready = false;
+    let terminalError: string | null = null;
+    if (mode === 'transcript') {
+      if (transcriptReady) ready = true;
+      else if (transcriptGone) {
+        terminalError =
+          'The transcript never appeared — Google stopped listing it (discarded or never saved).';
+      }
+    } else if (mode === 'video') {
+      if (readyVideo) ready = true;
+      else if (videoGone) {
+        terminalError =
+          'The recording never appeared — Google stopped listing it (discarded or never saved).';
+      }
+    } else {
+      // 'both'
+      if (videoGone) {
+        terminalError =
+          'The recording never appeared — Google stopped listing it (discarded or never saved).';
+      } else if (readyVideo) {
+        // Hold for the Doc, but not forever: gone or overdue → video-only run
+        // (executeGmeetImport swallows a missing transcript in 'both' mode).
+        ready = transcriptReady || transcriptGone || age > BOTH_TRANSCRIPT_WAIT_MS;
+      }
+    }
 
-  if (!ready) {
-    await heartbeat(row.user_id, row.assemblyai_id, marker, {
-      lastCheckedAt: nowIso,
-      attempts: (marker.attempts ?? 0) + 1,
-    });
-    return;
+    if (terminalError) {
+      console.log(`[deferred-import] ${row.assemblyai_id}: ${terminalError}`);
+      await markDeferredImportFailed(row.user_id, row.assemblyai_id, {
+        ...marker,
+        lastCheckedAt: nowIso,
+        attempts: (marker.attempts ?? 0) + 1,
+        status: 'failed',
+        error: terminalError,
+        resolvedAt: nowIso,
+      });
+      return;
+    }
+
+    if (!ready) {
+      await heartbeat(row.user_id, row.assemblyai_id, marker, {
+        lastCheckedAt: nowIso,
+        attempts: (marker.attempts ?? 0) + 1,
+      });
+      return;
+    }
   }
 
   console.log(
@@ -329,8 +352,8 @@ async function checkRow(row: {
 }
 
 async function tick(): Promise<void> {
-  if (ticking) return; // a video execution can far outlive the interval
-  ticking = true;
+  if (pollerState.ticking) return; // a video execution can far outlive the interval
+  pollerState.ticking = true;
   try {
     const rows = await listDeferredImportRows(MAX_PER_TICK);
     for (const row of rows) {
@@ -343,13 +366,23 @@ async function tick(): Promise<void> {
   } catch (err) {
     console.warn('[deferred-import] tick failed:', err);
   } finally {
-    ticking = false;
+    pollerState.ticking = false;
   }
 }
 
+/**
+ * Run a tick soon — the import routes call this right after queueing a
+ * background import so it starts in seconds instead of on the next interval.
+ * The short delay lets the HTTP response flush first; the `ticking` guard
+ * dedupes overlap with the interval.
+ */
+export function kickDeferredImportPoller(): void {
+  setTimeout(() => void tick(), 500).unref?.();
+}
+
 export function startDeferredImportPoller(): void {
-  if (started) return;
-  started = true;
+  if (pollerState.started) return;
+  pollerState.started = true;
   console.log(`[deferred-import] armed: every ${TICK_MS / 1000}s`);
   const timer = setInterval(() => void tick(), TICK_MS);
   timer.unref?.();

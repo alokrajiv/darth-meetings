@@ -224,6 +224,29 @@ export function TranscriptSourcesCard({
             </span>
           </li>
         )}
+        {(ctx?.uploadedParts?.length ?? 0) > 1 && (
+          <li className="flex items-start gap-2">
+            <Video className="mt-0.5 h-3.5 w-3.5 shrink-0 text-muted-foreground" />
+            <span>
+              <span className="font-medium">
+                Stitched from {ctx!.uploadedParts!.length} uploaded files
+              </span>
+              <span className="text-muted-foreground">
+                {' '}
+                — joined in order into one recording before transcription. The AI is told
+                where the joins are{ctx!.uploadedParts!.some((p) => p.comment) ? ' and gets your per-file notes' : ''}.
+              </span>
+              <span className="mt-1 block space-y-0.5">
+                {ctx!.uploadedParts!.map((p) => (
+                  <span key={p.index} className="block truncate text-muted-foreground">
+                    {p.index}. {p.originalFilename ?? `file ${p.index}`}
+                    {p.comment ? ` — ${p.comment}` : ''}
+                  </span>
+                ))}
+              </span>
+            </span>
+          </li>
+        )}
         {multiVideo && (
           <li className="flex items-start gap-2">
             <Video className="mt-0.5 h-3.5 w-3.5 shrink-0 text-muted-foreground" />

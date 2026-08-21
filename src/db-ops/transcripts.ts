@@ -110,6 +110,7 @@ export async function listVisibleToUser(
            -- Google to prepare the X" listing copy; error shows after give-up.
            t.gmeet_context->'deferredImport'->>'mode' AS deferred_mode,
            t.gmeet_context->'deferredImport'->>'error' AS deferred_error,
+           t.gmeet_context->'deferredImport'->>'background' AS deferred_background,
            sm.series_id, se.title AS series_title,
            sus.series_id AS suspected_series_id, sus.title AS suspected_series_title,
            CASE
@@ -295,6 +296,7 @@ export async function listPagedForUser(
              (t.gmeet_context->>'eventId') IS NOT NULL AS has_event,
              t.gmeet_context->'deferredImport'->>'mode' AS deferred_mode,
              t.gmeet_context->'deferredImport'->>'error' AS deferred_error,
+             t.gmeet_context->'deferredImport'->>'background' AS deferred_background,
              -- Meetings with more than one recording: extra Meet segments
              -- (videoParts, on top of the primary), a stitched multi-file
              -- upload (uploadedParts), or a combined re-transcription.

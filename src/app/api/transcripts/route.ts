@@ -3,10 +3,12 @@ import { withAuth } from '@/lib/auth/with-auth';
 import {
   createUploadingPlaceholder,
   deleteForUser,
+  findUploadGroupRow,
   listDeletedForUser,
   listPagedForUser,
   listPendingVisibleToUser,
   listVisibleToUser,
+  mergeGmeetContextForUser,
   setRecordedAtForUser,
   updateStatusForUser,
   updateUploadProgress,
@@ -17,9 +19,11 @@ import { resolveAccess } from '@/db-ops/transcript-access';
 import { getTranscript } from '@/lib/server/assemblyai';
 import {
   deleteAudioFile,
+  deleteAudioFilesByPrefix,
   saveAudioBytes,
   saveAudioStreamToTemp,
 } from '@/lib/server/audio-storage';
+import { concatMediaSmart, probeDurationSec } from '@/lib/server/media-concat';
 import { IngestError, ingestLocalAudio } from '@/lib/server/ingest';
 import { onTranscriptCompleted } from '@/lib/server/post-completion';
 import type { GmeetAttendee, GmeetContext, StoredTranscript } from '@/lib/format';
@@ -393,6 +397,179 @@ export const POST = withAuth(async ({ user, request }) => {
     const rejected = textDocRejection(originalFilename, contentType);
     if (rejected) return rejected;
 
+    // --- Multi-file single-meeting upload (N recordings of ONE meeting,
+    // stitched server-side into one transcript). Files arrive sequentially,
+    // each tagged ?multi_group/&multi_index/&multi_total; per-file user
+    // comments ride in x-part-comment. Part 1 creates the placeholder and
+    // parks its bytes; the last part stitches and ingests. ---
+    const multiGroup = request.nextUrl.searchParams.get('multi_group');
+    const multiIndex = Number(request.nextUrl.searchParams.get('multi_index') ?? NaN);
+    const multiTotal = Number(request.nextUrl.searchParams.get('multi_total') ?? NaN);
+    const isMulti =
+      !!multiGroup &&
+      /^[0-9a-f-]{8,64}$/i.test(multiGroup) &&
+      Number.isInteger(multiIndex) &&
+      Number.isInteger(multiTotal) &&
+      multiTotal >= 2 &&
+      multiTotal <= 12 &&
+      multiIndex >= 1 &&
+      multiIndex <= multiTotal;
+    if ((multiGroup || request.nextUrl.searchParams.has('multi_index')) && !isMulti) {
+      return NextResponse.json({ error: 'Invalid multi-upload parameters' }, { status: 400 });
+    }
+    let partComment: string | undefined;
+    const rawComment = request.headers.get('x-part-comment');
+    if (rawComment) {
+      try {
+        partComment = decodeURIComponent(rawComment).trim().slice(0, 500) || undefined;
+      } catch {
+        partComment = rawComment.trim().slice(0, 500) || undefined;
+      }
+    }
+
+    if (isMulti && multiIndex > 1) {
+      const groupRow = await findUploadGroupRow(user.userId, multiGroup);
+      if (!groupRow) {
+        return NextResponse.json(
+          { error: 'Upload group not found (expired or reaped)' },
+          { status: 404 }
+        );
+      }
+      const group = groupRow.gmeet_context?.uploadGroup;
+      if (!group || group.total !== multiTotal || group.parts.some((p) => p.index === multiIndex)) {
+        return NextResponse.json({ error: 'Upload group state mismatch' }, { status: 409 });
+      }
+      const groupUuid = groupRow.assemblyai_id.slice(3);
+      const partTemp = `upload-${groupUuid}.part${multiIndex}`;
+
+      let lastFlush = 0;
+      let flushing = false;
+      const onPartProgress = (streamed: number) => {
+        const now = Date.now();
+        if (flushing || now - lastFlush < 2000) return;
+        flushing = true;
+        lastFlush = now;
+        void updateUploadProgress(user.userId, groupRow.assemblyai_id, streamed)
+          .catch(() => {})
+          .finally(() => {
+            flushing = false;
+          });
+      };
+      let partBytes: number;
+      try {
+        ({ bytes: partBytes } = await saveAudioStreamToTemp(request.body, {
+          tempFilename: partTemp,
+          onProgress: onPartProgress,
+        }));
+      } catch (error) {
+        await deleteAudioFile(partTemp);
+        return NextResponse.json(
+          { error: 'Upload stream failed', detail: String(error) },
+          { status: 400 }
+        );
+      }
+      if (partBytes === 0) {
+        await deleteAudioFile(partTemp);
+        return NextResponse.json({ error: 'Empty request body' }, { status: 400 });
+      }
+      const parts = [
+        ...group.parts,
+        {
+          index: multiIndex,
+          tempFilename: partTemp,
+          originalFilename: originalFilename ?? undefined,
+          comment: partComment,
+          bytes: partBytes,
+        },
+      ].sort((a, b) => a.index - b.index);
+      await mergeGmeetContextForUser(
+        user.userId,
+        groupRow.assemblyai_id,
+        { uploadGroup: { ...group, parts } },
+        { quiet: true }
+      );
+      await updateUploadProgress(user.userId, groupRow.assemblyai_id, partBytes).catch(() => {});
+
+      if (multiIndex < multiTotal) {
+        return NextResponse.json({ transcript: groupRow }, { status: 201 });
+      }
+
+      // Last part landed: stitch in index order and ingest as ONE transcript.
+      if (new Set(parts.map((p) => p.index)).size !== multiTotal) {
+        return NextResponse.json(
+          { error: `Upload group incomplete (${parts.length}/${multiTotal} parts)` },
+          { status: 409 }
+        );
+      }
+      const heartbeat = setInterval(() => {
+        void updateUploadProgress(user.userId, groupRow.assemblyai_id).catch(() => {});
+      }, 60_000);
+      heartbeat.unref?.();
+      try {
+        const durations: Array<number | null> = [];
+        for (const p of parts) durations.push(await probeDurationSec(p.tempFilename));
+        let offset = 0;
+        const uploadedParts = parts.map((p, i) => {
+          const entry = {
+            index: p.index,
+            originalFilename: p.originalFilename,
+            comment: p.comment,
+            durationSec: durations[i] ?? undefined,
+            offsetSec: Math.round(offset * 10) / 10,
+          };
+          offset += durations[i] ?? 0;
+          return entry;
+        });
+        const { filename: combinedTemp, reencoded } = await concatMediaSmart(
+          parts.map((p) => p.tempFilename)
+        );
+        console.log(
+          `[POST /api/transcripts] stitched ${multiTotal} recordings for ${groupRow.assemblyai_id}` +
+            (reencoded ? ' (re-encoded — mixed codecs)' : ' (stream-copy)')
+        );
+        for (const p of parts) await deleteAudioFile(p.tempFilename);
+        // Persist the stitch map on the row BEFORE ingest — the placeholder
+        // is promoted in place, context intact, so the map survives.
+        await mergeGmeetContextForUser(
+          user.userId,
+          groupRow.assemblyai_id,
+          { uploadGroup: null, uploadedParts },
+          { quiet: true }
+        );
+        const ctx = groupRow.gmeet_context ?? {};
+        const groupAttendeeNames = (ctx.attendees ?? [])
+          .map((a) => a.name?.trim())
+          .filter((n): n is string => !!n && n.length > 1);
+        const ext = combinedTemp.slice(combinedTemp.lastIndexOf('.'));
+        const row = await ingestLocalAudio(user.userId, combinedTemp, {
+          originalFilename: `stitched-${multiTotal}-recordings${ext}`,
+          languageCode: languageCode ?? groupRow.language_code ?? undefined,
+          title: groupRow.title ?? null,
+          extraKeyterms: groupAttendeeNames.length > 0 ? groupAttendeeNames : undefined,
+          gmeetContext: { ...ctx, uploadGroup: null, uploadedParts },
+          placeholderAssemblyaiId: groupRow.assemblyai_id,
+        });
+        return NextResponse.json({ transcript: row }, { status: 201 });
+      } catch (error) {
+        await deleteForUser(user.userId, groupRow.assemblyai_id).catch(() => {});
+        await deleteAudioFilesByPrefix(`upload-${groupUuid}.part`);
+        if (error instanceof IngestError) {
+          console.error(`[POST /api/transcripts] ${error.stage} failed:`, error.causeErr);
+          return NextResponse.json(
+            { error: error.message, detail: String(error.causeErr) },
+            { status: 502 }
+          );
+        }
+        console.error('[POST /api/transcripts] stitch failed:', error);
+        return NextResponse.json(
+          { error: 'Stitching the recordings failed', detail: String(error) },
+          { status: 502 }
+        );
+      } finally {
+        clearInterval(heartbeat);
+      }
+    }
+
     // Re-transcription of an existing import: resolve the source row BEFORE
     // consuming the (potentially huge) body so a bad id fails fast.
     const sourceId = request.nextUrl.searchParams.get('source_id');
@@ -420,7 +597,23 @@ export const POST = withAuth(async ({ user, request }) => {
       originalFilename,
       languageCode: languageCode ?? null,
       title: sourceRow?.title ?? linkedEvent?.title?.slice(0, 300) ?? null,
-      gmeetContext,
+      gmeetContext: isMulti
+        ? {
+            ...(gmeetContext ?? {}),
+            uploadGroup: {
+              id: multiGroup,
+              total: multiTotal,
+              parts: [
+                {
+                  index: 1,
+                  tempFilename,
+                  originalFilename: originalFilename ?? undefined,
+                  comment: partComment,
+                },
+              ],
+            },
+          }
+        : gmeetContext,
       bytesTotal,
     });
     // Same "throw them in" rule as the Meet import: internal invitees on the
@@ -484,6 +677,12 @@ export const POST = withAuth(async ({ user, request }) => {
     // 100% while the AAI re-upload leg runs.
     await pendingFlush;
     await updateUploadProgress(user.userId, placeholderId, bytes).catch(() => {});
+
+    if (isMulti) {
+      // Part 1 of a multi-file group: the bytes are parked, the group marker
+      // is on the placeholder — ingest waits for the last part.
+      return NextResponse.json({ transcript: placeholder }, { status: 201 });
+    }
   }
 
   // Shared tail: AAI upload (disk-streamed) → vocab-biased submit → DB row

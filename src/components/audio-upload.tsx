@@ -167,6 +167,10 @@ export function AudioUpload({ onTranscriptCreated }: AudioUploadProps) {
   const [uploads, setUploads] = useState<UploadStatus[]>([]);
   const [isDragging, setIsDragging] = useState(false);
   const [pendingFiles, setPendingFiles] = useState<File[]>([]);
+  // Multi-file batches: stitch into ONE meeting (ordered concat + per-file
+  // comments, one transcript) vs. N independent transcripts.
+  const [stitchMode, setStitchMode] = useState(false);
+  const [partComments, setPartComments] = useState<string[]>([]);
   const [isDialogOpen, setIsDialogOpen] = useState(false);
   const [selectedLanguage, setSelectedLanguage] = useState<string>('');
   const fileInputRef = useRef<HTMLInputElement>(null);
@@ -286,24 +290,50 @@ export function AudioUpload({ onTranscriptCreated }: AudioUploadProps) {
     file: File,
     languageCode: string,
     linked: LinkedEvent | null,
-    pref: ReportPref
+    pref: ReportPref,
+    /** Multi-file single-meeting group: this file is part `index` of `total`.
+     * Progress reports against `progressFile`'s entry in the group's shared
+     * 0–50% band (`base` + `span`). */
+    multi?: {
+      group: string;
+      index: number;
+      total: number;
+      comment?: string;
+      progressFile: File;
+      base: number;
+      span: number;
+    }
   ): Promise<StoredTranscript> =>
     new Promise((resolve, reject) => {
       const xhr = new XMLHttpRequest();
       const params = new URLSearchParams();
       if (languageCode) params.set('language_code', languageCode);
       if (pref !== 'summary') params.set('report_pref', pref);
+      if (multi) {
+        params.set('multi_group', multi.group);
+        params.set('multi_index', String(multi.index));
+        params.set('multi_total', String(multi.total));
+      }
       const qs = params.size > 0 ? `?${params}` : '';
       xhr.open('POST', `/api/transcripts${qs}`);
       xhr.setRequestHeader('content-type', file.type || 'application/octet-stream');
       xhr.setRequestHeader('x-filename', encodeURIComponent(file.name));
+      if (multi?.comment) {
+        xhr.setRequestHeader('x-part-comment', encodeURIComponent(multi.comment));
+      }
       if (linked) {
         xhr.setRequestHeader('x-linked-event', encodeURIComponent(JSON.stringify(linked)));
       }
       xhr.upload.onprogress = (e) => {
         if (e.lengthComputable && e.total > 0) {
           // Upload owns the 0–50% band; transcription polling owns the rest.
-          updateUpload(file, { progress: Math.round((e.loaded / e.total) * 50) });
+          if (multi) {
+            updateUpload(multi.progressFile, {
+              progress: Math.round(multi.base + (e.loaded / e.total) * multi.span),
+            });
+          } else {
+            updateUpload(file, { progress: Math.round((e.loaded / e.total) * 50) });
+          }
         }
       };
       xhr.onload = () => {
@@ -358,13 +388,74 @@ export function AudioUpload({ onTranscriptCreated }: AudioUploadProps) {
     await pollUntilDone(file, transcript.assemblyai_id);
   };
 
+  /** Stitch path: N ordered files → one meeting. One progress entry (keyed on
+   * the first file); files upload sequentially into the server-side group;
+   * the last response is the real ingested row, then normal polling. */
+  const submitStitchGroup = async (
+    files: File[],
+    comments: string[],
+    languageCode: string,
+    linked: LinkedEvent | null,
+    pref: ReportPref
+  ) => {
+    const progressFile = files[0]!;
+    for (const file of files) {
+      if (file.size > MAX_FILE_BYTES) {
+        throw new Error(
+          `${file.name} is ${formatFileSize(file.size)} — the upload limit is ${formatFileSize(MAX_FILE_BYTES)}`
+        );
+      }
+    }
+    updateUpload(progressFile, { status: 'uploading', progress: 0 });
+    const group = crypto.randomUUID();
+    const totalBytes = files.reduce((s, f) => s + f.size, 0) || 1;
+    let doneBytes = 0;
+    let last: StoredTranscript | null = null;
+    for (const [i, file] of files.entries()) {
+      last = await uploadFile(file, languageCode, i === 0 ? linked : null, i === 0 ? pref : 'summary', {
+        group,
+        index: i + 1,
+        total: files.length,
+        comment: comments[i]?.trim() || undefined,
+        progressFile,
+        base: (doneBytes / totalBytes) * 50,
+        span: (file.size / totalBytes) * 50,
+      });
+      doneBytes += file.size;
+    }
+    updateUpload(progressFile, {
+      status: 'transcribing',
+      progress: 50,
+      transcriptId: last!.assemblyai_id,
+    });
+    onTranscriptCreated?.();
+    await pollUntilDone(progressFile, last!.assemblyai_id);
+  };
+
   const startUpload = useCallback(
     async (
       files: File[],
       languageCode: string,
       linked: LinkedEvent | null,
-      pref: ReportPref
+      pref: ReportPref,
+      stitch?: { comments: string[] }
     ) => {
+      if (stitch && files.length > 1) {
+        const progressFile = files[0]!;
+        setUploads((prev) => [
+          ...prev,
+          { file: progressFile, status: 'uploading', progress: 0 },
+        ]);
+        try {
+          await submitStitchGroup(files, stitch.comments, languageCode, linked, pref);
+        } catch (error) {
+          updateUpload(progressFile, {
+            status: 'error',
+            error: error instanceof Error ? error.message : 'Upload failed',
+          });
+        }
+        return;
+      }
       for (const file of files) {
         const uploadStatus: UploadStatus = {
           file,
@@ -420,14 +511,18 @@ export function AudioUpload({ onTranscriptCreated }: AudioUploadProps) {
       setSkippedTextNames(texts.map((f) => f.name));
       setTextFiles([]);
       setPendingFiles(list);
+      // A batch that arrives with a calendar event in hand is almost always
+      // one meeting recorded in pieces — default to stitching those.
+      setStitchMode(list.length > 1 && isDialogOpen && !!prefill);
+      setPartComments(list.map(() => ''));
       setSelectedLanguage('');
       setReportPref('summary');
       setEventsError(null);
       // Coming from the 'pick' step, the pre-link banner's selection carries
       // straight into the link step. Page-wide drag-drop (dialog closed)
-      // starts fresh — and linking one event to a multi-file batch makes no
-      // sense, so that clears the link too.
-      const keepLink = isDialogOpen && list.length === 1;
+      // starts fresh. Batches keep the link too now — it only ATTACHES when
+      // the batch is stitched into one meeting (or is a single file).
+      const keepLink = isDialogOpen;
       if (!keepLink) {
         setPrefill(null);
         setSelectedEventId(null);
@@ -511,6 +606,8 @@ export function AudioUpload({ onTranscriptCreated }: AudioUploadProps) {
       const detail = ((e as CustomEvent).detail as MediaUploadPrefill | null) ?? null;
       setPrefill(detail);
       setPendingFiles([]);
+      setStitchMode(false);
+      setPartComments([]);
       setSelectedLanguage('');
       setReportPref('summary');
       setSelectedEventId(null);
@@ -577,13 +674,27 @@ export function AudioUpload({ onTranscriptCreated }: AudioUploadProps) {
 
   const handleConfirmUpload = () => {
     setIsDialogOpen(false);
-    startUpload(pendingFiles, selectedLanguage, buildLinkedEvent(), reportPref);
+    const stitching = stitchMode && pendingFiles.length > 1;
+    // A linked event only attaches when it maps to ONE transcript — never to
+    // each row of an independent batch.
+    const linked = canLink ? buildLinkedEvent() : null;
+    startUpload(
+      pendingFiles,
+      selectedLanguage,
+      linked,
+      reportPref,
+      stitching ? { comments: partComments } : undefined
+    );
     setPendingFiles([]);
+    setStitchMode(false);
+    setPartComments([]);
   };
 
   const handleCancelUpload = () => {
     setIsDialogOpen(false);
     setPendingFiles([]);
+    setStitchMode(false);
+    setPartComments([]);
     setSelectedLanguage('');
     setPrefill(null);
     setPasteOpen(false);
@@ -777,9 +888,9 @@ export function AudioUpload({ onTranscriptCreated }: AudioUploadProps) {
     }
   };
 
-  // Linking one calendar event to a batch makes no sense — the link step
-  // only shows for single-file uploads (the overwhelmingly common case).
-  const canLink = pendingFiles.length === 1;
+  // One calendar event ↔ one transcript: a single file, or a batch being
+  // stitched into one meeting. Independent batches skip the link step.
+  const canLink = pendingFiles.length === 1 || (pendingFiles.length > 1 && stitchMode);
   // A calendar-row "Upload…" arrives with its event already resolved and
   // selected — asking "link to a calendar meeting?" again is the one question
   // the flow already knows the answer to, so those skip the link step (the
@@ -795,44 +906,11 @@ export function AudioUpload({ onTranscriptCreated }: AudioUploadProps) {
     ? dayEvents.find((e) => e.id === selectedEventId)
     : undefined;
 
-  const reportOptions: Array<{
-    value: ReportPref;
-    icon: React.ReactNode;
-    label: string;
-    detail: string;
-    hidden?: boolean;
-  }> = [
-    {
-      value: 'summary',
-      icon: <Sparkles className="h-4 w-4 text-primary" />,
-      label: 'Quick summary',
-      detail: 'Fast and clean — the default tier.',
-    },
-    {
-      value: 'detailed-video',
-      icon: <Film className="h-4 w-4 text-primary" />,
-      label: 'Detailed report — with video frames',
-      detail:
-        'Wiki-style deep dive: Claude reads the screen shares and embeds screenshots and citations. Slower.',
-      hidden: !hasVideoFile,
-    },
-    {
-      value: 'detailed-text',
-      icon: <FileText className="h-4 w-4 text-primary" />,
-      // The comparative phrasing only makes sense when the video option is
-      // showing above it — with audio-only files this IS the detailed report.
-      label: hasVideoFile ? 'Detailed report — text only' : 'Detailed report',
-      detail: hasVideoFile
-        ? 'Same deep dive without reading the video. Cheaper.'
-        : 'Wiki-style deep dive with tables and click-to-jump citations. Slower.',
-    },
-    {
-      value: 'later',
-      icon: <CalendarDays className="h-4 w-4 text-muted-foreground" />,
-      label: 'Decide later',
-      detail: 'Nothing generates until you pick on the meeting page.',
-    },
-  ];
+  // The unified generation shape — quick summary is always written, detailed
+  // is an opt-in on top, "later" defers the whole thing. All states map onto
+  // the legacy ReportPref wire values, so the server contract is unchanged.
+  const prefLater = reportPref === 'later';
+  const prefDetailed = reportPref === 'detailed-video' || reportPref === 'detailed-text';
 
   return (
     <>
@@ -1137,14 +1215,98 @@ export function AudioUpload({ onTranscriptCreated }: AudioUploadProps) {
                 <p className="text-sm text-muted-foreground">
                   {pendingFiles.length} file{pendingFiles.length > 1 ? 's' : ''} selected:
                 </p>
+                {pendingFiles.length > 1 && (
+                  <label className="flex cursor-pointer items-start gap-2 rounded-md border p-2.5 has-[:checked]:border-primary">
+                    <input
+                      type="checkbox"
+                      className="mt-0.5"
+                      checked={stitchMode}
+                      onChange={(e) => setStitchMode(e.target.checked)}
+                    />
+                    <span className="text-sm">
+                      <span className="font-medium">
+                        These are recordings of the same meeting — stitch into one transcript
+                      </span>
+                      <span className="mt-0.5 block text-xs text-muted-foreground">
+                        The files are joined in the order below into a single recording and
+                        transcribed once. Add a note per file (which mic, rejoin after a drop,
+                        …) — the AI uses it to make sense of the joins. Unticked: each file
+                        becomes its own independent meeting.
+                      </span>
+                    </span>
+                  </label>
+                )}
                 <ul className="text-sm space-y-1">
                   {pendingFiles.map((file, i) => (
-                    <li key={i} className="flex min-w-0 items-center gap-2">
-                      <FileAudio className="h-4 w-4 shrink-0 text-muted-foreground" />
-                      <span className="min-w-0 truncate">{file.name}</span>
-                      <Badge variant="outline" className="text-xs shrink-0">
-                        {formatFileSize(file.size)}
-                      </Badge>
+                    <li key={`${file.name}-${i}`} className="space-y-1">
+                      <div className="flex min-w-0 items-center gap-2">
+                        {stitchMode && pendingFiles.length > 1 && (
+                          <span className="flex shrink-0 items-center gap-0.5">
+                            <span className="w-4 text-xs text-muted-foreground">{i + 1}.</span>
+                            <button
+                              type="button"
+                              disabled={i === 0}
+                              className="rounded border px-1 text-xs text-muted-foreground hover:bg-muted disabled:opacity-30"
+                              title="Move earlier"
+                              onClick={() => {
+                                setPendingFiles((prev) => {
+                                  const next = [...prev];
+                                  [next[i - 1], next[i]] = [next[i]!, next[i - 1]!];
+                                  return next;
+                                });
+                                setPartComments((prev) => {
+                                  const next = [...prev];
+                                  [next[i - 1], next[i]] = [next[i] ?? '', next[i - 1] ?? ''];
+                                  return next;
+                                });
+                              }}
+                            >
+                              ↑
+                            </button>
+                            <button
+                              type="button"
+                              disabled={i === pendingFiles.length - 1}
+                              className="rounded border px-1 text-xs text-muted-foreground hover:bg-muted disabled:opacity-30"
+                              title="Move later"
+                              onClick={() => {
+                                setPendingFiles((prev) => {
+                                  const next = [...prev];
+                                  [next[i], next[i + 1]] = [next[i + 1]!, next[i]!];
+                                  return next;
+                                });
+                                setPartComments((prev) => {
+                                  const next = [...prev];
+                                  [next[i], next[i + 1]] = [next[i + 1] ?? '', next[i] ?? ''];
+                                  return next;
+                                });
+                              }}
+                            >
+                              ↓
+                            </button>
+                          </span>
+                        )}
+                        <FileAudio className="h-4 w-4 shrink-0 text-muted-foreground" />
+                        <span className="min-w-0 truncate">{file.name}</span>
+                        <Badge variant="outline" className="text-xs shrink-0">
+                          {formatFileSize(file.size)}
+                        </Badge>
+                      </div>
+                      {stitchMode && pendingFiles.length > 1 && (
+                        <Input
+                          value={partComments[i] ?? ''}
+                          onChange={(e) => {
+                            const v = e.target.value;
+                            setPartComments((prev) => {
+                              const next = [...prev];
+                              next[i] = v;
+                              return next;
+                            });
+                          }}
+                          placeholder="Note for the AI — e.g. 'room mic, first half' or 'rejoined after the drop'"
+                          maxLength={500}
+                          className="ml-6 h-7 text-xs"
+                        />
+                      )}
                     </li>
                   ))}
                 </ul>
@@ -1309,31 +1471,83 @@ export function AudioUpload({ onTranscriptCreated }: AudioUploadProps) {
                 with real names from the start.
               </p>
               <div className="space-y-1.5">
-                {reportOptions
-                  .filter((o) => !o.hidden)
-                  .map((o) => (
-                    <label
-                      key={o.value}
-                      className="flex cursor-pointer items-start gap-2 rounded-md border p-3 has-[:checked]:border-primary"
-                    >
-                      <input
-                        type="radio"
-                        name="upload-report-pref"
-                        className="mt-0.5"
-                        checked={reportPref === o.value}
-                        onChange={() => setReportPref(o.value)}
-                      />
-                      <span className="text-sm">
-                        <span className="flex items-center gap-2 font-medium">
-                          {o.icon}
-                          {o.label}
-                        </span>
-                        <span className="mt-0.5 block text-xs text-muted-foreground">
-                          {o.detail}
-                        </span>
+                <label
+                  className={`flex items-start gap-2 rounded-md border p-3 ${prefLater ? 'opacity-50' : ''}`}
+                >
+                  <input type="checkbox" className="mt-0.5" checked={!prefLater} disabled readOnly />
+                  <span className="text-sm">
+                    <span className="flex items-center gap-2 font-medium">
+                      <Sparkles className="h-4 w-4 text-primary" />
+                      Quick summary
+                    </span>
+                    <span className="mt-0.5 block text-xs text-muted-foreground">
+                      Always written — fast and clean.
+                    </span>
+                  </span>
+                </label>
+                <label
+                  className={`flex cursor-pointer items-start gap-2 rounded-md border p-3 has-[:checked]:border-primary ${prefLater ? 'pointer-events-none opacity-50' : ''}`}
+                >
+                  <input
+                    type="checkbox"
+                    className="mt-0.5"
+                    checked={prefDetailed}
+                    disabled={prefLater}
+                    onChange={(e) =>
+                      setReportPref(
+                        e.target.checked
+                          ? hasVideoFile
+                            ? 'detailed-video'
+                            : 'detailed-text'
+                          : 'summary'
+                      )
+                    }
+                  />
+                  <span className="min-w-0 flex-1 text-sm">
+                    <span className="flex items-center gap-2 font-medium">
+                      <FileText className="h-4 w-4 text-primary" />
+                      Also write a detailed report
+                    </span>
+                    <span className="mt-0.5 block text-xs text-muted-foreground">
+                      Wiki-style deep dive with tables and click-to-jump citations. Slower and
+                      pricier — worth it for dense meetings. The quick summary then distills
+                      from it.
+                    </span>
+                    {prefDetailed && hasVideoFile && (
+                      <span className="mt-2 block space-y-1">
+                        <label className="flex cursor-pointer items-center gap-2 text-xs">
+                          <input
+                            type="radio"
+                            name="upload-report-mode"
+                            checked={reportPref === 'detailed-video'}
+                            onChange={() => setReportPref('detailed-video')}
+                          />
+                          <Film className="h-3.5 w-3.5 text-primary" />
+                          With video frames — Claude reads the screen shares and embeds
+                          screenshots
+                        </label>
+                        <label className="flex cursor-pointer items-center gap-2 text-xs">
+                          <input
+                            type="radio"
+                            name="upload-report-mode"
+                            checked={reportPref === 'detailed-text'}
+                            onChange={() => setReportPref('detailed-text')}
+                          />
+                          <FileText className="h-3.5 w-3.5 text-muted-foreground" />
+                          Text only — cheaper, for meetings with no screen share worth seeing
+                        </label>
                       </span>
-                    </label>
-                  ))}
+                    )}
+                  </span>
+                </label>
+                <label className="flex cursor-pointer items-center gap-2 px-1 pt-1 text-xs text-muted-foreground">
+                  <input
+                    type="checkbox"
+                    checked={prefLater}
+                    onChange={(e) => setReportPref(e.target.checked ? 'later' : 'summary')}
+                  />
+                  Don&apos;t generate anything yet — I&apos;ll decide on the meeting page
+                </label>
               </div>
             </div>
           )}

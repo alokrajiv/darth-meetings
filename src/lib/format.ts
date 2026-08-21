@@ -264,6 +264,9 @@ export interface GmeetContext {
     /** Owner's email at queue time (needed for dedupe + share resolution —
      * there is no users table to look it up from later). */
     ownerEmail: string;
+    /** Queued with the artifacts already ready — the poller runs it right
+     * away; the listing words it "importing" rather than "waiting". */
+    background?: boolean;
     /** The import request frozen at queue time, replayed verbatim (plus the
      * artifact ids discovered by the poller) when the provider finishes. */
     request: {
@@ -396,6 +399,9 @@ export interface TranscriptListRow {
    * copy. */
   deferred_mode?: 'video' | 'transcript' | 'both' | null;
   deferred_error?: string | null;
+  /** 'true' when the queued import's artifacts were ready at queue time (a
+   * background run, actively importing) — jsonb ->> yields text. */
+  deferred_background?: string | null;
   /** Meetings with more than one recording: extra Meet segments beyond the
    * primary, a stitched multi-file upload, or a combined re-transcription.
    * 1 (or absent — legacy/v1 payloads) = single recording. */

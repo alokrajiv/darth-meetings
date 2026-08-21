@@ -29,6 +29,7 @@ import { EditableUtterance, type UtteranceHighlight } from '@/components/editabl
 import { FindReplacePanel } from '@/components/find-replace-panel';
 import { SpeakerSummaryPanel } from '@/components/speaker-summary-panel';
 import { SpeakerReviewDialog } from '@/components/speaker-review-dialog';
+import { GenerateDialog } from '@/components/generate-dialog';
 import { AttachmentPanel } from '@/components/attachment-panel';
 import { ShareDialog } from '@/components/share-dialog';
 import { LinkEventDialog } from '@/components/link-event-dialog';
@@ -64,7 +65,6 @@ import {
   Pencil,
   Users,
   ListTree,
-  Film,
   Loader2,
   Sparkles,
   MoreHorizontal,
@@ -158,8 +158,14 @@ export default function TranscriptDetailPage({ params }: TranscriptDetailPagePro
   const [transcriptEdits, setTranscriptEdits] = useState<TranscriptEditMap>({});
   const [generatingNotes, setGeneratingNotes] = useState(false);
   const [notesPromptOpen, setNotesPromptOpen] = useState(false);
+  // Pre-tick "detailed report" in the generate dialog when it's opened from a
+  // report-tab context.
+  const [genDefaultDetailed, setGenDefaultDetailed] = useState(false);
+  const openGenerateDialog = (detailed: boolean) => {
+    setGenDefaultDetailed(detailed);
+    setNotesPromptOpen(true);
+  };
   const [reviewOpen, setReviewOpen] = useState(false);
-  const [notesInstructions, setNotesInstructions] = useState('');
   const [summaryTab, setSummaryTab] = useState<'summary' | 'report'>('summary');
   const [generatingReport, setGeneratingReport] = useState(false);
 
@@ -646,16 +652,24 @@ export default function TranscriptDetailPage({ params }: TranscriptDetailPagePro
         }),
       });
       if (res.ok) {
-        setRow((prev) =>
-          prev ? { ...prev, auto_report_status: 'running', auto_report_error: null } : prev
-        );
+        const payload = (await res.json().catch(() => ({}))) as { status?: string };
+        if (payload.status === 'queued') {
+          // Recording still being prepared — the server queued the run
+          // (gmeet_context.pendingVideoReport); reload so the queued notice
+          // shows.
+          void loadAll({ silent: true });
+        } else {
+          setRow((prev) =>
+            prev ? { ...prev, auto_report_status: 'running', auto_report_error: null } : prev
+          );
+          bumpActivity();
+        }
         setStaleReasons({});
-        bumpActivity();
       }
     } finally {
       setGeneratingReport(false);
     }
-  }, [transcriptId, generatingReport, bumpActivity]);
+  }, [transcriptId, generatingReport, bumpActivity, loadAll]);
 
   // --- Drive recording fetch (playback + frame-reading AI) ---
   // A Meet quick-import can know the recording's Drive file without having
@@ -674,6 +688,17 @@ export default function TranscriptDetailPage({ params }: TranscriptDetailPagePro
   const hasLocalVideo = /\.(mp4|webm|mov|mkv|m4v)$/i.test(row?.local_audio_path ?? '');
   const canFetchVideo =
     !!row && canEdit && !row.local_audio_path && (!!recordingFileId || !!teamsRecordingId);
+  // The recording exists only as a promise — Google is still preparing the
+  // file (no fileId to pull yet). A video report can be QUEUED in this state;
+  // the recording poller fires it when the video lands.
+  const videoPreparing =
+    !!row &&
+    canEdit &&
+    !row.local_audio_path &&
+    !recordingFileId &&
+    !teamsRecordingId &&
+    row.gmeet_context?.recordingPending?.status === 'waiting';
+  const reportQueued = !!row?.gmeet_context?.pendingVideoReport;
 
   // --- Multi-video meetings (stop-restart recordings → several files) ---
   // The primary video ("Video 1") is local_audio_path; extra segments live in
@@ -788,6 +813,20 @@ export default function TranscriptDetailPage({ params }: TranscriptDetailPagePro
     void fetchVideo({ auto: true });
   }, [canFetchVideo, fetchVideo]);
 
+  // What runs after the speaker-review gate (Confirm OR Skip): honor what the
+  // user picked at upload time (upload-media stepper) — a detailed report,
+  // nothing ('later'), or the default quick summary.
+  const runPostReviewGeneration = useCallback(async () => {
+    const pref = row?.gmeet_context?.uploadPrefs?.report;
+    if (pref === 'detailed-video' || pref === 'detailed-text') {
+      selectSummaryTab('report');
+      await handleGenerateReport(undefined, pref === 'detailed-video');
+    } else if (pref !== 'later') {
+      selectSummaryTab('summary');
+      await handleGenerateNotes();
+    }
+  }, [row, selectSummaryTab, handleGenerateReport, handleGenerateNotes]);
+
   // Review-dialog confirm: batch-save the finalized names, then kick off the
   // first summary generation — the whole point of the interrupt is that the
   // summary is written with real names from the start.
@@ -825,27 +864,9 @@ export default function TranscriptDetailPage({ params }: TranscriptDetailPagePro
         }
       }
       setReviewOpen(false);
-      // Honor what the user picked at upload time (upload-media stepper):
-      // a detailed report, nothing ('later'), or the default quick summary.
-      const pref = row?.gmeet_context?.uploadPrefs?.report;
-      if (pref === 'detailed-video' || pref === 'detailed-text') {
-        selectSummaryTab('report');
-        await handleGenerateReport(undefined, pref === 'detailed-video');
-      } else if (pref !== 'later') {
-        selectSummaryTab('summary');
-        await handleGenerateNotes();
-      }
+      await runPostReviewGeneration();
     },
-    [
-      speakerLabels,
-      transcriptId,
-      bumpActivity,
-      loadAll,
-      handleGenerateNotes,
-      handleGenerateReport,
-      selectSummaryTab,
-      row,
-    ]
+    [speakerLabels, transcriptId, bumpActivity, loadAll, runPostReviewGeneration]
   );
 
   // Safety net for the report status: live events normally push the refresh,
@@ -1885,7 +1906,7 @@ export default function TranscriptDetailPage({ params }: TranscriptDetailPagePro
             size="sm"
             className="ai-glimmer h-8 w-full justify-start gap-2 text-[13px] font-medium text-primary hover:text-primary"
             disabled={notesGenerating || generatingReport}
-            onClick={() => setNotesPromptOpen(true)}
+            onClick={() => openGenerateDialog(false)}
             title={`Changed since the last AI run: ${staleLabels.join(', ')}. One click re-runs with the new context — the AI may well decide nothing needs updating.`}
           >
             <Sparkles className="h-4 w-4" />
@@ -1898,7 +1919,7 @@ export default function TranscriptDetailPage({ params }: TranscriptDetailPagePro
             size="sm"
             className="h-8 w-full justify-start gap-2 text-[13px]"
             disabled={notesGenerating || row.status !== 'completed'}
-            onClick={() => setNotesPromptOpen(true)}
+            onClick={() => openGenerateDialog(false)}
           >
             {notesGenerating ? (
               <RefreshCw className="h-4 w-4 animate-spin text-muted-foreground" />
@@ -2506,7 +2527,7 @@ export default function TranscriptDetailPage({ params }: TranscriptDetailPagePro
                         {
                           key: 'report' as const,
                           label: 'Detailed report',
-                          spinning: row.auto_report_status === 'running',
+                          spinning: row.auto_report_status === 'running' || reportQueued,
                         },
                         { key: 'summary' as const, label: 'Summary', spinning: false },
                       ]
@@ -2528,7 +2549,15 @@ export default function TranscriptDetailPage({ params }: TranscriptDetailPagePro
                         ))}
                     </div>
                     {summaryTab === 'report' ? (
-                      row.auto_report_status === 'running' ? (
+                    <>
+                    {reportQueued && row.auto_report_status !== 'running' && (
+                      <div className="mb-3 flex items-center gap-2 rounded-md border border-amber-400/50 bg-amber-500/5 px-3 py-2 text-xs text-muted-foreground">
+                        <Loader2 className="h-3.5 w-3.5 shrink-0 animate-spin text-amber-600 dark:text-amber-500" />
+                        Video report queued — Google is still preparing the recording. It starts
+                        on its own the moment the video lands (checked every minute).
+                      </div>
+                    )}
+                    {row.auto_report_status === 'running' ? (
                         <div className="space-y-2 py-2">
                           {['95%', '100%', '85%', '90%', '70%'].map((w, i) => (
                             <div key={i} className="h-3 animate-pulse rounded bg-muted" style={{ width: w }} />
@@ -2563,7 +2592,7 @@ export default function TranscriptDetailPage({ params }: TranscriptDetailPagePro
                                 size="sm"
                                 className="h-7 text-xs"
                                 disabled={generatingReport}
-                                onClick={() => setNotesPromptOpen(true)}
+                                onClick={() => openGenerateDialog(true)}
                               >
                                 <RefreshCw className="h-3 w-3" />
                                 Regenerate
@@ -2607,7 +2636,7 @@ export default function TranscriptDetailPage({ params }: TranscriptDetailPagePro
                       ) : canEdit ? (
                         <div className="flex flex-col items-center py-6 text-center">
                           <p className="text-sm text-muted-foreground">No detailed report yet.</p>
-                          <Button size="sm" className="mt-3" disabled={generatingReport} onClick={() => setNotesPromptOpen(true)}>
+                          <Button size="sm" className="mt-3" disabled={generatingReport} onClick={() => openGenerateDialog(true)}>
                             <Sparkles className="h-4 w-4" />
                             Generate detailed report
                           </Button>
@@ -2620,7 +2649,8 @@ export default function TranscriptDetailPage({ params }: TranscriptDetailPagePro
                         </div>
                       ) : (
                         <p className="py-4 text-sm text-muted-foreground">No detailed report yet.</p>
-                      )
+                      )}
+                    </>
                     ) : (
                     <>
                     {notesStale && row.auto_notes_status !== 'running' && canEdit && (
@@ -2705,7 +2735,7 @@ export default function TranscriptDetailPage({ params }: TranscriptDetailPagePro
                               size="sm"
                               className="h-7 text-xs"
                               disabled={generatingNotes}
-                              onClick={() => setNotesPromptOpen(true)}
+                              onClick={() => openGenerateDialog(false)}
                             >
                               <RefreshCw className="h-3 w-3" />
                               Regenerate
@@ -2809,7 +2839,7 @@ export default function TranscriptDetailPage({ params }: TranscriptDetailPagePro
                               className="mt-3"
                               disabled={generatingNotes}
                               onClick={() =>
-                                reviewSpeakers.length > 0 ? setReviewOpen(true) : setNotesPromptOpen(true)
+                                reviewSpeakers.length > 0 ? setReviewOpen(true) : openGenerateDialog(false)
                               }
                             >
                               <Sparkles className="h-4 w-4" />
@@ -3204,111 +3234,33 @@ export default function TranscriptDetailPage({ params }: TranscriptDetailPagePro
           onConfirm={handleReviewConfirm}
           onSkip={() => {
             setReviewOpen(false);
-            selectSummaryTab('summary');
-            void handleGenerateNotes();
+            void runPostReviewGeneration();
           }}
         />
 
-        <Dialog open={notesPromptOpen} onOpenChange={setNotesPromptOpen}>
-          <DialogContent className="max-w-md">
-            <DialogHeader>
-              <DialogTitle className="text-base font-semibold">Generate with Claude</DialogTitle>
-              <DialogDescription className="text-xs">
-                Optional instructions steer whichever you pick — tone, depth, focus, or language.
-              </DialogDescription>
-            </DialogHeader>
-            {staleLabels.length > 0 && (
-              <p className="rounded-md border border-primary/30 bg-primary/5 px-3 py-2 text-xs text-muted-foreground">
-                <Sparkles className="mr-1.5 inline h-3.5 w-3.5 text-primary" />
-                New since the last run: <span className="font-medium text-foreground">{staleLabels.join(', ')}</span>.
-                The AI folds these in — it may decide nothing needs changing.
-              </p>
-            )}
-            <Textarea
-              value={notesInstructions}
-              onChange={(e) => setNotesInstructions(e.target.value)}
-              placeholder={
-                'e.g. "be very detailed", "focus on action items and owners", "keep it to five bullets"'
-              }
-              rows={2}
-              maxLength={2000}
-              className="text-sm"
-            />
-            <div className="space-y-1.5">
-              <button
-                type="button"
-                disabled={generatingNotes}
-                onClick={() => {
-                  setNotesPromptOpen(false);
-                  selectSummaryTab('summary');
-                  void handleGenerateNotes(notesInstructions);
-                }}
-                className="w-full rounded-md border px-3 py-2 text-left hover:bg-muted disabled:opacity-50"
-              >
-                <span className="flex items-center gap-2 text-sm font-medium">
-                  <Sparkles className="h-4 w-4 text-primary" />
-                  Quick summary
-                </span>
-                <span className="mt-0.5 block text-xs text-muted-foreground">
-                  Fast and clean. Remembers earlier runs of this meeting (speaker fixes, attached
-                  files) when the session is still fresh.
-                </span>
-              </button>
-              {(hasLocalVideo || canFetchVideo) && (
-                <button
-                  type="button"
-                  disabled={generatingReport}
-                  onClick={() => {
-                    setNotesPromptOpen(false);
-                    selectSummaryTab('report');
-                    void handleGenerateReport(notesInstructions, true);
-                  }}
-                  className="w-full rounded-md border px-3 py-2 text-left hover:bg-muted disabled:opacity-50"
-                >
-                  <span className="flex items-center gap-2 text-sm font-medium">
-                    <Film className="h-4 w-4 text-primary" />
-                    Detailed report — with video frames
-                  </span>
-                  <span className="mt-0.5 block text-xs text-muted-foreground">
-                    Wiki-style deep dive at high effort: Claude looks at the screen shares and
-                    embeds screenshots, tables, and click-to-jump citations. Slower.
-                    {!hasLocalVideo &&
-                      (videoFetching
-                        ? ' The recording is still downloading from Drive — the report waits for it, then starts.'
-                        : ' The recording is pulled from Drive first, then the report starts.')}
-                  </span>
-                </button>
-              )}
-              <button
-                type="button"
-                disabled={generatingReport}
-                onClick={() => {
-                  setNotesPromptOpen(false);
-                  selectSummaryTab('report');
-                  void handleGenerateReport(notesInstructions, false);
-                }}
-                className="w-full rounded-md border px-3 py-2 text-left hover:bg-muted disabled:opacity-50"
-              >
-                <span className="flex items-center gap-2 text-sm font-medium">
-                  <FileText className="h-4 w-4 text-primary" />
-                  {hasLocalVideo || canFetchVideo
-                    ? 'Detailed report — text only'
-                    : 'Detailed report'}
-                </span>
-                <span className="mt-0.5 block text-xs text-muted-foreground">
-                  {hasLocalVideo || canFetchVideo
-                    ? 'Same deep dive without reading the video. Cheaper; use when the meeting had no screen share worth seeing.'
-                    : 'Wiki-style deep dive at high effort: topic sections, tables, and click-to-jump citations. Slower.'}
-                </span>
-              </button>
-            </div>
-            <DialogFooter>
-              <Button variant="ghost" size="sm" onClick={() => setNotesPromptOpen(false)}>
-                Cancel
-              </Button>
-            </DialogFooter>
-          </DialogContent>
-        </Dialog>
+        <GenerateDialog
+          open={notesPromptOpen}
+          onOpenChange={setNotesPromptOpen}
+          staleLabels={staleLabels}
+          hasLocalVideo={hasLocalVideo}
+          canFetchVideo={canFetchVideo}
+          videoPreparing={videoPreparing}
+          videoFetching={videoFetching}
+          generating={generatingNotes || generatingReport}
+          defaultDetailed={genDefaultDetailed}
+          onGenerate={({ detailed, video, instructions }) => {
+            setNotesPromptOpen(false);
+            if (detailed) {
+              // Only the report fires — the quick summary auto-distills from
+              // the report session when it completes.
+              selectSummaryTab('report');
+              void handleGenerateReport(instructions, video);
+            } else {
+              selectSummaryTab('summary');
+              void handleGenerateNotes(instructions);
+            }
+          }}
+        />
 
         <Dialog open={outlineOpenMobile} onOpenChange={setOutlineOpenMobile}>
           <DialogContent className="max-w-sm">

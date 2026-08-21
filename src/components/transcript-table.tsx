@@ -1573,15 +1573,17 @@ export function TranscriptTable({
                 </div>
               ) : waiting ? (
                 <div className="truncate font-mono text-[11px] text-muted-foreground">
-                  {`import queued — ${t.provider === 'teams' ? 'Microsoft' : 'Google'} is still preparing the ${
-                    t.deferred_mode === 'video'
-                      ? 'video file'
-                      : t.deferred_mode === 'both'
-                        ? 'video + transcript'
-                        : t.provider === 'teams'
-                          ? 'transcript'
-                          : 'transcript Doc'
-                  }; runs automatically (checked every minute)`}
+                  {t.deferred_background
+                    ? 'importing in the background — pulling the recording and submitting for transcription'
+                    : `import queued — ${t.provider === 'teams' ? 'Microsoft' : 'Google'} is still preparing the ${
+                        t.deferred_mode === 'video'
+                          ? 'video file'
+                          : t.deferred_mode === 'both'
+                            ? 'video + transcript'
+                            : t.provider === 'teams'
+                              ? 'transcript'
+                              : 'transcript Doc'
+                      }; runs automatically (checked every minute)`}
                 </div>
               ) : t.status === 'error' && t.deferred_error ? (
                 <div className="truncate text-xs text-destructive/80">{t.deferred_error}</div>

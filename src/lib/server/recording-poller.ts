@@ -4,6 +4,7 @@ import { publishEvent } from '@/lib/server/event-bus';
 import { listRecordArtifacts } from '@/lib/server/gmeet';
 import { getServerAccessToken } from '@/lib/server/google-oauth';
 import { fetchRecordingFromDrive, fetchVideoPartFromDrive } from '@/lib/server/recording-fetch';
+import { generateAutoReport } from '@/lib/server/auto-notes';
 import type { GmeetContext } from '@/lib/format';
 
 /**
@@ -41,6 +42,27 @@ const MAX_PER_TICK = 20;
 let started = false;
 let ticking = false;
 
+/**
+ * A detailed report queued while the recording was still being prepared
+ * (gmeet_context.pendingVideoReport): clear the marker and start the run.
+ * Called when the primary video lands — or when it never will ('gone' /
+ * 'gave-up'), in which case the run degrades to text-only on its own.
+ */
+async function fireQueuedReport(
+  row: { user_id: string; assemblyai_id: string; gmeet_context: GmeetContext },
+  reason: string
+): Promise<void> {
+  const queued = row.gmeet_context.pendingVideoReport;
+  if (!queued) return;
+  console.log(`[recording-poller] ${row.assemblyai_id}: firing queued video report (${reason})`);
+  await mergeGmeetContextForUser(row.user_id, row.assemblyai_id, { pendingVideoReport: null });
+  void generateAutoReport(row.user_id, row.assemblyai_id, {
+    triggeredBy: queued.triggeredBy,
+    instructions: queued.instructions,
+    useVideo: true,
+  });
+}
+
 async function checkRow(row: {
   user_id: string;
   assemblyai_id: string;
@@ -62,6 +84,7 @@ async function checkRow(row: {
         resolvedAt: new Date(now).toISOString(),
       },
     });
+    await fireQueuedReport(row, 'gave up waiting — report degrades to text-only');
     return;
   }
 
@@ -87,6 +110,7 @@ async function checkRow(row: {
         resolvedAt: new Date(now).toISOString(),
       },
     });
+    await fireQueuedReport(row, 'recording gone — report degrades to text-only');
     return;
   }
 
@@ -177,6 +201,10 @@ async function checkRow(row: {
     } catch (err) {
       console.warn(`[recording-poller] Drive fetch failed for ${row.assemblyai_id}:`, err);
     }
+    // Queued-while-preparing report: the primary video just landed (context
+    // has its fileId even if the byte pull above failed — the run re-pulls
+    // with the requester's token, joining any in-flight download).
+    await fireQueuedReport(row, 'primary video landed');
   }
   for (const [i, part] of parts.entries()) {
     if (part.filename) continue; // already stored (or a prior visit's fetch)

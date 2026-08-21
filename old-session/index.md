@@ -187,3 +187,68 @@ cookie-injected Playwright), merge exercised with two throwaway series only.
    human eye (visible adjacent in the index anyway).
 4. Memory updated: `project_series_recurring_calls.md` (full ship details),
    pickup note in `project_listing_v2_calendar_views.md` collapsed to a pointer.
+
+## 5. Series index: Imported/Importable columns, evidence-based dup pairing, member folding — 2026-08-20
+
+**File:** [5.%20series-index-imported-importable-dup-pairing-member-folding.txt](5.%20series-index-imported-importable-dup-pairing-member-folding.txt)
+
+Triggered by Alok's "this entire UI is stupid" screenshot of /series: the MCAP
+dialog claimed "0 occurrences" while the footer said "1 meeting in this
+series", and the "dup" badge on Integration Cadence had no visible partner.
+Root causes: (a) the occurrence sweep is the CALLER's own Google Calendar /
+Teams — a colleague's import in a meeting Alok isn't invited to has no
+calendar instance, so it vanished from the list; (b) dup detection was
+title-only and the index is sorted by last meeting, so the twin was 12 rows
+down. Data finding: both "Integration Cadence" (#6=49, #1=5) and both "Data
+Cadence" (#4=2, #9=1) are literally the SAME Meet (`ook-esgs-wkf` /
+`vnm-gyww-fiy`) split across keys — one side only held the recurring-base id,
+the other only the meeting code (members on both sides carry both).
+
+Shipped + prod-verified (commits 8c31738, 6e5becb, e868401; rsync deploy):
+1. **Sweep folds members** no calendar/Graph occurrence claimed into the list
+   as `source:'imported'` rows (key `imp-<id>`), so counts always agree with
+   "N meetings in this series"; `counts.external` = calendar-seen count (0 with
+   members ⇒ "not on your calendar" hint in header + row chip); `bare` excludes
+   imported rows; candidates skip soft-deleted transcripts.
+2. **`findDuplicateSeries()`** (db-ops/series.ts): siblings by shared series
+   key OR member-level evidence — Meet code, recurring base from
+   recurringEventId or the `<base>_YYYYMMDDTHHMMSSZ` instance eventId, Teams
+   join URL — title-only ranked last; carries `last_recorded_at` for
+   disambiguation. `GET /api/series` → `dup_with[]`, `GET /api/series/:id` →
+   `dupes[]`.
+3. **New `GET /api/series/occurrence-counts?ids=`** (≤8) batches sweep counts
+   behind the same 6h per-user cache.
+4. **Index**: Members→Imported, new **Importable** column filled progressively
+   in chunks of 4 (amber >0, "—" + tooltip when not on your calendar / Google
+   not connected, breakdown tooltip), dup groups emitted ADJACENTLY (largest
+   first, ↳ tinted siblings, badge says why), footer legend + "N probable
+   duplicates". `/series?series=<id>` deep-link opens that dialog on load.
+5. **Dialog**: "Probably a duplicate" banner — "Another series with the same
+   name (#4, 2 meetings, last Jul 24) is the same recurring event as this one
+   (1 meeting)" + **View it ↗** (new tab deep-link) + **Merge this one into
+   it**; right-side chips wrap instead of overflowing; "Also in this series"
+   is now only the sweep-failed fallback.
+
+Tested via tunnel 5433 + scrubbed-env dev on 3002 + headless playwright-core
+script (the shared Playwright MCP browser was held by another session —
+`~/.npm/_npx/9833c18b2d85bc59/node_modules/playwright-core` +
+`chromium_headless_shell-1223` works as a standalone driver).
+
+Real numbers seen: Weekly Tressa Review 16 importable, Data Cadence 21+23,
+Spanish Perfume w/ Monday reviews 5, Integration Cadence 2.
+
+**Status: KIV — deployed and usable, but Alok hasn't signed off on the Series
+UI as a whole ("ok for now").**
+
+**Next session pickup points:**
+1. Alok still needs to do the two real merges (one click now): Integration
+   Cadence #1(5)→#6(49), Data Cadence #9(1)→#4(2); then Re-scan attachments.
+2. Series UI is KIV — revisit overall design when Alok raises it again; the
+   "—" importable cells for colleague-imported series are expected behaviour
+   (caller's calendar), not a bug — don't re-investigate.
+3. Dialog on a dup series still shows the UNION imported count (e.g. "50
+   imported" on the 5-member Integration Cadence) because imported
+   cross-reference is key-matched, not member-only — acceptable while the
+   banner explains; fix if it confuses after merges are done.
+4. Remaining working-tree changes (generate-dialog, stitch uploads, etc.) are
+   deployed but UNCOMMITTED — commit them separately.

@@ -70,6 +70,12 @@ export interface ImportBody {
    * placeholder row) instead of failing — the deferred-import poller runs
    * it the moment Google finishes. */
   defer?: boolean;
+  /** Client opt-in: even when the artifacts ARE ready, don't pull the video
+   * inline — queue the same `defer-…` placeholder and let the poller run the
+   * heavy download/AAI submit server-side. The request returns in seconds
+   * and the browser tab is free (closing it no longer kills the import).
+   * Only affects video/'both' modes; quick transcript imports stay inline. */
+  background?: boolean;
   /** Extra gmeet_context to stamp on the created row (series auto-import
    * marker + report pref). Merged into the base context, so it also lands on
    * defer placeholders and survives promotion via the frozen request. */
@@ -524,6 +530,107 @@ export async function executeGmeetImport(
         `[gmeet/import] deferred ${mode} import queued as ${placeholderId} (waiting for ${waitingFor})`
       );
       return out(202, { deferred: true, waitingFor, transcript: placeholder, mode, autoShared });
+    }
+
+    // ---- Background import: artifacts are READY, but downloading a
+    // recording and re-uploading it to AssemblyAI takes minutes, and holding
+    // the HTTP request open that long chains the user to the tab. Queue the
+    // same placeholder the not-ready path uses; the deferred-import poller
+    // (kicked immediately by the route) replays it with the owner's minted
+    // token. Dedupe and download-permission problems still surface HERE,
+    // interactively — only the heavy pull moves to the background. Requires
+    // a conference record (it's what the poller re-checks); without one the
+    // import falls through to the inline path below.
+    if (
+      body.background &&
+      mode !== 'transcript' &&
+      hasToken &&
+      actuals?.conferenceRecordName &&
+      primaryFileId
+    ) {
+      if (!force) {
+        const existing = await findVisibleByDriveFileId(user.userId, user.email, primaryFileId);
+        if (existing) {
+          return out(409, {
+            error: 'This recording was already imported.',
+            existing: {
+              assemblyai_id: existing.assemblyai_id,
+              title: existing.title,
+              created_at: existing.created_at,
+              own: existing.user_id === user.userId,
+              accessible: true,
+            },
+          });
+        }
+        if (event.meetingCode) {
+          const conflictOut = await checkCrossUserDuplicate(
+            event.meetingCode,
+            event.startTime ?? actuals.conferenceStart ?? null,
+            user
+          );
+          if (conflictOut) return conflictOut;
+        }
+      }
+      try {
+        const meta = await getDriveFileMeta(accessToken!, primaryFileId);
+        if (!meta.canDownload) {
+          return out(403, {
+            error:
+              'The owner has disabled downloads for viewers on this recording. Ask them for edit access or to lift the restriction (Share → gear icon).',
+          });
+        }
+      } catch (err) {
+        if (err instanceof GoogleApiError) return googleErrorOutcome(err);
+        throw err;
+      }
+
+      const placeholderId = `defer-${randomUUID()}`;
+      // Same reasoning as the not-ready queue: recordingPending stays off the
+      // placeholder so the recording poller can't race the promotion.
+      const { recordingPending: _dropped, ...ctxForPlaceholder } = baseContext;
+      void _dropped;
+      const placeholder = await createDeferredPlaceholder(user.userId, {
+        placeholderId,
+        title,
+        recordedAt: event.startTime ?? actuals.conferenceStart ?? null,
+        gmeetContext: {
+          ...ctxForPlaceholder,
+          deferredImport: {
+            mode,
+            ownerEmail: user.email,
+            background: true,
+            request: {
+              videoFileId: primaryFileId,
+              transcriptDocId: transcriptDocId ?? undefined,
+              languageCode,
+              conferenceRecordName: actuals.conferenceRecordName,
+              force,
+              event,
+              contextExtra: body.contextExtra,
+            },
+            since: new Date().toISOString(),
+            status: 'waiting',
+          },
+        },
+      });
+      const autoShared = await autoShareToInternalInvitees(
+        placeholder.id,
+        user.userId,
+        user.email,
+        shareList
+      );
+      await registerPeopleFromMeeting(shareList, user.userId);
+      console.log(
+        `[gmeet/import] background ${mode} import queued as ${placeholderId} (artifacts ready)`
+      );
+      return out(202, {
+        deferred: true,
+        background: true,
+        waitingFor: mode === 'both' ? 'both' : 'video',
+        transcript: placeholder,
+        mode,
+        autoShared,
+      });
     }
   }
 

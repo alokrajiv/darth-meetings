@@ -2,7 +2,7 @@ import { NextResponse } from 'next/server';
 import { withAuth } from '@/lib/auth/with-auth';
 import { resolveAccess } from '@/db-ops/transcript-access';
 import { logActivity } from '@/db-ops/transcript-activity';
-import { setAutoReportForUser } from '@/db-ops/transcripts';
+import { mergeGmeetContextForUser, setAutoReportForUser } from '@/db-ops/transcripts';
 import { generateAutoReport } from '@/lib/server/auto-notes';
 
 export const runtime = 'nodejs';
@@ -38,6 +38,27 @@ export const POST = withAuth(async ({ user, request }, { params }) => {
   }
   if (access.row.status !== 'completed') {
     return NextResponse.json({ error: 'Transcript is not completed yet' }, { status: 409 });
+  }
+
+  // Video report requested while the recording is still only a promise
+  // (Google preparing the file — no fileId to pull yet): queue it instead of
+  // running text-only. The recording poller fires the run the moment the
+  // video lands (or degraded to text-only if the recording never appears).
+  const ctx = access.row.gmeet_context;
+  const knownRecording =
+    !!access.row.local_audio_path ||
+    !!ctx?.videoFileId ||
+    !!ctx?.actuals?.recordings?.[0]?.fileId ||
+    !!(ctx?.provider === 'teams' && ctx.teams?.recordingId);
+  if (useVideo && !knownRecording && ctx?.recordingPending?.status === 'waiting') {
+    await mergeGmeetContextForUser(access.ownerUserId, id, {
+      pendingVideoReport: {
+        ...(instructions ? { instructions } : {}),
+        triggeredBy: { userId: user.userId, email: user.email },
+        requestedAt: new Date().toISOString(),
+      },
+    });
+    return NextResponse.json({ status: 'queued' });
   }
 
   void generateAutoReport(access.ownerUserId, id, {

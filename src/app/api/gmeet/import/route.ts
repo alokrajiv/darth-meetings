@@ -1,6 +1,7 @@
 import { NextResponse } from 'next/server';
 import { withAuth } from '@/lib/auth/with-auth';
 import { executeGmeetImport, type ImportBody } from '@/lib/server/gmeet-import-core';
+import { kickDeferredImportPoller } from '@/lib/server/deferred-import-poller';
 
 export const runtime = 'nodejs';
 // Pulling a multi-GB recording from Drive and re-uploading it to AssemblyAI
@@ -23,5 +24,8 @@ export const POST = withAuth(async ({ user, request }) => {
     return NextResponse.json({ error: 'Invalid JSON body' }, { status: 400 });
   }
   const result = await executeGmeetImport({ userId: user.userId, email: user.email }, body);
+  // Queued (202): start the poller now so a ready-artifact background import
+  // begins in seconds rather than on the next interval tick.
+  if (result.status === 202) kickDeferredImportPoller();
   return NextResponse.json(result.body, { status: result.status });
 });

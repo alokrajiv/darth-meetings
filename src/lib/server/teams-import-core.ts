@@ -49,6 +49,12 @@ export interface TeamsImportBody {
    * ends), queue the import (202 + a `defer-…` placeholder row) instead of
    * failing — the deferred-import poller runs it once the artifact lands. */
   defer?: boolean;
+  /** Client opt-in: even when the recording IS ready, don't stream it from
+   * Graph inline — queue the same `defer-…` placeholder and let the poller
+   * run the heavy download/AAI submit (app-only, no user token needed). The
+   * request returns in seconds and closing the tab no longer kills the
+   * import. Only affects video/'both' modes; transcript stays inline. */
+  background?: boolean;
   event?: {
     id?: string;
     title?: string;
@@ -299,6 +305,91 @@ export async function executeTeamsImport(
       // Dedupe is best-effort — never block an import on a failed check.
       console.warn('[teams/import] cross-user dedupe check failed:', err);
     }
+  }
+
+  // ---- Background import: the recording is READY, but streaming it from
+  // Graph and re-uploading it to AssemblyAI takes minutes — queue the same
+  // placeholder the not-ready path uses and let the deferred-import poller
+  // (kicked immediately by the route) replay it app-only. Dedupe already
+  // passed above, so conflicts stayed interactive; only the heavy pull moves
+  // to the background. The placeholder's teams context deliberately omits
+  // callId (same as the not-ready path) so cross-user dedupe on the replay
+  // can never match the placeholder itself.
+  if (body.background && mode !== 'transcript' && !opts?.placeholderAssemblyaiId) {
+    const waitingFor: 'video' | 'both' = mode === 'both' ? 'both' : 'video';
+    // Second click while queued → hand back the existing placeholder.
+    const already = await findWaitingTeamsDeferred(
+      user.userId,
+      info.joinWebUrl,
+      event.startTime ?? null
+    );
+    if (already) {
+      return out(202, {
+        deferred: true,
+        background: true,
+        waitingFor,
+        transcript: already,
+        mode,
+        autoShared: 0,
+      });
+    }
+    const placeholderId = `defer-${randomUUID()}`;
+    const placeholder = await createDeferredPlaceholder(user.userId, {
+      placeholderId,
+      title: event.title ?? meeting.subject ?? null,
+      recordedAt: event.startTime ?? meeting.startDateTime ?? null,
+      gmeetContext: {
+        provider: 'teams',
+        teams: {
+          joinWebUrl: info.joinWebUrl,
+          tenantId: info.tenantId,
+          organizerOid: info.organizerOid,
+          graphMeetingId: meeting.id,
+        },
+        eventId: event.id,
+        recurringEventId: event.recurringEventId,
+        iCalUID: event.iCalUID,
+        organizerEmail: event.organizerEmail,
+        eventTitle: event.title,
+        startTime: event.startTime,
+        endTime: event.endTime,
+        attendees,
+        ...(body.contextExtra ?? {}),
+        deferredImport: {
+          mode,
+          ownerEmail: user.email,
+          background: true,
+          request: {
+            url: info.joinWebUrl,
+            languageCode,
+            force,
+            event,
+            contextExtra: body.contextExtra,
+          },
+          since: new Date().toISOString(),
+          status: 'waiting',
+        },
+      },
+    });
+    const bgShareList = attendees.map((a) => ({ email: a.email, name: a.name }));
+    const autoShared = await autoShareToInternalInvitees(
+      placeholder.id,
+      user.userId,
+      user.email,
+      bgShareList
+    );
+    await registerPeopleFromMeeting(bgShareList, user.userId);
+    console.log(
+      `[teams/import] background ${mode} import queued as ${placeholderId} (recording ready)`
+    );
+    return out(202, {
+      deferred: true,
+      background: true,
+      waitingFor,
+      transcript: placeholder,
+      mode,
+      autoShared,
+    });
   }
 
   const context: GmeetContext = {

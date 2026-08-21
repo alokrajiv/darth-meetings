@@ -506,6 +506,9 @@ export function GmeetImportDialog({
     /** Import queued (202) — the provider is still preparing this artifact;
      * the server runs the import automatically once it lands. */
     deferred?: 'transcript' | 'video' | 'both';
+    /** Queued with the artifacts already ready (202 + background) — the
+     * server is pulling + transcribing right now; nothing to wait on here. */
+    background?: boolean;
     /** Teams import — words the done/queued copy (Microsoft vs Google). */
     teams?: boolean;
   } | null>(null);
@@ -1478,6 +1481,10 @@ export function GmeetImportDialog({
           // file yet, queue the import instead of failing — the server runs
           // it automatically the moment the file lands.
           defer: true,
+          // Even when everything IS ready, don't pull the video inline: the
+          // server queues it and imports in the background, so this request
+          // returns in seconds and closing the tab kills nothing.
+          background: true,
           event: {
             id: e.id,
             title: picked.offCalendar ? undefined : e.summary,
@@ -1526,13 +1533,16 @@ export function GmeetImportDialog({
       const payload = (await res.json()) as {
         autoShared?: number;
         deferred?: boolean;
+        background?: boolean;
         waitingFor?: 'transcript' | 'video' | 'both';
       };
       setDoneInfo({
         mode,
         title: e.summary ?? 'Untitled meeting',
         autoShared: payload.autoShared ?? 0,
-        deferred: payload.deferred ? (payload.waitingFor ?? 'both') : undefined,
+        deferred:
+          payload.deferred && !payload.background ? (payload.waitingFor ?? 'both') : undefined,
+        background: payload.background,
       });
       setStep('done');
       onImported?.();
@@ -1564,6 +1574,9 @@ export function GmeetImportDialog({
           // Microsoft is still processing the artifacts → queue instead of
           // failing; the deferred-import poller finishes it automatically.
           defer: true,
+          // Ready artifacts also import in the background (202 in seconds)
+          // instead of holding this request open for the whole MP4 pull.
+          background: true,
           event: {
             id: e.id,
             title: e.summary,
@@ -1609,13 +1622,16 @@ export function GmeetImportDialog({
       const payload = (await res.json()) as {
         autoShared?: number;
         deferred?: boolean;
+        background?: boolean;
         waitingFor?: 'transcript' | 'video' | 'both';
       };
       setDoneInfo({
         mode,
         title: e.summary ?? 'Untitled meeting',
         autoShared: payload.autoShared ?? 0,
-        deferred: payload.deferred ? (payload.waitingFor ?? 'both') : undefined,
+        deferred:
+          payload.deferred && !payload.background ? (payload.waitingFor ?? 'both') : undefined,
+        background: payload.background,
         teams: true,
       });
       setStep('done');
@@ -2755,8 +2771,8 @@ export function GmeetImportDialog({
             <Download className="h-10 w-10 animate-bounce mx-auto text-primary" />
             <p className="mt-3 text-sm text-muted-foreground">
               {mode === 'transcript'
-                ? 'Importing the Meet transcript…'
-                : 'Pulling the recording from Drive and submitting for transcription… this can take a few minutes for long meetings. Keep this tab open.'}
+                ? 'Importing the transcript…'
+                : 'Starting the import — checking the artifacts and handing the download to the server… a few seconds.'}
             </p>
           </div>
         )}
@@ -2770,7 +2786,9 @@ export function GmeetImportDialog({
             )}
             <p className="text-sm font-medium">{doneInfo.title}</p>
             <p className="text-sm text-muted-foreground">
-              {doneInfo.deferred
+              {doneInfo.background
+                ? 'Import running in the background — the server is pulling the recording and submitting it for transcription. It shows in your list right away and completes on its own; nothing else to do here.'
+                : doneInfo.deferred
                 ? `Import queued — ${doneInfo.teams ? 'Microsoft' : 'Google'} is still preparing the ${
                     doneInfo.deferred === 'both'
                       ? 'video and transcript'
