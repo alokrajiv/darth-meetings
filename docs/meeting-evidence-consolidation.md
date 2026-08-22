@@ -163,8 +163,7 @@ for one deploy) → Phase 3 (½ day).
 
 ## Addendum (2026-08-22): same disease, different organ — auth/401 self-heal
 
-Sibling session (`2026-08-22-122555-image-1-can-we-figure-out-how-to-renew-the-tok.txt`, repo
-root) diagnosed the "Retry loop after 24h": the `trames-auth-session` JWT lives 24h but the
+Sibling session (`old-session/7. sso-401-token-renewal-design.txt`) diagnosed the "Retry loop after 24h": the `trames-auth-session` JWT lives 24h but the
 cookie 30d; `src/proxy.ts` only checks cookie *presence*, so pages load and every `/api/*` call
 401s; nothing in this app ever calls kenoby-sso's `/api/auth/refresh`. Kyloren solves it with a
 single-flight axios interceptor against `login.trames.io/api/auth/refresh`; the cross-origin

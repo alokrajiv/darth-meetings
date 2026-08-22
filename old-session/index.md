@@ -305,3 +305,18 @@ unparseable warnings.
 3. Everything is committed (c9ba3ae, 7fe05dd, b595cb5, a736c24) and deployed;
    migration 026 + Teams repair applied on prod. No loose ends in the tree.
 4. Full plan + status banner: `docs/meeting-evidence-consolidation.md`.
+
+## 7. SSO 401 token-renewal design (sibling session) — 2026-08-22
+
+**File:** [7. sso-401-token-renewal-design.txt](7.%20sso-401-token-renewal-design.txt)
+
+The sibling session that diagnosed the "Retry loop after 24h" (JWT lives 24h,
+cookie 30d, `proxy.ts` only checked presence) and designed the fix: a single
+`window.fetch` guard → single-flight `POST login.trames.io/api/auth/refresh`
+→ replay, plus a JWT-exp pre-check in `proxy.ts` for document navigations;
+cross-origin refresh proven live with real cookies. The design was built and
+shipped in session 6 (c9ba3ae) and the cookbook lives at
+`~/.claude/playbooks/trames-sso-401-self-heal.md`.
+
+**Next session pickup points:** none — fully shipped; kept for the reasoning
+(CORS/same-site proof, kyloren precedent).
