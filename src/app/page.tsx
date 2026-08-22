@@ -7,6 +7,7 @@ import { AudioUpload, requestMediaUpload } from '@/components/audio-upload';
 import { getGoogleAccessToken } from '@/lib/google-token';
 import { LogoutButton } from '@/components/logout-button';
 import { GmeetImportDialog } from '@/components/gmeet-import-dialog';
+import { GmeetImportDialogLegacy } from '@/components/gmeet-import-dialog-legacy';
 import { GmeetRemindersCard, type Reminder } from '@/components/gmeet-reminders-card';
 import { TranscriptImportDialog } from '@/components/transcript-import-dialog';
 import { AppHeader } from '@/components/app-header';
@@ -22,7 +23,33 @@ import {
 
 const REMINDERS_COLLAPSED_KEY = 'mw-reminders-collapsed';
 
+/**
+ * ONE-DEPLOY escape hatch for the Phase-2 dialog rewrite: the old browser-
+ * Google dialog stays reachable via NEXT_PUBLIC_MEET_DIALOG_LEGACY=1 (build-
+ * time default), `localStorage.setItem('mw:legacyMeetDialog','1')`, or
+ * `?meetLegacy=1` on the URL (sticky for the tab via the same key). Remove
+ * together with gmeet-import-dialog-legacy.tsx once the new path has
+ * survived a deploy.
+ */
+function useLegacyMeetDialog(): boolean {
+  const [legacy, setLegacy] = useState(process.env.NEXT_PUBLIC_MEET_DIALOG_LEGACY === '1');
+  useEffect(() => {
+    try {
+      const params = new URLSearchParams(window.location.search);
+      const q = params.get('meetLegacy');
+      if (q === '1') window.localStorage.setItem('mw:legacyMeetDialog', '1');
+      if (q === '0') window.localStorage.removeItem('mw:legacyMeetDialog');
+      if (window.localStorage.getItem('mw:legacyMeetDialog') === '1') setLegacy(true);
+      else if (q === '0') setLegacy(false);
+    } catch {
+      // storage unavailable — build-time default stands
+    }
+  }, []);
+  return legacy;
+}
+
 export default function Home() {
+  const MeetDialog = useLegacyMeetDialog() ? GmeetImportDialogLegacy : GmeetImportDialog;
   const [refreshTrigger, setRefreshTrigger] = useState(0);
   const [gmeetOpen, setGmeetOpen] = useState(false);
   const [gmeetSyncMode, setGmeetSyncMode] = useState(false);
@@ -263,7 +290,7 @@ export default function Home() {
         />
       </main>
 
-      <GmeetImportDialog
+      <MeetDialog
         open={gmeetOpen}
         onClose={() => {
           setGmeetOpen(false);

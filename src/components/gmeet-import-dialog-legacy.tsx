@@ -37,53 +37,78 @@ import {
 } from 'lucide-react';
 import { MeetLogo, TeamsLogo } from '@/components/provider-icon';
 import { requestMediaUpload } from '@/components/audio-upload';
-import type {
-  CachedMeetingMeta,
-  DiscoverWindowResponse,
-  DiscoveredEvent,
-  DiscoveredRow,
-  EvidenceRequest,
-  EvidenceResponse,
-  MeetRecordsResponse,
-} from '@/lib/meeting-discovery-types';
 
-// Thin client over the meeting-discovery service (Phase 2 of
-// docs/meeting-evidence-consolidation.md). Every Google read — calendar day
-// / sync window, Meet record listings, per-occurrence artifact evidence —
-// goes through /api/calendar/discover, /api/meet/records and
-// /api/meet/evidence, which run under the caller's own server-minted token
-// and WRITE BACK to the shared caches, so a visit here feeds the listing and
-// the poller. The browser token is still used for the import call itself.
-// The previous browser-Google implementation is gmeet-import-dialog-legacy.tsx
-// (behind a flag for one deploy).
+import { classifyCalendarAttachments, classifyRecordings } from '@/lib/meeting-evidence';
 
-type CalendarEvent = DiscoveredEvent;
-type EventRow = DiscoveredRow;
+const MEET_API = 'https://meet.googleapis.com/v2';
 
-/** Thrown by the discovery routes when the caller hasn't connected Google
- * (404) — the dialog shows its Connect pitch. */
-class NotConnectedError extends Error {
-  constructor() {
-    super('Google account not connected yet — hit Connect Google (one time).');
-    this.name = 'NotConnectedError';
-  }
+// Teams meetings scheduled from Google Calendar (GSuite add-on) carry the
+// meetup-join link in location / description / conference entry points.
+const TEAMS_URL_RE = /https:\/\/teams\.microsoft\.com\/l\/meetup-join\/[^\s"'<>\\]+/;
+
+interface CalendarAttachment {
+  fileId?: string;
+  title?: string;
+  mimeType?: string;
 }
 
-async function discoveryGet<T>(url: string): Promise<T> {
-  const res = await fetch(url);
-  if (res.status === 404) throw new NotConnectedError();
-  const j = (await res.json().catch(() => ({}))) as T & { error?: string };
-  if (!res.ok) throw new Error(j.error || `Request failed (${res.status})`);
-  return j;
+interface CalendarEvent {
+  id: string;
+  summary?: string;
+  /** Series key for recurring events — sturdier identity than the meeting
+   * code (people recycle Meet links across unrelated meetings). */
+  recurringEventId?: string;
+  iCalUID?: string;
+  organizer?: { email?: string; self?: boolean };
+  location?: string;
+  description?: string;
+  start?: { dateTime?: string; date?: string };
+  end?: { dateTime?: string; date?: string };
+  attendees?: Array<{
+    email?: string;
+    displayName?: string;
+    responseStatus?: string;
+    self?: boolean;
+  }>;
+  attachments?: CalendarAttachment[];
+  conferenceData?: { conferenceId?: string; entryPoints?: Array<{ uri?: string }> };
 }
 
-/** ISO instants for a local calendar day (the server has no idea what
- * "today" means for this browser). */
-function dayWindow(forDate: string): { from: string; to: string } {
-  return {
-    from: new Date(`${forDate}T00:00:00`).toISOString(),
-    to: new Date(`${forDate}T23:59:59.999`).toISOString(),
-  };
+function teamsUrlOf(e: CalendarEvent): string | null {
+  const hay = [
+    e.location,
+    e.description,
+    ...(e.conferenceData?.entryPoints ?? []).map((p) => p.uri),
+  ]
+    .filter(Boolean)
+    .join('\n');
+  return TEAMS_URL_RE.exec(hay)?.[0] ?? null;
+}
+
+/** Meet API artifact info attached to a row by the day sweep / record pick. */
+interface MeetRowInfo {
+  recordName: string;
+  videoFileId: string | null;
+  transcriptDocId: string | null;
+  /** Artifact exists on the record but Google hasn't finished the file yet. */
+  videoPending: boolean;
+  transcriptPending: boolean;
+  /** null = not checked yet (recents rows — resolved on pick) */
+  checked: boolean;
+}
+
+interface EventRow {
+  event: CalendarEvent;
+  video: CalendarAttachment | null;
+  transcriptDoc: CalendarAttachment | null;
+  geminiNotes: CalendarAttachment | null;
+  videoCount: number;
+  meet: MeetRowInfo | null;
+  /** Raw Teams meetup-join link found on the event (null = not a Teams
+   * meeting). Canonicalization / tenant checks happen server-side. */
+  teamsUrl?: string | null;
+  /** conference record with no matching calendar event (orphan) */
+  offCalendar?: boolean;
 }
 
 /** Normalised selection — artifacts may come from calendar attachments or a
@@ -144,10 +169,29 @@ interface ImportedMark {
   mine: boolean;
 }
 
-/** Poller/probe-cached meeting metadata from /api/gmeet/check and
- * /api/meet/evidence — display-only enrichment (badges, instant options
- * step). Access is still proven through the user's own token at import time. */
-type MeetingMeta = CachedMeetingMeta;
+/** Poller-cached meeting metadata from /api/gmeet/check — display-only
+ * enrichment (badges, instant options step). Access is still proven through
+ * the user's own token at import time. */
+interface MeetingMeta {
+  conferenceRecord: string | null;
+  confStart: string | null;
+  confEnd: string | null;
+  /** Entries Google LISTED — files or not; use readyRecordingCount for
+   * "recording you can actually pull" (D4). */
+  recordingCount: number;
+  readyRecordingCount?: number;
+  recordingState?: string | null;
+  transcriptState?: string | null;
+  transcriptSource?: string | null;
+  videoFileId: string | null;
+  videoSize: number | null;
+  videoDurationMs: number | null;
+  transcriptDocIds: string[] | null;
+  transcriptParseable: boolean | null;
+  utteranceCount: number | null;
+  wordCount: number | null;
+  speakerCount: number | null;
+}
 
 interface SyncInfo {
   lastSyncedAt: string | null;
@@ -220,6 +264,24 @@ function shiftDate(dateStr: string, days: number): string {
   return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
 }
 
+/** Thin adapter over the ONE shared rule set (lib/meeting-evidence) — the
+ * dialog renders attachment objects, so map the classified ids back. */
+function classifyAttachments(atts: CalendarAttachment[] | undefined): {
+  video: CalendarAttachment | null;
+  transcriptDoc: CalendarAttachment | null;
+  geminiNotes: CalendarAttachment | null;
+  videoCount: number;
+} {
+  const c = classifyCalendarAttachments(atts);
+  const byId = (id: string | null) => (id ? (atts?.find((a) => a.fileId === id) ?? null) : null);
+  return {
+    video: byId(c.videoFileId),
+    transcriptDoc: c.geminiNotes ? null : byId(c.transcriptDocId),
+    geminiNotes: c.geminiNotes ? byId(c.transcriptDocId) : null,
+    videoCount: c.videoCount,
+  };
+}
+
 function fmtEventTime(e: CalendarEvent): string {
   const iso = e.start?.dateTime;
   if (!iso) return 'all day';
@@ -272,6 +334,34 @@ function parseMeetCode(input: string): string | null {
   return m ? m[1]!.toLowerCase() : null;
 }
 
+async function fetchDriveMeta(
+  token: string,
+  fileId: string
+): Promise<{ name: string; size: number | null; durationMs: number | null } | null> {
+  try {
+    const res = await fetch(
+      `https://www.googleapis.com/drive/v3/files/${encodeURIComponent(fileId)}?fields=${encodeURIComponent('name,size,videoMediaMetadata(durationMillis)')}&supportsAllDrives=true`,
+      { headers: { Authorization: `Bearer ${token}` } }
+    );
+    if (!res.ok) return null;
+    const j = (await res.json()) as {
+      name?: string;
+      size?: string;
+      videoMediaMetadata?: { durationMillis?: string };
+    };
+    return {
+      name: j.name ?? 'recording',
+      size: j.size != null ? Number(j.size) : null,
+      durationMs:
+        j.videoMediaMetadata?.durationMillis != null
+          ? Number(j.videoMediaMetadata.durationMillis)
+          : null,
+    };
+  } catch {
+    return null;
+  }
+}
+
 /** 5400000 → "1 h 30 m"; 240000 → "4 min". */
 function fmtDurationMs(ms: number): string {
   const mins = Math.round(ms / 60_000);
@@ -281,15 +371,129 @@ function fmtDurationMs(ms: number): string {
   return m > 0 ? `${h} h ${m} m` : `${h} h`;
 }
 
+interface MeetRecordLite {
+  name: string;
+  startTime?: string;
+  endTime?: string;
+  spaceResource?: string;
+}
+
+/** List conference records matching a filter (the caller's own meetings). */
+async function listMeetRecords(
+  token: string,
+  filterExpr: string,
+  pageLimit = 3
+): Promise<MeetRecordLite[]> {
+  const out: MeetRecordLite[] = [];
+  let pageToken: string | undefined;
+  for (let i = 0; i < pageLimit; i++) {
+    const res = await fetch(
+      `${MEET_API}/conferenceRecords?filter=${encodeURIComponent(filterExpr)}&pageSize=50${pageToken ? `&pageToken=${pageToken}` : ''}`,
+      { headers: { Authorization: `Bearer ${token}` } }
+    );
+    if (!res.ok) {
+      // THROW, don't return partial: callers must distinguish "no records"
+      // (meeting never happened) from "couldn't check" (scope/quota) — a
+      // silent empty result greys out real meetings as "never started".
+      const detail = await res.text().catch(() => '');
+      console.debug('[gmeet-import] conferenceRecords list failed', res.status, detail);
+      throw new Error(`Meet API list failed (${res.status})`);
+    }
+    const j = (await res.json()) as {
+      conferenceRecords?: Array<{ name: string; startTime?: string; endTime?: string; space?: string }>;
+      nextPageToken?: string;
+    };
+    for (const r of j.conferenceRecords ?? []) {
+      out.push({ name: r.name, startTime: r.startTime, endTime: r.endTime, spaceResource: r.space });
+    }
+    pageToken = j.nextPageToken;
+    if (!pageToken) break;
+  }
+  return out;
+}
+
+/** Resolve a record's space resource to its human meeting code. */
+async function fetchMeetingCode(token: string, spaceResource: string): Promise<string | null> {
+  try {
+    const res = await fetch(`${MEET_API}/${spaceResource}`, {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    if (!res.ok) return null;
+    const j = (await res.json()) as { meetingCode?: string };
+    return j.meetingCode ?? null;
+  } catch {
+    return null;
+  }
+}
+
+/** Fetch a record's recording + transcript artifact ids.
+ *
+ * Artifacts appear in these lists BEFORE their files exist: right after a
+ * call ends the entry is there with `state: "ENDED"` and an empty
+ * driveDestination/docsDestination, flipping to `FILE_GENERATED` with the id
+ * populated once Google finishes processing. The pending flags carry that
+ * "recorded, still being prepared" state — without them a just-ended meeting
+ * reads as "never recorded". */
+async function recordArtifacts(
+  token: string,
+  recordName: string
+): Promise<{
+  videoFileId: string | null;
+  transcriptDocId: string | null;
+  videoPending: boolean;
+  transcriptPending: boolean;
+  /** A listing call failed — "couldn't check" must NOT read as "nothing to
+   * import" (the old behaviour greyed real meetings out on a quota blip). */
+  checkFailed: boolean;
+}> {
+  const auth = { headers: { Authorization: `Bearer ${token}` } };
+  const [recRes, transRes] = await Promise.all([
+    fetch(`${MEET_API}/${recordName}/recordings`, auth),
+    fetch(`${MEET_API}/${recordName}/transcripts`, auth),
+  ]);
+  const recs = recRes.ok
+    ? ((await recRes.json()) as {
+        recordings?: Array<{ state?: string; driveDestination?: { file?: string } }>;
+      })
+    : null;
+  const trans = transRes.ok
+    ? ((await transRes.json()) as {
+        transcripts?: Array<{ state?: string; docsDestination?: { document?: string } }>;
+      })
+    : null;
+  const recordings = recs?.recordings ?? [];
+  const transcripts = trans?.transcripts ?? [];
+  const rec = classifyRecordings(
+    recordings.map((r) => ({ fileId: r.driveDestination?.file ?? null }))
+  );
+  return {
+    videoFileId: rec.fileIds[0] ?? null,
+    transcriptDocId:
+      transcripts.find((t) => t.docsDestination?.document)?.docsDestination?.document ?? null,
+    // Server-consistent: ANY listed-but-missing file means generation is
+    // still running (partial recordings keep the poller polling), matching
+    // gmeet-import-core / recording-poller instead of contradicting them.
+    videoPending: rec.state === 'generating' || rec.state === 'partial',
+    transcriptPending:
+      transcripts.length > 0 && !transcripts.some((t) => t.docsDestination?.document),
+    checkFailed: recs === null || trans === null,
+  };
+}
+
+// LEGACY (kept for ONE deploy behind a flag — see page.tsx / useLegacyMeetDialog):
+// the pre-Phase-2 dialog that talks to Google Calendar / Meet / Drive from the
+// browser and writes nothing back. The live dialog is gmeet-import-dialog.tsx,
+// which goes through /api/calendar/discover, /api/meet/records and
+// /api/meet/evidence (lib/server/meeting-discovery). Delete this file once the
+// new path has survived a deploy.
 /**
  * "Import from Meet": connect Google → pick a meeting (from the calendar day
  * view, the last-30-days Meet history, or a pasted Meet link) → the options
  * step enriches it (Drive metadata + Meet API artifacts) → choose how to
- * import → run. All Google reads go through the server-side discovery
- * service (caller's own token, written back to the shared caches); the
- * browser token is only used for the import call.
+ * import → run. All Google reads happen in the browser with the user's
+ * short-lived token; only the import call goes through our server.
  */
-export function GmeetImportDialog({
+export function GmeetImportDialogLegacy({
   open,
   onClose,
   onImported,
@@ -508,6 +712,8 @@ export function GmeetImportDialog({
     setError(null);
     setTab('sync');
     try {
+      const token = await getGoogleAccessToken();
+
       // 1. Our sync state (last sync + mutes).
       let lastSyncedAt: string | null = null;
       let skips = new Set<string>();
@@ -534,30 +740,103 @@ export function GmeetImportDialog({
       const fromIso = new Date(fromMs).toISOString();
       setSyncFrom(fromIso);
 
-      // 2. Calendar events + Meet conferences over the window, joined
-      // server-side (and written back to the caches).
-      const q = new URLSearchParams({ from: fromIso, to: new Date().toISOString(), meetOnly: '1' });
-      const data = await discoveryGet<DiscoverWindowResponse>(`/api/calendar/discover?${q}`);
-      const evRows = [...data.rows].sort((a, b) =>
+      // 2. Calendar events over the window.
+      const params = new URLSearchParams({
+        timeMin: fromIso,
+        timeMax: new Date().toISOString(),
+        singleEvents: 'true',
+        orderBy: 'startTime',
+        maxResults: '250',
+        fields:
+          'items(id,summary,recurringEventId,iCalUID,organizer(email,self),location,description,start,end,attendees(email,displayName,responseStatus,self),attachments(fileId,title,mimeType),conferenceData(conferenceId,entryPoints(uri)))',
+      });
+      const calRes = await fetch(
+        `https://www.googleapis.com/calendar/v3/calendars/primary/events?${params}`,
+        { headers: { Authorization: `Bearer ${token}` } }
+      );
+      if (calRes.status === 401) {
+        invalidateGoogleToken();
+        throw new Error('Google session expired — hit Connect again.');
+      }
+      if (!calRes.ok) throw new Error(`Calendar request failed (${calRes.status})`);
+      const calData = (await calRes.json()) as { items?: CalendarEvent[] };
+      const evRows: EventRow[] = (calData.items ?? [])
+        .filter((e) => e.start?.dateTime && (e.conferenceData?.conferenceId || teamsUrlOf(e)))
+        .map((event) => ({
+          event,
+          ...classifyAttachments(event.attachments),
+          meet: null,
+          teamsUrl: teamsUrlOf(event),
+        }));
+
+      // 3. Conference records over the window (proves which meetings actually
+      // happened + finds their artifacts), joined by exact meeting code.
+      try {
+        const records = await listMeetRecords(token, `start_time >= "${fromIso}"`, 3);
+        const enriched = await Promise.all(
+          records.map(async (r) => {
+            const [code, artifacts] = await Promise.all([
+              r.spaceResource
+                ? fetchMeetingCode(token, r.spaceResource)
+                : Promise.resolve(null),
+              recordArtifacts(token, r.name),
+            ]);
+            return { ...r, code, ...artifacts };
+          })
+        );
+        const extras: EventRow[] = [];
+        for (const rec of enriched) {
+          const info: MeetRowInfo = {
+            recordName: rec.name,
+            videoFileId: rec.videoFileId,
+            transcriptDocId: rec.transcriptDocId,
+            videoPending: rec.videoPending,
+            transcriptPending: rec.transcriptPending,
+            checked: !rec.checkFailed,
+          };
+          const target = rec.code
+            ? evRows.find((row) => row.event.conferenceData?.conferenceId === rec.code)
+            : undefined;
+          if (target) {
+            target.meet = target.meet ?? info;
+          } else {
+            extras.push({
+              event: {
+                id: rec.name,
+                summary: `Meet${rec.code ? ` · ${rec.code}` : ''} (not on calendar)`,
+                start: { dateTime: rec.startTime },
+                end: { dateTime: rec.endTime },
+                conferenceData: rec.code ? { conferenceId: rec.code } : undefined,
+                attendees: [],
+              },
+              video: null,
+              transcriptDoc: null,
+              geminiNotes: null,
+              videoCount: 0,
+              meet: info,
+              offCalendar: true,
+            });
+          }
+        }
+        evRows.push(...extras);
+        setSweepDone(true);
+      } catch (err) {
+        console.debug('[gmeet-import] sync sweep failed', err);
+        setSweepDone(false);
+      }
+
+      evRows.sort((a, b) =>
         (b.event.start?.dateTime ?? '').localeCompare(a.event.start?.dateTime ?? '')
       );
-      setSweepDone(data.meetChecked);
       setSelected(new Set());
       setRows(evRows);
       setStep('pick');
     } catch (err) {
-      if (err instanceof NotConnectedError) {
-        // The server says not connected — a still-cached browser token
-        // would make connect() skip the re-connect redirect; drop it.
-        invalidateGoogleToken();
+      setError(err instanceof Error ? err.message : 'Failed to load sync view');
+      if (!hasValidGoogleToken()) {
         setStep('connect');
         setConnectPitch(true);
-        return;
       }
-      setError(err instanceof Error ? err.message : 'Failed to load sync view');
-      // First open lands here with only the spinner rendered — move to the
-      // pick step so the error (and "Switch Google account") is visible.
-      setStep((s) => (s === 'connect' ? 'pick' : s));
     } finally {
       setBusy(false);
     }
@@ -586,41 +865,139 @@ export function GmeetImportDialog({
   };
 
   /**
-   * Day view: the calendar's events for the day joined with the Meet
-   * conferences that actually happened (accurate badges even when nothing is
-   * attached to the event), plus meetings you joined that aren't on your
-   * calendar — one server round-trip.
+   * Day sweep: one Meet API listing for the day joins actual conferences to
+   * the calendar rows (accurate badges even when nothing is attached to the
+   * event), and surfaces meetings you joined that aren't on your calendar.
    */
-  const loadEvents = useCallback(async (forDate: string) => {
-    setBusy(true);
-    setError(null);
-    setTab('calendar');
+  const sweepDay = useCallback(async (forDate: string, token: string) => {
     try {
-      const w = dayWindow(forDate);
-      const q = new URLSearchParams({ from: w.from, to: w.to });
-      const data = await discoveryGet<DiscoverWindowResponse>(`/api/calendar/discover?${q}`);
-      console.debug('[gmeet-import] discover', forDate, data);
-      setSweepDone(data.meetChecked);
-      setSelected(new Set());
-      setRows(data.rows);
-      setStep('pick');
-    } catch (err) {
-      if (err instanceof NotConnectedError) {
-        // The server says not connected — a still-cached browser token
-        // would make connect() skip the re-connect redirect; drop it.
-        invalidateGoogleToken();
-        setStep('connect');
-        setConnectPitch(true);
+      const lo = new Date(`${forDate}T00:00:00`).toISOString();
+      const hi = new Date(`${forDate}T23:59:59.999`).toISOString();
+      const records = await listMeetRecords(
+        token,
+        `start_time >= "${lo}" AND start_time <= "${hi}"`,
+        2
+      );
+      if (records.length === 0) {
+        setSweepDone(true);
         return;
       }
-      setError(err instanceof Error ? err.message : 'Failed to load calendar');
-      // First open lands here with only the spinner rendered — move to the
-      // pick step so the error (and "Switch Google account") is visible.
-      setStep((s) => (s === 'connect' ? 'pick' : s));
-    } finally {
-      setBusy(false);
+
+      const enriched = await Promise.all(
+        records.map(async (r) => {
+          const [code, artifacts] = await Promise.all([
+            r.spaceResource ? fetchMeetingCode(token, r.spaceResource) : Promise.resolve(null),
+            recordArtifacts(token, r.name),
+          ]);
+          return { ...r, code, ...artifacts };
+        })
+      );
+      console.debug('[gmeet-import] day sweep', forDate, enriched);
+
+      setRows((prev) => {
+        const next = prev.map((row) => ({ ...row }));
+        const extras: EventRow[] = [];
+        for (const rec of enriched) {
+          const info: MeetRowInfo = {
+            recordName: rec.name,
+            videoFileId: rec.videoFileId,
+            transcriptDocId: rec.transcriptDocId,
+            videoPending: rec.videoPending,
+            transcriptPending: rec.transcriptPending,
+            checked: !rec.checkFailed,
+          };
+          // Join ONLY by exact meeting code. No time-overlap guessing: a
+          // moved calendar event once matched a neighbouring slot's record
+          // and imported a completely different meeting's transcript.
+          const target = rec.code
+            ? next.find((row) => row.event.conferenceData?.conferenceId === rec.code)
+            : undefined;
+          if (target) {
+            // Keep the earliest-found artifacts; Meet API fills gaps.
+            target.meet = target.meet ?? info;
+          } else {
+            extras.push({
+              event: {
+                id: rec.name,
+                summary: `Meet${rec.code ? ` · ${rec.code}` : ''} (not on calendar)`,
+                start: { dateTime: rec.startTime },
+                end: { dateTime: rec.endTime },
+                conferenceData: rec.code ? { conferenceId: rec.code } : undefined,
+                attendees: [],
+              },
+              video: null,
+              transcriptDoc: null,
+              geminiNotes: null,
+              videoCount: 0,
+              meet: info,
+              offCalendar: true,
+            });
+          }
+        }
+        return [...next, ...extras];
+      });
+      setSweepDone(true);
+    } catch (err) {
+      // Sweep unavailable (scope/API not granted) — stay permissive, don't
+      // grey rows we can't actually verify.
+      console.debug('[gmeet-import] day sweep failed', err);
     }
   }, []);
+
+  const loadEvents = useCallback(
+    async (forDate: string) => {
+      setBusy(true);
+      setError(null);
+      setTab('calendar');
+      try {
+        const token = await getGoogleAccessToken();
+        const params = new URLSearchParams({
+          timeMin: new Date(`${forDate}T00:00:00`).toISOString(),
+          timeMax: new Date(`${forDate}T23:59:59.999`).toISOString(),
+          singleEvents: 'true',
+          orderBy: 'startTime',
+          maxResults: '50',
+          fields:
+            'items(id,summary,recurringEventId,iCalUID,organizer(email,self),location,description,start,end,attendees(email,displayName,responseStatus,self),attachments(fileId,title,mimeType),conferenceData(conferenceId,entryPoints(uri)))',
+        });
+        const res = await fetch(
+          `https://www.googleapis.com/calendar/v3/calendars/primary/events?${params}`,
+          { headers: { Authorization: `Bearer ${token}` } }
+        );
+        if (res.status === 401) {
+          invalidateGoogleToken();
+          throw new Error('Google session expired — hit Connect again.');
+        }
+        if (!res.ok) throw new Error(`Calendar request failed (${res.status})`);
+        const data = (await res.json()) as { items?: CalendarEvent[] };
+        console.debug('[gmeet-import] events for', forDate, data.items);
+        const evRows: EventRow[] = (data.items ?? [])
+          // Meetings only — skip all-day events (no dateTime).
+          .filter((e) => e.start?.dateTime)
+          .map((event) => ({
+            event,
+            ...classifyAttachments(event.attachments),
+            meet: null,
+            teamsUrl: teamsUrlOf(event),
+          }));
+        setSweepDone(false);
+        setSelected(new Set());
+        setRows(evRows);
+        setStep('pick');
+        // Non-blocking: join the day's actual conferences in when they load.
+        void sweepDay(forDate, token);
+      } catch (err) {
+        setError(err instanceof Error ? err.message : 'Failed to load calendar');
+        if (!hasValidGoogleToken()) {
+          setStep('connect');
+          setConnectPitch(true);
+        }
+      } finally {
+        setBusy(false);
+      }
+    },
+    [sweepDay]
+  );
 
   /** Last 30 days of conferences the user was in (Meet API only, no titles). */
   const loadRecents = useCallback(async () => {
@@ -628,23 +1005,38 @@ export function GmeetImportDialog({
     setError(null);
     setTab('recent');
     try {
-      const data = await discoveryGet<MeetRecordsResponse>('/api/meet/records?days=30');
+      const token = await getGoogleAccessToken();
+      const lo = new Date(Date.now() - 30 * 24 * 3600_000).toISOString();
+      const records = await listMeetRecords(token, `start_time >= "${lo}"`, 3);
+      records.sort((a, b) => (b.startTime ?? '').localeCompare(a.startTime ?? ''));
       setSelected(new Set());
-      setRows(data.rows);
+      setRows(
+        records.map((r) => ({
+          event: {
+            id: r.name,
+            summary: `Meet — ${fmtDayTime(r.startTime)}`,
+            start: { dateTime: r.startTime },
+            end: { dateTime: r.endTime },
+            attendees: [],
+          },
+          video: null,
+          transcriptDoc: null,
+          geminiNotes: null,
+          videoCount: 0,
+          meet: {
+            recordName: r.name,
+            videoFileId: null,
+            transcriptDocId: null,
+            videoPending: false,
+            transcriptPending: false,
+            checked: false,
+          },
+          offCalendar: true,
+        }))
+      );
       setStep('pick');
     } catch (err) {
-      if (err instanceof NotConnectedError) {
-        // The server says not connected — a still-cached browser token
-        // would make connect() skip the re-connect redirect; drop it.
-        invalidateGoogleToken();
-        setStep('connect');
-        setConnectPitch(true);
-        return;
-      }
       setError(err instanceof Error ? err.message : 'Failed to load recent meets');
-      // First open lands here with only the spinner rendered — move to the
-      // pick step so the error (and "Switch Google account") is visible.
-      setStep((s) => (s === 'connect' ? 'pick' : s));
     } finally {
       setBusy(false);
     }
@@ -661,26 +1053,42 @@ export function GmeetImportDialog({
     setError(null);
     setTab('recent');
     try {
-      const data = await discoveryGet<MeetRecordsResponse>(
-        `/api/meet/records?code=${encodeURIComponent(code)}`
-      );
-      if (data.rows.length === 0) {
+      const token = await getGoogleAccessToken();
+      const records = await listMeetRecords(token, `space.meeting_code = "${code}"`, 2);
+      records.sort((a, b) => (b.startTime ?? '').localeCompare(a.startTime ?? ''));
+      if (records.length === 0) {
         setError(
           `No conference records found for ${code} — the Meet API only shows meetings you attended or organised.`
         );
         return;
       }
       setSelected(new Set());
-      setRows(data.rows);
+      setRows(
+        records.map((r) => ({
+          event: {
+            id: r.name,
+            summary: `${code} — ${fmtDayTime(r.startTime)}`,
+            start: { dateTime: r.startTime },
+            end: { dateTime: r.endTime },
+            conferenceData: { conferenceId: code },
+            attendees: [],
+          },
+          video: null,
+          transcriptDoc: null,
+          geminiNotes: null,
+          videoCount: 0,
+          meet: {
+            recordName: r.name,
+            videoFileId: null,
+            transcriptDocId: null,
+            videoPending: false,
+            transcriptPending: false,
+            checked: false,
+          },
+          offCalendar: true,
+        }))
+      );
     } catch (err) {
-      if (err instanceof NotConnectedError) {
-        // The server says not connected — a still-cached browser token
-        // would make connect() skip the re-connect redirect; drop it.
-        invalidateGoogleToken();
-        setStep('connect');
-        setConnectPitch(true);
-        return;
-      }
       setError(err instanceof Error ? err.message : 'Lookup failed');
     } finally {
       setBusy(false);
@@ -748,61 +1156,69 @@ export function GmeetImportDialog({
     void loadEvents(next);
   };
 
-  /** Merge the live evidence probe (Meet API artifacts + Drive metadata,
-   * via /api/meet/evidence — which also writes back to the cache) into the
-   * picked meeting. */
+  /** Merge Drive metadata + Meet API artifacts into the picked meeting. */
   const enrich = async (initial: PickedMeeting) => {
     try {
+      const token = await getGoogleAccessToken();
       const e = initial.event;
-      const code = e.conferenceData?.conferenceId;
-      if (!code) {
-        setPicked((prev) =>
-          prev && prev.event.id === initial.event.id ? { ...prev, enriching: false } : prev
-        );
-        return;
-      }
-      const body: EvidenceRequest = {
-        meetingCode: code,
-        // Off-calendar rows carry the record start here — same key the
-        // discovery service writes, so the cache join is the right occurrence.
-        startTime: e.start?.dateTime ?? null,
-        recordName: initial.conferenceRecordName,
-        attachments: e.attachments ?? null,
-        event: {
-          id: e.id,
-          recurringEventId: e.recurringEventId ?? null,
-          iCalUID: e.iCalUID ?? null,
-          organizerEmail: e.organizer?.email ?? null,
-        },
-      };
-      const res = await fetch('/api/meet/evidence', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(body),
-      });
-      if (!res.ok) {
-        const j = (await res.json().catch(() => ({}))) as { error?: string };
-        throw new Error(j.error || `Couldn’t check Google (${res.status})`);
-      }
-      const found = (await res.json()) as EvidenceResponse;
-
-      const recordName = found.recordName ?? initial.conferenceRecordName;
-      const videoFileId = found.recording.fileIds[0] ?? initial.videoFileId;
+      let recordName = initial.conferenceRecordName;
+      let videoFileId = initial.videoFileId;
       let transcriptDocId = initial.transcriptDocId;
       let transcriptSource = initial.transcriptSource;
-      if (!transcriptDocId && found.transcript.docIds[0]) {
-        transcriptDocId = found.transcript.docIds[0];
-        transcriptSource = found.transcript.source === 'gemini' ? 'gemini' : 'meet-api';
-      }
-      // Live check is authoritative for the pending state either way —
-      // this is also how a re-check clears a stale "still preparing".
-      // Unless the check itself FAILED (quota/403): keep the prior state
-      // rather than letting a blip read as "nothing to import" (D5).
       let videoPending = initial.videoPending;
       let transcriptPending = initial.transcriptPending;
-      if (!found.checkFailed) {
-        videoPending = found.recording.state === 'generating' || found.recording.state === 'partial';
-        transcriptPending = found.transcript.state === 'generating';
+
+      // Find the conference record if we don't have it yet. The API returns
+      // records NEWEST-first — always pick the one NEAREST the event start,
+      // never [0], or a reused standing link imports the wrong meeting.
+      if (!recordName && e.conferenceData?.conferenceId) {
+        let filter = `space.meeting_code = "${e.conferenceData.conferenceId}"`;
+        if (e.start?.dateTime) {
+          const t = new Date(e.start.dateTime).getTime();
+          filter += ` AND start_time >= "${new Date(t - 6 * 3600_000).toISOString()}" AND start_time <= "${new Date(t + 12 * 3600_000).toISOString()}"`;
+        }
+        const records = await listMeetRecords(token, filter, 1);
+        if (records.length > 0) {
+          const target = e.start?.dateTime ? new Date(e.start.dateTime).getTime() : null;
+          if (target != null) {
+            records.sort(
+              (a, b) =>
+                Math.abs(new Date(a.startTime ?? 0).getTime() - target) -
+                Math.abs(new Date(b.startTime ?? 0).getTime() - target)
+            );
+          }
+          recordName = records[0]!.name;
+        }
+      }
+
+      // Fill artifact gaps from the record.
+      if (recordName && (!videoFileId || !transcriptDocId)) {
+        const found = await recordArtifacts(token, recordName);
+        if (!videoFileId && found.videoFileId) videoFileId = found.videoFileId;
+        if (!transcriptDocId && found.transcriptDocId) {
+          transcriptDocId = found.transcriptDocId;
+          transcriptSource = 'meet-api';
+        }
+        // Live check is authoritative for the pending state either way —
+        // this is also how a re-check clears a stale "still preparing".
+        // Unless the check itself FAILED (quota/403): keep the prior state
+        // rather than letting a blip read as "nothing to import" (D5).
+        if (!found.checkFailed) {
+          videoPending = found.videoPending;
+          transcriptPending = found.transcriptPending;
+        }
+      }
+
+      let videoName: string | null = null;
+      let videoSize: number | null = null;
+      let videoDurationMs: number | null = null;
+      if (videoFileId) {
+        const meta = await fetchDriveMeta(token, videoFileId);
+        if (meta) {
+          videoName = meta.name;
+          videoSize = meta.size;
+          videoDurationMs = meta.durationMs;
+        }
       }
 
       let applied = false;
@@ -815,15 +1231,13 @@ export function GmeetImportDialog({
           ...prev,
           conferenceRecordName: recordName ?? prev.conferenceRecordName,
           videoFileId: videoFileId ?? prev.videoFileId,
-          videoName: found.video?.name ?? prev.videoName,
-          videoSize: found.video?.size ?? prev.videoSize,
-          videoDurationMs: found.video?.durationMs ?? prev.videoDurationMs,
-          videoCount: Math.max(prev.videoCount, found.recording.ready),
+          videoName: videoName ?? prev.videoName,
+          videoSize: videoSize ?? prev.videoSize,
+          videoDurationMs: videoDurationMs ?? prev.videoDurationMs,
           transcriptDocId: transcriptDocId ?? prev.transcriptDocId,
           transcriptSource: transcriptSource ?? prev.transcriptSource,
           videoPending: !(videoFileId ?? prev.videoFileId) && videoPending,
           transcriptPending: !(transcriptDocId ?? prev.transcriptDocId) && transcriptPending,
-          cacheMeta: found.meta ?? prev.cacheMeta,
           enriching: false,
         };
       });
@@ -832,8 +1246,7 @@ export function GmeetImportDialog({
       // as available: a still-preparing Doc is still the recommended path
       // (the import queues and runs when it lands).
       if (applied && !modeTouchedRef.current) {
-        const docKnownBad =
-          (found.meta ?? initial.cacheMeta)?.transcriptParseable === false;
+        const docKnownBad = initial.cacheMeta?.transcriptParseable === false;
         setMode(
           (transcriptDocId || transcriptPending) && !docKnownBad
             ? 'transcript'
@@ -842,11 +1255,10 @@ export function GmeetImportDialog({
               : 'transcript'
         );
       }
-    } catch (err) {
+    } catch {
       setPicked((prev) =>
         prev && prev.event.id === initial.event.id ? { ...prev, enriching: false } : prev
       );
-      setError(err instanceof Error ? err.message : 'Couldn’t check Google');
     }
   };
 
@@ -977,9 +1389,7 @@ export function GmeetImportDialog({
     const results: BulkResult[] = [];
     for (const row of targets) {
       const e = row.event;
-      const title = row.offCalendar
-        ? `${e.summary ?? 'Meet'} — ${fmtDayTime(e.start?.dateTime)}`
-        : (e.summary ?? '(no title)');
+      const title = e.summary ?? '(no title)';
       try {
         const token = await getGoogleAccessToken();
         const res = await fetch('/api/gmeet/import', {
@@ -1148,9 +1558,7 @@ export function GmeetImportDialog({
       };
       setDoneInfo({
         mode,
-        title: picked.offCalendar
-          ? `${e.summary ?? 'Meet'} — ${fmtDayTime(e.start?.dateTime)}`
-          : (e.summary ?? 'Untitled meeting'),
+        title: e.summary ?? 'Untitled meeting',
         autoShared: payload.autoShared ?? 0,
         deferred:
           payload.deferred && !payload.background ? (payload.waitingFor ?? 'both') : undefined,
@@ -1611,12 +2019,14 @@ export function GmeetImportDialog({
                         >
                           <span
                             className={`text-xs text-muted-foreground shrink-0 ${
-                              tab === 'calendar' ? 'w-16' : 'w-24'
+                              tab === 'sync' ? 'w-24' : 'w-16'
                             }`}
                           >
                             {tab === 'calendar'
                               ? fmtEventTime(row.event)
-                              : fmtDayTime(row.event.start?.dateTime)}
+                              : tab === 'sync'
+                                ? fmtDayTime(row.event.start?.dateTime)
+                                : ''}
                           </span>
                           {/* Provider identity — always visually distinct in
                               the same list (spec §10.1). */}

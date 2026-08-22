@@ -11,6 +11,7 @@ import {
 import { noteEmptyTranscriptDoc } from '@/db-ops/empty-transcripts';
 import { autoShareToInternalInvitees } from '@/lib/server/auto-share';
 import { findImportedByMeetingCodes } from '@/db-ops/gmeet-sync';
+import { OCCURRENCE_WINDOW_MS } from '@/lib/meeting-evidence';
 import { registerPeopleFromMeeting } from '@/lib/server/import-helpers';
 import {
   GoogleApiError,
@@ -342,8 +343,7 @@ export async function executeGmeetImport(
         event.startTime &&
         Math.abs(
           new Date(actuals.conferenceStart).getTime() - new Date(event.startTime).getTime()
-        ) >
-          12 * 3600_000
+        ) > OCCURRENCE_WINDOW_MS
       ) {
         console.warn(
           '[gmeet/import] rejecting conferenceRecordName outside the event time window'

@@ -3,7 +3,19 @@ import {
   classifyCalendarAttachments,
   classifyRecordings,
   classifyTranscripts,
+  OCCURRENCE_WINDOW_MS,
 } from '@/lib/meeting-evidence';
+import {
+  getMeetingCacheByKeys,
+  getMeetingCacheByMeetings,
+  type GmeetMeetingCacheRow,
+} from '@/db-ops/gmeet-meeting-cache';
+import {
+  cacheKeyOf,
+  persistMeetingEvidence,
+  probeMeetingEvidence,
+  probeRecordEvidence,
+} from '@/lib/server/meeting-discovery';
 import { sql } from '@/lib/db';
 import { SCHEMAS } from '@/lib/constants/database';
 import { getServerAccessToken } from '@/lib/server/google-oauth';
@@ -15,10 +27,11 @@ import {
   resolveMeetingByJoinUrl,
 } from '@/lib/server/ms-graph';
 import { parseTeamsJoinLink, pickOccurrenceArtifacts } from '@/lib/teams-link';
-import { listConferenceRecordsByCode, listRecordArtifacts } from '@/lib/server/gmeet';
+import { listConferenceRecordsByCode } from '@/lib/server/gmeet';
 import { listKeys, getSeries } from '@/db-ops/series';
 import { listEmptyTranscriptDocIds } from '@/db-ops/empty-transcripts';
 import { recurringBaseId } from '@/lib/series-keys';
+import { importedOccurrenceMatches } from '@/lib/imported-occurrence';
 import type { GmeetAttendee } from '@/lib/format';
 
 /**
@@ -43,7 +56,13 @@ import type { GmeetAttendee } from '@/lib/format';
  *    occurrences from before the caller was invited (verified: calendar saw
  *    5 instances, Graph had 11).
  *
- * Occurrences are ephemeral — computed here, never mirrored into the DB.
+ * Occurrences themselves are ephemeral (computed here, never mirrored), but
+ * every Meet-record inventory the sweep performs IS written back to the
+ * global artifact cache through the discovery service — so a series sweep
+ * feeds the listing and the import dialog, and vice versa: at serve time the
+ * skeleton is re-read against that cache (the poller re-probes −7d every 30
+ * minutes) and recently-ended occurrences are re-probed live, so a meeting
+ * that just finished no longer reads "bare" for six hours (D12).
  */
 
 const SCHEMA = SCHEMAS.MEETING_WHISPERER;
@@ -56,9 +75,19 @@ const SWEEP_DAYS_FORWARD = 45;
  * the refresh button forces past this. Only the expensive skeleton is
  * cached — imported cross-references are recomputed on every request. */
 const SWEEP_TTL_MS = 6 * 3600_000;
+/** Past occurrences younger than this may still be growing artifacts (or
+ * have just ended) — re-probed live at serve time instead of trusting the
+ * cached skeleton (D12). */
+const LIVE_REFRESH_AGE_MS = 48 * 3600_000;
+/** Don't re-probe more often than this per series+user (refresh-spam guard). */
+const LIVE_REFRESH_MIN_GAP_MS = 5 * 60_000;
+/** Cap on live probes per serve — each is 1–3 Meet API calls. */
+const LIVE_REFRESH_MAX = 8;
 
 interface SweepCacheEntry {
   at: number;
+  /** Last live re-probe of recent occurrences (D12). */
+  refreshedAt: number;
   googleConnected: boolean;
   meetChecked: boolean;
   graphChecked: boolean;
@@ -220,6 +249,8 @@ interface ImportedRow {
   title: string | null;
   recorded_at: string | null;
   created_at: string;
+  /** Same COALESCE chain as the shared lookup. */
+  occurrence_start: string | null;
   drive_file_id: string | null;
   event_id: string | null;
   transcript_doc_id: string | null;
@@ -241,6 +272,11 @@ async function loadImportedCandidates(
   return sql<ImportedRow[]>`
     SELECT DISTINCT t.id, t.assemblyai_id, t.title,
            t.recorded_at::text AS recorded_at, t.created_at::text AS created_at,
+           COALESCE(
+             t.gmeet_context->>'startTime',
+             t.gmeet_context->'actuals'->>'conferenceStart',
+             t.recorded_at::text
+           ) AS occurrence_start,
            t.drive_file_id,
            t.gmeet_context->>'eventId' AS event_id,
            t.gmeet_context->>'transcriptDocId' AS transcript_doc_id,
@@ -274,26 +310,31 @@ function matchImported(
   occ: SeriesOccurrence,
   candidates: ImportedRow[]
 ): OccurrenceImportedRef[] {
-  const occStart = Date.parse(occ.startIso);
+  // THE shared rule (lib/imported-occurrence): strong ids exact, meeting
+  // code pinned by the ±12h window.
   return candidates
-    .filter((c) => {
-      if (occ.eventId && c.event_id && c.event_id === occ.eventId) return true;
-      if (occ.videoFileId && (c.drive_file_id === occ.videoFileId || c.video_file_id === occ.videoFileId)) return true;
-      if (occ.transcriptDocId && c.transcript_doc_id === occ.transcriptDocId) return true;
-      if (occ.teams?.callId && c.teams_call_id === occ.teams.callId) return true;
-      // Same meeting code + within half a day = same occurrence (the
-      // /api/gmeet/check ±12h convention; timezone strings vary per user).
-      const when = c.recorded_at ?? c.created_at;
-      if (
-        occ.meetingCode &&
-        c.meeting_code === occ.meetingCode &&
-        when &&
-        Math.abs(Date.parse(when) - occStart) < DAY_MS / 2
-      ) {
-        return true;
-      }
-      return false;
-    })
+    .filter((c) =>
+      importedOccurrenceMatches(
+        {
+          meeting_code: c.meeting_code,
+          join_web_url: null,
+          event_id: c.event_id,
+          video_file_id: c.video_file_id,
+          drive_file_id: c.drive_file_id,
+          transcript_doc_id: c.transcript_doc_id,
+          teams_call_id: c.teams_call_id,
+          occurrence_start: c.occurrence_start ?? c.recorded_at ?? c.created_at,
+        },
+        {
+          meetingCode: occ.meetingCode,
+          eventId: occ.eventId,
+          videoFileId: occ.videoFileId,
+          transcriptDocId: occ.transcriptDocId,
+          teamsCallId: occ.teams?.callId ?? null,
+          startTime: occ.startIso,
+        }
+      )
+    )
     .map((c) => ({
       assemblyai_id: c.assemblyai_id,
       title: c.title,
@@ -320,13 +361,21 @@ export async function sweepSeriesOccurrences(
   if (stale) {
     entry = {
       at: Date.now(),
+      refreshedAt: Date.now(),
       ...(await computeSweepSkeleton(series.title, seriesId, caller)),
     };
     sweepCache.set(cacheKey, entry);
   }
 
-  const candidates = await loadImportedCandidates(seriesId, caller);
   const nowMs = Date.now();
+  // Serve-time evidence refresh: fold the shared artifact cache in ALWAYS
+  // (D8 — the poller's Doc-parse verdict must reach auto-import even on a
+  // fresh skeleton), and live re-probe recently-ended occurrences when
+  // serving a cached skeleton (D12). Mutates the cached entries in place so
+  // the next serve starts from the better answer even before the 6h TTL.
+  await refreshRecentEvidence(entry!, caller, nowMs, { live: !stale });
+
+  const candidates = await loadImportedCandidates(seriesId, caller);
   const occurrences: SeriesOccurrence[] = entry!.occurrences.map((o) => ({
     ...o,
     // recomputed at serve time — a cached "upcoming" may have happened since
@@ -415,6 +464,138 @@ export async function sweepSeriesOccurrences(
     occurrences,
     counts,
   };
+}
+
+/**
+ * Fold a shared-cache row into an occurrence: ready evidence the skeleton
+ * missed (the poller/dialog probed it since), and the Doc-parse verdict —
+ * `transcript_parseable=false` means the Doc holds no speech, so the
+ * occurrence is NOT importable as a transcript (D8: the dialog and the
+ * listing already honoured this; the series sweep, "Import all" and
+ * auto-import used to fire doomed imports at it).
+ */
+function applyCacheRow(occ: SeriesOccurrence, row: GmeetMeetingCacheRow): void {
+  const hasRec = row.ready_recording_count > 0 || !!row.video_file_id;
+  const docIds = row.transcript_doc_ids ?? [];
+  if (hasRec) {
+    occ.hasRecording = true;
+    occ.videoFileId = occ.videoFileId ?? row.video_file_id;
+  }
+  if (docIds.length > 0 && row.transcript_parseable !== false) {
+    const hadDoc = !!occ.transcriptDocId;
+    occ.hasTranscript = true;
+    occ.transcriptDocId = occ.transcriptDocId ?? docIds[0] ?? null;
+    if (!hadDoc && row.transcript_source === 'gemini') occ.geminiNotes = true;
+  }
+  if (
+    row.transcript_parseable === false &&
+    (!occ.transcriptDocId || docIds.includes(occ.transcriptDocId))
+  ) {
+    occ.emptyTranscript = true;
+    occ.hasTranscript = false;
+  }
+  if (row.conference_record && !occ.meet) {
+    occ.meet = {
+      recordName: row.conference_record,
+      videoPending: row.recording_state === 'generating' || row.recording_state === 'partial',
+      transcriptPending: row.transcript_state === 'generating',
+    };
+  }
+}
+
+/**
+ * Serve-time refresh of the cached skeleton (D12): (1) re-read the shared
+ * artifact cache for every Meet occurrence — cheap, and the poller re-probes
+ * the last 7 days every 30 minutes; (2) for past occurrences that ended
+ * within LIVE_REFRESH_AGE_MS and still look incomplete, probe Google live
+ * (through the discovery service, which writes back). Never throws.
+ */
+async function refreshRecentEvidence(
+  entry: SweepCacheEntry,
+  caller: { userId: string; email: string },
+  nowMs: number,
+  opts: { live: boolean }
+): Promise<void> {
+  try {
+    const meetOccs = entry.occurrences.filter((o) => o.meetingCode && !o.teams);
+    if (meetOccs.length === 0) return;
+    const rows = await getMeetingCacheByMeetings(
+      meetOccs.map((o) => ({ code: o.meetingCode!, startTime: o.startIso }))
+    );
+    const rowOf = new Map<SeriesOccurrence, GmeetMeetingCacheRow>();
+    meetOccs.forEach((o, i) => {
+      const row = rows[i];
+      if (row) {
+        rowOf.set(o, row);
+        applyCacheRow(o, row);
+      }
+    });
+
+    if (!opts.live) return;
+    if (nowMs - entry.refreshedAt < LIVE_REFRESH_MIN_GAP_MS) return;
+    const minted = await getServerAccessToken(caller.userId).catch(() => null);
+    if (!minted) return;
+    const targets = meetOccs
+      .filter((o) => {
+        const start = Date.parse(o.startIso);
+        if (start > nowMs) return false; // still upcoming
+        if (nowMs - start > LIVE_REFRESH_AGE_MS) return false;
+        const end = o.endIso ? Date.parse(o.endIso) : start;
+        if (nowMs < end) return false; // in progress — nothing to inventory yet
+        // Could still change: no evidence yet, or a listed-but-pending
+        // artifact. A record already inventoried with nothing pending is
+        // settled — don't re-ask Google every serve for a transcript-only
+        // meeting that simply had recording off.
+        if (o.meet && !o.meet.videoPending && !o.meet.transcriptPending) return false;
+        return (
+          !o.hasRecording ||
+          !o.hasTranscript ||
+          !!o.meet?.videoPending ||
+          !!o.meet?.transcriptPending
+        );
+      })
+      .sort((a, b) => Date.parse(b.startIso) - Date.parse(a.startIso))
+      .slice(0, LIVE_REFRESH_MAX);
+    entry.refreshedAt = nowMs;
+    for (const o of targets) {
+      const probe = await probeMeetingEvidence(minted.token, {
+        userId: caller.userId,
+        meetingCode: o.meetingCode!,
+        eventStart: o.startIso,
+        recordName: o.meet?.recordName ?? null,
+        event: {
+          recurringEventId: o.recurringEventId,
+          iCalUID: o.iCalUID,
+          organizerEmail: o.organizerEmail,
+        },
+        existing: rowOf.get(o) ?? undefined,
+      });
+      const { recording, transcript, verdict } = probe;
+      if (verdict.hasRecording) {
+        o.hasRecording = true;
+        o.videoFileId = o.videoFileId ?? recording.fileIds[0] ?? null;
+      }
+      if (transcript.state === 'ready') {
+        o.hasTranscript = true;
+        o.transcriptDocId = o.transcriptDocId ?? transcript.docIds[0] ?? null;
+      }
+      if (probe.recordName) {
+        o.meet = {
+          recordName: probe.recordName,
+          videoPending: recording.state === 'generating' || recording.state === 'partial',
+          transcriptPending: transcript.state === 'generating',
+        };
+        // Same 24h aging as the listing: a fresh listed-but-generating
+        // artifact still counts as importable (the import defers on it).
+        const fresh = nowMs - Date.parse(o.startIso) < 24 * 3600_000;
+        if (fresh && o.meet.videoPending) o.hasRecording = true;
+        if (fresh && o.meet.transcriptPending) o.hasTranscript = true;
+      }
+      if (probe.row) applyCacheRow(o, probe.row);
+    }
+  } catch (err) {
+    console.warn('[series] evidence refresh failed (serving cached skeleton):', err);
+  }
 }
 
 /** The expensive external enumeration: calendar pages + Graph artifacts. */
@@ -526,29 +707,58 @@ async function computeSweepSkeleton(
       if (records.length === 0) continue;
       meetChecked = true;
       const sameCode = occurrences.filter((o) => o.meetingCode === code && !o.teams);
-      // Artifacts in small parallel batches — two calls per record.
+      // Artifacts in small parallel batches — two calls per record, through
+      // the discovery service so each inventory is classified by the shared
+      // rules AND written back to the global artifact cache (the listing and
+      // the dialog see what this sweep learned).
+      const writeBacks: Array<{
+        key: string;
+        eventStart: string | null;
+        rec: (typeof records)[number];
+        ev: Awaited<ReturnType<typeof probeRecordEvidence>>;
+        target: SeriesOccurrence | null;
+      }> = [];
       for (let i = 0; i < records.length; i += MEET_BATCH) {
         const batch = records.slice(i, i + MEET_BATCH);
         const inventories = await Promise.all(
-          batch.map((r) => listRecordArtifacts(minted.token, r.name))
+          batch.map((r) => probeRecordEvidence(minted.token, r.name))
         );
         batch.forEach((rec, j) => {
-          const inv = inventories[j]!;
+          const ev = inventories[j]!;
           if (!rec.startTime) return;
-          // Shared classifiers + the same 24h aging as the listing's
-          // evidencePresent(): a listed-but-never-generated artifact used to
-          // count "importable" here FOREVER (and series auto-import fired
-          // doomed imports at it) while the listing aged it out.
-          const recEv = classifyRecordings(inv.recordings);
-          const trEv = classifyTranscripts({
-            docIds: inv.transcriptDocIds,
-            listed: inv.transcriptsListed,
-          });
+          // Same 24h aging as the listing's evidencePresent(): a listed-but-
+          // never-generated artifact used to count "importable" here FOREVER
+          // (and series auto-import fired doomed imports at it) while the
+          // listing aged it out.
+          const recEv = ev.recording;
+          const trEv = ev.transcript;
           const fresh = Date.now() - Date.parse(rec.startTime) < 24 * 3600_000;
           const hasRec =
             recEv.ready > 0 || (fresh && recEv.state === 'generating');
           const hasTr =
             trEv.state === 'ready' || (fresh && trEv.state === 'generating');
+          const recStart = Date.parse(rec.startTime);
+          // Nearest calendar instance of the same code within the ONE
+          // occurrence window (codes are reused across the series, so time
+          // is the only disambiguator).
+          let best: SeriesOccurrence | null = null;
+          let bestDelta = OCCURRENCE_WINDOW_MS;
+          for (const o of sameCode) {
+            const delta = Math.abs(Date.parse(o.startIso) - recStart);
+            if (delta < bestDelta) {
+              bestDelta = delta;
+              best = o;
+            }
+          }
+          if (ev.verdict.importable) {
+            writeBacks.push({
+              key: cacheKeyOf(code, best ? best.startIso : rec.startTime),
+              eventStart: best ? best.startIso : rec.startTime,
+              rec,
+              ev,
+              target: best,
+            });
+          }
           if (!hasRec && !hasTr) return;
           const fileId = recEv.fileIds[0] ?? null;
           const docId = trEv.docIds[0] ?? null;
@@ -557,19 +767,6 @@ async function computeSweepSkeleton(
             videoPending: recEv.state === 'generating' || recEv.state === 'partial',
             transcriptPending: trEv.state === 'generating',
           };
-          const recStart = Date.parse(rec.startTime);
-          // Nearest calendar instance of the same code within half a day
-          // (the /api/gmeet/check ±12h convention — codes are reused across
-          // the series, so time is the only disambiguator).
-          let best: SeriesOccurrence | null = null;
-          let bestDelta = DAY_MS / 2;
-          for (const o of sameCode) {
-            const delta = Math.abs(Date.parse(o.startIso) - recStart);
-            if (delta < bestDelta) {
-              bestDelta = delta;
-              best = o;
-            }
-          }
           if (best) {
             best.hasRecording = best.hasRecording || hasRec;
             best.hasTranscript = best.hasTranscript || hasTr;
@@ -611,6 +808,42 @@ async function computeSweepSkeleton(
             imported: [],
           });
         });
+      }
+      // Write back what this sweep learned — best-effort, never blocks the
+      // skeleton. Calendar attachments fold in for matched instances.
+      try {
+        const existing = await getMeetingCacheByKeys(writeBacks.map((w) => w.key));
+        for (const w of writeBacks) {
+          const inst = w.target ? instances.get(w.target.eventId ?? '') : undefined;
+          const att = inst ? classifyCalendarAttachments(inst.attachments) : null;
+          const row = await persistMeetingEvidence(minted.token, {
+            userId: caller.userId,
+            meetingCode: code,
+            eventStart: w.eventStart,
+            recordName: w.rec.name,
+            recording: att ? classifyRecordings(w.ev.artifacts.recordings, att) : w.ev.recording,
+            transcript: att
+              ? classifyTranscripts({
+                  docIds: w.ev.artifacts.transcriptDocIds,
+                  listed: w.ev.artifacts.transcriptsListed,
+                  attachments: att,
+                })
+              : w.ev.transcript,
+            artifacts: w.ev.artifacts,
+            attachments: att,
+            event: w.target
+              ? {
+                  recurringEventId: w.target.recurringEventId,
+                  iCalUID: w.target.iCalUID,
+                  organizerEmail: w.target.organizerEmail,
+                }
+              : null,
+            existing: existing.get(w.key) ?? undefined,
+          });
+          if (row) existing.set(w.key, row);
+        }
+      } catch (err) {
+        console.warn('[series] artifact-cache write-back failed (continuing):', err);
       }
     }
   }

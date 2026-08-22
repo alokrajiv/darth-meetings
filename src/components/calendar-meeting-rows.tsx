@@ -5,7 +5,7 @@ import { TableCell, TableRow } from '@/components/ui/table';
 import { Button } from '@/components/ui/button';
 import { Badge } from '@/components/ui/badge';
 import { formatDuration } from '@/lib/format';
-import { ExternalLink, EyeOff, FileText, Loader2, Repeat, Settings2, Upload, Video, VideoOff } from 'lucide-react';
+import { ExternalLink, EyeOff, FileText, Loader2, Repeat, Search, Settings2, Upload, Video, VideoOff } from 'lucide-react';
 import { MeetLogo, TeamsLogo } from '@/components/provider-icon';
 import { requestMediaUpload } from '@/components/audio-upload';
 
@@ -419,9 +419,66 @@ export function CalendarEventRow({
   onMuteChanged,
   onOpenSeries,
 }: CalendarEventRowProps) {
+  // Unimported rows (artifacts known) and Teams rows import straight away.
+  // A Meet row in the "No recording" layer has NO known artifacts — the old
+  // Import… button opened the dialog only for it to answer "never started"
+  // (D10). Now the button is "Check…": one live probe through the discovery
+  // service (which writes back to the cache); if Google does hold something
+  // the import dialog opens on it, otherwise the row says so inline.
   const canImport =
-    !!r.meetingCode && (layer === 'unimported' || r.hasMeet) && !!onImportMeeting;
-  const canUpload = !canImport && layer === 'norec' && !!r.eventId;
+    !!r.meetingCode &&
+    !!onImportMeeting &&
+    (layer === 'unimported' || (r.hasMeet && r.provider === 'teams'));
+  const canCheck =
+    !canImport &&
+    layer === 'norec' &&
+    r.hasMeet &&
+    r.provider === 'gmeet' &&
+    !!r.meetingCode &&
+    !!onImportMeeting;
+  const canUpload = !canImport && !canCheck && layer === 'norec' && !!r.eventId;
+  const [checking, setChecking] = useState(false);
+  const [checkNote, setCheckNote] = useState<string | null>(null);
+  const checkEvidence = async () => {
+    if (!r.meetingCode) return;
+    setChecking(true);
+    setCheckNote(null);
+    try {
+      const res = await fetch('/api/meet/evidence', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          meetingCode: r.meetingCode,
+          startTime: r.eventStart,
+          event: { id: r.eventId, recurringEventId: r.recurringEventId },
+        }),
+      });
+      if (res.status === 404) {
+        setCheckNote('Connect Google first');
+        return;
+      }
+      const j = (await res.json().catch(() => ({}))) as {
+        verdict?: { importable?: boolean; pending?: boolean };
+        checkFailed?: boolean;
+        error?: string;
+      };
+      if (!res.ok) throw new Error(j.error || `Check failed (${res.status})`);
+      if (j.verdict?.importable) {
+        // The probe wrote the evidence back — the row migrates to "Not
+        // imported" on refetch; open the dialog on it meanwhile.
+        onMuteChanged?.();
+        onImportMeeting?.({ meetingCode: r.meetingCode, eventStart: r.eventStart });
+      } else if (j.checkFailed) {
+        setCheckNote('Google didn’t answer — try again');
+      } else {
+        setCheckNote('Nothing at Google — never recorded');
+      }
+    } catch (err) {
+      setCheckNote(err instanceof Error ? err.message : 'Check failed');
+    } finally {
+      setChecking(false);
+    }
+  };
 
   const middleCell = (key: string) => {
     switch (key) {
@@ -596,6 +653,33 @@ export function CalendarEventRow({
             >
               Import…
             </Button>
+          )}
+          {canCheck && (
+            <>
+              {checkNote && (
+                <span className="max-w-[18ch] truncate text-[11px] text-muted-foreground" title={checkNote}>
+                  {checkNote}
+                </span>
+              )}
+              <Button
+                size="sm"
+                variant="outline"
+                className="h-7 px-2.5 text-xs"
+                disabled={checking}
+                title="Ask Google whether this meeting left a recording or transcript (the calendar hasn't shown any yet)"
+                onClick={(e) => {
+                  e.stopPropagation();
+                  void checkEvidence();
+                }}
+              >
+                {checking ? (
+                  <Loader2 className="mr-1 h-3 w-3 animate-spin" />
+                ) : (
+                  <Search className="mr-1 h-3 w-3" />
+                )}
+                Check…
+              </Button>
+            </>
           )}
           {canUpload && (
             <Button

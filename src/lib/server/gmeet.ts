@@ -1,5 +1,6 @@
 import 'server-only';
 import { saveAudioStreamToTemp } from '@/lib/server/audio-storage';
+import { RECORD_LOOKUP_AFTER_MS, RECORD_LOOKUP_BEFORE_MS } from '@/lib/meeting-evidence';
 import type {
   MeetActuals,
   MeetParticipantInfo,
@@ -375,25 +376,66 @@ async function tryJson<T>(token: string, url: string): Promise<T | null> {
   }
 }
 
-/** Find the conference record for a meeting code, nearest to `aroundIso`
- * (codes are reused across a recurring series). */
-export async function findConferenceRecordName(
+export interface ConferenceRecordLite {
+  name: string;
+  startTime?: string;
+  endTime?: string;
+  /** `spaces/{id}` — resolve to the human meeting code via getSpaceMeetingCode. */
+  space?: string;
+}
+
+/**
+ * List conference records matching a Meet API filter expression, paged.
+ * Returns `null` when ANY page failed (403/quota/network) — callers that
+ * turn "no records" into a verdict ("never started", "nothing to import")
+ * MUST treat null as "could not check", never as empty (D5); a partial list
+ * would silently read as "those other meetings never happened".
+ */
+export async function listConferenceRecords(
   token: string,
-  meetingCode: string,
-  aroundIso?: string
-): Promise<string | null> {
+  filter: string,
+  maxPages = 4
+): Promise<ConferenceRecordLite[] | null> {
+  const out: ConferenceRecordLite[] = [];
+  let pageToken: string | undefined;
+  for (let p = 0; p < maxPages; p++) {
+    const url =
+      `${MEET_API}/conferenceRecords?filter=${encodeURIComponent(filter)}&pageSize=50` +
+      (pageToken ? `&pageToken=${encodeURIComponent(pageToken)}` : '');
+    const j = await tryJson<{
+      conferenceRecords?: ConferenceRecordLite[];
+      nextPageToken?: string;
+    }>(token, url);
+    if (!j) return null;
+    for (const r of j.conferenceRecords ?? []) {
+      out.push({ name: r.name, startTime: r.startTime, endTime: r.endTime, space: r.space });
+    }
+    pageToken = j.nextPageToken;
+    if (!pageToken) break;
+  }
+  return out;
+}
+
+/** Meet API filter for one meeting code's records around an occurrence —
+ * the ONE record-lookup window (lib/meeting-evidence, D6). */
+export function recordFilterForOccurrence(meetingCode: string, aroundIso?: string | null): string {
   let filter = `space.meeting_code = "${meetingCode}"`;
   if (aroundIso) {
     const t = new Date(aroundIso).getTime();
-    filter += ` AND start_time >= "${new Date(t - 6 * 3600_000).toISOString()}"`;
-    filter += ` AND start_time <= "${new Date(t + 12 * 3600_000).toISOString()}"`;
+    filter += ` AND start_time >= "${new Date(t - RECORD_LOOKUP_BEFORE_MS).toISOString()}"`;
+    filter += ` AND start_time <= "${new Date(t + RECORD_LOOKUP_AFTER_MS).toISOString()}"`;
   }
-  const list = await tryJson<{
-    conferenceRecords?: Array<{ name: string; startTime?: string }>;
-  }>(token, `${MEET_API}/conferenceRecords?filter=${encodeURIComponent(filter)}`);
-  const records = list?.conferenceRecords ?? [];
+  return filter;
+}
+
+/** Of several records, the one whose start is nearest `aroundIso`. The API
+ * returns NEWEST-first — never take [0] for a reused standing link. */
+export function nearestRecord<T extends { startTime?: string }>(
+  records: readonly T[],
+  aroundIso?: string | null
+): T | null {
   if (records.length === 0) return null;
-  if (!aroundIso) return records[0]!.name;
+  if (!aroundIso) return records[0]!;
   const target = new Date(aroundIso).getTime();
   let best = records[0]!;
   let bestDelta = Infinity;
@@ -404,13 +446,31 @@ export async function findConferenceRecordName(
       best = r;
     }
   }
-  return best.name;
+  return best;
 }
 
-export interface ConferenceRecordLite {
-  name: string;
-  startTime?: string;
-  endTime?: string;
+/** Find the conference record for a meeting code, nearest to `aroundIso`
+ * (codes are reused across a recurring series). */
+export async function findConferenceRecordName(
+  token: string,
+  meetingCode: string,
+  aroundIso?: string
+): Promise<string | null> {
+  const records = await listConferenceRecords(
+    token,
+    recordFilterForOccurrence(meetingCode, aroundIso),
+    1
+  );
+  return nearestRecord(records ?? [], aroundIso)?.name ?? null;
+}
+
+/** `spaces/{id}` → human meeting code (abc-defg-hij). Null on any miss. */
+export async function getSpaceMeetingCode(
+  token: string,
+  spaceResource: string
+): Promise<string | null> {
+  const j = await tryJson<{ meetingCode?: string }>(token, `${MEET_API}/${spaceResource}`);
+  return j?.meetingCode ?? null;
 }
 
 /**
@@ -424,25 +484,7 @@ export async function listConferenceRecordsByCode(
   meetingCode: string,
   maxPages = 4
 ): Promise<ConferenceRecordLite[]> {
-  const filter = `space.meeting_code = "${meetingCode}"`;
-  const out: ConferenceRecordLite[] = [];
-  let pageToken: string | undefined;
-  for (let p = 0; p < maxPages; p++) {
-    const url =
-      `${MEET_API}/conferenceRecords?filter=${encodeURIComponent(filter)}&pageSize=50` +
-      (pageToken ? `&pageToken=${encodeURIComponent(pageToken)}` : '');
-    const j = await tryJson<{
-      conferenceRecords?: ConferenceRecordLite[];
-      nextPageToken?: string;
-    }>(token, url);
-    if (!j) break;
-    for (const r of j.conferenceRecords ?? []) {
-      out.push({ name: r.name, startTime: r.startTime, endTime: r.endTime });
-    }
-    pageToken = j.nextPageToken;
-    if (!pageToken) break;
-  }
-  return out;
+  return (await listConferenceRecords(token, `space.meeting_code = "${meetingCode}"`, maxPages)) ?? [];
 }
 
 /**

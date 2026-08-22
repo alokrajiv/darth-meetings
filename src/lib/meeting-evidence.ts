@@ -23,6 +23,25 @@
 export const OCCURRENCE_WINDOW_MS = 12 * 3600_000;
 export const OCCURRENCE_WINDOW_S = OCCURRENCE_WINDOW_MS / 1000;
 
+/** Meet conferenceRecord lookup window around a calendar occurrence's start:
+ * a call can start a bit early and run long. ONE declaration (D6) — the
+ * import core, the poller, the dialog's evidence route and the series sweep
+ * all resolve "which record is this occurrence" with the same bounds. */
+export const RECORD_LOOKUP_BEFORE_MS = 6 * 3600_000;
+export const RECORD_LOOKUP_AFTER_MS = 12 * 3600_000;
+
+/** Is `recordStartIso` the occurrence that started at `eventStartIso`? */
+export function recordMatchesOccurrence(
+  recordStartIso: string | null | undefined,
+  eventStartIso: string | null | undefined
+): boolean {
+  if (!recordStartIso || !eventStartIso) return false;
+  const r = Date.parse(recordStartIso);
+  const e = Date.parse(eventStartIso);
+  if (Number.isNaN(r) || Number.isNaN(e)) return false;
+  return r >= e - RECORD_LOOKUP_BEFORE_MS && r <= e + RECORD_LOOKUP_AFTER_MS;
+}
+
 // ---------------------------------------------------------------------------
 // Calendar attachments (Meet's post-call uploads: recording videos, the
 // "<title> - Transcript" Doc, the "Notes by Gemini" Doc)

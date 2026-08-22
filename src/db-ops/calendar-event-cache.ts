@@ -2,6 +2,7 @@ import 'server-only';
 import { sql } from '@/lib/db';
 import { SCHEMAS } from '@/lib/constants/database';
 import { OCCURRENCE_WINDOW_S } from '@/lib/meeting-evidence';
+import { importedOccurrenceAntiJoin } from '@/db-ops/imported-occurrences';
 
 // Per-user calendar event cache (migration 022) + the paged queries behind
 // GET /api/calendar-meetings. The poller batch-upserts EVERY timed event
@@ -99,6 +100,57 @@ export async function upsertCalendarEvents(
       attachment_gemini_notes = (EXCLUDED.attachment_gemini_notes OR calendar_event_cache.attachment_gemini_notes),
       last_seen_at       = now()
   `;
+}
+
+/**
+ * The caller's own cached calendar row for a Meet occurrence → its classified
+ * attachments (the poller persists them per event, migration 026). Lets a
+ * probe that arrives without the live event (listing "Check…", API callers)
+ * fold the Gemini-notes Doc / attached video in exactly like the poller does.
+ */
+export async function getCalendarAttachmentsFor(
+  userId: string,
+  q: { eventId?: string | null; meetingCode: string; startTime?: string | null }
+): Promise<{
+  videoFileId: string | null;
+  videoCount: number;
+  transcriptDocId: string | null;
+  geminiNotes: boolean;
+} | null> {
+  const rows = await sql<
+    Array<{
+      attachment_video_file_id: string | null;
+      attachment_video_count: number;
+      attachment_transcript_doc_id: string | null;
+      attachment_gemini_notes: boolean;
+    }>
+  >`
+    SELECT attachment_video_file_id, attachment_video_count,
+           attachment_transcript_doc_id, attachment_gemini_notes
+    FROM ${sql(SCHEMA)}.calendar_event_cache
+    WHERE user_id = ${userId}
+      AND (
+        ${q.eventId ? sql`event_id = ${q.eventId}` : sql`false`}
+        OR (
+          meeting_code = ${q.meetingCode}
+          AND ${
+            q.startTime
+              ? sql`abs(extract(epoch FROM (event_start - ${q.startTime}::timestamptz))) <= ${OCCURRENCE_WINDOW_S}`
+              : sql`false`
+          }
+        )
+      )
+    ORDER BY (attachment_transcript_doc_id IS NOT NULL OR attachment_video_file_id IS NOT NULL) DESC
+    LIMIT 1
+  `;
+  const r = rows[0];
+  if (!r) return null;
+  return {
+    videoFileId: r.attachment_video_file_id,
+    videoCount: r.attachment_video_count,
+    transcriptDocId: r.attachment_transcript_doc_id,
+    geminiNotes: r.attachment_gemini_notes,
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -236,16 +288,6 @@ export interface CalendarPageOpts extends CalendarRangeOpts {
 
 type Caller = { userId: string; email: string };
 
-/** Occurrence timestamp of a stored import — same COALESCE chain as
- * findImportedByMeetingCodes (gmeet-sync.ts). */
-const IMPORT_OCCURRENCE = sql`
-  COALESCE(
-    t.gmeet_context->>'startTime',
-    t.gmeet_context->'actuals'->>'conferenceStart',
-    t.recorded_at::text
-  )::timestamptz
-`;
-
 function dayFilters(
   dayExpr: ReturnType<typeof sql>,
   opts: CalendarRangeOpts
@@ -298,37 +340,27 @@ function unimportedMuteExclusion(userId: string): ReturnType<typeof sql> {
 }
 
 function unimportedWhere(userId: string, opts: CalendarRangeOpts): ReturnType<typeof sql> {
+  // THE already-imported rule (db-ops/imported-occurrences): meeting code /
+  // Teams join URL pinned by the ±12h window, plus calendar eventIds —
+  // uploads and pasted transcripts link by eventId, not meeting code (D9) —
+  // resolved through the caller's own calendar rows for the occurrence.
   return sql`
     WHERE COALESCE(c.event_start, c.conf_start) IS NOT NULL
       AND ${evidencePresent('c')}
-      AND NOT EXISTS (
-        SELECT 1 FROM ${sql(SCHEMA)}.transcripts t
-        WHERE t.deleted_at IS NULL
-          AND (
-            t.gmeet_context->>'meetingCode' = c.meeting_code
-            OR (
-              c.raw->'teamsResolution'->>'joinWebUrl' IS NOT NULL
-              AND t.gmeet_context->'teams'->>'joinWebUrl' = c.raw->'teamsResolution'->>'joinWebUrl'
-            )
-          )
-          AND abs(extract(epoch FROM (
-                ${IMPORT_OCCURRENCE} - COALESCE(c.event_start, c.conf_start)
-              ))) <= ${OCCURRENCE_WINDOW_S}
-      )
-      -- Uploads / pasted transcripts link by calendar eventId, not meeting
-      -- code (D9) — resolve through the caller's own calendar row for the
-      -- occurrence, mirroring norecWhere's eventId anti-join.
-      AND NOT EXISTS (
-        SELECT 1
-        FROM ${sql(SCHEMA)}.calendar_event_cache ce
-        JOIN ${sql(SCHEMA)}.transcripts t ON t.gmeet_context->>'eventId' = ce.event_id
-        WHERE ce.user_id = ${userId}
-          AND ce.meeting_code = c.meeting_code
-          AND abs(extract(epoch FROM (
-                ce.event_start - COALESCE(c.event_start, c.conf_start)
-              ))) <= ${OCCURRENCE_WINDOW_S}
-          AND t.deleted_at IS NULL
-      )
+      AND ${importedOccurrenceAntiJoin({
+        meetingCode: sql`c.meeting_code`,
+        joinWebUrl: sql`c.raw->'teamsResolution'->>'joinWebUrl'`,
+        eventIdIn: sql`(
+          SELECT ce.event_id
+          FROM ${sql(SCHEMA)}.calendar_event_cache ce
+          WHERE ce.user_id = ${userId}
+            AND ce.meeting_code = c.meeting_code
+            AND abs(extract(epoch FROM (
+                  ce.event_start - COALESCE(c.event_start, c.conf_start)
+                ))) <= ${OCCURRENCE_WINDOW_S}
+        )`,
+        instant: sql`COALESCE(c.event_start, c.conf_start)`,
+      })}
       ${unimportedMuteExclusion(userId)}
       ${dayFilters(unimportedDay(opts.tz), opts)}
   `;
@@ -353,21 +385,14 @@ function norecWhere(userId: string, opts: CalendarRangeOpts): ReturnType<typeof 
                 COALESCE(g.event_start, g.conf_start) - c.event_start
               ))) <= ${OCCURRENCE_WINDOW_S}
       ))
-      AND (c.meeting_code IS NULL OR NOT EXISTS (
-        SELECT 1 FROM ${sql(SCHEMA)}.transcripts t
-        WHERE t.deleted_at IS NULL
-          AND t.gmeet_context->>'meetingCode' = c.meeting_code
-          AND abs(extract(epoch FROM (${IMPORT_OCCURRENCE} - c.event_start))) <= ${OCCURRENCE_WINDOW_S}
-      ))
-      -- No-Meet events can still get imports: uploads and pasted transcripts
-      -- link by calendar eventId (an occurrence-specific instance id, so no
-      -- time window is needed). Without this check a linked import leaves the
-      -- event stranded in "No recording".
-      AND NOT EXISTS (
-        SELECT 1 FROM ${sql(SCHEMA)}.transcripts t
-        WHERE t.deleted_at IS NULL
-          AND t.gmeet_context->>'eventId' = c.event_id
-      )
+      -- THE already-imported rule: meeting code ±12h, plus calendar eventId
+      -- (uploads / pasted transcripts link by eventId — without it a linked
+      -- import leaves the event stranded in "No recording").
+      AND ${importedOccurrenceAntiJoin({
+        meetingCode: sql`c.meeting_code`,
+        eventIdIn: sql`(SELECT c.event_id)`,
+        instant: sql`c.event_start`,
+      })}
       AND NOT EXISTS (
         SELECT 1 FROM ${sql(SCHEMA)}.calendar_event_mutes m
         WHERE m.user_id = ${userId}
@@ -429,7 +454,12 @@ async function unimportedRows(
       (c.ready_recording_count > 0 OR c.video_file_id IS NOT NULL) AS has_recording,
       (COALESCE(jsonb_array_length(c.transcript_doc_ids), 0) > 0
         OR c.transcript_parseable IS TRUE) AS has_transcript,
-      c.recording_count,
+      -- "Recording ×N" = files you can actually pull, never the listed count
+      -- (a stop/restart meeting lists 3 entries with 1 file for a while).
+      GREATEST(
+        c.ready_recording_count,
+        CASE WHEN c.video_file_id IS NOT NULL THEN 1 ELSE 0 END
+      ) AS recording_count,
       c.transcript_parseable,
       (c.recording_state = 'generating'
         AND COALESCE(c.event_start, c.conf_start) > now() - interval '24 hours')

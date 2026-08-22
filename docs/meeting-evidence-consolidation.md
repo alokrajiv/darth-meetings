@@ -2,12 +2,15 @@
 
 Analysis date: 2026-08-22 (HEAD 4a50246). Prod numbers queried the same day.
 
-> **STATUS 2026-08-22 EOD — largely SHIPPED** (commits c9ba3ae, 7fe05dd, b595cb5;
-> migration 026 applied + Teams backfill repaired on prod; deployed + E2E'd).
-> Fixed: D1, D2, D3, D4, D5, D7, D9, D11 + series 24h aging. Still open:
-> D6, D8 (series x transcript_parseable), D10, D12, Recording xN listed-count
-> chip, and Phase 2/3 (single discovery service, single already-imported
-> lookup). 401 self-heal from the addendum also shipped (c9ba3ae).
+> **STATUS 2026-08-22 (late) — ALL PHASES SHIPPED.** Phase 0+1: c9ba3ae,
+> 7fe05dd, b595cb5 (migration 026 + Teams backfill repair). Phase 2+3 +
+> D6/D8/D10/D12 + the Recording ×N chip: the commit after a736c24 (see
+> "As built" at the end of this doc). D1–D12 all closed. Deployed + prod
+> E2E'd (discover / records / evidence routes, series, listing, DB
+> write-back). The pre-Phase-2 browser dialog is kept for ONE deploy as
+> `gmeet-import-dialog-legacy.tsx` behind `NEXT_PUBLIC_MEET_DIALOG_LEGACY=1`
+> / `localStorage mw:legacyMeetDialog=1` / `?meetLegacy=1` — delete it (and
+> `useLegacyMeetDialog` in page.tsx) next deploy.
 
 ## Trigger
 
@@ -183,3 +186,50 @@ Agreed design (on hold, ~1h incl. Playwright proof with an expired JWT):
 
 Sequencing note: ship this **before / independent of** Phase 2 — the fetch-wrapper is also the
 natural seed of a central `apiFetch()` that Phase 2's new dialog routes should use.
+
+
+## As built — Phase 2 + 3 (2026-08-22)
+
+### Phase 2: `src/lib/server/meeting-discovery.ts` — THE discovery service
+| function | does | writes back |
+|---|---|---|
+| `listCalendarEvents` / `syncCalendarWindow(userId, token, {from,to})` | Calendar API (one `CAL_FIELDS` mask for everyone; `CalendarListError` on a refused first page) | `calendar_event_cache` via `persistCalendarEvents` |
+| `probeRecordEvidence(token, recordName, attachments?)` | one record's inventory, classified by `lib/meeting-evidence` | — |
+| `persistMeetingEvidence(token, …)` | the poller's old `captureMeetingMeta`, now the single writer: gap-fill (conf times, Drive size/duration, Doc parse) fetched at most once ever; **reuses the existing row within ±12h** (poller's raw-calendar-string key vs a probe's record-ISO start → no second "Not imported" row) | `gmeet_meeting_cache` |
+| `probeMeetingEvidence(token, {meetingCode, eventStart, recordName?, attachments?, existing?})` | record lookup (the ONE `RECORD_LOOKUP_BEFORE/AFTER_MS` window, D6) → inventory → folds calendar attachments **and the cached row's known evidence** → verdict; a failed lookup is `checkFailed`, never "never started" (D5) | always, via `persistMeetingEvidence` |
+| `discoverWindow(userId, token, {from,to,meetOnly?})` | the dialog's day/sync view: calendar rows + Meet records in the window (space→code, probe each, join by code + lookup window, nearest start), off-calendar extras; attachment-only past Meet events count too | calendar rows synchronously; artifact rows **detached** (after the response) |
+| `listMeetRecordRows(token, {fromIso}|{code})` | "Recent 30d" / pasted code — records with their meeting codes, `meet.checked=false` (resolved on pick) | — |
+
+Routes (caller's own **server-minted** token; 404 `{connected:false}` when Google isn't
+connected; darth-cli bearers allowed — the token never leaves the server):
+`GET /api/calendar/discover?from&to[&meetOnly=1]`, `GET /api/meet/records?days=30|code=`,
+`POST /api/meet/evidence {meetingCode,startTime?,recordName?,attachments?,event?}` (also
+reads the caller's cached calendar attachments when none are sent, and returns Drive meta +
+the cache row's counts). Wire types: `src/lib/meeting-discovery-types.ts`.
+
+Callers moved onto it: the poller (`sweepUser` → `syncCalendarWindow` + `probeMeetingEvidence`;
+a refused calendar listing now marks the account `error` and does NOT stamp `last_poll_at`),
+the dialog (`gmeet-import-dialog.tsx` is ~2,150 lines of pure UI; `recordArtifacts`,
+`listMeetRecords`, `fetchMeetingCode`, `fetchDriveMeta`, `sweepDay`, the browser `enrich`
+are gone), the series sweep (Meet-side inventories go through `probeRecordEvidence` and are
+persisted; at serve time the skeleton is re-read against the shared cache — D8: a
+`transcript_parseable=false` Doc is `emptyTranscript`, so "Import all"/auto-import skip it —
+and recently-ended occurrences (<48h, still incomplete) are re-probed live, ≤8 per serve, ≥5 min
+apart — D12), and the listing (`Check…` on a No-recording Meet row = one probe; importable →
+opens the dialog on it, else says "Nothing at Google" inline — D10; "Recording ×N" = ready
+files, not listed entries).
+
+### Phase 3: one "already imported?" rule
+`src/lib/imported-occurrence.ts` (`importedOccurrenceMatches`, pure, tested) +
+`src/db-ops/imported-occurrences.ts` (`findImportedOccurrences` — one SQL with only the key
+arms present so the per-key indexes stay usable; `importedOccurrenceAntiJoin` — the SQL twin
+used by both listing views). `findImportedByMeetingCodes`, `findImportedByTeamsMeetings`,
+`findImportedByTeamsCallId` are thin adapters; `series-occurrences.matchImported` uses the pure
+matcher. Verified row-equivalent against prod data (all callers, both views) before deploy.
+
+### Known quirks (documented, not bugs)
+- An event carrying BOTH a Meet link and a Teams link: the dialog rows treat it as Teams
+  (explicit link wins — legacy behaviour); the calendar cache keys it as Meet (poller, unchanged).
+- `calendar_event_cache` / `gmeet_meeting_cache` still hold tz-duplicate keys for the same
+  instant from different users' calendars (`+08:00` vs `+05:30`); the listing dedupes by
+  instant and new probes reuse the first row within ±12h.

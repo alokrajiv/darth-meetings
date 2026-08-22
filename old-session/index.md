@@ -252,3 +252,56 @@ UI as a whole ("ok for now").**
    banner explains; fix if it confuses after merges are done.
 4. Remaining working-tree changes (generate-dialog, stitch uploads, etc.) are
    deployed but UNCOMMITTED — commit them separately.
+
+## 6. Evidence consolidation, 401 self-heal & sync chip — 2026-08-22
+
+**File:** [6. evidence-consolidation-401-self-heal-and-sync-chip.txt](6.%20evidence-consolidation-401-self-heal-and-sync-chip.txt)
+
+Started from Alok's screenshot pair (listing vs import dialog disagreeing on
+21 Aug meetings — "APP Thru" missing, Data scrum "No recording" while the
+dialog showed recording+transcript) and the question "is the entire codebase
+disorganised?". Two explorer agents produced a full inventory: meeting
+discovery/evidence is FOUR parallel stacks (poller, listing SQL, browser
+dialog, series sweep) with ~15 inline predicates and 12 concrete
+disagreements (D1–D12), catalogued in `docs/meeting-evidence-consolidation.md`.
+Then shipped, in order:
+
+- **c9ba3ae — 401 self-heal** (folded in from the same-day token session):
+  `lib/auth-refresh.ts` fetch guard (single-flight kenoby refresh + replay)
+  + `proxy.ts` JWT-exp pre-check for document navs (returnTo from
+  `x-forwarded-host`, NOT request.url = localhost behind nginx). Proven in a
+  real browser: expired JWT → refresh → back on page, zero 401s. Global
+  cookbook written: `~/.claude/playbooks/trames-sso-401-self-heal.md`.
+- **7fe05dd — sync visibility**: "Cal synced Nm ago · Sync" chip from
+  `last_poll_at`; `POST /api/calendar/sync` runs a real caller sweep (E2E
+  21.5s); misleading "Meet not synced" header nudge (manual checkpoint,
+  4 users ever) removed.
+- **b595cb5 — evidence consolidation Phase 1**: `lib/meeting-evidence.ts` is
+  THE classifier (attachments/recordings/transcripts/verdict + the single
+  ±12h window); migration 026 evidence states on both caches; poller counts
+  Gemini-notes Docs + attached videos as evidence (D1), generating artifacts
+  get state rows (D2); one `evidencePresent()` predicate, WHERE==SELECT (D3),
+  file-less recordings stop badging (D4, 20/138 prod rows), checkFailed ≠
+  "nothing to import" (D5), shared attachment regexes (D7), eventId anti-join
+  (D9), server-consistent pending (D11), series 24h aging.
+
+10-agent adversarial workflow caught 3 real bugs pre-release (Teams backfill
+zeroed → repaired live on prod; dialog ignored meta.videoFileId;
+attachment video outside the classifier) — all fixed. E2E: darth-cli bearer
+for the API (human SSO jar was dead mid-session; Alok refreshed it later),
+forged-JWT curls, Playwright with real refresh token; final screenshot shows
+Not imported 63→79 (Gemini meetings now counted), Gemini-notes badges, amber
+unparseable warnings.
+
+**Next session pickup points:**
+1. **Phase 2**: one server-side discovery service (calendar window sync +
+   evidence probe, ALWAYS writes back to caches); thin gmeet-import-dialog's
+   ~600 lines of browser Google calls into server routes (old path behind a
+   flag for one deploy). Then **Phase 3**: single already-imported lookup.
+2. Deferred disagreements: D6 (record-lookup windows), D8 (series ×
+   transcript_parseable — `empty_transcript_docs` covers part), D10 (norec
+   canImport → doomed click), D12 (6h series skeleton staleness), and the
+   "Recording ×N" chip showing listed-count not ready-count.
+3. Everything is committed (c9ba3ae, 7fe05dd, b595cb5, a736c24) and deployed;
+   migration 026 + Teams repair applied on prod. No loose ends in the tree.
+4. Full plan + status banner: `docs/meeting-evidence-consolidation.md`.

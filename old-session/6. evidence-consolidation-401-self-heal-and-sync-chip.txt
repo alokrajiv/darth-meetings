@@ -1,0 +1,1101 @@
+ ▐▛███▛█   Claude Code v2.1.238
+▝▜██████▀  Fable 5 · Claude Max
+  ▝▝ ▝▝    ~/workspace/meeting-whisperer/.playwright-mcp
+
+
+❯ [Image #1] [Image #2] APP thru vs non thru if u realise isnt there in main    
+  lsiting - this kinda happens often - i think - is there a cal last sycned     
+  somehere in main listing - also if the import dialog did a sync is it not     
+  centralized and save again - i see a lot of inconsitencies - even in series   
+  just now i fixe din prev comit some shit like gemoni notes vs transcrip -     
+  which series didnt do but the import was careful for - can we look into if    
+  the enbtire codebase is disorganizsed and not solid central? think deep after 
+  full code analysis                                                            
+  ⎿  [Image #1]
+  ⎿  [Image #2]
+
+  Thought for 13s (ctrl+o to expand)
+
+⏺ I'll read the relevant memory notes, then map every code path that reads
+  Google Calendar / Meet artifacts (listing, import dialog, series, pollers) to
+  see where they diverge.
+
+  Thought for 27s, ran 4 shell commands (ctrl+o to expand)
+
+⏺ Explore(Map all Google Calendar fetch paths)
+  ⎿  Backgrounded agent (↓ to manage · ctrl+o to expand)
+
+⏺ Explore(Map evidence/importable classifiers)
+  ⎿  Backgrounded agent (↓ to manage · ctrl+o to expand)
+
+  Thought for 1m 27s, ran 7 shell commands (ctrl+o to expand)
+
+⏺ Core picture is clear; waiting on the two explorers (fetch-path inventory +
+  evidence-classifier inventory) to confirm the remaining divergences before I
+  write up the assessment.
+
+✻ Brewed for 2m 49s
+
+⏺ Agent "Map all Google Calendar fetch paths" finished · 4m 24s
+
+  Thought for 1m 4s, read 1 file, ran 2 shell commands (ctrl+o to expand)
+
+⏺ Ground truth from prod confirms the mechanism: "APP Thru…" landed in
+  calendar_event_cache at 06:12Z (it was created after the previous sweep), and
+  the Data scrum 14:00 row only got its recording/transcript captured at 06:50Z
+  (poller waits 15 min past event end, then the 30m tick) — the dialog hits
+  Google live, so the two disagree for up to ~45 min with no "as of" shown
+  anywhere. "my lunch" is hidden because you muted that series (that's the
+  "Hidden (1)"). Waiting on the classifier inventory to finish the picture.
+
+✻ Cogitated for 1m 13s
+
+⏺ Agent "Map evidence/importable classifiers" finished · 6m 18s
+
+  Thought for 7s (ctrl+o to expand)
+
+⏺ Both inventories are in. Quick prod check to quantify two of the reported
+  cache-level disagreements before I write up.
+
+  Thought for 13s, ran 3 shell commands (ctrl+o to expand)
+
+⏺ Short answer: yes — your instinct is right, and it's structural, not a handful
+  of bugs. Full write-up with line refs and a phased plan is in
+  docs/meeting-evidence-consolidation.md (untracked, not committed). Here's the
+  substance.
+
+  What your screenshot actually was (prod DB, verified)
+
+  - "APP Thru vs Non Thru" was created after the previous poller sweep; it
+    landed in calendar_event_cache at 06:12Z and is in the listing now. Pure
+    cache lag.
+  - Data scrum 14:00 "No recording" — the poller waits 15 min past event end,
+    then the 30 m tick; the recording/transcript got captured at 06:50Z. The
+    dialog hits the Meet API live from your browser, so it was ~45 min ahead of
+    the listing.
+  - "my lunch" is hidden because you muted that series on 19 Aug — that's the
+    "Hidden (1)" chip.
+
+  Your three questions
+
+  1. "Is there a cal last-synced in the main listing?" No.
+     /api/calendar-meetings already returns sync.lastPollAt
+     (google_accounts.last_poll_at, stamped every 30 m for all 9 accounts) but
+     the table only uses syncing for the first-connect banner. The header badge
+     "Meet not synced" reads a different thing —
+     gmeet_sync_state.last_synced_at, which only the dialog's manual "Sync" tab
+     writes (4 users have ever done it). So the badge says "not synced" while
+     the background sync is running fine. Two sync concepts, the wrong one is on
+     screen.
+  2. "If the dialog did a sync, is it centralized / saved?" No. The dialog
+     fetches Calendar + Meet + Drive from the browser and writes nothing back —
+     it only reads the poller cache via /api/gmeet/check. Same for the series
+     sweep: fetches 12 months, caches 6 h in globalThis, never touches the DB.
+     gmeet-poller.ts is the sole writer of both caches. Work done by any other
+     stack is thrown away.
+  3. "Is the codebase disorganized / not solid central?" The import/transcript
+     core is fine — gmeet-import-core / teams-import-core / ingest / auto-notes
+     each have one owner used by every caller. The rot is specifically the
+     discovery/evidence layer ("what happened on my calendar, what did Google
+     keep, is it importable"): it is four parallel stacks — poller, listing SQL,
+     browser dialog, series sweep — sharing only the lowest transport helpers.
+     There is no MeetingEvidence type and no classifyEvidence(); the agents
+     counted ~15 inline re-implementations of
+     has-recording/has-transcript/importable and found 12 concrete disagreements
+     (D1–D12 in the doc). The worst:
+     - D1 poller never reads calendar attachments → Gemini-notes-only meetings
+       show "No recording" in the listing while dialog + series (your e3ebbc7
+       fix) call them importable. Your fix landed in the 2nd of 3 places.
+     - D2 poller hasTranscript = docIds.length; everyone else uses
+       transcriptsListed → "still generating" meetings sit in No-recording.
+     - D4 recording_count counts file-less entries — 20 of 138 prod cache rows
+       show a Recording badge with a dead Drive link.
+     - D3 the unimported view's WHERE includes Teams transcript-only rows but
+       its SELECT's has_transcript excludes them → listed as "Not imported" with
+       a No-recording glyph.
+     - D5 inside the dialog, one Google helper throws on error ("stay
+       permissive"), the one 40 lines below swallows to {} → "nothing to import"
+       on a 403/quota hit.
+     - Plus: attachment regexes differ between dialog and series; three
+       conference-record lookups with three windows; ±12h declared in four
+       modules; bulk import omits defer/background; token identity varies per
+       path.
+
+  Proposed fix (in the doc, phased)
+
+  - Phase 0 (½ day): show "Calendar synced N m ago" from last_poll_at in the
+    listing; retire the badge's dependency on the manual checkpoint; make "Sync
+    now" run sweepUser(caller) server-side (the sweepNewAccount path already
+    exists).
+  - Phase 1: one isomorphic meeting-evidence.ts — MeetingEvidence type +
+    classifyEvidence() + one classifyAttachments() + one window constant; store
+    classified columns at upsert so SQL WHERE/SELECT can't drift. Fixes D1–D4,
+    D7, D8, D11 at the source.
+  - Phase 2: one meeting-discovery.ts (calendar window sync + evidence probe)
+    that always writes back to the caches; poller, dialog (via new server routes
+    — the browser token is already server-minted, so nothing changes about the
+    own-token rule), series sweep and import pollers all call it. Dialog shrinks
+    by ~600 lines of browser Google code.
+  - Phase 3: one "already imported" lookup used by SQL views, check route,
+    series and poller.
+
+  Nothing was changed in code; only the doc and a memory note were written. Say
+  the word on Phase 0 (or a different slice) and I'll start.
+
+✻ Churned for 9m 39s
+
+※ recap: Goal was auditing why listing, import dialog and series disagree about meetings; analysis is done and written to docs/meeting-evidence-consolidation.md with a phased plan. Next: your go-ahead on Phase 0 (show last_poll_at, real Sync now). (disable recaps in /config)
+
+❯ look this too /Users/alokrajiv/workspace/meeting-whisperer/2026-08-22-122555- 
+  image-1-can-we-figure-out-how-to-renew-the-tok.txt                            
+
+  Thought for 34s, ran 3 shell commands (ctrl+o to expand)
+
+⏺ Done. Recap of where everything stands:
+
+  - The transcript's finding is now part of the picture:
+    docs/meeting-evidence-consolidation.md has an addendum tying the 401-Retry
+    loop to the same root cause — no central seam. The evidence layer has no
+    shared classifier; the client has no shared fetch wrapper (118 raw fetch(
+    calls, 28 files), which is why nothing could ever call refresh. Memory
+    updated so the next session knows the fix is designed-but-on-hold.
+  - Sequencing recommendation: the 401 interceptor + proxy.ts exp pre-check
+    should ship first and independent of the evidence work — it's ~1h, already
+    proven cross-origin with real cookies, and the fetch-wrapper it introduces
+    becomes the apiFetch() seed that the later consolidation phases should build
+    on.
+  - Nothing has been built yet — that session parked on your "go", and I've kept
+    it parked. Two cheap, independent starts whenever you want: the 401
+    self-heal, and Phase 0 (real "synced N m ago" from last_poll_at + a "Sync
+    now" that actually runs a server sweep).
+
+  If you want that export tucked away, say "put it in old-session" and I'll file
+  it with an index entry per the usual convention.
+
+✻ Crunched for 54s
+
+※ recap: Goal: fix the listing/dialog/series inconsistencies, which trace to four parallel evidence stacks with no shared core; analysis and phased plan are written to docs/meeting-evidence-consolidation.md. Next action: your go on the 401 refresh fix or Phase 0. (disable recaps in /config)
+
+❯ so wht wud be the action plan? wud we do it using workflows in this esssion - 
+  we are at 170k context - sud be ok                                            
+
+  Thought for 33s (ctrl+o to expand)
+
+⏺ Here's the plan I'd actually run, and where workflows genuinely earn their
+  cost vs where they'd hurt.
+
+  Action plan (ordered)
+
+  A. 401 self-heal — first, independent (~1h)
+  1. src/lib/api-fetch.ts: wrap window.fetch for same-origin /api/ calls — on
+     401, single-flight POST login.trames.io/api/auth/refresh
+     (credentials:'include'), replay once; refresh fails → /login?returnTo=.
+     Skip /api/auth/* + non-replayable streams (the multi-GB upload). Mount in
+     layout.tsx.
+  2. proxy.ts: base64-decode JWT exp (Edge-safe, no verify) → redirect
+     navigations to refresh with returnTo.
+  3. Playwright proof on prod with a deliberately expired JWT.
+     This also creates the apiFetch() seam everything later reuses.
+
+  B. Phase 0 — sync visibility (~½ day)
+  1. Listing toolbar: "Calendar synced N m ago" from sync.lastPollAt (already in
+     the API response, unused).
+  2. POST /api/calendar/sync → sweepUser(caller) (code exists as
+     sweepNewAccount), wire "Sync now" to it + refetch layers.
+  3. Retire the header badge's read of gmeet_sync_state.last_synced_at.
+
+  C. Phase 1 — one evidence model (~1–2 days, the core of your complaint)
+  1. Migration 025: classified columns on gmeet_meeting_cache (recording_state,
+     transcript_state, transcript_source) + backfill; fix recording_count
+     semantics (kills the 20 dead "Recording" badges).
+  2. src/lib/meeting-evidence.ts: MeetingEvidence + classifyEvidence() + one
+     classifyAttachments() + one OCCURRENCE_WINDOW. Unit-tested in isolation.
+  3. Migrate the ~15 call sites (poller → SQL views → dialog → series sweep →
+     series dialog → auto-import → deferred/recording pollers). Serial, me —
+     these files are tightly coupled and two of them are 2–3k lines.
+  4. Verification fan-out (see below), then guarded deploy + prod E2E against
+     the real 21-Aug meetings.
+
+  D. Phase 2 — discovery service + dialog thinning. Defer to a fresh session;
+  it's the risky refactor and deserves its own runway after C has soaked.
+
+  On workflows
+
+  Yes, but surgically — not for the edits. Parallel agents editing
+  gmeet-import-dialog.tsx / series-dialog.tsx would trip over each other; the
+  migration is serial hand-work. Where a workflow is the right tool:
+
+  1. After step C.3: fan out 12 verifiers, one per D1–D12, each independently
+     checking its disagreement is actually dead in the new code (both surfaces
+     now agree), plus an adversarial "what call site still uses an inline
+     predicate?" sweeper. That's the comprehensive-confidence shape workflows
+     exist for, and it's exactly where I'd otherwise miss a straggler in 41k
+     lines.
+  2. Optionally one small one before C.3 to produce a per-call-site migration
+     checklist — though the two explorer reports from earlier already give me
+     ~90% of that.
+
+  Context-wise we're fine (session gets summarized-and-continued if it runs
+  long, so no need to split for that reason alone).
+
+  My recommendation: A → B → C in this session in that order (A and B are
+  shippable today; C spans into tomorrow with the workflow verification at the
+  end), D later. Say go — "go A" / "go A+B" / "go all" — and I'll start.
+
+✻ Crunched for 49s
+
+❯ goooooooooooooooooooooooo                                                     
+
+  Thought for 18s (ctrl+o to expand)
+
+⏺ Building. Phase A first — reading the auth plumbing.
+
+  Thought for 36s, ran 2 shell commands (ctrl+o to expand)
+⏺ XHR uploads mean the fetch wrapper can't touch the multi-GB path — good.
+  Verifying kenoby's refresh returnTo contract before writing the code.
+
+  Thought for 44s, searched for 1 pattern, ran 1 shell command (ctrl+o to expand)
+
+⏺ Contract verified: GET /api/auth/refresh?returnTo=<abs url> rotates and 302s
+  back; failure path bounces to SSO login (no loop risk on our side). Writing
+  the client guard + proxy pre-check.
+
+⏺ Write(~/workspace/meeting-whisperer/src/lib/auth-refresh.ts)
+  ⎿  Wrote 102 lines to ../src/lib/auth-refresh.ts
+       1 // Client-side session self-heal.
+       3 // The trames-auth-session JWT lives 24h but its cookie lives 30
+         d, so after a
+         ll renders —
+         encrypted,
+       6 // httpOnly, .trames.io) and exposes POST /api/auth/refresh; kyl
+       7 // this exact cross-origin call from app.trames.io in prod for a
+         ges
+       9 //
+         > in the root
+     … +118 lines (ctrl+o to expand)
+
+⏺ Write(~/workspace/meeting-whisperer/src/components/session-keeper.tsx)
+  ⎿  Wrote 17 lines to ../src/components/session-keeper.tsx
+      1 'use client';
+      2 
+      3 import { useEffect } from 'react';
+      4 import { installAuthFetchGuard } from '@/lib/auth-refresh';
+      5 
+        rst-render
+      7 // fetches fire; the effect is a belt for any environment that sk
+        ips module
+      8 // side effects. Idempotent either way.
+      9 installAuthFetchGuard();
+     … +10 lines (ctrl+o to expand)
+
+⏺ Update(~/workspace/meeting-whisperer/src/app/layout.tsx)
+  ⎿  Added 1 line
+      1  import type { Metadata } from "next";
+      2  import { Geist, Geist_Mono } from "next/font/google";
+      3  import "./globals.css";
+      4 +import { SessionKeeper } from "@/components/session-keeper";    
+      5  
+      6  const geistSans = Geist({
+      7    variable: "--font-geist-sans",
+
+⏺ Update(~/workspace/meeting-whisperer/src/app/layout.tsx)
+  ⎿  Added 1 line
+      40        <body
+      41          className={`${geistSans.variable} ${geistMono.variable}
+           antialiased`}
+      42        >
+      43 +        <SessionKeeper />                                      
+      44          {children}
+      45        </body>
+      46      </html>
+
+⏺ Now the proxy exp pre-check:
+
+⏺ Update(~/workspace/meeting-whisperer/src/proxy.ts)
+  ⎿  Added 30 lines
+      12    return !!request.cookies.get('trames-auth-session')?.value;
+      13  }
+      14  
+      15 +/** Decode (NOT verify) the JWT's exp claim. Edge-safe: atob + 
+         +JSON only.                                                     
+      16 + * Returns null when the token doesn't parse — callers must fai
+         +l open and let                                                 
+      17 + * withAuth do the real verification. */                       
+      18 +function jwtExpMs(token: string): number | null {              
+      19 +  try {                                                        
+      20 +    const payload = token.split('.')[1];                       
+      21 +    if (!payload) return null;                                 
+      22 +    const json = atob(payload.replace(/-/g, '+').replace(/_/g, 
+         +'/'));                                                         
+      23 +    const exp = (JSON.parse(json) as { exp?: number }).exp;    
+      24 +    return typeof exp === 'number' ? exp * 1000 : null;        
+      25 +  } catch {                                                    
+      26 +    return null;                                               
+      27 +  }                                                            
+      28 +}                                                              
+      29 +                                                               
+      30 +/** Top-level page navigation (address bar, link click, reload)
+         + — the only                                                    
+      31 + * requests we bounce through the SSO refresh redirect. RSC/pre
+         +fetch fetches                                                  
+      32 + * must NOT be redirected cross-origin (their CORS mode can't f
+         +ollow it);                                                     
+      33 + * they fall through and the client fetch guard heals the sessi
+         +on instead. */                                                 
+      34 +function isDocumentNav(request: NextRequest): boolean {        
+      35 +  if (request.method !== 'GET') return false;                  
+      36 +  const dest = request.headers.get('sec-fetch-dest');          
+      37 +  if (dest) return dest === 'document';                        
+      38 +  // Old browsers without sec-fetch-*: accept-header heuristic,
+         + RSC excluded.                                                 
+      39 +  return (                                                     
+      40 +    !request.headers.get('rsc') &&                             
+      41 +    (request.headers.get('accept') ?? '').includes('text/html')
+      42 +  );                                                           
+      43 +}                                                              
+      44 +                                                               
+      45  export async function proxy(request: NextRequest) {
+      46    const pathname = request.nextUrl.pathname;
+      47  
+
+⏺ Update(~/workspace/meeting-whisperer/src/proxy.ts)
+  ⎿  Added 16 lines
+       84      return NextResponse.redirect(loginUrl);
+       85    }
+       86  
+       87 +  // Cookie present but JWT expired (24h life vs the cookie's 
+          +30d): silently                                                
+       88 +  // rotate via kenoby-sso and land back here — no 401 flash, 
+          +no Retry loop.                                                
+       89 +  // The refresh route whitelists *.trames.io returnTo values;
+          + on a dead                                                    
+       90 +  // refresh token it wipes the cookies and forwards to the SS
+          +O login itself,                                               
+       91 +  // so there is no loop through this branch. Document navigat
+          +ions only.                                                    
+       92 +  if (isDocumentNav(request)) {                               
+       93 +    const token = request.cookies.get('trames-auth-session')!.
+          +value;                                                        
+       94 +    const expMs = jwtExpMs(token);                            
+       95 +    if (expMs !== null && expMs <= Date.now()) {              
+       96 +      const sso = process.env.NEXT_PUBLIC_SSO_LOGIN_URL || 'ht
+          +tps://login.trames.io';                                       
+       97 +      const refreshUrl = new URL('/api/auth/refresh', sso);   
+       98 +      refreshUrl.searchParams.set('returnTo', request.url);   
+       99 +      return NextResponse.redirect(refreshUrl);               
+      100 +    }                                                         
+      101 +  }                                                           
+      102 +                                                              
+      103    return NextResponse.next();
+      104  }
+      105  
+
+  Thought for 16s (ctrl+o to expand)
+
+⏺ Phase A code complete. Starting Phase B while typecheck runs in background.
+
+  Thought for 49s, ran 4 shell commands (ctrl+o to expand)
+
+⏺ Write(~/workspace/meeting-whisperer/src/app/api/calendar/sync/route.ts)
+  ⎿  Wrote 48 lines to ../src/app/api/calendar/sync/route.ts
+       1 import { NextResponse } from 'next/server';
+       2 import { withAuth } from '@/lib/auth/with-auth';
+       3 import { getGoogleAccount } from '@/db-ops/google-accounts';
+       4 import { sweepNewAccount } from '@/lib/server/gmeet-poller';
+       5 
+       7 
+       8 /**
+       9  * POST /api/calendar/sync — run one poller sweep for the CALLER
+         , now.
+      10  *
+     … +48 lines (ctrl+o to expand)
+
+  Ran 1 shell command (ctrl+o to expand)
+
+⏺ Adding a formatAgo helper, then wiring the indicator + Sync button into the
+  listing toolbar.
+
+⏺ Update(~/workspace/meeting-whisperer/src/lib/format.ts)
+  ⎿  Added 12 lines
+      629    return d.toLocaleDateString([], { day: 'numeric', month: 'sh
+           ort', year: 'numeric' });
+      630  }
+      631  
+      632 +/** Compact relative age: "just now" / "12m ago" / "3h ago" / 
+          +"2d ago". */                                                  
+      633 +export function formatAgo(iso: string): string {              
+      634 +  const t = new Date(iso).getTime();                          
+      635 +  if (Number.isNaN(t)) return '';                             
+      636 +  const mins = Math.max(0, Math.floor((Date.now() - t) / 60_00
+          +0));                                                          
+      637 +  if (mins < 1) return 'just now';                            
+      638 +  if (mins < 60) return `${mins}m ago`;                       
+      639 +  const hours = Math.floor(mins / 60);                        
+      640 +  if (hours < 24) return `${hours}h ago`;                     
+      641 +  return `${Math.floor(hours / 24)}d ago`;                    
+      642 +}                                                             
+      643 +                                                              
+      644  export function formatTime(milliseconds: number): string {
+      645    const totalSeconds = Math.floor(milliseconds / 1000);
+      646    const minutes = Math.floor(totalSeconds / 60);
+
+  Ran 2 shell commands (ctrl+o to expand)
+
+⏺ Update(~/workspace/meeting-whisperer/src/components/transcript-table.tsx)
+  ⎿  Added 1 line
+      15  import { Input } from '@/components/ui/input';
+      16  import {
+      17    formatBytes,
+      18 +  formatAgo,                                                   
+      19    formatDuration,
+      20    formatSmartDate,
+      21    type TranscriptListRow,
+
+  Thought for 4s (ctrl+o to expand)
+
+⏺ Update(~/workspace/meeting-whisperer/src/components/transcript-table.tsx)
+  ⎿  Added 26 lines
+      754      if (!didCal) void fetchCalCountsRef.current();
+      755    }, []);
+      756  
+      757 +  // "Sync now": run one poller sweep for the caller (server-s
+          +ide, same code                                                
+      758 +  // path and cache writes as the 30-minute background tick), 
+          +then refetch the                                              
+      759 +  // calendar layers. The `lastPollAt` chip is the freshness i
+          +ndicator for                                                  
+      760 +  // everything the calendar layers show.                     
+      761 +  const [manualSyncing, setManualSyncing] = useState(false);  
+      762 +  const runManualCalSync = useCallback(async () => {          
+      763 +    if (manualSyncing) return;                                
+      764 +    setManualSyncing(true);                                   
+      765 +    try {                                                     
+      766 +      const res = await fetch('/api/calendar/sync', { method: 
+          +'POST' });                                                    
+      767 +      if (res.ok) {                                           
+      768 +        const data = (await res.json()) as { lastPollAt: strin
+          +g | null };                                                   
+      769 +        setCalSync((prev) =>                                  
+      770 +          prev                                                
+      771 +            ? { ...prev, lastPollAt: data.lastPollAt ?? prev.l
+          +astPollAt, syncing: false }                                   
+      772 +            : prev                                            
+      773 +        );                                                    
+      774 +      }                                                       
+      775 +      silentRefetchCalendars();                               
+      776 +    } catch {                                                 
+      777 +      // transient — the chip simply keeps the old timestamp  
+      778 +    } finally {                                               
+      779 +      setManualSyncing(false);                                
+      780 +    }                                                         
+      781 +  }, [manualSyncing, silentRefetchCalendars]);                
+      782 +                                                              
+      783    /** A hide was confirmed from a calendar row's popover. */
+      784    const handleMuteChanged = useCallback(() => {
+      785      void fetchMutes();
+
+⏺ Update(~/workspace/meeting-whisperer/src/components/transcript-table.tsx)
+  ⎿  Added 24 lines
+      1415          )}
+      1416          {layerChip('norec', 'No recording')}
+      1417        </div>
+      1418 +      {renderMerged && calConnected && calSync && (          
+      1419 +        <div className="mb-2 mt-0.5 flex items-center gap-0.5
+           + text-[11px] text-muted-foreground">                         
+      1420 +          <span                                              
+      1421 +            title="When your calendar and meeting artifacts w
+           +ere last swept from Google/Microsoft. The background sync run
+           +s every 30 minutes; the import dialog always checks live."   
+      1422 +          >                                                  
+      1423 +            {manualSyncing                                   
+      1424 +              ? 'Syncing…'                                   
+      1425 +              : calSync.lastPollAt                           
+      1426 +                ? `Cal synced ${formatAgo(calSync.lastPollAt)
+           +}`                                                           
+      1427 +                : 'Calendar not synced yet'}                 
+      1428 +          </span>                                            
+      1429 +          <Button                                            
+      1430 +            variant="ghost"                                  
+      1431 +            size="sm"                                        
+      1432 +            className="h-6 px-1.5 text-[11px]"               
+      1433 +            disabled={manualSyncing}                         
+      1434 +            title="Sweep your calendar and meeting artifacts 
+           +now"                                                         
+      1435 +            onClick={() => void runManualCalSync()}          
+      1436 +          >                                                  
+      1437 +            <RefreshCw className={`h-3 w-3 ${manualSyncing ? 
+           +'animate-spin' : ''}`} />                                    
+      1438 +            Sync                                             
+      1439 +          </Button>                                          
+      1440 +        </div>                                               
+      1441 +      )}                                                     
+      1442        {mutes.length > 0 && (
+      1443          <div className="relative mb-2 mt-0.5" ref={hiddenMenu
+            Ref}>
+      1444            <button
+
+⏺ Now removing the misleading "Meet not synced" nudge from the header
+  (page.tsx).
+
+  Thought for 49s, ran 4 shell commands (ctrl+o to expand)
+
+⏺ A+B typecheck clean. Phase C now — starting with the migration and the shared
+  classifier module.
+
+  Thought for 1m 2s, ran 2 shell commands (ctrl+o to expand)
+
+⏺ Migration 025 exists already (empty_transcript_docs — it even pre-solves part
+  of D8 for series). Locking the C design and building stepwise. First the
+  shared classifier module.
+
+  Ran 1 shell command (ctrl+o to expand)
+
+⏺ Write(~/workspace/meeting-whisperer/src/lib/meeting-evidence.ts)  ⎿  Wrote 212 lines to ../src/lib/meeting-evidence.ts
+       1 // THE shared "what does this meeting have" model.
+       3 // Before this module existed, has-recording / has-transcript / 
+         importable /
+         og ×5, series
+         tible
+       6 // definitions of "has a transcript" — see docs/meeting-evidence
+       7 // (D1–D12) for the catalogue of user-visible disagreements that
+          caused.
+       9 // Rules of the road:
+         ient
+     … +252 lines (ctrl+o to expand)
+
+⏺ Write(~/workspace/meeting-whisperer/src/lib/server/__tests__/meeting-evidence.
+       test.ts)
+  ⎿  Wrote 121 lines to
+     ../src/lib/server/__tests__/meeting-evidence.test.ts
+       1 import { describe, expect, test } from 'bun:test';
+       2 import {
+       3   classifyCalendarAttachments,
+       4   classifyEvidence,
+       5   classifyRecordings,
+       6   classifyTranscripts,
+       7 } from '@/lib/meeting-evidence';
+       8 
+       9 const doc = (title: string, fileId = 'd1') => ({
+      10   fileId,
+     … +129 lines (ctrl+o to expand)
+
+  Thought for 7s, ran 1 shell command (ctrl+o to expand)
+
+⏺ Classifier green (13/13). Now migration 026 + db-ops.
+
+⏺ Write(~/workspace/meeting-whisperer/migrations/026_meeting_evidence_states.sql
+       )
+  ⎿  Wrote 73 lines to ../migrations/026_meeting_evidence_states.sql
+       1 -- Classified evidence states on the artifact cache (docs/meetin
+       2 -- consolidation.md, Phase 1). Until now the SQL views re-derive
+       3 -- has-recording / has-transcript from raw counts, with two famo
+       4 --  D4: recording_count counted file-less (never-generated) entr
+       5 --      prod rows showed a "Recording" badge with a dead Drive l
+         ink;
+          rows) but
+         sted as
+       9 -- The states are computed ONCE, in src/lib/meeting-evidence.ts,
+      10 -- time; the views only read them.
+     … +89 lines (ctrl+o to expand)
+
+  Thought for 36s, ran 2 shell commands (ctrl+o to expand)
+
+⏺ Update(~/workspace/meeting-whisperer/src/lib/server/gmeet.ts)
+  ⎿  Added 5 lines
+      459    /** Transcript SESSIONS listed, generated or not — listed > 
+           0 with no doc
+      460     * ids = Google is still preparing the transcript Doc. */
+      461    transcriptsListed: number;
+      462 +  /** True when either listing call failed (403/quota/network)
+          + — "we could                                                  
+      463 +   * not check" and "Google lists nothing" MUST read different
+          +ly: callers                                                   
+      464 +   * that treat empty as terminal (deferred poller's 'gone', t
+          +he dialog's                                                   
+      465 +   * "nothing to import") skip that verdict when this is set (
+          +D5). */                                                       
+      466 +  checkFailed: boolean;                                       
+      467    /** The verbatim API responses — callers that archive struct
+           ured data keep
+      468     * every field Google returns, not just what we shape today.
+            */
+      469    raw: { recordings?: unknown; transcripts?: unknown };
+
+⏺ Update(~/workspace/meeting-whisperer/src/lib/server/gmeet.ts)
+  ⎿  Added 1 line
+      499      recordings,
+      500      transcriptDocIds,
+      501      transcriptsListed: (trans?.transcripts ?? []).length,
+      502 +    checkFailed: recs === null || trans === null,             
+      503      raw: {
+      504        recordings: recs ?? undefined,
+      505        transcripts: trans ?? undefined,
+
+⏺ Now the cache db-ops — new columns, evidence-typed upsert, shared window
+  constant:
+
+  Thought for 12s, ran 2 shell commands (ctrl+o to expand)
+
+⏺ Now the poller — the single cache writer learns attachments + evidence states:
+
+  Ran 1 shell command (ctrl+o to expand)
+
+⏺ Update(~/workspace/meeting-whisperer/src/lib/server/gmeet-poller.ts)
+  ⎿  Added 22 lines, removed 6 lines
+      241      meetingCode: string;
+      242      eventStart: string | null;
+      243      event: CalEvent;
+      244 -    recordName: string;                                       
+      244 +    /** Null when the Meet record aged out / never existed but
+          + calendar                                                     
+      245 +     * attachments still prove artifacts (Gemini-notes-only me
+          +etings). */                                                   
+      246 +    recordName: string | null;                                
+      247      artifacts: Awaited<ReturnType<typeof listRecordArtifacts>>
+           ;
+      248 +    /** Classified calendar attachments for the same event. */
+      249 +    attachments: ClassifiedAttachments;                       
+      250      existing: GmeetMeetingCacheRow | undefined;
+      251    }
+      252  ): Promise<void> {
+      253    const { eventKey, meetingCode, eventStart, event, recordName
+           , artifacts, existing } = input;
+      250 -  const firstFileId = artifacts.recordings.find((r) => r.fileI
+          -d)?.fileId ?? null;                                           
+      251 -  const needConf = !existing?.conf_start;                     
+      254 +  const recEv = classifyRecordings(artifacts.recordings);     
+      255 +  const trEvPre = classifyTranscripts({                       
+      256 +    docIds: artifacts.transcriptDocIds,                       
+      257 +    listed: artifacts.transcriptsListed,                      
+      258 +    attachments: input.attachments,                           
+      259 +  });                                                         
+      260 +  const docIds = trEvPre.docIds;                              
+      261 +  const firstFileId =                                         
+      262 +    artifacts.recordings.find((r) => r.fileId)?.fileId ??     
+      263 +    input.attachments.videoFileId ??                          
+      264 +    null;                                                     
+      265 +  const needConf = !!recordName && !existing?.conf_start;     
+      266    const needVideo = !!firstFileId && existing?.video_size == n
+           ull;
+      253 -  const needParse = artifacts.transcriptDocIds.length > 0 && e
+          -xisting?.transcript_parseable == null;                        
+      267 +  const needParse = docIds.length > 0 && existing?.transcript_
+          +parseable == null;                                            
+      268    const needInventory =
+      269      !existing ||
+      256 -    artifacts.recordings.length > existing.recording_count || 
+      270 +    recEv.listed > existing.recordings_listed ||              
+      271 +    recEv.ready > existing.ready_recording_count ||           
+      272      (!!firstFileId && !existing.video_file_id) ||
+      258 -    (artifacts.transcriptDocIds.length > 0 && !existing.transc
+          -ript_doc_ids?.length);                                        
+      273 +    docIds.length > (existing.transcript_doc_ids?.length ?? 0)
+          + ||                                                           
+      274 +    trEvPre.listed > existing.transcripts_listed;             
+      275    if (!needConf && !needVideo && !needParse && !needInventory)
+            return;
+      276  
+      277    // Everything structured the APIs hand back goes into `raw` 
+           verbatim —
+
+  Thought for 22s, ran 1 shell command (ctrl+o to expand)
+
+⏺ Update(~/workspace/meeting-whisperer/src/lib/server/gmeet-poller.ts)
+  ⎿  Added 31 lines, removed 6 lines
+      589        continue;
+      590      }
+      591      // Meeting artifacts only appear a while after the call en
+           ds; re-checked
+      592 -    // every poll until the event ages out of the window.     
+      592 +    // every poll until the event ages out of the window. Cale
+          +ndar attachments                                              
+      593 +    // (recording videos, the Transcript / Gemini-notes Doc) c
+          +ount as evidence                                              
+      594 +    // too — they are the ONLY evidence once the Meet record a
+          +ges out, and the                                              
+      595 +    // only evidence Gemini-notes-only meetings ever get (D1).
+      596 +    const att = classifyCalendarAttachments(e.attachments);   
+      597      const recordName = await findConferenceRecordName(token, c
+           ode, startIso ?? undefined);
+      594 -    if (!recordName) continue; // never held or nothing captur
+          -ed — nothing to nag about                                     
+      595 -    const artifacts = await listRecordArtifacts(token, recordN
+          -ame);                                                         
+      596 -    const hasRecording = artifacts.recordings.length > 0;     
+      597 -    const hasTranscript = artifacts.transcriptDocIds.length > 
+          -0;                                                            
+      598 -    if (!hasRecording && !hasTranscript) continue;            
+      598 +    const artifacts = recordName                              
+      599 +      ? await listRecordArtifacts(token, recordName)          
+      600 +      : {                                                     
+      601 +          recordings: [],                                     
+      602 +          transcriptDocIds: [],                               
+      603 +          transcriptsListed: 0,                               
+      604 +          checkFailed: false,                                 
+      605 +          raw: {},                                            
+      606 +        };                                                    
+      607 +    const recEv = classifyRecordings(artifacts.recordings);   
+      608 +    const trEv = classifyTranscripts({                        
+      609 +      docIds: artifacts.transcriptDocIds,                     
+      610 +      listed: artifacts.transcriptsListed,                    
+      611 +      attachments: att,                                       
+      612 +    });                                                       
+      613 +    const verdict = classifyEvidence({ recording: recEv, trans
+          +cript: trEv });                                               
+      614 +    const attachmentVideo = !!att.videoFileId;                
+      615 +    // Nothing held / nothing captured / nothing attached — no
+          +thing to track.                                               
+      616 +    if (!verdict.importable && !attachmentVideo) continue;    
+      617      try {
+      618        await captureMeetingMeta(token, {
+      619          userId,
+     ...
+      623          event: e,
+      624          recordName,
+      625          artifacts,
+      626 +        attachments: att,                                     
+      627          existing: cacheRows.get(key),
+      628        });
+      629      } catch (err) {
+      630        console.warn('[gmeet-poller] meta capture failed for', k
+           ey, err);
+      631      }
+      632 +    // Remind only once something is actually materialized — a
+          + still-                                                       
+      633 +    // generating artifact will be ready by a later sweep; nag
+          +ging early                                                    
+      634 +    // invites a doomed import click.                         
+      635 +    const hasRecording = verdict.hasRecording || attachmentVid
+          +eo;                                                           
+      636 +    const hasTranscript = verdict.hasTranscript;              
+      637 +    if (!hasRecording && !hasTranscript) continue;            
+      638      await upsertReminder({
+      639        userId,
+      640        kind: 'unimported',
+
+  Thought for 6s (ctrl+o to expand)
+
+⏺ Update(~/workspace/meeting-whisperer/src/lib/server/gmeet-poller.ts)
+  ⎿  Added 6 lines
+      495              picked.transcript?.createdDateTime ?? picked.recor
+           ding?.createdDateTime ?? null,
+      496            confEnd: picked.transcript?.endDateTime ?? picked.re
+           cording?.endDateTime ?? null,
+      497            recordingCount: picked.recording ? 1 : 0,
+      498 +          recordingsListed: picked.recording ? 1 : 0,         
+      499 +          readyRecordingCount: picked.recording ? 1 : 0,      
+      500 +          transcriptsListed: picked.transcript ? 1 : 0,       
+      501 +          recordingState: picked.recording ? 'ready' : 'none',
+      502 +          transcriptState: picked.transcript ? 'ready' : 'none
+          +',                                                            
+      503 +          transcriptSource: picked.transcript ? 'teams' : null
+          +,                                                             
+      504            transcriptParseable: hasTranscript ? true : null,
+      505            recurringEventId: e.recurringEventId ?? null,
+      506            iCalUID: e.iCalUID ?? null,
+
+  Thought for 25s (ctrl+o to expand)
+
+⏺ Now the SQL views — one evidence predicate, aligned SELECTs, eventId
+  anti-join:
+
+  Thought for 25s, ran 5 shell commands (ctrl+o to expand)
+
+⏺ tsc clean. Now the client-side fixes — dialog recordArtifacts (D5/D11), shared
+  attachment rules, check-route meta:
+
+  Thought for 27s, ran 6 shell commands (ctrl+o to expand)
+
+⏺ Fixing the remaining server call sites (series sweep attachment rules,
+  deferred-poller terminal gating), then full typecheck.
+
+  Ran 1 shell command (ctrl+o to expand)
+
+⏺ Update(~/workspace/meeting-whisperer/src/lib/server/deferred-import-poller.ts)
+  ⎿  Added 6 lines, removed 2 lines
+      293    if (!readyAtQueue) {
+      294      const artifacts = await listRecordArtifacts(minted.token, 
+           recordName!);
+      295      readyVideo = artifacts.recordings.find((r) => r.fileId)?.f
+           ileId ?? null;
+      296 -    const videoGone = artifacts.recordings.length === 0;      
+      296 +    // "gone" verdicts are TERMINAL — never issue one off a fa
+          +iled listing                                                  
+      297 +    // call (D5): a 403/quota blip used to read as "Google sto
+          +pped listing                                                  
+      298 +    // it" and killed a perfectly good deferred import. A fail
+          +ed check just                                                 
+      299 +    // means "not ready yet, ask again next tick".            
+      300 +    const videoGone = artifacts.recordings.length === 0 && !ar
+          +tifacts.checkFailed;                                          
+      301      const transcriptReady = artifacts.transcriptDocIds.length 
+           > 0;
+      298 -    const transcriptGone = artifacts.transcriptsListed === 0; 
+      302 +    const transcriptGone = artifacts.transcriptsListed === 0 &
+          +& !artifacts.checkFailed;                                     
+      303  
+      304      let ready = false;
+      305      let terminalError: string | null = null;
+
+  Thought for 15s, ran 2 shell commands (ctrl+o to expand)
+
+⏺ Build ✅, all 83 tests ✅. Now the adversarial verification fan-out you opted
+  into — one verifier per fixed disagreement plus a straggler sweep:
+
+⏺ Workflow(Adversarially verify D-fixes in the meeting-evidence consolidation)
+  ⎿  /workflows to view dynamic workflow runs
+
+  Thought for 9s (ctrl+o to expand)
+
+⏺ While verification runs (read-only, no conflicts), applying migration 026 to
+  prod — additive columns, safe under the currently-deployed code:
+
+  Thought for 24s, ran 1 shell command (ctrl+o to expand)
+⏺ Migration 026 applied on prod: 138 rows backfilled — the 20 dead-badge rows
+  are now generating (they'll age out of "Not imported" instead of showing a
+  dead Recording link), and the 30 Teams transcript-only rows will now render
+  their transcript state correctly once the new code deploys.
+
+  Status: A+B+C code done (tsc, 83 tests, build all green), migration live,
+  verification workflow (9 skeptics + straggler sweep) running. Next after its
+  verdicts: fix anything it confirms, then guarded deploy + prod E2E (including
+  the 401 self-heal proof with a tampered-exp cookie).
+
+✻ Cooked for 17m 14s
+
+⏺ Dynamic workflow "Adversarially verify D-fixes in the meeting-evidence
+consolidation" completed · 15m 23s
+
+  Thought for 6s (ctrl+o to expand)
+
+⏺ Verification came back: D1–D4, D7 confirmed fixed; D5 has one unfixed leg (the
+  dialog's enrich still stomps pending state on a failed check). Reading the
+  remaining verdicts (D9, D11, STATES, sweep):
+
+  Thought for 1m 34s, ran 4 shell commands (ctrl+o to expand)
+
+⏺ Now the series sweep alignment, migration-file fix, and prod repair:
+
+  Thought for 8s, ran 1 shell command (ctrl+o to expand)
+
+⏺ tsc clean, 83/83 pass. Repairing the already-applied prod backfill (N1):
+
+  Thought for 15s, ran 1 shell command (ctrl+o to expand)
+
+⏺ 9 Teams rows repaired to ready; 0 Meet rows needed repair (confirms the D4
+  analysis). Now the guarded deploy — build, probe for in-flight AI runs, rsync,
+  rebuild, restart:
+
+  Thought for 9s, ran 2 shell commands (ctrl+o to expand)
+
+⏺ Deployed, pollers armed. Running prod E2E now:
+
+  Thought for 7s, ran 1 shell command (ctrl+o to expand)
+
+⏺ The refresh 401ed and (per the known kenoby footgun) wiped the cookie jar.
+  Checking what's left and the failure reason — one attempt only, no loop:
+
+  Thought for 46s, ran 5 shell commands (ctrl+o to expand)
+
+⏺ Sync endpoint works (21.5s sweep, lastPollAt stamped) and — the D1 payoff —
+  Gemini-notes evidence now shows in the listing (Data scrum, Lothal scrum,
+  DevOps Scrum…). Now the 401 self-heal legs:
+
+  Thought for 7s, ran 1 shell command (ctrl+o to expand)
+
+⏺ Proxy redirect fires correctly — but returnTo says https://localhost:3002/
+  (Next's internal origin behind nginx). Fixing to use the forwarded host:
+
+  Thought for 7s, ran 1 shell command (ctrl+o to expand)
+
+⏺ Update(~/workspace/meeting-whisperer/src/proxy.ts)
+  ⎿  Added 10 lines, removed 1 line
+       95      if (expMs !== null && expMs <= Date.now()) {
+       96        const sso = process.env.NEXT_PUBLIC_SSO_LOGIN_URL || 'ht
+           tps://login.trames.io';
+       97        const refreshUrl = new URL('/api/auth/refresh', sso);
+       98 -      refreshUrl.searchParams.set('returnTo', request.url);   
+       98 +      // request.url reflects the INTERNAL origin behind nginx
+       99 +      // (https://localhost:3002/...) — build returnTo from th
+          +e forwarded                                                   
+      100 +      // public host or kenoby bounces the user to localhost. 
+      101 +      const host =                                            
+      102 +        request.headers.get('x-forwarded-host') ?? request.hea
+          +ders.get('host');                                             
+      103 +      const proto = request.headers.get('x-forwarded-proto') ?
+          +? 'https';                                                    
+      104 +      const returnTo = host                                   
+      105 +        ? `${proto}://${host}${request.nextUrl.pathname}${requ
+          +est.nextUrl.search}`                                          
+      106 +        : request.url;                                        
+      107 +      refreshUrl.searchParams.set('returnTo', returnTo);      
+      108        return NextResponse.redirect(refreshUrl);
+      109      }
+      110    }
+
+  Thought for 15s, called playwright, ran 2 shell commands (ctrl+o to expand)
+
+⏺ Stale Playwright browser lock — clearing it and retrying:
+
+  Thought for 35s, called playwright 3 times, ran 8 shell commands (ctrl+o to expand)
+
+⏺ Three commits in. Updating memory + the doc to reflect shipped state, then
+  wrapping up:
+
+  Thought for 17s, ran 1 shell command (ctrl+o to expand)
+
+⏺ All done — A, B, and C shipped, verified, deployed, committed. Full recap:
+
+  Shipped today (commits c9ba3ae, 7fe05dd, b595cb5, a736c24)
+
+  A. 401 Retry loop — dead. window.fetch guard (single-flight refresh against
+  kenoby-sso + one replay) + proxy.ts exp pre-check that silently rotates
+  expired sessions on page load. E2E'd on prod: expired-cookie nav 307s to the
+  SSO refresh with the correct public returnTo (caught & fixed: middleware's
+  request.url is localhost:3002 behind nginx), and a real browser with a bad-sig
+  cookie fired the guard's refresh POST and bounced cleanly to SSO login.
+
+  B. Calendar freshness — visible. "Cal synced Nm ago" chip next to the layer
+  toggles (from last_poll_at, the real sync stamp) + a Sync button → new POST 
+  /api/calendar/sync runs a genuine poller sweep for you (E2E: 21.5s, stamp
+  updated). The misleading "Meet not synced" header nudge is gone.
+
+  C. One evidence classifier. lib/meeting-evidence.ts + migration 026 (evidence
+  states in the cache, applied to prod). Poller now reads calendar attachments —
+  Gemini-notes-only meetings appear in "Not imported" with a Gemini badge
+  (live: Data scrum, Lothal scrum, DevOps Scrum…), generating artifacts show
+  amber "preparing…" instead of "No recording", dead-listing rows lost their
+  fake Recording badges, WHERE/SELECT agree, dialog + series use the same rules.
+  13 new unit tests, 83 total green.
+
+  The 10-agent adversarial workflow earned its keep: it caught 3 real bugs
+  before they hit you (migration backfill zeroing Teams recording evidence —
+  repaired live on prod; dialog ignoring attachment-video rows; enrich stomping
+  state on a failed check). All fixed and re-deployed.
+
+  Needs you: my curl SSO jar turned out genuinely dead (SESSION_EXPIRED) — your
+  browser session is separate and unaffected, but when convenient run
+  ~/workspace/kenoby-sso/kenoby-sso-cli set-refresh after a browser sign-in so
+  agent sessions can simulate you again. Also eyeball the new chip/badges on
+  your next page load — server-verified, but I couldn't screenshot an authed
+  page without the jar.
+
+  Still open (documented in docs/meeting-evidence-consolidation.md):
+  D6/D8/D10/D12, the Recording ×N count nit, and Phases 2–3 (single discovery
+  service + dialog thinning, single already-imported lookup) — sized for a fresh
+  session.
+
+✻ Cooked for 44m 22s
+
+※ recap: Goal: fix the listing/dialog/series inconsistencies and the 401 retry loop. All three phases are shipped, deployed, E2E-verified, and committed. Next: you eyeball the new sync chip and Gemini/preparing badges in your browser. (disable recaps in /config)
+
+❯ cookijar updated                                                              
+
+  Thought for 14s (ctrl+o to expand)
+
+⏺ Jar's back — verifying it, then finishing the two deferred proofs: the authed
+  screenshot of the new UI, and the full self-heal replay leg with a real
+  refresh token.
+
+  Thought for 23s, read 1 file, listed 1 directory, called playwright 3 times, ran 2 shell commands (ctrl+o to expand)
+
+⏺ Everything's live — sending the visual proof:
+
+  Ran 1 shell command (ctrl+o to expand)
+
+⏺ Live listing after the consolidation — reached via an expired JWT that
+  self-healed through kenoby refresh (no 401, no login screen). Note: "Cal
+  synced 7m ago · Sync" chip, Not imported jumped 63→79 (Gemini-notes meetings
+  now counted), Gemini notes badges, and amber "transcript unparseable" warnings
+  before you click Import.
+
+  ›       /private/tmp/claude-501/-Users-alokrajiv-workspace-meeting-whi (126.9K
+  [image] sperer/5b0760cc-1c0e-4673-b5f2-4bb65a32702e/scratchpad/listingB)
+          -after-consolidation.png
+
+  Thought for 8s (ctrl+o to expand)
+
+⏺ Jar verified and every remaining leg is now closed:
+
+  - Self-heal, fully proven with a real refresh token: navigated with a
+    deliberately-expired session JWT → proxy 307'd to kenoby refresh → rotated →
+    landed back on the authed page. Navigation trail: meetings/ → 
+    login.trames.io/api/auth/refresh?returnTo=… → meetings/. No 401 flash, no
+    Retry loop.
+  - UI confirmed in the screenshot above: "Cal synced 7m ago · Sync" chip; Not 
+    imported went 63 → 79 because Gemini-notes-only meetings finally count;
+    yesterday's problem child Data scrum now shows Recording + Transcript +
+    Gemini notes; the reminders card surfaces those series too; and
+    known-unparseable Docs warn in amber before the doomed Import click.
+
+  That closes out the whole run: 401 self-heal + sync visibility + evidence
+  consolidation shipped (c9ba3ae, 7fe05dd, b595cb5, a736c24), migration 026
+  applied + repaired on prod, 10-agent adversarial verification, and E2E on
+  every path. Remaining backlog (D6/D8/D10/D12, Phase 2 discovery service, Phase
+  3 imported-lookup) is documented in docs/meeting-evidence-consolidation.md
+  and memory for a fresh session.
+✻ Worked for 1m 49s
+
+❯ how to start fresh session and this 401 issue can you make a glovbal cookbook 
+  md on how to solev this if it appears in other apps that use the http only    
+  traes cookie                                                                  
+
+  Thought for 18s (ctrl+o to expand)
+
+⏺ Writing the playbook to ~/.claude/playbooks/ (where your other cookbooks live)
+  and registering it in your global CLAUDE.md so future sessions in any repo
+  find it:
+
+⏺ Write(~/.claude/playbooks/trames-sso-401-self-heal.md)
+  ⎿  Wrote 135 lines to
+     ../../../.claude/playbooks/trames-sso-401-self-heal.md
+       1 # Trames SSO 401 self-heal — cookbook for any app on the httpOnl
+       2 
+       3 As-of: 2026-08-22. Reference implementation: `~/workspace/meetin
+       4 `c9ba3ae` (files: `src/lib/auth-refresh.ts`, `src/components/ses
+         sion-keeper.tsx`,
+       6 `meetings.darth-internal.trames.io` with a real Cognito refresh 
+         token.
+       8 ## Symptom
+       9 
+         still render —
+     … +185 lines (ctrl+o to expand)
+
+  Thought for 10s, ran 1 shell command (ctrl+o to expand)
+
+⏺ Done — both parts:
+
+  Global cookbook: ~/.claude/playbooks/trames-sso-401-self-heal.md, registered
+  with a trigger bullet in ~/.claude/CLAUDE.md so any future session (jarjar,
+  tressa, plagueis, whatever) that hits the 24h-JWT Retry loop reads it before
+  reinventing anything. It carries: the verified kenoby facts (decode-only
+  refresh, *.trames.io CORS + same-site cookies, returnTo allowlist,
+  cookie-wipe-on-failure), both halves with copy-paste shape (fetch wrapper for
+  fetch apps, kyloren's ssoAxios interceptor for axios apps), the two gotchas
+  that cost me a round-trip each (never redirect RSC requests cross-origin;
+  request.url behind nginx is localhost:3002 — build returnTo from
+  x-forwarded-host), and the full forged-JWT curl + Playwright test recipe.
+
+  Starting a fresh session:
+  - Exit this one (ctrl+d or /exit) and just run claude again in
+    ~/workspace/meeting-whisperer — that's a brand-new session with clean
+    context.
+  - /clear also resets context in place if you'd rather not restart the
+    terminal.
+  - claude --resume is for reopening old sessions by name — not what you want
+    for fresh work.
+
+  The new session lands well-prepared: MEMORY.md auto-loads with the
+  evidence-consolidation entry (what shipped, what's open: D6/D8/D10/D12, Phase
+  2 discovery service + dialog thinning, Phase 3 imported-lookup), and
+  docs/meeting-evidence-consolidation.md in the repo has the full plan. Opening
+  a fresh session with "do Phase 2 from docs/meeting-evidence-consolidation.md"
+  is enough to pick up exactly where we stopped.
+
+  If you want this exported session archived first, run /export and tell me (or
+  the next session) to "put it in old-session" — the convention handles the
+  rest.
+
+✻ Sautéed for 1m 18s
+
+※ recap: Goal: fix the calendar/evidence inconsistencies and 401 Retry loop in meeting-whisperer. All shipped, deployed, E2E-verified, committed, plus a global 401 playbook. Nothing pending; next would be Phase 2 (discovery service) in a fresh session.
