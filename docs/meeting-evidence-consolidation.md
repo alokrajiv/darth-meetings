@@ -2,6 +2,13 @@
 
 Analysis date: 2026-08-22 (HEAD 4a50246). Prod numbers queried the same day.
 
+> **STATUS 2026-08-22 EOD — largely SHIPPED** (commits c9ba3ae, 7fe05dd, b595cb5;
+> migration 026 applied + Teams backfill repaired on prod; deployed + E2E'd).
+> Fixed: D1, D2, D3, D4, D5, D7, D9, D11 + series 24h aging. Still open:
+> D6, D8 (series x transcript_parseable), D10, D12, Recording xN listed-count
+> chip, and Phase 2/3 (single discovery service, single already-imported
+> lookup). 401 self-heal from the addendum also shipped (c9ba3ae).
+
 ## Trigger
 
 Screenshot pair, 21 Aug: import dialog shows "APP Thru vs Non Thru…" (no Meet link) and
