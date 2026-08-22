@@ -12,6 +12,36 @@ function hasSSOSession(request: NextRequest): boolean {
   return !!request.cookies.get('trames-auth-session')?.value;
 }
 
+/** Decode (NOT verify) the JWT's exp claim. Edge-safe: atob + JSON only.
+ * Returns null when the token doesn't parse — callers must fail open and let
+ * withAuth do the real verification. */
+function jwtExpMs(token: string): number | null {
+  try {
+    const payload = token.split('.')[1];
+    if (!payload) return null;
+    const json = atob(payload.replace(/-/g, '+').replace(/_/g, '/'));
+    const exp = (JSON.parse(json) as { exp?: number }).exp;
+    return typeof exp === 'number' ? exp * 1000 : null;
+  } catch {
+    return null;
+  }
+}
+
+/** Top-level page navigation (address bar, link click, reload) — the only
+ * requests we bounce through the SSO refresh redirect. RSC/prefetch fetches
+ * must NOT be redirected cross-origin (their CORS mode can't follow it);
+ * they fall through and the client fetch guard heals the session instead. */
+function isDocumentNav(request: NextRequest): boolean {
+  if (request.method !== 'GET') return false;
+  const dest = request.headers.get('sec-fetch-dest');
+  if (dest) return dest === 'document';
+  // Old browsers without sec-fetch-*: accept-header heuristic, RSC excluded.
+  return (
+    !request.headers.get('rsc') &&
+    (request.headers.get('accept') ?? '').includes('text/html')
+  );
+}
+
 export async function proxy(request: NextRequest) {
   const pathname = request.nextUrl.pathname;
 
@@ -52,6 +82,31 @@ export async function proxy(request: NextRequest) {
       loginUrl.searchParams.set('returnTo', returnTo);
     }
     return NextResponse.redirect(loginUrl);
+  }
+
+  // Cookie present but JWT expired (24h life vs the cookie's 30d): silently
+  // rotate via kenoby-sso and land back here — no 401 flash, no Retry loop.
+  // The refresh route whitelists *.trames.io returnTo values; on a dead
+  // refresh token it wipes the cookies and forwards to the SSO login itself,
+  // so there is no loop through this branch. Document navigations only.
+  if (isDocumentNav(request)) {
+    const token = request.cookies.get('trames-auth-session')!.value;
+    const expMs = jwtExpMs(token);
+    if (expMs !== null && expMs <= Date.now()) {
+      const sso = process.env.NEXT_PUBLIC_SSO_LOGIN_URL || 'https://login.trames.io';
+      const refreshUrl = new URL('/api/auth/refresh', sso);
+      // request.url reflects the INTERNAL origin behind nginx
+      // (https://localhost:3002/...) — build returnTo from the forwarded
+      // public host or kenoby bounces the user to localhost.
+      const host =
+        request.headers.get('x-forwarded-host') ?? request.headers.get('host');
+      const proto = request.headers.get('x-forwarded-proto') ?? 'https';
+      const returnTo = host
+        ? `${proto}://${host}${request.nextUrl.pathname}${request.nextUrl.search}`
+        : request.url;
+      refreshUrl.searchParams.set('returnTo', returnTo);
+      return NextResponse.redirect(refreshUrl);
+    }
   }
 
   return NextResponse.next();
