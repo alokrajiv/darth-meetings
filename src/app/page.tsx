@@ -20,7 +20,6 @@ import {
   CircleAlert,
 } from 'lucide-react';
 
-const SYNC_NUDGE_AFTER_DAYS = 5;
 const REMINDERS_COLLAPSED_KEY = 'mw-reminders-collapsed';
 
 export default function Home() {
@@ -119,23 +118,6 @@ export default function Home() {
       window.history.replaceState(null, '', `${window.location.pathname}${qs ? `?${qs}` : ''}`);
     }
   }, []);
-
-  // "Don't forget to sync" nudge: fetched once per visit; shows when the
-  // user has never run a Meet sync or their last one is getting stale.
-  const [lastSyncedAt, setLastSyncedAt] = useState<string | null | undefined>(undefined);
-  useEffect(() => {
-    fetch('/api/gmeet/sync-state')
-      .then((r) => (r.ok ? r.json() : null))
-      .then((data) => setLastSyncedAt(data ? (data.lastSyncedAt ?? null) : undefined))
-      .catch(() => {});
-  }, [refreshTrigger]);
-  const syncAgeDays =
-    lastSyncedAt === undefined
-      ? null // unknown yet — no nudge flash
-      : lastSyncedAt === null
-        ? Infinity
-        : Math.floor((Date.now() - new Date(lastSyncedAt).getTime()) / 86_400_000);
-  const showSyncNudge = syncAgeDays !== null && syncAgeDays >= SYNC_NUDGE_AFTER_DAYS;
 
   const handleTranscriptCreated = () => {
     setRefreshTrigger((prev) => prev + 1);
@@ -278,31 +260,6 @@ export default function Home() {
             setGmeetFocus({ meetingCode: m.meetingCode, eventStart: m.eventStart });
             setGmeetOpen(true);
           }}
-          toolbarExtra={
-            <>
-              {showSyncNudge && (
-                <div className="mr-1 flex items-center gap-1.5 rounded-md border border-primary/25 bg-primary/5 py-0.5 pl-2 pr-0.5 text-xs">
-                  <Video className="h-3.5 w-3.5 shrink-0 text-primary" />
-                  <span
-                    className="text-muted-foreground"
-                    title="Pull everything in so nothing gets forgotten."
-                  >
-                    {lastSyncedAt ? `Synced ${syncAgeDays}d ago` : 'Meet not synced'}
-                  </span>
-                  <Button
-                    size="sm"
-                    className="h-6 px-2 text-xs"
-                    onClick={() => {
-                      setGmeetSyncMode(true);
-                      setGmeetOpen(true);
-                    }}
-                  >
-                    Sync now
-                  </Button>
-                </div>
-              )}
-            </>
-          }
         />
       </main>
 

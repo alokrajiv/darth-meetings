@@ -15,6 +15,7 @@ import { Badge } from '@/components/ui/badge';
 import { Input } from '@/components/ui/input';
 import {
   formatBytes,
+  formatAgo,
   formatDuration,
   formatSmartDate,
   type TranscriptListRow,
@@ -753,6 +754,32 @@ export function TranscriptTable({
     if (!didCal) void fetchCalCountsRef.current();
   }, []);
 
+  // "Sync now": run one poller sweep for the caller (server-side, same code
+  // path and cache writes as the 30-minute background tick), then refetch the
+  // calendar layers. The `lastPollAt` chip is the freshness indicator for
+  // everything the calendar layers show.
+  const [manualSyncing, setManualSyncing] = useState(false);
+  const runManualCalSync = useCallback(async () => {
+    if (manualSyncing) return;
+    setManualSyncing(true);
+    try {
+      const res = await fetch('/api/calendar/sync', { method: 'POST' });
+      if (res.ok) {
+        const data = (await res.json()) as { lastPollAt: string | null };
+        setCalSync((prev) =>
+          prev
+            ? { ...prev, lastPollAt: data.lastPollAt ?? prev.lastPollAt, syncing: false }
+            : prev
+        );
+      }
+      silentRefetchCalendars();
+    } catch {
+      // transient — the chip simply keeps the old timestamp
+    } finally {
+      setManualSyncing(false);
+    }
+  }, [manualSyncing, silentRefetchCalendars]);
+
   /** A hide was confirmed from a calendar row's popover. */
   const handleMuteChanged = useCallback(() => {
     void fetchMutes();
@@ -1388,6 +1415,30 @@ export function TranscriptTable({
         )}
         {layerChip('norec', 'No recording')}
       </div>
+      {renderMerged && calConnected && calSync && (
+        <div className="mb-2 mt-0.5 flex items-center gap-0.5 text-[11px] text-muted-foreground">
+          <span
+            title="When your calendar and meeting artifacts were last swept from Google/Microsoft. The background sync runs every 30 minutes; the import dialog always checks live."
+          >
+            {manualSyncing
+              ? 'Syncing…'
+              : calSync.lastPollAt
+                ? `Cal synced ${formatAgo(calSync.lastPollAt)}`
+                : 'Calendar not synced yet'}
+          </span>
+          <Button
+            variant="ghost"
+            size="sm"
+            className="h-6 px-1.5 text-[11px]"
+            disabled={manualSyncing}
+            title="Sweep your calendar and meeting artifacts now"
+            onClick={() => void runManualCalSync()}
+          >
+            <RefreshCw className={`h-3 w-3 ${manualSyncing ? 'animate-spin' : ''}`} />
+            Sync
+          </Button>
+        </div>
+      )}
       {mutes.length > 0 && (
         <div className="relative mb-2 mt-0.5" ref={hiddenMenuRef}>
           <button
