@@ -459,6 +459,11 @@ export async function listRecordArtifacts(
   /** Transcript SESSIONS listed, generated or not — listed > 0 with no doc
    * ids = Google is still preparing the transcript Doc. */
   transcriptsListed: number;
+  /** True when either listing call failed (403/quota/network) — "we could
+   * not check" and "Google lists nothing" MUST read differently: callers
+   * that treat empty as terminal (deferred poller's 'gone', the dialog's
+   * "nothing to import") skip that verdict when this is set (D5). */
+  checkFailed: boolean;
   /** The verbatim API responses — callers that archive structured data keep
    * every field Google returns, not just what we shape today. */
   raw: { recordings?: unknown; transcripts?: unknown };
@@ -494,6 +499,7 @@ export async function listRecordArtifacts(
     recordings,
     transcriptDocIds,
     transcriptsListed: (trans?.transcripts ?? []).length,
+    checkFailed: recs === null || trans === null,
     raw: {
       recordings: recs ?? undefined,
       transcripts: trans ?? undefined,

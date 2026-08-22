@@ -1,6 +1,12 @@
 import 'server-only';
 import { sql } from '@/lib/db';
 import { SCHEMAS } from '@/lib/constants/database';
+import {
+  OCCURRENCE_WINDOW_MS,
+  type RecordingState,
+  type TranscriptSource,
+  type TranscriptState,
+} from '@/lib/meeting-evidence';
 
 // Poll-time metadata snapshot per meeting occurrence — see migration 017.
 // Display-only: never a source of content access. The poller fills rows
@@ -30,6 +36,14 @@ export interface GmeetMeetingCacheRow {
   ical_uid: string | null;
   organizer_email: string | null;
   captured_at: string;
+  // Classified evidence (migration 026) — computed by lib/meeting-evidence
+  // at write time; readers must NOT re-derive from the raw counts.
+  recordings_listed: number;
+  ready_recording_count: number;
+  transcripts_listed: number;
+  recording_state: RecordingState | null;
+  transcript_state: TranscriptState | null;
+  transcript_source: TranscriptSource;
 }
 
 const ROW_COLUMNS = sql`
@@ -38,7 +52,9 @@ const ROW_COLUMNS = sql`
   video_size::float8 AS video_size,
   video_duration_ms::float8 AS video_duration_ms,
   transcript_doc_ids, transcript_parseable, utterance_count, word_count,
-  speakers, recurring_event_id, ical_uid, organizer_email, captured_at
+  speakers, recurring_event_id, ical_uid, organizer_email, captured_at,
+  recordings_listed, ready_recording_count, transcripts_listed,
+  recording_state, transcript_state, transcript_source
 `;
 
 export async function getMeetingCacheByKeys(
@@ -53,11 +69,7 @@ export async function getMeetingCacheByKeys(
   return new Map(rows.map((r) => [r.event_key, r]));
 }
 
-/** Same ±12h occurrence window as findImportedByMeetingCodes — and for the
- * same reason: recurring meetings reuse one code, and two users' calendars
- * can render the same instant with different timezone strings, so exact
- * event_key equality is too brittle for cross-user lookups. */
-const OCCURRENCE_WINDOW_MS = 12 * 3600_000;
+// ±12h occurrence window: single declaration in lib/meeting-evidence.
 
 /**
  * Cache rows for a list of meeting occurrences, aligned by index (null =
@@ -138,13 +150,24 @@ export async function upsertMeetingCache(input: {
   /** Verbatim API payloads fetched this round — jsonb-merged into `raw`. */
   raw?: Record<string, unknown> | null;
   capturedBy?: string | null;
+  // Classified evidence — pass what this sweep proved; merge never regresses
+  // a state (states only advance: none → generating → partial/ready, and
+  // ready → unparseable once the Doc is probed).
+  recordingsListed?: number | null;
+  readyRecordingCount?: number | null;
+  transcriptsListed?: number | null;
+  recordingState?: RecordingState | null;
+  transcriptState?: TranscriptState | null;
+  transcriptSource?: TranscriptSource | null;
 }): Promise<void> {
   await sql`
     INSERT INTO ${sql(SCHEMA)}.gmeet_meeting_cache
       (event_key, meeting_code, event_start, conference_record, conf_start,
        conf_end, recording_count, video_file_id, video_size, video_duration_ms,
        transcript_doc_ids, transcript_parseable, utterance_count, word_count,
-       speakers, recurring_event_id, ical_uid, organizer_email, raw, captured_by)
+       speakers, recurring_event_id, ical_uid, organizer_email, raw, captured_by,
+       recordings_listed, ready_recording_count, transcripts_listed,
+       recording_state, transcript_state, transcript_source)
     VALUES
       (${input.eventKey}, ${input.meetingCode}, ${input.eventStart},
        ${input.conferenceRecord}, ${input.confStart ?? null}, ${input.confEnd ?? null},
@@ -157,7 +180,10 @@ export async function upsertMeetingCache(input: {
        ${input.recurringEventId ?? null}, ${input.iCalUID ?? null},
        ${input.organizerEmail ?? null},
        ${input.raw ? sql.json(input.raw as unknown as never) : null},
-       ${input.capturedBy ?? null})
+       ${input.capturedBy ?? null},
+       ${input.recordingsListed ?? 0}, ${input.readyRecordingCount ?? 0},
+       ${input.transcriptsListed ?? 0}, ${input.recordingState ?? null},
+       ${input.transcriptState ?? null}, ${input.transcriptSource ?? null})
     ON CONFLICT (event_key) DO UPDATE SET
       conference_record    = COALESCE(EXCLUDED.conference_record, gmeet_meeting_cache.conference_record),
       conf_start           = COALESCE(EXCLUDED.conf_start, gmeet_meeting_cache.conf_start),
@@ -178,6 +204,26 @@ export async function upsertMeetingCache(input: {
                                WHEN EXCLUDED.raw IS NULL THEN gmeet_meeting_cache.raw
                                ELSE COALESCE(gmeet_meeting_cache.raw, '{}'::jsonb) || EXCLUDED.raw
                              END,
+      recordings_listed     = GREATEST(EXCLUDED.recordings_listed, gmeet_meeting_cache.recordings_listed),
+      ready_recording_count = GREATEST(EXCLUDED.ready_recording_count, gmeet_meeting_cache.ready_recording_count),
+      transcripts_listed    = GREATEST(EXCLUDED.transcripts_listed, gmeet_meeting_cache.transcripts_listed),
+      recording_state = CASE
+        WHEN EXCLUDED.recording_state IS NULL THEN gmeet_meeting_cache.recording_state
+        WHEN gmeet_meeting_cache.recording_state IS NULL THEN EXCLUDED.recording_state
+        WHEN array_position(ARRAY['none','generating','partial','ready'], EXCLUDED.recording_state)
+           >= array_position(ARRAY['none','generating','partial','ready'], gmeet_meeting_cache.recording_state)
+          THEN EXCLUDED.recording_state
+        ELSE gmeet_meeting_cache.recording_state
+      END,
+      transcript_state = CASE
+        WHEN EXCLUDED.transcript_state IS NULL THEN gmeet_meeting_cache.transcript_state
+        WHEN gmeet_meeting_cache.transcript_state IS NULL THEN EXCLUDED.transcript_state
+        WHEN array_position(ARRAY['none','generating','ready','unparseable'], EXCLUDED.transcript_state)
+           >= array_position(ARRAY['none','generating','ready','unparseable'], gmeet_meeting_cache.transcript_state)
+          THEN EXCLUDED.transcript_state
+        ELSE gmeet_meeting_cache.transcript_state
+      END,
+      transcript_source    = COALESCE(EXCLUDED.transcript_source, gmeet_meeting_cache.transcript_source),
       updated_at           = now()
   `;
 }

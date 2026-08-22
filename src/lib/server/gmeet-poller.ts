@@ -32,6 +32,13 @@ import {
   type CalendarEventUpsert,
 } from '@/db-ops/calendar-event-cache';
 import {
+  classifyCalendarAttachments,
+  classifyEvidence,
+  classifyRecordings,
+  classifyTranscripts,
+  type ClassifiedAttachments,
+} from '@/lib/meeting-evidence';
+import {
   findTeamsJoinUrl,
   isOwnTenant,
   parseTeamsJoinLink,
@@ -94,6 +101,7 @@ interface CalEvent {
     responseStatus?: string;
     resource?: boolean;
   }>;
+  attachments?: Array<{ fileId?: string; title?: string; mimeType?: string }>;
   conferenceData?: {
     conferenceId?: string;
     conferenceSolution?: { key?: { type?: string } };
@@ -185,6 +193,7 @@ function toCalendarUpsert(e: CalEvent): CalendarEventUpsert {
   // the same code. External-tenant links count too — the import dialog's
   // guided manual panel is still the right click-through for those.
   const teamsInfo = isMeetEvent(e) ? null : teamsInfoOf(e);
+  const att = classifyCalendarAttachments(e.attachments);
   return {
     eventKey: `${e.id}|${e.start!.dateTime}`,
     eventId: e.id,
@@ -206,6 +215,10 @@ function toCalendarUpsert(e: CalEvent): CalendarEventUpsert {
       ...(a.displayName ? { displayName: a.displayName } : {}),
       ...(a.responseStatus ? { responseStatus: a.responseStatus } : {}),
     })),
+    attachmentVideoCount: att.videoCount,
+    attachmentVideoFileId: att.videoFileId,
+    attachmentTranscriptDocId: att.transcriptDocId,
+    attachmentGeminiNotes: att.geminiNotes,
   };
 }
 
@@ -228,21 +241,37 @@ async function captureMeetingMeta(
     meetingCode: string;
     eventStart: string | null;
     event: CalEvent;
-    recordName: string;
+    /** Null when the Meet record aged out / never existed but calendar
+     * attachments still prove artifacts (Gemini-notes-only meetings). */
+    recordName: string | null;
     artifacts: Awaited<ReturnType<typeof listRecordArtifacts>>;
+    /** Classified calendar attachments for the same event. */
+    attachments: ClassifiedAttachments;
     existing: GmeetMeetingCacheRow | undefined;
   }
 ): Promise<void> {
   const { eventKey, meetingCode, eventStart, event, recordName, artifacts, existing } = input;
-  const firstFileId = artifacts.recordings.find((r) => r.fileId)?.fileId ?? null;
-  const needConf = !existing?.conf_start;
+  const recEv = classifyRecordings(artifacts.recordings, input.attachments);
+  const trEvPre = classifyTranscripts({
+    docIds: artifacts.transcriptDocIds,
+    listed: artifacts.transcriptsListed,
+    attachments: input.attachments,
+  });
+  const docIds = trEvPre.docIds;
+  const firstFileId =
+    artifacts.recordings.find((r) => r.fileId)?.fileId ??
+    input.attachments.videoFileId ??
+    null;
+  const needConf = !!recordName && !existing?.conf_start;
   const needVideo = !!firstFileId && existing?.video_size == null;
-  const needParse = artifacts.transcriptDocIds.length > 0 && existing?.transcript_parseable == null;
+  const needParse = docIds.length > 0 && existing?.transcript_parseable == null;
   const needInventory =
     !existing ||
-    artifacts.recordings.length > existing.recording_count ||
+    recEv.listed > existing.recordings_listed ||
+    recEv.ready > existing.ready_recording_count ||
     (!!firstFileId && !existing.video_file_id) ||
-    (artifacts.transcriptDocIds.length > 0 && !existing.transcript_doc_ids?.length);
+    docIds.length > (existing.transcript_doc_ids?.length ?? 0) ||
+    trEvPre.listed > existing.transcripts_listed;
   if (!needConf && !needVideo && !needParse && !needInventory) return;
 
   // Everything structured the APIs hand back goes into `raw` verbatim —
@@ -283,7 +312,7 @@ async function captureMeetingMeta(
   let speakers: string[] | null = null;
   if (needParse) {
     try {
-      const parsed = await parseTranscriptDocs(token, artifacts.transcriptDocIds);
+      const parsed = await parseTranscriptDocs(token, docIds);
       parseable = parsed.utterances.length > 0;
       utteranceCount = parsed.utterances.length;
       wordCount = parsed.utterances.reduce(
@@ -298,6 +327,13 @@ async function captureMeetingMeta(
     }
   }
 
+  // Re-classify with the parse verdict folded in (ready → unparseable).
+  const trEv = classifyTranscripts({
+    docIds: artifacts.transcriptDocIds,
+    listed: artifacts.transcriptsListed,
+    parseable: parseable ?? existing?.transcript_parseable ?? null,
+    attachments: input.attachments,
+  });
   await upsertMeetingCache({
     eventKey,
     meetingCode,
@@ -305,12 +341,11 @@ async function captureMeetingMeta(
     conferenceRecord: recordName,
     confStart,
     confEnd,
-    recordingCount: artifacts.recordings.length,
+    recordingCount: recEv.listed,
     videoFileId: firstFileId,
     videoSize,
     videoDurationMs,
-    transcriptDocIds:
-      artifacts.transcriptDocIds.length > 0 ? artifacts.transcriptDocIds : null,
+    transcriptDocIds: docIds.length > 0 ? docIds : null,
     transcriptParseable: parseable,
     utteranceCount,
     wordCount,
@@ -320,6 +355,12 @@ async function captureMeetingMeta(
     organizerEmail: event.organizer?.email ?? null,
     raw: Object.keys(raw).length > 0 ? raw : null,
     capturedBy: input.userId,
+    recordingsListed: recEv.listed,
+    readyRecordingCount: recEv.ready,
+    transcriptsListed: trEv.listed,
+    recordingState: recEv.state,
+    transcriptState: trEv.state,
+    transcriptSource: trEv.source,
   });
 }
 
@@ -403,7 +444,7 @@ async function sweepUserTeams(
 
     const existing = cacheRows.get(key);
     let hasTranscript = existing?.transcript_parseable === true;
-    let hasRecording = (existing?.recording_count ?? 0) > 0;
+    let hasRecording = (existing?.ready_recording_count ?? 0) > 0;
     // Artifacts are immutable once present — only hit Graph while one is
     // still missing (recordings routinely land minutes after transcripts).
     if (!hasTranscript || !hasRecording) {
@@ -454,6 +495,12 @@ async function sweepUserTeams(
             picked.transcript?.createdDateTime ?? picked.recording?.createdDateTime ?? null,
           confEnd: picked.transcript?.endDateTime ?? picked.recording?.endDateTime ?? null,
           recordingCount: picked.recording ? 1 : 0,
+          recordingsListed: picked.recording ? 1 : 0,
+          readyRecordingCount: picked.recording ? 1 : 0,
+          transcriptsListed: picked.transcript ? 1 : 0,
+          recordingState: picked.recording ? 'ready' : 'none',
+          transcriptState: picked.transcript ? 'ready' : 'none',
+          transcriptSource: picked.transcript ? 'teams' : null,
           transcriptParseable: hasTranscript ? true : null,
           recurringEventId: e.recurringEventId ?? null,
           iCalUID: e.iCalUID ?? null,
@@ -548,13 +595,30 @@ async function sweepUser(account: GoogleAccountRow): Promise<void> {
       continue;
     }
     // Meeting artifacts only appear a while after the call ends; re-checked
-    // every poll until the event ages out of the window.
+    // every poll until the event ages out of the window. Calendar attachments
+    // (recording videos, the Transcript / Gemini-notes Doc) count as evidence
+    // too — they are the ONLY evidence once the Meet record ages out, and the
+    // only evidence Gemini-notes-only meetings ever get (D1).
+    const att = classifyCalendarAttachments(e.attachments);
     const recordName = await findConferenceRecordName(token, code, startIso ?? undefined);
-    if (!recordName) continue; // never held or nothing captured — nothing to nag about
-    const artifacts = await listRecordArtifacts(token, recordName);
-    const hasRecording = artifacts.recordings.length > 0;
-    const hasTranscript = artifacts.transcriptDocIds.length > 0;
-    if (!hasRecording && !hasTranscript) continue;
+    const artifacts = recordName
+      ? await listRecordArtifacts(token, recordName)
+      : {
+          recordings: [],
+          transcriptDocIds: [],
+          transcriptsListed: 0,
+          checkFailed: false,
+          raw: {},
+        };
+    const recEv = classifyRecordings(artifacts.recordings, att);
+    const trEv = classifyTranscripts({
+      docIds: artifacts.transcriptDocIds,
+      listed: artifacts.transcriptsListed,
+      attachments: att,
+    });
+    const verdict = classifyEvidence({ recording: recEv, transcript: trEv });
+    // Nothing held / nothing captured / nothing attached — nothing to track.
+    if (!verdict.importable) continue;
     try {
       await captureMeetingMeta(token, {
         userId,
@@ -564,11 +628,18 @@ async function sweepUser(account: GoogleAccountRow): Promise<void> {
         event: e,
         recordName,
         artifacts,
+        attachments: att,
         existing: cacheRows.get(key),
       });
     } catch (err) {
       console.warn('[gmeet-poller] meta capture failed for', key, err);
     }
+    // Remind only once something is actually materialized — a still-
+    // generating artifact will be ready by a later sweep; nagging early
+    // invites a doomed import click.
+    const hasRecording = verdict.hasRecording;
+    const hasTranscript = verdict.hasTranscript;
+    if (!hasRecording && !hasTranscript) continue;
     await upsertReminder({
       userId,
       kind: 'unimported',

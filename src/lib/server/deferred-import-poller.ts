@@ -293,9 +293,13 @@ async function checkRow(row: {
   if (!readyAtQueue) {
     const artifacts = await listRecordArtifacts(minted.token, recordName!);
     readyVideo = artifacts.recordings.find((r) => r.fileId)?.fileId ?? null;
-    const videoGone = artifacts.recordings.length === 0;
+    // "gone" verdicts are TERMINAL — never issue one off a failed listing
+    // call (D5): a 403/quota blip used to read as "Google stopped listing
+    // it" and killed a perfectly good deferred import. A failed check just
+    // means "not ready yet, ask again next tick".
+    const videoGone = artifacts.recordings.length === 0 && !artifacts.checkFailed;
     const transcriptReady = artifacts.transcriptDocIds.length > 0;
-    const transcriptGone = artifacts.transcriptsListed === 0;
+    const transcriptGone = artifacts.transcriptsListed === 0 && !artifacts.checkFailed;
 
     let ready = false;
     let terminalError: string | null = null;

@@ -38,6 +38,8 @@ import {
 import { MeetLogo, TeamsLogo } from '@/components/provider-icon';
 import { requestMediaUpload } from '@/components/audio-upload';
 
+import { classifyCalendarAttachments, classifyRecordings } from '@/lib/meeting-evidence';
+
 const MEET_API = 'https://meet.googleapis.com/v2';
 
 // Teams meetings scheduled from Google Calendar (GSuite add-on) carry the
@@ -174,7 +176,13 @@ interface MeetingMeta {
   conferenceRecord: string | null;
   confStart: string | null;
   confEnd: string | null;
+  /** Entries Google LISTED — files or not; use readyRecordingCount for
+   * "recording you can actually pull" (D4). */
   recordingCount: number;
+  readyRecordingCount?: number;
+  recordingState?: string | null;
+  transcriptState?: string | null;
+  transcriptSource?: string | null;
   videoFileId: string | null;
   videoSize: number | null;
   videoDurationMs: number | null;
@@ -256,30 +264,22 @@ function shiftDate(dateStr: string, days: number): string {
   return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
 }
 
+/** Thin adapter over the ONE shared rule set (lib/meeting-evidence) — the
+ * dialog renders attachment objects, so map the classified ids back. */
 function classifyAttachments(atts: CalendarAttachment[] | undefined): {
   video: CalendarAttachment | null;
   transcriptDoc: CalendarAttachment | null;
   geminiNotes: CalendarAttachment | null;
   videoCount: number;
 } {
-  let video: CalendarAttachment | null = null;
-  let transcriptDoc: CalendarAttachment | null = null;
-  let geminiNotes: CalendarAttachment | null = null;
-  let videoCount = 0;
-  for (const a of atts ?? []) {
-    if (!a.fileId) continue;
-    if (a.mimeType?.startsWith('video/')) {
-      videoCount++;
-      if (!video) video = a;
-    } else if (a.mimeType === 'application/vnd.google-apps.document') {
-      if (/gemini/i.test(a.title ?? '')) {
-        if (!geminiNotes) geminiNotes = a;
-      } else if (/transcript/i.test(a.title ?? '')) {
-        if (!transcriptDoc) transcriptDoc = a;
-      }
-    }
-  }
-  return { video, transcriptDoc, geminiNotes, videoCount };
+  const c = classifyCalendarAttachments(atts);
+  const byId = (id: string | null) => (id ? (atts?.find((a) => a.fileId === id) ?? null) : null);
+  return {
+    video: byId(c.videoFileId),
+    transcriptDoc: c.geminiNotes ? null : byId(c.transcriptDocId),
+    geminiNotes: c.geminiNotes ? byId(c.transcriptDocId) : null,
+    videoCount: c.videoCount,
+  };
 }
 
 function fmtEventTime(e: CalendarEvent): string {
@@ -442,6 +442,9 @@ async function recordArtifacts(
   transcriptDocId: string | null;
   videoPending: boolean;
   transcriptPending: boolean;
+  /** A listing call failed — "couldn't check" must NOT read as "nothing to
+   * import" (the old behaviour greyed real meetings out on a quota blip). */
+  checkFailed: boolean;
 }> {
   const auth = { headers: { Authorization: `Bearer ${token}` } };
   const [recRes, transRes] = await Promise.all([
@@ -452,21 +455,28 @@ async function recordArtifacts(
     ? ((await recRes.json()) as {
         recordings?: Array<{ state?: string; driveDestination?: { file?: string } }>;
       })
-    : {};
+    : null;
   const trans = transRes.ok
     ? ((await transRes.json()) as {
         transcripts?: Array<{ state?: string; docsDestination?: { document?: string } }>;
       })
-    : {};
-  const recordings = recs.recordings ?? [];
-  const transcripts = trans.transcripts ?? [];
+    : null;
+  const recordings = recs?.recordings ?? [];
+  const transcripts = trans?.transcripts ?? [];
+  const rec = classifyRecordings(
+    recordings.map((r) => ({ fileId: r.driveDestination?.file ?? null }))
+  );
   return {
-    videoFileId: recordings.find((r) => r.driveDestination?.file)?.driveDestination?.file ?? null,
+    videoFileId: rec.fileIds[0] ?? null,
     transcriptDocId:
       transcripts.find((t) => t.docsDestination?.document)?.docsDestination?.document ?? null,
-    videoPending: recordings.length > 0 && !recordings.some((r) => r.driveDestination?.file),
+    // Server-consistent: ANY listed-but-missing file means generation is
+    // still running (partial recordings keep the poller polling), matching
+    // gmeet-import-core / recording-poller instead of contradicting them.
+    videoPending: rec.state === 'generating' || rec.state === 'partial',
     transcriptPending:
       transcripts.length > 0 && !transcripts.some((t) => t.docsDestination?.document),
+    checkFailed: recs === null || trans === null,
   };
 }
 
@@ -776,7 +786,7 @@ export function GmeetImportDialog({
             transcriptDocId: rec.transcriptDocId,
             videoPending: rec.videoPending,
             transcriptPending: rec.transcriptPending,
-            checked: true,
+            checked: !rec.checkFailed,
           };
           const target = rec.code
             ? evRows.find((row) => row.event.conferenceData?.conferenceId === rec.code)
@@ -888,7 +898,7 @@ export function GmeetImportDialog({
             transcriptDocId: rec.transcriptDocId,
             videoPending: rec.videoPending,
             transcriptPending: rec.transcriptPending,
-            checked: true,
+            checked: !rec.checkFailed,
           };
           // Join ONLY by exact meeting code. No time-overlap guessing: a
           // moved calendar event once matched a neighbouring slot's record
@@ -1185,8 +1195,12 @@ export function GmeetImportDialog({
         }
         // Live check is authoritative for the pending state either way —
         // this is also how a re-check clears a stale "still preparing".
-        videoPending = found.videoPending;
-        transcriptPending = found.transcriptPending;
+        // Unless the check itself FAILED (quota/403): keep the prior state
+        // rather than letting a blip read as "nothing to import" (D5).
+        if (!found.checkFailed) {
+          videoPending = found.videoPending;
+          transcriptPending = found.transcriptPending;
+        }
       }
 
       let videoName: string | null = null;
@@ -1927,7 +1941,8 @@ export function GmeetImportDialog({
                       : !!(
                           row.video ||
                           row.meet?.videoFileId ||
-                          (meta?.recordingCount ?? 0) > 0
+                          meta?.videoFileId || // attachment-video-only rows
+                          (meta?.readyRecordingCount ?? 0) > 0
                         );
                     const hasTranscript = isTeams
                       ? teams?.meta?.hasTranscript === true

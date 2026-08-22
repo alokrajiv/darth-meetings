@@ -41,6 +41,11 @@ export interface CalendarMeetingRow {
   hasTranscript: boolean;
   recordingCount: number;
   transcriptParseable: boolean | null;
+  /** Artifact listed at the provider but the file isn't generated yet. */
+  recordingPreparing: boolean;
+  transcriptPreparing: boolean;
+  /** Transcript is the Gemini-notes Doc (calendar attachment). */
+  geminiNotes: boolean;
   organizerEmail: string | null;
   organizerSelf: boolean | null;
   provider: 'gmeet' | 'teams';
@@ -130,6 +135,9 @@ function toRow(
     hasTranscript: r.has_transcript,
     recordingCount: r.recording_count,
     transcriptParseable: r.transcript_parseable,
+    recordingPreparing: r.recording_preparing,
+    transcriptPreparing: r.transcript_preparing,
+    geminiNotes: r.gemini_notes,
     organizerEmail: r.organizer_email,
     organizerSelf: r.organizer_self,
     provider: r.provider,

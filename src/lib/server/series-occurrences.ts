@@ -1,4 +1,9 @@
 import 'server-only';
+import {
+  classifyCalendarAttachments,
+  classifyRecordings,
+  classifyTranscripts,
+} from '@/lib/meeting-evidence';
 import { sql } from '@/lib/db';
 import { SCHEMAS } from '@/lib/constants/database';
 import { getServerAccessToken } from '@/lib/server/google-oauth';
@@ -198,16 +203,14 @@ function classifyAttachments(e: CalInstance): {
   transcriptDocId: string | null;
   geminiNotes: boolean;
 } {
-  const atts = e.attachments ?? [];
-  const video = atts.find((a) => /^video\//.test(a.mimeType ?? ''));
-  const docs = atts.filter((a) => a.mimeType === 'application/vnd.google-apps.document' && a.fileId);
-  const transcriptDoc = docs.find((a) => /transcript\s*$/i.test(a.title ?? ''));
-  const geminiDoc = docs.find((a) => /gemini/i.test(a.title ?? ''));
-  const doc = transcriptDoc ?? geminiDoc ?? null;
+  // ONE shared rule set (lib/meeting-evidence) — this used to anchor
+  // /transcript\s*$/i while the dialog matched anywhere, so "Transcript of
+  // X" was a transcript in one surface and nothing in the other (D7).
+  const c = classifyCalendarAttachments(e.attachments);
   return {
-    videoFileId: video?.fileId ?? null,
-    transcriptDocId: doc?.fileId ?? null,
-    geminiNotes: !transcriptDoc && Boolean(geminiDoc),
+    videoFileId: c.videoFileId,
+    transcriptDocId: c.transcriptDocId,
+    geminiNotes: c.geminiNotes,
   };
 }
 
@@ -532,15 +535,27 @@ async function computeSweepSkeleton(
         batch.forEach((rec, j) => {
           const inv = inventories[j]!;
           if (!rec.startTime) return;
-          const hasRec = inv.recordings.length > 0;
-          const hasTr = inv.transcriptsListed > 0;
+          // Shared classifiers + the same 24h aging as the listing's
+          // evidencePresent(): a listed-but-never-generated artifact used to
+          // count "importable" here FOREVER (and series auto-import fired
+          // doomed imports at it) while the listing aged it out.
+          const recEv = classifyRecordings(inv.recordings);
+          const trEv = classifyTranscripts({
+            docIds: inv.transcriptDocIds,
+            listed: inv.transcriptsListed,
+          });
+          const fresh = Date.now() - Date.parse(rec.startTime) < 24 * 3600_000;
+          const hasRec =
+            recEv.ready > 0 || (fresh && recEv.state === 'generating');
+          const hasTr =
+            trEv.state === 'ready' || (fresh && trEv.state === 'generating');
           if (!hasRec && !hasTr) return;
-          const fileId = inv.recordings.find((r) => r.fileId)?.fileId ?? null;
-          const docId = inv.transcriptDocIds[0] ?? null;
+          const fileId = recEv.fileIds[0] ?? null;
+          const docId = trEv.docIds[0] ?? null;
           const meet = {
             recordName: rec.name,
-            videoPending: hasRec && !fileId,
-            transcriptPending: hasTr && !docId,
+            videoPending: recEv.state === 'generating' || recEv.state === 'partial',
+            transcriptPending: trEv.state === 'generating',
           };
           const recStart = Date.parse(rec.startTime);
           // Nearest calendar instance of the same code within half a day

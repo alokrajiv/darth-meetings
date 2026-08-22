@@ -41,6 +41,13 @@ function statusGlyph(r: CalendarMeetingRow) {
       </span>
     );
   }
+  if (r.recordingPreparing || r.transcriptPreparing) {
+    return (
+      <span title="Google is still preparing the recording/transcript" className="shrink-0">
+        <Video className="h-3.5 w-3.5 animate-pulse text-amber-500" />
+      </span>
+    );
+  }
   return (
     <span title="No recording" className="shrink-0">
       <VideoOff className="h-3.5 w-3.5 text-muted-foreground/40" />
@@ -316,7 +323,9 @@ function EventGearMenu({
                 ? ` · recording ×${r.recordingCount}`
                 : r.hasTranscript
                   ? ' · transcript only'
-                  : ' · no artifacts'}
+                  : r.recordingPreparing || r.transcriptPreparing
+                    ? ' · preparing…'
+                    : ' · no artifacts'}
             </p>
             {r.recurringEventId && (
               <p>
@@ -495,6 +504,31 @@ export function CalendarEventRow({
                   destination="the transcript Doc in Google Docs"
                   className="shrink-0 text-[10px]"
                 />
+              )}
+              {!r.hasRecording && r.recordingPreparing && (
+                <Badge
+                  variant="outline"
+                  className="shrink-0 border-amber-500/50 text-[10px] text-amber-600 dark:text-amber-500"
+                >
+                  recording preparing…
+                </Badge>
+              )}
+              {!r.hasTranscript && r.transcriptPreparing && (
+                <Badge
+                  variant="outline"
+                  className="shrink-0 border-amber-500/50 text-[10px] text-amber-600 dark:text-amber-500"
+                >
+                  transcript preparing…
+                </Badge>
+              )}
+              {r.hasTranscript && r.geminiNotes && (
+                <Badge
+                  variant="outline"
+                  title="Transcript lives in the Gemini-notes Doc attached to the calendar event"
+                  className="shrink-0 text-[10px] text-muted-foreground"
+                >
+                  Gemini notes
+                </Badge>
               )}
               {r.transcriptParseable === false && (
                 <ArtifactBadge

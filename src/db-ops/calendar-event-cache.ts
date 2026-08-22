@@ -1,6 +1,7 @@
 import 'server-only';
 import { sql } from '@/lib/db';
 import { SCHEMAS } from '@/lib/constants/database';
+import { OCCURRENCE_WINDOW_S } from '@/lib/meeting-evidence';
 
 // Per-user calendar event cache (migration 022) + the paged queries behind
 // GET /api/calendar-meetings. The poller batch-upserts EVERY timed event
@@ -15,8 +16,7 @@ import { SCHEMAS } from '@/lib/constants/database';
 
 const SCHEMA = SCHEMAS.MEETING_WHISPERER;
 
-/** Same ±12h occurrence window as findImportedByMeetingCodes (gmeet-sync). */
-const OCCURRENCE_WINDOW_S = 12 * 3600;
+// ±12h occurrence window: single declaration in lib/meeting-evidence.
 
 export interface CalendarEventAttendee {
   email: string;
@@ -40,6 +40,13 @@ export interface CalendarEventUpsert {
   organizerSelf: boolean | null;
   attendeeCount: number | null;
   attendees: CalendarEventAttendee[] | null;
+  // Classified calendar attachments (lib/meeting-evidence) — the only
+  // artifact evidence that outlives the Meet record's ~30d retention, and
+  // the only evidence Gemini-notes-only meetings ever get (D1).
+  attachmentVideoCount: number;
+  attachmentVideoFileId: string | null;
+  attachmentTranscriptDocId: string | null;
+  attachmentGeminiNotes: boolean;
 }
 
 /**
@@ -59,15 +66,21 @@ export async function upsertCalendarEvents(
     INSERT INTO ${sql(SCHEMA)}.calendar_event_cache
       (user_id, event_key, event_id, recurring_event_id, ical_uid, title,
        event_start, event_end, meeting_code, organizer_email, organizer_self,
-       attendee_count, attendees)
+       attendee_count, attendees, attachment_video_count,
+       attachment_video_file_id, attachment_transcript_doc_id,
+       attachment_gemini_notes)
     SELECT ${userId}, e."eventKey", e."eventId", e."recurringEventId", e."iCalUID",
            e.title, e."eventStart", e."eventEnd", e."meetingCode",
-           e."organizerEmail", e."organizerSelf", e."attendeeCount", e.attendees
+           e."organizerEmail", e."organizerSelf", e."attendeeCount", e.attendees,
+           COALESCE(e."attachmentVideoCount", 0), e."attachmentVideoFileId",
+           e."attachmentTranscriptDocId", COALESCE(e."attachmentGeminiNotes", false)
     FROM jsonb_to_recordset(${sql.json(batch as unknown as never)}) AS e(
       "eventKey" text, "eventId" text, "recurringEventId" text, "iCalUID" text,
       title text, "eventStart" timestamptz, "eventEnd" timestamptz,
       "meetingCode" text, "organizerEmail" text, "organizerSelf" boolean,
-      "attendeeCount" int, attendees jsonb
+      "attendeeCount" int, attendees jsonb, "attachmentVideoCount" int,
+      "attachmentVideoFileId" text, "attachmentTranscriptDocId" text,
+      "attachmentGeminiNotes" boolean
     )
     ON CONFLICT (user_id, event_key) DO UPDATE SET
       title              = EXCLUDED.title,
@@ -79,6 +92,11 @@ export async function upsertCalendarEvents(
       ical_uid           = COALESCE(EXCLUDED.ical_uid, calendar_event_cache.ical_uid),
       organizer_email    = COALESCE(EXCLUDED.organizer_email, calendar_event_cache.organizer_email),
       organizer_self     = COALESCE(EXCLUDED.organizer_self, calendar_event_cache.organizer_self),
+      -- Attachments accrue after the call; a later sweep only ever adds.
+      attachment_video_count = GREATEST(EXCLUDED.attachment_video_count, calendar_event_cache.attachment_video_count),
+      attachment_video_file_id = COALESCE(EXCLUDED.attachment_video_file_id, calendar_event_cache.attachment_video_file_id),
+      attachment_transcript_doc_id = COALESCE(EXCLUDED.attachment_transcript_doc_id, calendar_event_cache.attachment_transcript_doc_id),
+      attachment_gemini_notes = (EXCLUDED.attachment_gemini_notes OR calendar_event_cache.attachment_gemini_notes),
       last_seen_at       = now()
   `;
 }
@@ -146,6 +164,28 @@ export async function listCalendarEventMutes(
 
 export type CalendarMeetingView = 'unimported' | 'norec';
 
+/**
+ * THE artifact-evidence predicate (D3): the unimported WHERE, the norec
+ * anti-join and the SELECT display columns must all agree or a meeting shows
+ * under the wrong label (or in both views / neither). Ready evidence counts
+ * always; a still-'generating' artifact counts only while the meeting is
+ * fresh (<24h) — the listing labels those "preparing…" instead of lying with
+ * "No recording"; a generation that never materialized ages out silently.
+ */
+function evidencePresent(alias: string): ReturnType<typeof sql> {
+  const a = sql(alias);
+  return sql`(
+    ${a}.ready_recording_count > 0
+    OR ${a}.video_file_id IS NOT NULL
+    OR COALESCE(jsonb_array_length(${a}.transcript_doc_ids), 0) > 0
+    OR ${a}.transcript_parseable IS TRUE
+    OR (
+      (${a}.recording_state = 'generating' OR ${a}.transcript_state = 'generating')
+      AND COALESCE(${a}.event_start, ${a}.conf_start) > now() - interval '24 hours'
+    )
+  )`;
+}
+
 export interface CalendarMeetingDbRow {
   day_key: string;
   key: string;
@@ -158,6 +198,11 @@ export interface CalendarMeetingDbRow {
   has_transcript: boolean;
   recording_count: number;
   transcript_parseable: boolean | null;
+  /** Provider lists the artifact but the file isn't generated yet (<24h). */
+  recording_preparing: boolean;
+  transcript_preparing: boolean;
+  /** Transcript comes from the Gemini-notes Doc (calendar attachment). */
+  gemini_notes: boolean;
   organizer_email: string | null;
   organizer_self: boolean | null;
   attendee_count: number | null;
@@ -255,12 +300,7 @@ function unimportedMuteExclusion(userId: string): ReturnType<typeof sql> {
 function unimportedWhere(userId: string, opts: CalendarRangeOpts): ReturnType<typeof sql> {
   return sql`
     WHERE COALESCE(c.event_start, c.conf_start) IS NOT NULL
-      -- transcript_parseable covers Teams rows: their transcripts live at
-      -- Microsoft, so there are no Doc ids — without it a transcript-only
-      -- Teams meeting never surfaces as importable.
-      AND (c.recording_count > 0
-        OR COALESCE(jsonb_array_length(c.transcript_doc_ids), 0) > 0
-        OR c.transcript_parseable IS TRUE)
+      AND ${evidencePresent('c')}
       AND NOT EXISTS (
         SELECT 1 FROM ${sql(SCHEMA)}.transcripts t
         WHERE t.deleted_at IS NULL
@@ -274,6 +314,20 @@ function unimportedWhere(userId: string, opts: CalendarRangeOpts): ReturnType<ty
           AND abs(extract(epoch FROM (
                 ${IMPORT_OCCURRENCE} - COALESCE(c.event_start, c.conf_start)
               ))) <= ${OCCURRENCE_WINDOW_S}
+      )
+      -- Uploads / pasted transcripts link by calendar eventId, not meeting
+      -- code (D9) — resolve through the caller's own calendar row for the
+      -- occurrence, mirroring norecWhere's eventId anti-join.
+      AND NOT EXISTS (
+        SELECT 1
+        FROM ${sql(SCHEMA)}.calendar_event_cache ce
+        JOIN ${sql(SCHEMA)}.transcripts t ON t.gmeet_context->>'eventId' = ce.event_id
+        WHERE ce.user_id = ${userId}
+          AND ce.meeting_code = c.meeting_code
+          AND abs(extract(epoch FROM (
+                ce.event_start - COALESCE(c.event_start, c.conf_start)
+              ))) <= ${OCCURRENCE_WINDOW_S}
+          AND t.deleted_at IS NULL
       )
       ${unimportedMuteExclusion(userId)}
       ${dayFilters(unimportedDay(opts.tz), opts)}
@@ -294,12 +348,7 @@ function norecWhere(userId: string, opts: CalendarRangeOpts): ReturnType<typeof 
       AND (c.meeting_code IS NULL OR NOT EXISTS (
         SELECT 1 FROM ${sql(SCHEMA)}.gmeet_meeting_cache g
         WHERE g.meeting_code = c.meeting_code
-          -- transcript_parseable covers Teams cache rows, whose transcripts
-          -- have no Doc ids (must mirror unimportedWhere or a meeting shows
-          -- in both views / neither).
-          AND (g.recording_count > 0
-            OR COALESCE(jsonb_array_length(g.transcript_doc_ids), 0) > 0
-            OR g.transcript_parseable IS TRUE)
+          AND ${evidencePresent('g')}
           AND abs(extract(epoch FROM (
                 COALESCE(g.event_start, g.conf_start) - c.event_start
               ))) <= ${OCCURRENCE_WINDOW_S}
@@ -377,10 +426,18 @@ async function unimportedRows(
         extract(epoch FROM (c.conf_end - c.conf_start)),
         c.video_duration_ms / 1000.0
       )::float8 AS duration_secs,
-      (c.recording_count > 0) AS has_recording,
-      (COALESCE(jsonb_array_length(c.transcript_doc_ids), 0) > 0) AS has_transcript,
+      (c.ready_recording_count > 0 OR c.video_file_id IS NOT NULL) AS has_recording,
+      (COALESCE(jsonb_array_length(c.transcript_doc_ids), 0) > 0
+        OR c.transcript_parseable IS TRUE) AS has_transcript,
       c.recording_count,
       c.transcript_parseable,
+      (c.recording_state = 'generating'
+        AND COALESCE(c.event_start, c.conf_start) > now() - interval '24 hours')
+        AS recording_preparing,
+      (c.transcript_state = 'generating'
+        AND COALESCE(c.event_start, c.conf_start) > now() - interval '24 hours')
+        AS transcript_preparing,
+      (c.transcript_source = 'gemini') AS gemini_notes,
       COALESCE(c.organizer_email, cal.organizer_email) AS organizer_email,
       COALESCE(cal.organizer_self, lower(c.organizer_email) = ${caller.email.toLowerCase()}) AS organizer_self,
       cal.attendee_count,
@@ -466,6 +523,9 @@ async function norecRows(
       false AS has_transcript,
       0 AS recording_count,
       NULL::boolean AS transcript_parseable,
+      false AS recording_preparing,
+      false AS transcript_preparing,
+      false AS gemini_notes,
       NULL::text AS video_file_id,
       NULL::text AS transcript_doc_id,
       c.organizer_email,

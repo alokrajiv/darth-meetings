@@ -82,7 +82,7 @@ export const POST = withAuth(async ({ user, request }) => {
       meta: cache
         ? {
             hasTranscript: cache.transcript_parseable === true,
-            hasRecording: cache.recording_count > 0,
+            hasRecording: cache.ready_recording_count > 0,
             utteranceCount: cache.utterance_count,
             wordCount: cache.word_count,
             speakers: cache.speakers,

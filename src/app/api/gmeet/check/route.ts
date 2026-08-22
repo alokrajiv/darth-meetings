@@ -73,6 +73,12 @@ export const POST = withAuth(async ({ user, request }) => {
       utteranceCount: number | null;
       wordCount: number | null;
       speakerCount: number | null;
+      /** Classified evidence (migration 026) — prefer these over raw counts:
+       * recordingCount counts listed entries, files or not (D4). */
+      readyRecordingCount: number;
+      recordingState: string | null;
+      transcriptState: string | null;
+      transcriptSource: string | null;
     }
   > = {};
   meetings.forEach((m, i) => {
@@ -103,6 +109,10 @@ export const POST = withAuth(async ({ user, request }) => {
         utteranceCount: c.utterance_count,
         wordCount: c.word_count,
         speakerCount: c.speakers?.length ?? null,
+        readyRecordingCount: c.ready_recording_count,
+        recordingState: c.recording_state,
+        transcriptState: c.transcript_state,
+        transcriptSource: c.transcript_source,
       };
     }
   });
