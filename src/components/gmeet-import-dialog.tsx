@@ -54,8 +54,6 @@ import type {
 // /api/meet/evidence, which run under the caller's own server-minted token
 // and WRITE BACK to the shared caches, so a visit here feeds the listing and
 // the poller. The browser token is still used for the import call itself.
-// The previous browser-Google implementation is gmeet-import-dialog-legacy.tsx
-// (behind a flag for one deploy).
 
 type CalendarEvent = DiscoveredEvent;
 type EventRow = DiscoveredRow;

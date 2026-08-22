@@ -7,10 +7,8 @@ Analysis date: 2026-08-22 (HEAD 4a50246). Prod numbers queried the same day.
 > D6/D8/D10/D12 + the Recording ×N chip: the commit after a736c24 (see
 > "As built" at the end of this doc). D1–D12 all closed. Deployed + prod
 > E2E'd (discover / records / evidence routes, series, listing, DB
-> write-back). The pre-Phase-2 browser dialog is kept for ONE deploy as
-> `gmeet-import-dialog-legacy.tsx` behind `NEXT_PUBLIC_MEET_DIALOG_LEGACY=1`
-> / `localStorage mw:legacyMeetDialog=1` / `?meetLegacy=1` — delete it (and
-> `useLegacyMeetDialog` in page.tsx) next deploy.
+> write-back). The pre-Phase-2 browser dialog was removed the same day (it
+> lived one deploy behind a flag; history has it at 03a02c8 if ever needed).
 
 ## Trigger
 
