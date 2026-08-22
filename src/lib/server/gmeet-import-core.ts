@@ -8,6 +8,7 @@ import {
   mergeGmeetContextForUser,
   setRecordedAtForUser,
 } from '@/db-ops/transcripts';
+import { noteEmptyTranscriptDoc } from '@/db-ops/empty-transcripts';
 import { autoShareToInternalInvitees } from '@/lib/server/auto-share';
 import { findImportedByMeetingCodes } from '@/db-ops/gmeet-sync';
 import { registerPeopleFromMeeting } from '@/lib/server/import-helpers';
@@ -108,6 +109,33 @@ export interface ExecuteOptions {
 }
 
 const out = (status: number, body: Record<string, unknown>): ImportOutcome => ({ status, body });
+
+/**
+ * 422 for a transcript Doc Google produced with no captured speech. Noted in
+ * the empty-Doc ledger so the series sweep stops offering it; `emptyTranscript`
+ * lets clients treat it as "nothing to import" rather than a failure.
+ */
+async function emptyTranscriptOutcome(input: {
+  docId: string;
+  endedAfter: string;
+  user: ImportUser;
+  event: ImportBody['event'];
+  title?: string | null;
+}): Promise<ImportOutcome> {
+  await noteEmptyTranscriptDoc({
+    docId: input.docId,
+    meetingCode: input.event?.meetingCode,
+    eventId: input.event?.id,
+    occStart: input.event?.startTime,
+    title: input.title ?? input.event?.title,
+    endedAfter: input.endedAfter,
+    notedBy: input.user.userId,
+  }).catch((err) => console.warn('[gmeet/import] empty-doc note failed:', err));
+  return out(422, {
+    error: `Google's transcript for this meeting is empty — the Transcript tab only says "Transcription ended after ${input.endedAfter}" (no speech was captured / not enough conversation). Nothing to import.`,
+    emptyTranscript: true,
+  });
+}
 
 /**
  * Cross-user duplicate check by meeting code + occurrence start. Returns a
@@ -683,6 +711,25 @@ export async function executeGmeetImport(
         if (conflictOut) return conflictOut;
       }
     }
+    // Probe the Doc NOW (one export, ~0.5s): Gemini attaches a Doc even when
+    // the meeting had no conversation, and queueing that would only produce
+    // a failed row minutes later. Empty → noted + 422 here, no row at all.
+    // A Google hiccup on the probe is not a verdict — fall through and let
+    // the poller find out.
+    try {
+      const probe = await parseTranscriptDocs(accessToken!, [effectiveDocId]);
+      if (probe.utterances.length === 0 && probe.endedAfter) {
+        return await emptyTranscriptOutcome({
+          docId: effectiveDocId,
+          endedAfter: probe.endedAfter,
+          user,
+          event,
+          title,
+        });
+      }
+    } catch (err) {
+      console.warn('[gmeet/import] queue-time Doc probe failed (queueing anyway):', err);
+    }
     const placeholderId = `defer-${randomUUID()}`;
     const { recordingPending: _dropped, ...ctxForPlaceholder } = baseContext;
     void _dropped;
@@ -775,10 +822,23 @@ export async function executeGmeetImport(
       }
     }
     if (mode === 'transcript' && (!parsed || parsed.utterances.length === 0)) {
+      if (parsed?.endedAfter && effectiveDocId) {
+        // A queued placeholder for an empty Doc must not linger as a failed
+        // row — the ledger + sweep now carry the outcome.
+        if (opts?.placeholderAssemblyaiId) {
+          await deleteForUser(user.userId, opts.placeholderAssemblyaiId).catch(() => {});
+        }
+        return await emptyTranscriptOutcome({
+          docId: effectiveDocId,
+          endedAfter: parsed.endedAfter,
+          user,
+          event,
+          title,
+        });
+      }
       return out(422, {
-        error: parsed?.endedAfter
-          ? `Google's transcript for this meeting is empty — the Transcript tab only says "Transcription ended after ${parsed.endedAfter}" (no speech was captured / not enough conversation). Nothing to import.`
-          : 'Could not parse any utterances out of the transcript Doc. It may be empty or in an unexpected format — try re-transcribing the video instead.',
+        error:
+          'Could not parse any utterances out of the transcript Doc. It may be empty or in an unexpected format — try re-transcribing the video instead.',
       });
     }
   }

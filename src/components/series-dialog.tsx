@@ -113,6 +113,8 @@ interface Occurrence {
   transcriptDocId: string | null;
   /** transcriptDocId is a "Notes by Gemini" Doc (Transcript tab). */
   geminiNotes: boolean;
+  /** Transcript Doc exists but Google captured no speech — not importable. */
+  emptyTranscript: boolean;
   teams: { joinWebUrl: string; callId: string | null } | null;
   /** Meet conference record backing this occurrence; `*Pending` = Google
    * lists the artifact but hasn't generated the file yet. */
@@ -141,6 +143,7 @@ interface OccurrencesResult {
     imported: number;
     importable: number;
     bare: number;
+    empty: number;
     upcoming: number;
     external: number;
   };
@@ -686,7 +689,12 @@ export function SeriesDialog({ seriesId, onClose, onChanged, onMerged }: SeriesD
           });
         }
         if (res.ok || res.status === 409) return null; // 409 = already imported
-        const j = (await res.json().catch(() => null)) as { error?: string } | null;
+        const j = (await res.json().catch(() => null)) as
+          | { error?: string; emptyTranscript?: boolean }
+          | null;
+        // Empty transcript Doc (no speech captured): not a failure — the
+        // sweep now shows the occurrence as "transcript empty".
+        if (res.status === 422 && j?.emptyTranscript) return null;
         return j?.error ?? `Import failed (${res.status})`;
       } catch (err) {
         if (err instanceof GoogleNotConnectedError) {
@@ -1352,9 +1360,13 @@ export function SeriesDialog({ seriesId, onClose, onChanged, onMerged }: SeriesD
                                   {!o.hasRecording && !o.hasTranscript && o.imported.length === 0 && (
                                     <span
                                       className="text-[11px] text-muted-foreground/60"
-                                      title="Meet/Teams didn’t produce (or you can’t see) a recording or transcript for this occurrence"
+                                      title={
+                                        o.emptyTranscript
+                                          ? 'Google produced a transcript Doc but captured no speech (“not enough conversation”) — nothing to import'
+                                          : 'Meet/Teams didn’t produce (or you can’t see) a recording or transcript for this occurrence'
+                                      }
                                     >
-                                      no recording or transcript
+                                      {o.emptyTranscript ? 'transcript empty — no speech captured' : 'no recording or transcript'}
                                     </span>
                                   )}
                                   {o.source === 'imported' && (

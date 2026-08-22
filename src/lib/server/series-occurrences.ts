@@ -12,6 +12,7 @@ import {
 import { parseTeamsJoinLink, pickOccurrenceArtifacts } from '@/lib/teams-link';
 import { listConferenceRecordsByCode, listRecordArtifacts } from '@/lib/server/gmeet';
 import { listKeys, getSeries } from '@/db-ops/series';
+import { listEmptyTranscriptDocIds } from '@/db-ops/empty-transcripts';
 import { recurringBaseId } from '@/lib/series-keys';
 import type { GmeetAttendee } from '@/lib/format';
 
@@ -118,6 +119,10 @@ export interface SeriesOccurrence {
   /** transcriptDocId is a "Notes by Gemini" Doc (transcript lives in its
    * Transcript tab) rather than a classic transcript Doc. */
   geminiNotes: boolean;
+  /** The transcript Doc is known to hold no speech (Google: "Transcription
+   * ended after …", not enough conversation) — hasTranscript is forced false
+   * so nothing offers it for import; the Doc link is kept for reference. */
+  emptyTranscript: boolean;
   teams: { joinWebUrl: string; callId: string | null } | null;
   /** Google Meet conference record that backs this occurrence (Meet API
    * side). `*Pending` = Google lists the artifact but the file isn't
@@ -149,6 +154,8 @@ export interface SeriesOccurrencesResult {
     imported: number;
     importable: number;
     bare: number;
+    /** Subset of bare: the transcript Doc exists but holds no speech. */
+    empty: number;
     upcoming: number;
     /** Occurrences the calendar/Graph sweep actually saw (excludes the
      * member-only 'imported' rows) — 0 with members present means "this
@@ -324,6 +331,18 @@ export async function sweepSeriesOccurrences(
     imported: [],
   }));
   for (const occ of occurrences) occ.imported = matchImported(occ, candidates);
+  // Known-empty transcript Docs (ledger written by the import): not
+  // importable, never were — read fresh so an "Import all" that just found
+  // one flips the row on the very next refresh.
+  const emptyDocs = await listEmptyTranscriptDocIds(
+    occurrences.map((o) => o.transcriptDocId).filter((d): d is string => !!d)
+  );
+  for (const occ of occurrences) {
+    if (occ.transcriptDocId && emptyDocs.has(occ.transcriptDocId)) {
+      occ.emptyTranscript = true;
+      occ.hasTranscript = false;
+    }
+  }
   const external = occurrences.length;
 
   // Members no external occurrence claimed still ARE occurrences of this
@@ -353,6 +372,7 @@ export async function sweepSeriesOccurrences(
       videoFileId: c.video_file_id ?? c.drive_file_id,
       transcriptDocId: c.transcript_doc_id,
       geminiNotes: false,
+      emptyTranscript: false,
       teams: null,
       meet: null,
       calendarUrl: null,
@@ -377,6 +397,7 @@ export async function sweepSeriesOccurrences(
     importable: past.filter((o) => o.imported.length === 0 && (o.hasRecording || o.hasTranscript))
       .length,
     bare: past.filter((o) => o.imported.length === 0 && !o.hasRecording && !o.hasTranscript).length,
+    empty: past.filter((o) => o.imported.length === 0 && o.emptyTranscript).length,
     upcoming: occurrences.filter((o) => o.upcoming).length,
   };
 
@@ -481,6 +502,7 @@ async function computeSweepSkeleton(
       videoFileId,
       transcriptDocId,
       geminiNotes,
+      emptyTranscript: false,
       teams: null,
       meet: null,
       calendarUrl: inst.htmlLink ?? null,
@@ -567,6 +589,7 @@ async function computeSweepSkeleton(
             videoFileId: fileId,
             transcriptDocId: docId,
             geminiNotes: false,
+            emptyTranscript: false,
             teams: null,
             meet,
             calendarUrl: null,
@@ -643,6 +666,7 @@ async function computeSweepSkeleton(
             videoFileId: null,
             transcriptDocId: null,
             geminiNotes: false,
+            emptyTranscript: false,
             teams: { joinWebUrl: info.joinWebUrl, callId },
             meet: null,
             calendarUrl: null,
