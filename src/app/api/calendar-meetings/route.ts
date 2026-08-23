@@ -9,6 +9,7 @@ import {
 } from '@/db-ops/calendar-event-cache';
 import { findSeriesByRecurringBaseIds } from '@/db-ops/series';
 import { recurringBaseId } from '@/lib/series-keys';
+import { parseMeetingFilters } from '@/lib/server/meeting-filters';
 
 export const runtime = 'nodejs';
 
@@ -22,7 +23,10 @@ export const runtime = 'nodejs';
  *    all — from their per-user calendar_event_cache sweep rows.
  *
  * Same from/to/tz/days/minRows/cursor semantics as the listing v2 endpoint:
- * whole-day buckets, newest first, a day is never split across pages.
+ * whole-day buckets, newest first, a day is never split across pages. Also
+ * the shared people/provider filters (participant / organizer / provider /
+ * q — lib/server/meeting-filters; `speaker` is ignored here, provider=upload
+ * matches nothing), applied to rows AND counts; bad provider → 400.
  * Display-only rule: never returns tokens or file IDs — importing always
  * goes through the existing dialog flow (caller's own Google token).
  */
@@ -163,8 +167,15 @@ export const GET = withAuth(async ({ user, request }) => {
       { status: 400 }
     );
   }
+  const parsed = parseMeetingFilters(params);
+  if (!parsed.ok) return NextResponse.json({ error: parsed.error }, { status: 400 });
   const tz = safeTz(params.get('tz'));
-  const range = { tz, from: dayParam(params.get('from')), to: dayParam(params.get('to')) };
+  const range = {
+    tz,
+    from: dayParam(params.get('from')),
+    to: dayParam(params.get('to')),
+    filters: parsed.filters,
+  };
   const caller = { userId: user.userId, email: user.email };
 
   const [account, counts, page] = await Promise.all([

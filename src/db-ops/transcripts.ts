@@ -2,6 +2,11 @@ import 'server-only';
 import { sql } from '@/lib/db';
 import { SCHEMAS } from '@/lib/constants/database';
 import { publishEvent } from '@/lib/server/event-bus';
+import {
+  archiveFilterSql,
+  archiveParticipantsExpr,
+} from '@/db-ops/meeting-filter-sql';
+import { EMPTY_MEETING_FILTERS, type MeetingFilters } from '@/lib/server/meeting-filters';
 import type {
   GmeetContext,
   StoredTranscript,
@@ -227,10 +232,17 @@ export interface TranscriptListPageOpts {
   minRows: number;
   /** Exclusive day-key cursor: only days strictly older. */
   cursor: string | null;
+  /** Shared people/provider filters (lib/server/meeting-filters) — applied
+   * to the page AND the tab counts. `q` inside it is ignored here (the
+   * listing's own `q` above carries the matched_in/snippet semantics). */
+  filters?: MeetingFilters;
 }
 
 /** Raw shape of the paged listing query before JS post-mapping. */
 type PagedRawRow = Omit<TranscriptListRow, 'access' | 'owner_email' | 'owner_name'> & {
+  /** Organizer + attendee emails (lower-cased, de-duplicated) — the optional
+   * `participants` field of v2 rows. */
+  participants: string[];
   __access: 'owner' | 'edit' | 'read' | null;
   day_key: string;
   __total_days: number;
@@ -258,6 +270,7 @@ export async function listPagedForUser(
   opts: TranscriptListPageOpts
 ): Promise<TranscriptListV2Response> {
   const { tab, from, to, tz, q, days, minRows, cursor } = opts;
+  const filters = opts.filters ?? EMPTY_MEETING_FILTERS;
   const normEmail = email.trim().toLowerCase();
   const isTrash = tab === 'trash';
   const pattern = q ? `%${q.replace(/[%_\\]/g, (m) => `\\${m}`)}%` : null;
@@ -278,6 +291,7 @@ export async function listPagedForUser(
           )`
         : sql``
     }
+    ${archiveFilterSql(filters)}
   `;
 
   const pagePromise = sql<PagedRawRow[]>`
@@ -387,7 +401,12 @@ export async function listPagedForUser(
            b.source, b.recorded_at, b.auto_notes_status,
            b.upload_bytes_received, b.upload_bytes_total,
            b.provider, b.has_event, b.deferred_mode, b.deferred_error,
-           b.recording_count, b.auto_state, b.deleted_at, b.__access, b.matched_in, b.snippet,
+           b.recording_count, b.auto_state,
+           -- Evaluated for the page's rows only (t is joined below for both
+           -- branches) — base is materialized for day_counts, so anything
+           -- computed there runs for every visible row in range.
+           ${archiveParticipantsExpr()} AS participants,
+           b.deleted_at, b.__access, b.matched_in, b.snippet,
            b.day_key::text AS day_key,
            ${
              isTrash
@@ -400,11 +419,11 @@ export async function listPagedForUser(
            (SELECT count(*)::int FROM page_days) AS __page_days
     FROM base b
     JOIN page_days pd ON pd.day_key = b.day_key
+    JOIN ${sql(SCHEMA)}.transcripts t ON t.id = b.id
     ${
       isTrash
         ? sql``
         : sql`
-          JOIN ${sql(SCHEMA)}.transcripts t ON t.id = b.id
           LEFT JOIN ${sql(SCHEMA)}.series_members sm ON sm.transcript_id = b.id
           LEFT JOIN ${sql(SCHEMA)}.series se ON se.id = sm.series_id
           -- Same suspected-series lookup as listVisibleToUser, applied only to
@@ -447,8 +466,10 @@ export async function listPagedForUser(
   `;
 
   // Tab badge counts: all/mine/shared respect the from/to + q filters (they
-  // label the tabs above the FILTERED list); trash is the caller's global
-  // trashed-row count (cheap scalar subquery).
+  // label the tabs above the FILTERED list); trash is the caller's trashed-row
+  // count, global over from/to/q (as it always was) but narrowed by the
+  // people/provider filters so the badge agrees with the filtered trash tab
+  // (the scalar subquery re-aliases transcripts as `t` for archiveFilterSql).
   const countsPromise = sql<
     [{ all_count: number; mine_count: number; shared_count: number; trash_count: number }]
   >`
@@ -456,8 +477,9 @@ export async function listPagedForUser(
       count(*)::int AS all_count,
       count(*) FILTER (WHERE t.user_id = ${userId})::int AS mine_count,
       count(*) FILTER (WHERE t.user_id <> ${userId})::int AS shared_count,
-      (SELECT count(*)::int FROM ${sql(SCHEMA)}.transcripts d
-        WHERE d.user_id = ${userId} AND d.deleted_at IS NOT NULL) AS trash_count
+      (SELECT count(*)::int FROM ${sql(SCHEMA)}.transcripts t
+        WHERE t.user_id = ${userId} AND t.deleted_at IS NOT NULL
+        ${archiveFilterSql(filters)}) AS trash_count
     FROM ${sql(SCHEMA)}.transcripts t
     LEFT JOIN ${sql(SCHEMA)}.transcript_shares s
       ON s.transcript_id = t.id

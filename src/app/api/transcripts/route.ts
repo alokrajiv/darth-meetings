@@ -27,6 +27,7 @@ import { concatMediaSmart, probeDurationSec } from '@/lib/server/media-concat';
 import { IngestError, ingestLocalAudio } from '@/lib/server/ingest';
 import { onTranscriptCompleted } from '@/lib/server/post-completion';
 import type { GmeetAttendee, GmeetContext, StoredTranscript } from '@/lib/format';
+import { parseMeetingFilters } from '@/lib/server/meeting-filters';
 
 /** Calendar event the upload-media stepper linked to this file — rides in
  * the `x-linked-event` header (URI-encoded JSON) because the body is the
@@ -181,8 +182,12 @@ function clampInt(raw: string | null, dflt: number, min: number, max: number): n
  * Params: tab=all|mine|shared|trash, from/to (YYYY-MM-DD in tz), tz (IANA),
  * q (>= 2 chars → server-side search with matched_in/snippet), days (max day
  * buckets, default 14 cap 60), minRows (soft row target, default 40 cap 200),
- * cursor (exclusive day key — only strictly older days). Envelope:
- * TranscriptListV2Response (src/lib/format.ts).
+ * cursor (exclusive day key — only strictly older days), plus the shared
+ * people/provider filters participant / organizer / provider / speaker
+ * (lib/server/meeting-filters — comma = OR, filters AND together, applied to
+ * rows AND tab counts; bad provider → 400). Envelope:
+ * TranscriptListV2Response (src/lib/format.ts); rows carry an optional
+ * `participants` string[] (organizer + attendee emails).
  */
 async function listingV2(
   user: { userId: string; email: string },
@@ -208,8 +213,11 @@ async function listingV2(
       tz = 'UTC';
     }
   }
-  const qRaw = (params.get('q') ?? '').trim();
-  const q = qRaw.length >= 2 ? qRaw : null;
+  const parsed = parseMeetingFilters(params);
+  if (!parsed.ok) return NextResponse.json({ error: parsed.error }, { status: 400 });
+  const filters = parsed.filters;
+  // Same >= 2 chars rule as before — the parser applies it.
+  const q = filters.q;
   const days = clampInt(params.get('days'), 14, 1, 60);
   const minRows = clampInt(params.get('minRows'), 40, 1, 200);
 
@@ -232,6 +240,7 @@ async function listingV2(
     days,
     minRows,
     cursor,
+    filters,
   });
   return NextResponse.json(result);
 }

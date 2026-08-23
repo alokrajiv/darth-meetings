@@ -34,6 +34,7 @@ import {
   EyeOff,
   FileAudio,
   FileText,
+  Filter,
   Search,
   ChevronRight,
   Inbox,
@@ -46,6 +47,17 @@ import {
 import { MeetLogo, TeamsLogo } from '@/components/provider-icon';
 import { SeriesBadge } from '@/components/series-badge';
 import { SeriesDialog } from '@/components/series-dialog';
+import {
+  PeopleFilterChips,
+  PeopleFilterControl,
+  EMPTY_PEOPLE_FILTERS,
+  appendPeopleFilterParams,
+  hasPeopleFilters,
+  peopleFiltersKey,
+  readPeopleFiltersFromUrl,
+  writePeopleFiltersToUrl,
+  type PeopleFilters,
+} from '@/components/people-filter';
 import {
   CalendarEventRow,
   type CalendarDayGroup,
@@ -391,6 +403,33 @@ export function TranscriptTable({
     []
   );
 
+  // People / organizer / provider filters — shared by the archive and both
+  // calendar layers (the server applies them to rows AND counts). The URL
+  // (?participant=&organizer=&provider=) is the source of truth on load so
+  // a filtered view is a shareable link; every change is written back with
+  // history.replaceState. `peopleLoaded` gates the first fetches so a
+  // filtered link doesn't fire an unfiltered request first.
+  const [peopleFilters, setPeopleFiltersState] = useState<PeopleFilters>(EMPTY_PEOPLE_FILTERS);
+  const [peopleLoaded, setPeopleLoaded] = useState(false);
+  useEffect(() => {
+    setPeopleFiltersState(readPeopleFiltersFromUrl(window.location.search));
+    setPeopleLoaded(true);
+  }, []);
+  // Only swap the object on a real change — its identity is what the fetch
+  // callbacks key on, so a no-op "Apply" must not refetch.
+  const setPeopleFilters = useCallback((next: PeopleFilters) => {
+    setPeopleFiltersState((prev) =>
+      peopleFiltersKey(prev) === peopleFiltersKey(next) ? prev : next
+    );
+    writePeopleFiltersToUrl(next);
+  }, []);
+  // Back/forward between two filtered URLs: re-read the params.
+  useEffect(() => {
+    const onPop = () => setPeopleFiltersState(readPeopleFiltersFromUrl(window.location.search));
+    window.addEventListener('popstate', onPop);
+    return () => window.removeEventListener('popstate', onPop);
+  }, []);
+
   // ---- Archive (listing v2) state: server day groups + cursor + counts ----
   const [days, setDays] = useState<TranscriptDayGroup[]>([]);
   const [counts, setCounts] = useState<TranscriptListV2Response['counts'] | null>(null);
@@ -513,6 +552,7 @@ export function TranscriptTable({
       if (from) params.set('from', from);
       if (to) params.set('to', to);
       if (debouncedQ) params.set('q', debouncedQ);
+      appendPeopleFilterParams(params, peopleFilters);
       if (mode === 'more') {
         if (!nextCursorRef.current) return;
         params.set('days', String(PAGE_DAYS));
@@ -562,7 +602,7 @@ export function TranscriptTable({
         if (mode === 'more') setLoadingMore(false);
       }
     },
-    [tab, debouncedQ, from, to, tz]
+    [tab, debouncedQ, from, to, tz, peopleFilters]
   );
 
   /**
@@ -576,6 +616,7 @@ export function TranscriptTable({
       const params = new URLSearchParams({ view, tz });
       if (from) params.set('from', from);
       if (to) params.set('to', to);
+      appendPeopleFilterParams(params, peopleFilters);
       if (mode === 'more') {
         if (!src.cursor) return;
         params.set('days', String(PAGE_DAYS));
@@ -646,7 +687,7 @@ export function TranscriptTable({
         // silent failures are quiet — the loaded window stays usable
       }
     },
-    [from, to, tz]
+    [from, to, tz, peopleFilters]
   );
 
   /** Minimal request just to keep the "Not imported (n)" chip badge and
@@ -660,6 +701,7 @@ export function TranscriptTable({
     });
     if (from) params.set('from', from);
     if (to) params.set('to', to);
+    appendPeopleFilterParams(params, peopleFilters);
     try {
       const res = await fetch(`/api/calendar-meetings?${params.toString()}`, {
         credentials: 'include',
@@ -672,7 +714,7 @@ export function TranscriptTable({
     } catch {
       // quiet — badge just stays stale
     }
-  }, [from, to, tz]);
+  }, [from, to, tz, peopleFilters]);
 
   // Latest-fn refs so long-lived callbacks (SSE, observer, refreshTrigger)
   // always call the current filters without re-subscribing.
@@ -690,8 +732,9 @@ export function TranscriptTable({
   // Filters changed (tab / search / range) or first mount → reset the
   // archive listing. Pagination restarts from the top.
   useEffect(() => {
+    if (!peopleLoaded) return;
     void fetchArchive('reset');
-  }, [fetchArchive]);
+  }, [fetchArchive, peopleLoaded]);
 
   // Range/tz changed → the calendar windows are stale. Drop them (bumping
   // gens so in-flight responses discard) and let the lazy loader below
@@ -700,28 +743,28 @@ export function TranscriptTable({
     calGenRef.current.unimported++;
     calGenRef.current.norec++;
     setCalSrc({ unimported: EMPTY_CAL_SOURCE, norec: EMPTY_CAL_SOURCE });
-  }, [from, to, tz]);
+  }, [from, to, tz, peopleFilters]);
 
   // Lazy layer loading: an enabled-but-never-fetched calendar layer fetches
   // on entry to merged mode / on toggle-on / after a filter reset. Toggling
   // OFF hides rows but keeps the data. Errors don't auto-retry (the error
   // strip has an explicit Retry).
   useEffect(() => {
-    if (!layersLoaded || !mergedMode) return;
+    if (!layersLoaded || !peopleLoaded || !mergedMode) return;
     for (const v of CAL_VIEWS) {
       if (!layers[v]) continue;
       const s = calSrcRef.current[v];
       if (!s.loaded && !s.loading && !s.error) void fetchCalendar(v, 'reset');
     }
-  }, [fetchCalendar, layers, layersLoaded, mergedMode, calSrc]);
+  }, [fetchCalendar, layers, layersLoaded, peopleLoaded, mergedMode, calSrc]);
 
   // Keep the "Not imported (n)" chip badge fresh when the full unimported
   // layer isn't being fetched (layer off, or archive-only mode).
   useEffect(() => {
-    if (!layersLoaded) return;
+    if (!layersLoaded || !peopleLoaded) return;
     if (mergedMode && layers.unimported) return; // full fetch carries counts
     void fetchCalCounts();
-  }, [fetchCalCounts, layersLoaded, mergedMode, layers.unimported]);
+  }, [fetchCalCounts, layersLoaded, peopleLoaded, mergedMode, layers.unimported]);
 
   /** Silent refetch of everything currently on screen (+ chip counts). */
   const silentRefetchAll = useCallback(() => {
@@ -1513,6 +1556,7 @@ export function TranscriptTable({
             /
           </kbd>
         </div>
+        <PeopleFilterControl value={peopleFilters} onChange={setPeopleFilters} />
         {columnChooser}
         <Button
           onClick={silentRefetchAll}
@@ -1527,6 +1571,9 @@ export function TranscriptTable({
       </div>
     </div>
   );
+
+  const filterChips = <PeopleFilterChips value={peopleFilters} onChange={setPeopleFilters} />;
+  const peopleActive = hasPeopleFilters(peopleFilters);
 
   const emptyState = (
     icon: React.ReactNode,
@@ -1870,6 +1917,12 @@ export function TranscriptTable({
             `No matches for "${debouncedQ}"`,
             'Searched titles, filenames, descriptions, summaries, and full transcript text.'
           )
+        ) : peopleActive ? (
+          emptyState(
+            <Filter className="h-5 w-5 text-muted-foreground" />,
+            'No meetings match these filters',
+            'Remove a filter chip above, or widen the date range.'
+          )
         ) : tab === 'trash' ? (
           emptyState(
             <Trash2 className="h-5 w-5 text-muted-foreground" />,
@@ -1985,6 +2038,12 @@ export function TranscriptTable({
               'Connect Google to see your calendar here',
               'Use "Import meeting" in the header to connect your Google account.'
             )
+          ) : peopleActive ? (
+            emptyState(
+              <Filter className="h-5 w-5 text-muted-foreground" />,
+              'No meetings match these filters',
+              'Remove a filter chip above, or widen the date range.'
+            )
           ) : layers.archive ? (
             emptyState(
               <FileAudio className="h-5 w-5 text-muted-foreground" />,
@@ -2054,6 +2113,7 @@ export function TranscriptTable({
   return (
     <div>
       {toolbar}
+      {filterChips}
       {renderMerged && calSync?.syncing && (
         <div className="mb-3 flex items-center gap-2.5 rounded-lg border border-primary/30 bg-primary/5 px-3 py-2 text-sm">
           <RefreshCw className="h-4 w-4 shrink-0 animate-spin text-primary" />

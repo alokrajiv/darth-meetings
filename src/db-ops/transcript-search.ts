@@ -1,6 +1,8 @@
 import 'server-only';
 import { sql } from '@/lib/db';
 import { SCHEMAS } from '@/lib/constants/database';
+import { archiveFilterSql } from '@/db-ops/meeting-filter-sql';
+import { EMPTY_MEETING_FILTERS, type MeetingFilters } from '@/lib/server/meeting-filters';
 
 // Deep search across everything we hold for a transcript: title, filename,
 // description, the AI summary, and the full transcript text (cached in
@@ -19,7 +21,10 @@ export async function searchVisibleTranscripts(
   userId: string,
   email: string,
   query: string,
-  limit = 50
+  limit = 50,
+  /** Shared people/provider filters (lib/server/meeting-filters) ANDed onto
+   * the text match; its own `q` is ignored — `query` is the search text. */
+  filters: MeetingFilters = EMPTY_MEETING_FILTERS
 ): Promise<TranscriptSearchHit[]> {
   const q = query.trim();
   if (q.length < 2) return [];
@@ -60,6 +65,7 @@ export async function searchVisibleTranscripts(
           OR t.auto_notes ILIKE ${pattern}
           OR t.imported_content->>'text' ILIKE ${pattern}
         )
+        ${archiveFilterSql(filters)}
     ) hits
     ORDER BY created_at DESC
     LIMIT ${limit}

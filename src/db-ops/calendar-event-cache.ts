@@ -3,6 +3,8 @@ import { sql } from '@/lib/db';
 import { SCHEMAS } from '@/lib/constants/database';
 import { OCCURRENCE_WINDOW_S } from '@/lib/meeting-evidence';
 import { importedOccurrenceAntiJoin } from '@/db-ops/imported-occurrences';
+import { norecFilterSql, unimportedFilterSql } from '@/db-ops/meeting-filter-sql';
+import { EMPTY_MEETING_FILTERS, type MeetingFilters } from '@/lib/server/meeting-filters';
 
 // Per-user calendar event cache (migration 022) + the paged queries behind
 // GET /api/calendar-meetings. The poller batch-upserts EVERY timed event
@@ -279,6 +281,10 @@ export interface CalendarRangeOpts {
   to?: string | null;
   /** Day key (exclusive): only days strictly older. */
   cursor?: string | null;
+  /** Shared people/provider/q filters (lib/server/meeting-filters) — applied
+   * to the rows AND the tab counts. `speaker` is ignored on these layers
+   * (no speakers on calendar rows); provider=upload matches nothing. */
+  filters?: MeetingFilters;
 }
 
 export interface CalendarPageOpts extends CalendarRangeOpts {
@@ -363,6 +369,7 @@ function unimportedWhere(userId: string, opts: CalendarRangeOpts): ReturnType<ty
       })}
       ${unimportedMuteExclusion(userId)}
       ${dayFilters(unimportedDay(opts.tz), opts)}
+      ${unimportedFilterSql(userId, opts.filters ?? EMPTY_MEETING_FILTERS)}
   `;
 }
 
@@ -402,11 +409,12 @@ function norecWhere(userId: string, opts: CalendarRangeOpts): ReturnType<typeof 
           )
       )
       ${dayFilters(norecDay(opts.tz), opts)}
+      ${norecFilterSql(opts.filters ?? EMPTY_MEETING_FILTERS)}
   `;
 }
 
-/** Tab counts — respect from/to (they label the tabs over a filtered list),
- * never the cursor. */
+/** Tab counts — respect from/to and the people/provider/q filters (they
+ * label the tabs over a filtered list), never the cursor. */
 export async function countCalendarMeetings(
   caller: Caller,
   opts: CalendarRangeOpts
