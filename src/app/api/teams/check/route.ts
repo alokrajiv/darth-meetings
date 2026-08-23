@@ -60,7 +60,7 @@ export const POST = withAuth(async ({ user, request }) => {
     if (!p) return null; // not a parseable Teams link
     const external = !isOwnTenant(p);
     if (external) {
-      return { external: true as const, tenantId: p.tenantId };
+      return { external: true as const, tenantId: p.tenantId, code: teamsCacheCode(p.joinWebUrl) };
     }
     const qi = queryIndex[i]!;
     const dupe = imported[qi] ?? null;

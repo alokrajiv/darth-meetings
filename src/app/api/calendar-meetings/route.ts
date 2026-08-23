@@ -73,6 +73,14 @@ export interface CalendarMeetingRow {
    * renders the same member chip archive rows get; click opens SeriesDialog. */
   seriesId: number | null;
   seriesTitle: string | null;
+  /** norec rows only: what the last provider probe (poller sweep or a
+   * "Check…") recorded for this occurrence — 'none' + 'none' means "asked
+   * Google/Microsoft, nothing there" as of `evidenceCheckedAt`; null = never
+   * probed (a Check… is the only way to know). Always null on unimported
+   * rows (they have evidence by definition). */
+  recordingState: string | null;
+  transcriptState: string | null;
+  evidenceCheckedAt: string | null;
 }
 
 export interface CalendarMeetingsResponse {
@@ -155,6 +163,10 @@ function toRow(
     seriesCount: r.series_count,
     seriesId: series?.series_id ?? null,
     seriesTitle: series?.title ?? null,
+    recordingState: r.evidence_recording_state,
+    transcriptState: r.evidence_transcript_state,
+    evidenceCheckedAt:
+      r.evidence_checked_at == null ? null : isoOf(r.evidence_checked_at),
   };
 }
 

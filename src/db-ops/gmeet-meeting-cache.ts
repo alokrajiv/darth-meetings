@@ -124,6 +124,29 @@ export async function getTeamsResolutionByKeys(
   );
 }
 
+/** The canonical Teams join URL a past probe stashed for a `teams-…` code
+ * (any occurrence within ±12h of `startTime`, else any occurrence of the
+ * code — one recurring series = one URL). Lets a "Check…" that only knows
+ * the cache code re-probe without a Calendar round-trip. */
+export async function getTeamsJoinUrlByMeeting(
+  code: string,
+  startTime: string | null
+): Promise<string | null> {
+  const rows = await sql<Array<{ url: string | null; event_start: string | null }>>`
+    SELECT raw->'teamsResolution'->>'joinWebUrl' AS url, event_start
+    FROM ${sql(SCHEMA)}.gmeet_meeting_cache
+    WHERE meeting_code = ${code}
+      AND raw->'teamsResolution'->>'joinWebUrl' IS NOT NULL
+    ORDER BY ${
+      startTime
+        ? sql`abs(extract(epoch FROM (COALESCE(event_start, conf_start) - ${startTime}::timestamptz)))`
+        : sql`updated_at DESC`
+    }
+    LIMIT 1
+  `;
+  return rows[0]?.url ?? null;
+}
+
 /**
  * Fill-gaps upsert: null inputs never clobber previously captured values —
  * a sweep that couldn't read the Doc must not erase last week's counts.

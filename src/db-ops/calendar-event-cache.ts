@@ -271,6 +271,13 @@ export interface CalendarMeetingDbRow {
   /** Occurrences currently cached for the row's recurring series (null when
    * the event isn't recurring) — powers "Hide all N + future ones". */
   series_count: number | null;
+  /** norec rows: what the LAST provider probe (poller / Check…) recorded for
+   * this occurrence in the artifact cache — 'none'/'none' = "asked
+   * Google/Microsoft, nothing there" (as of evidence_checked_at); null =
+   * never probed. Unimported rows always have evidence, so these are null. */
+  evidence_recording_state: string | null;
+  evidence_transcript_state: string | null;
+  evidence_checked_at: string | null;
 }
 
 export interface CalendarRangeOpts {
@@ -487,6 +494,9 @@ async function unimportedRows(
           AND s.event_key IN (c.meeting_code, c.event_key)
       ) AS muted,
       cal.event_id,
+      NULL::text AS evidence_recording_state,
+      NULL::text AS evidence_transcript_state,
+      NULL::timestamptz AS evidence_checked_at,
       -- Artifact deep links (display-only ids; Google enforces access when
       -- the link is opened — same exposure as the gmeet/check meta).
       c.video_file_id,
@@ -583,8 +593,27 @@ async function norecRows(
         FROM ${sql(SCHEMA)}.calendar_event_cache ce2
         WHERE ce2.user_id = c.user_id
           AND ce2.recurring_event_id = c.recurring_event_id
-      ) END AS series_count
+      ) END AS series_count,
+      ev.recording_state AS evidence_recording_state,
+      ev.transcript_state AS evidence_transcript_state,
+      ev.updated_at AS evidence_checked_at
     FROM ${sql(SCHEMA)}.calendar_event_cache c
+    -- The artifact cache row the last probe left for this occurrence (the
+    -- anti-join above already proved it holds no evidence — this only tells
+    -- the UI "probed, nothing there" vs "never probed", so the row can say
+    -- so instead of inviting an Import click). Indexed code lookup, one
+    -- row per listed event.
+    LEFT JOIN LATERAL (
+      SELECT g.recording_state, g.transcript_state, g.updated_at
+      FROM ${sql(SCHEMA)}.gmeet_meeting_cache g
+      WHERE c.meeting_code IS NOT NULL
+        AND g.meeting_code = c.meeting_code
+        AND abs(extract(epoch FROM (
+              COALESCE(g.event_start, g.conf_start) - c.event_start
+            ))) <= ${OCCURRENCE_WINDOW_S}
+      ORDER BY g.updated_at DESC
+      LIMIT 1
+    ) ev ON true
     ${norecWhere(userId, opts)}
       AND to_char(${day}, 'YYYY-MM-DD') = ANY(${dayKeys})
     ORDER BY c.event_start DESC, c.event_key DESC

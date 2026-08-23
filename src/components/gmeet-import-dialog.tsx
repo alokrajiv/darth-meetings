@@ -737,9 +737,14 @@ export function GmeetImportDialog({
     if (el) {
       el.scrollIntoView({ block: 'center' });
       focusScrolledRef.current = true;
-      el.querySelector('button')?.click();
+      // Disabled = nothing importable; the row then renders its own
+      // explanation + "Check again" instead of a silent no-op.
+      const btn = el.querySelector<HTMLButtonElement>('button');
+      if (btn && !btn.disabled) btn.click();
     }
-  }, [open, rows, focusMeeting]);
+    // teamsMap: a Teams row only becomes the focus row once /api/teams/check
+    // has handed back its cache code — re-run then (the ref keeps it one-shot).
+  }, [open, rows, focusMeeting, teamsMap]);
 
   const changeDate = (next: string) => {
     setDate(next);
@@ -848,11 +853,11 @@ export function GmeetImportDialog({
     }
   };
 
-  const pickEvent = (row: EventRow) => {
+  const pickEvent = (row: EventRow, teamsCheck?: TeamsCheck | null) => {
     // Teams rows have their own options step (internal) or a guided manual
     // panel (external tenant) — nothing Meet-shaped applies to them.
     if (row.teamsUrl) {
-      const check = teamsMap[row.event.id] ?? null;
+      const check = teamsCheck ?? teamsMap[row.event.id] ?? null;
       setPickedTeams({ row, check });
       setPicked(null);
       setError(null);
@@ -928,6 +933,148 @@ export function GmeetImportDialog({
     );
     setStep('options');
     void enrich(initial);
+  };
+
+  /** Per-row live re-probe state for the "Check again" affordance on rows
+   * the day view says have nothing (event id → checking / last note). */
+  const [rowChecking, setRowChecking] = useState<string | null>(null);
+  const [rowCheckNote, setRowCheckNote] = useState<Record<string, string>>({});
+
+  /**
+   * "Check again" on a row with no importable evidence: ONE live probe
+   * through the discovery service — Teams: /api/teams/evidence (app-only
+   * Graph, writes the cache), Meet: /api/meet/evidence — then, if the
+   * provider does hold something now, open the row's import options
+   * directly; otherwise say so inline. Mirrors the listing's "Check…".
+   */
+  const recheckRow = async (row: EventRow) => {
+    const id = row.event.id;
+    setRowChecking(id);
+    setRowCheckNote((prev) => {
+      const next = { ...prev };
+      delete next[id];
+      return next;
+    });
+    try {
+      if (row.teamsUrl) {
+        const res = await fetch('/api/teams/evidence', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            url: row.teamsUrl,
+            startTime: row.event.start?.dateTime ?? null,
+            endTime: row.event.end?.dateTime ?? null,
+            event: {
+              recurringEventId: row.event.recurringEventId ?? null,
+              iCalUID: row.event.iCalUID ?? null,
+              organizerEmail: row.event.organizer?.email ?? null,
+            },
+          }),
+        });
+        const j = (await res.json().catch(() => ({}))) as {
+          external?: boolean;
+          tenantId?: string;
+          code?: string;
+          resolved?: boolean;
+          imported?: ImportedMark | null;
+          meta?: TeamsCheck['meta'];
+          verdict?: { importable?: boolean };
+          checkFailed?: boolean;
+          error?: string;
+        };
+        if (!res.ok) throw new Error(j.error || `Check failed (${res.status})`);
+        if (j.external) {
+          const check: TeamsCheck = { external: true, tenantId: j.tenantId, code: j.code };
+          setTeamsMap((prev) => ({ ...prev, [id]: check }));
+          pickEvent(row, check);
+          return;
+        }
+        if (j.checkFailed) {
+          setRowCheckNote((prev) => ({ ...prev, [id]: j.error || 'Microsoft didn’t answer — try again' }));
+          return;
+        }
+        const check: TeamsCheck = {
+          external: false,
+          code: j.code,
+          imported: j.imported ?? null,
+          meta: j.meta ?? null,
+        };
+        setTeamsMap((prev) => ({ ...prev, [id]: check }));
+        if (j.verdict?.importable) {
+          onImported?.(); // listing refetch — the row migrates to "Not imported"
+          pickEvent(row, check);
+        } else {
+          setRowCheckNote((prev) => ({
+            ...prev,
+            [id]:
+              j.resolved === false
+                ? 'Microsoft has no record of this meeting'
+                : 'Still nothing at Microsoft',
+          }));
+        }
+        return;
+      }
+      const code = row.event.conferenceData?.conferenceId;
+      if (!code) return;
+      const body: EvidenceRequest = {
+        meetingCode: code,
+        startTime: row.event.start?.dateTime ?? null,
+        recordName: row.meet?.recordName ?? null,
+        attachments: row.event.attachments ?? null,
+        event: {
+          id: row.event.id,
+          recurringEventId: row.event.recurringEventId ?? null,
+          iCalUID: row.event.iCalUID ?? null,
+          organizerEmail: row.event.organizer?.email ?? null,
+        },
+      };
+      const res = await fetch('/api/meet/evidence', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      });
+      if (res.status === 404) throw new NotConnectedError();
+      const j = (await res.json().catch(() => ({}))) as EvidenceResponse & { error?: string };
+      if (!res.ok) throw new Error(j.error || `Check failed (${res.status})`);
+      if (j.checkFailed) {
+        setRowCheckNote((prev) => ({ ...prev, [id]: 'Google didn’t answer — try again' }));
+        return;
+      }
+      // Fold the probe into the row the same way the day sweep would have
+      // (server-side meetInfoOf) so badges / importability re-derive.
+      const meet = j.recordName
+        ? {
+            recordName: j.recordName,
+            videoFileId: j.recording.fileIds[0] ?? null,
+            transcriptDocId: j.transcript.docIds[0] ?? null,
+            videoPending: j.recording.state === 'generating' || j.recording.state === 'partial',
+            transcriptPending: j.transcript.state === 'generating',
+            checked: true,
+          }
+        : null;
+      const updated: EventRow = { ...row, meet };
+      setRows((prev) => prev.map((r) => (r.event.id === id ? updated : r)));
+      if (j.verdict.importable) {
+        onImported?.();
+        pickEvent(updated);
+      } else {
+        setRowCheckNote((prev) => ({
+          ...prev,
+          [id]: j.recordName ? 'Still nothing at Google' : 'Google has no record of this meeting',
+        }));
+      }
+    } catch (err) {
+      if (err instanceof NotConnectedError) {
+        setConnectPitch(true);
+        return;
+      }
+      setRowCheckNote((prev) => ({
+        ...prev,
+        [id]: err instanceof Error ? err.message : 'Check failed',
+      }));
+    } finally {
+      setRowChecking((cur) => (cur === id ? null : cur));
+    }
   };
 
   /** Can this row be bulk quick-imported (transcript-only)? Requires real
@@ -1559,32 +1706,51 @@ export function GmeetImportDialog({
                     // importable. Don't invite a doomed click.
                     const checkedEmpty =
                       !isTeams && !!row.meet?.checked && !hasVideo && !hasTranscript && !preparing;
+                    // Teams twin: the poller (or a Check) already asked
+                    // Microsoft about this occurrence and it listed neither
+                    // artifact — a click would open an options step with
+                    // nothing to pick. Unknown (no cache row yet) stays
+                    // clickable: artifacts are re-checked at import time.
+                    const teamsCheckedEmpty =
+                      isTeams && !teamsExternal && !!teams?.meta && !hasVideo && !hasTranscript;
                     // Before the day sweep confirms which meetings actually
                     // happened, a Meet link is enough to try; after it, a
                     // link with no conference record = never started. Teams
-                    // rows are ALWAYS clickable — internal ones import
-                    // (artifacts re-checked server-side), external ones open
-                    // the guided manual panel.
-                    const importable =
-                      isTeams ||
-                      (!checkedEmpty &&
+                    // rows are clickable unless known-empty — internal ones
+                    // import (artifacts re-checked server-side), external
+                    // ones open the guided manual panel.
+                    const importable = isTeams
+                      ? !teamsCheckedEmpty
+                      : !checkedEmpty &&
                         (hasVideo ||
                           hasTranscript ||
                           !!row.meet ||
-                          (!sweepDone && !!row.event.conferenceData?.conferenceId)));
+                          (!sweepDone && !!row.event.conferenceData?.conferenceId));
+                    // A row with nothing importable that a live re-probe could
+                    // still change: offer "Check again" right on the row.
+                    const recheckable =
+                      !importable &&
+                      !mark &&
+                      (teamsCheckedEmpty ||
+                        (!isTeams && !!row.event.conferenceData?.conferenceId));
                     const muted = !!syncInfo?.skips.has(rowKey(row));
                     const focused =
                       !!focusMeeting?.meetingCode &&
                       (row.event.conferenceData?.conferenceId === focusMeeting.meetingCode ||
                         (isTeams && teams?.code === focusMeeting.meetingCode));
+                    const rowNote = rowCheckNote[row.event.id];
+                    const providerName = isTeams ? 'Microsoft' : 'Google';
                     return (
                       <li
                         key={row.event.id}
                         id={focused ? 'gmeet-focus-row' : undefined}
-                        className={`flex items-center ${muted ? 'opacity-45' : ''} ${
-                          focused ? 'bg-primary/5 ring-1 ring-inset ring-primary/40' : ''
+                        className={`flex flex-col ${muted ? 'opacity-45' : ''} ${
+                          focused
+                            ? 'bg-primary/10 ring-2 ring-inset ring-primary/60 shadow-[inset_3px_0_0_0_hsl(var(--primary))]'
+                            : ''
                         }`}
                       >
+                      <div className="flex items-center">
                         {bulkEligible(row) && !mark && !muted ? (
                           <input
                             type="checkbox"
@@ -1708,7 +1874,7 @@ export function GmeetImportDialog({
                           )}
                           {!importable && (
                             <span className="text-[10px] text-muted-foreground shrink-0">
-                              {checkedEmpty
+                              {checkedEmpty || teamsCheckedEmpty
                                 ? 'nothing to import'
                                 : row.event.conferenceData?.conferenceId
                                   ? 'never started'
@@ -1716,6 +1882,23 @@ export function GmeetImportDialog({
                             </span>
                           )}
                         </button>
+                        {recheckable && (
+                          <Button
+                            size="sm"
+                            variant={focused ? 'outline' : 'ghost'}
+                            className="mr-2 h-7 shrink-0 px-2 text-[11px]"
+                            disabled={busy || rowChecking === row.event.id}
+                            title={`Ask ${providerName} again whether this meeting left a recording or transcript`}
+                            onClick={() => void recheckRow(row)}
+                          >
+                            {rowChecking === row.event.id ? (
+                              <Loader2 className="mr-1 h-3 w-3 animate-spin" />
+                            ) : (
+                              <RefreshCw className="mr-1 h-3 w-3" />
+                            )}
+                            Check again
+                          </Button>
+                        )}
                         {tab === 'sync' && !mark && (
                           <button
                             type="button"
@@ -1731,6 +1914,21 @@ export function GmeetImportDialog({
                             <BellOff className="h-3.5 w-3.5" />
                           </button>
                         )}
+                      </div>
+                      {/* The caller landed HERE on this row (listing / reminder
+                          click) and there is nothing to select — say why
+                          instead of a silent no-op. */}
+                      {(focused && !importable && !mark) || rowNote ? (
+                        <p className="flex items-center gap-1.5 px-3 pb-2 pl-10 text-[11px] text-muted-foreground">
+                          <AlertCircle className="h-3 w-3 shrink-0" />
+                          {rowNote ??
+                            (teamsCheckedEmpty || checkedEmpty
+                              ? `Nothing at ${providerName} yet — no recording or transcript was listed for this occurrence. Recap artifacts usually land minutes after the call; if the call was recorded, Check again in a bit.`
+                              : row.event.conferenceData?.conferenceId
+                                ? 'Google has no conference record for this occurrence — the Meet call never started (or the record has aged out). Check again asks Google directly.'
+                                : 'This event has no meeting link — upload a recording from the listing instead.')}
+                        </p>
+                      ) : null}
                       </li>
                     );
                   })}

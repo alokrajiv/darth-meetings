@@ -419,24 +419,23 @@ export function CalendarEventRow({
   onMuteChanged,
   onOpenSeries,
 }: CalendarEventRowProps) {
-  // Unimported rows (artifacts known) and Teams rows import straight away.
-  // A Meet row in the "No recording" layer has NO known artifacts — the old
-  // Import… button opened the dialog only for it to answer "never started"
-  // (D10). Now the button is "Check…": one live probe through the discovery
-  // service (which writes back to the cache); if Google does hold something
-  // the import dialog opens on it, otherwise the row says so inline.
-  const canImport =
-    !!r.meetingCode &&
-    !!onImportMeeting &&
-    (layer === 'unimported' || (r.hasMeet && r.provider === 'teams'));
+  // Unimported rows (artifacts known) import straight away. A row in the
+  // "No recording" layer — Meet OR Teams — has NO known artifacts: the old
+  // Import… button opened the dialog only for it to answer "never started" /
+  // show a Teams row with nothing selectable (D10). Now the button is
+  // "Check…": one live probe through the discovery service (Meet:
+  // /api/meet/evidence, Teams: /api/teams/evidence — both write back to the
+  // cache); if the provider does hold something the import dialog opens on
+  // it, otherwise the row says so inline. When the cache already records a
+  // probe that found nothing ('none'/'none'), the row says so up front.
+  const isTeams = r.provider === 'teams';
+  const providerName = isTeams ? 'Microsoft' : 'Google';
+  const canImport = !!r.meetingCode && !!onImportMeeting && layer === 'unimported';
   const canCheck =
-    !canImport &&
-    layer === 'norec' &&
-    r.hasMeet &&
-    r.provider === 'gmeet' &&
-    !!r.meetingCode &&
-    !!onImportMeeting;
+    !canImport && layer === 'norec' && r.hasMeet && !!r.meetingCode && !!onImportMeeting;
   const canUpload = !canImport && !canCheck && layer === 'norec' && !!r.eventId;
+  const knownEmpty =
+    canCheck && r.recordingState === 'none' && r.transcriptState === 'none';
   const [checking, setChecking] = useState(false);
   const [checkNote, setCheckNote] = useState<string | null>(null);
   const checkEvidence = async () => {
@@ -444,15 +443,27 @@ export function CalendarEventRow({
     setChecking(true);
     setCheckNote(null);
     try {
-      const res = await fetch('/api/meet/evidence', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          meetingCode: r.meetingCode,
-          startTime: r.eventStart,
-          event: { id: r.eventId, recurringEventId: r.recurringEventId },
-        }),
-      });
+      const res = isTeams
+        ? await fetch('/api/teams/evidence', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              meetingCode: r.meetingCode,
+              eventId: r.eventId,
+              startTime: r.eventStart,
+              endTime: r.eventEnd,
+              event: { recurringEventId: r.recurringEventId, organizerEmail: r.organizerEmail },
+            }),
+          })
+        : await fetch('/api/meet/evidence', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              meetingCode: r.meetingCode,
+              startTime: r.eventStart,
+              event: { id: r.eventId, recurringEventId: r.recurringEventId },
+            }),
+          });
       if (res.status === 404) {
         setCheckNote('Connect Google first');
         return;
@@ -460,18 +471,30 @@ export function CalendarEventRow({
       const j = (await res.json().catch(() => ({}))) as {
         verdict?: { importable?: boolean; pending?: boolean };
         checkFailed?: boolean;
+        external?: boolean;
+        resolved?: boolean;
+        code?: string;
         error?: string;
       };
       if (!res.ok) throw new Error(j.error || `Check failed (${res.status})`);
+      if (j.external) {
+        // Organized outside our tenant — app-only Graph can't see it; the
+        // dialog's guided manual-import panel is the right next step.
+        onImportMeeting?.({ meetingCode: j.code ?? r.meetingCode, eventStart: r.eventStart });
+        return;
+      }
       if (j.verdict?.importable) {
         // The probe wrote the evidence back — the row migrates to "Not
-        // imported" on refetch; open the dialog on it meanwhile.
+        // imported" on refetch; open the dialog on it meanwhile. Teams: the
+        // dialog keys its rows by the canonical cache code the server returns.
         onMuteChanged?.();
-        onImportMeeting?.({ meetingCode: r.meetingCode, eventStart: r.eventStart });
+        onImportMeeting?.({ meetingCode: j.code ?? r.meetingCode, eventStart: r.eventStart });
       } else if (j.checkFailed) {
-        setCheckNote('Google didn’t answer — try again');
+        setCheckNote(`${providerName} didn’t answer — try again`);
+      } else if (isTeams && j.resolved === false) {
+        setCheckNote('Microsoft has no record of this meeting');
       } else {
-        setCheckNote('Nothing at Google — never recorded');
+        setCheckNote(`Nothing at ${providerName} — never recorded`);
       }
     } catch (err) {
       setCheckNote(err instanceof Error ? err.message : 'Check failed');
@@ -656,17 +679,30 @@ export function CalendarEventRow({
           )}
           {canCheck && (
             <>
-              {checkNote && (
-                <span className="max-w-[18ch] truncate text-[11px] text-muted-foreground" title={checkNote}>
+              {checkNote ? (
+                <span className="max-w-[22ch] truncate text-[11px] text-muted-foreground" title={checkNote}>
                   {checkNote}
                 </span>
-              )}
+              ) : knownEmpty ? (
+                <span
+                  className="max-w-[26ch] truncate text-[11px] text-muted-foreground"
+                  title={`${providerName} was asked${
+                    r.evidenceCheckedAt
+                      ? ` (${new Date(r.evidenceCheckedAt).toLocaleString()})`
+                      : ''
+                  } and listed neither a recording nor a transcript for this occurrence. Recap artifacts usually land minutes after the call — Check… asks again.`}
+                >
+                  No recording or transcript at {providerName}
+                </span>
+              ) : null}
               <Button
                 size="sm"
                 variant="outline"
                 className="h-7 px-2.5 text-xs"
                 disabled={checking}
-                title="Ask Google whether this meeting left a recording or transcript (the calendar hasn't shown any yet)"
+                title={`Ask ${providerName} whether this meeting left a recording or transcript${
+                  knownEmpty ? ' (re-check — nothing was there last time)' : " (the calendar hasn't shown any yet)"
+                }`}
                 onClick={(e) => {
                   e.stopPropagation();
                   void checkEvidence();

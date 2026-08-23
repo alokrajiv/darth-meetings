@@ -243,6 +243,15 @@ async function checkRow(row: {
       { placeholderAssemblyaiId: row.assemblyai_id }
     );
     if (outcome.status === 422 && typeof outcome.body.notReady === 'string') {
+      // Terminal: the occurrence ended >24h ago and Graph lists NEITHER a
+      // transcript nor a recording for its window — the call was not
+      // recorded; nothing is coming (lib/teams-deferred-terminal). Same
+      // error path as the 24h give-up: status 'error', failure DM.
+      if (outcome.body.neverRecorded === true) {
+        console.log(`[deferred-import] ${row.assemblyai_id}: ${String(outcome.body.error)}`);
+        await settleExecOutcome(row, marker, nowIso, outcome, [422]);
+        return;
+      }
       await heartbeat(row.user_id, row.assemblyai_id, marker, {
         lastCheckedAt: nowIso,
         attempts: (marker.attempts ?? 0) + 1,

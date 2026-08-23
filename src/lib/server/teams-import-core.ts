@@ -10,6 +10,7 @@ import {
 } from '@/db-ops/transcripts';
 import { findImportedByTeamsCallId } from '@/db-ops/teams-import';
 import { parseTeamsJoinLink, isOwnTenant, pickOccurrenceArtifacts } from '@/lib/teams-link';
+import { teamsDeferredTerminalError } from '@/lib/teams-deferred-terminal';
 import {
   GraphApiError,
   fetchTranscriptVtt,
@@ -184,6 +185,24 @@ export async function executeTeamsImport(
         ? 'recording'
         : null;
   if (missing) {
+    // Nothing listed for an occurrence that ended >24h ago = the call was
+    // not recorded — never queue a deferred import for it (the poller would
+    // only heartbeat for a day and give up), and tell the deferred poller
+    // the same via `neverRecorded` so an already-queued row goes terminal.
+    const neverRecorded = teamsDeferredTerminalError({
+      startTime: windowStart ?? null,
+      endTime: windowEnd ?? null,
+      transcriptListed: !!transcript,
+      recordingListed: !!recording,
+    });
+    if (neverRecorded) {
+      return out(422, {
+        error: neverRecorded,
+        notReady: missing,
+        neverRecorded: true,
+        listed: { transcript: !!transcript, recording: !!recording },
+      });
+    }
     if (body.defer && !opts?.placeholderAssemblyaiId) {
       const waitingFor: 'transcript' | 'video' | 'both' =
         mode === 'both' ? 'both' : mode === 'video' ? 'video' : 'transcript';
@@ -256,6 +275,7 @@ export async function executeTeamsImport(
           : 'No Teams recording found for this occurrence — it may not have been recorded, or Microsoft is still processing it (recordings appear a few minutes after the call ends).',
       // Machine-readable "not there yet" flag the deferred poller keys off.
       notReady: missing,
+      listed: { transcript: !!transcript, recording: !!recording },
     });
   }
 

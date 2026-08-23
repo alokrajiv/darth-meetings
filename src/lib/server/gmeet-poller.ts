@@ -13,20 +13,11 @@ import {
   listOpenRemindersRaw,
   resolveReminderByKey,
 } from '@/db-ops/gmeet-reminders';
-import {
-  getMeetingCacheByKeys,
-  getTeamsResolutionByKeys,
-  upsertMeetingCache,
-} from '@/db-ops/gmeet-meeting-cache';
+import { getMeetingCacheByKeys, getTeamsResolutionByKeys } from '@/db-ops/gmeet-meeting-cache';
 import { findImportedByTeamsMeetings } from '@/db-ops/teams-import';
 import { sweepAutoImportSeries } from '@/lib/server/series-auto-import';
 import { classifyCalendarAttachments } from '@/lib/meeting-evidence';
-import {
-  isOwnTenant,
-  parseTeamsJoinLink,
-  pickOccurrenceArtifacts,
-  type TeamsJoinInfo,
-} from '@/lib/teams-link';
+import { isOwnTenant, parseTeamsJoinLink, type TeamsJoinInfo } from '@/lib/teams-link';
 import { teamsCacheCode } from '@/lib/server/teams-ids';
 import {
   CalendarListError,
@@ -37,13 +28,8 @@ import {
   teamsUrlOf,
 } from '@/lib/server/meeting-discovery';
 import type { DiscoveredEvent } from '@/lib/meeting-discovery-types';
-import {
-  GraphApiError,
-  isGraphConfigured,
-  listRecordings,
-  listTranscripts,
-  resolveMeetingByJoinUrl,
-} from '@/lib/server/ms-graph';
+import { GraphApiError, isGraphConfigured } from '@/lib/server/ms-graph';
+import { probeTeamsEvidence } from '@/lib/server/teams-evidence';
 
 /**
  * Background sync-and-remind poller. Every POLL_MS, for each user with a
@@ -179,90 +165,40 @@ async function sweepUserTeams(
       continue;
     }
 
-    const existing = cacheRows.get(key);
-    let hasTranscript = existing?.transcript_parseable === true;
-    let hasRecording = (existing?.ready_recording_count ?? 0) > 0;
-    // Artifacts are immutable once present — only hit Graph while one is
-    // still missing (recordings routinely land minutes after transcripts).
-    if (!hasTranscript || !hasRecording) {
-      try {
-        let resolution = resolutions.get(key) ?? null;
-        if (!resolution) {
-          const meeting = await resolveMeetingByJoinUrl(info.organizerOid, info.joinWebUrl);
-          if (!meeting) continue; // deleted or never materialized — retry next sweep
-          resolution = {
-            joinWebUrl: info.joinWebUrl,
-            organizerOid: info.organizerOid,
-            graphMeetingId: meeting.id,
-            meetingCode: meeting.meetingCode,
-          };
-        }
-        const [transcripts, recordings] = await Promise.all([
-          listTranscripts(resolution.organizerOid, resolution.graphMeetingId),
-          listRecordings(resolution.organizerOid, resolution.graphMeetingId),
-        ]);
-        const endIso = e.end?.dateTime ?? e.end?.date ?? startIso;
-        const picked =
-          startIso && endIso
-            ? pickOccurrenceArtifacts(transcripts, recordings, startIso, endIso)
-            : { transcript: undefined, recording: undefined };
-        hasTranscript = !!picked.transcript;
-        hasRecording = !!picked.recording;
-        if (!hasTranscript && !hasRecording) {
-          // Recap artifacts lag the call end by minutes — cache the
-          // resolution so the retry next sweep skips the $filter call.
-          if (!resolutions.get(key)) {
-            await upsertMeetingCache({
-              eventKey: key,
-              meetingCode: code,
-              eventStart: startIso,
-              conferenceRecord: null,
-              raw: { teamsResolution: resolution },
-              capturedBy: caller.userId,
-            });
-          }
-          continue;
-        }
-        await upsertMeetingCache({
-          eventKey: key,
-          meetingCode: code,
-          eventStart: startIso,
-          conferenceRecord: null,
-          confStart:
-            picked.transcript?.createdDateTime ?? picked.recording?.createdDateTime ?? null,
-          confEnd: picked.transcript?.endDateTime ?? picked.recording?.endDateTime ?? null,
-          recordingCount: picked.recording ? 1 : 0,
-          recordingsListed: picked.recording ? 1 : 0,
-          readyRecordingCount: picked.recording ? 1 : 0,
-          transcriptsListed: picked.transcript ? 1 : 0,
-          recordingState: picked.recording ? 'ready' : 'none',
-          transcriptState: picked.transcript ? 'ready' : 'none',
-          transcriptSource: picked.transcript ? 'teams' : null,
-          transcriptParseable: hasTranscript ? true : null,
+    // THE Teams probe (lib/server/teams-evidence) — shared with the
+    // listing's / dialog's on-demand "Check…": resolves once, lists the
+    // artifacts only while one is still missing, writes the cache row.
+    let hasTranscript: boolean;
+    let hasRecording: boolean;
+    try {
+      const probe = await probeTeamsEvidence({
+        info,
+        eventStart: startIso,
+        eventEnd: e.end?.dateTime ?? e.end?.date ?? startIso,
+        event: {
           recurringEventId: e.recurringEventId ?? null,
           iCalUID: e.iCalUID ?? null,
           organizerEmail: e.organizer?.email ?? null,
-          raw: {
-            teamsResolution: resolution,
-            teamsArtifacts: {
-              transcript: picked.transcript ?? null,
-              recording: picked.recording ?? null,
-            },
-          },
-          capturedBy: caller.userId,
-        });
-      } catch (err) {
-        if (err instanceof GraphApiError) {
-          console.warn(
-            '[gmeet-poller] teams artifact check failed for',
-            key,
-            err.status,
-            err.code ?? ''
-          );
-          continue;
-        }
-        throw err;
+        },
+        capturedBy: caller.userId,
+        existing: cacheRows.get(key) ?? null,
+        resolution: resolutions.get(key) ?? null,
+      });
+      if (!probe.resolved) continue; // deleted or never materialized — retry next sweep
+      hasTranscript = probe.hasTranscript;
+      hasRecording = probe.hasRecording;
+      if (!hasTranscript && !hasRecording) continue; // nothing to remind about (yet)
+    } catch (err) {
+      if (err instanceof GraphApiError) {
+        console.warn(
+          '[gmeet-poller] teams artifact check failed for',
+          key,
+          err.status,
+          err.code ?? ''
+        );
+        continue;
       }
+      throw err;
     }
     await upsertReminder({
       userId: caller.userId,

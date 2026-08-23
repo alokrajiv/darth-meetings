@@ -38,7 +38,7 @@ import {
   type ConferenceRecordLite,
 } from '@/lib/server/gmeet';
 import { teamsCacheCode } from '@/lib/server/teams-ids';
-import { findTeamsJoinUrl } from '@/lib/teams-link';
+import { findTeamsJoinUrl, parseTeamsJoinLink } from '@/lib/teams-link';
 
 /**
  * THE meeting-discovery service (docs/meeting-evidence-consolidation.md,
@@ -70,6 +70,8 @@ const CAL_FIELDS =
   'attendees(email,displayName,responseStatus,self,resource),' +
   'attachments(fileId,title,mimeType),' +
   'conferenceData(conferenceId,conferenceSolution(key(type)),entryPoints(uri))),nextPageToken';
+/** The same mask for a single `events.get` (no `items()` wrapper). */
+const CAL_EVENT_FIELDS = CAL_FIELDS.replace(/^items\(/, '').replace(/\),nextPageToken$/, '');
 
 async function apiJson<T>(token: string, url: string): Promise<T | null> {
   try {
@@ -154,6 +156,21 @@ export async function listCalendarEvents(
   return out;
 }
 
+/** One calendar event by id (primary calendar), same field mask as the
+ * listing. Null when Google won't serve it (gone, 404, no access) — callers
+ * treat that as "no live event in hand", never as an error. */
+export async function getCalendarEvent(
+  token: string,
+  eventId: string
+): Promise<DiscoveredEvent | null> {
+  const q = new URLSearchParams({ fields: CAL_EVENT_FIELDS });
+  const e = await apiJson<DiscoveredEvent & { status?: string }>(
+    token,
+    `${CAL_API}/calendars/primary/events/${encodeURIComponent(eventId)}?${q}`
+  );
+  return e && e.id && e.status !== 'cancelled' ? e : null;
+}
+
 export function isMeetEvent(e: DiscoveredEvent): boolean {
   const code = e.conferenceData?.conferenceId ?? '';
   const type = e.conferenceData?.conferenceSolution?.key?.type;
@@ -194,8 +211,14 @@ export function toCalendarUpsert(e: DiscoveredEvent): CalendarEventUpsert {
   // row to the unimported view once the Teams sweep records artifacts under
   // the same code. External-tenant links count too — the import dialog's
   // guided manual panel is still the right click-through for those.
+  // The code hashes the CANONICAL join URL (what the Teams poller / check
+  // route / dialog all key by) — the raw calendar link carries add-on noise
+  // (`&launchAgent=GSuiteAddOn&correlationId=…`) that used to hash to a
+  // different code, so the norec view never saw the Teams evidence and the
+  // dialog's focus-row match missed (86/90 prod rows, 2026-08-23).
   const meet = isMeetEvent(e);
   const teamsUrl = meet ? null : teamsUrlOf(e);
+  const teamsCanonical = teamsUrl ? (parseTeamsJoinLink(teamsUrl)?.joinWebUrl ?? teamsUrl) : null;
   const att = classifyCalendarAttachments(e.attachments);
   return {
     eventKey: `${e.id}|${e.start!.dateTime}`,
@@ -207,8 +230,8 @@ export function toCalendarUpsert(e: DiscoveredEvent): CalendarEventUpsert {
     eventEnd: e.end?.dateTime ?? null,
     meetingCode: meet
       ? e.conferenceData!.conferenceId!
-      : teamsUrl
-        ? teamsCacheCode(teamsUrl)
+      : teamsCanonical
+        ? teamsCacheCode(teamsCanonical)
         : null,
     organizerEmail: e.organizer?.email ?? null,
     organizerSelf: e.organizer?.self ?? null,
