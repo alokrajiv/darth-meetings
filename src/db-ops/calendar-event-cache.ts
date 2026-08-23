@@ -332,14 +332,40 @@ export interface CalendarPageOpts extends CalendarRangeOpts {
 
 type Caller = { userId: string; email: string };
 
+/**
+ * Day-key bounds, in two forms each: the exact predicate on the tz-cast day
+ * expression, plus a REDUNDANT (strictly wider — ±2 days swallows any tz
+ * offset) range on the raw start column. The tz-cast form is unestimatable,
+ * and its default selectivity convinces the planner the range matches ~1
+ * row — which flips the imported-occurrence anti-join into a nested loop
+ * that re-scans transcripts (detoasting the ~16KB gmeet_context per pair)
+ * once per candidate row. The sargable twin restores real row estimates and
+ * gives the planner an indexable band; it never changes which rows match.
+ */
 function dayFilters(
   dayExpr: ReturnType<typeof sql>,
+  startExpr: ReturnType<typeof sql>,
   opts: CalendarRangeOpts
 ): ReturnType<typeof sql> {
   return sql`
-    ${opts.from ? sql`AND ${dayExpr} >= ${opts.from}::date` : sql``}
-    ${opts.to ? sql`AND ${dayExpr} <= ${opts.to}::date` : sql``}
-    ${opts.cursor ? sql`AND ${dayExpr} < ${opts.cursor}::date` : sql``}
+    ${
+      opts.from
+        ? sql`AND ${startExpr} >= ${opts.from}::date - interval '2 days'
+    AND ${dayExpr} >= ${opts.from}::date`
+        : sql``
+    }
+    ${
+      opts.to
+        ? sql`AND ${startExpr} <= ${opts.to}::date + interval '2 days'
+    AND ${dayExpr} <= ${opts.to}::date`
+        : sql``
+    }
+    ${
+      opts.cursor
+        ? sql`AND ${startExpr} < ${opts.cursor}::date + interval '2 days'
+    AND ${dayExpr} < ${opts.cursor}::date`
+        : sql``
+    }
   `;
 }
 
@@ -370,9 +396,9 @@ function unimportedMuteExclusion(userId: string): ReturnType<typeof sql> {
             SELECT 1 FROM ${sql(SCHEMA)}.calendar_event_cache ce
             WHERE ce.user_id = ${userId}
               AND ce.meeting_code = c.meeting_code
-              AND abs(extract(epoch FROM (
-                    ce.event_start - COALESCE(c.event_start, c.conf_start)
-                  ))) <= ${OCCURRENCE_WINDOW_S}
+              AND ce.event_start
+                    BETWEEN COALESCE(c.event_start, c.conf_start) - ${OCCURRENCE_WINDOW_S} * interval '1 second'
+                        AND COALESCE(c.event_start, c.conf_start) + ${OCCURRENCE_WINDOW_S} * interval '1 second'
               AND (
                 (m.kind = 'occurrence' AND m.value = ce.event_key)
                 OR (m.kind = 'series' AND m.value = COALESCE(ce.recurring_event_id, ce.event_id))
@@ -399,14 +425,14 @@ function unimportedWhere(userId: string, opts: CalendarRangeOpts): ReturnType<ty
           FROM ${sql(SCHEMA)}.calendar_event_cache ce
           WHERE ce.user_id = ${userId}
             AND ce.meeting_code = c.meeting_code
-            AND abs(extract(epoch FROM (
-                  ce.event_start - COALESCE(c.event_start, c.conf_start)
-                ))) <= ${OCCURRENCE_WINDOW_S}
+            AND ce.event_start
+                  BETWEEN COALESCE(c.event_start, c.conf_start) - ${OCCURRENCE_WINDOW_S} * interval '1 second'
+                      AND COALESCE(c.event_start, c.conf_start) + ${OCCURRENCE_WINDOW_S} * interval '1 second'
         )`,
         instant: sql`COALESCE(c.event_start, c.conf_start)`,
       })}
       ${unimportedMuteExclusion(userId)}
-      ${dayFilters(unimportedDay(opts.tz), opts)}
+      ${dayFilters(unimportedDay(opts.tz), sql`COALESCE(c.event_start, c.conf_start)`, opts)}
       ${unimportedFilterSql(userId, opts.filters ?? EMPTY_MEETING_FILTERS)}
   `;
 }
@@ -446,7 +472,7 @@ function norecWhere(userId: string, opts: CalendarRangeOpts): ReturnType<typeof 
             OR (m.kind = 'series' AND m.value = COALESCE(c.recurring_event_id, c.event_id))
           )
       )
-      ${dayFilters(norecDay(opts.tz), opts)}
+      ${dayFilters(norecDay(opts.tz), sql`c.event_start`, opts)}
       ${norecFilterSql(opts.filters ?? EMPTY_MEETING_FILTERS)}
   `;
 }
@@ -569,9 +595,9 @@ async function unimportedRows(
       FROM ${sql(SCHEMA)}.calendar_event_cache ce
       WHERE ce.user_id = ${caller.userId}
         AND ce.meeting_code = c.meeting_code
-        AND abs(extract(epoch FROM (
-              ce.event_start - COALESCE(c.event_start, c.conf_start)
-            ))) <= ${OCCURRENCE_WINDOW_S}
+        AND ce.event_start
+              BETWEEN COALESCE(c.event_start, c.conf_start) - ${OCCURRENCE_WINDOW_S} * interval '1 second'
+                  AND COALESCE(c.event_start, c.conf_start) + ${OCCURRENCE_WINDOW_S} * interval '1 second'
       ORDER BY abs(extract(epoch FROM (
         ce.event_start - COALESCE(c.event_start, c.conf_start)
       )))

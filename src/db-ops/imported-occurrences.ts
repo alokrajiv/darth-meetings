@@ -44,9 +44,12 @@ type Fragment = ReturnType<typeof sql>;
  * SQL twin of importedOccurrenceMatches for the listing views: `NOT EXISTS`
  * over live transcripts (deferred `defer-*` placeholders count — they carry
  * the same keys). `meetingCode` / `joinWebUrl` are provider keys pinned to
- * `instant` by the ±12h window; `eventIdIn` is a parenthesized subquery of
- * calendar event ids that identify the occurrence exactly (uploads / pasted
- * transcripts link by eventId, not meeting code — D9).
+ * `instant` by the ±12h window; `eventIdIn` is a parenthesized subquery
+ * yielding one text column of calendar event ids that identify the
+ * occurrence exactly (uploads / pasted transcripts link by eventId, not
+ * meeting code — D9). It is planted as a FROM item joined to the transcripts
+ * eventId expression index (a correlated `IN (subquery)` can't become a
+ * semi-join and degrades to a per-pair filter).
  */
 export function importedOccurrenceAntiJoin(input: {
   meetingCode: Fragment;
@@ -55,29 +58,44 @@ export function importedOccurrenceAntiJoin(input: {
   instant: Fragment;
 }): Fragment {
   const occ = sql`${IMPORTED_OCCURRENCE_START}::timestamptz`;
-  return sql`NOT EXISTS (
-    SELECT 1 FROM ${sql(SCHEMA)}.transcripts t
-    WHERE t.deleted_at IS NULL
-      AND (
-        (
-          t.gmeet_context->>'meetingCode' = ${input.meetingCode}
-          AND abs(extract(epoch FROM (${occ} - ${input.instant}))) <= ${OCCURRENCE_WINDOW_S}
-        )
-        ${
-          input.joinWebUrl
-            ? sql`OR (
-          ${input.joinWebUrl} IS NOT NULL
-          AND t.gmeet_context->'teams'->>'joinWebUrl' = ${input.joinWebUrl}
-          AND abs(extract(epoch FROM (${occ} - ${input.instant}))) <= ${OCCURRENCE_WINDOW_S}
-        )`
-            : sql``
-        }
-        ${
-          input.eventIdIn
-            ? sql`OR t.gmeet_context->>'eventId' IN ${input.eventIdIn}`
-            : sql``
-        }
-      )
+  // One NOT EXISTS per arm (De Morgan of the old single OR chain — same
+  // semantics) so each probes its expression index: a combined OR forces a
+  // per-(candidate x transcript) join filter that re-extracts (= detoasts)
+  // the ~16KB gmeet_context jsonb tens of thousands of times per listing
+  // query. The explicit `gmeet_context IS NOT NULL` is implied by the `->>`
+  // match but stated so the planner can use the partial indexes.
+  return sql`(
+    NOT EXISTS (
+      SELECT 1 FROM ${sql(SCHEMA)}.transcripts t
+      WHERE t.deleted_at IS NULL
+        AND t.gmeet_context IS NOT NULL
+        AND t.gmeet_context->>'meetingCode' = ${input.meetingCode}
+        AND abs(extract(epoch FROM (${occ} - ${input.instant}))) <= ${OCCURRENCE_WINDOW_S}
+    )
+    ${
+      input.joinWebUrl
+        ? sql`AND NOT EXISTS (
+      SELECT 1 FROM ${sql(SCHEMA)}.transcripts t
+      WHERE t.deleted_at IS NULL
+        AND ${input.joinWebUrl} IS NOT NULL
+        AND t.gmeet_context IS NOT NULL
+        AND t.gmeet_context->'teams'->>'joinWebUrl' = ${input.joinWebUrl}
+        AND abs(extract(epoch FROM (${occ} - ${input.instant}))) <= ${OCCURRENCE_WINDOW_S}
+    )`
+        : sql``
+    }
+    ${
+      input.eventIdIn
+        ? sql`AND NOT EXISTS (
+      SELECT 1
+      FROM ${input.eventIdIn} AS _ids(event_id)
+      JOIN ${sql(SCHEMA)}.transcripts t
+        ON t.gmeet_context->>'eventId' = _ids.event_id
+      WHERE t.deleted_at IS NULL
+        AND t.gmeet_context IS NOT NULL
+    )`
+        : sql``
+    }
   )`;
 }
 
