@@ -37,6 +37,9 @@ import {
 } from 'lucide-react';
 import { MeetLogo, TeamsLogo } from '@/components/provider-icon';
 import { requestMediaUpload } from '@/components/audio-upload';
+import { ConnectMicrosoftHint, TeamsChatVerdictLine } from '@/components/calendar-meeting-rows';
+import { msLinkMissing, useMsLinkStatus } from '@/components/connect-nudge-banner';
+import { asTeamsChatVerdict, teamsChatVerdictCopy, type TeamsChatVerdict } from '@/lib/format';
 import type {
   CachedMeetingMeta,
   DiscoverWindowResponse,
@@ -169,6 +172,10 @@ interface TeamsCheck {
     confStart: string | null;
     confEnd: string | null;
   } | null;
+  /** Teams chat evidence (held / recorded) from the cache row or a live
+   * Check again — for rows with no importable artifacts, own-tenant AND
+   * external (lib/format TeamsChatVerdict). */
+  chat?: TeamsChatVerdict | null;
 }
 
 function relDays(iso: string): string {
@@ -342,6 +349,9 @@ export function GmeetImportDialog({
   const [syncFrom, setSyncFrom] = useState<string | null>(null);
   /** /api/teams/check results by calendar event id. */
   const [teamsMap, setTeamsMap] = useState<Record<string, TeamsCheck>>({});
+  // Microsoft (Teams chat) link — only to offer "Connect Microsoft to see
+  // whether it was held" on Teams rows that have no chat verdict yet.
+  const msLink = useMsLinkStatus(rows.some((r) => !!r.teamsUrl));
   const [pickedTeams, setPickedTeams] = useState<{
     row: EventRow;
     check: TeamsCheck | null;
@@ -418,12 +428,15 @@ export function GmeetImportDialog({
           }),
         });
         if (!res.ok) return;
-        const { results } = (await res.json()) as { results: (TeamsCheck | null)[] };
+        const { results } = (await res.json()) as {
+          results: ((Omit<TeamsCheck, 'chat'> & { chat?: unknown }) | null)[];
+        };
         if (cancelled) return;
         setTeamsMap((prev) => {
           const next = { ...prev };
           targets.forEach((r, i) => {
-            if (results[i]) next[r.event.id] = results[i]!;
+            const res = results[i];
+            if (res) next[r.event.id] = { ...res, chat: asTeamsChatVerdict(res.chat) };
           });
           return next;
         });
@@ -981,15 +994,20 @@ export function GmeetImportDialog({
           verdict?: { importable?: boolean };
           checkFailed?: boolean;
           error?: string;
+          chat?: unknown;
         };
         if (!res.ok) throw new Error(j.error || `Check failed (${res.status})`);
+        // The evidence route now also carries the Teams chat verdict (held /
+        // recorded) — for external meetings too, where it is all we get.
+        const chat = asTeamsChatVerdict(j.chat) ?? teamsMap[id]?.chat ?? null;
         if (j.external) {
-          const check: TeamsCheck = { external: true, tenantId: j.tenantId, code: j.code };
+          const check: TeamsCheck = { external: true, tenantId: j.tenantId, code: j.code, chat };
           setTeamsMap((prev) => ({ ...prev, [id]: check }));
           pickEvent(row, check);
           return;
         }
         if (j.checkFailed) {
+          if (chat) setTeamsMap((prev) => ({ ...prev, [id]: { ...(prev[id] ?? { external: false }), chat } }));
           setRowCheckNote((prev) => ({ ...prev, [id]: j.error || 'Microsoft didn’t answer — try again' }));
           return;
         }
@@ -998,6 +1016,7 @@ export function GmeetImportDialog({
           code: j.code,
           imported: j.imported ?? null,
           meta: j.meta ?? null,
+          chat,
         };
         setTeamsMap((prev) => ({ ...prev, [id]: check }));
         if (j.verdict?.importable) {
@@ -1006,8 +1025,11 @@ export function GmeetImportDialog({
         } else {
           setRowCheckNote((prev) => ({
             ...prev,
-            [id]:
-              j.resolved === false
+            [id]: chat
+              ? // The verdict line on the row carries the chat finding; the note
+                // adds the artifact side so the two read as one sentence.
+                `${teamsChatVerdictCopy(chat, { external: false }).text} — nothing importable at Microsoft yet`
+              : j.resolved === false
                 ? 'Microsoft has no record of this meeting'
                 : 'Still nothing at Microsoft',
           }));
@@ -1740,6 +1762,12 @@ export function GmeetImportDialog({
                         (isTeams && teams?.code === focusMeeting.meetingCode));
                     const rowNote = rowCheckNote[row.event.id];
                     const providerName = isTeams ? 'Microsoft' : 'Google';
+                    // Teams chat evidence for rows with nothing importable:
+                    // the verdict line ("Held 51 min · not recorded"), or the
+                    // connect hint when the caller has no Microsoft link.
+                    const teamsChat = isTeams && !hasVideo && !hasTranscript ? (teams?.chat ?? null) : null;
+                    const teamsChatHint =
+                      isTeams && !hasVideo && !hasTranscript && !teamsChat && !mark && msLinkMissing(msLink);
                     return (
                       <li
                         key={row.event.id}
@@ -1881,7 +1909,14 @@ export function GmeetImportDialog({
                                   : 'no meet link'}
                             </span>
                           )}
+                          {teamsChat && (
+                            <TeamsChatVerdictLine
+                              verdict={teamsChat}
+                              external={teamsExternal ? true : teams ? false : null}
+                            />
+                          )}
                         </button>
+                        {teamsChatHint && <ConnectMicrosoftHint className="mr-2" />}
                         {recheckable && (
                           <Button
                             size="sm"
@@ -2198,6 +2233,11 @@ export function GmeetImportDialog({
               <p className="text-xs text-muted-foreground">
                 {fmtEventRange(pickedTeams.row.event)}
               </p>
+              {pickedTeams.check?.chat && (
+                <p className="text-xs">
+                  <TeamsChatVerdictLine verdict={pickedTeams.check.chat} external />
+                </p>
+              )}
             </div>
 
             <p className="text-sm">

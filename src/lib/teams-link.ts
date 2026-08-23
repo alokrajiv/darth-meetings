@@ -75,6 +75,31 @@ export function parseTeamsJoinLink(raw: string): TeamsJoinInfo | null {
   return { joinWebUrl, tenantId: ctx.Tid, organizerOid: ctx.Oid };
 }
 
+/**
+ * The meeting's Teams chat/thread id — the percent-decoded path segment right
+ * after `/l/meetup-join/` (`19:meeting_<base64>@thread.v2`, or
+ * `19:…@thread.tacv2` for channel meetings). Works for own-tenant AND
+ * external-tenant links: the chat id needs no Graph resolution, it IS the
+ * join link's first path segment. Null when the string isn't a meetup-join
+ * link or the segment doesn't decode to a `19:…` thread id.
+ */
+export function threadIdFromJoinUrl(raw: string): string | null {
+  const match = MEETUP_JOIN_RE.exec(raw)?.[0];
+  if (!match) return null;
+  const marker = '/l/meetup-join/';
+  const start = match.indexOf(marker) + marker.length;
+  const rest = match.slice(start);
+  const seg = rest.split(/[/?]/, 1)[0] ?? '';
+  if (!seg) return null;
+  let decoded: string;
+  try {
+    decoded = decodeURIComponent(seg);
+  } catch {
+    return null;
+  }
+  return decoded.startsWith('19:') ? decoded : null;
+}
+
 /** True when the meeting was organized inside OUR tenant — the only case
  * where app-only Graph can reach its artifacts (spec §4.5). */
 export function isOwnTenant(info: TeamsJoinInfo): boolean {

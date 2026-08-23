@@ -4,6 +4,7 @@ import { isOwnTenant, parseTeamsJoinLink } from '@/lib/teams-link';
 import { teamsCacheCode } from '@/lib/server/teams-ids';
 import { GraphApiError, isGraphConfigured } from '@/lib/server/ms-graph';
 import { probeTeamsEvidence } from '@/lib/server/teams-evidence';
+import { chatVerdictFor } from '@/lib/server/teams-chat-evidence';
 import { getMeetingCacheByMeetings, getTeamsJoinUrlByMeeting } from '@/db-ops/gmeet-meeting-cache';
 import { getServerAccessToken } from '@/lib/server/google-oauth';
 import {
@@ -11,6 +12,7 @@ import {
   persistCalendarEvents,
   teamsUrlOf,
 } from '@/lib/server/meeting-discovery';
+import { hasCalendarOccurrence } from '@/db-ops/calendar-event-cache';
 import { findImportedByTeamsMeetings } from '@/db-ops/teams-import';
 
 export const runtime = 'nodejs';
@@ -32,8 +34,15 @@ export const runtime = 'nodejs';
  *     startTime: string, endTime?: string,
  *     event?: { recurringEventId?, iCalUID?, organizerEmail? } }
  *
- * 200 { external: true, tenantId }                  — organized outside our tenant
- * 200 { external: false, code, resolved, hasRecording, hasTranscript,
+ * Every 200 also carries `chat` — the Teams chat verdict (was the call held /
+ * recorded; lib/teams-chat-evidence TeamsChatEvidence) read via the caller's
+ * Darth Tasks Microsoft link, cache-first with one live lookup at most; null
+ * when never checked and not checkable (feature off / caller not linked and
+ * plagueis unreachable). External-tenant occurrences get their cache row
+ * created by this (raw.external = true) — chat evidence is all they have.
+ *
+ * 200 { external: true, tenantId, code, chat, checkedAt } — organized outside our tenant
+ * 200 { external: false, code, chat, resolved, hasRecording, hasTranscript,
  *       verdict: { hasRecording, hasTranscript, pending: false, importable },
  *       imported, checkFailed: false, checkedAt }
  * 200 { …, checkFailed: true, error }               — Graph refused (status/code in error)
@@ -126,11 +135,38 @@ export const POST = withAuth(async ({ user, request }) => {
     return NextResponse.json({ error: 'Not a parseable Teams meetup-join link' }, { status: 422 });
   }
   if (!isOwnTenant(info)) {
+    // Organized outside our tenant: app-only Graph is blind, but the chat
+    // thread isn't — the caller's Darth Tasks Microsoft link can read the
+    // meeting chat's call events (held / recorded). Cache-first, one live
+    // lookup at most, persisted on a row CREATED for the occurrence
+    // (raw.external = true) — external occurrences had no cache row before.
     // `code` lets the listing hand the dialog the same key its rows carry.
+    // Creation is gated on the occurrence actually existing in the caller's
+    // calendar cache: the URL + startTime here are client-supplied, and an
+    // ungated CREATE would let any authenticated caller mint one permanent
+    // junk cache row (plus a plagueis→Graph call) per fabricated join URL.
+    // The verdict itself is still returned either way; updates to an
+    // existing row are always allowed.
+    const extCode = teamsCacheCode(info.joinWebUrl);
+    const allowCreate = await hasCalendarOccurrence(user.userId, extCode, startTime).catch(
+      () => false
+    );
+    const chat = await chatVerdictFor({
+      info,
+      external: true,
+      eventStart: startTime,
+      eventEnd: endTime,
+      email: user.email,
+      event: eventMeta,
+      capturedBy: user.userId,
+      allowCreate,
+    }).catch(() => null);
     return NextResponse.json({
       external: true as const,
       tenantId: info.tenantId,
-      code: teamsCacheCode(info.joinWebUrl),
+      code: extCode,
+      chat,
+      checkedAt: new Date().toISOString(),
     });
   }
   if (!isGraphConfigured()) {
@@ -141,6 +177,18 @@ export const POST = withAuth(async ({ user, request }) => {
   }
 
   const code = teamsCacheCode(info.joinWebUrl);
+  // Teams chat verdict (held / recorded) rides along with the artifact
+  // probe — cache-first, else one live lookup through the caller's Darth
+  // Tasks Microsoft link; persisted on the same cache row (raw.teamsChat).
+  const chatP = chatVerdictFor({
+    info,
+    external: false,
+    eventStart: startTime,
+    eventEnd: endTime,
+    email: user.email,
+    event: eventMeta,
+    capturedBy: user.userId,
+  }).catch(() => null);
   const importedP = findImportedByTeamsMeetings(
     [{ joinWebUrl: info.joinWebUrl, startTime }],
     { userId: user.userId, email: user.email }
@@ -155,10 +203,14 @@ export const POST = withAuth(async ({ user, request }) => {
       capturedBy: user.userId,
     });
     const [imported] = await importedP;
-    const [row] = await getMeetingCacheByMeetings([{ code, startTime }]).catch(() => [null]);
+    const [[row], chat] = await Promise.all([
+      getMeetingCacheByMeetings([{ code, startTime }]).catch(() => [null]),
+      chatP,
+    ]);
     return NextResponse.json({
       external: false as const,
       code,
+      chat,
       resolved: probe.resolved,
       probed: probe.probed,
       hasRecording: probe.hasRecording,
@@ -196,9 +248,11 @@ export const POST = withAuth(async ({ user, request }) => {
   } catch (err) {
     if (err instanceof GraphApiError) {
       console.warn('[teams/evidence] Graph probe failed for', code, err.status, err.code ?? '');
+      const chat = await chatP;
       return NextResponse.json({
         external: false as const,
         code,
+        chat,
         resolved: false,
         probed: true,
         hasRecording: false,

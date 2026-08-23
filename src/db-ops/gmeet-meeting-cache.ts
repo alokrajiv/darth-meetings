@@ -7,6 +7,7 @@ import {
   type TranscriptSource,
   type TranscriptState,
 } from '@/lib/meeting-evidence';
+import type { TeamsChatEvidence } from '@/lib/teams-chat-evidence';
 
 // Poll-time metadata snapshot per meeting occurrence — see migration 017.
 // Display-only: never a source of content access. The poller fills rows
@@ -44,6 +45,12 @@ export interface GmeetMeetingCacheRow {
   recording_state: RecordingState | null;
   transcript_state: TranscriptState | null;
   transcript_source: TranscriptSource;
+  /** raw.teamsChat — the Teams chat verdict (held / recorded), when a chat
+   * lookup ever ran for the occurrence (lib/teams-chat-evidence). */
+  teams_chat: TeamsChatEvidence | null;
+  /** raw.external — row created for an external-tenant Teams occurrence
+   * (chat evidence only; app-only Graph can't see its artifacts). */
+  external_tenant: boolean | null;
 }
 
 const ROW_COLUMNS = sql`
@@ -54,7 +61,9 @@ const ROW_COLUMNS = sql`
   transcript_doc_ids, transcript_parseable, utterance_count, word_count,
   speakers, recurring_event_id, ical_uid, organizer_email, captured_at,
   recordings_listed, ready_recording_count, transcripts_listed,
-  recording_state, transcript_state, transcript_source
+  recording_state, transcript_state, transcript_source,
+  raw->'teamsChat' AS teams_chat,
+  (raw->>'external')::boolean AS external_tenant
 `;
 
 export async function getMeetingCacheByKeys(
@@ -77,7 +86,15 @@ export async function getMeetingCacheByKeys(
  * not by exact key string.
  */
 export async function getMeetingCacheByMeetings(
-  meetings: Array<{ code: string; startTime?: string | null }>
+  meetings: Array<{ code: string; startTime?: string | null }>,
+  opts?: {
+    /** Dual-tz event keys leave tz-duplicate twins for one occurrence; the
+     * ±12h match otherwise picks one in arbitrary row order, so a chat-less
+     * twin can mask its sibling's raw.teamsChat verdict. Chat-evidence
+     * callers pass true to prefer (and keep landing verdicts on) the
+     * chat-bearing twin. */
+    preferChat?: boolean;
+  }
 ): Promise<(GmeetMeetingCacheRow | null)[]> {
   const codes = [...new Set(meetings.map((m) => m.code.trim()).filter(Boolean))];
   if (codes.length === 0) return meetings.map(() => null);
@@ -91,12 +108,12 @@ export async function getMeetingCacheByMeetings(
     if (candidates.length === 0) return null;
     const wanted = m.startTime ? Date.parse(m.startTime) : NaN;
     if (Number.isNaN(wanted)) return candidates[0]!;
-    return (
-      candidates.find((r) => {
-        const at = Date.parse(r.event_start ?? r.conf_start ?? '');
-        return !Number.isNaN(at) && Math.abs(at - wanted) <= OCCURRENCE_WINDOW_MS;
-      }) ?? null
-    );
+    const inWindow = candidates.filter((r) => {
+      const at = Date.parse(r.event_start ?? r.conf_start ?? '');
+      return !Number.isNaN(at) && Math.abs(at - wanted) <= OCCURRENCE_WINDOW_MS;
+    });
+    if (inWindow.length === 0) return null;
+    return (opts?.preferChat ? inWindow.find((r) => r.teams_chat != null) : undefined) ?? inWindow[0]!;
   });
 }
 

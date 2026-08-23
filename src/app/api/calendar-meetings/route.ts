@@ -81,6 +81,21 @@ export interface CalendarMeetingRow {
   recordingState: string | null;
   transcriptState: string | null;
   evidenceCheckedAt: string | null;
+  /** Teams rows: the chat verdict (was the call held / recorded — read from
+   * the meeting chat via the caller's Darth Tasks Microsoft link; persisted
+   * as raw.teamsChat on the artifact-cache row). All null until a sweep or
+   * Check… recorded one. `chatHeld` null with `chatReason` set = the lookup
+   * itself failed (forbidden / throttled / graph_error). */
+  chatHeld: boolean | null;
+  chatCallStart: string | null;
+  chatCallEnd: string | null;
+  chatDurationMs: number | null;
+  chatRecorded: boolean | null;
+  chatTranscribed: boolean | null;
+  chatCheckedAt: string | null;
+  chatReason: string | null;
+  /** Organized by an external tenant (raw.external on the same row). */
+  chatExternal: boolean | null;
 }
 
 export interface CalendarMeetingsResponse {
@@ -167,6 +182,15 @@ function toRow(
     transcriptState: r.evidence_transcript_state,
     evidenceCheckedAt:
       r.evidence_checked_at == null ? null : isoOf(r.evidence_checked_at),
+    chatHeld: r.teams_chat?.held ?? null,
+    chatCallStart: r.teams_chat?.callStart ?? null,
+    chatCallEnd: r.teams_chat?.callEnd ?? null,
+    chatDurationMs: r.teams_chat?.durationMs ?? null,
+    chatRecorded: r.teams_chat ? r.teams_chat.recorded === true : null,
+    chatTranscribed: r.teams_chat ? r.teams_chat.transcribed === true : null,
+    chatCheckedAt: r.teams_chat?.checkedAt ?? null,
+    chatReason: r.teams_chat?.reason ?? null,
+    chatExternal: r.chat_external ?? null,
   };
 }
 

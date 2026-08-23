@@ -661,3 +661,182 @@ export function formatTime(milliseconds: number): string {
   const remainingSeconds = totalSeconds % 60;
   return `${minutes}:${remainingSeconds.toString().padStart(2, '0')}`;
 }
+
+// ---------------------------------------------------------------------------
+// Teams chat evidence (system messages in the meeting's Teams chat, read via
+// the caller's Darth Tasks Microsoft link). Tells us whether an occurrence was
+// HELD (and for how long) and whether anyone RECORDED it — even for meetings
+// hosted by external tenants, where the app-only artifact probe is blind.
+// Stored on the gmeet_meeting_cache row as raw.teamsChat; surfaced by
+// /api/teams/evidence (`chat`), /api/teams/check (`chat`) and the norec view
+// rows (the flat chat* fields below).
+// ---------------------------------------------------------------------------
+
+export interface TeamsChatVerdict {
+  checkedAt: string;
+  byEmail?: string | null;
+  held: boolean;
+  callStart: string | null;
+  callEnd: string | null;
+  durationMs: number | null;
+  recorded: boolean;
+  transcribed?: boolean;
+  humanMessages?: number | null;
+  /** Set when the chat could not be read for the window — the verdict is
+   * then "no signal", not "not held": forbidden (external tenant, chat not
+   * visible to the caller) | not_found | throttled | graph_error |
+   * not_linked | revoked. */
+  reason?: string | null;
+}
+
+/** Reasons that carry a user-facing verdict of their own (the chat exists
+ * but we cannot read it). Transient/link reasons yield no verdict at all —
+ * the row falls back to the connect hint / plain "nothing to import" copy. */
+const TEAMS_CHAT_SHOWN_REASONS = new Set(['forbidden', 'not_found']);
+
+function usableTeamsChatReason(reason: unknown): string | null {
+  return typeof reason === 'string' && TEAMS_CHAT_SHOWN_REASONS.has(reason) ? reason : null;
+}
+
+/** Additive norec-row fields (CalendarMeetingRow) carrying the same verdict. */
+export interface TeamsChatRowFields {
+  chatHeld?: boolean | null;
+  chatCallStart?: string | null;
+  chatCallEnd?: string | null;
+  chatDurationMs?: number | null;
+  chatRecorded?: boolean | null;
+  chatCheckedAt?: string | null;
+  /** Optional extras the server may expose; read defensively. */
+  chatReason?: string | null;
+  chatExternal?: boolean | null;
+}
+
+/** Flat row fields → verdict, or null when the chat was never checked (or
+ * the check produced no signal — reason set, held unknown). */
+export function teamsChatVerdictFromRow(r: TeamsChatRowFields): TeamsChatVerdict | null {
+  if (!r.chatCheckedAt) return null;
+  const reason = usableTeamsChatReason(r.chatReason);
+  // A reason means the chat was NOT read: held/recorded are meaningless then.
+  if (r.chatReason && !reason) return null;
+  if (!reason && typeof r.chatHeld !== 'boolean') return null;
+  return {
+    checkedAt: r.chatCheckedAt,
+    held: reason ? false : r.chatHeld === true,
+    callStart: reason ? null : (r.chatCallStart ?? null),
+    callEnd: reason ? null : (r.chatCallEnd ?? null),
+    durationMs: reason ? null : (r.chatDurationMs ?? null),
+    recorded: reason ? false : r.chatRecorded === true,
+    reason,
+  };
+}
+
+/** Accept the shape an API hands back and keep only a usable verdict. */
+export function asTeamsChatVerdict(v: unknown): TeamsChatVerdict | null {
+  if (!v || typeof v !== 'object') return null;
+  const o = v as Partial<TeamsChatVerdict>;
+  if (typeof o.checkedAt !== 'string') return null;
+  const reason = usableTeamsChatReason(o.reason);
+  if (o.reason && !reason) return null; // not_linked / throttled / … → no verdict
+  if (!reason && typeof o.held !== 'boolean') return null;
+  if (reason) {
+    return {
+      checkedAt: o.checkedAt,
+      byEmail: o.byEmail ?? null,
+      held: false,
+      callStart: null,
+      callEnd: null,
+      durationMs: null,
+      recorded: false,
+      transcribed: false,
+      humanMessages: null,
+      reason,
+    };
+  }
+  return {
+    checkedAt: o.checkedAt,
+    byEmail: o.byEmail ?? null,
+    held: o.held === true,
+    callStart: o.callStart ?? null,
+    callEnd: o.callEnd ?? null,
+    durationMs: typeof o.durationMs === 'number' ? o.durationMs : null,
+    recorded: o.recorded === true,
+    transcribed: o.transcribed === true,
+    humanMessages: typeof o.humanMessages === 'number' ? o.humanMessages : null,
+    reason: null,
+  };
+}
+
+/** "51 min" / "1 h 05 min" for a held-call duration. */
+export function formatHeldMinutes(durationMs: number): string {
+  const mins = Math.max(1, Math.round(durationMs / 60_000));
+  if (mins < 60) return `${mins} min`;
+  const h = Math.floor(mins / 60);
+  const m = mins % 60;
+  return m ? `${h} h ${String(m).padStart(2, '0')} min` : `${h} h`;
+}
+
+/**
+ * One-line verdict copy for a Teams occurrence with no importable evidence,
+ * from the chat check. `external`: organized outside our tenant (true), our
+ * own tenant (false), unknown (null). `tone` drives the colour: 'warn' when
+ * a recording exists that we cannot import (yet).
+ */
+export function teamsChatVerdictCopy(
+  v: TeamsChatVerdict,
+  opts: { external: boolean | null }
+): { text: string; tone: 'neutral' | 'info' | 'warn'; title: string } {
+  const fmt = (iso: string | null) => (iso ? new Date(iso).toLocaleString() : null);
+  const titleParts = [`Source: Teams chat · checked ${fmt(v.checkedAt) ?? v.checkedAt}`];
+  if (v.held && v.callStart) {
+    titleParts.push(
+      `Call ${new Date(v.callStart).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}` +
+        (v.callEnd
+          ? `–${new Date(v.callEnd).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}`
+          : '')
+    );
+  }
+  if (v.reason === 'forbidden') {
+    return {
+      text: 'Teams chat not visible to you (external tenant)',
+      tone: 'neutral',
+      title: `${titleParts.join(' · ')} · the organizer's tenant did not let your account read the meeting chat`,
+    };
+  }
+  if (v.reason === 'not_found') {
+    return {
+      text: 'Teams chat not found',
+      tone: 'neutral',
+      title: `${titleParts.join(' · ')} · Microsoft has no chat for this meeting link under your account`,
+    };
+  }
+  if (!v.held) {
+    return {
+      text: 'Not held — nobody joined the call',
+      tone: 'neutral',
+      title: titleParts.join(' · '),
+    };
+  }
+  const heldLabel = v.durationMs ? `Held ${formatHeldMinutes(v.durationMs)}` : 'Held';
+  if (!v.recorded) {
+    return { text: `${heldLabel} · not recorded`, tone: 'info', title: titleParts.join(' · ') };
+  }
+  if (opts.external === true) {
+    return {
+      text: `${heldLabel} · recorded elsewhere — not importable here`,
+      tone: 'warn',
+      title: `${titleParts.join(' · ')} · the organizer's tenant owns the recording`,
+    };
+  }
+  if (opts.external === false) {
+    return {
+      text: `${heldLabel} · recording still processing`,
+      tone: 'warn',
+      title: `${titleParts.join(' · ')} · Microsoft hasn't listed the recording for us yet — Check… asks again`,
+    };
+  }
+  return {
+    text: `${heldLabel} · recorded — not importable here yet`,
+    tone: 'warn',
+    title: titleParts.join(' · '),
+  };
+}

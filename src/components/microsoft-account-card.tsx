@@ -126,6 +126,22 @@ export function MicrosoftAccountCard() {
           here so all your connected accounts are in one place.
         </p>
 
+        {status !== null && status.available && status.configured !== false && (
+          <p className="text-xs" data-teams-chat-evidence={status.connected ? 'on' : 'off'}>
+            <span className="font-medium">Teams chat evidence:</span>{' '}
+            {status.connected ? (
+              <span className="text-emerald-600">on (linked)</span>
+            ) : (
+              <span className="text-muted-foreground">off</span>
+            )}
+            <span className="text-muted-foreground">
+              {' '}
+              — with your link, meetings can read each Teams meeting chat to tell whether a call was held and
+              recorded (even when another company hosted it).
+            </span>
+          </p>
+        )}
+
         {status === null ? (
           <p className="text-sm text-muted-foreground">Checking connection…</p>
         ) : !status.available ? (

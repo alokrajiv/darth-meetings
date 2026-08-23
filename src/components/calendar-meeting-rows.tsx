@@ -4,7 +4,15 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import { TableCell, TableRow } from '@/components/ui/table';
 import { Button } from '@/components/ui/button';
 import { Badge } from '@/components/ui/badge';
-import { formatDuration } from '@/lib/format';
+import {
+  asTeamsChatVerdict,
+  formatDuration,
+  teamsChatVerdictCopy,
+  teamsChatVerdictFromRow,
+  type TeamsChatRowFields,
+  type TeamsChatVerdict,
+} from '@/lib/format';
+import { msConnectHref, msLinkMissing, useMsLinkStatus } from '@/components/connect-nudge-banner';
 import { ExternalLink, EyeOff, FileText, Loader2, Repeat, Search, Settings2, Upload, Video, VideoOff } from 'lucide-react';
 import { MeetLogo, TeamsLogo } from '@/components/provider-icon';
 import { requestMediaUpload } from '@/components/audio-upload';
@@ -177,6 +185,65 @@ function ArtifactBadge({
   );
 }
 
+/**
+ * Teams chat verdict for an occurrence with no importable evidence — "Held
+ * 51 min · not recorded" / "Not held — nobody joined the call" / … — from the
+ * caller's Darth Tasks Microsoft link (lib/format teamsChatVerdictCopy).
+ * `external`: organized outside our tenant (true) / ours (false) / unknown.
+ */
+export function TeamsChatVerdictLine({
+  verdict,
+  external,
+  className = '',
+}: {
+  verdict: TeamsChatVerdict;
+  external: boolean | null;
+  className?: string;
+}) {
+  const { text, tone, title } = teamsChatVerdictCopy(verdict, { external });
+  const color =
+    tone === 'warn'
+      ? 'text-amber-600 dark:text-amber-500'
+      : tone === 'info'
+        ? 'text-foreground/70'
+        : 'text-muted-foreground';
+  return (
+    <span
+      data-teams-chat-verdict={
+        verdict.reason ? verdict.reason : verdict.held ? (verdict.recorded ? 'held-recorded' : 'held') : 'not-held'
+      }
+      title={title}
+      className={`inline-flex min-w-0 shrink items-center gap-1 truncate text-[11px] ${color} ${className}`}
+    >
+      <span className="shrink-0 rounded border border-current/30 px-1 text-[9px] uppercase tracking-wide opacity-70">
+        Teams chat
+      </span>
+      <span className="truncate">{text}</span>
+    </span>
+  );
+}
+
+/** "Connect Microsoft to see whether it was held" — the not-linked twin of
+ * the verdict line. Sends the user through the Darth Tasks connect flow and
+ * back to this page. */
+export function ConnectMicrosoftHint({ className = '' }: { className?: string }) {
+  const ms = useMsLinkStatus(false);
+  return (
+    <button
+      type="button"
+      data-connect-microsoft-hint
+      className={`min-w-0 max-w-[34ch] shrink truncate text-left text-[11px] text-primary/80 underline-offset-2 hover:underline ${className}`}
+      title="Teams meeting chats record when a call started/ended and whether it was recorded. Connect your Microsoft account (via Darth Tasks) to read them."
+      onClick={(e) => {
+        e.stopPropagation();
+        window.location.href = msConnectHref(ms);
+      }}
+    >
+      Connect Microsoft to see whether it was held
+    </button>
+  );
+}
+
 /** Local YYYY-MM-DD of an ISO instant — matches the upload stepper's day. */
 function localDayOf(iso: string): string {
   const d = new Date(iso);
@@ -273,6 +340,11 @@ function EventGearMenu({
   };
 
   const canUpload = layer === 'norec' && !!r.eventId;
+  const gearChat =
+    r.provider === 'teams' ? teamsChatVerdictFromRow(r as TeamsChatRowFields) : null;
+  // Explicit true only — null on a verdict-bearing row means own tenant
+  // (external rows are always created with raw.external = true).
+  const gearExternal = (r as TeamsChatRowFields).chatExternal === true;
   const startTs = new Date(r.eventStart);
   const timeLine =
     startTs.toLocaleDateString([], { weekday: 'short', day: 'numeric', month: 'short' }) +
@@ -331,6 +403,15 @@ function EventGearMenu({
               <p>
                 Recurring series
                 {r.seriesCount ? ` · ${r.seriesCount} occurrences seen` : ''}
+              </p>
+            )}
+            {gearChat && (
+              <p>
+                {teamsChatVerdictCopy(gearChat, { external: gearExternal }).text}
+                {' · '}
+                <span title={`Source: Teams chat · checked ${new Date(gearChat.checkedAt).toLocaleString()}`}>
+                  Teams chat
+                </span>
               </p>
             )}
           </div>
@@ -438,6 +519,22 @@ export function CalendarEventRow({
     canCheck && r.recordingState === 'none' && r.transcriptState === 'none';
   const [checking, setChecking] = useState(false);
   const [checkNote, setCheckNote] = useState<string | null>(null);
+  // Teams chat evidence (was the call held / recorded) — the cache row's
+  // verdict (norec view fields) or, after a Check…, the live one the
+  // evidence route returns alongside the artifact probe.
+  const [chatLive, setChatLive] = useState<TeamsChatVerdict | null>(null);
+  const [externalLive, setExternalLive] = useState<boolean | null>(null);
+  const chatFields = r as TeamsChatRowFields;
+  const chat = chatLive ?? (isTeams ? teamsChatVerdictFromRow(chatFields) : null);
+  // chatExternal is only stamped (raw.external = true) on rows CREATED for
+  // external occurrences — own-tenant rows carry NULL, which reliably means
+  // "our tenant" whenever a verdict exists. Treat only an explicit true as
+  // external so own-tenant held+recorded rows get the "recording still
+  // processing" copy instead of the unknown-tenant fallback.
+  const chatExternal = externalLive ?? (chatFields.chatExternal === true);
+  const wantsChatHint = isTeams && layer === 'norec' && !chat;
+  const ms = useMsLinkStatus(wantsChatHint);
+  const showConnectMsHint = wantsChatHint && msLinkMissing(ms);
   const checkEvidence = async () => {
     if (!r.meetingCode) return;
     setChecking(true);
@@ -475,8 +572,16 @@ export function CalendarEventRow({
         resolved?: boolean;
         code?: string;
         error?: string;
+        chat?: unknown;
       };
       if (!res.ok) throw new Error(j.error || `Check failed (${res.status})`);
+      if (isTeams) {
+        // The evidence route now carries the chat verdict (own-tenant AND
+        // external) — keep it on the row whatever the artifact outcome.
+        const live = asTeamsChatVerdict(j.chat);
+        if (live) setChatLive(live);
+        if (typeof j.external === 'boolean') setExternalLive(j.external);
+      }
       if (j.external) {
         // Organized outside our tenant — app-only Graph can't see it; the
         // dialog's guided manual-import panel is the right next step.
@@ -491,6 +596,9 @@ export function CalendarEventRow({
         onImportMeeting?.({ meetingCode: j.code ?? r.meetingCode, eventStart: r.eventStart });
       } else if (j.checkFailed) {
         setCheckNote(`${providerName} didn’t answer — try again`);
+      } else if (isTeams && asTeamsChatVerdict(j.chat)) {
+        // The verdict line says it better than a generic "nothing" note.
+        setCheckNote(null);
       } else if (isTeams && j.resolved === false) {
         setCheckNote('Microsoft has no record of this meeting');
       } else {
@@ -648,6 +756,10 @@ export function CalendarEventRow({
                   No Meet link
                 </Badge>
               )}
+              {isTeams && layer === 'norec' && chat && (
+                <TeamsChatVerdictLine verdict={chat} external={chatExternal} />
+              )}
+              {showConnectMsHint && <ConnectMicrosoftHint />}
             </div>
           </div>
         </div>
@@ -683,7 +795,7 @@ export function CalendarEventRow({
                 <span className="max-w-[22ch] truncate text-[11px] text-muted-foreground" title={checkNote}>
                   {checkNote}
                 </span>
-              ) : knownEmpty ? (
+              ) : knownEmpty && !(isTeams && chat) ? (
                 <span
                   className="max-w-[26ch] truncate text-[11px] text-muted-foreground"
                   title={`${providerName} was asked${

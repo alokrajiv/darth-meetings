@@ -17,7 +17,12 @@ import { getMeetingCacheByKeys, getTeamsResolutionByKeys } from '@/db-ops/gmeet-
 import { findImportedByTeamsMeetings } from '@/db-ops/teams-import';
 import { sweepAutoImportSeries } from '@/lib/server/series-auto-import';
 import { classifyCalendarAttachments } from '@/lib/meeting-evidence';
-import { isOwnTenant, parseTeamsJoinLink, type TeamsJoinInfo } from '@/lib/teams-link';
+import {
+  isOwnTenant,
+  parseTeamsJoinLink,
+  threadIdFromJoinUrl,
+  type TeamsJoinInfo,
+} from '@/lib/teams-link';
 import { teamsCacheCode } from '@/lib/server/teams-ids';
 import {
   CalendarListError,
@@ -30,6 +35,20 @@ import {
 import type { DiscoveredEvent } from '@/lib/meeting-discovery-types';
 import { GraphApiError, isGraphConfigured } from '@/lib/server/ms-graph';
 import { probeTeamsEvidence } from '@/lib/server/teams-evidence';
+import {
+  fetchMsLinkStatusOne,
+  isDarthTasksConfigured,
+} from '@/lib/server/darth-tasks-client';
+import { lookupAndPersistTeamsChat } from '@/lib/server/teams-chat-evidence';
+import {
+  CHAT_MIN_AGE_MS,
+  chatCallEndMs,
+  chatEvidenceWindow,
+  needsChatLookup,
+} from '@/lib/teams-chat-evidence';
+import { findImportedOccurrences } from '@/db-ops/imported-occurrences';
+import { markTeamsChatBackfilled } from '@/db-ops/google-accounts';
+import { getMeetingCacheByMeetings } from '@/db-ops/gmeet-meeting-cache';
 
 /**
  * Background sync-and-remind poller. Every POLL_MS, for each user with a
@@ -114,13 +133,34 @@ async function getArtifactConfig(
 }
 
 /**
- * Teams half of a user's sweep: past own-tenant Teams meetings that nobody
- * imported and that DO have artifacts at Microsoft → 'unimported' reminders,
- * plus the metadata cache row the check route serves. App-only Graph; one
- * resolution per occurrence ever (cached in raw.teamsResolution), and once
- * both artifacts are known no Graph call is made at all.
+ * Teams half of a user's sweep — two independent parts:
+ *
+ *  1. ARTIFACTS (own tenant only, app-only Graph): past Teams meetings that
+ *     nobody imported and that DO have artifacts at Microsoft →
+ *     'unimported' reminders + the metadata cache row the check route
+ *     serves. One resolution per occurrence ever (raw.teamsResolution);
+ *     once both artifacts are known no Graph call is made at all.
+ *  2. CHAT EVIDENCE (own tenant AND external, via Darth Tasks + the user's
+ *     delegated Microsoft link): was the occurrence actually held / recorded
+ *     — persisted as raw.teamsChat (sweepTeamsChat below), with a one-time
+ *     60-day backfill on first sighting as linked (migration 028).
  */
 async function sweepUserTeams(
+  caller: { userId: string; email: string },
+  events: CalEvent[],
+  mutedKeys: Set<string>,
+  now: number,
+  ctx: { account: GoogleAccountRow; token: string }
+): Promise<void> {
+  await sweepTeamsArtifacts(caller, events, mutedKeys, now);
+  try {
+    await sweepTeamsChatForUser(caller, events, mutedKeys, now, ctx);
+  } catch (err) {
+    console.warn(`[gmeet-poller] teams chat sweep failed for ${caller.email}:`, err);
+  }
+}
+
+async function sweepTeamsArtifacts(
   caller: { userId: string; email: string },
   events: CalEvent[],
   mutedKeys: Set<string>,
@@ -211,6 +251,229 @@ async function sweepUserTeams(
       hasRecording,
       hasTranscript,
     });
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Teams chat evidence sweep (own + external tenant, via Darth Tasks)
+// ---------------------------------------------------------------------------
+
+/** At most this many chat-call-events lookups per user sweep (regular window
+ * and backfill share the budget; an unfinished backfill resumes next sweep). */
+const CHAT_LOOKUP_CAP = 40;
+const CHAT_BACKFILL_DAYS = 60;
+
+interface ChatCandidate {
+  e: CalEvent;
+  info: TeamsJoinInfo;
+  external: boolean;
+  startIso: string;
+  endIso: string | null;
+}
+
+/** Past Teams events (own-tenant AND external) old enough for a chat
+ * verdict, deduped per occurrence, mutes excluded. */
+function chatCandidatesOf(events: CalEvent[], mutedKeys: Set<string>, now: number): ChatCandidate[] {
+  const seen = new Set<string>();
+  const out: ChatCandidate[] = [];
+  for (const e of events) {
+    const endIso = e.end?.dateTime ?? e.end?.date ?? null;
+    if (!endIso || Date.parse(endIso) >= now - CHAT_MIN_AGE_MS) continue;
+    const info = teamsInfoOf(e);
+    if (!info) continue;
+    const startIso = eventStartIso(e);
+    if (!startIso) continue;
+    const code = teamsCacheCode(info.joinWebUrl);
+    if (mutedKeys.has(code) || mutedKeys.has(e.id)) continue;
+    const key = eventKeyOf(code, startIso);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push({ e, info, external: !isOwnTenant(info), startIso, endIso });
+  }
+  return out;
+}
+
+interface ChatSweepStats {
+  candidates: number;
+  lookups: number;
+  persisted: number;
+  /** Lookups that persisted a failure reason (forbidden / throttled / …). */
+  failedVerdicts: number;
+  /** Needed a lookup but couldn't get one this sweep (budget exhausted or
+   * plagueis unreachable) — nonzero means "not done, come back". */
+  leftover: number;
+  /** Candidates that can NEVER be asked (join URL with no parseable thread
+   * id / bad start). Counted separately from leftover so a permanently
+   * malformed event can't wedge the one-time backfill stamp — and checked
+   * BEFORE spending budget, so they don't burn lookup slots either. */
+  unaskable: number;
+  /** Occurrences whose verdict is a TRANSIENT failure (throttled /
+   * graph_error) still inside its retry backoff — fresh from this pass or
+   * already cached. The backfill must not stamp while any exist: once
+   * stamped nothing ever revisits occurrences older than the regular
+   * 7-day window, which would freeze a throttling storm into the 60-day
+   * history forever. */
+  transientPending: number;
+}
+
+/** Failure reasons worth re-asking about (visibility can change; a Graph
+ * hiccup passes). forbidden / not_found are treated as settled verdicts. */
+const TRANSIENT_CHAT_REASONS = new Set(['throttled', 'graph_error']);
+
+/** One pass over a candidate list: skip imported + fresh verdicts, spend the
+ * shared budget on the rest, persist via lookupAndPersistTeamsChat. */
+async function sweepTeamsChatEvents(
+  caller: { userId: string; email: string },
+  candidates: ChatCandidate[],
+  budget: { left: number },
+  now: number
+): Promise<ChatSweepStats> {
+  const stats: ChatSweepStats = {
+    candidates: candidates.length,
+    lookups: 0,
+    persisted: 0,
+    failedVerdicts: 0,
+    leftover: 0,
+    unaskable: 0,
+    transientPending: 0,
+  };
+  if (candidates.length === 0) return stats;
+
+  // Anything anyone already imported needs no held/recorded verdict — the
+  // transcript itself is the evidence. Join URL ±12h plus the exact calendar
+  // eventId (external occurrences are imported via linked uploads — D9).
+  const imported = await findImportedOccurrences(
+    candidates.map((c) => ({
+      joinWebUrl: c.info.joinWebUrl,
+      eventId: c.e.id,
+      startTime: c.startIso,
+    })),
+    caller
+  ).catch(() => candidates.map(() => null));
+  const cacheRows = await getMeetingCacheByMeetings(
+    candidates.map((c) => ({ code: teamsCacheCode(c.info.joinWebUrl), startTime: c.startIso })),
+    { preferChat: true }
+  ).catch(() => candidates.map(() => null));
+
+  for (let i = 0; i < candidates.length; i++) {
+    const c = candidates[i]!;
+    if (imported[i]) continue;
+    const existing = cacheRows[i] ?? null;
+    const verdict = existing?.teams_chat ?? null;
+    if (!needsChatLookup(verdict, chatCallEndMs(c.endIso, verdict), now)) {
+      if (verdict?.reason && TRANSIENT_CHAT_REASONS.has(verdict.reason)) {
+        stats.transientPending++;
+      }
+      continue;
+    }
+    if (!threadIdFromJoinUrl(c.info.joinWebUrl) || !chatEvidenceWindow(c.startIso, c.endIso)) {
+      // lookupAndPersistTeamsChat could never even send this one — don't
+      // spend budget on it, and don't let it block the backfill stamp.
+      stats.unaskable++;
+      continue;
+    }
+    if (budget.left <= 0) {
+      stats.leftover++;
+      continue;
+    }
+    budget.left--;
+    stats.lookups++;
+    const result = await lookupAndPersistTeamsChat({
+      info: c.info,
+      external: c.external,
+      eventStart: c.startIso,
+      eventEnd: c.endIso,
+      email: caller.email,
+      event: {
+        recurringEventId: c.e.recurringEventId ?? null,
+        iCalUID: c.e.iCalUID ?? null,
+        organizerEmail: c.e.organizer?.email ?? null,
+      },
+      capturedBy: caller.userId,
+      existing,
+    });
+    if (!result?.persisted) {
+      // Plagueis unreachable, or it says this user isn't linked after all —
+      // nothing written, retry next sweep.
+      stats.leftover++;
+    } else if (result.verdict.reason) {
+      stats.failedVerdicts++;
+      stats.persisted++;
+      if (TRANSIENT_CHAT_REASONS.has(result.verdict.reason)) stats.transientPending++;
+    } else {
+      stats.persisted++;
+    }
+  }
+  return stats;
+}
+
+/**
+ * Chat half of a user's Teams sweep: one link-status call per sweep; if the
+ * user's Microsoft link is active, verdicts for the regular window's Teams
+ * events, then (until stamped) the one-time 60-day backfill — listed through
+ * the same discovery service (maxPages 20, persists calendar rows) and
+ * stamped only when every backfill occurrence has a verdict.
+ */
+async function sweepTeamsChatForUser(
+  caller: { userId: string; email: string },
+  events: CalEvent[],
+  mutedKeys: Set<string>,
+  now: number,
+  ctx: { account: GoogleAccountRow; token: string }
+): Promise<void> {
+  if (!isDarthTasksConfigured()) return;
+  const candidates = chatCandidatesOf(events, mutedKeys, now);
+  const needsBackfill = !ctx.account.teams_chat_backfilled_at;
+  if (candidates.length === 0 && !needsBackfill) return;
+
+  const link = await fetchMsLinkStatusOne(caller.email);
+  if (!link) return; // plagueis unreachable — try again next sweep
+  if (!link.linked) return; // not connected (or revoked) — nothing to read with
+
+  const budget = { left: CHAT_LOOKUP_CAP };
+  const stats = await sweepTeamsChatEvents(caller, candidates, budget, now);
+
+  let backfill: ChatSweepStats | null = null;
+  // No point listing 60 days of calendar (up to 20 pages) when the regular
+  // window already spent every lookup slot — nothing could be asked anyway;
+  // the stamp resumes on a quieter sweep.
+  if (needsBackfill && budget.left > 0) {
+    try {
+      // Only the part of the 60 days the regular window doesn't cover.
+      const bfEvents = await syncCalendarWindow(caller.userId, ctx.token, {
+        from: new Date(now - CHAT_BACKFILL_DAYS * 86_400_000).toISOString(),
+        to: new Date(now - LOOKBACK_DAYS * 86_400_000).toISOString(),
+        maxPages: 20,
+      });
+      backfill = await sweepTeamsChatEvents(
+        caller,
+        chatCandidatesOf(bfEvents, mutedKeys, now),
+        budget,
+        now
+      );
+      // Stamp only when NOTHING remains to ask: no budget/transport
+      // leftovers AND no transient failure verdicts awaiting their retry —
+      // after the stamp nothing ever revisits these occurrences.
+      if (backfill.leftover === 0 && backfill.transientPending === 0) {
+        await markTeamsChatBackfilled(caller.userId);
+      }
+    } catch (err) {
+      console.warn(`[gmeet-poller] teams chat backfill listing failed for ${caller.email}:`, err);
+    }
+  }
+
+  const fmt = (s: ChatSweepStats) =>
+    `${s.lookups} lookups, ${s.persisted} persisted (${s.failedVerdicts} failed verdicts), ` +
+    `${s.leftover} leftover, ${s.unaskable} unaskable, ${s.transientPending} transient of ${s.candidates}`;
+  if (stats.lookups > 0 || stats.leftover > 0 || backfill) {
+    console.log(
+      `[gmeet-poller] teams chat for ${caller.email}: ${fmt(stats)}` +
+        (backfill
+          ? `; backfill: ${fmt(backfill)}${
+              backfill.leftover === 0 && backfill.transientPending === 0 ? ' — stamped' : ''
+            }`
+          : '')
+    );
   }
 }
 
@@ -351,7 +614,7 @@ async function sweepUser(account: GoogleAccountRow): Promise<void> {
 
   // ---- Teams events (own tenant) → 'unimported' reminders + cache ---------
   try {
-    await sweepUserTeams(caller, allEvents, mutedKeys, now);
+    await sweepUserTeams(caller, allEvents, mutedKeys, now, { account, token });
   } catch (err) {
     console.warn(`[gmeet-poller] teams sweep failed for ${account.user_email}:`, err);
   }

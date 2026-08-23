@@ -10,6 +10,7 @@ import { GmeetImportDialog } from '@/components/gmeet-import-dialog';
 import { GmeetRemindersCard, type Reminder } from '@/components/gmeet-reminders-card';
 import { TranscriptImportDialog } from '@/components/transcript-import-dialog';
 import { AppHeader } from '@/components/app-header';
+import { ConnectNudgeBanner } from '@/components/connect-nudge-banner';
 import { LabelRail, LABEL_RAIL_STORAGE_KEY } from '@/components/label-rail';
 import { Button } from '@/components/ui/button';
 import {
@@ -310,6 +311,10 @@ export default function Home() {
             onClose={dismissBanner}
           />
         )}
+
+        {/* Missing Google / Microsoft link → one dismissable nudge above the
+            listing (per-service 7-day snooze; see connect-nudge-banner.tsx). */}
+        <ConnectNudgeBanner />
 
         <div className="flex items-start gap-4">
           {!railCollapsed && (

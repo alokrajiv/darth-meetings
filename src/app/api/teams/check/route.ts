@@ -13,11 +13,17 @@ export const runtime = 'nodejs';
  * `url` is the RAW Teams link found on the calendar event (canonicalization
  * happens here).
  *
- * Returns `results` aligned by index. Cache-first and cheap: no Graph calls
- * in this path — artifact presence comes from the poller's metadata cache,
- * dedupe from the indexed gmeet_context->'teams' lookups. External-tenant
- * events are flagged (the dialog renders them as guided manual import, spec
- * §10.1) and never resolved.
+ * Returns `results` aligned by index. Cache-first and cheap: no Graph or
+ * Darth Tasks calls in this path — artifact presence comes from the poller's
+ * metadata cache, dedupe from the indexed gmeet_context->'teams' lookups.
+ * External-tenant events are flagged (the dialog renders them as guided
+ * manual import, spec §10.1) and never resolved — but they DO carry `chat`
+ * when a chat-evidence row exists for the occurrence.
+ *
+ * Every entry (own-tenant and external) carries `chat`: the cached Teams
+ * chat verdict (held / recorded — raw.teamsChat, lib/teams-chat-evidence)
+ * or null when no sweep/Check ever recorded one. A live chat lookup is the
+ * evidence route's job.
  */
 export const POST = withAuth(async ({ user, request }) => {
   const body = (await request.json().catch(() => null)) as {
@@ -34,15 +40,23 @@ export const POST = withAuth(async ({ user, request }) => {
   const parsed = events.map((e) => (e.url ? parseTeamsJoinLink(e.url) : null));
 
   const dedupeQueries: Array<{ joinWebUrl: string; startTime: string | null }> = [];
+  const dedupeIndex: number[] = []; // position in dedupeQueries per event (own tenant only)
+  // Cache rows for ALL parseable links — external occurrences have chat-
+  // evidence rows (raw.teamsChat / raw.external) worth surfacing too.
   const cacheQueries: Array<{ code: string; startTime: string | null }> = [];
-  const queryIndex: number[] = []; // position in dedupe/cache arrays per event
+  const cacheIndex: number[] = [];
   parsed.forEach((p, i) => {
     if (p && isOwnTenant(p)) {
-      queryIndex.push(dedupeQueries.length);
+      dedupeIndex.push(dedupeQueries.length);
       dedupeQueries.push({ joinWebUrl: p.joinWebUrl, startTime: events[i]!.startTime });
+    } else {
+      dedupeIndex.push(-1);
+    }
+    if (p) {
+      cacheIndex.push(cacheQueries.length);
       cacheQueries.push({ code: teamsCacheCode(p.joinWebUrl), startTime: events[i]!.startTime });
     } else {
-      queryIndex.push(-1);
+      cacheIndex.push(-1);
     }
   });
 
@@ -59,12 +73,18 @@ export const POST = withAuth(async ({ user, request }) => {
   const results = parsed.map((p, i) => {
     if (!p) return null; // not a parseable Teams link
     const external = !isOwnTenant(p);
+    const cacheAny = cacheRows[cacheIndex[i]!] ?? null;
     if (external) {
-      return { external: true as const, tenantId: p.tenantId, code: teamsCacheCode(p.joinWebUrl) };
+      return {
+        external: true as const,
+        tenantId: p.tenantId,
+        code: teamsCacheCode(p.joinWebUrl),
+        chat: cacheAny?.teams_chat ?? null,
+      };
     }
-    const qi = queryIndex[i]!;
+    const qi = dedupeIndex[i]!;
     const dupe = imported[qi] ?? null;
-    const cache = cacheRows[qi] ?? null;
+    const cache = cacheAny;
     return {
       external: false as const,
       /** `teams-<hash>` — the mute/reminder key the client can't compute
@@ -91,6 +111,7 @@ export const POST = withAuth(async ({ user, request }) => {
             confEnd: cache.conf_end,
           }
         : null,
+      chat: cache?.teams_chat ?? null,
     };
   });
 

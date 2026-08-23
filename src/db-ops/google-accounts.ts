@@ -21,12 +21,16 @@ export interface GoogleAccountRow {
   connected_at: string;
   last_refresh_at: string | null;
   last_poll_at: string | null;
+  /** When the one-time 60-day Teams-chat-evidence backfill completed for
+   * this user (migration 028); null = not yet run (or still partial). */
+  teams_chat_backfilled_at: string | null;
 }
 
 export async function getGoogleAccount(userId: string): Promise<GoogleAccountRow | null> {
   const rows = await sql<GoogleAccountRow[]>`
     SELECT user_id, user_email, google_email, refresh_token_enc, scopes,
-           client_key, status, last_error, connected_at, last_refresh_at, last_poll_at
+           client_key, status, last_error, connected_at, last_refresh_at,
+           last_poll_at, teams_chat_backfilled_at
     FROM ${sql(SCHEMA)}.google_accounts
     WHERE user_id = ${userId}
   `;
@@ -81,6 +85,15 @@ export async function markGoogleAccountStatus(
   `;
 }
 
+/** Stamp the one-time Teams-chat backfill as fully done (migration 028). */
+export async function markTeamsChatBackfilled(userId: string): Promise<void> {
+  await sql`
+    UPDATE ${sql(SCHEMA)}.google_accounts
+    SET teams_chat_backfilled_at = now(), updated_at = now()
+    WHERE user_id = ${userId}
+  `;
+}
+
 export async function markGoogleAccountPolled(userId: string): Promise<void> {
   await sql`
     UPDATE ${sql(SCHEMA)}.google_accounts
@@ -94,7 +107,8 @@ export async function markGoogleAccountPolled(userId: string): Promise<void> {
 export async function listPollableGoogleAccounts(): Promise<GoogleAccountRow[]> {
   return sql<GoogleAccountRow[]>`
     SELECT user_id, user_email, google_email, refresh_token_enc, scopes,
-           client_key, status, last_error, connected_at, last_refresh_at, last_poll_at
+           client_key, status, last_error, connected_at, last_refresh_at,
+           last_poll_at, teams_chat_backfilled_at
     FROM ${sql(SCHEMA)}.google_accounts
     WHERE status <> 'revoked'
     ORDER BY last_poll_at ASC NULLS FIRST

@@ -5,6 +5,7 @@ import { OCCURRENCE_WINDOW_S } from '@/lib/meeting-evidence';
 import { importedOccurrenceAntiJoin } from '@/db-ops/imported-occurrences';
 import { norecFilterSql, unimportedFilterSql } from '@/db-ops/meeting-filter-sql';
 import { EMPTY_MEETING_FILTERS, type MeetingFilters } from '@/lib/server/meeting-filters';
+import type { TeamsChatEvidence } from '@/lib/teams-chat-evidence';
 
 // Per-user calendar event cache (migration 022) + the paged queries behind
 // GET /api/calendar-meetings. The poller batch-upserts EVERY timed event
@@ -155,6 +156,30 @@ export async function getCalendarAttachmentsFor(
   };
 }
 
+/**
+ * Does THIS user's calendar actually contain the occurrence (meeting code
+ * ±12h of the start)? Gate for persistence keyed on client-supplied input:
+ * /api/teams/evidence takes a raw join URL + startTime from the browser, and
+ * without this check any authenticated caller could mint one permanent
+ * gmeet_meeting_cache row per fabricated URL (the row key is derived from
+ * the URL's hash, so the space is unbounded).
+ */
+export async function hasCalendarOccurrence(
+  userId: string,
+  meetingCode: string,
+  startIso: string
+): Promise<boolean> {
+  const rows = await sql<Array<{ ok: boolean }>>`
+    SELECT true AS ok
+    FROM ${sql(SCHEMA)}.calendar_event_cache
+    WHERE user_id = ${userId}
+      AND meeting_code = ${meetingCode}
+      AND abs(extract(epoch FROM (event_start - ${startIso}::timestamptz))) <= ${OCCURRENCE_WINDOW_S}
+    LIMIT 1
+  `;
+  return rows.length > 0;
+}
+
 // ---------------------------------------------------------------------------
 // Calendar-event mutes (migration 023) — per-user HIDE of calendar rows.
 // Personal blocks ("my lunch", focus time) aren't real meetings; a mute
@@ -278,6 +303,12 @@ export interface CalendarMeetingDbRow {
   evidence_recording_state: string | null;
   evidence_transcript_state: string | null;
   evidence_checked_at: string | null;
+  /** Teams rows: the chat verdict (held / recorded — raw.teamsChat on the
+   * occurrence's artifact-cache row, lib/teams-chat-evidence); null = never
+   * checked. Serves the "Held 51 min · not recorded" line on norec rows. */
+  teams_chat: TeamsChatEvidence | null;
+  /** raw.external on the same row — organized by an external tenant. */
+  chat_external: boolean | null;
 }
 
 export interface CalendarRangeOpts {
@@ -497,6 +528,8 @@ async function unimportedRows(
       NULL::text AS evidence_recording_state,
       NULL::text AS evidence_transcript_state,
       NULL::timestamptz AS evidence_checked_at,
+      c.raw->'teamsChat' AS teams_chat,
+      (c.raw->>'external')::boolean AS chat_external,
       -- Artifact deep links (display-only ids; Google enforces access when
       -- the link is opened — same exposure as the gmeet/check meta).
       c.video_file_id,
@@ -596,7 +629,9 @@ async function norecRows(
       ) END AS series_count,
       ev.recording_state AS evidence_recording_state,
       ev.transcript_state AS evidence_transcript_state,
-      ev.updated_at AS evidence_checked_at
+      ev.updated_at AS evidence_checked_at,
+      chatv.teams_chat,
+      chatv.chat_external
     FROM ${sql(SCHEMA)}.calendar_event_cache c
     -- The artifact cache row the last probe left for this occurrence (the
     -- anti-join above already proved it holds no evidence — this only tells
@@ -614,6 +649,24 @@ async function norecRows(
       ORDER BY g.updated_at DESC
       LIMIT 1
     ) ev ON true
+    -- The chat verdict separately: dual-tz event keys leave tz-duplicate
+    -- twin rows for one occurrence, and whichever was touched last is not
+    -- necessarily the one the chat sweep wrote raw.teamsChat on — a
+    -- chat-less twin must not mask its sibling's verdict, so this lateral
+    -- only looks at chat-bearing rows.
+    LEFT JOIN LATERAL (
+      SELECT g.raw->'teamsChat' AS teams_chat,
+             (g.raw->>'external')::boolean AS chat_external
+      FROM ${sql(SCHEMA)}.gmeet_meeting_cache g
+      WHERE c.meeting_code IS NOT NULL
+        AND g.meeting_code = c.meeting_code
+        AND g.raw ? 'teamsChat'
+        AND abs(extract(epoch FROM (
+              COALESCE(g.event_start, g.conf_start) - c.event_start
+            ))) <= ${OCCURRENCE_WINDOW_S}
+      ORDER BY g.updated_at DESC
+      LIMIT 1
+    ) chatv ON true
     ${norecWhere(userId, opts)}
       AND to_char(${day}, 'YYYY-MM-DD') = ANY(${dayKeys})
     ORDER BY c.event_start DESC, c.event_key DESC
