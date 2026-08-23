@@ -22,6 +22,7 @@ import {
   Crown,
   Sparkles,
   FileText,
+  Tag,
   X,
 } from 'lucide-react';
 
@@ -37,7 +38,9 @@ export type ActivityAction =
   | 'owner_transfer'
   | 'generate_notes'
   | 'set_notes'
-  | 'set_report';
+  | 'set_report'
+  | 'label_add'
+  | 'label_remove';
 
 export interface ActivityRow {
   id: number;
@@ -155,6 +158,14 @@ function actionVerb(row: ActivityRow): string {
       const d = row.details as { via?: string } | null;
       return d?.via ? `updated report via ${d.via}` : 'updated report';
     }
+    case 'label_add': {
+      const d = row.details as { path?: string } | null;
+      return d?.path ? `added label ${d.path}` : 'added a label';
+    }
+    case 'label_remove': {
+      const d = row.details as { path?: string } | null;
+      return d?.path ? `removed label ${d.path}` : 'removed a label';
+    }
     default:
       return row.action;
   }
@@ -186,6 +197,9 @@ function actionIcon(action: ActivityAction) {
     case 'set_notes':
     case 'set_report':
       return <FileText className={cls} />;
+    case 'label_add':
+    case 'label_remove':
+      return <Tag className={cls} />;
     default:
       return <Eye className={cls} />;
   }

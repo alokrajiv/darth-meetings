@@ -358,6 +358,16 @@ export interface TranscriptWithAccess extends StoredTranscript {
   owner_name: string | null;
 }
 
+/** Minimal label reference carried on listing rows / chips (mirror of
+ * `LabelRef` in src/lib/labels.ts — kept here so format.ts stays the one
+ * place wire shapes are declared). */
+export interface LabelRef {
+  id: number;
+  name: string;
+  path: string;
+  color: string | null;
+}
+
 /**
  * Skinny row returned by the listing endpoint. Deliberately excludes the
  * enormous `imported_content` JSONB, `audio_url`, and `local_audio_path`
@@ -422,6 +432,10 @@ export interface TranscriptListRow {
   access: TranscriptAccess;
   owner_email: string | null;
   owner_name: string | null;
+  /** v2 listing only: org-wide labels on this transcript, sorted by path_key
+   * (docs/labels-design.md §7). Absent on the legacy (no-params) listing,
+   * which stays byte-identical. */
+  labels?: LabelRef[];
 }
 
 /** One day bucket of the paginated v2 listing. `key` is the day in the

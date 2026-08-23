@@ -52,11 +52,39 @@ READ
                                   from a video recording have frames
   attachments <id>                List attached context files
   attachment-get <id> <attId> [--out <file>]   Download one attachment
+  labels                          Org-wide label tree with visible-to-you counts
+                                  (subtree-inclusive) and #ids; --json = flat rows
+
+LABELS (org-wide, hierarchical 'Customers/LP Global/QBR', many per transcript;
+<label> = a path, case-insensitive, or '#<id>' from 'labels')
+  label <id> <label>              Add a label to a transcript — missing path
+                                  segments are created (prints "created …")
+  unlabel <id> <label>            Remove a label from a transcript
+  list --label <label|none> [--exact]
+                                  Filter the archive by label; default includes
+                                  sub-labels, --exact = that label only, 'none'
+                                  = unlabelled. Composes with the FILTERS below
+  export --label <label|none> [--exact] --out-dir <dir>
+                                  Mirror as folders: <dir>/<label path>/<date>
+                                  <title> (<id>)/{meta.json,text.txt,notes.md,
+                                  report.md}; a transcript carrying N matching
+                                  labels lands N times (by design)
+  label-create <path> [--color #rrggbb]
+                                  Create a label (whole chain; 0 created = existed)
+  label-rename <label> <newName>  Rename one segment (sub-label paths follow)
+  label-mv <label> <newParent|/>  Move a label (and its subtree) under another
+                                  label, or '/' = top level
+  label-rm <label> [--cascade]    Delete a label; refuses (exit 1) if it has
+                                  sub-labels unless --cascade. Assignments on
+                                  meetings go with it
 
 WRITE (needs read+write for meetings)
   set-title <id> <title>          Update the title
   set-notes <id> --file <md|->    Replace the notes markdown ('-' = stdin)
   set-report <id> --file <md|->   Replace the report markdown ('-' = stdin)
+  label / unlabel / label-create / label-rename / label-mv / label-rm
+                                  (label/unlabel also need owner or edit access
+                                  on that transcript; readers get 403)
   skill                           Print the agent workflow guide
 
 FILTERS (list / search / export / calendar — all AND together; a comma
@@ -73,8 +101,11 @@ inside one value = OR; matching is case-insensitive substring)
                       attendees. ('search' takes the query as its argument.)
   --from <YYYY-MM-DD> --to <YYYY-MM-DD>   inclusive day range in your timezone
                       (config 'timezone', else this machine's). Not on 'search'.
+  --label <label|none> [--exact]   label filter (list / export only, see LABELS)
 Tab counts / totals printed alongside already reflect the filters.
-'list --json' / 'export' rows carry "participants": [emails] (organizer first).
+'list --json' / 'export' rows carry "participants": [emails] (organizer first)
+and "labels": [{id,name,path,color}]; filtered 'list' lines show a
+{path,path} column when a row has labels.
 
 IDS: <id> is the transcript id shown by 'list' (also in web URLs:
 /transcript/<id>). Timestamps in 'text' output are utterance starts — feed
@@ -143,6 +174,29 @@ lines ({ms, speaker, text}) plus the row metadata instead.
 at Google/Microsoft but un-imported, or no recording at all) — use it to
 tell a human "these 3 meetings have recordings nobody imported"; importing
 itself is a web-UI action.
+
+## Labels (org-wide taxonomy, many per meeting)
+
+Labels are hierarchical paths ('Customers/LP Global/QBR') shared by the
+whole org — everyone sees the same tree, counts are "visible to you". A
+meeting can carry any number of labels; filtering by a label includes its
+sub-labels unless --exact. Deterministic verbs, no AI:
+
+    darth-cli meetings labels                       # tree + counts + #ids
+    darth-cli meetings label <id> Customers/LP Global   # creates missing segments
+    darth-cli meetings unlabel <id> '#12'
+    darth-cli meetings list --label customers --from 2026-07-01   # case-insensitive
+    darth-cli meetings list --label none            # unlabelled meetings
+    darth-cli meetings export --label Customers --out-dir ./mirror
+
+The export mirror is a folder tree <dir>/<label path>/<date> <title> (<id>)/
+with meta.json, text.txt (= 'text <id>'), notes.md and report.md (the
+latter two only when they exist) — read a whole customer's history with
+your own model in one walk. Paths you type are case-insensitive; '#<id>'
+from 'labels' works wherever a label is expected. Before inventing a new
+top-level label, run 'labels' and reuse an existing branch — it is a shared
+taxonomy, not a personal tag list. label-rename / label-mv / label-rm
+change it for everyone (the server logs who did it).
 
 ## Report markdown conventions
 
@@ -243,9 +297,34 @@ function localTz(ctx: Ctx): string {
  * Values are passed through verbatim (comma = OR is server-side semantics);
  * only cheap shape checks happen here so typos fail before a network hop.
  */
+/**
+ * `--cascade` / `--exact` are booleans, but the shared parseArgs eats the next
+ * non-`--` token as a flag VALUE (`label-rm --cascade zz-test` →
+ * cascade='zz-test', no label). Normalise: 1/true/yes → true, 0/false/no →
+ * false, anything else was a swallowed positional → hand it back to `pos`
+ * and set the flag true.
+ */
+function liftBoolFlags(pos: string[], flags: Record<string, string | boolean>, names: readonly string[]): void {
+  for (const name of names) {
+    const v = flags[name];
+    if (v === undefined || typeof v === "boolean") continue;
+    const lc = v.trim().toLowerCase();
+    if (["1", "true", "yes"].includes(lc)) flags[name] = true;
+    else if (["0", "false", "no"].includes(lc)) delete flags[name];
+    else { flags[name] = true; pos.push(v); }
+  }
+}
+
 function readFilterFlags(ctx: Ctx, flags: Record<string, string | boolean>, allow: readonly string[]): FilterRead {
   const params = new URLSearchParams();
   let active = false;
+  // --label/--exact are resolved separately (async, needs GET /api/labels —
+  // see resolveLabelFilter); here we only reject them where unsupported so
+  // `calendar --label x` fails loudly instead of silently listing everything.
+  for (const name of ["label", "exact"] as const) {
+    if (flags[name] !== undefined && !allow.includes(name)) return { ok: false, error: `--${name} is not supported by this command` };
+  }
+  if (flags.exact !== undefined && flags.label === undefined) return { ok: false, error: "--exact only makes sense together with --label" };
   for (const name of ALL_FILTER_FLAGS) {
     const v = flags[name];
     if (v === undefined) continue;
@@ -296,6 +375,156 @@ async function drainDayPages<R = any, C = any>(
   return { rows, counts };
 }
 
+// ---------------------------------------------------------------------------
+// Labels (org-wide hierarchical taxonomy — docs/labels-design.md §6)
+// ---------------------------------------------------------------------------
+// The path helpers below mirror src/lib/labels.ts (pure) — this folder is
+// copied into darth-cli at build time, so it cannot import from the app.
+
+/** Minimal label as carried on listing rows / assignment responses. */
+interface LabelRef { id: number; name: string; path: string; color: string | null }
+/** Flat row of GET /api/labels (sorted by path_key by the server). */
+interface LabelRow extends LabelRef {
+  parent_id: number | null; depth: number; path_key: string; description: string | null;
+  created_by_email: string; count_visible?: number; count_direct?: number;
+}
+
+/** 'a / b//c ' → ['a','b','c'] (trim segments, drop empties). */
+function splitLabelPath(input: string): string[] {
+  return input.split("/").map(s => s.trim()).filter(Boolean);
+}
+/** Case-folded comparison key, same folding as the server's path_key. */
+function labelPathKey(input: string): string {
+  return splitLabelPath(input).join("/").toLowerCase();
+}
+/** '#12' → 12; anything else → null. */
+function labelIdArg(input: string): number | null {
+  const m = /^#(\d+)$/.exec(input.trim());
+  return m ? parseInt(m[1]!, 10) : null;
+}
+/** Filesystem-safe folder segment that still reads like the label / title:
+ * keeps case and inner spaces, swaps path separators + Windows-illegal chars
+ * for '-', strips control chars and trailing dots/spaces, caps length. */
+function fsSegment(raw: string, max = 120): string {
+  let s = (raw ?? "").replace(/[\x00-\x1f\x7f]/g, "").replace(/[\\/:*?"<>|]/g, "-").replace(/\s+/g, " ").trim().replace(/[. ]+$/g, "");
+  if (s.length > max) s = s.slice(0, max).replace(/[. ]+$/g, "");
+  return !s || s === "." || s === ".." ? "_" : s;
+}
+/** Does `pathKey` sit at / under the label `rootKey`? */
+function underLabel(pathKey: string, rootKey: string, exact: boolean): boolean {
+  return pathKey === rootKey || (!exact && pathKey.startsWith(rootKey + "/"));
+}
+
+/**
+ * Export-mirror folder path per label id. Siblings whose names differ only in
+ * characters fsSegment folds away ('Q&A: 2026' vs 'Q&A- 2026') would land in
+ * one directory — those get a ' (#id)' suffix so every label keeps its own
+ * folder. Unknown ids (label not in the catalog) fall back to the display
+ * path segments.
+ */
+function exportRelPaths(rows: LabelRow[]): Map<number, string> {
+  const byId = new Map(rows.map(r => [r.id, r]));
+  const segOf = new Map<number, string>();
+  const groups = new Map<string, LabelRow[]>();
+  for (const r of rows) {
+    const k = `${r.parent_id ?? 0}|${fsSegment(r.name)}`;
+    (groups.get(k) ?? groups.set(k, []).get(k)!).push(r);
+  }
+  for (const list of groups.values()) {
+    for (const r of list) segOf.set(r.id, list.length > 1 ? `${fsSegment(r.name)} (#${r.id})` : fsSegment(r.name));
+  }
+  const out = new Map<number, string>();
+  const rel = (id: number, guard = 0): string => {
+    const cached = out.get(id);
+    if (cached !== undefined) return cached;
+    const r = byId.get(id);
+    if (!r || guard > 8) return "";
+    const own = segOf.get(id) ?? fsSegment(r.name);
+    const parent = r.parent_id == null ? "" : rel(r.parent_id, guard + 1);
+    const v = parent ? `${parent}/${own}` : own;
+    out.set(id, v);
+    return v;
+  };
+  for (const r of rows) rel(r.id);
+  return out;
+}
+
+async function fetchLabels(ctx: Ctx, counts = false): Promise<LabelRow[]> {
+  const data = await ctx.expectJson<{ labels: LabelRow[] }>(ctx.api("meetings", `/api/labels${counts ? "?counts=1" : ""}`));
+  return data.labels || [];
+}
+
+/**
+ * Resolve a user-typed `<label>` ('Customers/LP Global', case-insensitive,
+ * or '#12') against the org tree. `rows` is the GET /api/labels listing
+ * (pass it in when you already have it — one fetch per run is plenty).
+ */
+async function resolveLabel(ctx: Ctx, input: string, rows?: LabelRow[]): Promise<{ rows: LabelRow[]; label: LabelRow | null; key: string }> {
+  const all = rows ?? await fetchLabels(ctx);
+  const id = labelIdArg(input);
+  if (id !== null) return { rows: all, label: all.find(l => l.id === id) ?? null, key: `#${id}` };
+  const key = labelPathKey(input);
+  return { rows: all, label: key ? all.find(l => l.path_key === key) ?? null : null, key };
+}
+
+/** Resolve or exit 1 with a helpful message (mutations / filters need an existing label). */
+async function requireLabel(ctx: Ctx, input: string, rows?: LabelRow[]): Promise<{ rows: LabelRow[]; label: LabelRow }> {
+  const r = await resolveLabel(ctx, input, rows);
+  if (r.label) return { rows: r.rows, label: r.label };
+  if (!r.key) { console.error("label path is empty — e.g. Customers/LP Global or '#12'"); process.exit(1); }
+  const near = r.rows.filter(l => l.path_key.includes(r.key.replace(/^#/, "").toLowerCase())).slice(0, 5).map(l => `  ${l.path}  (#${l.id})`);
+  console.error(`No label '${input}'.${near.length ? `\nDid you mean:\n${near.join("\n")}` : " Run 'darth-cli meetings labels' to see the tree."}`);
+  process.exit(1);
+}
+
+/** --label/--exact → the listing-v2 `label=<id|none>&exact=1` params (spec §7). */
+async function resolveLabelFilter(ctx: Ctx, flags: Record<string, string | boolean>, params: URLSearchParams):
+  Promise<{ active: boolean; root: LabelRow | null; none: boolean; exact: boolean; rows: LabelRow[] }> {
+  const raw = flags.label;
+  if (raw === undefined) return { active: false, root: null, none: false, exact: false, rows: [] };
+  if (typeof raw !== "string" || !raw.trim()) { console.error("--label needs a value: a path, '#<id>' or none"); process.exit(1); }
+  const exact = flags.exact === true;
+  if (raw.trim().toLowerCase() === "none") {
+    params.set("label", "none");
+    return { active: true, root: null, none: true, exact, rows: [] };
+  }
+  const { label, rows } = await requireLabel(ctx, raw);
+  params.set("label", String(label.id));
+  if (exact) params.set("exact", "1");
+  return { active: true, root: label, none: false, exact, rows };
+}
+
+/** Indented tree of the flat listing ("Customers (41) #3" → children by parent_id). */
+function printLabelTree(rows: LabelRow[]): void {
+  if (!rows.length) return console.log("No labels yet — create one: darth-cli meetings label-create <path>   (or: label <id> <path>)");
+  const byParent = new Map<number | null, LabelRow[]>();
+  for (const l of rows) {
+    const k = l.parent_id != null && rows.some(p => p.id === l.parent_id) ? l.parent_id : null;
+    (byParent.get(k) ?? byParent.set(k, []).get(k)!).push(l);
+  }
+  const width = Math.min(48, Math.max(12, ...rows.map(l => (l.depth - 1) * 2 + l.name.length)));
+  const countOf = (l: LabelRow) => {
+    const vis = l.count_visible ?? 0, direct = l.count_direct ?? vis;
+    return direct !== vis ? `(${vis} · ${direct} direct)` : `(${vis})`;
+  };
+  const cwidth = Math.max(...rows.map(l => countOf(l).length));
+  const walk = (parent: number | null, depth: number) => {
+    const kids = (byParent.get(parent) ?? []).sort((a, b) => a.path_key < b.path_key ? -1 : a.path_key > b.path_key ? 1 : a.id - b.id);
+    for (const l of kids) {
+      console.log(`${"  ".repeat(depth)}${l.name.padEnd(Math.max(0, width - depth * 2))}  ${countOf(l).padStart(cwidth)}  #${l.id}${l.color ? `  ${l.color}` : ""}`);
+      walk(l.id, depth + 1);
+    }
+  };
+  walk(null, 0);
+  const total = rows.length, top = (byParent.get(null) ?? []).length;
+  console.log(`\n${total} label(s), ${top} top-level · counts = meetings visible to you, sub-labels included · '#id' works wherever a <label> is expected`);
+}
+
+/** Response of the assignment routes → one human line. */
+function printAssigned(id: string, labels: LabelRef[]): void {
+  console.log(`${id}: ${labels.length ? labels.map(l => l.path).join(", ") : "(no labels)"}`);
+}
+
 /** One archive row → the 'list' line (legacy and filtered paths share it). */
 function transcriptDate(t: any): string {
   return (t.recorded_at || t.completed_at || t.created_at || "").slice(0, 10);
@@ -311,7 +540,10 @@ function printTranscriptRows(rows: any[]): void {
       t.auto_notes ? "notes" : null,
       t.auto_report ? "report" : null,
     ].filter(Boolean).join(",");
-    console.log(`${t.assemblyai_id}  ${date}  ${fmtDuration(t.duration).padStart(7)}  ${String(t.speaker_count ?? "?").padStart(2)}sp  ${title}${flagsCol ? `  [${flagsCol}]` : ""}`);
+    // Labels column only exists on listing-v2 rows; legacy rows never have
+    // the field, so the no-flag `list` output stays byte-identical.
+    const labelsCol = Array.isArray(t.labels) && t.labels.length ? `  {${t.labels.map((l: LabelRef) => l.path).join(",")}}` : "";
+    console.log(`${t.assemblyai_id}  ${date}  ${fmtDuration(t.duration).padStart(7)}  ${String(t.speaker_count ?? "?").padStart(2)}sp  ${title}${labelsCol}${flagsCol ? `  [${flagsCol}]` : ""}`);
   }
 }
 
@@ -400,6 +632,7 @@ const meetings: Subcommand = {
   help: HELP,
   async run(ctx, argv) {
     const { pos, flags } = parseArgs(argv);
+    liftBoolFlags(pos, flags, ["cascade", "exact"]);
     const [, cmd, ...args] = pos.length && pos[0] === "meetings" ? pos : ["", ...pos];
     if (!cmd || flags.help === true) { console.log(HELP); return 0; }
 
@@ -417,9 +650,10 @@ const meetings: Subcommand = {
       }
 
       case "list": {
-        const fr = readFilterFlags(ctx, flags, ALL_FILTER_FLAGS);
+        const fr = readFilterFlags(ctx, flags, [...ALL_FILTER_FLAGS, "label", "exact"]);
         if (!fr.ok) { console.error(fr.error); return 1; }
-        if (!fr.active) {
+        const lf = await resolveLabelFilter(ctx, flags, fr.params);
+        if (!fr.active && !lf.active) {
           // No filters → the legacy full listing, byte-for-byte as before.
           const data = await ctx.expectJson<{ transcripts: any[] }>(ctx.api("meetings", "/api/transcripts"));
           const rows = data.transcripts;
@@ -436,8 +670,112 @@ const meetings: Subcommand = {
         ctx.print(rows, () => {
           if (!rows.length) return console.log("No transcripts match those filters.");
           printTranscriptRows(rows);
-          console.log(`\n${rows.length} transcript(s) matching — ${counts.mine ?? "?"} yours, ${counts.shared ?? "?"} shared with you`);
+          const labelNote = lf.none ? " · unlabelled only" : lf.root ? ` · label ${lf.root.path}${lf.exact ? " (exact)" : " (+ sub-labels)"}` : "";
+          console.log(`\n${rows.length} transcript(s) matching — ${counts.mine ?? "?"} yours, ${counts.shared ?? "?"} shared with you${labelNote}`);
         });
+        return 0;
+      }
+
+      case "labels": {
+        const rows = await fetchLabels(ctx, true);
+        ctx.print(rows, () => printLabelTree(rows));
+        return 0;
+      }
+
+      case "label":
+      case "unlabel": {
+        const id = args[0];
+        const target = args.slice(1).join(" ").trim();
+        if (!id || !target) { console.error(`usage: darth-cli meetings ${cmd} <id> <label path|#id>`); return 1; }
+        ctx.requireWrite();
+        if (cmd === "unlabel") {
+          const { label } = await requireLabel(ctx, target);
+          const data = await ctx.expectJson<{ labels: LabelRef[] }>(ctx.api("meetings", `/api/transcripts/${id}/labels/${label.id}`, { method: "DELETE" }));
+          ctx.print(data, () => { console.log(`removed ${label.path} (#${label.id})`); printAssigned(id, data.labels || []); });
+          return 0;
+        }
+        // label: resolve first so we can say exactly which segments were created.
+        const r = await resolveLabel(ctx, target);
+        let label = r.label;
+        let created: LabelRef[] = [];
+        if (!label) {
+          if (labelIdArg(target) !== null) { console.error(`No label ${target}. Run 'darth-cli meetings labels'.`); return 1; }
+          const made = await ctx.expectJson<{ label: LabelRow; created: LabelRef[] }>(
+            ctx.api("meetings", "/api/labels", { method: "POST", body: JSON.stringify({ path: splitLabelPath(target).join("/") }) }));
+          label = made.label; created = made.created || [];
+        }
+        const data = await ctx.expectJson<{ labels: LabelRef[] }>(
+          ctx.api("meetings", `/api/transcripts/${id}/labels`, { method: "POST", body: JSON.stringify({ labelId: label.id }) }));
+        ctx.print({ ...data, label, created }, () => {
+          for (const c of created) console.log(`created ${c.path} (#${c.id})`);
+          console.log(`added ${label!.path} (#${label!.id})`);
+          printAssigned(id, data.labels || []);
+        });
+        return 0;
+      }
+
+      case "label-create": {
+        const path = args.join(" ").trim();
+        if (!splitLabelPath(path).length) { console.error("usage: darth-cli meetings label-create <path>   (e.g. Customers/LP\\ Global)"); return 1; }
+        ctx.requireWrite();
+        const color = str(flags.color);
+        const made = await ctx.expectJson<{ label: LabelRow; created: LabelRef[] }>(
+          ctx.api("meetings", "/api/labels", { method: "POST", body: JSON.stringify({ path: splitLabelPath(path).join("/"), ...(color ? { color } : {}) }) }));
+        ctx.print(made, () => {
+          for (const c of made.created || []) console.log(`created ${c.path} (#${c.id})`);
+          if (!(made.created || []).length) console.log(`exists ${made.label.path} (#${made.label.id}) — nothing created`);
+          else console.log(`${made.label.path} (#${made.label.id}) ready`);
+        });
+        return 0;
+      }
+
+      case "label-rename": {
+        const [target, newName] = args;
+        if (!target || !newName || args.length > 2) { console.error("usage: darth-cli meetings label-rename <label path|#id> <newName>   (quote values with spaces)"); return 1; }
+        if (newName.includes("/")) { console.error("newName is one segment — no '/'. To move a label use label-mv."); return 1; }
+        ctx.requireWrite();
+        const { label } = await requireLabel(ctx, target);
+        const data = await ctx.expectJson<{ label: LabelRow; updated: Array<{ id: number; path: string }> }>(
+          ctx.api("meetings", `/api/labels/${label.id}`, { method: "PATCH", body: JSON.stringify({ name: newName.trim() }) }));
+        ctx.print(data, () => {
+          console.log(`renamed ${label.path} → ${data.label.path} (#${label.id})`);
+          for (const u of data.updated || []) if (u.id !== label.id) console.log(`  sub-label #${u.id} → ${u.path}`);
+        });
+        return 0;
+      }
+
+      case "label-mv": {
+        const [target, dest] = args;
+        if (!target || !dest || args.length > 2) { console.error("usage: darth-cli meetings label-mv <label path|#id> <new parent path|#id|/>   (quote values with spaces)"); return 1; }
+        ctx.requireWrite();
+        const { rows, label } = await requireLabel(ctx, target);
+        let parentId: number | null = null;
+        if (dest.trim() !== "/") parentId = (await requireLabel(ctx, dest, rows)).label.id;
+        if (parentId === label.parent_id) { console.log(`${label.path} (#${label.id}) is already there — nothing to do`); return 0; }
+        const data = await ctx.expectJson<{ label: LabelRow; updated: Array<{ id: number; path: string }> }>(
+          ctx.api("meetings", `/api/labels/${label.id}`, { method: "PATCH", body: JSON.stringify({ parentId }) }));
+        ctx.print(data, () => {
+          console.log(`moved ${label.path} → ${data.label.path} (#${label.id})`);
+          for (const u of data.updated || []) if (u.id !== label.id) console.log(`  sub-label #${u.id} → ${u.path}`);
+        });
+        return 0;
+      }
+
+      case "label-rm": {
+        const target = args.join(" ").trim();
+        if (!target) { console.error("usage: darth-cli meetings label-rm <label path|#id> [--cascade]"); return 1; }
+        ctx.requireWrite();
+        const { rows, label } = await requireLabel(ctx, target);
+        const kids = rows.filter(l => l.path_key.startsWith(label.path_key + "/")).length;
+        const cascade = flags.cascade === true;
+        if (kids && !cascade) {
+          console.error(`${label.path} (#${label.id}) has ${kids} sub-label(s) — re-run with --cascade to delete the whole subtree (their assignments go too).`);
+          return 1;
+        }
+        const data = await ctx.expectJson<{ ok: boolean; removedAssignments: number; removedLabels: number }>(
+          ctx.api("meetings", `/api/labels/${label.id}${cascade ? "?cascade=1" : ""}`, { method: "DELETE" }));
+        ctx.print(data, () =>
+          console.log(`deleted ${label.path} (#${label.id}) — ${data.removedLabels ?? 1} label(s), ${data.removedAssignments ?? "?"} assignment(s) removed`));
         return 0;
       }
 
@@ -500,17 +838,79 @@ const meetings: Subcommand = {
 
       case "export": {
         const outDir = str(flags["out-dir"]) || str(flags.out);
-        if (!outDir) { console.error("usage: darth-cli meetings export --out-dir <dir> [--participant --organizer --provider --speaker --q --from --to] [--format text|json] [--force]"); return 1; }
+        if (!outDir) { console.error("usage: darth-cli meetings export --out-dir <dir> [--label <path|#id|none> [--exact]] [--participant --organizer --provider --speaker --q --from --to] [--format text|json] [--force]"); return 1; }
         const format = str(flags.format) || "text";
         if (format !== "text" && format !== "json") { console.error("--format must be text or json"); return 1; }
         const force = flags.force === true;
-        const fr = readFilterFlags(ctx, flags, ALL_FILTER_FLAGS);
+        const fr = readFilterFlags(ctx, flags, [...ALL_FILTER_FLAGS, "label", "exact"]);
         if (!fr.ok) { console.error(fr.error); return 1; }
+        const lf = await resolveLabelFilter(ctx, flags, fr.params);
         const { rows } = await drainDayPages<any, any>(ctx, "/api/transcripts?v=2&tab=all", fr.params);
         mkdirSync(outDir, { recursive: true });
         const ext = format === "json" ? "json" : "txt";
         const written: any[] = [], skipped: any[] = [], failed: any[] = [];
         const say = (line: string) => { if (!ctx.json) console.log(line); };
+        if (lf.active) {
+          // Label mirror: <dir>/<label path>/<date> <title> (<id>)/{meta.json,
+          // text.txt,notes.md,report.md}. A transcript lands once per MATCHING
+          // label (exact → only the filter label; default → the filter label
+          // and any sub-label it carries). `--label none` → <dir>/_unlabelled.
+          const rootKey = lf.root?.path_key ?? "";
+          const relById = exportRelPaths(lf.rows);
+          const relOf = (l: LabelRef) => relById.get(l.id) ?? splitLabelPath(l.path).map(s => fsSegment(s)).join("/");
+          for (const t of rows) {
+            const id: string = t.assemblyai_id;
+            const title = t.title || t.original_filename || "(untitled)";
+            const date = transcriptDate(t) || "undated";
+            const labels: LabelRef[] = Array.isArray(t.labels) ? t.labels : [];
+            const targets = lf.none
+              ? ["_unlabelled"]
+              : labels.filter(l => underLabel(labelPathKey(l.path), rootKey, lf.exact)).map(relOf);
+            if (!targets.length) targets.push(lf.root ? relOf(lf.root) : "_unlabelled");
+            const leaf = `${date} ${fsSegment(title, 80)} (${id})`;
+            const dirs = [...new Set(targets)].map(rel => join(outDir, rel, leaf));
+            if (t.status !== "completed") {
+              for (const dir of dirs) { skipped.push({ id, file: dir, reason: `status ${t.status}` }); say(`skip   ${dir}  (status: ${t.status})`); }
+              continue;
+            }
+            const todo = dirs.filter(dir => {
+              if (!force && existsSync(join(dir, "text.txt"))) { skipped.push({ id, file: dir, reason: "exists" }); say(`skip   ${dir}  (exists — --force to rewrite)`); return false; }
+              return true;
+            });
+            if (!todo.length) continue;
+            try {
+              const [rendered, detail] = await Promise.all([
+                fetchTranscriptText(ctx, id, p => getJsonOrThrow(ctx, p)),
+                getJsonOrThrow(ctx, `/api/transcripts/${id}`) as Promise<{ transcript: any }>,
+              ]);
+              const tr = detail.transcript || {};
+              const meta = {
+                id, title, date, recorded_at: t.recorded_at ?? null, duration: t.duration ?? null, speaker_count: t.speaker_count ?? null,
+                provider: t.provider ?? null, access: t.access, owner_email: t.owner_email ?? null, participants: t.participants ?? [],
+                labels, description: tr.description ?? null, notes_status: tr.auto_notes_status ?? null, report_status: tr.auto_report_status ?? null,
+                web: `/transcript/${id}`,
+              };
+              const textBody = rendered.text + "\n";
+              for (const dir of todo) {
+                mkdirSync(dir, { recursive: true });
+                writeFileSync(join(dir, "meta.json"), JSON.stringify(meta, null, 2) + "\n");
+                writeFileSync(join(dir, "text.txt"), textBody);
+                const files = ["meta.json", "text.txt"];
+                if (format === "json") { writeFileSync(join(dir, "lines.json"), JSON.stringify(rendered.lines, null, 2) + "\n"); files.push("lines.json"); }
+                if (tr.auto_notes) { writeFileSync(join(dir, "notes.md"), String(tr.auto_notes).replace(/\n?$/, "\n")); files.push("notes.md"); }
+                if (tr.auto_report) { writeFileSync(join(dir, "report.md"), String(tr.auto_report).replace(/\n?$/, "\n")); files.push("report.md"); }
+                written.push({ id, file: dir, title, date, lines: rendered.lines.length, files, bytes: Buffer.byteLength(textBody) });
+                say(`wrote  ${dir}/  (${files.join(", ")})`);
+              }
+            } catch (e: any) {
+              for (const dir of todo) { failed.push({ id, file: dir, error: e?.message || String(e) }); say(`FAIL   ${dir}  (${e?.message || e})`); }
+            }
+          }
+          const manifest = { outDir, format, layout: "labels", label: lf.none ? "none" : lf.root?.path, exact: lf.exact, matched: rows.length, written, skipped, failed };
+          ctx.print(manifest, () =>
+            console.log(`\n${rows.length} matched → ${written.length} folder(s) written, ${skipped.length} skipped, ${failed.length} failed  (${outDir})`));
+          return failed.length ? 1 : 0;
+        }
         for (const t of rows) {
           const id: string = t.assemblyai_id;
           const title = t.title || t.original_filename || "(untitled)";
@@ -533,7 +933,7 @@ const meetings: Subcommand = {
                   id, title, date,
                   recorded_at: t.recorded_at ?? null, duration: t.duration ?? null, speaker_count: t.speaker_count ?? null,
                   provider: t.provider ?? null, access: t.access, owner_email: t.owner_email ?? null,
-                  participants: t.participants ?? [], lines: rendered.lines, text: rendered.text,
+                  participants: t.participants ?? [], labels: t.labels ?? [], lines: rendered.lines, text: rendered.text,
                 }, null, 2) + "\n"
               : rendered.text + "\n";
             writeFileSync(file, body);

@@ -10,7 +10,8 @@ import 'server-only';
  */
 
 export interface MwEvent {
-  /** What changed: notes | speakers | edits | meta | shares | status | created | deleted */
+  /** What changed: notes | speakers | edits | meta | shares | status | created | deleted | labels
+   *  ('labels' = taxonomy or assignment change; assemblyaiId set for the latter) */
   kind: string;
   /** Which transcript (absent for archive-wide events like 'created'). */
   assemblyaiId?: string;

@@ -6,9 +6,9 @@ CLIs keep running the old bundle until darth-cli is rebuilt and deployed.
 
 Design rule for this subcommand: **no AI commands.** The CLI is used mostly by
 people's AI agents; it exposes deterministic primitives (list/get/text/search/
-audio/frame/attachments + set-notes/set-report/set-title write-back) and the
-calling agent brings the intelligence with its own tokens. `skill` prints the
-agent workflow guide.
+audio/frame/attachments/labels + set-notes/set-report/set-title/label write-
+back) and the calling agent brings the intelligence with its own tokens.
+`skill` prints the agent workflow guide.
 
 ## Commands (quick map → endpoints)
 
@@ -20,6 +20,15 @@ agent workflow guide.
 | `export --out-dir <dir> [FILTERS]` | list v2 drain (as above) → per row `GET /api/transcripts/:id/content` + `/speakers` |
 | `calendar [--view unimported\|norec] [FILTERS]` | `GET /api/calendar-meetings?view=…&<filters>` paged the same way |
 | `text / get / notes / report / audio / frame / attachments / set-*` | unchanged |
+| `labels` | `GET /api/labels?counts=1` — human = indented tree (`name (count_visible · n direct) #id color`), `--json` = the flat `labels` array verbatim |
+| `label <id> <label>` | resolve `<label>` against `GET /api/labels`; if the path is new → `POST /api/labels {path}` (prints `created …` per segment); then `POST /api/transcripts/:id/labels {labelId}` |
+| `unlabel <id> <label>` | resolve → `DELETE /api/transcripts/:id/labels/:labelId` |
+| `list --label <label\|none> [--exact] [FILTERS]` | resolve → listing v2 with `&label=<id\|none>&exact=1` (the other filters compose); rows get a `{path,path}` column |
+| `export --label <label\|none> [--exact] --out-dir <dir>` | same listing drain, then per row `GET /api/transcripts/:id/content` + `/speakers` + `/api/transcripts/:id` (notes/report) → folder mirror (below) |
+| `label-create <path> [--color #rrggbb]` | `POST /api/labels {path, color?}` → prints `created …` or `exists …` |
+| `label-rename <label> <newName>` | resolve → `PATCH /api/labels/:id {name}`; prints every rewritten sub-label path from `updated[]` |
+| `label-mv <label> <newParent\|/>` | resolve both → `PATCH /api/labels/:id {parentId: id\|null}` (server 409s cycles / dup names / depth > 6) |
+| `label-rm <label> [--cascade]` | resolve → `DELETE /api/labels/:id[?cascade=1]`; the CLI refuses locally (exit 1) when the label has sub-labels and `--cascade` is absent (the server 409s too) |
 
 ## IDs, files and flags
 
@@ -53,8 +62,38 @@ agent workflow guide.
   manifest `{outDir,format,matched,written,skipped,failed}` instead of the
   per-file lines.
 - `list --json` / `export` rows carry `participants: string[]` (organizer
-  first, then attendee emails) — that field comes from listing v2 only, so the
-  legacy no-flag `list --json` does not have it.
+  first, then attendee emails) and `labels: [{id,name,path,color}]` — both
+  fields come from listing v2 only, so the legacy no-flag `list --json` has
+  neither (and its text lines never grow the `{…}` labels column).
+
+## Labels (`docs/labels-design.md` §6)
+
+- `<label>` anywhere = a path (`Customers/LP Global`, **case-insensitive** —
+  matched on the server's `path_key` = `lower(path)`) or `#<id>` as printed by
+  `labels`. Unknown paths exit 1 with up-to-5 "did you mean" rows; only
+  `label <id> <path>` and `label-create` create missing segments (whole
+  chain, one `POST /api/labels {path}`).
+- `label` / `unlabel` / `label-*` call `ctx.requireWrite()` first (read-only
+  meetings token → exit 4 before any network hop). `label`/`unlabel` also need
+  owner-or-edit access on the transcript (server 403 otherwise).
+- `--label` / `--exact` are accepted by `list` and `export` only; `search`
+  and `calendar` reject them (exit 1), and `--exact` without `--label` is an
+  error. `none` = unlabelled meetings (`label=none`).
+- `export --label …` switches from the flat file naming to a **folder
+  mirror**: `<dir>/<label path>/<YYYY-MM-DD> <title> (<id>)/` containing
+  `meta.json` (row meta + `labels` + notes/report status), `text.txt` (exact
+  `text <id>` rendering + trailing newline), `notes.md` / `report.md` (only
+  when the transcript has them), plus `lines.json` with `--format json`. A
+  transcript lands once per label it carries that sits at/under the filter
+  label (only the filter label itself with `--exact`); `--label none` writes
+  under `<dir>/_unlabelled/`. Folder segments keep case and spaces but swap
+  `/ \ : * ? " < > |` for `-` (120-char cap on label segments, 80 on the
+  title). Skip/`--force`/partial-failure semantics are the flat export's,
+  keyed on the folder's `text.txt`; `--json` prints the manifest with
+  `layout: "labels"`.
+- `labels` prints `count_visible` (subtree-inclusive, visible to the caller)
+  and adds `· n direct` when `count_direct` differs. Tree order = server
+  `path_key` order; orphans (parent not in the listing) print at top level.
 
 ## After changing anything in this folder
 

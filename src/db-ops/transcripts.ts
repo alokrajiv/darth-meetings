@@ -7,6 +7,7 @@ import {
   archiveParticipantsExpr,
 } from '@/db-ops/meeting-filter-sql';
 import { EMPTY_MEETING_FILTERS, type MeetingFilters } from '@/lib/server/meeting-filters';
+import type { LabelFilter } from '@/lib/labels';
 import type {
   GmeetContext,
   StoredTranscript,
@@ -236,6 +237,44 @@ export interface TranscriptListPageOpts {
    * to the page AND the tab counts. `q` inside it is ignored here (the
    * listing's own `q` above carries the matched_in/snippet semantics). */
   filters?: MeetingFilters;
+  /** Label filter (`?label=<id|none>&exact=1`, lib/labels parseLabelFilter) —
+   * applied to the page AND the tab counts, like `filters`. null/undefined =
+   * no label filter. */
+  labelFilter?: LabelFilter | null;
+}
+
+/**
+ * `AND (…)` fragment for the `?label=` listing filter against a transcripts
+ * query aliased `t` (docs/labels-design.md §7). Subtree-inclusive unless
+ * `exact`; `none` = no label at all. Empty fragment when no filter — the
+ * legacy listing never passes one, so it stays byte-identical.
+ */
+function labelFilterSql(f: LabelFilter | null | undefined): ReturnType<typeof sql> {
+  if (!f) return sql``;
+  if (f.kind === 'none') {
+    return sql`AND NOT EXISTS (
+      SELECT 1 FROM ${sql(SCHEMA)}.transcript_labels tl WHERE tl.transcript_id = t.id
+    )`;
+  }
+  if (f.exact) {
+    return sql`AND EXISTS (
+      SELECT 1 FROM ${sql(SCHEMA)}.transcript_labels tl
+      WHERE tl.transcript_id = t.id AND tl.label_id = ${f.id}
+    )`;
+  }
+  // Descendants: the assignment's label is the filter label itself or has
+  // its path_key as a '/'-terminated prefix (resolved once via a scalar
+  // subquery; prefix compare instead of LIKE so no pattern escaping is
+  // needed — the EXISTS is per transcript, so the assignment index does the
+  // work).
+  return sql`AND EXISTS (
+    SELECT 1 FROM ${sql(SCHEMA)}.transcript_labels tl
+    JOIN ${sql(SCHEMA)}.labels l ON l.id = tl.label_id
+    CROSS JOIN (SELECT path_key FROM ${sql(SCHEMA)}.labels WHERE id = ${f.id}) root
+    WHERE tl.transcript_id = t.id
+      AND (l.id = ${f.id}
+           OR left(l.path_key, length(root.path_key) + 1) = root.path_key || '/')
+  )`;
 }
 
 /** Raw shape of the paged listing query before JS post-mapping. */
@@ -271,6 +310,7 @@ export async function listPagedForUser(
 ): Promise<TranscriptListV2Response> {
   const { tab, from, to, tz, q, days, minRows, cursor } = opts;
   const filters = opts.filters ?? EMPTY_MEETING_FILTERS;
+  const labelFilter = opts.labelFilter ?? null;
   const normEmail = email.trim().toLowerCase();
   const isTrash = tab === 'trash';
   const pattern = q ? `%${q.replace(/[%_\\]/g, (m) => `\\${m}`)}%` : null;
@@ -292,6 +332,7 @@ export async function listPagedForUser(
         : sql``
     }
     ${archiveFilterSql(filters)}
+    ${labelFilterSql(labelFilter)}
   `;
 
   const pagePromise = sql<PagedRawRow[]>`
@@ -406,6 +447,9 @@ export async function listPagedForUser(
            -- branches) — base is materialized for day_counts, so anything
            -- computed there runs for every visible row in range.
            ${archiveParticipantsExpr()} AS participants,
+           -- Org-wide labels on the row (docs/labels-design.md §7), page rows
+           -- only — outside the materialized base, next to the series join.
+           lbl.labels AS labels,
            b.deleted_at, b.__access, b.matched_in, b.snippet,
            b.day_key::text AS day_key,
            ${
@@ -420,6 +464,14 @@ export async function listPagedForUser(
     FROM base b
     JOIN page_days pd ON pd.day_key = b.day_key
     JOIN ${sql(SCHEMA)}.transcripts t ON t.id = b.id
+    LEFT JOIN LATERAL (
+      SELECT COALESCE(jsonb_agg(
+               jsonb_build_object('id', l.id, 'name', l.name, 'path', l.path, 'color', l.color)
+               ORDER BY l.path_key), '[]'::jsonb) AS labels
+      FROM ${sql(SCHEMA)}.transcript_labels tl
+      JOIN ${sql(SCHEMA)}.labels l ON l.id = tl.label_id
+      WHERE tl.transcript_id = b.id
+    ) lbl ON true
     ${
       isTrash
         ? sql``
@@ -479,7 +531,8 @@ export async function listPagedForUser(
       count(*) FILTER (WHERE t.user_id <> ${userId})::int AS shared_count,
       (SELECT count(*)::int FROM ${sql(SCHEMA)}.transcripts t
         WHERE t.user_id = ${userId} AND t.deleted_at IS NOT NULL
-        ${archiveFilterSql(filters)}) AS trash_count
+        ${archiveFilterSql(filters)}
+        ${labelFilterSql(labelFilter)}) AS trash_count
     FROM ${sql(SCHEMA)}.transcripts t
     LEFT JOIN ${sql(SCHEMA)}.transcript_shares s
       ON s.transcript_id = t.id

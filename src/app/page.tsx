@@ -10,6 +10,7 @@ import { GmeetImportDialog } from '@/components/gmeet-import-dialog';
 import { GmeetRemindersCard, type Reminder } from '@/components/gmeet-reminders-card';
 import { TranscriptImportDialog } from '@/components/transcript-import-dialog';
 import { AppHeader } from '@/components/app-header';
+import { LabelRail, LABEL_RAIL_STORAGE_KEY } from '@/components/label-rail';
 import { Button } from '@/components/ui/button';
 import {
   Settings,
@@ -18,9 +19,29 @@ import {
   FileAudio,
   ChevronDown,
   CircleAlert,
+  Tag,
 } from 'lucide-react';
+import { labelFilterToParams, parseLabelFilter, type LabelFilter } from '@/lib/labels';
 
 const REMINDERS_COLLAPSED_KEY = 'mw-reminders-collapsed';
+
+/** Rewrite `?label=&exact=` in place (history.replaceState, other params kept). */
+function writeLabelFilterToUrl(f: LabelFilter | null): void {
+  if (typeof window === 'undefined') return;
+  const sp = new URLSearchParams(window.location.search);
+  sp.delete('label');
+  sp.delete('exact');
+  for (const [k, v] of Object.entries(labelFilterToParams(f))) sp.set(k, v);
+  const qs = sp.toString();
+  const next = `${window.location.pathname}${qs ? `?${qs}` : ''}${window.location.hash}`;
+  const cur = `${window.location.pathname}${window.location.search}${window.location.hash}`;
+  if (next !== cur) window.history.replaceState(window.history.state, '', next);
+}
+
+function readLabelFilterFromUrl(): LabelFilter | null {
+  const sp = new URLSearchParams(window.location.search);
+  return parseLabelFilter(sp.get('label'), sp.get('exact'));
+}
 
 
 export default function Home() {
@@ -122,6 +143,43 @@ export default function Home() {
 
   const handleTranscriptCreated = () => {
     setRefreshTrigger((prev) => prev + 1);
+  };
+
+  // Labels (docs/labels-design.md §4): the page owns the `?label=&exact=`
+  // filter (URL = source of truth, shareable) and the rail's collapsed state
+  // (localStorage `mw-label-rail`); the rail and the table both receive it.
+  const [labelFilter, setLabelFilterState] = useState<LabelFilter | null>(null);
+  const [labelReady, setLabelReady] = useState(false);
+  const [railCollapsed, setRailCollapsed] = useState(false);
+  useEffect(() => {
+    setLabelFilterState(readLabelFilterFromUrl());
+    setLabelReady(true);
+    try {
+      setRailCollapsed(localStorage.getItem(LABEL_RAIL_STORAGE_KEY) === 'collapsed');
+    } catch {
+      // storage blocked — rail just shows
+    }
+    const onPop = () => setLabelFilterState(readLabelFilterFromUrl());
+    window.addEventListener('popstate', onPop);
+    return () => window.removeEventListener('popstate', onPop);
+  }, []);
+  const setLabelFilter = (next: LabelFilter | null) => {
+    setLabelFilterState((prev) => {
+      const same =
+        (prev === null && next === null) ||
+        (prev?.kind === 'none' && next?.kind === 'none') ||
+        (prev?.kind === 'id' && next?.kind === 'id' && prev.id === next.id && prev.exact === next.exact);
+      return same ? prev : next;
+    });
+    writeLabelFilterToUrl(next);
+  };
+  const toggleRail = (collapsed: boolean) => {
+    setRailCollapsed(collapsed);
+    try {
+      localStorage.setItem(LABEL_RAIL_STORAGE_KEY, collapsed ? 'collapsed' : 'open');
+    } catch {
+      // storage blocked — state just won't persist
+    }
   };
 
   // Close the hand-rolled Import popover on outside click / Escape.
@@ -253,15 +311,47 @@ export default function Home() {
           />
         )}
 
-        <TranscriptTable
-          refreshTrigger={refreshTrigger}
-          onImportMeeting={(m) => {
-            // Same focus mechanism as reminder rows: open the import dialog
-            // scrolled to that meeting's day, highlighting the meeting.
-            setGmeetFocus({ meetingCode: m.meetingCode, eventStart: m.eventStart });
-            setGmeetOpen(true);
-          }}
-        />
+        <div className="flex items-start gap-4">
+          {!railCollapsed && (
+            <LabelRail
+              filter={labelFilter}
+              onFilter={setLabelFilter}
+              onChanged={handleTranscriptCreated}
+              onCollapse={() => toggleRail(true)}
+              className="sticky top-4 max-h-[calc(100vh-2rem)]"
+            />
+          )}
+          <div className="min-w-0 flex-1">
+            <TranscriptTable
+              refreshTrigger={refreshTrigger}
+              labelFilter={labelFilter}
+              labelFilterReady={labelReady}
+              onLabelFilter={setLabelFilter}
+              toolbarExtra={
+                railCollapsed ? (
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    className="h-8"
+                    title="Show the labels rail"
+                    data-label-rail-show
+                    onClick={() => toggleRail(false)}
+                  >
+                    <Tag className="h-3.5 w-3.5" />
+                    Labels
+                    {labelFilter && <span className="h-1.5 w-1.5 rounded-full bg-primary" />}
+                  </Button>
+                ) : undefined
+              }
+              onImportMeeting={(m) => {
+                // Same focus mechanism as reminder rows: open the import dialog
+                // scrolled to that meeting's day, highlighting the meeting.
+                setGmeetFocus({ meetingCode: m.meetingCode, eventStart: m.eventStart });
+                setGmeetOpen(true);
+              }}
+            />
+          </div>
+        </div>
       </main>
 
       <GmeetImportDialog

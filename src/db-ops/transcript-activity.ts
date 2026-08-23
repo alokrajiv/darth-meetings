@@ -15,6 +15,8 @@ import { SCHEMAS } from '@/lib/constants/database';
 //   share_add         — collaborator added
 //   share_update      — collaborator's access level changed
 //   share_remove      — collaborator removed
+//   label_add         — label assigned   (details {label_id, path})
+//   label_remove      — label unassigned (details {label_id, path})
 
 const SCHEMA = SCHEMAS.MEETING_WHISPERER;
 
@@ -32,7 +34,9 @@ export type ActivityAction =
   | 'owner_transfer'
   | 'generate_notes'
   | 'set_notes'
-  | 'set_report';
+  | 'set_report'
+  | 'label_add'
+  | 'label_remove';
 
 export interface ActivityRow {
   id: number;
@@ -59,7 +63,7 @@ interface LogActivityInput {
  * own meeting_whisperer_prod.people table. Returns null if nothing matches —
  * the caller is expected to fall back to the email's local-part for display.
  */
-async function resolveDisplayName(email: string): Promise<string | null> {
+export async function resolveDisplayName(email: string): Promise<string | null> {
   const e = email.trim().toLowerCase();
 
   try {
@@ -192,6 +196,10 @@ const EDIT_ACTIONS = [
   'share_add',
   'share_update',
   'share_remove',
+  // Label changes count as edits (same footing as share changes) so the
+  // activity bar's "last edit" reflects them.
+  'label_add',
+  'label_remove',
 ] as const;
 
 /**

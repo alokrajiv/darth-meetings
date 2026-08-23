@@ -28,6 +28,7 @@ import { IngestError, ingestLocalAudio } from '@/lib/server/ingest';
 import { onTranscriptCompleted } from '@/lib/server/post-completion';
 import type { GmeetAttendee, GmeetContext, StoredTranscript } from '@/lib/format';
 import { parseMeetingFilters } from '@/lib/server/meeting-filters';
+import { parseLabelFilter } from '@/lib/labels';
 
 /** Calendar event the upload-media stepper linked to this file — rides in
  * the `x-linked-event` header (URI-encoded JSON) because the body is the
@@ -185,9 +186,11 @@ function clampInt(raw: string | null, dflt: number, min: number, max: number): n
  * cursor (exclusive day key — only strictly older days), plus the shared
  * people/provider filters participant / organizer / provider / speaker
  * (lib/server/meeting-filters — comma = OR, filters AND together, applied to
- * rows AND tab counts; bad provider → 400). Envelope:
+ * rows AND tab counts; bad provider → 400), and the label filter
+ * label=<id|none> (+ exact=1; docs/labels-design.md §7 — subtree-inclusive
+ * unless exact; bad values are ignored). Envelope:
  * TranscriptListV2Response (src/lib/format.ts); rows carry an optional
- * `participants` string[] (organizer + attendee emails).
+ * `participants` string[] (organizer + attendee emails) and `labels[]`.
  */
 async function listingV2(
   user: { userId: string; email: string },
@@ -220,6 +223,7 @@ async function listingV2(
   const q = filters.q;
   const days = clampInt(params.get('days'), 14, 1, 60);
   const minRows = clampInt(params.get('minRows'), 40, 1, 200);
+  const labelFilter = parseLabelFilter(params.get('label'), params.get('exact'));
 
   // Pending-refresh fan-out, decoupled from the page: refresh EVERY visible
   // in-flight row (usually zero) so rows outside the requested page keep
@@ -241,6 +245,7 @@ async function listingV2(
     minRows,
     cursor,
     filters,
+    labelFilter,
   });
   return NextResponse.json(result);
 }

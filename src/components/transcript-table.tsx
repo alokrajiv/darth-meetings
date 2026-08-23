@@ -47,6 +47,12 @@ import {
 import { MeetLogo, TeamsLogo } from '@/components/provider-icon';
 import { SeriesBadge } from '@/components/series-badge';
 import { SeriesDialog } from '@/components/series-dialog';
+import { LabelChips } from '@/components/label-chips';
+import { LabelPicker, anchorFromElement, parseError, type PickerAnchor } from '@/components/label-picker';
+import { BulkLabelBar } from '@/components/bulk-label-bar';
+import { refreshLabelCatalog } from '@/hooks/use-label-catalog';
+import { labelFilterToParams, type LabelFilter } from '@/lib/labels';
+import type { LabelRef } from '@/lib/format';
 import {
   PeopleFilterChips,
   PeopleFilterControl,
@@ -77,6 +83,14 @@ interface TranscriptTableProps {
   /** Calendar-view rows' Import action — page.tsx wires this to the
    * existing gmeetFocus mechanism (focus + open GmeetImportDialog). */
   onImportMeeting?: (m: { meetingCode: string; eventStart: string }) => void;
+  /** Label filter (`?label=<id|none>&exact=1`), owned by page.tsx together
+   * with the rail (docs/labels-design.md §4). null = no filter. */
+  labelFilter?: LabelFilter | null;
+  /** False until the page has read `?label=` from the URL — gates the first
+   * fetch so a filtered link doesn't fire an unfiltered request first. */
+  labelFilterReady?: boolean;
+  /** Row chips / picker set the filter through this (the page writes the URL). */
+  onLabelFilter?: (f: LabelFilter | null) => void;
 }
 
 type TabKey = 'all' | 'mine' | 'shared' | 'trash';
@@ -350,10 +364,16 @@ function loadColPrefs(): ColPrefs {
   }
 }
 
+/** Label assignment mirrors share management: owner or edit share. */
+const canEditRow = (t: ListRow) => t.access === 'owner' || t.access === 'edit';
+
 export function TranscriptTable({
   refreshTrigger,
   toolbarExtra,
   onImportMeeting,
+  labelFilter = null,
+  labelFilterReady = true,
+  onLabelFilter,
 }: TranscriptTableProps) {
   const router = useRouter();
   const [tab, setTab] = useState<TabKey>('all');
@@ -388,7 +408,9 @@ export function TranscriptTable({
   // Tabs (Mine/Shared/Trash) and search are ARCHIVE-ONLY concepts — while
   // either is active the calendar layers hide entirely and the table
   // behaves like the plain archive view.
-  const mergedMode = tab === 'all' && debouncedQ.length === 0;
+  // A label filter is archive-only too: labels live on transcripts (v1 —
+  // calendar rows carry none), so the calendar layers hide while it's set.
+  const mergedMode = tab === 'all' && debouncedQ.length === 0 && !labelFilter;
   const renderMerged = mergedMode && (layers.unimported || layers.norec);
 
   // Date-range filter — shared by the archive and both calendar layers.
@@ -553,6 +575,7 @@ export function TranscriptTable({
       if (to) params.set('to', to);
       if (debouncedQ) params.set('q', debouncedQ);
       appendPeopleFilterParams(params, peopleFilters);
+      for (const [k, v] of Object.entries(labelFilterToParams(labelFilter))) params.set(k, v);
       if (mode === 'more') {
         if (!nextCursorRef.current) return;
         params.set('days', String(PAGE_DAYS));
@@ -602,7 +625,7 @@ export function TranscriptTable({
         if (mode === 'more') setLoadingMore(false);
       }
     },
-    [tab, debouncedQ, from, to, tz, peopleFilters]
+    [tab, debouncedQ, from, to, tz, peopleFilters, labelFilter]
   );
 
   /**
@@ -732,9 +755,9 @@ export function TranscriptTable({
   // Filters changed (tab / search / range) or first mount → reset the
   // archive listing. Pagination restarts from the top.
   useEffect(() => {
-    if (!peopleLoaded) return;
+    if (!peopleLoaded || !labelFilterReady) return;
     void fetchArchive('reset');
-  }, [fetchArchive, peopleLoaded]);
+  }, [fetchArchive, peopleLoaded, labelFilterReady]);
 
   // Range/tz changed → the calendar windows are stale. Drop them (bumping
   // gens so in-flight responses discard) and let the lazy loader below
@@ -880,10 +903,22 @@ export function TranscriptTable({
   // transcript — silently refresh the loaded window. Debounced so bursts
   // (bulk imports) coalesce into one reload.
   const liveReloadTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // 'labels' events (taxonomy or assignment changes; a bulk tag emits one per
+  // row) also refresh the shared label catalog — on the same 800ms debounce,
+  // so a burst costs one /api/labels?counts=1, not one per event. The rail
+  // has no SSE of its own; it re-renders through the catalog store.
+  const labelsDirtyRef = useRef(false);
   useLiveEvents((e) => {
-    if (!['created', 'deleted', 'meta', 'status', 'notes', 'shares'].includes(e.kind)) return;
+    if (!['created', 'deleted', 'meta', 'status', 'notes', 'shares', 'labels'].includes(e.kind)) return;
+    if (e.kind === 'labels') labelsDirtyRef.current = true;
     if (liveReloadTimer.current) clearTimeout(liveReloadTimer.current);
-    liveReloadTimer.current = setTimeout(silentRefetchAll, 800);
+    liveReloadTimer.current = setTimeout(() => {
+      if (labelsDirtyRef.current) {
+        labelsDirtyRef.current = false;
+        void refreshLabelCatalog();
+      }
+      silentRefetchAll();
+    }, 800);
   });
 
   // Global `/` focuses the search input when no other field has focus.
@@ -1008,6 +1043,160 @@ export function TranscriptTable({
       alert('Failed to restore transcript: ' + (err instanceof Error ? err.message : 'Unknown error'));
     }
   };
+
+  // ---- Labels: row picker, multi-select + bulk bar (docs/labels-design.md §4) ----
+  // One LabelPicker instance for the whole table, re-anchored per row.
+  const [rowPicker, setRowPicker] = useState<{ id: string; anchor: PickerAnchor } | null>(null);
+  const rowById = useMemo(() => {
+    const m = new Map<string, ListRow>();
+    for (const g of days) for (const r of g.rows as ListRow[]) m.set(r.assemblyai_id, r);
+    return m;
+  }, [days]);
+  const rowPickerRow = rowPicker ? rowById.get(rowPicker.id) ?? null : null;
+  const rowPickerSelected = useMemo(
+    () => new Set((rowPickerRow?.labels ?? []).map((l) => l.id)),
+    [rowPickerRow]
+  );
+  const closeRowPicker = useCallback(() => setRowPicker(null), []);
+  /** Optimistic chip update, then the silent refetch + catalog refresh reconcile. */
+  const patchRowLabels = useCallback((assemblyaiId: string, labels: LabelRef[]) => {
+    setDays((prev) =>
+      prev.map((g) =>
+        g.rows.some((r) => r.assemblyai_id === assemblyaiId)
+          ? {
+              ...g,
+              rows: g.rows.map((r) => (r.assemblyai_id === assemblyaiId ? { ...r, labels } : r)),
+            }
+          : g
+      )
+    );
+  }, []);
+  const toggleRowLabel = useCallback(
+    async (assemblyaiId: string, label: LabelRef, nextOn: boolean) => {
+      const res = nextOn
+        ? await fetch(`/api/transcripts/${assemblyaiId}/labels`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ labelId: label.id }),
+          })
+        : await fetch(`/api/transcripts/${assemblyaiId}/labels/${label.id}`, { method: 'DELETE' });
+      if (!res.ok) {
+        const txt = await res.text().catch(() => '');
+        throw new Error(parseError(txt) || (res.status === 403 ? 'Read-only access' : `Failed (${res.status})`));
+      }
+      const data = (await res.json().catch(() => null)) as { labels?: LabelRef[] } | null;
+      if (data?.labels) patchRowLabels(assemblyaiId, data.labels);
+      void fetchArchiveRef.current('silent');
+      void refreshLabelCatalog();
+    },
+    [patchRowLabels]
+  );
+  // Selection (assemblyai ids). Checkboxes reveal on row hover / while the
+  // selection is non-empty; shift-click ranges over the rendered order.
+  const [selected, setSelected] = useState<Set<string>>(() => new Set());
+  const selectionAnchorRef = useRef<string | null>(null);
+  const renderedIdsRef = useRef<string[]>([]);
+  const hoverRowIdRef = useRef<string | null>(null);
+  const [bulkOpenSignal, setBulkOpenSignal] = useState(0);
+  const clearSelection = useCallback(() => {
+    setSelected(new Set());
+    selectionAnchorRef.current = null;
+  }, []);
+  const toggleSelected = useCallback((id: string, shift: boolean) => {
+    setSelected((prev) => {
+      const next = new Set(prev);
+      const order = renderedIdsRef.current;
+      const anchor = selectionAnchorRef.current;
+      if (shift && anchor && order.includes(anchor) && order.includes(id)) {
+        const a = order.indexOf(anchor);
+        const b = order.indexOf(id);
+        const [lo, hi] = a < b ? [a, b] : [b, a];
+        const turnOn = !prev.has(id);
+        for (let i = lo; i <= hi; i++) {
+          if (turnOn) next.add(order[i]);
+          else next.delete(order[i]);
+        }
+      } else if (next.has(id)) {
+        next.delete(id);
+      } else {
+        next.add(id);
+      }
+      selectionAnchorRef.current = id;
+      return next;
+    });
+  }, []);
+  // Filters changed → the selection no longer maps to what's on screen.
+  useEffect(() => {
+    clearSelection();
+  }, [tab, debouncedQ, from, to, peopleFilters, labelFilter, clearSelection]);
+  // Drop ids that left the loaded window (deleted / filtered away).
+  useEffect(() => {
+    setSelected((prev) => {
+      if (prev.size === 0) return prev;
+      let changed = false;
+      const next = new Set<string>();
+      for (const id of prev) {
+        if (rowById.has(id)) next.add(id);
+        else changed = true;
+      }
+      return changed ? next : prev;
+    });
+  }, [rowById]);
+  const selectedRows = useMemo(
+    () => [...selected].map((id) => rowById.get(id)).filter((r): r is ListRow => !!r),
+    [selected, rowById]
+  );
+  const selectedIds = useMemo(() => selectedRows.map((r) => r.assemblyai_id), [selectedRows]);
+  const selectedLabels = useMemo(() => {
+    const m = new Map<number, LabelRef>();
+    for (const r of selectedRows) for (const l of r.labels ?? []) m.set(l.id, l);
+    return [...m.values()].sort((a, b) => a.path.localeCompare(b.path));
+  }, [selectedRows]);
+  const selectedReadOnly = useMemo(
+    () => selectedRows.filter((r) => !canEditRow(r)).length,
+    [selectedRows]
+  );
+  const selectionMode = selected.size > 0;
+
+  // Keyboard: `x` toggles the hovered row, `l` opens the label picker for
+  // the selection (or the hovered row), `Esc` clears the selection.
+  useEffect(() => {
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.metaKey || e.ctrlKey || e.altKey) return;
+      const el = document.activeElement as HTMLElement | null;
+      if (el && (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA' || el.tagName === 'SELECT' || el.isContentEditable)) return;
+      if (document.querySelector('[data-label-picker]')) return; // picker owns keys
+      // Compare case-folded: Shift+x reports 'X' (shift = range select), and
+      // Caps Lock must not kill the shortcuts.
+      const key = e.key.length === 1 ? e.key.toLowerCase() : e.key;
+      if (key === 'x') {
+        const id = hoverRowIdRef.current;
+        if (!id) return;
+        const row = rowById.get(id);
+        if (!row || row.deleted_at || row.status === 'uploading' || id.startsWith('defer-')) return;
+        e.preventDefault();
+        toggleSelected(id, e.shiftKey);
+      } else if (key === 'l') {
+        if (selected.size > 0) {
+          e.preventDefault();
+          setBulkOpenSignal((n) => n + 1);
+          return;
+        }
+        const id = hoverRowIdRef.current;
+        if (!id) return;
+        const row = rowById.get(id);
+        if (!row || !canEditRow(row) || row.deleted_at) return;
+        const btn = document.querySelector(`[data-row-id="${CSS.escape(id)}"] [data-label-add]`);
+        if (!btn) return;
+        e.preventDefault();
+        setRowPicker({ id, anchor: anchorFromElement(btn) });
+      } else if (e.key === 'Escape' && selected.size > 0) {
+        clearSelection();
+      }
+    };
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+  }, [rowById, selected.size, toggleSelected, clearSelection]);
 
   const statusDot = (status: string) => {
     const base = 'inline-flex h-2 w-2 shrink-0 rounded-full';
@@ -1573,7 +1762,7 @@ export function TranscriptTable({
   );
 
   const filterChips = <PeopleFilterChips value={peopleFilters} onChange={setPeopleFilters} />;
-  const peopleActive = hasPeopleFilters(peopleFilters);
+  const peopleActive = hasPeopleFilters(peopleFilters) || !!labelFilter;
 
   const emptyState = (
     icon: React.ReactNode,
@@ -1612,17 +1801,46 @@ export function TranscriptTable({
     const waiting = t.status === 'waiting';
     const placeholder = uploading || t.assemblyai_id.startsWith('defer-');
     const trashed = !!t.deleted_at;
+    const selectable = !placeholder && !trashed;
+    const isSelected = selected.has(t.assemblyai_id);
     return (
       <TableRow
         key={t.id}
+        data-row-id={t.assemblyai_id}
+        onMouseEnter={() => {
+          hoverRowIdRef.current = t.assemblyai_id;
+        }}
+        onMouseLeave={() => {
+          if (hoverRowIdRef.current === t.assemblyai_id) hoverRowIdRef.current = null;
+        }}
         onClick={() => {
           if (!placeholder) router.push(`/transcript/${t.assemblyai_id}`);
         }}
         className={`group transition-colors hover:bg-accent/40 ${
           placeholder ? 'cursor-default' : 'cursor-pointer'
-        }`}
+        } ${isSelected ? 'bg-primary/5' : ''}`}
       >
-        <TableCell className="py-2 pl-4">
+        <TableCell className={`relative py-2 ${selectionMode ? 'pl-8' : 'pl-4'}`}>
+          {/* Selection checkbox — sits in the cell's left padding, revealed on
+              hover; the padding widens while a selection exists. */}
+          {selectable && (
+            <input
+              type="checkbox"
+              checked={isSelected}
+              aria-label={isSelected ? 'Deselect meeting' : 'Select meeting'}
+              data-row-select
+              onClick={(e) => {
+                e.stopPropagation();
+                toggleSelected(t.assemblyai_id, e.shiftKey);
+              }}
+              onChange={() => {}}
+              className={`absolute top-1/2 -translate-y-1/2 cursor-pointer accent-primary ${
+                selectionMode
+                  ? 'left-2.5 h-3.5 w-3.5 opacity-100'
+                  : 'left-[3px] h-3 w-3 opacity-0 group-hover:opacity-100 focus:opacity-100'
+              }`}
+            />
+          )}
           {/* w-0 + min-w-full: zero min-content contribution, so long nowrap
               titles/series chips can't widen the table past its container. */}
           <div className="w-0 min-w-full">
@@ -1655,6 +1873,25 @@ export function TranscriptTable({
                     defaultTitle={t.title}
                     onOpenSeries={setOpenSeriesId}
                     onChanged={() => void fetchArchiveRef.current('silent')}
+                  />
+                )}
+                {!placeholder && !waiting && !trashed && (
+                  <LabelChips
+                    labels={t.labels}
+                    onFilter={
+                      onLabelFilter
+                        ? (l) => onLabelFilter({ kind: 'id', id: l.id, exact: false })
+                        : undefined
+                    }
+                    onAdd={
+                      canEditRow(t)
+                        ? (e) =>
+                            setRowPicker({
+                              id: t.assemblyai_id,
+                              anchor: anchorFromElement(e.currentTarget),
+                            })
+                        : undefined
+                    }
                   />
                 )}
                 {!uploading && !waiting && !trashed && recordingsChip(t)}
@@ -1847,6 +2084,13 @@ export function TranscriptTable({
 
   const rowCount = flatRows.length;
   const searchEmpty = rowCount === 0 && debouncedQ.length > 0;
+  // Rendered archive-row order (for shift-click ranges), kept in a ref so
+  // the selection handlers don't re-create on every page.
+  renderedIdsRef.current = mergedGroups
+    ? mergedGroups.flatMap((g) =>
+        g.items.flatMap((it) => (it.kind === 'archive' ? [it.row.assemblyai_id] : []))
+      )
+    : flatRows.map((r) => r.assemblyai_id);
 
   const archiveTableHeader = (
     <TableHeader>
@@ -2140,6 +2384,26 @@ export function TranscriptTable({
         onClose={() => setOpenSeriesId(null)}
         onChanged={() => void fetchArchiveRef.current('silent')}
         onMerged={setOpenSeriesId}
+      />
+      {rowPicker && rowPickerRow && (
+        <LabelPicker
+          anchor={rowPicker.anchor}
+          onClose={closeRowPicker}
+          selectedIds={rowPickerSelected}
+          onSelect={(label, nextOn) => toggleRowLabel(rowPicker.id, label, nextOn)}
+          resetKey={rowPicker.id}
+        />
+      )}
+      <BulkLabelBar
+        selectedIds={selectedIds}
+        selectedLabels={selectedLabels}
+        readOnlyCount={selectedReadOnly}
+        onClear={clearSelection}
+        openAddSignal={bulkOpenSignal}
+        onApplied={() => {
+          void fetchArchiveRef.current('silent');
+          void refreshLabelCatalog();
+        }}
       />
     </div>
   );

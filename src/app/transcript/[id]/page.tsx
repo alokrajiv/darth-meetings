@@ -11,9 +11,13 @@ import { Input } from '@/components/ui/input';
 import { Textarea } from '@/components/ui/textarea';
 import { SeriesBadge } from '@/components/series-badge';
 import { SeriesDialog } from '@/components/series-dialog';
+import { LabelChips } from '@/components/label-chips';
+import { LabelPicker, anchorFromElement, parseError, type PickerAnchor } from '@/components/label-picker';
+import { refreshLabelCatalog } from '@/hooks/use-label-catalog';
 import {
   formatDuration,
   formatTime,
+  type LabelRef,
   type StoredTranscript,
   type TranscriptResponse,
   type SpeakerLabel,
@@ -250,6 +254,73 @@ export default function TranscriptDetailPage({ params }: TranscriptDetailPagePro
     loadSeriesInfo();
   }, [loadSeriesInfo]);
 
+  // --- labels (chips + "+ Label" in the meta row; docs/labels-design.md §4) ---
+  // GET /api/transcripts/:id/labels answers {labels, canEdit}; readers see
+  // chips only. `l` opens the picker (when no field is focused).
+  const [labelInfo, setLabelInfo] = useState<{ labels: LabelRef[]; canEdit: boolean } | null>(null);
+  const [labelPickerAnchor, setLabelPickerAnchor] = useState<PickerAnchor | null>(null);
+  /** Transient inline error for chip × failures (403 after a share downgrade,
+   * 5xx, network) — auto-clears; a failure also re-pulls labels so
+   * canEdit/chips resync. */
+  const [labelError, setLabelError] = useState<string | null>(null);
+  const labelAddRef = useRef<HTMLSpanElement>(null);
+  const loadLabels = useCallback(() => {
+    fetch(`/api/transcripts/${transcriptId}/labels`)
+      .then((r) => (r.ok ? r.json() : null))
+      .then((d) =>
+        setLabelInfo(
+          d && Array.isArray(d.labels) ? { labels: d.labels, canEdit: !!d.canEdit } : null
+        )
+      )
+      .catch(() => setLabelInfo(null));
+  }, [transcriptId]);
+  useEffect(() => {
+    loadLabels();
+  }, [loadLabels]);
+  const labelSelectedIds = useMemo(
+    () => new Set((labelInfo?.labels ?? []).map((l) => l.id)),
+    [labelInfo]
+  );
+  const toggleLabel = useCallback(
+    async (label: LabelRef, nextOn: boolean) => {
+      const res = nextOn
+        ? await fetch(`/api/transcripts/${transcriptId}/labels`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ labelId: label.id }),
+          })
+        : await fetch(`/api/transcripts/${transcriptId}/labels/${label.id}`, { method: 'DELETE' });
+      if (!res.ok) {
+        const txt = await res.text().catch(() => '');
+        throw new Error(
+          parseError(txt) || (res.status === 403 ? 'Read-only access' : `Failed (${res.status})`)
+        );
+      }
+      const data = (await res.json().catch(() => null)) as { labels?: LabelRef[] } | null;
+      if (data?.labels) setLabelInfo((prev) => ({ labels: data.labels!, canEdit: prev?.canEdit ?? true }));
+      else loadLabels();
+      void refreshLabelCatalog();
+      bumpActivity();
+    },
+    [transcriptId, loadLabels, bumpActivity]
+  );
+  const closeLabelPicker = useCallback(() => setLabelPickerAnchor(null), []);
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key.toLowerCase() !== 'l' || e.shiftKey || e.metaKey || e.ctrlKey || e.altKey) return;
+      if (!labelInfo?.canEdit) return;
+      const el = document.activeElement as HTMLElement | null;
+      if (el && (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA' || el.tagName === 'SELECT' || el.isContentEditable)) return;
+      if (document.querySelector('[data-label-picker]')) return;
+      const btn = labelAddRef.current?.querySelector('[data-label-add]');
+      if (!btn) return;
+      e.preventDefault();
+      setLabelPickerAnchor(anchorFromElement(btn));
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [labelInfo?.canEdit]);
+
   // --- audio player state ---
   const playerRef = useRef<AudioPlayerHandle>(null);
   const [currentTime, setCurrentTime] = useState(0); // seconds, from <audio>
@@ -416,6 +487,7 @@ export default function TranscriptDetailPage({ params }: TranscriptDetailPagePro
   const liveReloadTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   useLiveEvents((e) => {
     if (e.assemblyaiId !== transcriptId) return;
+    if (e.kind === 'labels') loadLabels();
     if (liveReloadTimer.current) clearTimeout(liveReloadTimer.current);
     liveReloadTimer.current = setTimeout(() => {
       const el = document.activeElement as HTMLElement | null;
@@ -2324,6 +2396,34 @@ export default function TranscriptDetailPage({ params }: TranscriptDetailPagePro
                 variant="full"
               />
             )}
+            {labelInfo && (
+              <span ref={labelAddRef} className="inline-flex items-center">
+                <LabelChips
+                  labels={labelInfo.labels}
+                  variant="full"
+                  onRemove={
+                    labelInfo.canEdit
+                      ? (l) =>
+                          void toggleLabel(l, false).catch((err: unknown) => {
+                            setLabelError(err instanceof Error ? err.message : 'Could not remove label');
+                            loadLabels();
+                            window.setTimeout(() => setLabelError(null), 5000);
+                          })
+                      : undefined
+                  }
+                  onAdd={
+                    labelInfo.canEdit
+                      ? (e) => setLabelPickerAnchor(anchorFromElement(e.currentTarget))
+                      : undefined
+                  }
+                />
+                {labelError && (
+                  <span className="ml-1.5 text-[11px] text-destructive" role="alert">
+                    {labelError}
+                  </span>
+                )}
+              </span>
+            )}
             {dateEditOpen && canEdit ? (
               <span
                 className="inline-flex items-center gap-1.5"
@@ -3364,6 +3464,14 @@ export default function TranscriptDetailPage({ params }: TranscriptDetailPagePro
           seriesId={openSeriesId}
           onClose={() => setOpenSeriesId(null)}
           onChanged={loadSeriesInfo}
+        />
+
+        <LabelPicker
+          anchor={labelPickerAnchor}
+          onClose={closeLabelPicker}
+          selectedIds={labelSelectedIds}
+          onSelect={toggleLabel}
+          resetKey={transcriptId}
         />
 
         <Dialog open={!!pendingShare} onOpenChange={(v) => !v && setPendingShare(null)}>
