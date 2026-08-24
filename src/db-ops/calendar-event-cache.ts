@@ -180,6 +180,64 @@ export async function hasCalendarOccurrence(
   return rows.length > 0;
 }
 
+/**
+ * THE caller-involvement check (2026-08-24 privacy audit) — the reusable
+ * form of unimportedVisibleTo's calendar arms, for routes that resolve
+ * global-cache rows / Graph artifacts from client-supplied meeting codes or
+ * join URLs. A caller is "involved" in an occurrence when their own sweep
+ * captured it, or they are organizer/invitee on ANY user's cached calendar
+ * row for it (code ±12h; instant null = any occurrence of the code).
+ * Callers holding the cache row should additionally accept
+ * `lower(row.organizer_email) === caller.email` (the cache-only arm).
+ * Returns the subset of input codes the caller is involved in.
+ */
+export async function callerInvolvedCodes(
+  caller: { userId: string; email: string },
+  occs: Array<{ code: string; instant?: string | null }>
+): Promise<Set<string>> {
+  const email = caller.email.toLowerCase();
+  const batch = occs
+    .filter((o) => typeof o.code === 'string' && o.code.length > 0)
+    .map((o) => ({
+      code: o.code,
+      instant: o.instant && !Number.isNaN(Date.parse(o.instant)) ? o.instant : null,
+    }));
+  if (batch.length === 0) return new Set();
+  const rows = await sql<Array<{ code: string }>>`
+    SELECT DISTINCT o.code
+    FROM jsonb_to_recordset(${sql.json(batch as unknown as never)})
+         AS o(code text, instant timestamptz)
+    WHERE EXISTS (
+      SELECT 1 FROM ${sql(SCHEMA)}.calendar_event_cache ce
+      WHERE ce.meeting_code = o.code
+        AND (
+          o.instant IS NULL
+          OR ce.event_start BETWEEN o.instant - ${OCCURRENCE_WINDOW_S} * interval '1 second'
+                                AND o.instant + ${OCCURRENCE_WINDOW_S} * interval '1 second'
+        )
+        AND (
+          ce.user_id = ${caller.userId}
+          OR lower(ce.organizer_email) = ${email}
+          OR EXISTS (
+            SELECT 1 FROM jsonb_array_elements(COALESCE(ce.attendees, '[]'::jsonb)) a
+            WHERE lower(a->>'email') = ${email}
+          )
+        )
+    )
+  `;
+  return new Set(rows.map((r) => r.code));
+}
+
+/** Single-occurrence form of callerInvolvedCodes. */
+export async function callerInvolvedInOccurrence(
+  caller: { userId: string; email: string },
+  code: string,
+  instant?: string | null
+): Promise<boolean> {
+  const set = await callerInvolvedCodes(caller, [{ code, instant }]);
+  return set.has(code);
+}
+
 // ---------------------------------------------------------------------------
 // Calendar-event mutes (migration 023) — per-user HIDE of calendar rows.
 // Personal blocks ("my lunch", focus time) aren't real meetings; a mute

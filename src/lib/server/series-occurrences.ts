@@ -337,7 +337,7 @@ function matchImported(
     )
     .map((c) => ({
       assemblyai_id: c.assemblyai_id,
-      title: c.title,
+      title: c.accessible ? c.title : null,
       accessible: c.accessible,
       queued: c.status === 'waiting',
       failed: c.status === 'error',
@@ -410,7 +410,7 @@ export async function sweepSeriesOccurrences(
       key: `imp-${c.assemblyai_id}`,
       startIso,
       endIso: null,
-      title: c.title,
+      title: c.accessible ? c.title : null,
       source: 'imported',
       upcoming: false,
       meetingCode: c.meeting_code,
@@ -431,7 +431,7 @@ export async function sweepSeriesOccurrences(
       imported: [
         {
           assemblyai_id: c.assemblyai_id,
-          title: c.title,
+          title: c.accessible ? c.title : null,
           accessible: c.accessible,
           queued: c.status === 'waiting',
           failed: c.status === 'error',

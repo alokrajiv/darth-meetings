@@ -9,6 +9,8 @@ import {
   listSuggestedMembers,
   setSeriesAutoImport,
   updateSeries,
+  visibleSeriesIds,
+  seriesVisibleToCaller,
   type SeriesAutoImportCfg,
 } from '@/db-ops/series';
 
@@ -27,17 +29,28 @@ function parseId(raw: string): number | null {
 export const GET = withAuth(async ({ user }, { params }) => {
   const id = parseId((await params).id);
   if (!id) return NextResponse.json({ error: 'Bad id' }, { status: 400 });
+  const caller = { userId: user.userId, email: user.email };
+  // PRIVACY GATE (2026-08-24): a series the caller isn't in must not exist
+  // for them — its title is a meeting title and its keys carry live Teams
+  // join URLs (the exact input /api/teams/import accepts).
+  const visible = await visibleSeriesIds(caller);
+  if (!visible.has(id)) return NextResponse.json({ error: 'Not found' }, { status: 404 });
   const series = await getSeries(id);
   if (!series) return NextResponse.json({ error: 'Not found' }, { status: 404 });
 
-  const caller = { userId: user.userId, email: user.email };
   const [keys, members, suggestions, dupMap] = await Promise.all([
     listKeys(id),
     listMembers(id, caller),
     listSuggestedMembers(id, caller),
     findDuplicateSeries(),
   ]);
-  return NextResponse.json({ series, keys, members, suggestions, dupes: dupMap.get(id) ?? [] });
+  return NextResponse.json({
+    series,
+    keys,
+    members,
+    suggestions,
+    dupes: (dupMap.get(id) ?? []).filter((d) => visible.has(d.id)),
+  });
 });
 
 const AUTO_MODES = ['transcript', 'video', 'both'] as const;
@@ -47,6 +60,9 @@ const AUTO_REPORTS = ['summary', 'detailed-video', 'detailed-text', 'later'] as 
 export const PATCH = withAuth(async ({ user, request }, { params }) => {
   const id = parseId((await params).id);
   if (!id) return NextResponse.json({ error: 'Bad id' }, { status: 400 });
+  if (!(await seriesVisibleToCaller(id, { userId: user.userId, email: user.email }))) {
+    return NextResponse.json({ error: 'Not found' }, { status: 404 });
+  }
   const series = await getSeries(id);
   if (!series) return NextResponse.json({ error: 'Not found' }, { status: 404 });
 
@@ -104,9 +120,12 @@ export const PATCH = withAuth(async ({ user, request }, { params }) => {
 
 /** DELETE /api/series/:id — remove the series (members detach, transcripts
  * are untouched). */
-export const DELETE = withAuth(async (_ctx, { params }) => {
+export const DELETE = withAuth(async ({ user }, { params }) => {
   const id = parseId((await params).id);
   if (!id) return NextResponse.json({ error: 'Bad id' }, { status: 400 });
+  if (!(await seriesVisibleToCaller(id, { userId: user.userId, email: user.email }))) {
+    return NextResponse.json({ error: 'Not found' }, { status: 404 });
+  }
   await deleteSeries(id);
   return NextResponse.json({ ok: true });
 });

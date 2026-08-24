@@ -21,7 +21,8 @@ import {
   resolveMeetingByJoinUrl,
 } from '@/lib/server/ms-graph';
 import { parseTeamsVtt } from '@/lib/server/teams-vtt';
-import { teamsSourceId } from '@/lib/server/teams-ids';
+import { teamsSourceId, teamsCacheCode } from '@/lib/server/teams-ids';
+import { callerInvolvedInOccurrence } from '@/db-ops/calendar-event-cache';
 import { ingestParsedUtterances } from '@/lib/server/ingest-parsed';
 import { saveAudioStreamToTemp, deleteAudioFile } from '@/lib/server/audio-storage';
 import { IngestError, ingestLocalAudio } from '@/lib/server/ingest';
@@ -132,6 +133,20 @@ export async function executeTeamsImport(
   }
   if (!isGraphConfigured()) {
     return out(503, { error: 'Microsoft Graph is not configured on this server.' });
+  }
+
+  // PRIVACY GATE (2026-08-24): artifacts come app-only (tenant-wide) from
+  // Graph — nothing downstream verifies per-user access, so the involvement
+  // check happens HERE or never. Without it any authenticated user with a
+  // join URL pulls the full transcript/recording of any own-tenant meeting.
+  // Calendar evidence only — body.event is client-supplied and untrusted.
+  const cacheCode = teamsCacheCode(info.joinWebUrl);
+  const involved = await callerInvolvedInOccurrence(user, cacheCode, event.startTime ?? null);
+  if (!involved) {
+    return out(403, {
+      error:
+        "This meeting isn't on your calendar. Imports are limited to meetings you organize or are invited to — if you were invited, Sync your calendar and try again.",
+    });
   }
 
   const attendees: GmeetAttendee[] = Array.isArray(event.attendees)

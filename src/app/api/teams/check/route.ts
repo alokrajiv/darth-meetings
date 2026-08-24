@@ -4,6 +4,7 @@ import { parseTeamsJoinLink, isOwnTenant } from '@/lib/teams-link';
 import { teamsCacheCode } from '@/lib/server/teams-ids';
 import { findImportedByTeamsMeetings } from '@/db-ops/teams-import';
 import { getMeetingCacheByMeetings } from '@/db-ops/gmeet-meeting-cache';
+import { callerInvolvedCodes } from '@/db-ops/calendar-event-cache';
 
 export const runtime = 'nodejs';
 
@@ -60,7 +61,7 @@ export const POST = withAuth(async ({ user, request }) => {
     }
   });
 
-  const [imported, cacheRows] = await Promise.all([
+  const [imported, cacheRows, involved] = await Promise.all([
     findImportedByTeamsMeetings(dedupeQueries, { userId: user.userId, email: user.email }).catch(
       (err) => {
         console.warn('[teams/check] dedupe lookup failed:', err);
@@ -68,18 +69,29 @@ export const POST = withAuth(async ({ user, request }) => {
       }
     ),
     getMeetingCacheByMeetings(cacheQueries).catch(() => cacheQueries.map(() => null)),
+    // PRIVACY GATE (2026-08-24): URLs are client-supplied and the cache is
+    // global — meta/chat/ownerEmail only for occurrences the caller is in.
+    callerInvolvedCodes(
+      { userId: user.userId, email: user.email },
+      cacheQueries.map((q) => ({ code: q.code, instant: q.startTime }))
+    ).catch(() => new Set<string>()),
   ]);
+  const callerEmail = user.email.toLowerCase();
 
   const results = parsed.map((p, i) => {
     if (!p) return null; // not a parseable Teams link
     const external = !isOwnTenant(p);
     const cacheAny = cacheRows[cacheIndex[i]!] ?? null;
+    const code = teamsCacheCode(p.joinWebUrl);
+    const ok =
+      involved.has(code) ||
+      (cacheAny?.organizer_email != null && cacheAny.organizer_email.toLowerCase() === callerEmail);
     if (external) {
       return {
         external: true as const,
         tenantId: p.tenantId,
-        code: teamsCacheCode(p.joinWebUrl),
-        chat: cacheAny?.teams_chat ?? null,
+        code,
+        chat: ok ? (cacheAny?.teams_chat ?? null) : null,
       };
     }
     const qi = dedupeIndex[i]!;
@@ -89,17 +101,17 @@ export const POST = withAuth(async ({ user, request }) => {
       external: false as const,
       /** `teams-<hash>` — the mute/reminder key the client can't compute
        * itself (server-side sha256 of the canonical URL). */
-      code: teamsCacheCode(p.joinWebUrl),
+      code,
       imported: dupe
         ? {
             assemblyaiId: dupe.accessible ? dupe.assemblyai_id : null,
             title: dupe.accessible ? dupe.title : null,
-            ownerEmail: dupe.owner_email,
+            ownerEmail: dupe.accessible || ok ? dupe.owner_email : null,
             accessible: dupe.accessible,
             mine: dupe.mine,
           }
         : null,
-      meta: cache
+      meta: cache && ok
         ? {
             hasTranscript: cache.transcript_parseable === true,
             hasRecording: cache.ready_recording_count > 0,
@@ -111,7 +123,7 @@ export const POST = withAuth(async ({ user, request }) => {
             confEnd: cache.conf_end,
           }
         : null,
-      chat: cache?.teams_chat ?? null,
+      chat: ok ? (cache?.teams_chat ?? null) : null,
     };
   });
 

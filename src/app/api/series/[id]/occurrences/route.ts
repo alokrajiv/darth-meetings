@@ -1,6 +1,7 @@
 import { NextResponse } from 'next/server';
 import { withAuth } from '@/lib/auth/with-auth';
 import { sweepSeriesOccurrences } from '@/lib/server/series-occurrences';
+import { seriesVisibleToCaller } from '@/db-ops/series';
 
 export const runtime = 'nodejs';
 // Sweeping calendar pages + Graph artifact lists can take a moment.
@@ -16,6 +17,11 @@ export const GET = withAuth(async ({ user, request }, { params }) => {
   const id = Number((await params).id);
   if (!Number.isInteger(id) || id <= 0) {
     return NextResponse.json({ error: 'Bad id' }, { status: 400 });
+  }
+  // PRIVACY GATE (2026-08-24): the sweep reads other users' transcript
+  // titles, app-only Graph artifacts and global-cache rows for the series.
+  if (!(await seriesVisibleToCaller(id, { userId: user.userId, email: user.email }))) {
+    return NextResponse.json({ error: 'Not found' }, { status: 404 });
   }
   const forceRefresh = new URL(request.url).searchParams.get('refresh') === '1';
   const result = await sweepSeriesOccurrences(

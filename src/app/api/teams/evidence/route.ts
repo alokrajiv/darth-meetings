@@ -12,7 +12,7 @@ import {
   persistCalendarEvents,
   teamsUrlOf,
 } from '@/lib/server/meeting-discovery';
-import { hasCalendarOccurrence } from '@/db-ops/calendar-event-cache';
+import { hasCalendarOccurrence, callerInvolvedInOccurrence } from '@/db-ops/calendar-event-cache';
 import { findImportedByTeamsMeetings } from '@/db-ops/teams-import';
 
 export const runtime = 'nodejs';
@@ -148,6 +148,17 @@ export const POST = withAuth(async ({ user, request }) => {
     // The verdict itself is still returned either way; updates to an
     // existing row are always allowed.
     const extCode = teamsCacheCode(info.joinWebUrl);
+    // PRIVACY GATE (2026-08-24): the URL is client-supplied — verdicts
+    // (held / recorded) only for occurrences the caller is actually in.
+    const extInvolved = await callerInvolvedInOccurrence(user, extCode, startTime).catch(
+      () => false
+    );
+    if (!extInvolved) {
+      return NextResponse.json(
+        { error: "This meeting isn't on your calendar — Sync your calendar and try again." },
+        { status: 403 }
+      );
+    }
     const allowCreate = await hasCalendarOccurrence(user.userId, extCode, startTime).catch(
       () => false
     );
@@ -177,6 +188,18 @@ export const POST = withAuth(async ({ user, request }) => {
   }
 
   const code = teamsCacheCode(info.joinWebUrl);
+  // PRIVACY GATE (2026-08-24): the identity inputs are client-supplied and
+  // the probe is app-only Graph + global-cache reads — refuse unless the
+  // caller is involved in the occurrence (own calendar row, or organizer/
+  // invitee on any user's cached row; the eventId path just persisted the
+  // caller's own event, so it passes by construction).
+  const involvedOk = await callerInvolvedInOccurrence(user, code, startTime).catch(() => false);
+  if (!involvedOk) {
+    return NextResponse.json(
+      { error: "This meeting isn't on your calendar — Sync your calendar and try again." },
+      { status: 403 }
+    );
+  }
   // Teams chat verdict (held / recorded) rides along with the artifact
   // probe — cache-first, else one live lookup through the caller's Darth
   // Tasks Microsoft link; persisted on the same cache row (raw.teamsChat).

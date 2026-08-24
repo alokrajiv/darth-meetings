@@ -3,7 +3,10 @@ import { withAuth } from '@/lib/auth/with-auth';
 import { getGoogleAccount } from '@/db-ops/google-accounts';
 import { getServerAccessToken } from '@/lib/server/google-oauth';
 import { getMeetingCacheByMeetings } from '@/db-ops/gmeet-meeting-cache';
-import { getCalendarAttachmentsFor } from '@/db-ops/calendar-event-cache';
+import {
+  getCalendarAttachmentsFor,
+  callerInvolvedInOccurrence,
+} from '@/db-ops/calendar-event-cache';
 import { getDriveFileMeta } from '@/lib/server/gmeet';
 import { classifyCalendarAttachments } from '@/lib/meeting-evidence';
 import { cachedMetaOf, probeMeetingEvidence } from '@/lib/server/meeting-discovery';
@@ -62,11 +65,19 @@ export const POST = withAuth(async ({ user, request }) => {
     }).catch(() => null);
     if (cached) attachments = cached;
   }
+  // PRIVACY GATE (2026-08-24): the global cache row (another user's probe)
+  // folds into the verdict AND the response meta — only feed it in when the
+  // caller is involved in the occurrence. An uninvolved caller still gets a
+  // pure own-token probe (Google's ACLs gate that), just never our cache.
+  const involvedOk = await callerInvolvedInOccurrence(user, meetingCode, startTime).catch(
+    () => false
+  );
   // Without a start there is no way to pick THE occurrence's row — let the
   // service key by code alone rather than borrowing another occurrence's.
-  const [existing] = startTime
-    ? await getMeetingCacheByMeetings([{ code: meetingCode, startTime }]).catch(() => [null])
-    : [null];
+  const [existing] =
+    involvedOk && startTime
+      ? await getMeetingCacheByMeetings([{ code: meetingCode, startTime }]).catch(() => [null])
+      : [null];
   const probe = await probeMeetingEvidence(minted.token, {
     userId: user.userId,
     meetingCode,
@@ -78,7 +89,9 @@ export const POST = withAuth(async ({ user, request }) => {
       iCalUID: body?.event?.iCalUID ?? null,
       organizerEmail: body?.event?.organizerEmail ?? null,
     },
-    existing: existing ?? undefined,
+    // Explicit null when uninvolved — undefined would make the service look
+    // the cache row up itself, re-opening the leak this gate closes.
+    existing: existing ?? null,
   });
 
   // Drive metadata for the first recording file — best-effort (the caller
@@ -102,17 +115,21 @@ export const POST = withAuth(async ({ user, request }) => {
     }
   }
 
+  // Row-derived fields only when involved, or when the caller's own token
+  // resolved the record (Google itself vouching they were a participant) —
+  // the write-back row can carry other users' cached captures either way.
+  const rowOk = involvedOk || probe.recordName != null;
   const out: EvidenceResponse = {
     recordName: probe.recordName,
-    confStart: probe.row?.conf_start ?? null,
-    confEnd: probe.row?.conf_end ?? null,
+    confStart: rowOk ? (probe.row?.conf_start ?? null) : null,
+    confEnd: rowOk ? (probe.row?.conf_end ?? null) : null,
     recording: probe.recording,
     transcript: probe.transcript,
     verdict: probe.verdict,
     attachments,
     checkFailed: probe.checkFailed,
     video,
-    meta: cachedMetaOf(probe.row),
+    meta: rowOk ? cachedMetaOf(probe.row) : null,
     checkedAt: new Date().toISOString(),
   };
   return NextResponse.json(out);

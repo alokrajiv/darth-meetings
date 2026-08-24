@@ -2,6 +2,7 @@ import { NextResponse } from 'next/server';
 import { withAuth } from '@/lib/auth/with-auth';
 import { findImportedByMeetingCodes } from '@/db-ops/gmeet-sync';
 import { getMeetingCacheByMeetings } from '@/db-ops/gmeet-meeting-cache';
+import { callerInvolvedCodes } from '@/db-ops/calendar-event-cache';
 
 export const runtime = 'nodejs';
 
@@ -41,13 +42,21 @@ export const POST = withAuth(async ({ user, request }) => {
     }));
   if (meetings.length === 0) return NextResponse.json({ imported: {}, meta: {} });
 
-  const [rows, cacheRows] = await Promise.all([
+  const [rows, cacheRows, involved] = await Promise.all([
     findImportedByMeetingCodes(meetings, {
       userId: user.userId,
       email: user.email,
     }),
     getMeetingCacheByMeetings(meetings).catch(() => meetings.map(() => null)),
+    // PRIVACY GATE (2026-08-24): codes are client-supplied and the cache is
+    // global — without this, any authed user harvests conf times / Drive
+    // ids / speaker counts / owner emails for arbitrary meeting codes.
+    callerInvolvedCodes(
+      user,
+      meetings.map((m) => ({ code: m.code, instant: m.startTime }))
+    ).catch(() => new Set<string>()),
   ]);
+  const email = user.email.toLowerCase();
   const imported: Record<
     string,
     {
@@ -83,19 +92,24 @@ export const POST = withAuth(async ({ user, request }) => {
   > = {};
   meetings.forEach((m, i) => {
     const key = legacy ? m.code : `${m.code}|${m.startTime ?? ''}`;
+    const c = cacheRows[i];
+    // Involved = calendar evidence, or the cache row itself names the
+    // caller as organizer (the cache-only arm).
+    const ok =
+      involved.has(m.code) || (c?.organizer_email && c.organizer_email.toLowerCase() === email);
     const r = rows[i];
     if (r) {
       imported[key] = {
         // Don't leak the transcript id unless the caller can actually open it.
         assemblyaiId: r.accessible ? r.assemblyai_id : null,
         title: r.accessible ? r.title : null,
-        ownerEmail: r.owner_email,
+        // "synced by X" only when the caller can open it or was in the room.
+        ownerEmail: r.accessible || ok ? r.owner_email : null,
         accessible: r.accessible,
         mine: r.mine,
       };
     }
-    const c = cacheRows[i];
-    if (c) {
+    if (c && ok) {
       meta[key] = {
         conferenceRecord: c.conference_record,
         confStart: c.conf_start,

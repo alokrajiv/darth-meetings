@@ -1,6 +1,6 @@
 import { NextResponse } from 'next/server';
 import { withAuth } from '@/lib/auth/with-auth';
-import { getSeries, mergeSeries } from '@/db-ops/series';
+import { getSeries, mergeSeries, visibleSeriesIds } from '@/db-ops/series';
 import { retroAttachSweep } from '@/lib/server/series-attach';
 
 export const runtime = 'nodejs';
@@ -32,6 +32,12 @@ export const POST = withAuth(async ({ user, request }, { params }) => {
     return NextResponse.json({ error: 'Cannot merge a series into itself' }, { status: 400 });
   }
 
+  // PRIVACY GATE (2026-08-24): both sides must be caller-visible — merging
+  // pulls another series' members/keys under a series the caller can read.
+  const visible = await visibleSeriesIds({ userId: user.userId, email: user.email });
+  if (!visible.has(intoId) || !visible.has(fromId)) {
+    return NextResponse.json({ error: 'Series not found' }, { status: 404 });
+  }
   const [into, from] = await Promise.all([getSeries(intoId), getSeries(fromId)]);
   if (!into || !from) {
     return NextResponse.json({ error: 'Series not found' }, { status: 404 });

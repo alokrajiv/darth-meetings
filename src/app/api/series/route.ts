@@ -8,6 +8,7 @@ import {
   findDuplicateSeries,
   listSeries,
   seriesTotals,
+  visibleSeriesIds,
 } from '@/db-ops/series';
 import { keysFromContext } from '@/lib/series-keys';
 import { publishEvent } from '@/lib/server/event-bus';
@@ -33,22 +34,29 @@ function cadenceOf(medianGapSecs: number | null): SeriesCadence {
  * Teams meeting / name — the merge prompt), and the memberships/unattached
  * totals for the index footer.
  */
-export const GET = withAuth(async () => {
-  const [series, totals, dupes] = await Promise.all([
+export const GET = withAuth(async ({ user }) => {
+  const [series, totals, dupes, visible] = await Promise.all([
     listSeries(),
     seriesTotals(),
     findDuplicateSeries(),
+    // PRIVACY GATE (2026-08-24): series titles are meeting titles — only
+    // series the caller attends or holds a member of (db-ops/series).
+    visibleSeriesIds({ userId: user.userId, email: user.email }),
   ]);
   return NextResponse.json({
-    series: series.map((s) => {
-      const dup_with = dupes.get(s.id) ?? [];
-      return {
-        ...s,
-        cadence: cadenceOf(s.median_gap_secs),
-        dup: dup_with.length > 0,
-        dup_with,
-      };
-    }),
+    series: series
+      .filter((s) => visible.has(s.id))
+      .map((s) => {
+        // Dup siblings are candidates for the caller's merge prompt — an
+        // invisible sibling's title must not ride along.
+        const dup_with = (dupes.get(s.id) ?? []).filter((d) => visible.has(d.id));
+        return {
+          ...s,
+          cadence: cadenceOf(s.median_gap_secs),
+          dup: dup_with.length > 0,
+          dup_with,
+        };
+      }),
     totals,
   });
 });

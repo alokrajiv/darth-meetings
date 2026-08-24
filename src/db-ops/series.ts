@@ -13,12 +13,69 @@ import type { GmeetContext } from '@/lib/format';
 
 /**
  * Recurring-call series: the curated first-class object behind the
- * "recurring call" badge. Series are org-global (no per-user ACL — this is
- * an internal tool); per-transcript visibility is still enforced wherever
- * member transcript CONTENT is returned.
+ * "recurring call" badge. Series rows are stored org-global (no owner), but
+ * as of 2026-08-24 every series API surface is scoped through
+ * visibleSeriesIds/seriesVisibleToCaller — a series title IS a meeting
+ * title, and its keys carry live Teams join URLs, so serving the whole
+ * table was the same leak class as the unimported-view incident.
  */
 
 const SCHEMA = SCHEMAS.MEETING_WHISPERER;
+
+/**
+ * PRIVACY GATE (2026-08-24): series ids the caller may see — they hold an
+ * accessible member transcript (own or shared), or their own calendar sweep
+ * evidences the series (a cached event matching the series' meeting-code /
+ * recurring-base-id key: they attend the recurring call even if nothing was
+ * imported yet). Teams-only series with no accessible member stay hidden
+ * until an import lands — the join-URL keys hash differently on the
+ * calendar side, so there is no safe calendar arm for them.
+ */
+export async function visibleSeriesIds(caller: {
+  userId: string;
+  email: string;
+}): Promise<Set<number>> {
+  const email = caller.email.trim().toLowerCase();
+  const rows = await sql<Array<{ id: number }>>`
+    SELECT s.id
+    FROM ${sql(SCHEMA)}.series s
+    WHERE EXISTS (
+        SELECT 1 FROM ${sql(SCHEMA)}.series_members m
+        JOIN ${sql(SCHEMA)}.transcripts t
+          ON t.id = m.transcript_id AND t.deleted_at IS NULL
+        LEFT JOIN ${sql(SCHEMA)}.transcript_shares sh
+          ON sh.transcript_id = t.id AND sh.shared_with_email = ${email}
+        WHERE m.series_id = s.id
+          AND (t.user_id = ${caller.userId} OR sh.id IS NOT NULL)
+      )
+      OR EXISTS (
+        SELECT 1 FROM ${sql(SCHEMA)}.series_keys k
+        WHERE k.series_id = s.id
+          AND (
+            (k.kind = 'meeting-code' AND EXISTS (
+              SELECT 1 FROM ${sql(SCHEMA)}.calendar_event_cache ce
+              WHERE ce.user_id = ${caller.userId} AND ce.meeting_code = k.value
+            ))
+            OR (k.kind = 'recurring-base-id' AND EXISTS (
+              SELECT 1 FROM ${sql(SCHEMA)}.calendar_event_cache ce
+              WHERE ce.user_id = ${caller.userId}
+                AND ce.recurring_event_id IS NOT NULL
+                AND regexp_replace(ce.recurring_event_id, '_R\\d{8}T\\d{6}Z?$', '') = k.value
+            ))
+          )
+      )
+  `;
+  return new Set(rows.map((r) => r.id));
+}
+
+/** Single-series form of visibleSeriesIds — the detail/mutation gate. */
+export async function seriesVisibleToCaller(
+  id: number,
+  caller: { userId: string; email: string }
+): Promise<boolean> {
+  const vis = await visibleSeriesIds(caller);
+  return vis.has(id);
+}
 
 /**
  * Per-series auto-import config (series.auto_import jsonb). The sweep runs
@@ -584,7 +641,13 @@ export async function listMembers(
 ): Promise<SeriesMemberEntry[]> {
   const normEmail = caller.email.trim().toLowerCase();
   return sql<SeriesMemberEntry[]>`
-    SELECT m.transcript_id, t.assemblyai_id, t.title, t.status,
+    -- Title only for accessible members — the row-shape below promises
+    -- "date + owner only, never content" for the rest, so enforce it in the
+    -- contract, not just in what the component chooses to paint.
+    SELECT m.transcript_id, t.assemblyai_id,
+           CASE WHEN t.user_id = ${caller.userId} OR sh.id IS NOT NULL
+                THEN t.title END AS title,
+           t.status,
            t.recorded_at::text AS recorded_at, t.created_at::text AS created_at,
            t.duration, m.how,
            (t.user_id = ${caller.userId} OR sh.id IS NOT NULL) AS accessible,
