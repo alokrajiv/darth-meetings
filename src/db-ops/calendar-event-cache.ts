@@ -409,13 +409,59 @@ function unimportedMuteExclusion(userId: string): ReturnType<typeof sql> {
   `;
 }
 
-function unimportedWhere(userId: string, opts: CalendarRangeOpts): ReturnType<typeof sql> {
+/**
+ * PRIVACY GATE (2026-08-24): the unimported view reads the GLOBAL artifact
+ * cache, which holds every connected user's meetings — without this
+ * predicate any caller sees titles/organizers/times of meetings they were
+ * never invited to. A row is visible only when the caller is involved in
+ * the occurrence:
+ *  1. their OWN calendar sweep captured it (code + ±12h — rides the
+ *     migration-029 user-scoped index), or
+ *  2. the cache row says they organized it, or
+ *  3. they appear as an invitee on ANY user's cached calendar row for the
+ *     occurrence (covers "invited, but own sweep hasn't seen it" — e.g.
+ *     history older than their first sweep; migration-030 unscoped index).
+ * Teams rows ride the same arms: calendar sweeps stamp the identical
+ * canonical `teams-…` code on calendar_event_cache rows.
+ */
+function unimportedVisibleTo(caller: Caller): ReturnType<typeof sql> {
+  const email = caller.email.toLowerCase();
+  return sql`(
+    EXISTS (
+      SELECT 1 FROM ${sql(SCHEMA)}.calendar_event_cache ce
+      WHERE ce.user_id = ${caller.userId}
+        AND ce.meeting_code = c.meeting_code
+        AND ce.event_start
+              BETWEEN COALESCE(c.event_start, c.conf_start) - ${OCCURRENCE_WINDOW_S} * interval '1 second'
+                  AND COALESCE(c.event_start, c.conf_start) + ${OCCURRENCE_WINDOW_S} * interval '1 second'
+    )
+    OR lower(c.organizer_email) = ${email}
+    OR EXISTS (
+      SELECT 1 FROM ${sql(SCHEMA)}.calendar_event_cache ce2
+      WHERE ce2.meeting_code = c.meeting_code
+        AND ce2.event_start
+              BETWEEN COALESCE(c.event_start, c.conf_start) - ${OCCURRENCE_WINDOW_S} * interval '1 second'
+                  AND COALESCE(c.event_start, c.conf_start) + ${OCCURRENCE_WINDOW_S} * interval '1 second'
+        AND (
+          lower(ce2.organizer_email) = ${email}
+          OR EXISTS (
+            SELECT 1 FROM jsonb_array_elements(COALESCE(ce2.attendees, '[]'::jsonb)) a
+            WHERE lower(a->>'email') = ${email}
+          )
+        )
+    )
+  )`;
+}
+
+function unimportedWhere(caller: Caller, opts: CalendarRangeOpts): ReturnType<typeof sql> {
+  const userId = caller.userId;
   // THE already-imported rule (db-ops/imported-occurrences): meeting code /
   // Teams join URL pinned by the ±12h window, plus calendar eventIds —
   // uploads and pasted transcripts link by eventId, not meeting code (D9) —
   // resolved through the caller's own calendar rows for the occurrence.
   return sql`
     WHERE COALESCE(c.event_start, c.conf_start) IS NOT NULL
+      AND ${unimportedVisibleTo(caller)}
       AND ${evidencePresent('c')}
       AND ${importedOccurrenceAntiJoin({
         meetingCode: sql`c.meeting_code`,
@@ -491,7 +537,7 @@ export async function countCalendarMeetings(
     sql<Array<{ n: number }>>`
       SELECT count(DISTINCT (c.meeting_code, COALESCE(c.event_start, c.conf_start)))::int AS n
       FROM ${sql(SCHEMA)}.gmeet_meeting_cache c
-      ${unimportedWhere(caller.userId, range)}
+      ${unimportedWhere(caller, range)}
     `,
     sql<Array<{ n: number }>>`
       SELECT count(*)::int AS n
@@ -603,7 +649,7 @@ async function unimportedRows(
       )))
       LIMIT 1
     ) cal ON true
-    ${unimportedWhere(caller.userId, opts)}
+    ${unimportedWhere(caller, opts)}
       AND to_char(${day}, 'YYYY-MM-DD') = ANY(${dayKeys})
     ORDER BY c.meeting_code, COALESCE(c.event_start, c.conf_start), c.event_key DESC
     ) d
@@ -718,7 +764,7 @@ export async function listCalendarMeetingsPage(
   const day = view === 'unimported' ? unimportedDay(opts.tz) : norecDay(opts.tz);
   const where =
     view === 'unimported'
-      ? unimportedWhere(caller.userId, opts)
+      ? unimportedWhere(caller, opts)
       : norecWhere(caller.userId, opts);
   const table = view === 'unimported' ? sql`gmeet_meeting_cache` : sql`calendar_event_cache`;
 
