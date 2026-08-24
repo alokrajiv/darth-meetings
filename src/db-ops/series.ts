@@ -2,6 +2,13 @@ import 'server-only';
 import { sql } from '@/lib/db';
 import { SCHEMAS } from '@/lib/constants/database';
 import { keysFromContext, normalizeTitle, strongKeys, type SeriesKeyInput } from '@/lib/series-keys';
+import {
+  onSeriesDeleted,
+  onSeriesMerged,
+  onSeriesRenamed,
+  preMergeLabelState,
+  syncSeriesLabelOnMemberAdd,
+} from '@/lib/server/series-labels';
 import type { GmeetContext } from '@/lib/format';
 
 /**
@@ -95,18 +102,40 @@ export async function getSeries(id: number): Promise<SeriesRow | null> {
 
 export async function updateSeries(
   id: number,
-  patch: { title?: string; notes?: string | null }
+  patch: { title?: string; notes?: string | null },
+  /** Who performed the edit — threaded to the series-label rename hook so
+   * label_history attributes the follow-up rename to the real actor. */
+  actorUserId?: string | null
 ): Promise<void> {
+  let oldTitle: string | null = null;
   if (patch.title !== undefined) {
+    const [cur] = await sql<Array<{ title: string }>>`
+      SELECT title FROM ${sql(SCHEMA)}.series WHERE id = ${id}
+    `;
+    oldTitle = cur?.title ?? null;
     await sql`UPDATE ${sql(SCHEMA)}.series SET title = ${patch.title}, updated_at = NOW() WHERE id = ${id}`;
   }
   if (patch.notes !== undefined) {
     await sql`UPDATE ${sql(SCHEMA)}.series SET notes = ${patch.notes}, updated_at = NOW() WHERE id = ${id}`;
   }
+  // Series label follows the title (AFTER the series write — a label failure
+  // must never fail a rename).
+  if (patch.title !== undefined && oldTitle !== null && oldTitle !== patch.title) {
+    try {
+      await onSeriesRenamed(id, oldTitle, patch.title, actorUserId);
+    } catch (err) {
+      console.warn(`[series-labels] rename hook failed for series ${id}:`, err);
+    }
+  }
 }
 
 export async function deleteSeries(id: number): Promise<void> {
   await sql`DELETE FROM ${sql(SCHEMA)}.series WHERE id = ${id}`;
+  try {
+    await onSeriesDeleted(id);
+  } catch (err) {
+    console.warn(`[series-labels] delete hook failed for series ${id}:`, err);
+  }
 }
 
 export async function listSeries(): Promise<SeriesListEntry[]> {
@@ -350,9 +379,16 @@ export async function findDuplicateSeries(): Promise<Map<number, DupSibling[]>> 
  */
 export async function mergeSeries(
   intoId: number,
-  fromId: number
+  fromId: number,
+  /** Who clicked the merge — attribution for the label follow-up. */
+  actorUserId?: string | null
 ): Promise<{ movedMembers: number; movedKeys: number }> {
-  return sql.begin(async (tx) => {
+  // Snapshot label-rule state BEFORE the txn — the loser row dies inside it.
+  const labelState = await preMergeLabelState(intoId, fromId).catch((err) => {
+    console.warn(`[series-labels] pre-merge snapshot failed (${intoId}<-${fromId}):`, err);
+    return null;
+  });
+  const result = await sql.begin(async (tx) => {
     const keys = await tx`
       UPDATE ${sql(SCHEMA)}.series_keys SET series_id = ${intoId}
       WHERE series_id = ${fromId} RETURNING id
@@ -370,6 +406,29 @@ export async function mergeSeries(
     await tx`DELETE FROM ${sql(SCHEMA)}.series WHERE id = ${fromId}`;
     return { movedMembers: members.length, movedKeys: keys.length };
   });
+  // Series-label follow-up AFTER the merge commits: winner keeps/gets its
+  // label, loser's rule dies, its assignments migrate (log-and-continue).
+  if (labelState) {
+    try {
+      await onSeriesMerged(intoId, fromId, labelState, actorUserId);
+    } catch (err) {
+      // Idempotent hook — re-running applySeriesLabel(intoId) heals the
+      // missing winner assignments.
+      console.warn(
+        `[series-labels] merge hook failed (${intoId}<-${fromId}) — heal: applySeriesLabel(${intoId}):`,
+        err
+      );
+    }
+  }
+  // The loser's rule must never outlive its series: delete it even when the
+  // snapshot failed or the hook threw mid-way (idempotent — the happy path
+  // already removed it; assignments keep their labels, rule_id nulls out).
+  try {
+    await onSeriesDeleted(fromId);
+  } catch (err) {
+    console.warn(`[series-labels] loser-rule cleanup failed (series ${fromId}):`, err);
+  }
+  return result;
 }
 
 /** Transcripts in no series — the retro-attach sweep's work list. */
@@ -471,7 +530,10 @@ export async function getMembership(
   return row ?? null;
 }
 
-/** Attach (or move) a transcript to a series. */
+/** Attach (or move) a transcript to a series. Every membership-insert path
+ * (routes, import auto-attach, retro sweep) funnels through here, so the
+ * series-label hook after the insert covers them all. Label failures are
+ * logged, never propagated — labels must not break series ops. */
 export async function addMember(
   seriesId: number,
   transcriptId: number,
@@ -484,6 +546,11 @@ export async function addMember(
     ON CONFLICT (transcript_id)
     DO UPDATE SET series_id = ${seriesId}, how = ${how}, added_by = ${userId}, added_at = NOW()
   `;
+  try {
+    await syncSeriesLabelOnMemberAdd(seriesId, userId);
+  } catch (err) {
+    console.warn(`[series-labels] member-add hook failed for series ${seriesId}:`, err);
+  }
 }
 
 /** Detach; `remember` writes an exclusion so guesses never resurface it. */

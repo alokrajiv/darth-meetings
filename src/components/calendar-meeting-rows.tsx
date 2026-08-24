@@ -613,6 +613,10 @@ export function CalendarEventRow({
 
   const middleCell = (key: string) => {
     switch (key) {
+      case 'labels':
+        // Calendar rows carry no labels (v1) — an empty cell keeps the grid
+        // aligned with the archive rows' Labels column.
+        return null;
       case 'owner':
         return r.organizerEmail ? (
           <span className="block max-w-[16ch] truncate text-xs text-muted-foreground">

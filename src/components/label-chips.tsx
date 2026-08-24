@@ -29,6 +29,10 @@ export interface LabelChipsProps {
   onRemove?: (label: LabelRef) => void;
   max?: number;
   variant?: 'row' | 'full';
+  /** Fill-and-fit the available width: chips shrink + truncate instead of
+   * overflowing, keeping the "+N" badge and the add "+" visible (used by
+   * the listing's width-capped Labels column). */
+  fit?: boolean;
   className?: string;
 }
 
@@ -58,15 +62,18 @@ export function LabelChip({
   onClick,
   onRemove,
   size = 'sm',
+  flexible = false,
 }: {
   label: LabelRef;
   color: string | null;
   onClick?: (e: React.MouseEvent) => void;
   onRemove?: (label: LabelRef) => void;
   size?: 'sm' | 'md';
+  /** Shrink below max-w to share a width-capped container (fit mode). */
+  flexible?: boolean;
 }) {
   const dot = <LabelDot color={color} />;
-  const cls = `inline-flex max-w-28 shrink-0 items-center gap-1 rounded-full border border-border bg-muted/40 px-2 ${
+  const cls = `inline-flex max-w-28 ${flexible ? 'min-w-0 shrink' : 'shrink-0'} items-center gap-1 rounded-full border border-border bg-muted/40 px-2 ${
     size === 'md' ? 'py-0.5 text-xs' : 'py-0.5 text-[11px]'
   } text-foreground/80 transition-colors ${onClick ? 'hover:bg-muted cursor-pointer' : ''}`;
   const body = (
@@ -120,6 +127,7 @@ export function LabelChips({
   onRemove,
   max = 2,
   variant = 'row',
+  fit = false,
   className = '',
 }: LabelChipsProps) {
   const { byId } = useLabelCatalog();
@@ -160,7 +168,9 @@ export function LabelChips({
   if (list.length === 0 && !onAdd) return null;
 
   return (
-    <span className={`inline-flex min-w-0 shrink-0 items-center gap-1 ${className}`}>
+    <span
+      className={`${fit ? 'flex' : 'inline-flex shrink-0'} min-w-0 items-center gap-1 ${className}`}
+    >
       {shown.map((l) => (
         <LabelChip
           key={l.id}
@@ -169,6 +179,7 @@ export function LabelChips({
           onClick={onFilter ? () => onFilter(l) : undefined}
           onRemove={onRemove}
           size={variant === 'full' ? 'md' : 'sm'}
+          flexible={fit}
         />
       ))}
       {rest.length > 0 && (

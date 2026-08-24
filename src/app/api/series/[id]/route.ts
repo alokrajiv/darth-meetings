@@ -69,7 +69,7 @@ export const PATCH = withAuth(async ({ user, request }, { params }) => {
     return NextResponse.json({ error: 'title cannot be empty' }, { status: 400 });
   }
   if (body.title !== undefined || body.notes !== undefined) {
-    await updateSeries(id, { title, notes: body.notes });
+    await updateSeries(id, { title, notes: body.notes }, user.userId);
   }
 
   if (body.autoImport !== undefined) {

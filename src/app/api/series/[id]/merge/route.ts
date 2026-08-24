@@ -37,7 +37,7 @@ export const POST = withAuth(async ({ user, request }, { params }) => {
     return NextResponse.json({ error: 'Series not found' }, { status: 404 });
   }
 
-  const moved = await mergeSeries(intoId, fromId);
+  const moved = await mergeSeries(intoId, fromId, user.userId);
   console.log(
     `[series] merge by ${user.email}: "${from.title}" (#${fromId}) → "${into.title}" (#${intoId}), ` +
       `${moved.movedMembers} members + ${moved.movedKeys} keys moved`

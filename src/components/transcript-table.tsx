@@ -29,7 +29,6 @@ import {
   RefreshCw,
   CalendarCheck2,
   CalendarX2,
-  Check,
   ChevronLeft,
   EyeOff,
   FileAudio,
@@ -45,6 +44,7 @@ import {
   X,
 } from 'lucide-react';
 import { MeetLogo, TeamsLogo } from '@/components/provider-icon';
+import { LayersDropdown } from '@/components/layers-dropdown';
 import { SeriesBadge } from '@/components/series-badge';
 import { SeriesDialog } from '@/components/series-dialog';
 import { LabelChips } from '@/components/label-chips';
@@ -184,7 +184,7 @@ const PAGE_MIN_ROWS = 40;
  * Users pick visibility + order via the toolbar chooser; persisted in
  * localStorage under COLS_STORAGE_KEY.
  */
-type ColKey = 'owner' | 'date' | 'duration' | 'speakers' | 'language' | 'imported';
+type ColKey = 'labels' | 'owner' | 'date' | 'duration' | 'speakers' | 'language' | 'imported';
 
 interface ColPrefs {
   order: ColKey[];
@@ -300,6 +300,7 @@ function cleanDescription(raw: string): string {
 }
 
 const DEFAULT_COL_ORDER: ColKey[] = [
+  'labels',
   'owner',
   'date',
   'duration',
@@ -311,6 +312,7 @@ const DEFAULT_HIDDEN: ColKey[] = ['language', 'imported'];
 const COLS_STORAGE_KEY = 'mw:cols:v1';
 
 const COL_LABELS: Record<ColKey, string> = {
+  labels: 'Labels',
   owner: 'Owner',
   date: 'Date',
   duration: 'Duration',
@@ -321,6 +323,7 @@ const COL_LABELS: Record<ColKey, string> = {
 
 /** Width + responsive visibility per column (applied to head & cells). */
 const COL_HEAD_WIDTH: Record<ColKey, string> = {
+  labels: 'w-[14%]',
   owner: 'w-[16%]',
   date: 'w-[14%]',
   duration: 'w-[11%]',
@@ -329,6 +332,7 @@ const COL_HEAD_WIDTH: Record<ColKey, string> = {
   imported: 'w-[12%]',
 };
 const COL_RESPONSIVE: Record<ColKey, string> = {
+  labels: 'hidden md:table-cell',
   owner: 'hidden lg:table-cell',
   date: 'hidden md:table-cell',
   duration: 'hidden sm:table-cell',
@@ -1354,6 +1358,39 @@ export function TranscriptTable({
 
   const renderColCell = (key: ColKey, t: ListRow) => {
     switch (key) {
+      case 'labels': {
+        // Chips moved here from the title cell (column-chooser controlled,
+        // default on). Placeholder/queued/trashed rows show an empty cell.
+        const placeholder = t.status === 'uploading' || t.assemblyai_id.startsWith('defer-');
+        if (placeholder || t.status === 'waiting' || t.deleted_at) return null;
+        return (
+          // w-0 + min-w-full + overflow-hidden: the chips contribute zero
+          // min-content width, so they can't widen the table (repo gotcha).
+          // `fit` makes the chips shrink+truncate INSIDE that width so the
+          // "+N" badge and the hover-"+" (the [data-label-add] anchor) never
+          // get clipped out of the cell.
+          <div className="w-0 min-w-full overflow-hidden">
+            <LabelChips
+              labels={t.labels}
+              fit
+              onFilter={
+                onLabelFilter
+                  ? (l) => onLabelFilter({ kind: 'id', id: l.id, exact: false })
+                  : undefined
+              }
+              onAdd={
+                canEditRow(t)
+                  ? (e) =>
+                      setRowPicker({
+                        id: t.assemblyai_id,
+                        anchor: anchorFromElement(e.currentTarget),
+                      })
+                  : undefined
+              }
+            />
+          </div>
+        );
+      }
       case 'owner':
         return ownerCell(t);
       case 'date': {
@@ -1531,47 +1568,6 @@ export function TranscriptTable({
     </button>
   );
 
-  const enabledLayerCount =
-    Number(layers.archive) + Number(layers.unimported) + Number(layers.norec);
-
-  /** Checkbox-style layer chip (replaces the old exclusive source radio). */
-  const layerChip = (key: LayerKey, label: string) => {
-    const on = layers[key];
-    // Tabs/search force the plain archive view — chips freeze, calendar
-    // chips read as off, the archive one as on.
-    const inactive = !mergedMode;
-    const lastOn = on && enabledLayerCount === 1;
-    const effectiveOn = inactive ? key === 'archive' : on;
-    const title = inactive
-      ? 'Layers apply on the All tab with no search active'
-      : lastOn
-        ? 'At least one layer must stay on'
-        : effectiveOn
-          ? `Hide these rows`
-          : `Show these rows`;
-    return (
-      <button
-        key={key}
-        type="button"
-        onClick={() => toggleLayer(key)}
-        disabled={inactive || lastOn}
-        aria-pressed={effectiveOn}
-        title={title}
-        className={`flex items-center gap-1 rounded-md px-2 py-1 text-xs transition-colors ${
-          effectiveOn
-            ? 'bg-background font-medium text-foreground shadow-sm'
-            : 'text-muted-foreground hover:text-foreground'
-        } ${inactive ? 'opacity-50' : ''}`}
-      >
-        <Check
-          className={`h-3 w-3 ${effectiveOn ? 'text-primary' : 'invisible'}`}
-          aria-hidden
-        />
-        {label}
-      </button>
-    );
-  };
-
   const monthLabel = useMemo(() => {
     const now = new Date();
     const y = pickedMonth?.y ?? now.getFullYear();
@@ -1639,13 +1635,13 @@ export function TranscriptTable({
 
   const toolbar = (
     <div className="mb-3 flex flex-wrap items-center gap-x-3 gap-y-1 border-b">
-      <div className="mb-2 mt-0.5 flex items-center gap-0.5 rounded-lg border bg-muted/40 p-0.5">
-        {layerChip('archive', 'Imported')}
-        {layerChip(
-          'unimported',
-          `Not imported${calCounts ? ` (${calCounts.unimported})` : ''}`
-        )}
-        {layerChip('norec', 'No recording')}
+      <div className="mb-2 mt-0.5">
+        <LayersDropdown
+          layers={layers}
+          unimportedCount={calCounts ? calCounts.unimported : null}
+          inactive={!mergedMode}
+          onToggle={toggleLayer}
+        />
       </div>
       {renderMerged && calConnected && calSync && (
         <div className="mb-2 mt-0.5 flex items-center gap-0.5 text-[11px] text-muted-foreground">
@@ -1875,21 +1871,17 @@ export function TranscriptTable({
                     onChanged={() => void fetchArchiveRef.current('silent')}
                   />
                 )}
-                {!placeholder && !waiting && !trashed && (
+                {/* Below md every middle column (incl. Labels) is hidden —
+                    keep a compact read-only chip row here so phones still
+                    see labels. No onAdd: [data-label-add] must stay unique
+                    to the Labels column for the 'l'-shortcut anchor. */}
+                {!uploading && !waiting && !trashed && (
                   <LabelChips
                     labels={t.labels}
+                    className="md:hidden"
                     onFilter={
                       onLabelFilter
                         ? (l) => onLabelFilter({ kind: 'id', id: l.id, exact: false })
-                        : undefined
-                    }
-                    onAdd={
-                      canEditRow(t)
-                        ? (e) =>
-                            setRowPicker({
-                              id: t.assemblyai_id,
-                              anchor: anchorFromElement(e.currentTarget),
-                            })
                         : undefined
                     }
                   />

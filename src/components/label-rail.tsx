@@ -9,6 +9,7 @@ import {
   MoreHorizontal,
   Plus,
   RefreshCw,
+  Repeat,
   Tag,
   X,
 } from 'lucide-react';
@@ -133,7 +134,15 @@ export function LabelRail({ filter, onFilter, onChanged, onCollapse, className =
       setOpenIds(stored);
       return;
     }
-    setOpenIds(new Set(catalog.rows.filter((r) => r.depth === 1).map((r) => r.id)));
+    // Top-level nodes open by default — except the reserved "Series" root
+    // (auto-labels, one child per recurring series), which starts collapsed.
+    setOpenIds(
+      new Set(
+        catalog.rows
+          .filter((r) => r.depth === 1 && r.path_key !== 'series')
+          .map((r) => r.id)
+      )
+    );
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [catalog.loaded]);
 
@@ -388,14 +397,17 @@ export function LabelRail({ filter, onFilter, onChanged, onCollapse, className =
     const isActive = activeId === node.id;
     const renaming = editing?.kind === 'rename' && editing.id === node.id;
     const color = labelDotColor(node as LabelRef, catalog.byId);
+    // The reserved "Series" root groups the per-series auto-labels — render
+    // it slightly muted with the series glyph instead of a color dot.
+    const isSeriesRoot = node.parent_id === null && node.path_key === 'series';
     return (
       <div key={node.id}>
         {renaming ? (
           editInput('Label name', depth)
         ) : (
           <div
-            className={`group flex items-center gap-1 rounded-md py-[3px] pr-1 text-sm transition-colors ${
-              isActive ? 'bg-primary/10 text-foreground' : 'hover:bg-muted/60'
+            className={`group flex h-7 items-center gap-1 rounded-md pr-1 text-sm transition-colors ${
+              isActive ? 'bg-accent text-accent-foreground' : 'hover:bg-muted/60'
             }`}
             style={{ paddingLeft: 4 + depth * 14 }}
             data-label-node={node.id}
@@ -420,8 +432,18 @@ export function LabelRail({ filter, onFilter, onChanged, onCollapse, className =
               title={`${node.path}${typeof node.count_visible === 'number' ? ` — ${node.count_visible} meeting${node.count_visible === 1 ? '' : 's'} (incl. sub-labels)` : ''}`}
               className="flex min-w-0 flex-1 items-center gap-1.5 text-left"
             >
-              <LabelDot color={color} />
-              <span className={`min-w-0 flex-1 truncate ${isActive ? 'font-medium' : ''}`}>{node.name}</span>
+              {isSeriesRoot ? (
+                <Repeat className="h-3 w-3 shrink-0 text-muted-foreground/70" aria-hidden />
+              ) : (
+                <LabelDot color={color} />
+              )}
+              <span
+                className={`min-w-0 flex-1 truncate ${isActive ? 'font-medium' : ''} ${
+                  isSeriesRoot && !isActive ? 'text-muted-foreground' : ''
+                }`}
+              >
+                {node.name}
+              </span>
               {typeof node.count_visible === 'number' && (
                 <span className="shrink-0 text-[11px] tabular-nums text-muted-foreground">
                   {node.count_visible}
@@ -464,6 +486,11 @@ export function LabelRail({ filter, onFilter, onChanged, onCollapse, className =
       <div className="flex items-center gap-1 border-b px-2 py-1.5">
         <Tag className="h-3.5 w-3.5 text-muted-foreground" />
         <span className="text-xs font-medium uppercase tracking-wider text-muted-foreground">Labels</span>
+        {catalog.loaded && catalog.rows.length > 0 && (
+          <span className="text-[10px] tabular-nums text-muted-foreground/70">
+            {catalog.rows.length}
+          </span>
+        )}
         <span className="flex-1" />
         <button
           type="button"
@@ -560,8 +587,8 @@ export function LabelRail({ filter, onFilter, onChanged, onCollapse, className =
           type="button"
           onClick={() => onFilter(null)}
           data-label-all
-          className={`flex w-full items-center gap-1.5 rounded-md px-2 py-[3px] text-left text-sm ${
-            !filter ? 'bg-primary/10 font-medium' : 'hover:bg-muted/60'
+          className={`flex h-7 w-full items-center gap-1.5 rounded-md px-2 text-left text-sm ${
+            !filter ? 'bg-accent font-medium text-accent-foreground' : 'hover:bg-muted/60'
           }`}
         >
           <span className="min-w-0 flex-1 truncate">All meetings</span>
@@ -573,8 +600,8 @@ export function LabelRail({ filter, onFilter, onChanged, onCollapse, className =
           type="button"
           onClick={() => onFilter({ kind: 'none' })}
           data-label-unlabelled
-          className={`mb-1 flex w-full items-center gap-1.5 rounded-md px-2 py-[3px] text-left text-sm ${
-            filter?.kind === 'none' ? 'bg-primary/10 font-medium' : 'hover:bg-muted/60'
+          className={`mb-1 flex h-7 w-full items-center gap-1.5 rounded-md px-2 text-left text-sm ${
+            filter?.kind === 'none' ? 'bg-accent font-medium text-accent-foreground' : 'hover:bg-muted/60'
           }`}
         >
           <span className="min-w-0 flex-1 truncate">Unlabelled</span>
