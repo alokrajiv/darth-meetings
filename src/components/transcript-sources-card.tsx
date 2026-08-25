@@ -90,6 +90,77 @@ export function TranscriptSourcesCard({
     (row.speaker_count ?? 0) > 0 &&
     joinedCount - (row.speaker_count ?? 0) >= 2;
 
+  // Quick imports (gmeet-/teams- primaries) never ran AssemblyAI: the text
+  // is what Meet/Teams wrote, so no acoustic diarization, no voiceprints.
+  // When the meeting's video is stored (or fetchable), offer the full
+  // pipeline over it — same re-run-from-local path as the multi-video
+  // combine below; the native transcript rides along as the sidecar.
+  const [retranscribing, setRetranscribing] = useState<null | 'fetching' | 'submitting'>(
+    null
+  );
+  const canRetranscribeFromVideo =
+    canEdit &&
+    (isMeetPrimary || isTeamsPrimary) &&
+    (!!row.local_audio_path || !!knownRecording) &&
+    !partsFetching &&
+    partsGenerating === 0;
+  const retranscribeFromVideo = async () => {
+    const needsFetch = !row.local_audio_path;
+    if (
+      !window.confirm(
+        `Re-transcribe this meeting from its video with AssemblyAI (acoustic speaker separation + voiceprints)?` +
+          (needsFetch
+            ? ` The recording is downloaded from ${isTeams ? 'Microsoft 365' : 'Google Drive'} first.`
+            : '') +
+          ' Takes a few minutes and uses transcription credit; a new transcript is created alongside this one, which stays untouched.'
+      )
+    ) {
+      return;
+    }
+    setError(null);
+    try {
+      if (needsFetch) {
+        setRetranscribing('fetching');
+        const fr = await fetch(`/api/transcripts/${row.assemblyai_id}/fetch-audio`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: '{}',
+        });
+        const fp = (await fr.json().catch(() => ({}))) as { error?: string };
+        if (!fr.ok) throw new Error(fp.error || `Video fetch failed (${fr.status})`);
+      }
+      setRetranscribing('submitting');
+      const res = await fetch('/api/gmeet/import', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          mode: (ctx?.meetTranscript?.utterances?.length ?? 0) > 0 ? 'both' : 'video',
+          sourceTranscriptId: row.assemblyai_id,
+          force: true,
+          event: {
+            id: ctx?.eventId,
+            title: ctx?.eventTitle ?? row.title ?? undefined,
+            startTime: ctx?.startTime,
+            endTime: ctx?.endTime,
+            meetingCode: ctx?.meetingCode,
+            attendees: ctx?.attendees ?? [],
+          },
+        }),
+      });
+      const payload = (await res.json().catch(() => ({}))) as {
+        transcript?: { assemblyai_id?: string };
+        error?: string;
+      };
+      if (!res.ok || !payload.transcript?.assemblyai_id) {
+        throw new Error(payload.error || `Failed (${res.status})`);
+      }
+      window.location.href = `/transcript/${payload.transcript.assemblyai_id}`;
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Re-transcribe failed');
+      setRetranscribing(null);
+    }
+  };
+
   const [combining, setCombining] = useState(false);
   // One-click fix for the "transcript covers Video 1 only" state: the server
   // concatenates the stored segments and runs a fresh AAI transcription over
@@ -288,6 +359,29 @@ export function TranscriptSourcesCard({
           only</span> — the other video{totalVideos > 2 ? 's are' : ' is'} playable in the
           player but not transcribed.
         </p>
+      )}
+      {canRetranscribeFromVideo && (
+        <Button
+          variant="outline"
+          size="sm"
+          className="mt-2 h-8 w-full justify-start gap-2 text-[13px]"
+          disabled={retranscribing !== null}
+          onClick={() => void retranscribeFromVideo()}
+          title={`This transcript is the text ${isTeams ? 'Teams' : 'Meet'} wrote — no acoustic speaker separation or voiceprint matching ran. Run the full AssemblyAI pipeline over the meeting video; a new transcript is created alongside this one`}
+        >
+          {retranscribing ? (
+            <Loader2 className="h-4 w-4 animate-spin text-muted-foreground" />
+          ) : (
+            <AudioWaveform className="h-4 w-4 text-primary" />
+          )}
+          {retranscribing === 'fetching'
+            ? 'Downloading the video…'
+            : retranscribing === 'submitting'
+              ? 'Submitting for transcription…'
+              : row.local_audio_path
+                ? 'Re-transcribe from video'
+                : 'Fetch video & re-transcribe'}
+        </Button>
       )}
       {canCombineRetranscribe && (
         <Button

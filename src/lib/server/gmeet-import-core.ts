@@ -311,11 +311,16 @@ export async function executeGmeetImport(
   // conference record (or a meeting code to find one), the actuals capture
   // below discovers the transcript itself. This is what lets bulk import
   // fire without the client pre-resolving every row.
+  // A re-run from a quick import already holds its parsed native transcript
+  // (Meet Doc or Teams VTT) — 'both' needs no Google-side reference then.
+  const sourceHasNativeTranscript =
+    (sourceRow?.gmeet_context?.meetTranscript?.utterances?.length ?? 0) > 0;
   if (
     (mode === 'transcript' || mode === 'both') &&
     !transcriptDocId &&
     !body.conferenceRecordName &&
-    !event.meetingCode
+    !event.meetingCode &&
+    !sourceHasNativeTranscript
   ) {
     return out(400, { error: 'transcriptDocId or a conference reference is required for this mode' });
   }
@@ -430,6 +435,14 @@ export async function executeGmeetImport(
     transcriptDocId: effectiveDocId ?? undefined,
     recordingPending,
     actuals,
+    // Re-runs keep the source's provider identity (a Teams quick import
+    // re-transcribed from its MP4 is still a Teams meeting — the Graph ids
+    // are what later video re-fetches and the "Imported from Teams" label
+    // key off).
+    ...(sourceRow?.gmeet_context?.provider
+      ? { provider: sourceRow.gmeet_context.provider }
+      : {}),
+    ...(sourceRow?.gmeet_context?.teams ? { teams: sourceRow.gmeet_context.teams } : {}),
     ...(body.contextExtra ?? {}),
   };
 
