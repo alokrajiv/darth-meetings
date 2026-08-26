@@ -320,3 +320,43 @@ shipped in session 6 (c9ba3ae) and the cookbook lives at
 
 **Next session pickup points:** none — fully shipped; kept for the reasoning
 (CORS/same-site proof, kyloren precedent).
+
+## 8. Privacy leak: caller-scoping audit + fixes — 2026-08-24 → 26
+
+**File:** [8. privacy-leak-caller-scoping-audit-and-fixes.txt](8.%20privacy-leak-caller-scoping-audit-and-fixes.txt)
+
+Jacqueline's "Not imported" view showed every user's meetings (titles,
+organizers, times). Root cause: the unimported layer read the GLOBAL
+`gmeet_meeting_cache` with no caller predicate — by design since listing v2
+(7bf6943), made glaring by the 60-day Teams chat backfill. Fixed af3d364:
+`unimportedVisibleTo(caller)` (own calendar row ±12h, OR organizer, OR
+invitee on any user's cached row) + migration 030 index; A/B on prod: all 9
+users saw 132 occurrences → Jac 12, each verified hers. A full-surface route
+audit then found the same missing predicate in 8 more places incl. a CONTENT
+leak — `POST /api/teams/import` pulled full VTT+MP4 app-only from Graph with
+no involvement check, and `GET /api/series/:id` handed out the join URLs.
+Round 2 (416e84c): `callerInvolvedCodes`/`callerInvolvedInOccurrence` gate
+teams-import, gmeet/check, teams/check, teams/evidence, meet/evidence;
+`visibleSeriesIds` scopes the whole series surface (index 22 → Alok 12).
+Also: row-title CSS truncation fix (615cf0e); the "wrong meeting speakers"
+report was NOT a bug (played-back LP-Global audio inside the 1:1 + Alok's
+voice split into two clusters, one matched to Ivan Seow 0.87); archive tab
+counts already respect all filters; handoff brief written
+(`docs/handoff-2026-08-26-detail-remount-and-tab-counts.md`, 9986ff8).
+Memory `feedback_privacy_caller_scoping_gate.md` now holds the ABSOLUTE
+pre-ship check + open holes.
+
+**Next session pickup points:**
+1. `docs/handoff-2026-08-26-detail-remount-and-tab-counts.md` — (A) confirmed
+   stale-state bug on `/transcript/[id]` navigation (key-by-id remount +
+   stale-response guard), (B) design call on archive tab counts shown while a
+   calendar layer is active.
+2. Re-enroll Ivan Seow's voiceprint (matches Alok's voice at 0.87 — likely
+   contaminated enrollment).
+3. Deliberately-open privacy holes: labels rail `Series/<title>` entries,
+   `/api/events` SSE fan-out ids, unimported `series_count`; series
+   delete/merge need only visibility (no owner concept). Alok's own series
+   view is now scoped like everyone's — add an admin bypass if he needs the
+   org-wide dedup view.
+4. Everything is committed and deployed (af3d364, 416e84c, 615cf0e, 9986ff8);
+   migration 030 applied on prod. No loose ends in the tree.

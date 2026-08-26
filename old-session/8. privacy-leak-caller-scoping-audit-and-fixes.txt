@@ -1,0 +1,1664 @@
+ ▐▛███▛█   Claude Code v2.1.246
+▝▜██████▀  Fable 5 · Claude Max
+  ▝▝ ▝▝    ~/workspace/meeting-whisperer
+
+
+❯ wtf [Image #1] - thats jac seeing invites she is not part off - is            
+  it!!!!!!!!!!!!!!!!!!!!1                                                       
+  ⎿  [Image #1]
+
+  Thought for 9s (ctrl+o to expand)
+
+⏺ That would be a serious privacy leak — and the top suspect is the fresh commit
+  a670605 ("kill the quadratic correlated subqueries") touching exactly the
+  calendar-meetings queries. Let me check whether the per-user scoping got
+  dropped.
+
+  Thought for 19s, searched for 2 patterns, read 1 file, ran 1 shell command (ctrl+o to expand)
+
+⏺ (summarized)
+  The "Not imported" view reads the global gmeet_meeting_cache without verifying
+  the occurrence belongs to the caller's own calendar. I'll check the history 
+  to see if that scoping check existed before and was removed, or was never 
+  there.
+
+  Thought for 30s, searched for 1 pattern, read 1 file, ran 3 shell commands (ctrl+o to expand)
+
+⏺ (summarized)
+  Confirmed the issue isn't a regression — unimportedWhere never had a filter, 
+  even in the original v2 design. Now checking whether clicking "Import…" would 
+  actually pull content or fail at the Google step.
+
+  Thought for 28s, searched for 2 patterns, listed 1 directory, ran 1 shell command (ctrl+o to expand)
+
+⏺ Yes — she is, and I've traced exactly why. Here's the full picture:
+
+  What Jac is seeing
+
+  The "Not imported" view reads the global gmeet_meeting_cache — the org-wide
+  artifact cache that every connected user's poller writes into — with no check 
+  that the caller's own calendar contains the meeting. unimportedWhere() in
+  src/db-ops/calendar-event-cache.ts:412 filters only on "has artifacts" +
+  "nobody imported it" + mutes/dates. So any signed-in user sees every
+  unimported meeting from everyone's calendars: titles (pulled from any user's
+  gmeet_reminders row — the code comment even says "Any user's row works"),
+  organizer emails, times, durations, recording/transcript badges, and the new
+  Teams "held/recorded" chat verdicts. That's how Jac gets "alok <> swaralee -
+  lp" and everyone else's scrums on her screen.
+
+  Not a regression — and what changed to make it blow up now
+
+  - I diffed last night's perf commit (a670605) against the original: it
+    preserved semantics exactly. And the original unimportedWhere from listing
+    v2 (7bf6943, Aug 19) never had caller scoping either. The norec view is
+    strictly per-user; the unimported view was global from day one.
+  - What made it suddenly glaring: the Teams chat call-events work (e71f7a8,
+    yesterday) plus its 60-day chat backfill doubled the cache, and Friday's UX
+    commit put the layers dropdown front and center. The exposure existed for 5
+    days; the volume and visibility landed this weekend.
+
+  Severity boundary
+
+  Content is not leaking: I checked executeGmeetImport — the Import button uses
+  the clicker's own Google token (browser token, or their own server-minted one
+  on the deferred path), so Google's Drive/Docs ACLs gate the actual
+  transcript/recording. If Jac clicks Import on Alok's 1:1 she gets a Google
+  permission failure. What leaks is metadata — which, for titles like private
+  1:1s, is still a real privacy problem.
+
+  The fix I'd make
+
+  Scope unimportedWhere to occurrences the caller can evidence involvement in:
+  require an EXISTS against their own calendar_event_cache rows matching
+  (meeting_code, ±12h) — the exact join the cal display-lateral already does,
+  just promoted from optional enrichment to a hard predicate (falling back to an
+  attendee-email match on the cached attendees jsonb if you want
+  invitee-but-different-calendar coverage). Since the counts, day-bucket, and
+  rows queries all share unimportedWhere, one change fixes the tab count, the
+  listing, and pagination together. One edge to handle: Teams chat-derived rows
+  (teams-… codes) — those need to stay visible to the user whose chat sweep
+  produced them.
+
+  Say the word and I'll implement + deploy it now.
+
+✻ Baked for 1m 57s · done Monday 3:59 PM
+
+❯ do it and do a proper check nothign else liek this is happening -memory to    
+  harden this as absolute improtant check                                       
+
+  Thought for 12s (ctrl+o to expand)
+
+⏺ On it. First let me understand how Teams chat-derived cache rows are
+  attributed, and the exact schema, so the scoping predicate covers all row
+  origins correctly.
+
+  Thought for 44s, searched for 1 pattern, read 1 file, ran 2 shell commands (ctrl+o to expand)
+
+⏺ (summarized)
+  I've confirmed I can build invitee and organizer match arms using the 
+  attendees jsonb and organizer_email fields. Now I'll check migration 029's 
+  indexes and the filter SQL helper to keep the new predicate indexed.
+
+  Thought for 20s, read 2 files (ctrl+o to expand)
+
+⏺ (summarized)
+  I'll now implement the visibility rule for unimported rows: a caller sees one 
+  only if it's on their calendar, they're the organizer, or they're an invitee 
+  on any cached calendar row. This requires adding one new unscoped index to 
+  avoid reintroducing the seq-scan issue just fixed.
+
+⏺ Write(migrations/030_unimported_visibility.sql)
+  ⎿  Wrote 15 lines to migrations/030_unimported_visibility.sql
+      1 -- Unimported-view visibility scoping (2026-08-24, privacy fix): 
+      2 -- longer serves the whole global artifact cache — a caller must 
+        be involved
+        tee on any
+      4 -- user's cached calendar row). The invitee arm probes calendar_e
+      5 -- by (meeting_code, event_start range) WITHOUT a user_id, which 
+        the
+        in keeps it
+      7 -- off the per-candidate seq-scan path.
+      9 -- Additive + idempotent; safe to re-run.
+     … +10 lines (ctrl+o to expand)
+
+⏺ Now the predicate itself in calendar-event-cache.ts:
+
+⏺ Update(src/db-ops/calendar-event-cache.ts)
+  ⎿  Added 47 lines, removed 1 line
+      409    `;
+      410  }
+      411  
+      412 -function unimportedWhere(userId: string, opts: CalendarRangeOp
+          -ts): ReturnType<typeof sql> {                                 
+      412 +/**                                                           
+      413 + * PRIVACY GATE (2026-08-24): the unimported view reads the GL
+          +OBAL artifact                                                 
+      414 + * cache, which holds every connected user's meetings — withou
+          +t this                                                        
+      415 + * predicate any caller sees titles/organizers/times of meetin
+          +gs they were                                                  
+      416 + * never invited to. A row is visible only when the caller is 
+          +involved in                                                   
+      417 + * the occurrence:                                            
+      418 + *  1. their OWN calendar sweep captured it (code + ±12h — rid
+          +es the                                                        
+      419 + *     migration-029 user-scoped index), or                   
+      420 + *  2. the cache row says they organized it, or               
+      421 + *  3. they appear as an invitee on ANY user's cached calendar
+          + row for the                                                  
+      422 + *     occurrence (covers "invited, but own sweep hasn't seen 
+          +it" — e.g.                                                    
+      423 + *     history older than their first sweep; migration-030 uns
+          +coped index).                                                 
+      424 + * Teams rows ride the same arms: calendar sweeps stamp the id
+          +entical                                                       
+      425 + * canonical `teams-…` code on calendar_event_cache rows.     
+      426 + */                                                           
+      427 +function unimportedVisibleTo(caller: Caller): ReturnType<typeo
+          +f sql> {                                                      
+      428 +  const email = caller.email.toLowerCase();                   
+      429 +  return sql`(                                                
+      430 +    EXISTS (                                                  
+      431 +      SELECT 1 FROM ${sql(SCHEMA)}.calendar_event_cache ce    
+      432 +      WHERE ce.user_id = ${caller.userId}                     
+      433 +        AND ce.meeting_code = c.meeting_code                  
+      434 +        AND ce.event_start                                    
+      435 +              BETWEEN COALESCE(c.event_start, c.conf_start) - 
+          +${OCCURRENCE_WINDOW_S} * interval '1 second'                  
+      436 +                  AND COALESCE(c.event_start, c.conf_start) + 
+          +${OCCURRENCE_WINDOW_S} * interval '1 second'                  
+      437 +    )                                                         
+      438 +    OR lower(c.organizer_email) = ${email}                    
+      439 +    OR EXISTS (                                               
+      440 +      SELECT 1 FROM ${sql(SCHEMA)}.calendar_event_cache ce2   
+      441 +      WHERE ce2.meeting_code = c.meeting_code                 
+      442 +        AND ce2.event_start                                   
+      443 +              BETWEEN COALESCE(c.event_start, c.conf_start) - 
+          +${OCCURRENCE_WINDOW_S} * interval '1 second'                  
+      444 +                  AND COALESCE(c.event_start, c.conf_start) + 
+          +${OCCURRENCE_WINDOW_S} * interval '1 second'                  
+      445 +        AND (                                                 
+      446 +          lower(ce2.organizer_email) = ${email}               
+      447 +          OR EXISTS (                                         
+      448 +            SELECT 1 FROM jsonb_array_elements(COALESCE(ce2.at
+          +tendees, '[]'::jsonb)) a                                      
+      449 +            WHERE lower(a->>'email') = ${email}               
+      450 +          )                                                   
+      451 +        )                                                     
+      452 +    )                                                         
+      453 +  )`;                                                         
+      454 +}                                                             
+      455 +                                                              
+      456 +function unimportedWhere(caller: Caller, opts: CalendarRangeOp
+          +ts): ReturnType<typeof sql> {                                 
+      457 +  const userId = caller.userId;                               
+      458    // THE already-imported rule (db-ops/imported-occurrences): 
+           meeting code /
+      459    // Teams join URL pinned by the ±12h window, plus calendar e
+           ventIds —
+      460    // uploads and pasted transcripts link by eventId, not meeti
+           ng code (D9) —
+      461    // resolved through the caller's own calendar rows for the o
+           ccurrence.
+      462    return sql`
+      463      WHERE COALESCE(c.event_start, c.conf_start) IS NOT NULL
+      464 +      AND ${unimportedVisibleTo(caller)}                      
+      465        AND ${evidencePresent('c')}
+      466        AND ${importedOccurrenceAntiJoin({
+      467          meetingCode: sql`c.meeting_code`,
+
+  Thought for 18s, searched for 1 pattern, ran 2 shell commands (ctrl+o to expand)
+
+⏺ (summarized)
+  Typecheck passed. Now I'll audit the rest of the API surface for similar 
+  cross-user exposures while pulling up infra notes to test the new query 
+  against the real DB before deploying.
+
+⏺ Explore(Audit API routes for cross-user leaks)
+  ⎿  Backgrounded agent (↓ to manage · ctrl+o to expand)
+
+  Thought for 9s, read 1 file (ctrl+o to expand)
+
+⏺ While the audit runs, let me test the new predicate directly against the prod
+  DB through the tunnel — both for correctness (Jac's view should shrink to her
+  own meetings) and perf (EXPLAIN).
+
+  Thought for 8s, ran 4 shell commands (ctrl+o to expand)
+
+⏺ Jac is jacqueline.ng@trames.sg (256b02f9…). Now A/B the visibility predicate
+  against the live data:
+
+  Thought for 4s, made 1 scratchpad edit +42, ran 1 shell command (ctrl+o to expand)
+
+⏺ Every user went from seeing all 132 evidence-bearing occurrences to only their
+  own (Jac: 132 → 12). Spot-checking Jac's 12 to confirm each is genuinely
+  hers:
+
+  Thought for 12s, ran 1 shell command (ctrl+o to expand)
+
+⏺ All 12 verified — each is on her own calendar and she's a listed invitee. Now
+  apply migration 030 (additive index) and build:
+
+  Thought for 6s, ran 2 shell commands (ctrl+o to expand)
+
+⏺ Build passes. While the audit agent works, let me verify the actual endpoint
+  end-to-end locally (against the prod schema through the tunnel):
+
+  Thought for 17s, searched for 1 pattern, ran 3 shell commands (ctrl+o to expand)
+⏺ Endpoint works — as Alok I now get 46 unimported (all meetings he's invited
+  to; was ~132 = everyone's). Killing the local dev server (its pollers run
+  against prod):
+
+  Thought for 5s, ran 1 shell command (ctrl+o to expand)
+
+⏺ Quick perf check on the new predicate with the fresh index while the audit
+  finishes:
+
+  Thought for 11s, ran 1 shell command (ctrl+o to expand)
+
+⏺ (summarized)
+  Query now runs in 3.2ms with the new index. Since the leak is live in prod, 
+  I'm deploying this fix now rather than waiting for the full audit, first 
+  checking for any in-flight AI runs per the guarded-deploy recipe.
+
+  Ran 3 shell commands (ctrl+o to expand)
+
+⏺ Deployed. Now verifying against the real prod endpoint with the SSO cookie:
+
+  Thought for 7s, ran 2 shell commands (ctrl+o to expand)
+
+⏺ Prod is fixed and fast (~120ms, same as the perf-commit numbers). Committing:
+
+  Thought for 3s, committed af3d364, ran 3 shell commands (ctrl+o to expand)
+
+⏺ Fix is committed and live. Now writing the hardening memory while the audit
+  agent finishes:
+
+  Wrote 1 memory (ctrl+o to expand)
+
+⏺ Agent "Audit API routes for cross-user leaks" failed: Agent terminated early
+due to an API error: API Error: 400 This organization has been disabled.
+
+⏺ API Error: 400 This organization has been disabled.
+
+✻ Worked for 6m 50s · done Monday 4:34 PM
+
+❯ /login                                                                        
+  ⎿  Login successful
+
+❯ contineu pls - it got stuck                                                   
+
+  Thought for 4s (ctrl+o to expand)
+
+⏺ The audit agent died mid-run when the API session hiccuped (that's what got
+  stuck). Relaunching it now, and finishing the memory index entry.
+
+⏺ Explore(Audit API routes for cross-user leaks)
+  ⎿  Backgrounded agent (↓ to manage · ctrl+o to expand)
+
+  Thought for 12s, wrote 1 memory (ctrl+o to expand)
+
+⏺ Quick status while the full audit re-runs (the first pass died on an API
+  hiccup — relaunched, I'll report its findings when it lands):
+
+  The fix is already live and verified on prod:
+  - unimportedVisibleTo(caller) now gates every unimported-view query (counts,
+    day buckets, rows): a row is visible only if the caller's own calendar sweep
+    captured the occurrence, they're the organizer, or they're a listed invitee
+    on any user's cached calendar row (±12h window; Teams rows covered via the
+    canonical teams- code).
+  - A/B'd against prod data for all 9 connected users: everyone previously saw
+    all 132 occurrences; now Jac sees 12, and I spot-checked each of her 12 —
+    all provably hers. Alok sees 79 candidates (46 after the imported
+    anti-join).
+  - Migration 030 adds the index the invitee arm needs — predicate runs in ~3ms,
+    endpoints ~120ms warm (perf win from last night preserved).
+  - Deployed to the VM (no in-flight AI runs at restart), verified against the
+    live endpoint, committed as af3d364.
+  - Confirmed again: content was never exposed — imports always go through the
+    clicker's own Google token — this was a metadata leak (which for 1:1 titles
+    is still serious).
+
+  Memory hardened: wrote privacy-caller-scoping-gate as a feedback memory
+  flagged ABSOLUTE — every new listing/route/CLI verb must prove caller scoping
+  on every table it reads, "display-only metadata" is explicitly called out as a
+  non-defense, with the cross-user A/B test recipe that caught this. Indexed in
+  MEMORY.md at the top.
+
+  The systematic sweep of every other API route (gmeet/, teams/, meet/*, series,
+  labels, transcripts sub-resources, stats, shares) is running now — anything
+  else leaking gets the same treatment.
+
+✻ Baked for 30s · done Monday 4:37 PM
+
+⏺ Agent "Audit API routes for cross-user leaks" finished · 7m 24s
+
+  Thought for 1m 29s (ctrl+o to expand)
+
+⏺ The audit came back — and it found something worse than the original leak:
+  POST /api/teams/import lets any authenticated user pull the full transcript 
+  and recording content of any own-tenant Teams meeting given a join URL (it
+  uses app-only Graph with no involvement check), and join URLs are handed out
+  by GET /api/series/:id, which has no ACL. Plus the same missing-predicate bug
+  in 4 metadata endpoints and the whole series surface. Fixing them now, most
+  severe first.
+
+  Thought for 7s, searched for 1 pattern, ran 3 shell commands (ctrl+o to expand)
+
+⏺ Now I'll build the shared involvement predicate and apply it everywhere. First
+  the helper in calendar-event-cache.ts:
+
+⏺ Update(src/db-ops/calendar-event-cache.ts)
+  ⎿  Added 58 lines
+      180    return rows.length > 0;
+      181  }
+      182  
+      183 +/**                                                           
+      184 + * THE caller-involvement check (2026-08-24 privacy audit) — t
+          +he reusable                                                   
+      185 + * form of unimportedVisibleTo's calendar arms, for routes tha
+          +t resolve                                                     
+      186 + * global-cache rows / Graph artifacts from client-supplied me
+          +eting codes or                                                
+      187 + * join URLs. A caller is "involved" in an occurrence when the
+          +ir own sweep                                                  
+      188 + * captured it, or they are organizer/invitee on ANY user's ca
+          +ched calendar                                                 
+      189 + * row for it (code ±12h; instant null = any occurrence of the
+          + code).                                                       
+      190 + * Callers holding the cache row should additionally accept   
+      191 + * `lower(row.organizer_email) === caller.email` (the cache-on
+          +ly arm).                                                      
+      192 + * Returns the subset of input codes the caller is involved in
+          +.                                                             
+      193 + */                                                           
+      194 +export async function callerInvolvedCodes(                    
+      195 +  caller: { userId: string; email: string },                  
+      196 +  occs: Array<{ code: string; instant?: string | null }>      
+      197 +): Promise<Set<string>> {                                     
+      198 +  const email = caller.email.toLowerCase();                   
+      199 +  const batch = occs                                          
+      200 +    .filter((o) => typeof o.code === 'string' && o.code.length
+          + > 0)                                                         
+      201 +    .map((o) => ({                                            
+      202 +      code: o.code,                                           
+      203 +      instant: o.instant && !Number.isNaN(Date.parse(o.instant
+          +)) ? o.instant : null,                                        
+      204 +    }));                                                      
+      205 +  if (batch.length === 0) return new Set();                   
+      206 +  const rows = await sql<Array<{ code: string }>>`            
+      207 +    SELECT DISTINCT o.code                                    
+      208 +    FROM jsonb_to_recordset(${sql.json(batch as unknown as nev
+          +er)})                                                         
+      209 +         AS o(code text, instant timestamptz)                 
+      210 +    WHERE EXISTS (                                            
+      211 +      SELECT 1 FROM ${sql(SCHEMA)}.calendar_event_cache ce    
+      212 +      WHERE ce.meeting_code = o.code                          
+      213 +        AND (                                                 
+      214 +          o.instant IS NULL                                   
+      215 +          OR ce.event_start BETWEEN o.instant - ${OCCURRENCE_W
+          +INDOW_S} * interval '1 second'                                
+      216 +                                AND o.instant + ${OCCURRENCE_W
+          +INDOW_S} * interval '1 second'                                
+      217 +        )                                                     
+      218 +        AND (                                                 
+      219 +          ce.user_id = ${caller.userId}                       
+      220 +          OR lower(ce.organizer_email) = ${email}             
+      221 +          OR EXISTS (                                         
+      222 +            SELECT 1 FROM jsonb_array_elements(COALESCE(ce.att
+          +endees, '[]'::jsonb)) a                                       
+      223 +            WHERE lower(a->>'email') = ${email}               
+      224 +          )                                                   
+      225 +        )                                                     
+      226 +    )                                                         
+      227 +  `;                                                          
+      228 +  return new Set(rows.map((r) => r.code));                    
+      229 +}                                                             
+      230 +                                                              
+      231 +/** Single-occurrence form of callerInvolvedCodes. */         
+      232 +export async function callerInvolvedInOccurrence(             
+      233 +  caller: { userId: string; email: string },                  
+      234 +  code: string,                                               
+      235 +  instant?: string | null                                     
+      236 +): Promise<boolean> {                                         
+      237 +  const set = await callerInvolvedCodes(caller, [{ code, insta
+          +nt }]);                                                       
+      238 +  return set.has(code);                                       
+      239 +}                                                             
+      240 +                                                              
+      241  // -----------------------------------------------------------
+           ----------------
+      242  // Calendar-event mutes (migration 023) — per-user HIDE of cal
+           endar rows.
+      243  // Personal blocks ("my lunch", focus time) aren't real meetin
+           gs; a mute
+
+⏺ Now the critical one — the Teams import content gate:
+
+⏺ Update(src/lib/server/teams-import-core.ts)
+  ⎿  Added 14 lines
+      134      return out(503, { error: 'Microsoft Graph is not configure
+           d on this server.' });
+      135    }
+      136  
+      137 +  // PRIVACY GATE (2026-08-24): artifacts come app-only (tenan
+          +t-wide) from                                                  
+      138 +  // Graph — nothing downstream verifies per-user access, so t
+          +he involvement                                                
+      139 +  // check happens HERE or never. Without it any authenticated
+          + user with a                                                  
+      140 +  // join URL pulls the full transcript/recording of any own-t
+          +enant meeting.                                                
+      141 +  // Calendar evidence only — body.event is client-supplied an
+          +d untrusted.                                                  
+      142 +  const cacheCode = teamsCacheCode(info.joinWebUrl);          
+      143 +  const involved = await callerInvolvedInOccurrence(user, cach
+          +eCode, event.startTime ?? null);                              
+      144 +  if (!involved) {                                            
+      145 +    return out(403, {                                         
+      146 +      error:                                                  
+      147 +        "This meeting isn't on your calendar. Imports are limi
+          +ted to meetings you organize or are invited to — if you were i
+          +nvited, Sync your calendar and try again.",                   
+      148 +    });                                                       
+      149 +  }                                                           
+      150 +                                                              
+      151    const attendees: GmeetAttendee[] = Array.isArray(event.atten
+           dees)
+      152      ? event.attendees
+      153          .filter((a) => a && typeof a.email === 'string')
+
+  Ran 1 shell command (ctrl+o to expand)
+
+⏺ Update(src/lib/server/teams-import-core.ts)
+  ⎿  Added 2 lines, removed 1 line
+      21    resolveMeetingByJoinUrl,
+      22  } from '@/lib/server/ms-graph';
+      23  import { parseTeamsVtt } from '@/lib/server/teams-vtt';
+      24 -import { teamsSourceId } from '@/lib/server/teams-ids';        
+      24 +import { teamsSourceId, teamsCacheCode } from '@/lib/server/tea
+         +ms-ids';                                                       
+      25 +import { callerInvolvedInOccurrence } from '@/db-ops/calendar-e
+         +vent-cache';                                                   
+      26  import { ingestParsedUtterances } from '@/lib/server/ingest-par
+          sed';
+      27  import { saveAudioStreamToTemp, deleteAudioFile } from '@/lib/s
+          erver/audio-storage';
+      28  import { IngestError, ingestLocalAudio } from '@/lib/server/ing
+          est';
+
+  Thought for 6s, ran 1 shell command (ctrl+o to expand)
+
+⏺ Update(src/app/api/gmeet/check/route.ts)  ⎿  Added 1 line
+      2  import { withAuth } from '@/lib/auth/with-auth';
+      3  import { findImportedByMeetingCodes } from '@/db-ops/gmeet-sync'
+         ;
+      4  import { getMeetingCacheByMeetings } from '@/db-ops/gmeet-meetin
+         g-cache';
+      5 +import { callerInvolvedCodes } from '@/db-ops/calendar-event-cac
+        +he';                                                            
+      6  
+      7  export const runtime = 'nodejs';
+      8  
+
+⏺ Update(src/app/api/gmeet/check/route.ts)
+  ⎿  Added 9 lines, removed 1 line
+      42      }));
+      43    if (meetings.length === 0) return NextResponse.json({ importe
+          d: {}, meta: {} });
+      44  
+      45 -  const [rows, cacheRows] = await Promise.all([                
+      45 +  const [rows, cacheRows, involved] = await Promise.all([      
+      46      findImportedByMeetingCodes(meetings, {
+      47        userId: user.userId,
+      48        email: user.email,
+      49      }),
+      50      getMeetingCacheByMeetings(meetings).catch(() => meetings.ma
+          p(() => null)),
+      51 +    // PRIVACY GATE (2026-08-24): codes are client-supplied and
+         + the cache is                                                  
+      52 +    // global — without this, any authed user harvests conf tim
+         +es / Drive                                                     
+      53 +    // ids / speaker counts / owner emails for arbitrary meetin
+         +g codes.                                                       
+      54 +    callerInvolvedCodes(                                       
+      55 +      user,                                                    
+      56 +      meetings.map((m) => ({ code: m.code, instant: m.startTime
+         + }))                                                           
+      57 +    ).catch(() => new Set<string>()),                          
+      58    ]);
+      59 +  const email = user.email.toLowerCase();                      
+      60    const imported: Record<
+      61      string,
+      62      {
+
+⏺ Update(src/app/api/gmeet/check/route.ts)
+  ⎿  Added 8 lines, removed 3 lines
+       92    > = {};
+       93    meetings.forEach((m, i) => {
+       94      const key = legacy ? m.code : `${m.code}|${m.startTime ?? 
+           ''}`;
+       95 +    const c = cacheRows[i];                                   
+       96 +    // Involved = calendar evidence, or the cache row itself n
+          +ames the                                                      
+       97 +    // caller as organizer (the cache-only arm).              
+       98 +    const ok =                                                
+       99 +      involved.has(m.code) || (c?.organizer_email && c.organiz
+          +er_email.toLowerCase() === email);                            
+      100      const r = rows[i];
+      101      if (r) {
+      102        imported[key] = {
+      103          // Don't leak the transcript id unless the caller can 
+           actually open it.
+      104          assemblyaiId: r.accessible ? r.assemblyai_id : null,
+      105          title: r.accessible ? r.title : null,
+      101 -        ownerEmail: r.owner_email,                            
+      106 +        // "synced by X" only when the caller can open it or w
+          +as in the room.                                               
+      107 +        ownerEmail: r.accessible || ok ? r.owner_email : null,
+      108          accessible: r.accessible,
+      109          mine: r.mine,
+      110        };
+      111      }
+      106 -    const c = cacheRows[i];                                   
+      107 -    if (c) {                                                  
+      112 +    if (c && ok) {                                            
+      113        meta[key] = {
+      114          conferenceRecord: c.conference_record,
+      115          confStart: c.conf_start,
+
+  Thought for 11s, ran 1 shell command (ctrl+o to expand)
+
+⏺ Update(src/app/api/teams/check/route.ts)
+  ⎿  Added 1 line
+       4  import { teamsCacheCode } from '@/lib/server/teams-ids';
+       5  import { findImportedByTeamsMeetings } from '@/db-ops/teams-imp
+          ort';
+       6  import { getMeetingCacheByMeetings } from '@/db-ops/gmeet-meeti
+          ng-cache';
+       7 +import { callerInvolvedCodes } from '@/db-ops/calendar-event-ca
+         +che';                                                          
+       8  
+       9  export const runtime = 'nodejs';
+      10  
+
+⏺ Update(src/app/api/teams/check/route.ts)
+  ⎿  Added 18 lines, removed 7 lines
+      61      }
+      62    });
+      63  
+      64 -  const [imported, cacheRows] = await Promise.all([            
+      64 +  const [imported, cacheRows, involved] = await Promise.all([  
+      65      findImportedByTeamsMeetings(dedupeQueries, { userId: user.u
+          serId, email: user.email }).catch(
+      66        (err) => {
+      67          console.warn('[teams/check] dedupe lookup failed:', err
+          );
+     ...
+      69        }
+      70      ),
+      71      getMeetingCacheByMeetings(cacheQueries).catch(() => cacheQu
+          eries.map(() => null)),
+      72 +    // PRIVACY GATE (2026-08-24): URLs are client-supplied and 
+         +the cache is                                                   
+      73 +    // global — meta/chat/ownerEmail only for occurrences the c
+         +aller is in.                                                   
+      74 +    callerInvolvedCodes(                                       
+      75 +      { userId: user.userId, email: user.email },              
+      76 +      cacheQueries.map((q) => ({ code: q.code, instant: q.start
+         +Time }))                                                       
+      77 +    ).catch(() => new Set<string>()),                          
+      78    ]);
+      79 +  const callerEmail = user.email.toLowerCase();                
+      80  
+      81    const results = parsed.map((p, i) => {
+      82      if (!p) return null; // not a parseable Teams link
+      83      const external = !isOwnTenant(p);
+      84      const cacheAny = cacheRows[cacheIndex[i]!] ?? null;
+      85 +    const code = teamsCacheCode(p.joinWebUrl);                 
+      86 +    const ok =                                                 
+      87 +      involved.has(code) ||                                    
+      88 +      (cacheAny?.organizer_email != null && cacheAny.organizer_
+         +email.toLowerCase() === callerEmail);                          
+      89      if (external) {
+      90        return {
+      91          external: true as const,
+      92          tenantId: p.tenantId,
+      82 -        code: teamsCacheCode(p.joinWebUrl),                    
+      83 -        chat: cacheAny?.teams_chat ?? null,                    
+      93 +        code,                                                  
+      94 +        chat: ok ? (cacheAny?.teams_chat ?? null) : null,      
+      95        };
+      96      }
+      97      const qi = dedupeIndex[i]!;
+     ...
+      101        external: false as const,
+      102        /** `teams-<hash>` — the mute/reminder key the client ca
+           n't compute
+      103         * itself (server-side sha256 of the canonical URL). */
+       93 -      code: teamsCacheCode(p.joinWebUrl),                     
+      104 +      code,                                                   
+      105        imported: dupe
+      106          ? {
+       96 -            assemblyaiId: dupe.accessible ? dupe.assemblyai_id
+          - : null,                                                      
+      107 +            assemblyaiId: dupe.accessible ? dupe.assembly_id_n
+          +ever : null,                                                  
+      108              title: dupe.accessible ? dupe.title : null,
+       98 -            ownerEmail: dupe.owner_email,                     
+      109 +            ownerEmail: dupe.accessible || ok ? dupe.owner_ema
+          +il : null,                                                    
+      110              accessible: dupe.accessible,
+      111              mine: dupe.mine,
+      112            }
+      113          : null,
+      103 -      meta: cache                                             
+      114 +      meta: cache && ok                                       
+      115          ? {
+      116              hasTranscript: cache.transcript_parseable === true
+           ,
+      117              hasRecording: cache.ready_recording_count > 0,
+
+  Thought for 3s (ctrl+o to expand)
+
+⏺ I introduced a typo in that edit — fixing it and gating the remaining chat
+  field:
+
+⏺ Update(src/app/api/teams/check/route.ts)
+  ⎿  Added 1 line, removed 1 line
+      104        code,
+      105        imported: dupe
+      106          ? {
+      107 -            assemblyaiId: dupe.accessible ? dupe.assembly_id_n
+          -ever : null,                                                  
+      107 +            assemblyaiId: dupe.accessible ? dupe.assemblyai_id
+          + : null,                                                      
+      108              title: dupe.accessible ? dupe.title : null,
+      109              ownerEmail: dupe.accessible || ok ? dupe.owner_ema
+           il : null,
+      110              accessible: dupe.accessible,
+
+⏺ Update(src/app/api/teams/check/route.ts)
+  ⎿  Added 1 line, removed 1 line
+      123              confEnd: cache.conf_end,
+      124            }
+      125          : null,
+      126 -      chat: cache?.teams_chat ?? null,                        
+      126 +      chat: ok ? (cache?.teams_chat ?? null) : null,          
+      127      };
+      128    });
+      129  
+
+⏺ Now /api/teams/evidence:
+
+  Thought for 16s, ran 1 shell command (ctrl+o to expand)
+
+⏺ Update(src/app/api/teams/evidence/route.ts)
+  ⎿  Added 1 line, removed 1 line
+      12    persistCalendarEvents,
+      13    teamsUrlOf,
+      14  } from '@/lib/server/meeting-discovery';
+      15 -import { hasCalendarOccurrence } from '@/db-ops/calendar-event-
+         -cache';                                                        
+      15 +import { hasCalendarOccurrence, callerInvolvedInOccurrence } fr
+         +om '@/db-ops/calendar-event-cache';                            
+      16  import { findImportedByTeamsMeetings } from '@/db-ops/teams-imp
+          ort';
+      17  
+      18  export const runtime = 'nodejs';
+
+⏺ Update(src/app/api/teams/evidence/route.ts)
+  ⎿  Added 11 lines
+      148      // The verdict itself is still returned either way; update
+           s to an
+      149      // existing row are always allowed.
+      150      const extCode = teamsCacheCode(info.joinWebUrl);
+      151 +    // PRIVACY GATE (2026-08-24): the URL is client-supplied —
+          + verdicts                                                     
+      152 +    // (held / recorded) only for occurrences the caller is ac
+          +tually in.                                                    
+      153 +    const extInvolved = await callerInvolvedInOccurrence(user,
+          + extCode, startTime).catch(                                   
+      154 +      () => false                                             
+      155 +    );                                                        
+      156 +    if (!extInvolved) {                                       
+      157 +      return NextResponse.json(                               
+      158 +        { error: "This meeting isn't on your calendar — Sync y
+          +our calendar and try again." },                               
+      159 +        { status: 403 }                                       
+      160 +      );                                                      
+      161 +    }                                                         
+      162      const allowCreate = await hasCalendarOccurrence(user.userI
+           d, extCode, startTime).catch(
+      163        () => false
+      164      );
+
+⏺ Update(src/app/api/teams/evidence/route.ts)
+  ⎿  Added 12 lines
+      188    }
+      189  
+      190    const code = teamsCacheCode(info.joinWebUrl);
+      191 +  // PRIVACY GATE (2026-08-24): the identity inputs are client
+          +-supplied and                                                 
+      192 +  // the probe is app-only Graph + global-cache reads — refuse
+          + unless the                                                   
+      193 +  // caller is involved in the occurrence (own calendar row, o
+          +r organizer/                                                  
+      194 +  // invitee on any user's cached row; the eventId path just p
+          +ersisted the                                                  
+      195 +  // caller's own event, so it passes by construction).       
+      196 +  const involvedOk = await callerInvolvedInOccurrence(user, co
+          +de, startTime).catch(() => false);                            
+      197 +  if (!involvedOk) {                                          
+      198 +    return NextResponse.json(                                 
+      199 +      { error: "This meeting isn't on your calendar — Sync you
+          +r calendar and try again." },                                 
+      200 +      { status: 403 }                                         
+      201 +    );                                                        
+      202 +  }                                                           
+      203    // Teams chat verdict (held / recorded) rides along with the
+            artifact
+      204    // probe — cache-first, else one live lookup through the cal
+           ler's Darth
+      205    // Tasks Microsoft link; persisted on the same cache row (ra
+           w.teamsChat).
+
+  Thought for 4s (ctrl+o to expand)
+
+⏺ Now /api/meet/evidence — the cache-fallback leak:
+
+  Thought for 42s, searched for 1 pattern, ran 2 shell commands (ctrl+o to expand)
+
+⏺ Update(src/app/api/meet/evidence/route.ts)
+  ⎿  Added 4 lines, removed 1 line
+       3  import { getGoogleAccount } from '@/db-ops/google-accounts';
+       4  import { getServerAccessToken } from '@/lib/server/google-oauth
+          ';
+       5  import { getMeetingCacheByMeetings } from '@/db-ops/gmeet-meeti
+          ng-cache';
+       6 -import { getCalendarAttachmentsFor } from '@/db-ops/calendar-ev
+         -ent-cache';                                                    
+       6 +import {                                                       
+       7 +  getCalendarAttachmentsFor,                                   
+       8 +  callerInvolvedInOccurrence,                                  
+       9 +} from '@/db-ops/calendar-event-cache';                        
+      10  import { getDriveFileMeta } from '@/lib/server/gmeet';
+      11  import { classifyCalendarAttachments } from '@/lib/meeting-evid
+          ence';
+      12  import { cachedMetaOf, probeMeetingEvidence } from '@/lib/serve
+          r/meeting-discovery';
+
+⏺ Update(src/app/api/meet/evidence/route.ts)
+  ⎿  Added 11 lines, removed 3 lines
+      65      }).catch(() => null);
+      66      if (cached) attachments = cached;
+      67    }
+      68 +  // PRIVACY GATE (2026-08-24): the global cache row (another u
+         +ser's probe)                                                   
+      69 +  // folds into the verdict AND the response meta — only feed i
+         +t in when the                                                  
+      70 +  // caller is involved in the occurrence. An uninvolved caller
+         + still gets a                                                  
+      71 +  // pure own-token probe (Google's ACLs gate that), just never
+         + our cache.                                                    
+      72 +  const involvedOk = await callerInvolvedInOccurrence(user, mee
+         +tingCode, startTime).catch(                                    
+      73 +    () => false                                                
+      74 +  );                                                           
+      75    // Without a start there is no way to pick THE occurrence's r
+          ow — let the
+      76    // service key by code alone rather than borrowing another oc
+          currence's.
+      70 -  const [existing] = startTime                                 
+      71 -    ? await getMeetingCacheByMeetings([{ code: meetingCode, sta
+         -rtTime }]).catch(() => [null])                                 
+      72 -    : [null];                                                  
+      77 +  const [existing] =                                           
+      78 +    involvedOk && startTime                                    
+      79 +      ? await getMeetingCacheByMeetings([{ code: meetingCode, s
+         +tartTime }]).catch(() => [null])                               
+      80 +      : [null];                                                
+      81    const probe = await probeMeetingEvidence(minted.token, {
+      82      userId: user.userId,
+      83      meetingCode,
+
+⏺ Update(src/app/api/meet/evidence/route.ts)
+  ⎿  Added 3 lines, removed 1 line
+      89        iCalUID: body?.event?.iCalUID ?? null,
+      90        organizerEmail: body?.event?.organizerEmail ?? null,
+      91      },
+      92 -    existing: existing ?? undefined,                           
+      92 +    // Explicit null when uninvolved — undefined would make the
+         + service look                                                  
+      93 +    // the cache row up itself, re-opening the leak this gate c
+         +loses.                                                         
+      94 +    existing: existing ?? null,                                
+      95    });
+      96  
+      97    // Drive metadata for the first recording file — best-effort 
+          (the caller
+
+⏺ Update(src/app/api/meet/evidence/route.ts)
+  ⎿  Added 7 lines, removed 3 lines
+      115      }
+      116    }
+      117  
+      118 +  // Row-derived fields only when involved, or when the caller
+          +'s own token                                                  
+      119 +  // resolved the record (Google itself vouching they were a p
+          +articipant) —                                                 
+      120 +  // the write-back row can carry other users' cached captures
+          + either way.                                                  
+      121 +  const rowOk = involvedOk || probe.recordName != null;       
+      122    const out: EvidenceResponse = {
+      123      recordName: probe.recordName,
+      120 -    confStart: probe.row?.conf_start ?? null,                 
+      121 -    confEnd: probe.row?.conf_end ?? null,                     
+      124 +    confStart: rowOk ? (probe.row?.conf_start ?? null) : null,
+      125 +    confEnd: rowOk ? (probe.row?.conf_end ?? null) : null,    
+      126      recording: probe.recording,
+      127      transcript: probe.transcript,
+      128      verdict: probe.verdict,
+      129      attachments,
+      130      checkFailed: probe.checkFailed,
+      131      video,
+      128 -    meta: cachedMetaOf(probe.row),                            
+      132 +    meta: rowOk ? cachedMetaOf(probe.row) : null,             
+      133      checkedAt: new Date().toISOString(),
+      134    };
+      135    return NextResponse.json(out);
+
+  Thought for 4s, ran 1 shell command (ctrl+o to expand)
+
+⏺ Clean. Now the series surface — index, detail (with the join-URL-leaking
+  keys), occurrences, delete/merge:
+
+  Thought for 43s, ran 5 shell commands (ctrl+o to expand)
+
+⏺ Now the series scoping. Adding a visibility helper to db-ops/series.ts:
+
+  Ran 1 shell command (ctrl+o to expand)
+⏺ Update(src/db-ops/series.ts)
+  ⎿  Added 60 lines, removed 3 lines
+      13  
+      14  /**
+      15   * Recurring-call series: the curated first-class object behind
+           the
+      16 - * "recurring call" badge. Series are org-global (no per-user A
+         -CL — this is                                                   
+      17 - * an internal tool); per-transcript visibility is still enforc
+         -ed wherever                                                    
+      18 - * member transcript CONTENT is returned.                      
+      16 + * "recurring call" badge. Series rows are stored org-global (n
+         +o owner), but                                                  
+      17 + * as of 2026-08-24 every series API surface is scoped through 
+      18 + * visibleSeriesIds/seriesVisibleToCaller — a series title IS a
+         + meeting                                                       
+      19 + * title, and its keys carry live Teams join URLs, so serving t
+         +he whole                                                       
+      20 + * table was the same leak class as the unimported-view inciden
+         +t.                                                             
+      21   */
+      22  
+      23  const SCHEMA = SCHEMAS.MEETING_WHISPERER;
+      24  
+      25  /**
+      26 + * PRIVACY GATE (2026-08-24): series ids the caller may see — t
+         +hey hold an                                                    
+      27 + * accessible member transcript (own or shared), or their own c
+         +alendar sweep                                                  
+      28 + * evidences the series (a cached event matching the series' me
+         +eting-code /                                                   
+      29 + * recurring-base-id key: they attend the recurring call even i
+         +f nothing was                                                  
+      30 + * imported yet). Teams-only series with no accessible member s
+         +tay hidden                                                     
+      31 + * until an import lands — the join-URL keys hash differently o
+         +n the                                                          
+      32 + * calendar side, so there is no safe calendar arm for them.   
+      33 + */                                                            
+      34 +export async function visibleSeriesIds(caller: {               
+      35 +  userId: string;                                              
+      36 +  email: string;                                               
+      37 +}): Promise<Set<number>> {                                     
+      38 +  const email = caller.email.trim().toLowerCase();             
+      39 +  const rows = await sql<Array<{ id: number }>>`               
+      40 +    SELECT s.id                                                
+      41 +    FROM ${sql(SCHEMA)}.series s                               
+      42 +    WHERE EXISTS (                                             
+      43 +        SELECT 1 FROM ${sql(SCHEMA)}.series_members m          
+      44 +        JOIN ${sql(SCHEMA)}.transcripts t                      
+      45 +          ON t.id = m.transcript_id AND t.deleted_at IS NULL   
+      46 +        LEFT JOIN ${sql(SCHEMA)}.transcript_shares sh          
+      47 +          ON sh.transcript_id = t.id AND sh.shared_with_email =
+         + ${email}                                                      
+      48 +        WHERE m.series_id = s.id                               
+      49 +          AND (t.user_id = ${caller.userId} OR sh.id IS NOT NUL
+         +L)                                                             
+      50 +      )                                                        
+      51 +      OR EXISTS (                                              
+      52 +        SELECT 1 FROM ${sql(SCHEMA)}.series_keys k             
+      53 +        WHERE k.series_id = s.id                               
+      54 +          AND (                                                
+      55 +            (k.kind = 'meeting-code' AND EXISTS (              
+      56 +              SELECT 1 FROM ${sql(SCHEMA)}.calendar_event_cache
+         + ce                                                            
+      57 +              WHERE ce.user_id = ${caller.userId} AND ce.meetin
+         +g_code = k.value                                               
+      58 +            ))                                                 
+      59 +            OR (k.kind = 'recurring-base-id' AND EXISTS (      
+      60 +              SELECT 1 FROM ${sql(SCHEMA)}.calendar_event_cache
+         + ce                                                            
+      61 +              WHERE ce.user_id = ${caller.userId}              
+      62 +                AND ce.recurring_event_id IS NOT NULL          
+      63 +                AND regexp_replace(ce.recurring_event_id, '_R\\
+         +d{8}T\\d{6}Z?$', '') = k.value                                 
+      64 +            ))                                                 
+      65 +          )                                                    
+      66 +      )                                                        
+      67 +  `;                                                           
+      68 +  return new Set(rows.map((r) => r.id));                       
+      69 +}                                                              
+      70 +                                                               
+      71 +/** Single-series form of visibleSeriesIds — the detail/mutatio
+         +n gate. */                                                     
+      72 +export async function seriesVisibleToCaller(                   
+      73 +  id: number,                                                  
+      74 +  caller: { userId: string; email: string }                    
+      75 +): Promise<boolean> {                                          
+      76 +  const vis = await visibleSeriesIds(caller);                  
+      77 +  return vis.has(id);                                          
+      78 +}                                                              
+      79 +                                                               
+      80 +/**                                                            
+      81   * Per-series auto-import config (series.auto_import jsonb). Th
+          e sweep runs
+      82   * as the enabler (their Google connection / identity), only fi
+          res on
+      83   * occurrences that START after `since`, and never re-fires an 
+          occurrence
+
+  Thought for 3s (ctrl+o to expand)
+
+⏺ Update(src/db-ops/series.ts)
+  ⎿  Added 7 lines, removed 1 line
+      641  ): Promise<SeriesMemberEntry[]> {
+      642    const normEmail = caller.email.trim().toLowerCase();
+      643    return sql<SeriesMemberEntry[]>`
+      644 -    SELECT m.transcript_id, t.assemblyai_id, t.title, t.status
+          -,                                                             
+      644 +    -- Title only for accessible members — the row-shape below
+          + promises                                                     
+      645 +    -- "date + owner only, never content" for the rest, so enf
+          +orce it in the                                                
+      646 +    -- contract, not just in what the component chooses to pai
+          +nt.                                                           
+      647 +    SELECT m.transcript_id, t.assemblyai_id,                  
+      648 +           CASE WHEN t.user_id = ${caller.userId} OR sh.id IS 
+          +NOT NULL                                                      
+      649 +                THEN t.title END AS title,                    
+      650 +           t.status,                                          
+      651             t.recorded_at::text AS recorded_at, t.created_at::t
+           ext AS created_at,
+      652             t.duration, m.how,
+      653             (t.user_id = ${caller.userId} OR sh.id IS NOT NULL)
+            AS accessible,
+
+⏺ Now the series routes. Index first:
+
+⏺ Update(src/app/api/series/route.ts)
+  ⎿  Added 1 line
+       8    findDuplicateSeries,
+       9    listSeries,
+      10    seriesTotals,
+      11 +  visibleSeriesIds,                                            
+      12  } from '@/db-ops/series';
+      13  import { keysFromContext } from '@/lib/series-keys';
+      14  import { publishEvent } from '@/lib/server/event-bus';
+
+⏺ Update(src/app/api/series/route.ts)
+  ⎿  Added 18 lines, removed 11 lines
+      34   * Teams meeting / name — the merge prompt), and the membership
+          s/unattached
+      35   * totals for the index footer.
+      36   */
+      37 -export const GET = withAuth(async () => {                      
+      38 -  const [series, totals, dupes] = await Promise.all([          
+      37 +export const GET = withAuth(async ({ user }) => {              
+      38 +  const [series, totals, dupes, visible] = await Promise.all([ 
+      39      listSeries(),
+      40      seriesTotals(),
+      41      findDuplicateSeries(),
+      42 +    // PRIVACY GATE (2026-08-24): series titles are meeting tit
+         +les — only                                                     
+      43 +    // series the caller attends or holds a member of (db-ops/s
+         +eries).                                                        
+      44 +    visibleSeriesIds({ userId: user.userId, email: user.email }
+         +),                                                             
+      45    ]);
+      46    return NextResponse.json({
+      44 -    series: series.map((s) => {                                
+      45 -      const dup_with = dupes.get(s.id) ?? [];                  
+      46 -      return {                                                 
+      47 -        ...s,                                                  
+      48 -        cadence: cadenceOf(s.median_gap_secs),                 
+      49 -        dup: dup_with.length > 0,                              
+      50 -        dup_with,                                              
+      51 -      };                                                       
+      52 -    }),                                                        
+      47 +    series: series                                             
+      48 +      .filter((s) => visible.has(s.id))                        
+      49 +      .map((s) => {                                            
+      50 +        // Dup siblings are candidates for the caller's merge p
+         +rompt — an                                                     
+      51 +        // invisible sibling's title must not ride along.      
+      52 +        const dup_with = (dupes.get(s.id) ?? []).filter((d) => 
+         +visible.has(d.id));                                            
+      53 +        return {                                               
+      54 +          ...s,                                                
+      55 +          cadence: cadenceOf(s.median_gap_secs),               
+      56 +          dup: dup_with.length > 0,                            
+      57 +          dup_with,                                            
+      58 +        };                                                     
+      59 +      }),                                                      
+      60      totals,
+      61    });
+      62  });
+
+⏺ Now the detail route (GET/PATCH/DELETE):
+
+⏺ Update(src/app/api/series/[id]/route.ts)
+  ⎿  Added 2 lines
+       9    listSuggestedMembers,
+      10    setSeriesAutoImport,
+      11    updateSeries,
+      12 +  visibleSeriesIds,                                            
+      13 +  seriesVisibleToCaller,                                       
+      14    type SeriesAutoImportCfg,
+      15  } from '@/db-ops/series';
+      16  
+
+⏺ Update(src/app/api/series/[id]/route.ts)
+  ⎿  Added 13 lines, removed 2 lines
+      29  export const GET = withAuth(async ({ user }, { params }) => {
+      30    const id = parseId((await params).id);
+      31    if (!id) return NextResponse.json({ error: 'Bad id' }, { stat
+          us: 400 });
+      32 +  const caller = { userId: user.userId, email: user.email };   
+      33 +  // PRIVACY GATE (2026-08-24): a series the caller isn't in mu
+         +st not exist                                                   
+      34 +  // for them — its title is a meeting title and its keys carry
+         + live Teams                                                    
+      35 +  // join URLs (the exact input /api/teams/import accepts).    
+      36 +  const visible = await visibleSeriesIds(caller);              
+      37 +  if (!visible.has(id)) return NextResponse.json({ error: 'Not 
+         +found' }, { status: 404 });                                    
+      38    const series = await getSeries(id);
+      39    if (!series) return NextResponse.json({ error: 'Not found' },
+           { status: 404 });
+      40  
+      35 -  const caller = { userId: user.userId, email: user.email };   
+      41    const [keys, members, suggestions, dupMap] = await Promise.al
+          l([
+      42      listKeys(id),
+      43      listMembers(id, caller),
+      44      listSuggestedMembers(id, caller),
+      45      findDuplicateSeries(),
+      46    ]);
+      42 -  return NextResponse.json({ series, keys, members, suggestions
+         -, dupes: dupMap.get(id) ?? [] });                              
+      47 +  return NextResponse.json({                                   
+      48 +    series,                                                    
+      49 +    keys,                                                      
+      50 +    members,                                                   
+      51 +    suggestions,                                               
+      52 +    dupes: (dupMap.get(id) ?? []).filter((d) => visible.has(d.i
+         +d)),                                                           
+      53 +  });                                                          
+      54  });
+      55  
+      56  const AUTO_MODES = ['transcript', 'video', 'both'] as const;
+
+⏺ Update(src/app/api/series/[id]/route.ts)
+  ⎿  Added 3 lines
+      60  export const PATCH = withAuth(async ({ user, request }, { param
+          s }) => {
+      61    const id = parseId((await params).id);
+      62    if (!id) return NextResponse.json({ error: 'Bad id' }, { stat
+          us: 400 });
+      63 +  if (!(await seriesVisibleToCaller(id, { userId: user.userId, 
+         +email: user.email }))) {                                       
+      64 +    return NextResponse.json({ error: 'Not found' }, { status: 
+         +404 });                                                        
+      65 +  }                                                            
+      66    const series = await getSeries(id);
+      67    if (!series) return NextResponse.json({ error: 'Not found' },
+           { status: 404 });
+      68  
+
+⏺ Update(src/app/api/series/[id]/route.ts)
+  ⎿  Added 4 lines, removed 1 line
+      120  
+      121  /** DELETE /api/series/:id — remove the series (members detach
+           , transcripts
+      122   * are untouched). */
+      123 -export const DELETE = withAuth(async (_ctx, { params }) => {  
+      123 +export const DELETE = withAuth(async ({ user }, { params }) =>
+          + {                                                            
+      124    const id = parseId((await params).id);
+      125    if (!id) return NextResponse.json({ error: 'Bad id' }, { sta
+           tus: 400 });
+      126 +  if (!(await seriesVisibleToCaller(id, { userId: user.userId,
+          + email: user.email }))) {                                     
+      127 +    return NextResponse.json({ error: 'Not found' }, { status:
+          + 404 });                                                      
+      128 +  }                                                           
+      129    await deleteSeries(id);
+      130    return NextResponse.json({ ok: true });
+      131  });
+
+⏺ Now merge, occurrences, occurrence-counts, and members routes:
+
+⏺ Update(src/app/api/series/[id]/merge/route.ts)
+  ⎿  Added 1 line, removed 1 line
+      1  import { NextResponse } from 'next/server';
+      2  import { withAuth } from '@/lib/auth/with-auth';
+      3 -import { getSeries, mergeSeries } from '@/db-ops/series';       
+      3 +import { getSeries, mergeSeries, visibleSeriesIds } from '@/db-o
+        +ps/series';                                                     
+      4  import { retroAttachSweep } from '@/lib/server/series-attach';
+      5  
+      6  export const runtime = 'nodejs';
+
+⏺ Update(src/app/api/series/[id]/merge/route.ts)
+  ⎿  Added 6 lines
+      32      return NextResponse.json({ error: 'Cannot merge a series in
+          to itself' }, { status: 400 });
+      33    }
+      34  
+      35 +  // PRIVACY GATE (2026-08-24): both sides must be caller-visib
+         +le — merging                                                   
+      36 +  // pulls another series' members/keys under a series the call
+         +er can read.                                                   
+      37 +  const visible = await visibleSeriesIds({ userId: user.userId,
+         + email: user.email });                                         
+      38 +  if (!visible.has(intoId) || !visible.has(fromId)) {          
+      39 +    return NextResponse.json({ error: 'Series not found' }, { s
+         +tatus: 404 });                                                 
+      40 +  }                                                            
+      41    const [into, from] = await Promise.all([getSeries(intoId), ge
+          tSeries(fromId)]);
+      42    if (!into || !from) {
+      43      return NextResponse.json({ error: 'Series not found' }, { s
+          tatus: 404 });
+
+  Thought for 14s, ran 4 shell commands (ctrl+o to expand)
+
+⏺ Update(src/app/api/series/[id]/occurrences/route.ts)
+  ⎿  Added 1 line
+      1  import { NextResponse } from 'next/server';
+      2  import { withAuth } from '@/lib/auth/with-auth';
+      3  import { sweepSeriesOccurrences } from '@/lib/server/series-occu
+         rrences';
+      4 +import { seriesVisibleToCaller } from '@/db-ops/series';        
+      5  
+      6  export const runtime = 'nodejs';
+      7  // Sweeping calendar pages + Graph artifact lists can take a mom
+         ent.
+
+⏺ Update(src/app/api/series/[id]/occurrences/route.ts)
+  ⎿  Added 5 lines
+      18    if (!Number.isInteger(id) || id <= 0) {
+      19      return NextResponse.json({ error: 'Bad id' }, { status: 400
+           });
+      20    }
+      21 +  // PRIVACY GATE (2026-08-24): the sweep reads other users' tr
+         +anscript                                                       
+      22 +  // titles, app-only Graph artifacts and global-cache rows for
+         + the series.                                                   
+      23 +  if (!(await seriesVisibleToCaller(id, { userId: user.userId, 
+         +email: user.email }))) {                                       
+      24 +    return NextResponse.json({ error: 'Not found' }, { status: 
+         +404 });                                                        
+      25 +  }                                                            
+      26    const forceRefresh = new URL(request.url).searchParams.get('r
+          efresh') === '1';
+      27    const result = await sweepSeriesOccurrences(
+      28      id,
+
+⏺ Update(src/app/api/series/occurrence-counts/route.ts)
+  ⎿  Added 1 line
+      1  import { NextResponse } from 'next/server';
+      2  import { withAuth } from '@/lib/auth/with-auth';
+      3  import { sweepSeriesOccurrences, type SeriesOccurrencesResult } 
+         from '@/lib/server/series-occurrences';
+      4 +import { visibleSeriesIds } from '@/db-ops/series';             
+      5  
+      6  export const runtime = 'nodejs';
+      7  export const maxDuration = 120;
+
+⏺ Update(src/app/api/series/occurrence-counts/route.ts)
+  ⎿  Added 5 lines, removed 1 line
+      23      return NextResponse.json({ error: `at most ${MAX_IDS} ids p
+          er call` }, { status: 400 });
+      24    }
+      25    const caller = { userId: user.userId, email: user.email };
+      26 +  // PRIVACY GATE (2026-08-24): invisible series report null, s
+         +ame as                                                         
+      27 +  // missing ones — no existence oracle.                       
+      28 +  const visible = await visibleSeriesIds(caller);              
+      29    const results = await Promise.all(
+      30      ids.map((id) =>
+      28 -      sweepSeriesOccurrences(id, caller).catch((err: unknown) =
+         -> {                                                            
+      31 +      visible.has(id)                                          
+      32 +        ? sweepSeriesOccurrences(id, caller).catch((err: unknow
+         +n) => {                                                        
+      33          console.warn(`[series] occurrence-counts sweep failed f
+          or ${id}:`, err);
+      34          return 'error' as const;
+      35        })
+
+⏺ Update(src/app/api/series/occurrence-counts/route.ts)
+  ⎿  Added 4 lines, removed 3 lines
+      30      ids.map((id) =>
+      31        visible.has(id)
+      32          ? sweepSeriesOccurrences(id, caller).catch((err: unknow
+          n) => {
+      33 -        console.warn(`[series] occurrence-counts sweep failed f
+         -or ${id}:`, err);                                              
+      34 -        return 'error' as const;                               
+      35 -      })                                                       
+      33 +            console.warn(`[series] occurrence-counts sweep fail
+         +ed for ${id}:`, err);                                          
+      34 +            return 'error' as const;                           
+      35 +          })                                                   
+      36 +        : Promise.resolve(null)                                
+      37      )
+      38    );
+      39    const counts: Record<
+
+  Thought for 4s, ran 4 shell commands (ctrl+o to expand)
+
+⏺ Update(src/lib/server/series-occurrences.ts)
+  ⎿  Added 1 line, removed 1 line
+      410        key: `imp-${c.assemblyai_id}`,
+      411        startIso,
+      412        endIso: null,
+      413 -      title: c.title,                                         
+      413 +      title: c.accessible ? c.title : null,                   
+      414        source: 'imported',
+      415        upcoming: false,
+      416        meetingCode: c.meeting_code,
+
+  Thought for 8s, searched for 1 pattern, ran 1 shell command (ctrl+o to expand)
+
+⏺ All green. Verifying the series visibility predicate against prod data before
+  deploying:
+  Thought for 13s, ran 1 shell command (ctrl+o to expand)
+
+⏺ Everyone previously saw all 22 series; now scoped correctly (Alok 12, Jac 10).
+  Building and deploying:
+
+  Ran 1 shell command (ctrl+o to expand)
+
+❯ [Image #2] what just happened here - the speakers and when i click it and     
+  play the speaker - naother audio is played - not this - u can see the guess   
+  names also guessed other ppl - this is a very diff meeting from gogle cal     
+  ⎿  [Image #2]
+
+  Thought for 22s (ctrl+o to expand)
+
+⏺ Got it — deploying the privacy fixes that are mid-flight, then digging into
+  that cross-wired transcript immediately.
+
+  Ran 3 shell commands (ctrl+o to expand)
+
+❯ is this an fe bug - where last loaded in browser remains after leaving page   
+
+  Thought for 41s (ctrl+o to expand)
+
+⏺ Row 461 is real server-side data — but let me check both halves: whether the
+  audio file on disk is the right meeting, and whether the FE player is serving
+  stale audio. First the facts:
+
+  Thought for 39s, ran 1 shell command (ctrl+o to expand)
+
+⏺ Background command "Deploy privacy fixes to VM" completed (exit code 0)
+
+⏺ (summarized)
+  The deploy confirms row 461 correctly has the Alok+Swaralee 1:1 meeting 
+  attached, but row 460's earlier import ("LP-Global<>Trames Weekly Catch Up") 
+  looks suspicious. I'll verify that hypothesis before concluding.
+
+  Thought for 28s, ran 6 shell commands (ctrl+o to expand)
+
+⏺ (summarized)
+  Speaker "D" is clearly one of the two real participants, not a playback 
+  artifact. I'll check Google's sidecar transcript, which has real names, to 
+  confirm who actually spoke D's lines.
+
+  Thought for 21s, ran 1 shell command (ctrl+o to expand)
+
+⏺ (summarized)
+  Confirmed Speaker D's lines actually belong to Alok — diarization just split 
+  his voice into two clusters, with two smaller clusters being noise 
+  misattributed to other names. Now checking the user's stale-player theory for 
+  the "wrong audio on click" issue.
+
+  Thought for 22s, searched for 4 patterns (ctrl+o to expand)
+
+⏺ (summarized)
+  The transcript mystery is resolved—it wasn't an FE bug or cross-wired upload. 
+  Now finishing deploy verification of the privacy fixes by finding test targets
+  not involving Alok, to confirm the gates hold on prod.
+
+  Thought for 9s, ran 3 shell commands (ctrl+o to expand)
+
+⏺ Now the E2E gate tests against live prod, as Alok:
+
+  Thought for 6s, ran 1 shell command (ctrl+o to expand)
+
+⏺ All gates hold. Quick sanity on the calendar views post-redeploy, then commit:
+
+  Committed 416e84c, ran 3 shell commands (ctrl+o to expand)
+
+❯ [Image #3] Screenshot 2026-08-24 at 5.02.16 PM.png was the time - i asked her 
+  aagin - btw                                                                   
+  ⎿  [Image #3]
+
+  Thought for 41s (ctrl+o to expand)
+
+⏺ (summarized)
+  Confirmed the fix works: Jacqueline's remaining rows are legitimate (she's an 
+  invitee on the "Preet Scrum" meetings, unlike Alok), and she now sees only her
+  own meetings instead of all ~132 org-wide ones. I'll update the memory with 
+  these round-2 findings and close out.
+
+  Wrote 2 memories (ctrl+o to expand)
+
+⏺ All done — everything is deployed, verified on prod, and committed (af3d364 +
+  416e84c). Here's the full picture across the three threads:
+
+  1. Jac's leak — fixed and confirmed by her own screenshot
+
+  Her 5:02 PM view is the fix working: she now sees only Preet Scrum ×2, and I
+  verified in the DB she's a listed invitee on both. Every user went from seeing
+  all ~132 org-wide meetings to only their own (Jac 12 candidates, Alok 79).
+  "Shared 81" is by-design auto-shares, each ACL-checked.
+
+  2. The audit found something worse — also fixed and deployed
+
+  The route sweep turned up the same missing caller check in 8 more places, one
+  of them critical:
+
+  - POST /api/teams/import was a full content leak: artifacts come app-only
+    (tenant-wide) from Graph with zero per-user verification — any authed user
+    with a join URL could ingest the complete transcript + recording of any
+    own-tenant Teams meeting. And GET /api/series/:id was handing out those join
+    URLs with no ACL. That chain is now closed: imports require the caller to
+    be organizer/invitee on the occurrence (calendar-evidence, never the
+    client-supplied body).
+  - gmeet/check, teams/check, teams/evidence, meet/evidence returned
+    global-cache metadata (speakers, conf times, chat verdicts, owner emails)
+    for arbitrary client-supplied codes/URLs — all now gated through a shared
+    callerInvolvedCodes predicate.
+  - The entire series surface (index, detail, occurrences, counts,
+    edit/delete/merge) was org-global — every series title is a meeting title.
+    Now scoped via visibleSeriesIds: everyone sees only series they hold a
+    member of or attend per their calendar (all 9 users previously saw 22; e.g.
+    you 12, Jac 10). Heads-up: this scopes you too — if you need the org-wide
+    view for dupe merging, ask me for an admin bypass.
+
+  E2E-verified on prod as you: invisible series 404, uninvolved code returns
+  empty, your own meetings unchanged, calendar views still ~90ms. Left open
+  deliberately (low severity, recorded in memory): the labels rail's
+  Series/<title> entries, the SSE activity feed's ids, and the series_count
+  field.
+
+  3. The "wrong audio" on alok <> swaralee — not a bug in the data, and not an 
+  FE bug
+
+  The row is correct: Google's own Meet record on it lists exactly you +
+  Swaralee, and the uploaded file's duration matches the conference to the
+  second. What happened is diarization over-split + voiceprint misattribution:
+  acoustic diarization split your voice into two clusters — I cross-referenced
+  Speaker D's lines against Google's named transcript and they're you ("we are a
+  data intermediary…" @6m = Alok Rajiv per Google) — and the voiceprint sidecar
+  matched that second cluster to Ivan Seow at 87%. Speakers A/E (Mandy 59%,
+  Nicolas 76%) are tiny noise clusters, 17 lines total. So the samples you
+  played were from this meeting — just labeled as other people, which made it
+  read as a different call. Fix is just the review dialog: merge D into
+  yourself, dismiss A/E. The real worry is Ivan's voiceprint matching your voice
+  at 0.87 — his enrollment may be contaminated with your speech; worth
+  re-enrolling him before the next confidence-gated auto-review fires.
+
+  Memory is hardened: the caller-scoping gate is written up as an absolute
+  pre-ship check with the reusable predicates, the A/B test recipe that caught
+  it, and the open-holes list.
+
+✻ Churned for 1h 1m 24s · done Monday 5:38 PM
+
+※ recap: Locked down the privacy leaks: Jac's cross-user meeting visibility plus a worse Teams-import content hole and unscoped series routes, all fixed, deployed, and verified on prod. Next: decide on the follow-ups (labels rail, admin series bypass, Ivan's voiceprint re-enrollment). (disable recaps in /config)
+
+❯ no i heard mandy in audio - btw - is is possible i play an audio and then     
+  move to a new chat that is being imported and thtn older one is still sgtuck  
+  in state or somethign                                                         
+
+  Thought for 23s (ctrl+o to expand)
+
+⏺ Two separate things to check: whether Mandy's voice is genuinely in that audio
+  (playback-during-meeting), and the stale-state navigation bug you're
+  describing. Let me verify both.
+
+  Thought for 11s, ran 1 shell command (ctrl+o to expand)
+
+⏺ (summarized)
+  Confirmed: Mandy's real voice is genuinely in the audio because a chunk of 
+  another call was played back during your screen-share and captured by the Meet
+  recording, not part of your 1:1 dialogue. I'll now check which call that 
+  segment came from.
+
+  Thought for 13s, ran 2 shell commands (ctrl+o to expand)
+
+⏺ (summarized)
+  Confirmed those terms are from the LP-Global calls, and Speaker D is still 
+  you—Google mislabels it as Alok Rajiv, so the Ivan 87% match is a voiceprint 
+  misfire needing re-enrollment. Now checking how the detail page handles 
+  switching transcripts mid-play.
+
+  Thought for 1m 14s, searched for 1 pattern, ran 2 shell commands (ctrl+o to expand)
+
+⏺ Yes — your instinct is right: that exact failure mode exists in the code. I've
+  confirmed the mechanism, and it's three stacked issues in
+  src/app/transcript/[id]/page.tsx:
+
+  Why stale state is possible when you navigate A → B:
+
+  1. The page component never remounts between transcripts. Navigating
+     /transcript/A → /transcript/B is the same route segment in the Next.js app
+     router, so the component instance survives with all ~30 pieces of state —
+     row keeps holding A's data (title, speakers, audio src) until the fetch for
+     B resolves. If B is mid-import, that window is when you're looking at B's
+     URL with A's player still loaded and playing.
+  2. The audio player is keyed by video-part only, not transcript
+     (key={activePart} at page.tsx:2571) — so on nav the same <audio> element is
+     reused and just has its src swapped whenever the row finally updates.
+  3. The real kicker — a stale-reload race with no guard: live collaborator
+     events schedule a debounced loadAll({silent:true}) on a 1-second timer
+     (page.tsx:491). That timer is never cancelled when the transcript id
+     changes, and loadAll has no "is this response still for the current id"
+     check. So: an event for A arrives, you click through to B, one second later
+     the old timer fires the old loadAll closure and writes A's row back into 
+     state on B's page. Since B is still importing, nothing corrects it until B
+     emits its own event or you refresh. Play a speaker sample in that state and
+     you hear A's audio under B's URL.
+
+  So both things you observed yesterday were real but different: the Mandy voice
+  is genuinely in the 1:1 recording (played-back LP-Global audio — I matched
+  Speaker A's words to the LP-Global calls' "Helsinki/TAOT/name account"
+  content), and this stale-navigation bug can independently show you the wrong
+  meeting's page state, which is probably what made it feel like a totally
+  different meeting.
+
+  The fix is small and surgical: wrap the page body in an inner component
+  rendered with key={transcriptId} — that force-remounts on every transcript
+  change (all state resets, player unmounts, audio stops instantly), and it
+  neuters the stale-timer race because the old instance's setRow becomes a
+  no-op. Plus a one-line stale-response guard in loadAll for good hygiene. Want
+  me to ship it?
+✻ Baked for 2m 31s · done Tuesday 1:14 PM
+
+※ recap: Fixing meeting-whisperer privacy leaks: both rounds (listing, Teams import, checks, series) are deployed, verified, and committed. Next up, pending your go-ahead: fix the transcript-page stale-state bug by remounting on id change so old audio can't linger. (disable recaps in /config)
+
+❯ [Image #4] she says names missing and that 121 was older count                
+  ⎿  [Image #4]
+
+  Thought for 28s (ctrl+o to expand)
+
+⏺ Two things in that screenshot, and the second one worries me more than the
+  first. Let me check the Shared-tab query — both you (Shared 81) and Jac
+  (Shared 81) show the identical shared count, which is suspicious for a
+  per-user scope.
+
+  Thought for 4s, searched for 1 pattern, listed 1 directory, ran 1 shell command (ctrl+o to expand)
+
+⏺ The listing SQL is properly caller-scoped (shared_with_email = caller on every
+  arm), so 81 might be a coincidence. Verifying with real numbers:
+
+  Thought for 33s, ran 2 shell commands (ctrl+o to expand)
+
+⏺ (summarized)
+  The title data is consistently present across all sources ("Preet Scrum"), so 
+  the API is likely returning it fine—now checking if the UI is intentionally 
+  hiding it when it matches the series chip name.
+
+  Thought for 23s, searched for 2 patterns, ran 1 shell command (ctrl+o to expand)
+
+⏺ (summarized)
+  Found the bug: in calendar-meeting-rows.tsx, badges are shrink-0 while the 
+  title is the only flexible element, so rows with many badges squeeze the title
+  to zero width on narrower screens. I'll fix it so the title keeps a minimum 
+  width and excess badges clip instead.
+
+  Ran 1 shell command (ctrl+o to expand)
+
+⏺ That one's a popover — fine. Applying the fix to the row:
+
+⏺ Update(src/components/calendar-meeting-rows.tsx)
+  ⎿  Added 6 lines, removed 2 lines
+      671            {statusGlyph(r)}
+      672            {providerGlyph(r)}
+      673            <div className="min-w-0 flex-1">
+      674 -            <div className="flex min-w-0 items-center gap-2"> 
+      674 +            {/* overflow-hidden + a title floor: the badges ar
+          +e shrink-0, so                                                
+      675 +                on a narrow column the title (the only shrinka
+          +ble item) used                                                
+      676 +                to collapse to zero width and the row read as 
+          +nameless —                                                    
+      677 +                clip trailing badges instead. */}             
+      678 +            <div className="flex min-w-0 items-center gap-2 ov
+          +erflow-hidden">                                               
+      679                <div
+      676 -                className={`min-w-0 truncate text-sm ${       
+      680 +                className={`min-w-[7rem] truncate text-sm ${  
+      681                    r.title?.trim()
+      682                      ? 'font-medium text-foreground/80'
+      683                      : 'italic text-muted-foreground'
+
+  Thought for 4s, ran 5 shell commands (ctrl+o to expand)
+
+⏺ Both of Jac's points are explained, and the one that was a real bug is fixed
+  and live (615cf0e, warm response 0.09s — the 5s was just the post-restart cold
+  start).
+
+  "Names missing" — the data was never missing. I checked the DB: her own
+  calendar rows, the reminder rows, everything says "Preet Scrum" for those two
+  occurrences, so the API returns the title. It was a CSS layout bug: in each
+  row the title is the only shrinkable element while every badge is fixed-width,
+  so a row carrying Transcript + Gemini notes + transcript-unparseable + a
+  series chip on a narrower window squeezed the title to zero pixels. On your
+  wider screen the same rows were showing as "(…" — same bug, one more pixel of
+  room. The title now keeps a minimum width and excess badges clip instead.
+  She'll see it on next reload.
+
+  "121 was the older count" — that's correct and unchanged on purpose.
+  All/Mine/Shared are the Archive tabs (imported transcripts), not the calendar
+  layer the leak was in. Since the identical "Shared 81" appeared in both her
+  screenshots and yours, I double-checked it's per-user scoped: the listing SQL
+  filters shared_with_email = caller on every arm, and the DB confirms it's her
+  own numbers — 41 transcripts she owns, 82 explicitly shared with her (you: 187
+  owned, 47 shared with you). The first screenshot in this thread was hers too
+  (All 116), so 116 → 121 is just five new imports/shares since then. Nothing to
+  fix there.
+
+  Still pending your word: the stale-navigation fix on the transcript page
+  (key-by-id remount + stale-response guard) — that one's real and I have the
+  change scoped, just say go.
+
+✻ Churned for 3m 32s · done 1:04 PM
+
+❯ wait if there is a filter - even then we show all  - is that  bug             
+  ok write that fix if applicab;e and the remount fix as an md file for another 
+  session to doo                                                                
+
+  Thought for 16s (ctrl+o to expand)
+
+⏺ Let me check what the tab counts actually respect when a filter is active:
+
+  Thought for 28s, searched for 1 pattern, ran 2 shell commands (ctrl+o to expand)
+
+⏺ (summarized)
+  Confirmed the archive tab counts already respect all filters — only a stale 
+  code comment needed fixing. The real issue is a UX bug: with the "Not 
+  imported" layer active, tabs still show archive counts (All 121/Mine 40/Shared
+  81) instead of counts for the visible list. I'll write the handoff brief 
+  covering both findings.
+
+⏺ Write(docs/handoff-2026-08-26-detail-remount-and-tab-counts.md)
+  ⎿  Wrote 135 lines to
+     docs/handoff-2026-08-26-detail-remount-and-tab-counts.md
+      1 # Handoff: transcript-page stale state on navigation + tab counts
+      2 
+      3 Written 2026-08-26 for a fresh session. Two independent items; do
+      4 order (A is a confirmed bug, B is a UX inconsistency needing one 
+        design call).
+        364,
+      6 416e84c; memory `privacy-caller-scoping-gate`). Repo rules that a
+      7 only, plain commit messages with no attribution trailers, `git st
+        atus -s` +
+      9 (`pgrep 'claude-agent-sd[k]'` on the VM) before `pm2 restart`.
+     … +191 lines (ctrl+o to expand)
+
+  Ran 1 shell command (ctrl+o to expand)
+
+⏺ Done — the brief is at
+  docs/handoff-2026-08-26-detail-remount-and-tab-counts.md (committed, 9986ff8).
+
+  On your question: no, the filter itself isn't broken. I read the count query —
+  the All/Mine/Shared badges already respect every filter (people, provider,
+  speaker, label, date, search) because they share the same rangeAndSearch()
+  fragment as the list; only a code comment claiming "date + search only" is
+  stale. What Jac hit is different: with the Not imported layer selected, the
+  tab strip keeps showing the archive's counts (All 121 / Mine 40 / Shared 81)
+  for a list that isn't on screen. Those numbers are correct and per-user, just
+  irrelevant in that mode — a UX inconsistency, not a scoping bug.
+
+  The brief covers both items for the next session:
+
+  - A. Transcript page stale state (confirmed bug) — root cause spelled out with
+    line refs (no remount between /transcript/A → B, player keyed by part not
+    id, and the un-cancelled 1s live-reload timer that writes A's row into B's
+    page), the exact fix (key={id} inner-component remount + stale-response
+    guard), and verification steps including how to reproduce the race.
+  - B. Tab counts under calendar layers — the facts, the stale comment to fix,
+    and the one design decision needed (recommended: hide/dim archive tabs when
+    a layer is active and show the layer's own count, which the API already
+    returns).
+
+  It also notes the out-of-scope items so the next session doesn't
+  re-investigate them: the title-truncation fix already shipped, the Ivan
+  voiceprint re-enrollment, and the deliberately-open privacy follow-ups.
+
+✻ Baked for 1m 42s · done 1:10 PM
