@@ -108,9 +108,22 @@ interface TranscriptDetailPageProps {
   params: Promise<{ id: string }>;
 }
 
+// Thin wrapper: `/transcript/A → /transcript/B` is the same App Router
+// segment, so without a key the inner component instance (and all its state,
+// timers and the <audio> element) would survive the navigation and show A's
+// title/audio on B's URL until B's fetch landed. Keying on the id forces a
+// full remount per transcript.
 export default function TranscriptDetailPage({ params }: TranscriptDetailPageProps) {
+  const { id } = use(params);
+  return <TranscriptDetailInner key={id} transcriptId={id} />;
+}
+
+function TranscriptDetailInner({ transcriptId }: { transcriptId: string }) {
   const router = useRouter();
-  const { id: transcriptId } = use(params);
+  // Stale-response guard: an in-flight fetch (or a debounced live-reload
+  // timer) started for a previous id must never setRow() onto this page.
+  const liveIdRef = useRef(transcriptId);
+  liveIdRef.current = transcriptId;
 
   const [row, setRow] = useState<StoredTranscript | null>(null);
   const [access, setAccess] = useState<TranscriptAccess>('owner');
@@ -424,6 +437,7 @@ export default function TranscriptDetailPage({ params }: TranscriptDetailPagePro
         fetch(`/api/transcripts/${transcriptId}/edits`),
         fetch(`/api/transcripts/${transcriptId}/shares`),
       ]);
+      if (liveIdRef.current !== transcriptId) return;
 
       if (rowRes.status === 404) {
         setError('Transcript not found');
@@ -435,6 +449,7 @@ export default function TranscriptDetailPage({ params }: TranscriptDetailPagePro
       const { transcript } = (await rowRes.json()) as {
         transcript: StoredTranscript & { access?: TranscriptAccess };
       };
+      if (liveIdRef.current !== transcriptId) return;
       setRow(transcript);
       setAccess(transcript.access ?? 'owner');
       setTitle(transcript.title || '');
@@ -463,6 +478,7 @@ export default function TranscriptDetailPage({ params }: TranscriptDetailPagePro
 
       if (transcript.status === 'completed') {
         const contentRes = await fetch(`/api/transcripts/${transcriptId}/content`);
+        if (liveIdRef.current !== transcriptId) return;
         if (contentRes.ok) {
           const { content } = (await contentRes.json()) as { content: TranscriptResponse };
           setContent(content);
@@ -477,14 +493,17 @@ export default function TranscriptDetailPage({ params }: TranscriptDetailPagePro
     }
   }, [transcriptId]);
 
+  const liveReloadTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   useEffect(() => {
     loadAll();
+    return () => {
+      if (liveReloadTimer.current) clearTimeout(liveReloadTimer.current);
+    };
   }, [loadAll]);
 
   // Live updates: a collaborator changed THIS transcript — silently re-pull
   // everything. Skipped while the user is mid-edit (focused form field) so a
   // reload never stomps typing; debounced so event bursts coalesce.
-  const liveReloadTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   useLiveEvents((e) => {
     if (e.assemblyaiId !== transcriptId) return;
     if (e.kind === 'labels') loadLabels();
@@ -2568,7 +2587,7 @@ export default function TranscriptDetailPage({ params }: TranscriptDetailPagePro
                   )}
                 </div>
                 <AudioPlayer
-                  key={activePart}
+                  key={`${row.assemblyai_id}-${activePart}`}
                   ref={playerRef}
                   className="h-10 w-full"
                   src={
