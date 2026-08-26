@@ -1639,6 +1639,7 @@ export function TranscriptTable({
         <LayersDropdown
           layers={layers}
           unimportedCount={calCounts ? calCounts.unimported : null}
+          norecCount={calCounts ? calCounts.norec : null}
           inactive={!mergedMode}
           onToggle={toggleLayer}
         />
@@ -1719,12 +1720,36 @@ export function TranscriptTable({
           )}
         </div>
       )}
-      <div className="flex items-center">
-        {tabButton('all', 'All', counts?.all)}
-        {tabButton('mine', 'Mine', counts?.mine)}
-        {tabButton('shared', 'Shared', counts?.shared)}
-        {tabButton('trash', 'Trash', counts?.trash)}
-      </div>
+      {renderMerged && !layers.archive ? (
+        // Archive layer off: All/Mine/Shared/Trash describe the IMPORTED
+        // archive, which isn't on screen — showing "All 121" over a list of
+        // calendar rows reads as "the filter shows everything". Show the
+        // active calendar layers' own counts instead (same filters applied).
+        <div
+          data-layer-counts
+          className="flex items-center gap-3 px-1 pb-2.5 pt-1 text-sm text-muted-foreground"
+        >
+          {(['unimported', 'norec'] as const)
+            .filter((v) => layers[v])
+            .map((v) => (
+              <span key={v}>
+                {v === 'unimported' ? 'Not imported' : 'No recording'}
+                {calCounts && (
+                  <span className="ml-1.5 rounded-full bg-muted px-1.5 py-0.5 text-[11px] tabular-nums">
+                    {calCounts[v]}
+                  </span>
+                )}
+              </span>
+            ))}
+        </div>
+      ) : (
+        <div className="flex items-center">
+          {tabButton('all', 'All', counts?.all)}
+          {tabButton('mine', 'Mine', counts?.mine)}
+          {tabButton('shared', 'Shared', counts?.shared)}
+          {tabButton('trash', 'Trash', counts?.trash)}
+        </div>
+      )}
       <div className="ml-auto flex flex-wrap items-center gap-1.5 pb-2">
         {toolbarExtra}
         {rangePicker}

@@ -28,6 +28,8 @@ interface LayersDropdownProps {
   layers: LayerDropdownPrefs;
   /** "Not imported" badge count (null until the first counts fetch lands). */
   unimportedCount: number | null;
+  /** "No recording" badge count (null until the first counts fetch lands). */
+  norecCount: number | null;
   /** Tabs/search/label filter active — archive-only view, controls frozen. */
   inactive: boolean;
   onToggle: (key: LayerDropdownKey) => void;
@@ -36,6 +38,7 @@ interface LayersDropdownProps {
 export function LayersDropdown({
   layers,
   unimportedCount,
+  norecCount,
   inactive,
   onToggle,
 }: LayersDropdownProps) {
@@ -70,7 +73,7 @@ export function LayersDropdown({
       ? 'Imported'
       : key === 'unimported'
         ? `Not imported${unimportedCount != null ? ` (${unimportedCount})` : ''}`
-        : 'No recording';
+        : `No recording${norecCount != null ? ` (${norecCount})` : ''}`;
 
   /** Short name for the trigger summary (no count suffix). */
   const shortLabel = (key: LayerDropdownKey): string =>

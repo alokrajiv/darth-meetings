@@ -517,7 +517,8 @@ export async function listPagedForUser(
     ORDER BY b.sort_key DESC, b.id DESC
   `;
 
-  // Tab badge counts: all/mine/shared respect the from/to + q filters (they
+  // Tab badge counts: all/mine/shared respect ALL listing filters — from/to, q,
+  // people, provider, speaker, label — via rangeAndSearch() (they
   // label the tabs above the FILTERED list); trash is the caller's trashed-row
   // count, global over from/to/q (as it always was) but narrowed by the
   // people/provider filters so the badge agrees with the filtered trash tab
