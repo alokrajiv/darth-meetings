@@ -16,12 +16,15 @@ export async function GET(
   request: NextRequest,
   ctx: { params: Promise<{ id: string }> }
 ) {
+  // Behind nginx request.url/nextUrl is localhost:<port> — build the origin
+  // from the forwarded headers or the redirect sends users to localhost.
+  const host =
+    request.headers.get('x-forwarded-host') ?? request.headers.get('host') ?? 'localhost';
+  const proto = request.headers.get('x-forwarded-proto') ?? 'https';
+  const origin = `${proto}://${host}`;
   const { id } = await ctx.params;
-  const home = new URL('/', request.nextUrl.origin);
-  if (!UUID_RE.test(id)) return NextResponse.redirect(home);
+  if (!UUID_RE.test(id)) return NextResponse.redirect(new URL('/', origin));
   const meeting = await getMeetingById(id);
-  if (!meeting) return NextResponse.redirect(home);
-  return NextResponse.redirect(
-    new URL(`/transcript/${meeting.transcript_id}`, request.nextUrl.origin)
-  );
+  if (!meeting) return NextResponse.redirect(new URL('/', origin));
+  return NextResponse.redirect(new URL(`/transcript/${meeting.transcript_id}`, origin));
 }
