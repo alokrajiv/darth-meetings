@@ -1,0 +1,491 @@
+import 'server-only';
+import {
+  listAutoSyncUsers,
+  getAutoSyncLog,
+  claimAutoSync,
+  settleAutoSync,
+  type AutoSyncUser,
+  type AutoSyncLogRow,
+} from '@/db-ops/user-prefs';
+import {
+  listOpenUnimportedForUsers,
+  resolveReminderByKey,
+  upsertReminder,
+  type UnimportedCandidateRow,
+} from '@/db-ops/gmeet-reminders';
+import {
+  findCalendarEventByOccurrence,
+  type CalendarEventImportRow,
+} from '@/db-ops/calendar-event-cache';
+import { getMeetingCacheByKeys, getTeamsJoinUrlByMeeting } from '@/db-ops/gmeet-meeting-cache';
+import { findImportedByMeetingCodes } from '@/db-ops/gmeet-sync';
+import { findImportedByTeamsMeetings } from '@/db-ops/teams-import';
+import { getAnyByAssemblyaiId } from '@/db-ops/transcripts';
+import { addShare } from '@/db-ops/transcript-shares';
+import { identityForUser, userIdForEmail } from '@/db-ops/transcript-activity';
+import { resolveMeetingByAnyTranscriptId } from '@/db-ops/meetings';
+import { findSeriesByKeys, getSeries } from '@/db-ops/series';
+import { recurringBaseId, type SeriesKeyInput } from '@/lib/series-keys';
+import { getServerAccessToken } from '@/lib/server/google-oauth';
+import { executeGmeetImport } from '@/lib/server/gmeet-import-core';
+import { executeTeamsImport } from '@/lib/server/teams-import-core';
+import { AUTO_SHARE_DOMAINS } from '@/lib/server/auto-share';
+import { notifyUser, APP_URL } from '@/lib/server/darth-notify';
+import type { GmeetContext } from '@/lib/format';
+
+/**
+ * Account-level auto-sync (T2): "import everything I'm in", deduped across
+ * users so N people with the switch on cost ONE import.
+ *
+ * Input is deliberately NOT a calendar listing of its own: the per-user
+ * poller sweeps (gmeet-poller.sweepUser, each under the user's own token)
+ * already reduce every past occurrence to an OPEN 'unimported' reminder
+ * when artifacts exist and nobody visible imported it. This sweep takes
+ * those reminders for every auto-sync user, groups them by occurrence
+ * ('<code>|<startIso>'), and per occurrence:
+ *
+ *  1. filters by each user's scope (mine = organiser only / all), `since`
+ *     (enable-time — never backfills history), provider switches, mode
+ *     (needs a listed artifact the mode wants) and mutes (already applied
+ *     in the query);
+ *  2. defers to per-series auto-import when the occurrence belongs to a
+ *     series with an explicit setting (on → the series sweep owns it, off →
+ *     explicit opt-out wins over the account switch);
+ *  3. ELECTS ONE IMPORTER — organiser first (owns the Drive artifacts), then
+ *     earliest-connected Google account — pre-checks that their token can
+ *     actually open the Doc / recording (Drive files.get), and fires ONE
+ *     deferred+background import through the same execute cores the dialog
+ *     and CLI use. Everyone else becomes a WATCHER: shared onto the row and
+ *     DM'd alongside the importer. The auto_sync_log PK is the claim — a
+ *     second process can't fire the same occurrence.
+ *  4. 409 (someone imported it by hand meanwhile) → share the existing row
+ *     with the electors, no import. No elector's token can reach the
+ *     artifacts → the organiser gets ONE 'sync_requested' reminder + Slack
+ *     DM ("colleagues need your import"), re-checked daily.
+ *
+ * Privacy: shares only ever go to users whose OWN calendar listed the
+ * occurrence (that is what produced their reminder) — the same population
+ * the existing auto-share-to-invitees rule already covers.
+ */
+
+const FAILED_RETRY_MS = 12 * 3600 * 1000;
+const NUDGE_RETRY_MS = 24 * 3600 * 1000;
+const MAX_FIRES_PER_PASS = 6;
+const DRIVE_FILES = 'https://www.googleapis.com/drive/v3/files';
+
+type Caller = { userId: string; email: string };
+type Elector = { user: AutoSyncUser; row: UnimportedCandidateRow };
+
+interface Group {
+  key: string;
+  code: string;
+  startIso: string;
+  title: string | null;
+  provider: 'gmeet' | 'teams';
+  electors: Elector[];
+}
+
+function retryable(prior: AutoSyncLogRow | undefined, now: number): boolean {
+  if (!prior) return true;
+  if (prior.outcome === 'imported' || prior.outcome === 'deferred' || prior.outcome === 'already')
+    return false;
+  const age = now - new Date(prior.updated_at).getTime();
+  return age > (prior.outcome === 'failed' ? FAILED_RETRY_MS : NUDGE_RETRY_MS);
+}
+
+export async function sweepAccountAutoSync(): Promise<void> {
+  let users: AutoSyncUser[];
+  try {
+    users = await listAutoSyncUsers();
+  } catch (err) {
+    console.warn('[auto-sync] listing users failed:', err);
+    return;
+  }
+  if (users.length === 0) return;
+  const byId = new Map(users.map((u) => [u.userId, u]));
+
+  let cands: UnimportedCandidateRow[];
+  try {
+    cands = await listOpenUnimportedForUsers(users.map((u) => u.userId));
+  } catch (err) {
+    console.warn('[auto-sync] listing candidates failed:', err);
+    return;
+  }
+  const now = Date.now();
+
+  // ---- group by occurrence, applying each user's own switches ------------
+  const groups = new Map<string, Group>();
+  for (const row of cands) {
+    const user = byId.get(row.user_id);
+    if (!user || !row.meeting_code || !row.event_start) continue;
+    const p = user.prefs;
+    if (p.scope === 'mine' && !row.organizer_self) continue;
+    const startMs = new Date(row.event_start).getTime();
+    if (p.since && startMs <= Date.parse(p.since)) continue;
+    const provider: 'gmeet' | 'teams' = row.meeting_code.startsWith('teams-') ? 'teams' : 'gmeet';
+    if (!p.providers[provider]) continue;
+    const wantVideo = p.mode !== 'transcript';
+    const wantTranscript = p.mode !== 'video';
+    if (!((wantVideo && row.has_recording) || (wantTranscript && row.has_transcript))) continue;
+    // NORMALISED occurrence key: reminders carry each user's OWN calendar
+    // timezone in their event_key ('…|11:30:00+05:30' vs '…|14:00:00+08:00'
+    // for the same instant), so grouping on the raw key would give every
+    // timezone its own import — exactly the duplicate this sweep exists to
+    // prevent. Per-user keys stay on the elector rows for reminder resolution.
+    const startIso = new Date(row.event_start).toISOString();
+    const key = `${row.meeting_code}|${startIso}`;
+    let g = groups.get(key);
+    if (!g) {
+      g = { key, code: row.meeting_code, startIso, title: row.title, provider, electors: [] };
+      groups.set(key, g);
+    }
+    g.electors.push({ user, row });
+  }
+  if (groups.size === 0) return;
+
+  const log = await getAutoSyncLog([...groups.keys()]);
+  // Oldest first so a backlog drains in order across passes.
+  const ordered = [...groups.values()].sort((a, b) => Date.parse(a.startIso) - Date.parse(b.startIso));
+
+  let fired = 0;
+  for (const g of ordered) {
+    if (fired >= MAX_FIRES_PER_PASS) break;
+    const prior = log.get(g.key);
+    if (!retryable(prior, now)) continue;
+    try {
+      if (await seriesOwnsOrOptsOut(g)) continue;
+      // Organiser first (owns the artifacts), then earliest-connected.
+      g.electors.sort((a, b) => {
+        if (a.row.organizer_self !== b.row.organizer_self) return a.row.organizer_self ? -1 : 1;
+        return (a.user.connectedAt ?? '9').localeCompare(b.user.connectedAt ?? '9');
+      });
+      const usable = g.electors.filter((e) => e.user.googleStatus !== 'revoked');
+      if (usable.length === 0) continue;
+      const claimed = await claimAutoSync({
+        occKey: g.key,
+        meetingCode: g.code,
+        occStart: g.startIso,
+        title: g.title,
+        importerUserId: usable[0]!.user.userId,
+        importerEmail: usable[0]!.user.email,
+        watchers: usable.slice(1).map((e) => e.user.email),
+        retryableBefore: new Date(now - (prior?.outcome === 'failed' ? FAILED_RETRY_MS : NUDGE_RETRY_MS)),
+      });
+      if (!claimed) continue; // another writer holds it
+      fired += 1;
+      await fireGroup(g, usable, now);
+    } catch (err) {
+      console.warn(`[auto-sync] ${g.key} failed:`, err);
+      await settleAutoSync(g.key, {
+        outcome: 'failed',
+        detail: err instanceof Error ? err.message : String(err),
+      }).catch(() => {});
+    }
+  }
+  if (fired > 0) console.log(`[auto-sync] pass: ${groups.size} candidate occurrence(s), ${fired} acted on`);
+}
+
+/** A series with an explicit auto-import setting owns its occurrences:
+ * enabled → the series sweep fires it (its own mode/report), disabled →
+ * explicit opt-out beats the account switch. */
+async function seriesOwnsOrOptsOut(g: Group): Promise<boolean> {
+  const keys: SeriesKeyInput[] = [];
+  if (g.provider === 'gmeet') keys.push({ kind: 'meeting-code', value: g.code });
+  else {
+    const url = await getTeamsJoinUrlByMeeting(g.code, g.startIso).catch(() => null);
+    if (url) keys.push({ kind: 'teams-join-url', value: url });
+  }
+  const rec = g.electors.find((e) => e.row.recurring_event_id)?.row.recurring_event_id;
+  if (rec) keys.push({ kind: 'recurring-base-id', value: recurringBaseId(rec) });
+  if (keys.length === 0) return false;
+  const hits = await findSeriesByKeys(keys);
+  for (const h of hits) {
+    const s = await getSeries(h.series_id);
+    if (s?.auto_import) return true; // enabled or explicitly off — either way not ours
+  }
+  return false;
+}
+
+/** Can this token open the artifacts the mode needs? null = unknown ids
+ * (nothing cached to probe) — let the import decide. */
+async function canReachArtifacts(
+  token: string,
+  ids: { docId: string | null; videoId: string | null },
+  mode: 'transcript' | 'video' | 'both'
+): Promise<boolean | null> {
+  const need: string[] = [];
+  if (mode !== 'video' && ids.docId) need.push(ids.docId);
+  if (mode !== 'transcript' && ids.videoId) need.push(ids.videoId);
+  if (need.length === 0) return null;
+  for (const id of need) {
+    try {
+      const res = await fetch(`${DRIVE_FILES}/${encodeURIComponent(id)}?fields=id&supportsAllDrives=true`, {
+        headers: { Authorization: `Bearer ${token}` },
+        signal: AbortSignal.timeout(8000),
+      });
+      if (res.status === 403 || res.status === 404) return false;
+    } catch {
+      return null; // transient — don't disqualify the elector
+    }
+  }
+  return true;
+}
+
+function eventFrom(g: Group, cal: CalendarEventImportRow | null) {
+  return {
+    id: cal?.event_id ?? undefined,
+    title: (cal?.title ?? g.title) ?? undefined,
+    startTime: cal ? new Date(cal.event_start).toISOString() : g.startIso,
+    endTime: cal?.event_end ? new Date(cal.event_end).toISOString() : undefined,
+    meetingCode: g.provider === 'gmeet' ? g.code : undefined,
+    recurringEventId: cal?.recurring_event_id ?? undefined,
+    iCalUID: cal?.ical_uid ?? undefined,
+    organizerEmail: cal?.organizer_email ?? undefined,
+    attendees: cal?.attendees ?? undefined,
+  };
+}
+
+function isAccessError(status: number, error: string): boolean {
+  if (status === 403 || status === 404) return true;
+  return /permission|forbidden|not found|no access|403|404/i.test(error);
+}
+
+async function fireGroup(g: Group, electors: Elector[], now: number): Promise<void> {
+  const watchersOf = (importer: Elector) =>
+    electors.filter((e) => e !== importer).map((e) => e.user.email);
+  const cacheRow = (await getMeetingCacheByKeys([g.key]).catch(() => new Map())).get(g.key) ?? null;
+  const teamsUrl = g.provider === 'teams' ? await getTeamsJoinUrlByMeeting(g.code, g.startIso) : null;
+  if (g.provider === 'teams' && !teamsUrl) {
+    await settleAutoSync(g.key, { outcome: 'failed', detail: 'no Teams join URL resolved yet' });
+    return;
+  }
+
+  let lastErr: { status: number; error: string; access: boolean } | null = null;
+  let organizerEmail: string | null = null;
+  for (const importer of electors) {
+    const caller: Caller = { userId: importer.user.userId, email: importer.user.email };
+    const cal = await findCalendarEventByOccurrence(caller.userId, g.code, g.startIso).catch(() => null);
+    organizerEmail = organizerEmail ?? cal?.organizer_email ?? cacheRow?.organizer_email ?? null;
+    const mode = importer.user.prefs.mode;
+    const event = eventFrom(g, cal);
+    const contextExtra: NonNullable<Parameters<typeof executeGmeetImport>[1]['contextExtra']> = {
+      autoSync: {
+        occKey: g.key,
+        byUserId: caller.userId,
+        byEmail: caller.email,
+        watchers: watchersOf(importer),
+        at: new Date(now).toISOString(),
+      },
+      uploadPrefs: { report: importer.user.prefs.report },
+    };
+
+    let outcome: { status: number; body: Record<string, unknown> };
+    try {
+      if (g.provider === 'teams') {
+        outcome = await executeTeamsImport(caller, {
+          url: teamsUrl!,
+          mode,
+          defer: true,
+          background: true,
+          event,
+          contextExtra,
+        });
+      } else {
+        const minted = await getServerAccessToken(caller.userId);
+        if (!minted) {
+          lastErr = { status: 0, error: `${caller.email}: Google not connected`, access: true };
+          continue;
+        }
+        const docId = cal?.attachment_transcript_doc_id ?? cacheRow?.transcript_doc_ids?.[0] ?? null;
+        const videoId = cal?.attachment_video_file_id ?? cacheRow?.video_file_id ?? null;
+        const reach = await canReachArtifacts(minted.token, { docId, videoId }, mode);
+        if (reach === false) {
+          lastErr = { status: 403, error: `${caller.email}: no access to the artifacts`, access: true };
+          continue;
+        }
+        outcome = await executeGmeetImport(caller, {
+          accessToken: minted.token,
+          mode,
+          videoFileId: videoId ?? undefined,
+          transcriptDocId: docId ?? undefined,
+          defer: true,
+          background: true,
+          event,
+          contextExtra,
+        });
+      }
+    } catch (err) {
+      outcome = { status: 500, body: { error: err instanceof Error ? err.message : String(err) } };
+    }
+
+    const errText = typeof outcome.body.error === 'string' ? outcome.body.error : `status ${outcome.status}`;
+    const transcript = outcome.body.transcript as { assemblyai_id?: string; id?: number } | undefined;
+
+    if (outcome.status === 201 || outcome.status === 202) {
+      const kind = outcome.status === 201 ? 'imported' : 'deferred';
+      await settleAutoSync(g.key, {
+        outcome: kind,
+        assemblyaiId: transcript?.assemblyai_id ?? null,
+        importerUserId: caller.userId,
+        importerEmail: caller.email,
+        detail: null,
+      });
+      if (transcript?.assemblyai_id) {
+        await ensureSharedWith(transcript.assemblyai_id, watchersOf(importer));
+      }
+      await resolveAll(electors, g.key, 'auto_synced');
+      const link = await stableLink(transcript?.assemblyai_id ?? null);
+      const when = g.startIso.slice(0, 10);
+      const title = `*${g.title ?? 'a meeting'}* (${when})`;
+      void notifyUser({
+        kind: 'auto_import',
+        toEmail: caller.email,
+        text:
+          kind === 'imported'
+            ? `Auto-sync imported ${title} → ${link}`
+            : `Auto-sync queued ${title} — artifacts still generating, it will land on its own → ${link}`,
+        dedupeKey: `mw-autosync:${g.key}:${caller.email}`,
+      });
+      for (const w of watchersOf(importer)) {
+        void notifyUser({
+          kind: 'auto_import',
+          toEmail: w,
+          text:
+            (kind === 'imported'
+              ? `Auto-sync imported ${title}`
+              : `Auto-sync queued ${title} (still generating)`) +
+            ` via ${caller.email}'s Google connection — shared with you → ${link}`,
+          dedupeKey: `mw-autosync:${g.key}:${w}`,
+        });
+      }
+      console.log(`[auto-sync] ${g.key} "${g.title ?? g.code}": ${kind} by ${caller.email}, ${watchersOf(importer).length} watcher(s)`);
+      return;
+    }
+
+    if (outcome.status === 409) {
+      // Someone imported it by hand meanwhile — attach everyone to that row.
+      const existing = await findExisting(g, teamsUrl, caller);
+      await settleAutoSync(g.key, {
+        outcome: 'already',
+        assemblyaiId: existing ?? null,
+        detail: errText,
+      });
+      if (existing) await ensureSharedWith(existing, electors.map((e) => e.user.email));
+      await resolveAll(electors, g.key, 'imported');
+      console.log(`[auto-sync] ${g.key}: already imported (${existing ?? '?'}) — shared to ${electors.length}`);
+      return;
+    }
+
+    lastErr = { status: outcome.status, error: errText, access: isAccessError(outcome.status, errText) };
+    if (!lastErr.access) break; // a real failure — trying other tokens won't help
+  }
+
+  if (lastErr?.access) {
+    await nudgeOrganizer(g, electors, organizerEmail, lastErr.error);
+    return;
+  }
+  await settleAutoSync(g.key, { outcome: 'failed', detail: lastErr?.error ?? 'no usable importer' });
+  console.warn(`[auto-sync] ${g.key} failed: ${lastErr?.error ?? 'no usable importer'}`);
+}
+
+async function findExisting(g: Group, teamsUrl: string | null, caller: Caller): Promise<string | null> {
+  try {
+    const [hit] =
+      g.provider === 'teams' && teamsUrl
+        ? await findImportedByTeamsMeetings([{ joinWebUrl: teamsUrl, startTime: g.startIso }], caller)
+        : await findImportedByMeetingCodes([{ code: g.code, startTime: g.startIso }], caller);
+    return hit?.assemblyai_id ?? null;
+  } catch {
+    return null;
+  }
+}
+
+async function resolveAll(electors: Elector[], _key: string, reason: string): Promise<void> {
+  for (const e of electors) {
+    // Each user's reminder wears THEIR timezone-flavoured event_key.
+    await resolveReminderByKey(e.user.userId, 'unimported', e.row.event_key, reason).catch(() => {});
+  }
+}
+
+/** Edit-share the row with these emails (idempotent; owner skipped). */
+async function ensureSharedWith(assemblyaiId: string, emails: string[]): Promise<void> {
+  if (emails.length === 0) return;
+  const row = await getAnyByAssemblyaiId(assemblyaiId).catch(() => null);
+  if (!row) return;
+  const owner = await identityForUser(row.user_id).catch(() => null);
+  for (const email of emails) {
+    if (owner?.email && owner.email.toLowerCase() === email.toLowerCase()) continue;
+    try {
+      await addShare({
+        transcriptId: row.id,
+        ownerUserId: row.user_id,
+        sharedByUserId: row.user_id,
+        sharedWithEmail: email,
+        sharedWithName: null,
+        sharedWithPplId: null,
+        access: 'edit',
+      });
+    } catch (err) {
+      console.warn('[auto-sync] share failed for', email, err);
+    }
+  }
+}
+
+async function stableLink(assemblyaiId: string | null): Promise<string> {
+  if (!assemblyaiId) return `<${APP_URL}/|open>`;
+  const m = await resolveMeetingByAnyTranscriptId(assemblyaiId).catch(() => null);
+  return m ? `<${APP_URL}/m/${m.id}|open>` : `<${APP_URL}/transcript/${assemblyaiId}|open>`;
+}
+
+/**
+ * No auto-sync user's token can read the artifacts: ask the one account
+ * that can — the organiser — once per occurrence (reminder + Slack DM),
+ * then re-check daily in case they connect / enable / import.
+ */
+async function nudgeOrganizer(
+  g: Group,
+  electors: Elector[],
+  organizerEmail: string | null,
+  why: string
+): Promise<void> {
+  const email = organizerEmail?.trim().toLowerCase() ?? null;
+  const domain = email?.split('@')[1] ?? '';
+  const internal = !!email && AUTO_SHARE_DOMAINS.has(domain);
+  const isElector = !!email && electors.some((e) => e.user.email.toLowerCase() === email);
+  if (!email || !internal || isElector) {
+    await settleAutoSync(g.key, { outcome: 'no_access', detail: why });
+    console.warn(`[auto-sync] ${g.key}: no token with access (organiser ${email ?? 'unknown'}) — ${why}`);
+    return;
+  }
+  const when = g.startIso.slice(0, 10);
+  const n = electors.length;
+  const who = electors.map((e) => e.user.email).join(', ');
+  const userId = await userIdForEmail(email).catch(() => null);
+  if (userId) {
+    const r = electors[0]!.row;
+    await upsertReminder({
+      userId,
+      kind: 'sync_requested',
+      eventKey: g.key,
+      meetingCode: g.code,
+      title: g.title,
+      eventStart: g.startIso,
+      organizerSelf: true,
+      hasRecording: r.has_recording,
+      hasTranscript: r.has_transcript,
+    }).catch(() => {});
+  }
+  void notifyUser({
+    kind: 'sync_request',
+    toEmail: email,
+    text:
+      `${n} colleague${n === 1 ? '' : 's'} (${who}) ha${n === 1 ? 's' : 've'} auto-sync on and want${n === 1 ? 's' : ''} ` +
+      `*${g.title ?? g.code}* (${when}) imported, but only your Google account can reach its transcript/recording. ` +
+      `<${APP_URL}/|Import it> once, or turn on auto-sync for your account in <${APP_URL}/settings#auto-sync|Settings> and it happens by itself.`,
+    dedupeKey: `mw-sync-request:${g.key}`,
+  });
+  await settleAutoSync(g.key, { outcome: 'nudged', detail: `${why}; nudged ${email}` });
+  console.log(`[auto-sync] ${g.key}: nudged organiser ${email} (${n} elector(s) lacked access)`);
+}
+
+export type { GmeetContext };

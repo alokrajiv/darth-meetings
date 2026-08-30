@@ -108,6 +108,15 @@ WRITE (needs read+write for meetings)
                                   access (absorbs its keys; default 'confirmed')
   series detach <id> <transcript-id> [--remember]   Detach; --remember = never
                                   re-suggest it for this series
+  auto-sync                       Your account-level auto-sync switch + what it
+                                  did recently (imports de-duplicated company-
+                                  wide: one import per meeting, others shared in)
+  auto-sync off|mine|all [--mode transcript|video|both]
+             [--report summary|detailed-video|detailed-text|later]
+             [--gmeet on|off] [--teams on|off]
+                                  mine = meetings you organise, all = every
+                                  meeting you attend; only meetings that start
+                                  after you switch it on. Needs Google connected
   set-title <id> <title>          Update the title
   set-notes <id> --file <md|->    Replace the notes markdown ('-' = stdin)
   set-report <id> --file <md|->   Replace the report markdown ('-' = stdin)
@@ -675,6 +684,43 @@ const meetings: Subcommand = {
     switch (cmd) {
       case "skill": {
         console.log(SKILL);
+        return 0;
+      }
+
+      case "auto-sync": {
+        const sub = args[0];
+        const fmtRow = (a: any) =>
+          `${(a.occStart ?? "").slice(0, 10).padEnd(11)}${String(a.outcome).padEnd(10)} ${a.title ?? a.occKey}` +
+          (a.importerEmail && !a.mine ? `  (via ${a.importerEmail})` : "") +
+          (a.assemblyaiId ? `  ${a.assemblyaiId}` : "") +
+          (a.detail && a.outcome !== "imported" && a.outcome !== "deferred" ? `  — ${a.detail}` : "");
+        if (!sub) {
+          const data = await ctx.expectJson<any>(ctx.api("meetings", "/api/auto-sync"));
+          ctx.print(data, () => {
+            const s = data.autoSync;
+            console.log(`auto-sync: ${s.scope}${s.scope !== "off" ? `  (mode ${s.mode}, report ${s.report}, gmeet ${s.providers.gmeet ? "on" : "off"}, teams ${s.providers.teams ? "on" : "off"}, since ${s.since ?? "?"})` : ""}`);
+            if (!data.googleConnected) console.log("google: NOT connected — connect in the web app Settings before turning this on");
+            if (data.activity?.length) {
+              console.log("\nrecent:");
+              for (const a of data.activity) console.log("  " + fmtRow(a));
+            }
+          });
+          return 0;
+        }
+        ctx.requireWrite();
+        if (!["off", "mine", "all"].includes(sub)) { console.error("usage: darth-cli meetings auto-sync [off|mine|all] [--mode ...] [--report ...] [--gmeet on|off] [--teams on|off]"); return 1; }
+        const body: any = { scope: sub };
+        const mode = str(flags.mode); const report = str(flags.report);
+        if (mode) body.mode = mode;
+        if (report) body.report = report;
+        const gm = str(flags.gmeet); const tm = str(flags.teams);
+        if (gm !== undefined || tm !== undefined) {
+          body.providers = {};
+          if (gm !== undefined) body.providers.gmeet = gm === "on";
+          if (tm !== undefined) body.providers.teams = tm === "on";
+        }
+        const data = await ctx.expectJson<any>(ctx.api("meetings", "/api/auto-sync", { method: "PUT", body: JSON.stringify(body) }));
+        ctx.print(data, () => console.log(`auto-sync: ${data.autoSync.scope}${data.autoSync.scope !== "off" ? ` (mode ${data.autoSync.mode}, report ${data.autoSync.report}, since ${data.autoSync.since})` : ""}`));
         return 0;
       }
 

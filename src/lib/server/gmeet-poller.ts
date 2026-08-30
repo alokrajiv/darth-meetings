@@ -12,10 +12,12 @@ import {
   upsertReminder,
   listOpenRemindersRaw,
   resolveReminderByKey,
+  type ReminderKind,
 } from '@/db-ops/gmeet-reminders';
 import { getMeetingCacheByKeys, getTeamsResolutionByKeys } from '@/db-ops/gmeet-meeting-cache';
 import { findImportedByTeamsMeetings } from '@/db-ops/teams-import';
 import { sweepAutoImportSeries } from '@/lib/server/series-auto-import';
+import { sweepAccountAutoSync } from '@/lib/server/account-auto-sync';
 import { classifyCalendarAttachments } from '@/lib/meeting-evidence';
 import {
   isOwnTenant,
@@ -101,6 +103,10 @@ function teamsInfoOf(e: CalEvent): TeamsJoinInfo | null {
   const url = teamsUrlOf(e);
   return url ? parseTeamsJoinLink(url) : null;
 }
+
+/** Reminder kinds that mean "this occurrence is not in the app yet" — both
+ * resolve the moment anyone imports (or the user mutes) the occurrence. */
+const IMPORT_KINDS: ReminderKind[] = ['unimported', 'sync_requested'];
 
 function eventKeyOf(code: string, startIso: string | null): string {
   return `${code}|${startIso ?? ''}`;
@@ -197,11 +203,11 @@ async function sweepTeamsArtifacts(
     const code = teamsCacheCode(info.joinWebUrl);
     const key = keys[i]!;
     if (imported[i]) {
-      await resolveReminderByKey(caller.userId, 'unimported', key, 'imported');
+      await resolveReminderByKey(caller.userId, IMPORT_KINDS, key, 'imported');
       continue;
     }
     if (mutedKeys.has(code) || mutedKeys.has(e.id)) {
-      await resolveReminderByKey(caller.userId, 'unimported', key, 'muted');
+      await resolveReminderByKey(caller.userId, IMPORT_KINDS, key, 'muted');
       continue;
     }
 
@@ -537,11 +543,11 @@ async function sweepUser(account: GoogleAccountRow): Promise<void> {
     const startIso = pastMeetings[i]!.startTime;
     const key = eventKeyOf(code, startIso);
     if (imported[i]) {
-      await resolveReminderByKey(userId, 'unimported', key, 'imported');
+      await resolveReminderByKey(userId, IMPORT_KINDS, key, 'imported');
       continue;
     }
     if (mutedKeys.has(code) || mutedKeys.has(e.id)) {
-      await resolveReminderByKey(userId, 'unimported', key, 'muted');
+      await resolveReminderByKey(userId, IMPORT_KINDS, key, 'muted');
       continue;
     }
     // Meeting artifacts only appear a while after the call ends; re-probed
@@ -635,7 +641,7 @@ async function sweepUser(account: GoogleAccountRow): Promise<void> {
       continue;
     }
     if (mutedKeys.has(r.meeting_code ?? '') || mutedKeys.has(r.event_key)) {
-      await resolveReminderByKey(userId, 'unimported', r.event_key, 'muted');
+      await resolveReminderByKey(userId, IMPORT_KINDS, r.event_key, 'muted');
       continue;
     }
     if (r.meeting_code?.startsWith('teams-')) {
@@ -651,7 +657,7 @@ async function sweepUser(account: GoogleAccountRow): Promise<void> {
     );
     for (let i = 0; i < staleUnimported.length; i++) {
       if (found[i]) {
-        await resolveReminderByKey(userId, 'unimported', staleUnimported[i]!.key, 'imported');
+        await resolveReminderByKey(userId, IMPORT_KINDS, staleUnimported[i]!.key, 'imported');
       }
     }
   }
@@ -668,7 +674,7 @@ async function sweepUser(account: GoogleAccountRow): Promise<void> {
       );
       for (let i = 0; i < withUrl.length; i++) {
         if (found[i]) {
-          await resolveReminderByKey(userId, 'unimported', withUrl[i]!.key, 'imported');
+          await resolveReminderByKey(userId, IMPORT_KINDS, withUrl[i]!.key, 'imported');
         }
       }
     }
@@ -698,6 +704,10 @@ async function sweepAll(): Promise<void> {
     // Series auto-import rides the same 30-minute cadence — after the
     // per-account sweeps so freshly-cached calendar data is available.
     await sweepAutoImportSeries();
+    // Account-level auto-sync (T2) LAST: it consumes the 'unimported'
+    // reminders the per-account sweeps just refreshed, and lets per-series
+    // auto-import claim its occurrences first.
+    await sweepAccountAutoSync();
   } catch (err) {
     console.warn('[gmeet-poller] sweep pass failed:', err);
   } finally {

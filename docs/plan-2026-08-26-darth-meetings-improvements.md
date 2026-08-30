@@ -84,6 +84,19 @@ Size: ~3–4 days (schema + dual-write + job page + API + poller unification).
 
 ## T2. Account-level auto-sync with cross-user dedupe
 
+**SHIPPED 2026-08-30** (migration 033, `lib/server/account-auto-sync.ts`,
+`/api/auto-sync`, Settings card, darth-cli 0.42.0 `meetings auto-sync`).
+Decisions taken (Alok, 2026-08-30): Q3 default **off**; Q4 nudge the
+organiser via reminder **and Slack DM** (once per occurrence, daily re-check).
+Implementation deviates from the sketch below in one way: the sweep does not
+list calendars itself — it consumes the per-user 'unimported' reminders the
+poller already produces, groups them on a normalised `code|<UTC instant>`
+key (raw reminder keys carry each user's calendar TZ), elects ONE importer
+(organiser → earliest-connected, Drive files.get pre-check), and shares the
+rest in. Dedupe anchor is `auto_sync_log.occ_key` (PK = the claim), not a
+UNIQUE on `meetings.provider_key` (a meeting legitimately has two rows when
+two users import it by hand; the ledger is what stops the sweep).
+
 ### Problem
 Auto-import is opt-in per series. People want "import everything I'm in".
 If 5 people in a meeting all turn it on, we must import **once** and share,

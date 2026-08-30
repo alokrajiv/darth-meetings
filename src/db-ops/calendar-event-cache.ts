@@ -888,6 +888,28 @@ export interface CalendarEventImportRow {
  * `meetingCode` picks the latest PAST occurrence of that code (the "import
  * the one that just ended" case); `eventKey` is exact.
  */
+/** The caller's cached row for ONE specific occurrence (meeting code +
+ * start, ±60s) — the account auto-sync sweep's event source, where "latest
+ * past occurrence of this code" would be the wrong row for a backlog. */
+export async function findCalendarEventByOccurrence(
+  userId: string,
+  meetingCode: string,
+  startIso: string
+): Promise<CalendarEventImportRow | null> {
+  const rows = await sql<CalendarEventImportRow[]>`
+    SELECT event_key, event_id, recurring_event_id, ical_uid, title,
+           event_start, event_end, meeting_code, organizer_email, attendees,
+           attachment_video_file_id, attachment_transcript_doc_id
+    FROM ${sql(SCHEMA)}.calendar_event_cache
+    WHERE user_id = ${userId}
+      AND meeting_code = ${meetingCode}
+      AND abs(extract(epoch FROM (event_start - ${startIso}::timestamptz))) <= 60
+    ORDER BY abs(extract(epoch FROM (event_start - ${startIso}::timestamptz)))
+    LIMIT 1
+  `;
+  return rows[0] ?? null;
+}
+
 export async function findCalendarEventForImport(
   userId: string,
   ref: { meetingCode?: string; eventKey?: string }

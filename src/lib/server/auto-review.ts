@@ -23,7 +23,7 @@ import { notifyUser, APP_URL } from '@/lib/server/darth-notify';
  * VTT imports) need no resolution at all, and speakers with a single
  * utterance are noise the human reviewer routinely skips too.
  *
- * Only rows carrying gmeet_context.autoImport are ever touched — manual
+ * Only rows carrying gmeet_context.autoImport or .autoSync are touched — manual
  * imports and uploads keep the human gate unconditionally.
  */
 
@@ -42,8 +42,18 @@ function isDiarizationLabel(speaker: string): boolean {
 export async function maybeAutoReview(ownerUserId: string, assemblyaiId: string): Promise<void> {
   const row = await getForUser(ownerUserId, assemblyaiId);
   if (!row || row.status !== 'completed') return;
-  const auto = row.gmeet_context?.autoImport;
-  if (!auto) return;
+  const ai = row.gmeet_context?.autoImport;
+  const as = row.gmeet_context?.autoSync;
+  if (!ai && !as) return;
+  // One shape for both automatic paths: who ran it, how to describe the
+  // source in DMs, and everyone who should hear about it (account auto-sync
+  // watchers were shared onto the row and want the same notes-ready DM).
+  const auto = {
+    byUserId: (ai ?? as)!.byUserId,
+    byEmail: (ai ?? as)!.byEmail,
+    source: ai ? `series *${ai.seriesTitle ?? ai.seriesId}*` : 'account auto-sync',
+    recipients: Array.from(new Set([(ai ?? as)!.byEmail, ...(as?.watchers ?? [])])),
+  };
   if (row.gmeet_context?.autoReview) return; // evaluated once, ever
 
   const pref = row.gmeet_context?.uploadPrefs?.report ?? 'summary';
@@ -89,12 +99,14 @@ export async function maybeAutoReview(ownerUserId: string, assemblyaiId: string)
     await mergeGmeetContextForUser(ownerUserId, assemblyaiId, {
       autoReview: { evaluatedAt: nowIso, passed: false, reason: blocker },
     });
-    void notifyUser({
-      kind: 'needs_review',
-      toEmail: auto.byEmail,
-      text: `Auto-imported *${title}* from series *${auto.seriesTitle ?? auto.seriesId}* — speaker names need a quick review before the summary: <${url}|review speakers>`,
-      dedupeKey: `mw-needs-review:${assemblyaiId}`,
-    });
+    for (const to of auto.recipients) {
+      void notifyUser({
+        kind: 'needs_review',
+        toEmail: to,
+        text: `Auto-imported *${title}* (${auto.source}) — speaker names need a quick review before the summary: <${url}|review speakers>`,
+        dedupeKey: `mw-needs-review:${assemblyaiId}:${to}`,
+      });
+    }
     return;
   }
 
@@ -141,11 +153,13 @@ export async function maybeAutoReview(ownerUserId: string, assemblyaiId: string)
       ? after?.auto_notes_status === 'completed'
       : after?.auto_report_status === 'completed';
   if (ok) {
-    void notifyUser({
-      kind: 'report_ready',
-      toEmail: auto.byEmail,
-      text: `${pref === 'summary' ? 'Summary' : 'Detailed report'} ready for *${title}* (auto-imported from *${auto.seriesTitle ?? auto.seriesId}*, speakers auto-identified) → <${url}|open>`,
-      dedupeKey: `mw-report-ready:${assemblyaiId}`,
-    });
+    for (const to of auto.recipients) {
+      void notifyUser({
+        kind: 'report_ready',
+        toEmail: to,
+        text: `${pref === 'summary' ? 'Summary' : 'Detailed report'} ready for *${title}* (auto-imported via ${auto.source}, speakers auto-identified) → <${url}|open>`,
+        dedupeKey: `mw-report-ready:${assemblyaiId}:${to}`,
+      });
+    }
   }
 }

@@ -16,6 +16,7 @@ export const NOTIFY_KINDS = [
   'report_ready',
   'needs_review',
   'deferred_import',
+  'sync_request',
 ] as const;
 export type NotifyKind = (typeof NOTIFY_KINDS)[number];
 
@@ -26,8 +27,8 @@ export const NOTIFY_KIND_LABELS: Record<NotifyKind, { label: string; hint: strin
     hint: 'Someone deliberately shares a meeting with you.',
   },
   auto_import: {
-    label: 'Series auto-import fired',
-    hint: 'A series you auto-import picked up a new meeting.',
+    label: 'Auto-import / auto-sync fired',
+    hint: 'A series you auto-import, or your account auto-sync, picked up a new meeting.',
   },
   report_ready: {
     label: 'Summary / report ready',
@@ -40,6 +41,10 @@ export const NOTIFY_KIND_LABELS: Record<NotifyKind, { label: string; hint: strin
   deferred_import: {
     label: 'Queued import landed',
     hint: 'An import that waited on Google/Microsoft finished (or failed for good).',
+  },
+  sync_request: {
+    label: 'Colleagues need your import',
+    hint: 'Auto-sync wanted a meeting only your Google account can reach — one nudge per meeting.',
   },
 };
 

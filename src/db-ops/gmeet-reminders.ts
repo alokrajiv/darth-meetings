@@ -9,7 +9,57 @@ import { SCHEMAS } from '@/lib/constants/database';
 
 const SCHEMA = SCHEMAS.MEETING_WHISPERER;
 
-export type ReminderKind = 'unimported' | 'autorec_off';
+export type ReminderKind = 'unimported' | 'autorec_off' | 'sync_requested';
+
+/** Election input for the account auto-sync sweep (lib/server/account-
+ * auto-sync): every OPEN 'unimported' reminder of the given users, with the
+ * user's mutes already applied (gmeet_sync_skips + calendar_event_mutes by
+ * occurrence or series) — a muted meeting must never be auto-imported. */
+export interface UnimportedCandidateRow extends GmeetReminderRow {
+  user_id: string;
+  recurring_event_id: string | null;
+  cal_event_key: string | null;
+}
+
+export async function listOpenUnimportedForUsers(
+  userIds: string[]
+): Promise<UnimportedCandidateRow[]> {
+  if (userIds.length === 0) return [];
+  return sql<UnimportedCandidateRow[]>`
+    SELECT r.id, r.user_id, r.kind, r.event_key, r.meeting_code, r.title, r.event_start,
+           r.organizer_self, r.has_recording, r.has_transcript,
+           r.first_seen_at, r.last_seen_at,
+           c.recurring_event_id, c.event_key AS cal_event_key
+    FROM ${sql(SCHEMA)}.gmeet_reminders r
+    LEFT JOIN LATERAL (
+      SELECT c.recurring_event_id, c.event_key, c.event_id
+      FROM ${sql(SCHEMA)}.calendar_event_cache c
+      WHERE c.user_id = r.user_id
+        AND c.meeting_code = r.meeting_code
+        AND abs(extract(epoch FROM (c.event_start - r.event_start))) <= 60
+      ORDER BY c.event_start
+      LIMIT 1
+    ) c ON true
+    WHERE r.user_id = ANY(${userIds}::uuid[])
+      AND r.kind = 'unimported'
+      AND r.resolved_at IS NULL
+      AND r.meeting_code IS NOT NULL
+      AND NOT EXISTS (
+        SELECT 1 FROM ${sql(SCHEMA)}.gmeet_sync_skips s
+        WHERE s.user_id = r.user_id
+          AND (s.event_key = r.meeting_code OR s.event_key = r.event_key)
+      )
+      AND NOT EXISTS (
+        SELECT 1 FROM ${sql(SCHEMA)}.calendar_event_mutes m
+        WHERE m.user_id = r.user_id
+          AND (
+            (m.kind = 'occurrence' AND (m.value = r.event_key OR m.value = c.event_key))
+            OR (m.kind = 'series' AND m.value = COALESCE(c.recurring_event_id, c.event_id))
+          )
+      )
+    ORDER BY r.event_start ASC NULLS LAST
+  `;
+}
 
 export interface GmeetReminderRow {
   id: number;
@@ -101,14 +151,15 @@ export async function resolveReminderById(
 
 export async function resolveReminderByKey(
   userId: string,
-  kind: ReminderKind,
+  kind: ReminderKind | ReminderKind[],
   eventKey: string,
   reason: string
 ): Promise<void> {
+  const kinds = Array.isArray(kind) ? kind : [kind];
   await sql`
     UPDATE ${sql(SCHEMA)}.gmeet_reminders
     SET resolved_at = now(), resolved_reason = ${reason}
-    WHERE user_id = ${userId} AND kind = ${kind} AND event_key = ${eventKey}
+    WHERE user_id = ${userId} AND kind = ANY(${kinds}) AND event_key = ${eventKey}
       AND resolved_at IS NULL
   `;
 }

@@ -7,7 +7,7 @@ import { MeetLogo, TeamsLogo } from '@/components/provider-icon';
 
 export interface Reminder {
   id: number;
-  kind: 'unimported' | 'autorec_off';
+  kind: 'unimported' | 'autorec_off' | 'sync_requested';
   meetingCode: string | null;
   title: string | null;
   eventStart: string | null;
@@ -120,6 +120,13 @@ export function GmeetRemindersCard({
                 {r.hasRecording && <Clapperboard className="h-3.5 w-3.5" aria-label="Has recording" />}
                 {r.hasTranscript && <FileText className="h-3.5 w-3.5" aria-label="Has transcript" />}
                 not imported
+              </span>
+            ) : r.kind === 'sync_requested' ? (
+              <span
+                className="shrink-0 text-[11px] text-sky-700 dark:text-sky-300"
+                title="Colleagues have auto-sync on and want this meeting, but only your Google account can reach its artifacts — import it once, or turn on auto-sync in Settings."
+              >
+                colleagues need your import
               </span>
             ) : (
               <span className="shrink-0 text-[11px] text-amber-600">

@@ -87,6 +87,7 @@ export interface ImportBody {
    * defer placeholders and survives promotion via the frozen request. */
   contextExtra?: {
     autoImport?: GmeetContext['autoImport'];
+    autoSync?: GmeetContext['autoSync'];
     uploadPrefs?: GmeetContext['uploadPrefs'];
   };
   event?: {

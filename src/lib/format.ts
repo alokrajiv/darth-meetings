@@ -300,6 +300,7 @@ export interface GmeetContext {
        * so they survive the placeholder→real-row promotion in every mode. */
       contextExtra?: {
         autoImport?: GmeetContext['autoImport'];
+        autoSync?: GmeetContext['autoSync'];
         uploadPrefs?: GmeetContext['uploadPrefs'];
       };
     };
@@ -334,6 +335,18 @@ export interface GmeetContext {
     occKey: string;
     byUserId: string;
     byEmail: string;
+    at: string;
+  } | null;
+  /** Stamped by the ACCOUNT auto-sync sweep (T2, lib/server/account-auto-
+   * sync) on rows it fires: which occurrence, whose Google connection ran
+   * the import (the elected importer) and which other auto-sync users
+   * wanted it (watchers — shared in and DM'd alongside the importer). Arms
+   * the automatic speaker-review evaluation exactly like autoImport. */
+  autoSync?: {
+    occKey: string;
+    byUserId: string;
+    byEmail: string;
+    watchers: string[];
     at: string;
   } | null;
   /** Outcome of the automatic speaker-review evaluation that runs after the

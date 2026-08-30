@@ -73,6 +73,7 @@ export interface TeamsImportBody {
    * promotion via the frozen request. */
   contextExtra?: {
     autoImport?: GmeetContext['autoImport'];
+    autoSync?: GmeetContext['autoSync'];
     uploadPrefs?: GmeetContext['uploadPrefs'];
   };
 }

@@ -9,6 +9,7 @@ import { VocabEditor } from '@/components/vocab-editor';
 import { GoogleAccountCard } from '@/components/google-account-card';
 import { MicrosoftAccountCard } from '@/components/microsoft-account-card';
 import { NotifyPrefsCard } from '@/components/notify-prefs-card';
+import { AutoSyncCard } from '@/components/auto-sync-card';
 import type { VocabPayload } from '@/lib/format';
 
 interface OrgVocabMeta {
@@ -110,6 +111,7 @@ export default function SettingsPage() {
       <div className="mb-6 space-y-6">
         <GoogleAccountCard />
         <MicrosoftAccountCard />
+        <AutoSyncCard />
         <NotifyPrefsCard />
       </div>
 
