@@ -71,3 +71,97 @@ export async function searchVisibleTranscripts(
     LIMIT ${limit}
   `;
 }
+
+/** Thrown for user-fixable regex problems (bad pattern, timeout) → HTTP 400. */
+export class RegexSearchError extends Error {
+  constructor(
+    message: string,
+    public readonly kind: 'invalid' | 'timeout'
+  ) {
+    super(message);
+  }
+}
+
+const MAX_REGEX_LEN = 200;
+
+/**
+ * Regex deep search (T5): same five fields, same visibility rules and hit
+ * shape as searchVisibleTranscripts, but the query is a POSIX regex matched
+ * case-insensitively (`~*`). Guards: pattern length cap + a 5s LOCAL
+ * statement_timeout (PG's regex engine is not catastrophic-backtracking-safe
+ * in general). Snippet = first match with ±40 chars of context, cut in SQL.
+ */
+export async function regexSearchVisibleTranscripts(
+  userId: string,
+  email: string,
+  pattern: string,
+  limit = 50,
+  filters: MeetingFilters = EMPTY_MEETING_FILTERS
+): Promise<TranscriptSearchHit[]> {
+  const re = pattern.trim();
+  if (re.length < 2) return [];
+  if (re.length > MAX_REGEX_LEN) {
+    throw new RegexSearchError(`pattern too long (max ${MAX_REGEX_LEN} chars)`, 'invalid');
+  }
+  const normEmail = email.trim().toLowerCase();
+  // First match + context, case-insensitively. The user pattern is wrapped in
+  // a non-capturing group so the OUTER capture stays the first group even
+  // when the pattern contains its own parens; substring() returns capture 1.
+  const snip = `(.{0,40}(?:${re}).{0,40})`;
+  try {
+    return await sql.begin(async (tx) => {
+      await tx`SET LOCAL statement_timeout = '5s'`;
+      return tx<TranscriptSearchHit[]>`
+        SELECT assemblyai_id, matched_in, snippet FROM (
+          SELECT
+            t.assemblyai_id,
+            t.created_at,
+            CASE
+              WHEN t.title ~* ${re} THEN 'title'
+              WHEN t.original_filename ~* ${re} THEN 'filename'
+              WHEN t.description ~* ${re} THEN 'description'
+              WHEN t.auto_notes ~* ${re} THEN 'notes'
+              ELSE 'content'
+            END AS matched_in,
+            CASE
+              WHEN t.title ~* ${re} OR t.original_filename ~* ${re} THEN NULL
+              WHEN t.description ~* ${re} THEN substring(t.description FROM ('(?i)' || ${snip}))
+              WHEN t.auto_notes ~* ${re} THEN substring(t.auto_notes FROM ('(?i)' || ${snip}))
+              ELSE substring(t.imported_content->>'text' FROM ('(?i)' || ${snip}))
+            END AS snippet
+          FROM ${sql(SCHEMA)}.transcripts t
+          LEFT JOIN ${sql(SCHEMA)}.transcript_shares s
+            ON s.transcript_id = t.id
+           AND s.shared_with_email = ${normEmail}
+          WHERE (t.user_id = ${userId} OR s.id IS NOT NULL)
+            AND t.deleted_at IS NULL
+            AND (
+              t.title ~* ${re}
+              OR t.original_filename ~* ${re}
+              OR t.description ~* ${re}
+              OR t.auto_notes ~* ${re}
+              OR t.imported_content->>'text' ~* ${re}
+            )
+            ${archiveFilterSql(filters)}
+        ) hits
+        ORDER BY created_at DESC
+        LIMIT ${limit}
+      `;
+    });
+  } catch (err) {
+    const code = (err as { code?: string }).code;
+    if (code === '2201B' || code === '22025' || code === '22P02') {
+      throw new RegexSearchError(
+        `invalid regex: ${(err as Error).message}`,
+        'invalid'
+      );
+    }
+    if (code === '57014') {
+      throw new RegexSearchError(
+        'regex search timed out after 5s — narrow the pattern or add filters',
+        'timeout'
+      );
+    }
+    throw err;
+  }
+}

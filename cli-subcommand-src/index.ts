@@ -33,8 +33,10 @@ READ
   report <id>                     Print the detailed-report markdown
   search <query> [FILTERS]        Server-side deep search (title, filename,
                                   description, notes, full text) with snippets;
-                                  --participant/--organizer/--provider/--speaker
-                                  narrow the hits (no --from/--to/--q here)
+                                  --regex = query is a case-insensitive POSIX
+                                  regex (5s server cap; bad pattern → clear
+                                  error). --participant/--organizer/--provider/
+                                  --speaker narrow the hits (no --from/--to/--q)
   export --out-dir <dir> [FILTERS] [--format text|json] [--force]
                                   Bulk-dump the filtered archive: one file per
                                   transcript, <dir>/<YYYY-MM-DD>-<title-slug>-<id>
@@ -79,6 +81,16 @@ LABELS (org-wide, hierarchical 'Customers/LP Global/QBR', many per transcript;
                                   meetings go with it
 
 WRITE (needs read+write for meetings)
+  import <meeting-code|event-key> [--mode transcript|video|both] [--wait]
+                                  [--timeout <mins>]
+                                  Import a meeting from your calendar by the
+                                  [meeting-code] shown in 'calendar' (or an
+                                  exact event key). Runs server-side under
+                                  your backend Google link (Teams: app-only);
+                                  not-ready artifacts queue automatically.
+                                  Prints the transcript id + the stable
+                                  /m/<uuid> link. --wait polls until the
+                                  import completes (default cap 30 min)
   set-title <id> <title>          Update the title
   set-notes <id> --file <md|->    Replace the notes markdown ('-' = stdin)
   set-report <id> --file <md|->   Replace the report markdown ('-' = stdin)
@@ -110,8 +122,8 @@ and "labels": [{id,name,path,color}]; filtered 'list' lines show a
 IDS: <id> is the transcript id shown by 'list' (also in web URLs:
 /transcript/<id>). Timestamps in 'text' output are utterance starts — feed
 them to 'frame' to see what was on screen at that moment. 'calendar' rows
-are NOT importable by id from here — they show [meeting-code] for
-cross-reference; importing stays a web-UI action (your own Google token).
+show [meeting-code] — feed it to 'import' to import the occurrence from
+here (server-side, your backend Google link; Teams runs app-only).
 
 If the server is unreachable, the user is probably off the company VPN/
 tailnet — say so and wait; don't retry-loop.
@@ -149,7 +161,9 @@ file reads. A 404 means that transcript has no video.
 
 ## Searching & filtering
 
-'search <query>' is a server-side deep search (ILIKE) across titles,
+'search <query>' is a server-side deep search (ILIKE; --regex switches the
+query to a case-insensitive POSIX regex — alternation, \m..\M word
+boundaries, quantifiers all work) across titles,
 filenames, descriptions, notes and full transcript text — use it to FIND
 meetings. For regex/precise analysis, fetch 'text <id>' and grep locally.
 
@@ -267,6 +281,11 @@ function readMarkdownFlag(fileFlag: string | undefined): string | null {
     console.error(`--file: ${e?.message || e}`);
     return null;
   }
+}
+
+/** Web-app base for printable links — same host the meetings API lives on. */
+function webBase(ctx: Ctx): string {
+  return (ctx.config.meetingsUrl || "https://meetings.darth-internal.trames.io").replace(/\/+$/, "");
 }
 
 // ---------------------------------------------------------------------------
@@ -820,10 +839,11 @@ const meetings: Subcommand = {
 
       case "search": {
         const q = args.join(" ").trim();
-        if (q.length < 2) { console.error("usage: darth-cli meetings search <query> [--participant --organizer --provider --speaker]  (2+ chars)"); return 1; }
+        if (q.length < 2) { console.error("usage: darth-cli meetings search <query> [--regex] [--participant --organizer --provider --speaker]  (2+ chars)"); return 1; }
         const fr = readFilterFlags(ctx, flags, PEOPLE_FLAGS);
         if (!fr.ok) { console.error(fr.error); return 1; }
         fr.params.set("q", q);
+        if (flags.regex === true) fr.params.set("regex", "1");
         const data = await ctx.expectJson<{ hits: any[] }>(
           ctx.api("meetings", `/api/transcripts/search?${fr.params.toString()}`));
         ctx.print(data.hits, () => {
@@ -833,6 +853,55 @@ const meetings: Subcommand = {
           }
           console.log(`\n${data.hits.length} hit(s) — 'darth-cli meetings text <id>' for the full transcript`);
         });
+        return 0;
+      }
+
+      case "import": {
+        const ref = args[0]?.trim();
+        if (!ref) { console.error("usage: darth-cli meetings import <meeting-code|event-key> [--mode transcript|video|both] [--wait] [--timeout <mins>]"); return 1; }
+        ctx.requireWrite();
+        const mode = str(flags.mode) || "transcript";
+        if (!["transcript", "video", "both"].includes(mode)) { console.error("--mode must be transcript, video or both"); return 1; }
+        // '<eventId>|<startIso>' = event key; anything else = meeting code.
+        const body = ref.includes("|") ? { eventKey: ref, mode } : { meetingCode: ref, mode };
+        const res = await ctx.api("meetings", `/api/meetings/import`, {
+          method: "POST", body: JSON.stringify(body) });
+        const data: any = await res.json().catch(() => null);
+        if (!res.ok) {
+          console.error(`Import failed (HTTP ${res.status}): ${data?.error ?? "unknown error"}`);
+          return 1;
+        }
+        let t: any = data.transcript;
+        const mUrl = data.meetingUrl ? `${webBase(ctx)}${data.meetingUrl}` : null;
+        const say = (line: string) => { if (!ctx.json) console.log(line); };
+        say(res.status === 201
+          ? `Imported: ${t?.assemblyai_id}  "${t?.title ?? ""}"`
+          : `Queued (${data.waitingFor ?? "processing"}): ${t?.assemblyai_id}`);
+        if (mUrl) say(`Link (stable): ${mUrl}`);
+        if (flags.wait === true && res.status === 202 && t?.assemblyai_id) {
+          const capMin = Number(str(flags.timeout) || "30");
+          const deadline = Date.now() + Math.max(1, capMin) * 60_000;
+          let id: string = t.assemblyai_id;
+          say(`Waiting for completion (up to ${capMin} min, poll 10s)…`);
+          while (Date.now() < deadline) {
+            await new Promise((r) => setTimeout(r, 10_000));
+            // Placeholder ids get renamed on promotion — re-resolve each poll.
+            const rr = await ctx.api("meetings", `/api/meetings/resolve?any=${encodeURIComponent(id)}`);
+            if (rr.ok) {
+              const j: any = await rr.json().catch(() => null);
+              if (j?.transcriptId && j.transcriptId !== id) { id = j.transcriptId; say(`… promoted to ${id}`); }
+            }
+            const gr = await ctx.api("meetings", `/api/transcripts/${id}`);
+            if (!gr.ok) continue; // brief gap mid-promotion — next poll catches up
+            const gj: any = await gr.json().catch(() => null);
+            const st = gj?.transcript?.status;
+            if (st === "completed") { t = gj.transcript; say(`Done: ${id}  "${t.title ?? ""}"  (${fmtDuration(t.duration)})`); ctx.print({ transcript: t, meetingUrl: mUrl }, () => {}); return 0; }
+            if (st === "error") { console.error(`Import errored: ${gj?.transcript?.error ?? "see the web app"}`); return 1; }
+          }
+          console.error(`Still not done after ${capMin} min — it keeps running server-side; check later with 'get ${id}'.`);
+          return 1;
+        }
+        ctx.print({ status: res.status, transcript: t, meetingUrl: mUrl }, () => {});
         return 0;
       }
 

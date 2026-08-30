@@ -865,3 +865,43 @@ export async function listCalendarMeetingsPage(
     hasMore,
   };
 }
+
+export interface CalendarEventImportRow {
+  event_key: string;
+  event_id: string;
+  recurring_event_id: string | null;
+  ical_uid: string | null;
+  title: string | null;
+  event_start: string;
+  event_end: string | null;
+  meeting_code: string | null;
+  organizer_email: string | null;
+  attendees: CalendarEventAttendee[] | null;
+  attachment_video_file_id: string | null;
+  attachment_transcript_doc_id: string | null;
+}
+
+/**
+ * The CALLER's cached calendar row for an occurrence they want to import
+ * (CLI/API import-by-code, T3). Caller-scoped by construction — rows in this
+ * cache are per-user from their own sweeps, so involvement is implicit.
+ * `meetingCode` picks the latest PAST occurrence of that code (the "import
+ * the one that just ended" case); `eventKey` is exact.
+ */
+export async function findCalendarEventForImport(
+  userId: string,
+  ref: { meetingCode?: string; eventKey?: string }
+): Promise<CalendarEventImportRow | null> {
+  if (!ref.meetingCode && !ref.eventKey) return null;
+  const rows = await sql<CalendarEventImportRow[]>`
+    SELECT event_key, event_id, recurring_event_id, ical_uid, title,
+           event_start, event_end, meeting_code, organizer_email, attendees,
+           attachment_video_file_id, attachment_transcript_doc_id
+    FROM ${sql(SCHEMA)}.calendar_event_cache
+    WHERE user_id = ${userId}
+      AND ${ref.eventKey ? sql`event_key = ${ref.eventKey}` : sql`meeting_code = ${ref.meetingCode!} AND event_start <= now()`}
+    ORDER BY event_start DESC
+    LIMIT 1
+  `;
+  return rows[0] ?? null;
+}

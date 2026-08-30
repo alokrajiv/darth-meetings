@@ -1,6 +1,10 @@
 import { NextResponse } from 'next/server';
 import { withAuth } from '@/lib/auth/with-auth';
-import { searchVisibleTranscripts } from '@/db-ops/transcript-search';
+import {
+  RegexSearchError,
+  regexSearchVisibleTranscripts,
+  searchVisibleTranscripts,
+} from '@/db-ops/transcript-search';
 import { parseMeetingFilters } from '@/lib/server/meeting-filters';
 
 export const runtime = 'nodejs';
@@ -21,6 +25,18 @@ export const GET = withAuth(async ({ user, request }) => {
   // NUL bytes (which Postgres would reject with a 500).
   const q = parsed.filters.q;
   if (!q) return NextResponse.json({ hits: [] });
+  // regex=1 (T5): q is a POSIX regex, matched case-insensitively server-side.
+  if (params.get('regex') === '1') {
+    try {
+      const hits = await regexSearchVisibleTranscripts(user.userId, user.email, q, 50, parsed.filters);
+      return NextResponse.json({ hits, regex: true });
+    } catch (err) {
+      if (err instanceof RegexSearchError) {
+        return NextResponse.json({ error: err.message }, { status: 400 });
+      }
+      throw err;
+    }
+  }
   const hits = await searchVisibleTranscripts(user.userId, user.email, q, 50, parsed.filters);
   return NextResponse.json({ hits });
 });
