@@ -671,13 +671,15 @@ export function CalendarEventRow({
           {statusGlyph(r)}
           {providerGlyph(r)}
           <div className="min-w-0 flex-1">
-            {/* overflow-hidden + a title floor: the badges are shrink-0, so
-                on a narrow column the title (the only shrinkable item) used
-                to collapse to zero width and the row read as nameless —
-                clip trailing badges instead. */}
-            <div className="flex min-w-0 items-center gap-2 overflow-hidden">
+            {/* flex-wrap: badges that don't fit drop to a second line
+                instead of being clipped (clipping hid the evidence verdict
+                and made crowded rows unreadable, 2026-08-30). The title
+                keeps its floor + truncate for pathological lengths, with
+                the full text on hover. */}
+            <div className="flex min-w-0 flex-wrap items-center gap-x-2 gap-y-0.5">
               <div
-                className={`min-w-[7rem] truncate text-sm ${
+                title={r.title?.trim() || undefined}
+                className={`min-w-[7rem] max-w-full truncate text-sm ${
                   r.title?.trim()
                     ? 'font-medium text-foreground/80'
                     : 'italic text-muted-foreground'
