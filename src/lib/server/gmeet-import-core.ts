@@ -924,9 +924,18 @@ export async function executeGmeetImport(
     // Repoint the meeting FIRST so the placeholder's /m/ uuid (handed out at
     // click time) survives onto the real row instead of being orphan-cleaned.
     if (opts?.placeholderAssemblyaiId) {
-      await repointMeeting(opts.placeholderAssemblyaiId, row.assemblyai_id).catch((err) =>
-        console.error('[meetings] repoint failed', opts.placeholderAssemblyaiId, err)
-      );
+      // Retry once: if the repoint fails twice the placeholder's meeting row
+      // would be orphan-cleaned by the delete below and the click-time /m/
+      // uuid lost — a second attempt covers transient DB hiccups (review
+      // finding "repoint failure + placeholder delete destroys the link").
+      try {
+        await repointMeeting(opts.placeholderAssemblyaiId, row.assemblyai_id);
+      } catch (err) {
+        console.error('[meetings] repoint failed, retrying once', opts.placeholderAssemblyaiId, err);
+        await repointMeeting(opts.placeholderAssemblyaiId, row.assemblyai_id).catch((err2) =>
+          console.error('[meetings] repoint retry failed — click-time /m/ link will be lost', opts.placeholderAssemblyaiId, err2)
+        );
+      }
       await deleteForUser(user.userId, opts.placeholderAssemblyaiId);
     }
 

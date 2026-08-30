@@ -124,6 +124,15 @@ function TranscriptDetailInner({ transcriptId }: { transcriptId: string }) {
   // timer) started for a previous id must never setRow() onto this page.
   const liveIdRef = useRef(transcriptId);
   liveIdRef.current = transcriptId;
+  // The keyed remount means an old instance unmounts rather than seeing a
+  // new id — so async work also checks unmountedRef before navigating.
+  const unmountedRef = useRef(false);
+  useEffect(() => {
+    unmountedRef.current = false;
+    return () => {
+      unmountedRef.current = true;
+    };
+  }, []);
 
   const [row, setRow] = useState<StoredTranscript | null>(null);
   const [access, setAccess] = useState<TranscriptAccess>('owner');
@@ -447,6 +456,7 @@ function TranscriptDetailInner({ transcriptId }: { transcriptId: string }) {
           const res = await fetch(`/api/meetings/resolve?any=${encodeURIComponent(transcriptId)}`);
           if (res.ok) {
             const j = (await res.json()) as { moved?: boolean; transcriptId?: string };
+            if (unmountedRef.current) return; // user already left this page
             if (j.moved && j.transcriptId) {
               router.replace(`/transcript/${j.transcriptId}`);
               return;
@@ -455,6 +465,7 @@ function TranscriptDetailInner({ transcriptId }: { transcriptId: string }) {
         } catch {
           // resolve is best-effort — fall through to the plain 404
         }
+        if (unmountedRef.current) return;
         setError('Transcript not found');
         return;
       }

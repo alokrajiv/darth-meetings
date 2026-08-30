@@ -75,11 +75,16 @@ export const POST = withAuth(async ({ user, request }) => {
   }
 
   const importUser = { userId: user.userId, email: user.email };
+  // postgres.js returns timestamptz columns as JS Date objects; the execute
+  // cores (and the frozen deferred-import request) expect ISO strings like
+  // every other caller sends (review finding).
+  const startIso = new Date(row.event_start).toISOString();
+  const endIso = row.event_end ? new Date(row.event_end).toISOString() : undefined;
   const event = {
     id: row.event_id,
     title: row.title ?? undefined,
-    startTime: row.event_start,
-    endTime: row.event_end ?? undefined,
+    startTime: startIso,
+    endTime: endIso,
     meetingCode: row.meeting_code,
     recurringEventId: row.recurring_event_id ?? undefined,
     iCalUID: row.ical_uid ?? undefined,
@@ -89,7 +94,7 @@ export const POST = withAuth(async ({ user, request }) => {
 
   let outcome: { status: number; body: Record<string, unknown> };
   if (row.meeting_code.startsWith('teams-')) {
-    const url = await getTeamsJoinUrlByMeeting(row.meeting_code, row.event_start);
+    const url = await getTeamsJoinUrlByMeeting(row.meeting_code, startIso);
     if (!url) {
       return NextResponse.json(
         {

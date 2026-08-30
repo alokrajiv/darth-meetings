@@ -107,9 +107,15 @@ export async function regexSearchVisibleTranscripts(
   // First match + context, case-insensitively. The user pattern is wrapped in
   // a non-capturing group so the OUTER capture stays the first group even
   // when the pattern contains its own parens; substring() returns capture 1.
+  //
+  // The wrapping can make an otherwise-valid pattern ILLEGAL as a snippet
+  // regex — PG only allows embedded options like (?i) at the very start of
+  // an RE, and the added groups renumber backreferences (review finding). So
+  // when the wrapped form doesn't compile but the raw pattern does, run the
+  // search with NULL snippets instead of failing the whole request.
   const snip = `(.{0,40}(?:${re}).{0,40})`;
-  try {
-    return await sql.begin(async (tx) => {
+  const run = (withSnippets: boolean) =>
+    sql.begin(async (tx) => {
       await tx`SET LOCAL statement_timeout = '5s'`;
       return tx<TranscriptSearchHit[]>`
         SELECT assemblyai_id, matched_in, snippet FROM (
@@ -124,6 +130,7 @@ export async function regexSearchVisibleTranscripts(
               ELSE 'content'
             END AS matched_in,
             CASE
+              WHEN NOT ${withSnippets} THEN NULL
               WHEN t.title ~* ${re} OR t.original_filename ~* ${re} THEN NULL
               WHEN t.description ~* ${re} THEN substring(t.description FROM ('(?i)' || ${snip}))
               WHEN t.auto_notes ~* ${re} THEN substring(t.auto_notes FROM ('(?i)' || ${snip}))
@@ -148,6 +155,16 @@ export async function regexSearchVisibleTranscripts(
         LIMIT ${limit}
       `;
     });
+  try {
+    // Probe whether the WRAPPED snippet form compiles; the raw pattern is
+    // exercised by the search itself (bad raw pattern → 400 below either way).
+    let snippetsOk = true;
+    try {
+      await sql`SELECT '' ~ ('(?i)' || ${snip})`;
+    } catch {
+      snippetsOk = false;
+    }
+    return await run(snippetsOk);
   } catch (err) {
     const code = (err as { code?: string }).code;
     if (code === '2201B' || code === '22025' || code === '22P02') {

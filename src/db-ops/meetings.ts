@@ -82,11 +82,19 @@ export async function ensureMeeting(input: {
 export async function repointMeeting(fromId: string, toId: string): Promise<void> {
   if (fromId === toId) return;
   await sql.begin(async (tx) => {
-    const old = await tx<MeetingRow[]>`
-      SELECT * FROM ${sql(SCHEMA)}.meetings WHERE transcript_id = ${fromId} FOR UPDATE
+    // Lock both rows in a deterministic order so two concurrent repoints
+    // (two users' placeholders fulfilling for the same final id) serialize
+    // instead of deadlocking.
+    const rows = await tx<MeetingRow[]>`
+      SELECT * FROM ${sql(SCHEMA)}.meetings
+      WHERE transcript_id IN (${fromId}, ${toId})
+      ORDER BY id
+      FOR UPDATE
     `;
-    if (!old[0]) {
-      // Nothing to repoint — make sure the new id at least has a row.
+    const from = rows.find((r) => r.transcript_id === fromId) ?? null;
+    const to = rows.find((r) => r.transcript_id === toId) ?? null;
+
+    if (!from && !to) {
       await tx`
         INSERT INTO ${sql(SCHEMA)}.meetings (transcript_id, provider, former_ids)
         VALUES (${toId}, ${meetingIdentityFrom(toId).provider}, ${sql.array([fromId])})
@@ -98,30 +106,72 @@ export async function repointMeeting(fromId: string, toId: string): Promise<void
       `;
       return;
     }
-    const usurper = await tx<MeetingRow[]>`
-      DELETE FROM ${sql(SCHEMA)}.meetings WHERE transcript_id = ${toId} AND id <> ${old[0].id}
-      RETURNING former_ids, provider_key, title_hint
-    `;
+    if (!from && to) {
+      // The rename's source never had a row — just remember the old id.
+      await tx`
+        UPDATE ${sql(SCHEMA)}.meetings SET
+          former_ids = ${sql.array(Array.from(new Set([...to.former_ids, fromId])))},
+          updated_at = now()
+        WHERE id = ${to.id}
+      `;
+      return;
+    }
+    if (from && !to) {
+      // Plain rename (the common promotion path).
+      await tx`
+        UPDATE ${sql(SCHEMA)}.meetings SET
+          transcript_id = ${toId},
+          former_ids = ${sql.array(Array.from(new Set([...from.former_ids, fromId])).filter((x) => x !== toId))},
+          provider = ${meetingIdentityFrom(toId).provider === 'upload' ? from.provider : meetingIdentityFrom(toId).provider},
+          updated_at = now()
+        WHERE id = ${from.id}
+      `;
+      return;
+    }
+    // BOTH exist: the two rows are the same meeting. Survivor = the OLDER
+    // uuid (an established, possibly-shared link always outranks the row a
+    // hook minted moments ago); the loser's uuid becomes an ALIAS so any
+    // /m/<loser-uuid> link someone copied keeps resolving forever
+    // (migration 032; review finding "usurper fold deletes established
+    // stable meeting uuids").
+    const older =
+      new Date(from!.created_at).getTime() <= new Date(to!.created_at).getTime() ? from! : to!;
+    const loser = older.id === from!.id ? to! : from!;
     const mergedFormer = Array.from(
-      new Set([...old[0].former_ids, fromId, ...(usurper[0]?.former_ids ?? [])])
+      new Set([...from!.former_ids, ...to!.former_ids, fromId])
     ).filter((x) => x !== toId);
+    await tx`
+      UPDATE ${sql(SCHEMA)}.meeting_aliases SET meeting_id = ${older.id} WHERE meeting_id = ${loser.id}
+    `;
+    await tx`DELETE FROM ${sql(SCHEMA)}.meetings WHERE id = ${loser.id}`;
+    await tx`
+      INSERT INTO ${sql(SCHEMA)}.meeting_aliases (alias, meeting_id)
+      VALUES (${loser.id}, ${older.id})
+      ON CONFLICT (alias) DO UPDATE SET meeting_id = ${older.id}
+    `;
     await tx`
       UPDATE ${sql(SCHEMA)}.meetings SET
         transcript_id = ${toId},
         former_ids = ${sql.array(mergedFormer)},
-        provider = ${meetingIdentityFrom(toId).provider === 'upload' ? old[0].provider : meetingIdentityFrom(toId).provider},
-        provider_key = COALESCE(provider_key, ${usurper[0]?.provider_key ?? null}),
-        title_hint = COALESCE(${usurper[0]?.title_hint ?? null}, title_hint),
+        provider = ${meetingIdentityFrom(toId).provider === 'upload' ? older.provider : meetingIdentityFrom(toId).provider},
+        provider_key = COALESCE(provider_key, ${loser.provider_key}),
+        title_hint = COALESCE(title_hint, ${loser.title_hint}),
         updated_at = now()
-      WHERE id = ${old[0].id}
+      WHERE id = ${older.id}
     `;
   });
 }
 
-/** `/m/<uuid>` lookup. */
+/** `/m/<uuid>` lookup — falls through to the alias table (migration 032)
+ * so a uuid whose row was folded into a survivor still resolves. */
 export async function getMeetingById(id: string): Promise<MeetingRow | null> {
   const rows = await sql<MeetingRow[]>`
-    SELECT * FROM ${sql(SCHEMA)}.meetings WHERE id = ${id}
+    SELECT m.* FROM ${sql(SCHEMA)}.meetings m WHERE m.id = ${id}
+    UNION ALL
+    SELECT m.* FROM ${sql(SCHEMA)}.meetings m
+    JOIN ${sql(SCHEMA)}.meeting_aliases a ON a.meeting_id = m.id
+    WHERE a.alias = ${id}
+    LIMIT 1
   `;
   return rows[0] ?? null;
 }

@@ -869,9 +869,12 @@ export async function promoteUploadingRow(
   `;
   if (rows[0]) {
     publishEvent({ kind: 'status', assemblyaiId: data.assemblyaiId });
-    await repointMeeting(placeholderId, data.assemblyaiId).catch((err) =>
-      console.error('[meetings] repoint failed', placeholderId, '->', data.assemblyaiId, err)
-    );
+    await repointMeeting(placeholderId, data.assemblyaiId).catch(async (err) => {
+      console.error('[meetings] repoint failed, retrying once', placeholderId, '->', data.assemblyaiId, err);
+      await repointMeeting(placeholderId, data.assemblyaiId).catch((err2) =>
+        console.error('[meetings] repoint retry failed — /m/ link stuck on the dead placeholder id', placeholderId, err2)
+      );
+    });
   }
   return rows[0] ?? null;
 }

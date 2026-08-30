@@ -988,9 +988,14 @@ const meetings: Subcommand = {
           : `Queued (${data.waitingFor ?? "processing"}): ${t?.assemblyai_id}`);
         if (mUrl) say(`Link (stable): ${mUrl}`);
         if (flags.wait === true && res.status === 202 && t?.assemblyai_id) {
-          const capMin = Number(str(flags.timeout) || "30");
-          const deadline = Date.now() + Math.max(1, capMin) * 60_000;
+          const capMin = Number(str(flags.timeout) ?? "30");
+          if (!Number.isFinite(capMin) || capMin <= 0) {
+            console.error(`--timeout must be a number of minutes (got '${str(flags.timeout)}')`);
+            return 1;
+          }
+          const deadline = Date.now() + capMin * 60_000;
           let id: string = t.assemblyai_id;
+          let gone = 0; // consecutive polls where BOTH resolve and get 404'd
           say(`Waiting for completion (up to ${capMin} min, poll 10s)…`);
           while (Date.now() < deadline) {
             await new Promise((r) => setTimeout(r, 10_000));
@@ -1001,7 +1006,21 @@ const meetings: Subcommand = {
               if (j?.transcriptId && j.transcriptId !== id) { id = j.transcriptId; say(`… promoted to ${id}`); }
             }
             const gr = await ctx.api("meetings", `/api/transcripts/${id}`);
-            if (!gr.ok) continue; // brief gap mid-promotion — next poll catches up
+            if (!gr.ok) {
+              // One 404 can be the promotion gap; SIX in a row (a minute)
+              // with resolve also blank means the queued row was retired
+              // without a successor (e.g. Google's transcript Doc was empty)
+              // — stop instead of spinning to the timeout.
+              gone = !rr.ok && gr.status === 404 ? gone + 1 : 0;
+              if (gone >= 6) {
+                console.error(
+                  "The queued import is gone without a successor — most often the provider's transcript was empty (nothing to import). Check the meeting in the web app."
+                );
+                return 1;
+              }
+              continue;
+            }
+            gone = 0;
             const gj: any = await gr.json().catch(() => null);
             const st = gj?.transcript?.status;
             if (st === "completed") { t = gj.transcript; say(`Done: ${id}  "${t.title ?? ""}"  (${fmtDuration(t.duration)})`); ctx.print({ transcript: t, meetingUrl: mUrl }, () => {}); return 0; }
