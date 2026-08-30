@@ -440,6 +440,21 @@ function TranscriptDetailInner({ transcriptId }: { transcriptId: string }) {
       if (liveIdRef.current !== transcriptId) return;
 
       if (rowRes.status === 404) {
+        // Self-heal stale ids (T1): a queued placeholder (defer-…/up-…) gets
+        // renamed on promotion — ask the meetings ledger whether this id is a
+        // FORMER id and hop to the current one instead of dead-ending.
+        try {
+          const res = await fetch(`/api/meetings/resolve?any=${encodeURIComponent(transcriptId)}`);
+          if (res.ok) {
+            const j = (await res.json()) as { moved?: boolean; transcriptId?: string };
+            if (j.moved && j.transcriptId) {
+              router.replace(`/transcript/${j.transcriptId}`);
+              return;
+            }
+          }
+        } catch {
+          // resolve is best-effort — fall through to the plain 404
+        }
         setError('Transcript not found');
         return;
       }

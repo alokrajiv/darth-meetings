@@ -3,6 +3,12 @@ import { sql } from '@/lib/db';
 import { SCHEMAS } from '@/lib/constants/database';
 import { publishEvent } from '@/lib/server/event-bus';
 import {
+  cleanupMeetingIfOrphan,
+  ensureMeeting,
+  meetingIdentityFrom,
+  repointMeeting,
+} from '@/db-ops/meetings';
+import {
   archiveFilterSql,
   archiveParticipantsExpr,
 } from '@/db-ops/meeting-filter-sql';
@@ -617,6 +623,22 @@ export async function getForUser(
   return rows[0] ?? null;
 }
 
+
+/** Best-effort meetings bookkeeping (T1) — must never fail the row write. */
+async function trackMeeting(
+  transcriptId: string,
+  ctx: GmeetContext | null | undefined,
+  title: string | null | undefined,
+  userId: string
+): Promise<void> {
+  try {
+    const { provider, providerKey } = meetingIdentityFrom(transcriptId, ctx);
+    await ensureMeeting({ transcriptId, provider, providerKey, title: title ?? null, createdBy: userId });
+  } catch (err) {
+    console.error('[meetings] ensure failed for', transcriptId, err);
+  }
+}
+
 export async function createForUser(
   userId: string,
   data: TranscriptInsert
@@ -643,6 +665,7 @@ export async function createForUser(
     RETURNING *
   `;
   publishEvent({ kind: 'created', assemblyaiId: data.assemblyaiId });
+  await trackMeeting(data.assemblyaiId, data.gmeetContext, data.title, userId);
   return rows[0]!;
 }
 
@@ -686,6 +709,7 @@ export async function createDeferredPlaceholder(
     RETURNING *
   `;
   publishEvent({ kind: 'created', assemblyaiId: data.placeholderId });
+  await trackMeeting(data.placeholderId, data.gmeetContext, data.title, userId);
   return rows[0]!;
 }
 
@@ -795,6 +819,7 @@ export async function createUploadingPlaceholder(
     RETURNING *
   `;
   publishEvent({ kind: 'created', assemblyaiId: data.placeholderId });
+  await trackMeeting(data.placeholderId, data.gmeetContext, data.title, userId);
   return rows[0]!;
 }
 
@@ -842,7 +867,12 @@ export async function promoteUploadingRow(
       AND status IN ('uploading', 'waiting')
     RETURNING *
   `;
-  if (rows[0]) publishEvent({ kind: 'status', assemblyaiId: data.assemblyaiId });
+  if (rows[0]) {
+    publishEvent({ kind: 'status', assemblyaiId: data.assemblyaiId });
+    await repointMeeting(placeholderId, data.assemblyaiId).catch((err) =>
+      console.error('[meetings] repoint failed', placeholderId, '->', data.assemblyaiId, err)
+    );
+  }
   return rows[0] ?? null;
 }
 
@@ -925,6 +955,7 @@ export async function createImportedForUser(
     RETURNING *
   `;
   publishEvent({ kind: 'created', assemblyaiId: data.assemblyaiId });
+  await trackMeeting(data.assemblyaiId, data.gmeetContext, data.title, userId);
   return rows[0]!;
 }
 
@@ -1358,7 +1389,12 @@ export async function deleteForUser(
     WHERE user_id = ${userId} AND assemblyai_id = ${assemblyaiId}
     RETURNING id
   `;
-  if (rows.length > 0) publishEvent({ kind: 'deleted', assemblyaiId });
+  if (rows.length > 0) {
+    publishEvent({ kind: 'deleted', assemblyaiId });
+    await cleanupMeetingIfOrphan(assemblyaiId).catch((err) =>
+      console.error('[meetings] orphan cleanup failed', assemblyaiId, err)
+    );
+  }
   return rows.length > 0;
 }
 

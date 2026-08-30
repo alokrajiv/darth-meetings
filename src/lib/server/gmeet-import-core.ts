@@ -1,4 +1,5 @@
 import 'server-only';
+import { repointMeeting } from '@/db-ops/meetings';
 import { randomUUID } from 'node:crypto';
 import {
   createDeferredPlaceholder,
@@ -920,7 +921,12 @@ export async function executeGmeetImport(
 
     // Deferred execution: the real row exists now — retire the placeholder
     // (its shares are re-established on the new row by the auto-share above).
+    // Repoint the meeting FIRST so the placeholder's /m/ uuid (handed out at
+    // click time) survives onto the real row instead of being orphan-cleaned.
     if (opts?.placeholderAssemblyaiId) {
+      await repointMeeting(opts.placeholderAssemblyaiId, row.assemblyai_id).catch((err) =>
+        console.error('[meetings] repoint failed', opts.placeholderAssemblyaiId, err)
+      );
       await deleteForUser(user.userId, opts.placeholderAssemblyaiId);
     }
 
