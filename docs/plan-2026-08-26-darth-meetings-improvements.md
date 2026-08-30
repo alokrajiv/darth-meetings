@@ -1,6 +1,14 @@
 # Darth Meetings improvement plan — 2026-08-26
 
 Planner session output (Alok's asks, 2026-08-26). Status: DRAFT for review.
+
+**Progress 2026-08-30:** T1 phase 1 SHIPPED (meetings ledger, /m/<uuid>,
+former_ids self-heal — 636a461; jobs table still phase 1.5). T5 SHIPPED
+(regex=1 + CLI --regex — 18cb005). T3 large slice SHIPPED (POST
+/api/meetings/import + CLI 0.41.0 `import --wait` + full `series` verb
+family; `calendar-get`/`jobs` verbs pending on phase 1.5). T2/T4 not
+started — T2 fires imports on users' behalf, get Alok's design sign-off
+(Q3/Q4 below) before building.
 Nothing here is built. Each track lists what exists today, the design, the
 decisions Alok must make, and rough size. Tracks are ordered by dependency:
 **T1 (stable ids + job model) is the foundation the other four sit on.**
