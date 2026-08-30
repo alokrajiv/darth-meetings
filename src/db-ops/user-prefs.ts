@@ -36,6 +36,7 @@ export interface UserPrefsRow {
   auto_sync_since: string | null;
   auto_sync_providers: { gmeet?: boolean; teams?: boolean } | null;
   auto_sync_announce_dismissed_at: string | null;
+  setup_reviewed_at: string | null;
   updated_at: string;
 }
 
@@ -66,7 +67,7 @@ export function autoSyncOf(row: UserPrefsRow | null | undefined): AutoSyncPrefs 
 export async function getUserPrefs(userId: string): Promise<UserPrefsRow | null> {
   const rows = await sql<UserPrefsRow[]>`
     SELECT user_id, email, auto_sync, auto_sync_mode, auto_sync_report,
-           auto_sync_since, auto_sync_providers, auto_sync_announce_dismissed_at, updated_at
+           auto_sync_since, auto_sync_providers, auto_sync_announce_dismissed_at, setup_reviewed_at, updated_at
     FROM ${sql(SCHEMA)}.user_prefs WHERE user_id = ${userId}
   `;
   return rows[0] ?? null;
@@ -111,7 +112,7 @@ export async function setAutoSyncPrefs(
       auto_sync_providers = EXCLUDED.auto_sync_providers,
       updated_at = now()
     RETURNING user_id, email, auto_sync, auto_sync_mode, auto_sync_report,
-              auto_sync_since, auto_sync_providers, auto_sync_announce_dismissed_at, updated_at
+              auto_sync_since, auto_sync_providers, auto_sync_announce_dismissed_at, setup_reviewed_at, updated_at
   `;
   return autoSyncOf(rows[0]);
 }
@@ -124,6 +125,19 @@ export async function dismissAutoSyncAnnounce(user: { userId: string; email: str
     INSERT INTO ${sql(SCHEMA)}.user_prefs (user_id, email, auto_sync_announce_dismissed_at)
     VALUES (${user.userId}, ${user.email.toLowerCase()}, now())
     ON CONFLICT (user_id) DO UPDATE SET
+      auto_sync_announce_dismissed_at = COALESCE(${sql(SCHEMA)}.user_prefs.auto_sync_announce_dismissed_at, now()),
+      updated_at = now()
+  `;
+}
+
+/** The one-time setup review (auto-sync + Slack notification settings) is
+ * done for this user — the setup dialog stops asking about those. */
+export async function markSetupReviewed(user: { userId: string; email: string }): Promise<void> {
+  await sql`
+    INSERT INTO ${sql(SCHEMA)}.user_prefs (user_id, email, setup_reviewed_at, auto_sync_announce_dismissed_at)
+    VALUES (${user.userId}, ${user.email.toLowerCase()}, now(), now())
+    ON CONFLICT (user_id) DO UPDATE SET
+      setup_reviewed_at = COALESCE(${sql(SCHEMA)}.user_prefs.setup_reviewed_at, now()),
       auto_sync_announce_dismissed_at = COALESCE(${sql(SCHEMA)}.user_prefs.auto_sync_announce_dismissed_at, now()),
       updated_at = now()
   `;
@@ -144,7 +158,7 @@ export async function listAutoSyncUsers(): Promise<AutoSyncUser[]> {
     Array<UserPrefsRow & { connected_at: string | null; google_status: 'ok' | 'revoked' | 'error' | null }>
   >`
     SELECT p.user_id, p.email, p.auto_sync, p.auto_sync_mode, p.auto_sync_report,
-           p.auto_sync_since, p.auto_sync_providers, p.auto_sync_announce_dismissed_at, p.updated_at,
+           p.auto_sync_since, p.auto_sync_providers, p.auto_sync_announce_dismissed_at, p.setup_reviewed_at, p.updated_at,
            g.connected_at, g.status AS google_status
     FROM ${sql(SCHEMA)}.user_prefs p
     LEFT JOIN ${sql(SCHEMA)}.google_accounts g ON g.user_id = p.user_id

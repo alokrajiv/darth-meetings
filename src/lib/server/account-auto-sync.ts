@@ -23,7 +23,6 @@ import { findImportedByTeamsMeetings } from '@/db-ops/teams-import';
 import { getAnyByAssemblyaiId } from '@/db-ops/transcripts';
 import { addShare } from '@/db-ops/transcript-shares';
 import { identityForUser, userIdForEmail } from '@/db-ops/transcript-activity';
-import { resolveMeetingByAnyTranscriptId } from '@/db-ops/meetings';
 import { findSeriesByKeys, getSeries } from '@/db-ops/series';
 import { recurringBaseId, type SeriesKeyInput } from '@/lib/series-keys';
 import { getServerAccessToken } from '@/lib/server/google-oauth';
@@ -31,6 +30,7 @@ import { executeGmeetImport } from '@/lib/server/gmeet-import-core';
 import { executeTeamsImport } from '@/lib/server/teams-import-core';
 import { AUTO_SHARE_DOMAINS } from '@/lib/server/auto-share';
 import { notifyUser, APP_URL } from '@/lib/server/darth-notify';
+import { dm, meetingLine, openLink, SETTINGS_LINK } from '@/lib/server/dm-copy';
 import type { GmeetContext } from '@/lib/format';
 
 /**
@@ -334,27 +334,33 @@ async function fireGroup(g: Group, electors: Elector[], now: number): Promise<vo
         await ensureSharedWith(transcript.assemblyai_id, watchersOf(importer));
       }
       await resolveAll(electors, g.key, 'auto_synced');
-      const link = await stableLink(transcript?.assemblyai_id ?? null);
-      const when = g.startIso.slice(0, 10);
-      const title = `*${g.title ?? 'a meeting'}* (${when})`;
+      const link = await openLink(transcript?.assemblyai_id ?? null, 'Open the meeting');
+      const dur = cal?.event_end ? (Date.parse(cal.event_end) - Date.parse(cal.event_start as unknown as string)) / 1000 : null;
+      const line = meetingLine({ title: g.title, when: g.startIso, duration: dur });
+      const report =
+        importer.user.prefs.report === 'summary' ? 'summary'
+          : importer.user.prefs.report === 'later' ? 'notes' : 'detailed report';
+      const status =
+        kind === 'imported'
+          ? `Imported — speakers are being identified; the ${report} follows once they're confirmed.`
+          : `Queued — the recording/transcript is still being generated. It lands on its own; nothing to do.`;
       void notifyUser({
         kind: 'auto_import',
         toEmail: caller.email,
-        text:
-          kind === 'imported'
-            ? `Auto-sync imported ${title} → ${link}`
-            : `Auto-sync queued ${title} — artifacts still generating, it will land on its own → ${link}`,
+        text: dm(`⚡ *Auto-sync picked up your meeting*`, line, status, link),
         dedupeKey: `mw-autosync:${g.key}:${caller.email}`,
       });
       for (const w of watchersOf(importer)) {
         void notifyUser({
           kind: 'auto_import',
           toEmail: w,
-          text:
-            (kind === 'imported'
-              ? `Auto-sync imported ${title}`
-              : `Auto-sync queued ${title} (still generating)`) +
-            ` via ${caller.email}'s Google connection — shared with you → ${link}`,
+          text: dm(
+            `⚡ *Auto-sync picked up a meeting you were in*`,
+            line,
+            status,
+            `Imported once, via ${caller.email}'s Google connection, and shared with you — no duplicate needed.`,
+            link
+          ),
           dedupeKey: `mw-autosync:${g.key}:${w}`,
         });
       }
@@ -431,12 +437,6 @@ async function ensureSharedWith(assemblyaiId: string, emails: string[]): Promise
   }
 }
 
-async function stableLink(assemblyaiId: string | null): Promise<string> {
-  if (!assemblyaiId) return `<${APP_URL}/|open>`;
-  const m = await resolveMeetingByAnyTranscriptId(assemblyaiId).catch(() => null);
-  return m ? `<${APP_URL}/m/${m.id}|open>` : `<${APP_URL}/transcript/${assemblyaiId}|open>`;
-}
-
 /**
  * No auto-sync user's token can read the artifacts: ask the one account
  * that can — the organiser — once per occurrence (reminder + Slack DM),
@@ -457,7 +457,6 @@ async function nudgeOrganizer(
     console.warn(`[auto-sync] ${g.key}: no token with access (organiser ${email ?? 'unknown'}) — ${why}`);
     return;
   }
-  const when = g.startIso.slice(0, 10);
   const n = electors.length;
   const who = electors.map((e) => e.user.email).join(', ');
   const userId = await userIdForEmail(email).catch(() => null);
@@ -478,10 +477,12 @@ async function nudgeOrganizer(
   void notifyUser({
     kind: 'sync_request',
     toEmail: email,
-    text:
-      `${n} colleague${n === 1 ? '' : 's'} (${who}) ha${n === 1 ? 's' : 've'} auto-sync on and want${n === 1 ? 's' : ''} ` +
-      `*${g.title ?? g.code}* (${when}) imported, but only your Google account can reach its transcript/recording. ` +
-      `<${APP_URL}/|Import it> once, or turn on auto-sync for your account in <${APP_URL}/settings#auto-sync|Settings> and it happens by itself.`,
+    text: dm(
+      `🙏 *Your colleagues need this meeting imported*`,
+      meetingLine({ title: g.title, when: g.startIso }),
+      `${who} ${n === 1 ? 'has' : 'have'} auto-sync on, but only your Google account (you organised it) can reach the transcript/recording.`,
+      `Import it once from its day in <${APP_URL}/|Darth Meetings>, or turn on auto-sync in ${SETTINGS_LINK} and this never comes up again.`
+    ),
     dedupeKey: `mw-sync-request:${g.key}`,
   });
   await settleAutoSync(g.key, { outcome: 'nudged', detail: `${why}; nudged ${email}` });

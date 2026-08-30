@@ -11,6 +11,7 @@ import { getServerAccessToken } from '@/lib/server/google-oauth';
 import { executeGmeetImport } from '@/lib/server/gmeet-import-core';
 import { executeTeamsImport } from '@/lib/server/teams-import-core';
 import { notifyUser, APP_URL } from '@/lib/server/darth-notify';
+import { dm, meetingLine, openLink } from '@/lib/server/dm-copy';
 
 /**
  * Series auto-import: for every series with auto_import enabled, re-run the
@@ -202,18 +203,24 @@ async function fireOne(
   );
 
   if (kind === 'imported' || kind === 'deferred') {
-    const when = o.startIso.slice(0, 10);
-    const link = imported?.assemblyai_id
-      ? `<${APP_URL}/transcript/${imported.assemblyai_id}|open>`
-      : `<${APP_URL}/series|series>`;
-    void notifyUser({
-      kind: 'auto_import',
-      toEmail: cfg.byEmail,
-      text:
-        kind === 'imported'
-          ? `Auto-imported *${o.title ?? 'a meeting'}* (${when}) from series *${series.title}* → ${link}`
-          : `Queued auto-import of *${o.title ?? 'a meeting'}* (${when}) from series *${series.title}* — artifacts still generating, it will land on its own → ${link}`,
-      dedupeKey: `mw-autoimport:${series.id}:${o.key}`,
-    });
+    void (async () => {
+      const link = imported?.assemblyai_id
+        ? await openLink(imported.assemblyai_id, 'Open the meeting')
+        : `<${APP_URL}/series|Open the series>`;
+      const dur = o.endIso ? (Date.parse(o.endIso) - Date.parse(o.startIso)) / 1000 : null;
+      await notifyUser({
+        kind: 'auto_import',
+        toEmail: cfg.byEmail,
+        text: dm(
+          `🔁 *Series auto-import: ${series.title}*`,
+          meetingLine({ title: o.title, when: o.startIso, duration: dur }),
+          kind === 'imported'
+            ? `Imported under your Google connection — speakers are being identified; the ${cfg.report === 'summary' ? 'summary' : cfg.report === 'later' ? 'notes' : 'detailed report'} follows once they're confirmed.`
+            : `Queued — Google is still generating the artifacts. It lands on its own; nothing to do.`,
+          link
+        ),
+        dedupeKey: `mw-autoimport:${series.id}:${o.key}`,
+      });
+    })();
   }
 }

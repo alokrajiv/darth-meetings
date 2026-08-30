@@ -8,6 +8,7 @@ import {
 import { getContentCached, generateAutoNotes, generateAutoReport } from '@/lib/server/auto-notes';
 import { enrollFromTranscript } from '@/lib/server/voiceprint';
 import { notifyUser, APP_URL } from '@/lib/server/darth-notify';
+import { dm, headlines, meetingLine } from '@/lib/server/dm-copy';
 
 /**
  * Automatic speaker-review for series-auto-imported rows: the human review
@@ -103,7 +104,12 @@ export async function maybeAutoReview(ownerUserId: string, assemblyaiId: string)
       void notifyUser({
         kind: 'needs_review',
         toEmail: to,
-        text: `Auto-imported *${title}* (${auto.source}) — speaker names need a quick review before the summary: <${url}|review speakers>`,
+        text: dm(
+          `👀 *Speakers need a quick look before the notes can be written*`,
+          meetingLine({ title, when: row.recorded_at ?? row.created_at, duration: row.duration, speakerCount: row.speaker_count }),
+          `Auto-imported via ${auto.source}. What blocked the automatic pass: ${blocker}.`,
+          `Confirm the names (usually 30 seconds) and the ${pref === 'summary' ? 'summary' : pref === 'later' ? 'notes' : 'detailed report'} generates itself → <${url}|Review speakers>`
+        ),
         dedupeKey: `mw-needs-review:${assemblyaiId}:${to}`,
       });
     }
@@ -153,11 +159,17 @@ export async function maybeAutoReview(ownerUserId: string, assemblyaiId: string)
       ? after?.auto_notes_status === 'completed'
       : after?.auto_report_status === 'completed';
   if (ok) {
+    const gist = headlines(after?.auto_notes, 3);
     for (const to of auto.recipients) {
       void notifyUser({
         kind: 'report_ready',
         toEmail: to,
-        text: `${pref === 'summary' ? 'Summary' : 'Detailed report'} ready for *${title}* (auto-imported via ${auto.source}, speakers auto-identified) → <${url}|open>`,
+        text: dm(
+          `📝 *${pref === 'summary' ? 'Summary' : 'Detailed report'} ready*`,
+          meetingLine({ title, when: row.recorded_at ?? row.created_at, duration: row.duration, speakerCount: row.speaker_count }),
+          ...gist,
+          `Auto-imported via ${auto.source}, ${applied.length > 0 ? `${applied.length} speaker${applied.length === 1 ? '' : 's'} identified by voice` : 'speakers already named'} → <${url}|Read the full notes>`
+        ),
         dedupeKey: `mw-report-ready:${assemblyaiId}:${to}`,
       });
     }

@@ -322,15 +322,21 @@ const COL_LABELS: Record<ColKey, string> = {
 };
 
 /** Width + responsive visibility per column (applied to head & cells). */
+// Fixed widths for every side column so TITLE (+ its labels/badges) takes
+// all the remaining room; the date column is rendered LEFT of the title as
+// a narrow time-of-day (Alok 2026-08-30: "title and labels should be most
+// of the listing, time on the very left").
 const COL_HEAD_WIDTH: Record<ColKey, string> = {
-  labels: 'w-[14%]',
-  owner: 'w-[16%]',
-  date: 'w-[14%]',
-  duration: 'w-[11%]',
-  speakers: 'w-[9%]',
-  language: 'w-[9%]',
-  imported: 'w-[12%]',
+  labels: 'w-[140px]',
+  owner: 'w-[130px]',
+  date: 'w-[64px]',
+  duration: 'w-[80px]',
+  speakers: 'w-[70px]',
+  language: 'w-[90px]',
+  imported: 'w-[110px]',
 };
+/** Columns rendered before the title cell (currently just the time). */
+const LEAD_COLS: ReadonlySet<ColKey> = new Set(['date']);
 const COL_RESPONSIVE: Record<ColKey, string> = {
   labels: 'hidden md:table-cell',
   owner: 'hidden lg:table-cell',
@@ -553,6 +559,8 @@ export function TranscriptTable({
     () => colPrefs.order.filter((k) => !colPrefs.hidden.includes(k)),
     [colPrefs]
   );
+  const leadCols = useMemo(() => visibleCols.filter((k) => LEAD_COLS.has(k)), [visibleCols]);
+  const restCols = useMemo(() => visibleCols.filter((k) => !LEAD_COLS.has(k)), [visibleCols]);
 
   // Search debounce: server-side search kicks in at 2+ chars, 350ms.
   useEffect(() => {
@@ -1841,6 +1849,11 @@ export function TranscriptTable({
           placeholder ? 'cursor-default' : 'cursor-pointer'
         } ${isSelected ? 'bg-primary/5' : ''}`}
       >
+        {leadCols.map((key) => (
+          <TableCell key={key} className={`py-1.5 pl-4 align-top ${COL_RESPONSIVE[key]}`}>
+            {renderColCell(key, t)}
+          </TableCell>
+        ))}
         <TableCell className={`relative py-2 ${selectionMode ? 'pl-8' : 'pl-4'}`}>
           {/* Selection checkbox — sits in the cell's left padding, revealed on
               hover; the padding widens while a selection exists. */}
@@ -1977,7 +1990,7 @@ export function TranscriptTable({
           </div>
           </div>
         </TableCell>
-        {visibleCols.map((key) => (
+        {restCols.map((key) => (
           <TableCell key={key} className={`py-1.5 ${COL_RESPONSIVE[key]}`}>
             {renderColCell(key, t)}
           </TableCell>
@@ -2112,10 +2125,18 @@ export function TranscriptTable({
   const archiveTableHeader = (
     <TableHeader>
       <TableRow className="hover:bg-transparent">
-        <TableHead className="h-9 bg-muted/50 text-[11px] font-medium uppercase tracking-wider text-muted-foreground">
+        {leadCols.map((key) => (
+          <TableHead
+            key={key}
+            className={`h-9 ${COL_HEAD_WIDTH[key]} bg-muted/50 pl-4 text-[11px] font-medium uppercase tracking-wider text-muted-foreground ${COL_RESPONSIVE[key]}`}
+          >
+            {COL_LABELS[key]}
+          </TableHead>
+        ))}
+        <TableHead className="h-9 w-[46%] bg-muted/50 text-[11px] font-medium uppercase tracking-wider text-muted-foreground">
           Title
         </TableHead>
-        {visibleCols.map((key) => (
+        {restCols.map((key) => (
           <TableHead
             key={key}
             className={`h-9 ${COL_HEAD_WIDTH[key]} bg-muted/50 text-[11px] font-medium uppercase tracking-wider text-muted-foreground ${COL_RESPONSIVE[key]}`}
@@ -2344,7 +2365,8 @@ export function TranscriptTable({
                       key={`cal-${it.layer}-${it.row.key}`}
                       row={it.row}
                       layer={it.layer}
-                      visibleCols={visibleCols}
+                      visibleCols={restCols}
+                      leadCols={leadCols}
                       colClass={(key) => COL_RESPONSIVE[key as ColKey] ?? ''}
                       onImportMeeting={onImportMeeting}
                       onMuteChanged={handleMuteChanged}

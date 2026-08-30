@@ -10,8 +10,7 @@ import { GmeetImportDialog } from '@/components/gmeet-import-dialog';
 import { GmeetRemindersCard, type Reminder } from '@/components/gmeet-reminders-card';
 import { TranscriptImportDialog } from '@/components/transcript-import-dialog';
 import { AppHeader } from '@/components/app-header';
-import { AutoSyncAnnounceBanner } from '@/components/auto-sync-announce-banner';
-import { ConnectNudgeBanner } from '@/components/connect-nudge-banner';
+import { SetupReviewDialog } from '@/components/setup-review-dialog';
 import { LabelRail, LABEL_RAIL_STORAGE_KEY } from '@/components/label-rail';
 import { Button } from '@/components/ui/button';
 import {
@@ -313,10 +312,10 @@ export default function Home() {
           />
         )}
 
-        {/* Missing Google / Microsoft link → one dismissable nudge above the
-            listing (per-service 7-day snooze; see connect-nudge-banner.tsx). */}
-        <ConnectNudgeBanner />
-        <AutoSyncAnnounceBanner />
+        {/* Missing Google / Microsoft link, or the one-time auto-sync +
+            notifications review → ONE modal, snoozable 24h (replaces the old
+            connect-nudge banner + announce banner; see setup-review-dialog). */}
+        <SetupReviewDialog />
 
         <div className="flex items-start gap-4">
           {!railCollapsed && (

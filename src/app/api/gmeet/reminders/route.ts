@@ -6,15 +6,23 @@ import {
 } from '@/db-ops/gmeet-reminders';
 import { addSkip } from '@/db-ops/gmeet-sync';
 import { getGoogleAccount } from '@/db-ops/google-accounts';
+import { getUserPrefs } from '@/db-ops/user-prefs';
 
 export const runtime = 'nodejs';
 
 /** Open reminders from the background poller, newest meeting first. */
 export const GET = withAuth(async ({ user }) => {
-  const [reminders, account] = await Promise.all([
+  const [allReminders, account, prefs] = await Promise.all([
     listOpenReminders(user.userId),
     getGoogleAccount(user.userId),
+    getUserPrefs(user.userId).catch(() => null),
   ]);
+  // With account auto-sync on, "not imported yet" is no longer the user's
+  // problem — the sweep consumes those rows itself (Alok 2026-08-30: the
+  // noise can go). Actionable kinds (auto-record off before a meeting,
+  // colleagues needing your import) stay.
+  const autoSyncOn = (prefs?.auto_sync ?? 'off') !== 'off';
+  const reminders = autoSyncOn ? allReminders.filter((r) => r.kind !== 'unimported') : allReminders;
   return NextResponse.json({
     connected: !!account && account.status !== 'revoked',
     accountStatus: account?.status ?? null,

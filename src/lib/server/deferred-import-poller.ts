@@ -9,6 +9,7 @@ import { getServerAccessToken } from '@/lib/server/google-oauth';
 import { executeGmeetImport } from '@/lib/server/gmeet-import-core';
 import { executeTeamsImport } from '@/lib/server/teams-import-core';
 import { notifyUser, APP_URL } from '@/lib/server/darth-notify';
+import { dm, meetingLine, openLink } from '@/lib/server/dm-copy';
 import type { GmeetContext } from '@/lib/format';
 
 /**
@@ -93,6 +94,14 @@ async function heartbeat(
  * 'done' on the promoted row), 409 and other terminal statuses fail the row
  * for good, anything else counts an exec attempt and backs off.
  */
+/** Scheduled length of the calendar event behind a queued import, seconds. */
+function eventDurationS(marker: DeferredMarker): number | null {
+  const e = marker.request.event;
+  if (!e?.startTime || !e.endTime) return null;
+  const d = (Date.parse(e.endTime) - Date.parse(e.startTime)) / 1000;
+  return Number.isFinite(d) && d > 0 ? d : null;
+}
+
 async function settleExecOutcome(
   row: { user_id: string; assemblyai_id: string },
   marker: DeferredMarker,
@@ -120,12 +129,20 @@ async function settleExecOutcome(
     // listing shows the progress — a "landed" DM would be noise. Deferred
     // imports resolve hours later, so those DO get told. Failures always DM.
     if (!marker.background) {
-      void notifyUser({
-        kind: 'deferred_import',
-        toEmail: marker.ownerEmail,
-        text: `Your queued import landed: *${title}* → <${APP_URL}/transcript/${imported?.assemblyai_id ?? row.assemblyai_id}|open>`,
-        dedupeKey: `mw-deferred-landed:${row.assemblyai_id}`,
-      });
+      void (async () => {
+        const link = await openLink(imported?.assemblyai_id ?? row.assemblyai_id, 'Open the meeting');
+        await notifyUser({
+          kind: 'deferred_import',
+          toEmail: marker.ownerEmail,
+          text: dm(
+            `✅ *Your queued import landed*`,
+            meetingLine({ title, when: marker.request.event?.startTime, duration: eventDurationS(marker) }),
+            `Google/Microsoft finished the ${marker.mode === 'transcript' ? 'transcript' : 'recording'} and the import ran by itself. Speakers next, then notes.`,
+            link
+          ),
+          dedupeKey: `mw-deferred-landed:${row.assemblyai_id}`,
+        });
+      })();
     }
     return;
   }
@@ -153,7 +170,12 @@ async function settleExecOutcome(
       void notifyUser({
         kind: 'deferred_import',
         toEmail: marker.ownerEmail,
-        text: `Your queued import for *${title}* failed for good: ${errText}`,
+        text: dm(
+          `⚠️ *A queued import gave up*`,
+          meetingLine({ title, when: marker.request.event?.startTime, duration: eventDurationS(marker) }),
+          `Why: ${errText}`,
+          `If the recording exists after all, import it again from its day in <${APP_URL}/|Darth Meetings> — the queue is cleared.`
+        ),
         dedupeKey: `mw-deferred-failed:${row.assemblyai_id}`,
       });
     }

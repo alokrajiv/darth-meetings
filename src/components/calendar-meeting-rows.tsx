@@ -473,6 +473,8 @@ interface CalendarEventRowProps {
   /** The host table's visible middle columns, in order — calendar rows render
    * a cell per column so they line up with the archive rows' grid. */
   visibleCols: string[];
+  /** Columns rendered LEFT of the title (the host's time column). */
+  leadCols?: string[];
   /** Responsive-hiding class per column key (the host's COL_RESPONSIVE). */
   colClass: (key: string) => string;
   onImportMeeting?: (m: { meetingCode: string; eventStart: string }) => void;
@@ -495,6 +497,7 @@ export function CalendarEventRow({
   row: r,
   layer,
   visibleCols,
+  leadCols = [],
   colClass,
   onImportMeeting,
   onMuteChanged,
@@ -662,6 +665,11 @@ export function CalendarEventRow({
         r.muted ? 'opacity-60' : ''
       }`}
     >
+      {leadCols.map((key) => (
+        <TableCell key={key} className={`py-1.5 pl-4 align-top ${colClass(key)}`}>
+          {middleCell(key)}
+        </TableCell>
+      ))}
       <TableCell className="py-2 pl-4">
         {/* w-0 + min-w-full: the cell contributes zero min-content width, so
             long nowrap titles can't inflate the table's column layout — the
