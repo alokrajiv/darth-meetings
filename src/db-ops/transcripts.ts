@@ -1296,6 +1296,26 @@ export async function setVideoPartStoredForUser(
  * the jsonb is fine at this table's size; oldest first so long-waiting rows
  * aren't starved by fresh imports.
  */
+/**
+ * T4: scheduled reports that are due — pendingVideoReport.runAfter has
+ * passed. Only completed, live rows (a schedule on a deleted/incomplete row
+ * silently waits; the marker survives for a restore). Oldest first.
+ */
+export async function listDueScheduledReports(limit: number): Promise<
+  Array<{ user_id: string; assemblyai_id: string; gmeet_context: GmeetContext }>
+> {
+  return sql<Array<{ user_id: string; assemblyai_id: string; gmeet_context: GmeetContext }>>`
+    SELECT user_id, assemblyai_id, gmeet_context
+    FROM ${sql(SCHEMA)}.transcripts
+    WHERE gmeet_context->'pendingVideoReport'->>'runAfter' IS NOT NULL
+      AND (gmeet_context->'pendingVideoReport'->>'runAfter')::timestamptz <= now()
+      AND status = 'completed'
+      AND deleted_at IS NULL
+    ORDER BY (gmeet_context->'pendingVideoReport'->>'runAfter')::timestamptz ASC
+    LIMIT ${limit}
+  `;
+}
+
 export async function listRecordingPendingRows(limit: number): Promise<
   Array<{
     id: number;

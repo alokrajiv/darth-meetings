@@ -1,5 +1,9 @@
 import 'server-only';
-import { listRecordingPendingRows, mergeGmeetContextForUser } from '@/db-ops/transcripts';
+import {
+  listDueScheduledReports,
+  listRecordingPendingRows,
+  mergeGmeetContextForUser,
+} from '@/db-ops/transcripts';
 import { publishEvent } from '@/lib/server/event-bus';
 import { listRecordArtifacts } from '@/lib/server/gmeet';
 import { getServerAccessToken } from '@/lib/server/google-oauth';
@@ -54,13 +58,38 @@ async function fireQueuedReport(
 ): Promise<void> {
   const queued = row.gmeet_context.pendingVideoReport;
   if (!queued) return;
+  // T4: a scheduled run (runAfter in the future) is NOT fired early just
+  // because the recording landed — the schedule wins; the due-report pass
+  // picks it up at its time (with the video now available).
+  if (queued.runAfter && new Date(queued.runAfter).getTime() > Date.now()) {
+    console.log(
+      `[recording-poller] ${row.assemblyai_id}: recording landed but report is scheduled for ${queued.runAfter} — leaving it`
+    );
+    return;
+  }
   console.log(`[recording-poller] ${row.assemblyai_id}: firing queued video report (${reason})`);
   await mergeGmeetContextForUser(row.user_id, row.assemblyai_id, { pendingVideoReport: null });
   void generateAutoReport(row.user_id, row.assemblyai_id, {
     triggeredBy: queued.triggeredBy,
     instructions: queued.instructions,
-    useVideo: true,
+    useVideo: queued.useVideo ?? true,
   });
+}
+
+/**
+ * T4: fire reports whose schedule (pendingVideoReport.runAfter) has come
+ * due. Same clear-then-run shape as fireQueuedReport; serialized within a
+ * tick so a backlog of schedules doesn't stampede the agent runner.
+ */
+async function fireDueScheduledReports(): Promise<void> {
+  const due = await listDueScheduledReports(MAX_PER_TICK);
+  for (const row of due) {
+    try {
+      await fireQueuedReport(row, `scheduled run due (${row.gmeet_context.pendingVideoReport?.runAfter})`);
+    } catch (err) {
+      console.warn(`[recording-poller] scheduled report failed for ${row.assemblyai_id}:`, err);
+    }
+  }
 }
 
 async function checkRow(row: {
@@ -240,6 +269,7 @@ async function tick(): Promise<void> {
         console.warn(`[recording-poller] check failed for ${row.assemblyai_id}:`, err);
       }
     }
+    await fireDueScheduledReports();
   } catch (err) {
     console.warn('[recording-poller] tick failed:', err);
   } finally {

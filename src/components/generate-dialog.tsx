@@ -11,7 +11,7 @@ import {
 } from '@/components/ui/dialog';
 import { Button } from '@/components/ui/button';
 import { Textarea } from '@/components/ui/textarea';
-import { FileText, Film, Sparkles } from 'lucide-react';
+import { FileText, Film, Sparkles, Clock } from 'lucide-react';
 
 interface GenerateDialogProps {
   open: boolean;
@@ -27,7 +27,13 @@ interface GenerateDialogProps {
   generating: boolean;
   /** Pre-tick the detailed option (dialog opened from the report tab). */
   defaultDetailed: boolean;
-  onGenerate: (opts: { detailed: boolean; video: boolean; instructions: string }) => void;
+  onGenerate: (opts: {
+    detailed: boolean;
+    video: boolean;
+    instructions: string;
+    /** T4: ISO instant to run the detailed report at, instead of now. */
+    runAt?: string;
+  }) => void;
 }
 
 /**
@@ -52,11 +58,29 @@ export function GenerateDialog({
   const [instructions, setInstructions] = useState('');
   const [detailed, setDetailed] = useState(defaultDetailed);
   const [useVideo, setUseVideo] = useState(true);
+  // T4: when to run the detailed report. 'now' | 'tonight' (next 02:00
+  // local) | 'custom' with a datetime-local value.
+  const [runWhen, setRunWhen] = useState<'now' | 'tonight' | 'custom'>('now');
+  const [runCustom, setRunCustom] = useState('');
+
+  const runAtIso = (): string | undefined => {
+    if (!detailed || runWhen === 'now') return undefined;
+    if (runWhen === 'tonight') {
+      const t = new Date();
+      t.setHours(2, 0, 0, 0);
+      if (t.getTime() <= Date.now()) t.setDate(t.getDate() + 1);
+      return t.toISOString();
+    }
+    const t = new Date(runCustom);
+    return Number.isNaN(t.getTime()) || t.getTime() <= Date.now() ? undefined : t.toISOString();
+  };
 
   // Fresh choices each time the dialog opens; instructions intentionally
   // survive a close-reopen within the page visit.
   useEffect(() => {
     if (open) {
+      setRunWhen('now');
+      setRunCustom('');
       setDetailed(defaultDetailed);
       setUseVideo(true);
     }
@@ -166,6 +190,36 @@ export function GenerateDialog({
                   </label>
                 </span>
               )}
+              {detailed && (
+                <span className="mt-2 flex flex-wrap items-center gap-2 text-xs">
+                  <span className="flex items-center gap-1.5 font-medium">
+                    <Clock className="h-3.5 w-3.5 text-muted-foreground" />
+                    Run
+                  </span>
+                  <select
+                    className="rounded border bg-background px-1.5 py-1"
+                    value={runWhen}
+                    onChange={(e) => setRunWhen(e.target.value as 'now' | 'tonight' | 'custom')}
+                  >
+                    <option value="now">now</option>
+                    <option value="tonight">tonight (02:00)</option>
+                    <option value="custom">at…</option>
+                  </select>
+                  {runWhen === 'custom' && (
+                    <input
+                      type="datetime-local"
+                      className="rounded border bg-background px-1.5 py-1"
+                      value={runCustom}
+                      onChange={(e) => setRunCustom(e.target.value)}
+                    />
+                  )}
+                  {runWhen !== 'now' && (
+                    <span className="text-muted-foreground">
+                      the summary distills after the report lands
+                    </span>
+                  )}
+                </span>
+              )}
             </span>
           </label>
         </div>
@@ -177,11 +231,20 @@ export function GenerateDialog({
             size="sm"
             disabled={generating}
             onClick={() =>
-              onGenerate({ detailed, video: detailed && videoAvailable && useVideo, instructions })
+              onGenerate({
+                detailed,
+                video: detailed && videoAvailable && useVideo,
+                instructions,
+                runAt: runAtIso(),
+              })
             }
           >
             <Sparkles className="h-4 w-4" />
-            {detailed ? 'Generate report + summary' : 'Generate summary'}
+            {detailed
+              ? runAtIso()
+                ? 'Schedule report + summary'
+                : 'Generate report + summary'
+              : 'Generate summary'}
           </Button>
         </DialogFooter>
       </DialogContent>

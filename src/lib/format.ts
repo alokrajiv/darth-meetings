@@ -224,6 +224,12 @@ export interface GmeetContext {
     instructions?: string;
     triggeredBy?: { userId: string; email: string };
     requestedAt: string;
+    /** T4: fire at/after this instant instead of when the recording lands.
+     * The recording-poller's due-report pass fires it; a recording landing
+     * EARLIER leaves the marker alone (schedule wins). */
+    runAfter?: string;
+    /** T4: scheduled runs remember the frames choice (default true). */
+    useVideo?: boolean;
   } | null;
   /** Multi-file single-meeting upload, in flight: bookkeeping while the
    * group's files stream in one by one (part k>1 lands as

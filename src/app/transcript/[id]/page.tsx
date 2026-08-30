@@ -745,7 +745,7 @@ function TranscriptDetailInner({ transcriptId }: { transcriptId: string }) {
     return counts;
   }, [content]);
 
-  const handleGenerateReport = useCallback(async (instructions?: string, useVideo = true) => {
+  const handleGenerateReport = useCallback(async (instructions?: string, useVideo = true, runAt?: string) => {
     if (generatingReport) return;
     setGeneratingReport(true);
     try {
@@ -755,11 +755,12 @@ function TranscriptDetailInner({ transcriptId }: { transcriptId: string }) {
         body: JSON.stringify({
           ...(instructions?.trim() ? { instructions: instructions.trim() } : {}),
           useVideo,
+          ...(runAt ? { runAt } : {}),
         }),
       });
       if (res.ok) {
         const payload = (await res.json().catch(() => ({}))) as { status?: string };
-        if (payload.status === 'queued') {
+        if (payload.status === 'queued' || payload.status === 'scheduled') {
           // Recording still being prepared — the server queued the run
           // (gmeet_context.pendingVideoReport); reload so the queued notice
           // shows.
@@ -805,6 +806,12 @@ function TranscriptDetailInner({ transcriptId }: { transcriptId: string }) {
     !teamsRecordingId &&
     row.gmeet_context?.recordingPending?.status === 'waiting';
   const reportQueued = !!row?.gmeet_context?.pendingVideoReport;
+  const reportScheduledAt = row?.gmeet_context?.pendingVideoReport?.runAfter ?? null;
+
+  const cancelPendingReport = useCallback(async () => {
+    const res = await fetch(`/api/transcripts/${transcriptId}/report`, { method: 'DELETE' });
+    if (res.ok) void loadAll({ silent: true });
+  }, [transcriptId, loadAll]);
 
   // --- Multi-video meetings (stop-restart recordings → several files) ---
   // The primary video ("Video 1") is local_audio_path; extra segments live in
@@ -2687,8 +2694,20 @@ function TranscriptDetailInner({ transcriptId }: { transcriptId: string }) {
                     {reportQueued && row.auto_report_status !== 'running' && (
                       <div className="mb-3 flex items-center gap-2 rounded-md border border-amber-400/50 bg-amber-500/5 px-3 py-2 text-xs text-muted-foreground">
                         <Loader2 className="h-3.5 w-3.5 shrink-0 animate-spin text-amber-600 dark:text-amber-500" />
-                        Video report queued — Google is still preparing the recording. It starts
-                        on its own the moment the video lands (checked every minute).
+                        <span className="min-w-0 flex-1">
+                          {reportScheduledAt
+                            ? `Report scheduled for ${new Date(reportScheduledAt).toLocaleString([], { dateStyle: 'medium', timeStyle: 'short' })} — it runs on its own.`
+                            : 'Video report queued — Google is still preparing the recording. It starts on its own the moment the video lands (checked every minute).'}
+                        </span>
+                        {access !== 'read' && (
+                          <button
+                            type="button"
+                            className="shrink-0 rounded border px-1.5 py-0.5 hover:bg-muted"
+                            onClick={() => void cancelPendingReport()}
+                          >
+                            Cancel
+                          </button>
+                        )}
                       </div>
                     )}
                     {row.auto_report_status === 'running' ? (
@@ -3382,13 +3401,13 @@ function TranscriptDetailInner({ transcriptId }: { transcriptId: string }) {
           videoFetching={videoFetching}
           generating={generatingNotes || generatingReport}
           defaultDetailed={genDefaultDetailed}
-          onGenerate={({ detailed, video, instructions }) => {
+          onGenerate={({ detailed, video, instructions, runAt }) => {
             setNotesPromptOpen(false);
             if (detailed) {
               // Only the report fires — the quick summary auto-distills from
               // the report session when it completes.
               selectSummaryTab('report');
-              void handleGenerateReport(instructions, video);
+              void handleGenerateReport(instructions, video, runAt);
             } else {
               selectSummaryTab('summary');
               void handleGenerateNotes(instructions);

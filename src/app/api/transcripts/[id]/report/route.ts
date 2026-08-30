@@ -19,12 +19,28 @@ export const POST = withAuth(async ({ user, request }, { params }) => {
 
   let instructions: string | undefined;
   let useVideo = true;
+  let runAt: Date | null = null;
   try {
-    const body = (await request.json()) as { instructions?: unknown; useVideo?: unknown };
+    const body = (await request.json()) as {
+      instructions?: unknown;
+      useVideo?: unknown;
+      runAt?: unknown;
+    };
     if (typeof body.instructions === 'string' && body.instructions.trim()) {
       instructions = body.instructions.trim().slice(0, 2000);
     }
     if (body.useVideo === false) useVideo = false;
+    // T4: schedule the run instead of firing now. Bounded to 30 days out;
+    // a past/invalid instant just means "now" (fall through to the run).
+    if (typeof body.runAt === 'string') {
+      const t = new Date(body.runAt);
+      if (!Number.isNaN(t.getTime()) && t.getTime() > Date.now()) {
+        if (t.getTime() - Date.now() > 30 * 86_400_000) {
+          return NextResponse.json({ error: 'runAt too far out (max 30 days)' }, { status: 400 });
+        }
+        runAt = t;
+      }
+    }
   } catch {
     // no/invalid body — plain run
   }
@@ -44,6 +60,22 @@ export const POST = withAuth(async ({ user, request }, { params }) => {
   // (Google preparing the file — no fileId to pull yet): queue it instead of
   // running text-only. The recording poller fires the run the moment the
   // video lands (or degraded to text-only if the recording never appears).
+  // T4: scheduled run — stamp the marker and let the recording-poller's
+  // due-report pass fire it at runAfter. Overwrites any previous schedule
+  // (latest wins); the same marker doubles as the waiting-for-video queue.
+  if (runAt) {
+    await mergeGmeetContextForUser(access.ownerUserId, id, {
+      pendingVideoReport: {
+        ...(instructions ? { instructions } : {}),
+        triggeredBy: { userId: user.userId, email: user.email },
+        requestedAt: new Date().toISOString(),
+        runAfter: runAt.toISOString(),
+        useVideo,
+      },
+    });
+    return NextResponse.json({ status: 'scheduled', runAt: runAt.toISOString() });
+  }
+
   const ctx = access.row.gmeet_context;
   const knownRecording =
     !!access.row.local_audio_path ||
@@ -68,6 +100,22 @@ export const POST = withAuth(async ({ user, request }, { params }) => {
   });
 
   return NextResponse.json({ status: 'running' });
+});
+
+/**
+ * DELETE /api/transcripts/:id/report — cancel a queued/scheduled report
+ * (clears gmeet_context.pendingVideoReport). Editors only. A run already
+ * in flight is not touched — only the pending marker.
+ */
+export const DELETE = withAuth(async ({ user }, { params }) => {
+  const { id } = await params;
+  const access = await resolveAccess(user.userId, user.email, id);
+  if (!access) return NextResponse.json({ error: 'Not found' }, { status: 404 });
+  if (access.access === 'read') {
+    return NextResponse.json({ error: 'Read-only access' }, { status: 403 });
+  }
+  await mergeGmeetContextForUser(access.ownerUserId, id, { pendingVideoReport: null });
+  return NextResponse.json({ cancelled: true });
 });
 
 /**
