@@ -115,8 +115,10 @@ WRITE (needs read+write for meetings)
              [--report summary|detailed-video|detailed-text|later]
              [--gmeet on|off] [--teams on|off]
                                   mine = meetings you organise, all = every
-                                  meeting you attend; only meetings that start
-                                  after you switch it on. Needs Google connected
+                                  meeting you attend (recommended: all, video,
+                                  detailed-video — the defaults); only meetings
+                                  that start after you switch it on. Needs
+                                  Google connected
   set-title <id> <title>          Update the title
   set-notes <id> --file <md|->    Replace the notes markdown ('-' = stdin)
   set-report <id> --file <md|->   Replace the report markdown ('-' = stdin)

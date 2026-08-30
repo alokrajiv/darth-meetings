@@ -5,6 +5,7 @@ import {
   autoSyncOf,
   setAutoSyncPrefs,
   listAutoSyncActivityFor,
+  dismissAutoSyncAnnounce,
   AUTO_SYNC_SCOPES,
   AUTO_SYNC_MODES,
   AUTO_SYNC_REPORTS,
@@ -29,6 +30,7 @@ export const GET = withAuth(async ({ user }) => {
   ]);
   return NextResponse.json({
     autoSync: autoSyncOf(row),
+    announceDismissed: !!row?.auto_sync_announce_dismissed_at || (row?.auto_sync ?? 'off') !== 'off',
     googleConnected: !!account && account.status !== 'revoked',
     options: { scopes: AUTO_SYNC_SCOPES, modes: AUTO_SYNC_MODES, reports: AUTO_SYNC_REPORTS },
     activity: activity.map((a) => ({
@@ -58,6 +60,7 @@ export const PUT = withAuth(async ({ user, request }) => {
     mode?: unknown;
     report?: unknown;
     providers?: unknown;
+    dismissAnnounce?: unknown;
   };
   try {
     body = (await request.json()) as typeof body;
@@ -92,6 +95,10 @@ export const PUT = withAuth(async ({ user, request }) => {
     if (typeof p.gmeet === 'boolean') providers.gmeet = p.gmeet;
     if (typeof p.teams === 'boolean') providers.teams = p.teams;
     patch.providers = providers;
+  }
+  if (body.dismissAnnounce === true) {
+    await dismissAutoSyncAnnounce({ userId: user.userId, email: user.email });
+    if (Object.keys(patch).length === 0) return NextResponse.json({ ok: true, announceDismissed: true });
   }
   if (Object.keys(patch).length === 0) {
     return NextResponse.json({ error: 'nothing to change' }, { status: 400 });

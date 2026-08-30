@@ -40,17 +40,17 @@ interface Payload {
 const SCOPES: Array<{ value: Scope; label: string; hint: string }> = [
   { value: 'off', label: 'Off', hint: 'Nothing imports by itself (series auto-import still works where you turned it on).' },
   { value: 'mine', label: 'Meetings I organise', hint: 'Past meetings where you are the organiser, once a recording / transcript exists.' },
-  { value: 'all', label: 'Every meeting I attend', hint: 'Everything on your calendar that left artifacts — organised by you or not.' },
+  { value: 'all', label: 'Every meeting I attend — recommended', hint: 'Everything on your calendar that left artifacts — organised by you or not.' },
 ];
 const MODES: Array<{ value: Mode; label: string }> = [
+  { value: 'video', label: 'Recording (re-transcribe, frames) — recommended' },
   { value: 'transcript', label: 'Transcript only (fast, cheap)' },
-  { value: 'video', label: 'Recording (re-transcribe, frames)' },
   { value: 'both', label: 'Both' },
 ];
 const REPORTS: Array<{ value: Report; label: string }> = [
+  { value: 'detailed-video', label: 'Detailed report with video frames — recommended' },
   { value: 'summary', label: 'Quick summary' },
   { value: 'detailed-text', label: 'Detailed report' },
-  { value: 'detailed-video', label: 'Detailed report with video frames' },
   { value: 'later', label: 'Nothing — I’ll pick on the page' },
 ];
 
