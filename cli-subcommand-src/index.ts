@@ -56,6 +56,11 @@ READ
   attachment-get <id> <attId> [--out <file>]   Download one attachment
   labels                          Org-wide label tree with visible-to-you counts
                                   (subtree-inclusive) and #ids; --json = flat rows
+  series                          Recurring-call series you're in: id, title,
+                                  cadence, members, auto-import + dup badges
+  series <id>                     One series: config, evidence keys, members
+                                  (imported transcripts), pending suggestions,
+                                  probable duplicates
 
 LABELS (org-wide, hierarchical 'Customers/LP Global/QBR', many per transcript;
 <label> = a path, case-insensitive, or '#<id>' from 'labels')
@@ -91,6 +96,18 @@ WRITE (needs read+write for meetings)
                                   Prints the transcript id + the stable
                                   /m/<uuid> link. --wait polls until the
                                   import completes (default cap 30 min)
+  series set <id> [--title <t>] [--notes <md>] [--auto-import on|off]
+             [--mode transcript|video|both] [--report summary|detailed-video|detailed-text|later]
+                                  Rename / edit notes / configure auto-import
+                                  (on = future occurrences import on their own
+                                  under YOUR Google link)
+  series merge <into-id> <from-id>   Fold a duplicate series into another
+                                  (keys+members move, the loser is deleted,
+                                  logged as you). Both must be visible to you
+  series attach <id> <transcript-id> [--manual]   Attach a transcript you can
+                                  access (absorbs its keys; default 'confirmed')
+  series detach <id> <transcript-id> [--remember]   Detach; --remember = never
+                                  re-suggest it for this series
   set-title <id> <title>          Update the title
   set-notes <id> --file <md|->    Replace the notes markdown ('-' = stdin)
   set-report <id> --file <md|->   Replace the report markdown ('-' = stdin)
@@ -854,6 +871,98 @@ const meetings: Subcommand = {
           console.log(`\n${data.hits.length} hit(s) — 'darth-cli meetings text <id>' for the full transcript`);
         });
         return 0;
+      }
+
+      case "series": {
+        const sub = args[0];
+        const asId = (v: string | undefined) => (v && /^\d+$/.test(v) ? Number(v) : null);
+        // -- index / one series ------------------------------------------
+        if (!sub || asId(sub) !== null) {
+          if (!sub) {
+            const data = await ctx.expectJson<{ series: any[]; totals: any }>(ctx.api("meetings", `/api/series`));
+            ctx.print(data, () => {
+              if (!data.series.length) return console.log("No series visible to you.");
+              for (const r of data.series) {
+                const bits = [
+                  String(r.id).padStart(4),
+                  (r.cadence ?? "ad-hoc").padEnd(8),
+                  `${String(r.member_count).padStart(3)} imported`,
+                  r.auto_enabled ? "auto" : "    ",
+                  r.dup ? `DUP?(${r.dup_with.map((d: any) => d.id).join(",")})` : "",
+                ];
+                console.log(`${bits.join("  ")}  ${r.title}`);
+              }
+              console.log(`\n${data.series.length} series — 'series <id>' for details`);
+            });
+            return 0;
+          }
+          const id = asId(sub)!;
+          const data = await ctx.expectJson<any>(ctx.api("meetings", `/api/series/${id}`));
+          ctx.print(data, () => {
+            const sr = data.series;
+            console.log(`series:      #${sr.id}  ${sr.title}`);
+            const ai = sr.auto_import;
+            console.log(`auto-import: ${ai?.enabled ? `ON (mode ${ai.mode}, report ${ai.report}, by ${ai.byEmail})` : "off"}`);
+            if (sr.notes) console.log(`notes:       ${sr.notes.split("\n")[0]}`);
+            console.log(`keys:        ${data.keys.map((k: any) => `${k.kind}=${k.value.length > 40 ? k.value.slice(0, 40) + "…" : k.value}`).join("  ") || "(none)"}`);
+            console.log(`members (${data.members.length}):`);
+            for (const m of data.members) {
+              console.log(`  ${m.assemblyai_id ?? "(hidden)"}  ${m.recorded_at?.slice(0, 10) ?? "????-??-??"}  ${m.visible === false ? "(not visible to you)" : (m.title ?? "")}`);
+            }
+            if (data.suggestions?.length) {
+              console.log(`suggested (unconfirmed): ${data.suggestions.length} — confirm in the web UI or 'series attach'`);
+            }
+            if (data.dupes?.length) {
+              console.log(`probable duplicates: ${data.dupes.map((d: any) => `#${d.id} ${d.title}`).join(", ")} — 'series merge ${sr.id} <from-id>' to fold`);
+            }
+          });
+          return 0;
+        }
+        // -- mutations ----------------------------------------------------
+        ctx.requireWrite();
+        if (sub === "set") {
+          const id = asId(args[1]);
+          if (!id) { console.error("usage: darth-cli meetings series set <id> [--title <t>] [--notes <md>] [--auto-import on|off] [--mode ...] [--report ...]"); return 1; }
+          const body: any = {};
+          if (str(flags.title) !== undefined) body.title = str(flags.title);
+          if (str(flags.notes) !== undefined) body.notes = str(flags.notes);
+          const ai = str(flags["auto-import"]);
+          if (ai !== undefined) {
+            if (ai !== "on" && ai !== "off") { console.error("--auto-import must be on or off"); return 1; }
+            body.autoImport = { enabled: ai === "on" };
+            const mode = str(flags.mode); const report = str(flags.report);
+            if (mode) body.autoImport.mode = mode;
+            if (report) body.autoImport.report = report;
+          }
+          if (!Object.keys(body).length) { console.error("nothing to change — pass --title/--notes/--auto-import"); return 1; }
+          await ctx.expectJson(ctx.api("meetings", `/api/series/${id}`, { method: "PATCH", body: JSON.stringify(body) }));
+          if (!ctx.json) console.log("Updated.");
+          return 0;
+        }
+        if (sub === "merge") {
+          const into = asId(args[1]); const from = asId(args[2]);
+          if (!into || !from) { console.error("usage: darth-cli meetings series merge <into-id> <from-id>"); return 1; }
+          await ctx.expectJson(ctx.api("meetings", `/api/series/${into}/merge`, { method: "POST", body: JSON.stringify({ fromSeriesId: from }) }));
+          if (!ctx.json) console.log(`Merged #${from} into #${into} (keys+members moved, #${from} deleted).`);
+          return 0;
+        }
+        if (sub === "attach" || sub === "detach") {
+          const id = asId(args[1]); const tid = args[2];
+          if (!id || !tid) { console.error(`usage: darth-cli meetings series ${sub} <series-id> <transcript-id>`); return 1; }
+          if (sub === "attach") {
+            await ctx.expectJson(ctx.api("meetings", `/api/series/${id}/members`, {
+              method: "POST", body: JSON.stringify({ transcriptId: tid, how: flags.manual === true ? "manual" : "confirmed" }) }));
+            if (!ctx.json) console.log("Attached.");
+          } else {
+            const qs = new URLSearchParams({ transcriptId: tid });
+            if (flags.remember === true) qs.set("remember", "1");
+            await ctx.expectJson(ctx.api("meetings", `/api/series/${id}/members?${qs}`, { method: "DELETE" }));
+            if (!ctx.json) console.log(flags.remember === true ? "Detached (and won't be re-suggested)." : "Detached.");
+          }
+          return 0;
+        }
+        console.error(`unknown series subcommand '${sub}' — try: series | series <id> | set | merge | attach | detach`);
+        return 1;
       }
 
       case "import": {
