@@ -21,7 +21,12 @@ const execFileP = promisify(execFile);
 export async function concatMediaToTemp(filenames: string[]): Promise<string> {
   await ensureAudioDir();
   const listPath = path.join(getAudioDir(), `concat-${randomUUID()}.txt`);
-  const outName = `concat-${randomUUID()}.mp4`;
+  // Container by CONTENT, not habit: stitched phone recordings (m4a) are
+  // audio-only AAC — naming them .mp4 made the transcript page call them
+  // "Uploaded video" and offer a video toggle (Alok 2026-08-30). The
+  // re-encode path below already picks this way.
+  const firstHasVideo = filenames.length > 0 ? await hasVideo(filenames[0]!) : false;
+  const outName = `concat-${randomUUID()}.${firstHasVideo ? 'mp4' : 'm4a'}`;
   const outAbs = resolveAudioPath(outName);
   // ffmpeg concat-demuxer list syntax: file 'path' — single quotes escaped.
   const list = filenames
