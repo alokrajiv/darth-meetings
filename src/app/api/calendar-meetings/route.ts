@@ -8,6 +8,8 @@ import {
   type CalendarMeetingView,
 } from '@/db-ops/calendar-event-cache';
 import { findSeriesByRecurringBaseIds } from '@/db-ops/series';
+import { ensureMeetingsForOccurrences } from '@/db-ops/meetings';
+import { getAutoSyncLog, predictedAutoSyncImporters, type AutoSyncLogRow } from '@/db-ops/user-prefs';
 import { recurringBaseId } from '@/lib/series-keys';
 import { parseMeetingFilters } from '@/lib/server/meeting-filters';
 
@@ -96,6 +98,18 @@ export interface CalendarMeetingRow {
   chatReason: string | null;
   /** Organized by an external tenant (raw.external on the same row). */
   chatExternal: boolean | null;
+  /** Stable meeting identity (migration 036) — /m/<uuid> works BEFORE any
+   * import and keeps resolving to the transcript afterwards. Minted for
+   * rows with a meeting code. */
+  meetingUuid: string | null;
+  /** Account auto-sync's intent for the occurrence (unimported rows):
+   * 'imported'/'queued' = the ledger claimed it, 'pending' = an enabled
+   * user's open reminder covers it and a sweep will take it — either way
+   * the Import… CTA gives way to the auto-sync chip. */
+  autoSync: {
+    state: 'imported' | 'queued' | 'pending';
+    importerEmail: string | null;
+  } | null;
 }
 
 export interface CalendarMeetingsResponse {
@@ -144,14 +158,47 @@ function isoOf(v: string | Date): string {
   return v instanceof Date ? v.toISOString() : new Date(v).toISOString();
 }
 
+/** Normalized occurrence key — matches the auto-sync ledger's occ_key. */
+function occKeyOf(r: CalendarMeetingDbRow): string | null {
+  return r.meeting_code ? `${r.meeting_code}|${new Date(r.event_start).toISOString()}` : null;
+}
+
+function autoSyncOf(
+  key: string | null,
+  log: Map<string, AutoSyncLogRow>,
+  predicted: Map<string, string>
+): CalendarMeetingRow['autoSync'] {
+  if (!key) return null;
+  const claim = log.get(key);
+  if (claim) {
+    // failed/no_access/nudged: the sweep tried and can't (yet) — the honest
+    // CTA there is the plain Import… button, so no chip.
+    if (claim.outcome === 'imported' || claim.outcome === 'already')
+      return { state: 'imported', importerEmail: claim.importer_email };
+    if (claim.outcome === 'deferred')
+      return { state: 'queued', importerEmail: claim.importer_email };
+    return null;
+  }
+  const importer = predicted.get(key);
+  return importer ? { state: 'pending', importerEmail: importer } : null;
+}
+
 function toRow(
   r: CalendarMeetingDbRow,
-  seriesByBase: Map<string, { series_id: number; title: string }>
+  seriesByBase: Map<string, { series_id: number; title: string }>,
+  extras: {
+    uuids: Map<string, string>;
+    log: Map<string, AutoSyncLogRow>;
+    predicted: Map<string, string>;
+  }
 ): CalendarMeetingRow {
   const series = r.recurring_event_id
     ? (seriesByBase.get(recurringBaseId(r.recurring_event_id)) ?? null)
     : null;
+  const occKey = occKeyOf(r);
   return {
+    meetingUuid: occKey ? (extras.uuids.get(occKey) ?? null) : null,
+    autoSync: autoSyncOf(occKey, extras.log, extras.predicted),
     key: r.key,
     meetingCode: r.meeting_code,
     title: r.title,
@@ -233,10 +280,32 @@ export const GET = withAuth(async ({ user, request }) => {
       )
     ),
   ];
-  const seriesByBase = await findSeriesByRecurringBaseIds(baseIds);
+  // Pre-import identity + auto-sync intent, batched over the served rows.
+  const allRows = page.days.flatMap((d) => d.rows);
+  const occs = allRows
+    .filter((r) => r.meeting_code)
+    .map((r) => ({
+      code: r.meeting_code!,
+      startIso: isoOf(r.event_start),
+      provider: (r.meeting_code!.startsWith('teams-') ? 'teams' : 'gmeet') as string,
+      title: r.title,
+    }));
+  const occKeys = [...new Set(occs.map((o) => `${o.code}|${o.startIso}`))];
+  const [seriesByBase, uuids, log, predicted] = await Promise.all([
+    findSeriesByRecurringBaseIds(baseIds),
+    ensureMeetingsForOccurrences(occs).catch((err) => {
+      console.warn('[calendar-meetings] occurrence uuid mint failed:', err);
+      return new Map<string, string>();
+    }),
+    view === 'unimported' ? getAutoSyncLog(occKeys) : Promise.resolve(new Map<string, AutoSyncLogRow>()),
+    view === 'unimported'
+      ? predictedAutoSyncImporters(occs)
+      : Promise.resolve(new Map<string, string>()),
+  ]);
+  const extras = { uuids, log, predicted };
 
   const body: CalendarMeetingsResponse = {
-    days: page.days.map((d) => ({ key: d.key, rows: d.rows.map((r) => toRow(r, seriesByBase)) })),
+    days: page.days.map((d) => ({ key: d.key, rows: d.rows.map((r) => toRow(r, seriesByBase, extras)) })),
     counts,
     nextCursor: page.nextCursor,
     hasMore: page.hasMore,

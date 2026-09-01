@@ -12,6 +12,8 @@ import { executeGmeetImport } from '@/lib/server/gmeet-import-core';
 import { executeTeamsImport } from '@/lib/server/teams-import-core';
 import { notifyUser, APP_URL } from '@/lib/server/darth-notify';
 import { dm, meetingLine, openLink } from '@/lib/server/dm-copy';
+import { listAutoSyncUsers, type AutoSyncUser } from '@/db-ops/user-prefs';
+import { ensureSharedWith } from '@/lib/server/account-auto-sync';
 
 /**
  * Series auto-import: for every series with auto_import enabled, re-run the
@@ -221,6 +223,71 @@ async function fireOne(
         ),
         dedupeKey: `mw-autoimport:${series.id}:${o.key}`,
       });
-    })();
+      await notifyAutoSyncWatchers(series, cfg, o, kind, imported?.assemblyai_id ?? null, link, dur);
+    })().catch((err) => console.warn('[series-auto-import] notify failed:', err));
   }
+}
+
+/**
+ * A series import also satisfies ACCOUNT auto-sync users who were in the
+ * meeting — the account sweep defers to the series setting
+ * (seriesOwnsOrOptsOut), so without this they'd hear nothing even with
+ * auto-sync + notifications on (the auto-share to invitees is silent).
+ * Share + DM them exactly like the account sweep's watchers.
+ */
+async function notifyAutoSyncWatchers(
+  series: SeriesRow,
+  cfg: NonNullable<SeriesRow['auto_import']>,
+  o: SeriesOccurrence,
+  kind: 'imported' | 'deferred',
+  assemblyaiId: string | null,
+  link: string,
+  dur: number | null
+): Promise<void> {
+  let users: AutoSyncUser[];
+  try {
+    users = await listAutoSyncUsers();
+  } catch {
+    return;
+  }
+  const involved = new Set(
+    (o.attendees ?? [])
+      .map((a) => a.email?.toLowerCase())
+      .filter((e): e is string => !!e)
+  );
+  if (o.organizerEmail) involved.add(o.organizerEmail.toLowerCase());
+  const startMs = Date.parse(o.startIso);
+  const provider = providerOf(o) === 'teams' ? 'teams' : 'gmeet';
+  const watchers = users.filter((u) => {
+    const email = u.email.toLowerCase();
+    if (email === cfg.byEmail.toLowerCase()) return false; // enabler already DM'd
+    if (!involved.has(email)) return false;
+    if (!u.prefs.providers[provider]) return false;
+    if (u.prefs.since && startMs <= Date.parse(u.prefs.since)) return false;
+    if (u.prefs.scope === 'mine' && (o.organizerEmail ?? '').toLowerCase() !== email) return false;
+    return true;
+  });
+  if (watchers.length === 0) return;
+  if (assemblyaiId) {
+    await ensureSharedWith(assemblyaiId, watchers.map((w) => w.email)).catch(() => {});
+  }
+  for (const w of watchers) {
+    void notifyUser({
+      kind: 'auto_import',
+      toEmail: w.email,
+      text: dm(
+        `⚡ *Auto-sync picked up a meeting you were in*`,
+        meetingLine({ title: o.title, when: o.startIso, duration: dur }),
+        kind === 'imported'
+          ? `Imported — speakers are being identified; notes follow once they're confirmed.`
+          : `Queued — the recording/transcript is still being generated. It lands on its own; nothing to do.`,
+        `Imported once, via ${cfg.byEmail}'s "${series.title}" series auto-import, and shared with you — no duplicate needed.`,
+        link
+      ),
+      dedupeKey: `mw-autoimport:${series.id}:${o.key}:${w.email}`,
+    });
+  }
+  console.log(
+    `[series-auto-import] series ${series.id} "${o.title ?? o.key}": notified ${watchers.length} auto-sync watcher(s)`
+  );
 }

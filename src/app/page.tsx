@@ -133,10 +133,19 @@ export default function Home() {
       setGmeetSyncMode(meet === 'sync');
       setGmeetOpen(true);
     }
-    if (meet || params.get('google')) {
+    // /m/<uuid> of a not-yet-imported occurrence lands here as
+    // /?import=<code>&start=<iso> — open the import dialog focused on it.
+    const importCode = params.get('import');
+    if (importCode) {
+      setGmeetFocus({ meetingCode: importCode, eventStart: params.get('start') });
+      setGmeetOpen(true);
+    }
+    if (meet || importCode || params.get('google')) {
       params.delete('meet');
       params.delete('google');
       params.delete('reason');
+      params.delete('import');
+      params.delete('start');
       const qs = params.toString();
       window.history.replaceState(null, '', `${window.location.pathname}${qs ? `?${qs}` : ''}`);
     }

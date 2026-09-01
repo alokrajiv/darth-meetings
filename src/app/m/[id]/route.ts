@@ -2,6 +2,7 @@ import { NextResponse, type NextRequest } from 'next/server';
 import { getMeetingById } from '@/db-ops/meetings';
 import { getCurrentUser } from '@/lib/auth/sso-session';
 import { resolveAccess } from '@/db-ops/transcript-access';
+import { callerInvolvedCodes } from '@/db-ops/calendar-event-cache';
 
 export const runtime = 'nodejs';
 
@@ -34,6 +35,23 @@ export async function GET(
   if (!user) return NextResponse.redirect(new URL('/', origin));
   const meeting = await getMeetingById(id);
   if (!meeting) return NextResponse.redirect(new URL('/', origin));
+  if (!meeting.transcript_id) {
+    // Pre-import occurrence row (migration 036): nobody imported it yet, so
+    // "in" is the home listing with the import dialog focused on it. Gated
+    // by the caller-involvement predicate (privacy audit 2026-08-24) — an
+    // uninvolved caller gets the same plain home redirect as an unknown
+    // uuid, so the Location header never leaks the meeting code/time.
+    if (!meeting.provider_key) return NextResponse.redirect(new URL('/', origin));
+    const involved = await callerInvolvedCodes(
+      { userId: user.userId, email: user.email },
+      [{ code: meeting.provider_key, instant: meeting.occ_start }]
+    ).catch(() => new Set<string>());
+    if (!involved.has(meeting.provider_key)) return NextResponse.redirect(new URL('/', origin));
+    const target = new URL('/', origin);
+    target.searchParams.set('import', meeting.provider_key);
+    if (meeting.occ_start) target.searchParams.set('start', new Date(meeting.occ_start).toISOString());
+    return NextResponse.redirect(target);
+  }
   const access = await resolveAccess(user.userId, user.email, meeting.transcript_id);
   if (!access) return NextResponse.redirect(new URL('/', origin));
   return NextResponse.redirect(new URL(`/transcript/${meeting.transcript_id}`, origin));

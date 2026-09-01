@@ -20,10 +20,14 @@ const SCHEMA = SCHEMAS.MEETING_WHISPERER;
 
 export interface MeetingRow {
   id: string;
-  transcript_id: string;
+  /** NULL = pre-import occurrence row (migration 036): identity minted from
+   * the calendar listing, waiting to be adopted by an import. */
+  transcript_id: string | null;
   former_ids: string[];
   provider: string;
   provider_key: string | null;
+  /** Occurrence UTC instant — set on pre-import rows (adoption key). */
+  occ_start: string | null;
   title_hint: string | null;
   created_by: string | null;
   created_at: string;
@@ -51,25 +55,124 @@ export function meetingIdentityFrom(
 /**
  * Idempotent per transcript identity: creates the meeting row on first
  * sight, backfills provider_key/title on later sights (never clears them).
+ *
+ * With `occStart` (the occurrence's calendar instant), first tries to ADOPT
+ * a pre-import occurrence row minted by the listing (migration 036) — the
+ * uuid people clicked/shared before the import becomes the transcript's
+ * permanent /m/<uuid>. Falls through to the plain insert when no occurrence
+ * row matches or the transcript identity already has a meeting.
  */
 export async function ensureMeeting(input: {
   transcriptId: string;
   provider: string;
   providerKey?: string | null;
+  occStart?: string | null;
+  /** Extra occurrence keys to adopt by — Teams rows are minted under the
+   * `teams-…` cache code while provider_key is the join URL. */
+  adoptKeys?: Array<string | null | undefined>;
   title?: string | null;
   createdBy?: string | null;
 }): Promise<MeetingRow> {
+  const adoptKeys = [
+    ...new Set([input.providerKey, ...(input.adoptKeys ?? [])].filter((k): k is string => !!k)),
+  ];
+  if (adoptKeys.length > 0 && input.occStart && !Number.isNaN(Date.parse(input.occStart))) {
+    const adopted = await sql<MeetingRow[]>`
+      UPDATE ${sql(SCHEMA)}.meetings SET
+        transcript_id = ${input.transcriptId},
+        provider = ${input.provider},
+        title_hint = COALESCE(title_hint, ${input.title ?? null}),
+        created_by = COALESCE(created_by, ${input.createdBy ?? null}),
+        updated_at = now()
+      WHERE id = (
+        SELECT m.id FROM ${sql(SCHEMA)}.meetings m
+        WHERE m.transcript_id IS NULL
+          AND m.provider_key = ANY(${adoptKeys})
+          AND m.occ_start IS NOT NULL
+          AND abs(extract(epoch FROM (m.occ_start - ${input.occStart}::timestamptz))) <= 60
+          AND NOT EXISTS (
+            SELECT 1 FROM ${sql(SCHEMA)}.meetings t WHERE t.transcript_id = ${input.transcriptId}
+          )
+        ORDER BY abs(extract(epoch FROM (m.occ_start - ${input.occStart}::timestamptz)))
+        LIMIT 1
+        FOR UPDATE SKIP LOCKED
+      )
+      RETURNING *
+    `;
+    if (adopted[0]) return adopted[0];
+  }
   const rows = await sql<MeetingRow[]>`
-    INSERT INTO ${sql(SCHEMA)}.meetings (transcript_id, provider, provider_key, title_hint, created_by)
+    INSERT INTO ${sql(SCHEMA)}.meetings (transcript_id, provider, provider_key, occ_start, title_hint, created_by)
     VALUES (${input.transcriptId}, ${input.provider}, ${input.providerKey ?? null},
-            ${input.title ?? null}, ${input.createdBy ?? null})
+            ${input.occStart ?? null}, ${input.title ?? null}, ${input.createdBy ?? null})
     ON CONFLICT (transcript_id) DO UPDATE SET
       provider_key = COALESCE(${sql(SCHEMA)}.meetings.provider_key, EXCLUDED.provider_key),
+      occ_start = COALESCE(${sql(SCHEMA)}.meetings.occ_start, EXCLUDED.occ_start),
       title_hint = COALESCE(EXCLUDED.title_hint, ${sql(SCHEMA)}.meetings.title_hint),
       updated_at = now()
     RETURNING *
   `;
   return rows[0]!;
+}
+
+/**
+ * Batch mint/return pre-import occurrence uuids for calendar listing rows
+ * (migration 036). Returns `<code>|<UTC ISO>` → meeting uuid. An occurrence
+ * an import already adopted resolves to THAT meeting's uuid (same instant
+ * match), so a row racing its own import still links to the right page.
+ */
+export async function ensureMeetingsForOccurrences(
+  occs: Array<{ code: string; startIso: string; provider: string; title?: string | null }>
+): Promise<Map<string, string>> {
+  const seen = new Map<string, (typeof occs)[number]>();
+  for (const o of occs) {
+    if (!o.code || Number.isNaN(Date.parse(o.startIso))) continue;
+    const key = `${o.code}|${new Date(o.startIso).toISOString()}`;
+    if (!seen.has(key)) seen.set(key, o);
+  }
+  if (seen.size === 0) return new Map();
+  const batch = [...seen.values()].map((o) => ({
+    code: o.code,
+    start: new Date(o.startIso).toISOString(),
+    provider: o.provider,
+    title: o.title ?? null,
+  }));
+  const rows = await sql<Array<{ id: string; provider_key: string; occ_start: string }>>`
+    WITH wanted AS (
+      SELECT * FROM jsonb_to_recordset(${sql.json(batch as unknown as never)})
+        AS w(code text, start timestamptz, provider text, title text)
+    ),
+    minted AS (
+      INSERT INTO ${sql(SCHEMA)}.meetings (transcript_id, provider, provider_key, occ_start, title_hint)
+      SELECT NULL, w.provider, w.code, w.start, w.title
+      FROM wanted w
+      WHERE NOT EXISTS (
+        SELECT 1 FROM ${sql(SCHEMA)}.meetings m
+        WHERE m.provider_key = w.code
+          AND m.occ_start IS NOT NULL
+          AND abs(extract(epoch FROM (m.occ_start - w.start))) <= 60
+      )
+      ON CONFLICT (provider_key, occ_start) WHERE transcript_id IS NULL DO NOTHING
+      RETURNING id, provider_key, occ_start
+    )
+    SELECT id, provider_key, occ_start FROM minted
+    UNION ALL
+    SELECT m.id, w.code AS provider_key, w.start AS occ_start
+    FROM wanted w
+    JOIN LATERAL (
+      SELECT m.id FROM ${sql(SCHEMA)}.meetings m
+      WHERE m.provider_key = w.code
+        AND m.occ_start IS NOT NULL
+        AND abs(extract(epoch FROM (m.occ_start - w.start))) <= 60
+      ORDER BY abs(extract(epoch FROM (m.occ_start - w.start))), m.created_at
+      LIMIT 1
+    ) m ON true
+  `;
+  const out = new Map<string, string>();
+  for (const r of rows) {
+    out.set(`${r.provider_key}|${new Date(r.occ_start).toISOString()}`, r.id);
+  }
+  return out;
 }
 
 /**
@@ -155,6 +258,7 @@ export async function repointMeeting(fromId: string, toId: string): Promise<void
         former_ids = ${sql.array(mergedFormer)},
         provider = ${meetingIdentityFrom(toId).provider === 'upload' ? older.provider : meetingIdentityFrom(toId).provider},
         provider_key = COALESCE(provider_key, ${loser.provider_key}),
+        occ_start = COALESCE(occ_start, ${loser.occ_start}),
         title_hint = COALESCE(title_hint, ${loser.title_hint}),
         updated_at = now()
       WHERE id = ${older.id}

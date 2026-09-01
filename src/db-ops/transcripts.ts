@@ -2,6 +2,7 @@ import 'server-only';
 import { sql } from '@/lib/db';
 import { SCHEMAS } from '@/lib/constants/database';
 import { publishEvent } from '@/lib/server/event-bus';
+import { teamsCacheCode } from '@/lib/server/teams-ids';
 import {
   cleanupMeetingIfOrphan,
   ensureMeeting,
@@ -633,7 +634,21 @@ async function trackMeeting(
 ): Promise<void> {
   try {
     const { provider, providerKey } = meetingIdentityFrom(transcriptId, ctx);
-    await ensureMeeting({ transcriptId, provider, providerKey, title: title ?? null, createdBy: userId });
+    await ensureMeeting({
+      transcriptId,
+      provider,
+      providerKey,
+      // Occurrence instant → adopt a pre-minted listing uuid when one exists.
+      // Teams: listing rows mint under the teams-… cache code, provider_key
+      // is the join URL — adopt by either.
+      occStart: ctx?.startTime ?? null,
+      adoptKeys: [
+        ctx?.meetingCode,
+        ctx?.teams?.joinWebUrl ? teamsCacheCode(ctx.teams.joinWebUrl) : null,
+      ],
+      title: title ?? null,
+      createdBy: userId,
+    });
   } catch (err) {
     console.error('[meetings] ensure failed for', transcriptId, err);
   }

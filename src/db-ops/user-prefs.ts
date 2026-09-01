@@ -174,6 +174,46 @@ export async function listAutoSyncUsers(): Promise<AutoSyncUser[]> {
   }));
 }
 
+/**
+ * Which occurrences is the account auto-sync sweep going to take? For each
+ * input occurrence, finds an OPEN 'unimported' reminder belonging to an
+ * auto-sync-enabled user whose scope/since/provider prefs match — the exact
+ * population sweepAccountAutoSync reads — and names the likeliest importer
+ * (organiser first, mirroring the sweep's election). Powers the listing's
+ * "auto-sync will pick this up" chip BEFORE any auto_sync_log claim exists.
+ * Returns `<code>|<UTC ISO>` → importer email.
+ */
+export async function predictedAutoSyncImporters(
+  occs: Array<{ code: string; startIso: string }>
+): Promise<Map<string, string>> {
+  const batch = occs
+    .filter((o) => o.code && !Number.isNaN(Date.parse(o.startIso)))
+    .map((o) => ({ code: o.code, start: new Date(o.startIso).toISOString() }));
+  if (batch.length === 0) return new Map();
+  const rows = await sql<Array<{ code: string; start: string; email: string }>>`
+    SELECT DISTINCT ON (o.code, o.start) o.code, o.start, p.email
+    FROM jsonb_to_recordset(${sql.json(batch as unknown as never)})
+         AS o(code text, start timestamptz)
+    JOIN ${sql(SCHEMA)}.gmeet_reminders r
+      ON r.meeting_code = o.code
+     AND r.kind = 'unimported'
+     AND r.resolved_at IS NULL
+     AND r.event_start IS NOT NULL
+     AND abs(extract(epoch FROM (r.event_start - o.start))) <= 60
+    JOIN ${sql(SCHEMA)}.user_prefs p
+      ON p.user_id = r.user_id
+     AND p.auto_sync <> 'off'
+     AND (p.auto_sync = 'all' OR r.organizer_self)
+     AND (p.auto_sync_since IS NULL OR r.event_start > p.auto_sync_since)
+     AND COALESCE(
+           (p.auto_sync_providers ->> CASE WHEN o.code LIKE 'teams-%' THEN 'teams' ELSE 'gmeet' END)::boolean,
+           true
+         )
+    ORDER BY o.code, o.start, r.organizer_self DESC, p.email
+  `;
+  return new Map(rows.map((r) => [`${r.code}|${new Date(r.start).toISOString()}`, r.email]));
+}
+
 // ---------------------------------------------------------------------------
 // auto_sync_log — the one-import-per-occurrence ledger
 // ---------------------------------------------------------------------------

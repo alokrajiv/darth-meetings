@@ -23,7 +23,9 @@ export const GET = withAuth(async ({ user, request }) => {
     return NextResponse.json({ error: 'any parameter required' }, { status: 400 });
   }
   const meeting = await resolveMeetingByAnyTranscriptId(any);
-  if (!meeting) return NextResponse.json({ found: false }, { status: 404 });
+  // Pre-import occurrence rows (transcript_id NULL) resolve by uuid via /m,
+  // never by transcript id — same 404 as unknown here.
+  if (!meeting?.transcript_id) return NextResponse.json({ found: false }, { status: 404 });
   const access = await resolveAccess(user.userId, user.email, meeting.transcript_id);
   if (!access) return NextResponse.json({ found: false }, { status: 404 });
   return NextResponse.json({

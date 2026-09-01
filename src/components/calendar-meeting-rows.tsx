@@ -13,7 +13,7 @@ import {
   type TeamsChatVerdict,
 } from '@/lib/format';
 import { msConnectHref, msLinkMissing, useMsLinkStatus } from '@/components/connect-nudge-banner';
-import { ExternalLink, EyeOff, FileText, Loader2, Repeat, Search, Settings2, Upload, Video, VideoOff } from 'lucide-react';
+import { ExternalLink, EyeOff, FileText, Loader2, Repeat, Search, Settings2, Upload, Video, VideoOff, Zap } from 'lucide-react';
 import { MeetLogo, TeamsLogo } from '@/components/provider-icon';
 import { requestMediaUpload } from '@/components/audio-upload';
 
@@ -659,11 +659,30 @@ export function CalendarEventRow({
     }
   };
 
+  // "Going in" on a not-yet-imported meeting = the import dialog focused on
+  // it (same mechanism as the reminder rows and the Import… button). The
+  // buttons/badges inside all stopPropagation already.
+  const rowClickable = !!r.meetingCode && !!onImportMeeting && layer === 'unimported';
+  const autoSyncTitle =
+    r.autoSync &&
+    (r.autoSync.state === 'pending'
+      ? `Auto-sync has this meeting: it will be imported automatically once the recording/transcript is ready${
+          r.autoSync.importerEmail ? ` (via ${r.autoSync.importerEmail}'s connection)` : ''
+        } and shared with everyone who was in it. No need to import it yourself — click the row if you can't wait.`
+      : r.autoSync.state === 'queued'
+        ? `Auto-sync already queued this import${
+            r.autoSync.importerEmail ? ` via ${r.autoSync.importerEmail}` : ''
+          } — it lands on its own once the artifacts are ready.`
+        : `Auto-sync already imported this meeting${
+            r.autoSync.importerEmail ? ` via ${r.autoSync.importerEmail}` : ''
+          } — the listing catches up on the next refresh.`);
+
   return (
     <TableRow
+      onClick={rowClickable ? () => onImportMeeting!({ meetingCode: r.meetingCode!, eventStart: r.eventStart }) : undefined}
       className={`group bg-muted/30 transition-colors hover:bg-accent/30 ${
         r.muted ? 'opacity-60' : ''
-      }`}
+      } ${rowClickable ? 'cursor-pointer' : ''}`}
     >
       {leadCols.map((key) => (
         <TableCell key={key} className={`py-1.5 pl-4 align-top ${colClass(key)}`}>
@@ -791,7 +810,21 @@ export function CalendarEventRow({
       <TableCell className="py-1.5 pr-3">
         <div className="flex items-center justify-end gap-0.5">
           <EventGearMenu row={r} layer={layer} onMuteChanged={onMuteChanged} />
-          {canImport && (
+          {canImport && r.autoSync && (
+            <Badge
+              variant="outline"
+              title={autoSyncTitle ?? undefined}
+              className="shrink-0 gap-1 border-primary/30 bg-primary/5 text-[10px] font-normal text-primary"
+            >
+              <Zap className="h-3 w-3" />
+              {r.autoSync.state === 'pending'
+                ? 'Auto-sync'
+                : r.autoSync.state === 'queued'
+                  ? 'Auto-sync queued'
+                  : 'Auto-synced'}
+            </Badge>
+          )}
+          {canImport && !r.autoSync && (
             <Button
               size="sm"
               variant="outline"

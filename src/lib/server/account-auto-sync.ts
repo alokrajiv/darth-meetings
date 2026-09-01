@@ -17,7 +17,11 @@ import {
   findCalendarEventByOccurrence,
   type CalendarEventImportRow,
 } from '@/db-ops/calendar-event-cache';
-import { getMeetingCacheByKeys, getTeamsJoinUrlByMeeting } from '@/db-ops/gmeet-meeting-cache';
+import {
+  getMeetingCacheByMeetings,
+  getTeamsJoinUrlByMeeting,
+  type GmeetMeetingCacheRow,
+} from '@/db-ops/gmeet-meeting-cache';
 import { findImportedByMeetingCodes } from '@/db-ops/gmeet-sync';
 import { findImportedByTeamsMeetings } from '@/db-ops/teams-import';
 import { getAnyByAssemblyaiId } from '@/db-ops/transcripts';
@@ -74,7 +78,13 @@ const MAX_FIRES_PER_PASS = 6;
 const DRIVE_FILES = 'https://www.googleapis.com/drive/v3/files';
 
 type Caller = { userId: string; email: string };
-type Elector = { user: AutoSyncUser; row: UnimportedCandidateRow };
+type Elector = {
+  user: AutoSyncUser;
+  row: UnimportedCandidateRow;
+  /** Admitted only because the recording may still be generating — dropped
+   * unless the cache confirms it is (see the preparing gate below). */
+  needsPreparing?: boolean;
+};
 
 interface Group {
   key: string;
@@ -83,6 +93,9 @@ interface Group {
   title: string | null;
   provider: 'gmeet' | 'teams';
   electors: Elector[];
+  /** Occurrence's artifact-cache row (matched by code+instant — cache
+   * event_keys are per-user-tz flavoured, never the normalized occ key). */
+  cacheRow: GmeetMeetingCacheRow | null;
 }
 
 function retryable(prior: AutoSyncLogRow | undefined, now: number): boolean {
@@ -126,7 +139,16 @@ export async function sweepAccountAutoSync(): Promise<void> {
     if (!p.providers[provider]) continue;
     const wantVideo = p.mode !== 'transcript';
     const wantTranscript = p.mode !== 'video';
-    if (!((wantVideo && row.has_recording) || (wantTranscript && row.has_transcript))) continue;
+    const firm = (wantVideo && row.has_recording) || (wantTranscript && row.has_transcript);
+    // Video-mode users whose occurrence only has its transcript so far are
+    // admitted PROVISIONALLY: when the provider says the recording is still
+    // generating, the deferred import fires NOW — the claim lands early
+    // ("locked in"), the defer- placeholder mints the meeting's uuid, and
+    // the poller attaches the video when Google finishes it. Without a
+    // preparing signal they're dropped below (a recording that never
+    // existed would just make a dead 6h placeholder).
+    const provisional = !firm && wantVideo && row.has_transcript;
+    if (!firm && !provisional) continue;
     // NORMALISED occurrence key: reminders carry each user's OWN calendar
     // timezone in their event_key ('…|11:30:00+05:30' vs '…|14:00:00+08:00'
     // for the same instant), so grouping on the raw key would give every
@@ -136,10 +158,39 @@ export async function sweepAccountAutoSync(): Promise<void> {
     const key = `${row.meeting_code}|${startIso}`;
     let g = groups.get(key);
     if (!g) {
-      g = { key, code: row.meeting_code, startIso, title: row.title, provider, electors: [] };
+      g = {
+        key,
+        code: row.meeting_code,
+        startIso,
+        title: row.title,
+        provider,
+        electors: [],
+        cacheRow: null,
+      };
       groups.set(key, g);
     }
-    g.electors.push({ user, row });
+    g.electors.push({ user, row, needsPreparing: provisional });
+  }
+  if (groups.size === 0) return;
+
+  // One batch cache lookup for every group (also feeds fireGroup — the old
+  // per-group exact-key lookup silently never matched). Provisional electors
+  // survive only when the cache says the recording is generating, with the
+  // same 24h freshness guard the calendar layer's recording_preparing uses.
+  {
+    const list = [...groups.values()];
+    const cacheRows = await getMeetingCacheByMeetings(
+      list.map((g) => ({ code: g.code, startTime: g.startIso }))
+    ).catch(() => list.map(() => null));
+    for (let i = 0; i < list.length; i++) {
+      const g = list[i]!;
+      g.cacheRow = cacheRows[i] ?? null;
+      const recPreparing =
+        g.cacheRow?.recording_state === 'generating' &&
+        Date.parse(g.startIso) > now - 24 * 3600 * 1000;
+      if (!recPreparing) g.electors = g.electors.filter((e) => !e.needsPreparing);
+      if (g.electors.length === 0) groups.delete(g.key);
+    }
   }
   if (groups.size === 0) return;
 
@@ -253,7 +304,7 @@ function isAccessError(status: number, error: string): boolean {
 async function fireGroup(g: Group, electors: Elector[], now: number): Promise<void> {
   const watchersOf = (importer: Elector) =>
     electors.filter((e) => e !== importer).map((e) => e.user.email);
-  const cacheRow = (await getMeetingCacheByKeys([g.key]).catch(() => new Map())).get(g.key) ?? null;
+  const cacheRow = g.cacheRow;
   const teamsUrl = g.provider === 'teams' ? await getTeamsJoinUrlByMeeting(g.code, g.startIso) : null;
   if (g.provider === 'teams' && !teamsUrl) {
     await settleAutoSync(g.key, { outcome: 'failed', detail: 'no Teams join URL resolved yet' });
@@ -378,6 +429,26 @@ async function fireGroup(g: Group, electors: Elector[], now: number): Promise<vo
       });
       if (existing) await ensureSharedWith(existing, electors.map((e) => e.user.email));
       await resolveAll(electors, g.key, 'imported');
+      if (existing) {
+        // The electors asked auto-sync to cover this — tell them it's ready
+        // even though someone else's import got there first (previously this
+        // path shared silently and nobody heard about the meeting).
+        const link = await openLink(existing, 'Open the meeting');
+        const line = meetingLine({ title: g.title, when: g.startIso });
+        for (const e of electors) {
+          void notifyUser({
+            kind: 'auto_import',
+            toEmail: e.user.email,
+            text: dm(
+              `⚡ *A meeting you were in is ready*`,
+              line,
+              `Someone already imported it — auto-sync shared it with you instead of importing a duplicate.`,
+              link
+            ),
+            dedupeKey: `mw-autosync:${g.key}:${e.user.email}`,
+          });
+        }
+      }
       console.log(`[auto-sync] ${g.key}: already imported (${existing ?? '?'}) — shared to ${electors.length}`);
       return;
     }
@@ -413,8 +484,9 @@ async function resolveAll(electors: Elector[], _key: string, reason: string): Pr
   }
 }
 
-/** Edit-share the row with these emails (idempotent; owner skipped). */
-async function ensureSharedWith(assemblyaiId: string, emails: string[]): Promise<void> {
+/** Edit-share the row with these emails (idempotent; owner skipped). Also
+ * used by the series auto-import sweep for its auto-sync watchers. */
+export async function ensureSharedWith(assemblyaiId: string, emails: string[]): Promise<void> {
   if (emails.length === 0) return;
   const row = await getAnyByAssemblyaiId(assemblyaiId).catch(() => null);
   if (!row) return;
