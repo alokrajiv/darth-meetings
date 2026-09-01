@@ -14,6 +14,7 @@ import {
 } from '@/lib/server/gmeet';
 import { getServerAccessToken } from '@/lib/server/google-oauth';
 import { fetchRecordingFromDrive, fetchVideoPartFromDrive } from '@/lib/server/recording-fetch';
+import { executeGmeetImport } from '@/lib/server/gmeet-import-core';
 import { generateAutoReport } from '@/lib/server/auto-notes';
 import { notifyUser } from '@/lib/server/darth-notify';
 import { dm, meetingLine, openLink, whenLine } from '@/lib/server/dm-copy';
@@ -72,6 +73,7 @@ const RESUME_SIBLING_SLOP_MS = 3 * 3600 * 1000;
 const RESUME_EMPTY_GRACE_MS = 15 * 60 * 1000;
 const MAX_RESUME_SIBLINGS = 4;
 const MAX_RESUME_PER_TICK = 15;
+const MAX_RECOMBINE_ATTEMPTS = 3;
 
 let started = false;
 let ticking = false;
@@ -433,6 +435,21 @@ async function checkResumeRow(row: ResumeRow): Promise<void> {
   const candidate = siblings.find((s) => s.endTime && !byName.get(s.name)?.adoptedAt);
   if (!candidate) {
     await heartbeat({ found });
+    // Nothing new to adopt — fire the queued combine-and-re-transcribe once
+    // every part's bytes are in, no attach is in flight, and no sitting is
+    // still live (a meeting on its SECOND break would otherwise recombine
+    // once per sitting, at a full transcription cost each time).
+    const parts = ctx.videoParts ?? [];
+    const partsStored = parts.length > 0 && parts.every((p) => !!p.filename);
+    const sittingOpen = siblings.some((s) => !s.endTime);
+    if (
+      ctx.pendingRecombine?.status === 'waiting' &&
+      !sittingOpen &&
+      ctx.recordingPending?.status !== 'waiting' &&
+      partsStored
+    ) {
+      await runRecombine(row, ctx.pendingRecombine);
+    }
     return;
   }
   if (watch.knownRecords.length > MAX_RESUME_SIBLINGS) {
@@ -485,6 +502,9 @@ async function checkResumeRow(row: ResumeRow): Promise<void> {
       attempts: (watch.attempts ?? 0) + 1,
     },
     recordingPending: { recordName: candidate.name, since: nowIso, status: 'waiting' },
+    // Queue the automatic combine-and-re-transcribe — fired by a later visit
+    // once the part bytes are stored and no sitting is still open.
+    pendingRecombine: { since: nowIso, status: 'waiting' },
     // Keep the sibling's transcript Docs on the snapshot — re-transcribe and
     // evidence flows read from here.
     ...(ctx.actuals && arts.transcriptDocIds.length > 0
@@ -514,10 +534,100 @@ async function checkResumeRow(row: ResumeRow): Promise<void> {
           speakerCount: row.speaker_count,
         }),
         `The call restarted${resumedAt ? ` at ${resumedAt}` : ''} as a fresh Meet session — Google keeps a separate recording for it, and it will attach here as an extra video on its own.`,
-        `For one combined transcript afterwards, use “Combine all videos & re-transcribe” → ${link}`
+        `Once it lands, the transcript re-generates automatically to cover both sittings → ${link}`
       ),
       dedupeKey: `mw-resume:${row.assemblyai_id}:${candidate.name}:${to}`,
     });
+  }
+}
+
+/**
+ * The automatic combine-all-videos re-run: exactly what the transcript
+ * page's manual button POSTs (mode 'both', sourceTranscriptId, force), run
+ * under the row owner. Concats the primary + every stored part, submits the
+ * whole meeting to AAI as a NEW row (combinedParts marker keeps it out of
+ * this sweep), and carries the source's auto markers so an auto-synced
+ * meeting stays unattended through speaker review and report generation.
+ */
+async function runRecombine(
+  row: ResumeRow,
+  marker: NonNullable<GmeetContext['pendingRecombine']>
+): Promise<void> {
+  const ctx = row.gmeet_context;
+  const attempts = (marker.attempts ?? 0) + 1;
+  const fail = async (error: string) => {
+    const give = attempts >= MAX_RECOMBINE_ATTEMPTS;
+    console.warn(
+      `[resume-sweep] ${row.assemblyai_id}: recombine ${give ? 'giving up' : 'failed'} (attempt ${attempts}): ${error}`
+    );
+    await mergeGmeetContextForUser(
+      row.user_id,
+      row.assemblyai_id,
+      {
+        pendingRecombine: { ...marker, attempts, ...(give ? { status: 'failed' as const } : {}), error },
+      },
+      { quiet: true }
+    );
+  };
+
+  try {
+    const identity = await identityForUser(row.user_id).catch(() => null);
+    const email =
+      identity?.email ??
+      (ctx.autoSync?.byUserId === row.user_id ? ctx.autoSync.byEmail : undefined) ??
+      (ctx.autoImport?.byUserId === row.user_id ? ctx.autoImport.byEmail : undefined);
+    if (!email) return await fail('no identity for the row owner');
+    // Token is optional for a local re-run — but with it the import can parse
+    // the resumed sitting's transcript Doc into the sidecar too.
+    const minted = await getServerAccessToken(row.user_id);
+    console.log(
+      `[resume-sweep] ${row.assemblyai_id}: firing combine-and-re-transcribe (${(ctx.videoParts?.length ?? 0) + 1} videos)`
+    );
+    const outcome = await executeGmeetImport(
+      { userId: row.user_id, email },
+      {
+        mode: 'both',
+        sourceTranscriptId: row.assemblyai_id,
+        ...(minted ? { accessToken: minted.token } : {}),
+        videoFileId: ctx.videoFileId,
+        force: true,
+        event: {
+          id: ctx.eventId,
+          title: ctx.eventTitle ?? row.title ?? undefined,
+          startTime: ctx.startTime,
+          endTime: ctx.endTime,
+          meetingCode: ctx.meetingCode,
+          recurringEventId: ctx.recurringEventId,
+          iCalUID: ctx.iCalUID,
+          organizerEmail: ctx.organizerEmail,
+          attendees: ctx.attendees,
+        },
+        contextExtra: {
+          ...(ctx.autoSync ? { autoSync: ctx.autoSync } : {}),
+          ...(ctx.autoImport ? { autoImport: ctx.autoImport } : {}),
+          ...(ctx.uploadPrefs ? { uploadPrefs: ctx.uploadPrefs } : {}),
+        },
+      }
+    );
+    if (outcome.status >= 300) {
+      return await fail(
+        typeof outcome.body.error === 'string' ? outcome.body.error : `status ${outcome.status}`
+      );
+    }
+    const newId = (outcome.body.transcript as { assemblyai_id?: string } | undefined)
+      ?.assemblyai_id;
+    console.log(`[resume-sweep] ${row.assemblyai_id}: combined row ${newId ?? '?'} transcribing`);
+    await mergeGmeetContextForUser(row.user_id, row.assemblyai_id, {
+      pendingRecombine: {
+        ...marker,
+        attempts,
+        status: 'fired',
+        firedAt: new Date().toISOString(),
+        ...(newId ? { newId } : {}),
+      },
+    });
+  } catch (err) {
+    await fail(err instanceof Error ? err.message : String(err));
   }
 }
 

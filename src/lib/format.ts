@@ -230,6 +230,22 @@ export interface GmeetContext {
       empty?: boolean;
     }>;
   } | null;
+  /** Set when the resume sweep adopts a sibling record: once every part's
+   * bytes are stored, no recordingPending wait is open and no further
+   * sitting is live, the sweep re-runs the import from local (the
+   * combine-all-videos re-transcribe flow, executeGmeetImport with
+   * sourceTranscriptId) so the transcript covers every sitting — the /m
+   * uuid repoints to the combined row. Auto/import markers are carried, so
+   * an auto-synced meeting stays a fully unattended pipeline. */
+  pendingRecombine?: {
+    since: string;
+    status: 'waiting' | 'fired' | 'failed';
+    attempts?: number;
+    firedAt?: string;
+    /** assemblyai_id of the combined row the re-run created. */
+    newId?: string;
+    error?: string;
+  } | null;
   /** Background video-fetch bookkeeping: a known-but-undownloaded recording
    * (videoFileId / teams.recordingId, no local audio) is pulled by the
    * video-fetch sweeper without waiting for a page visit. Attempts are

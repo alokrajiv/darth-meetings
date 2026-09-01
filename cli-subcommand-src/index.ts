@@ -61,6 +61,8 @@ READ
   series <id>                     One series: config, evidence keys, members
                                   (imported transcripts), pending suggestions,
                                   probable duplicates
+  notify                          Your Slack DM notification switches, one
+                                  line per kind (opt-out: on unless turned off)
 
 LABELS (org-wide, hierarchical 'Customers/LP Global/QBR', many per transcript;
 <label> = a path, case-insensitive, or '#<id>' from 'labels')
@@ -119,6 +121,8 @@ WRITE (needs read+write for meetings)
                                   detailed-video — the defaults); only meetings
                                   that start after you switch it on. Needs
                                   Google connected
+  notify <kind> on|off            Flip one Slack DM notification kind (see
+                                  'notify' for the kinds)
   set-title <id> <title>          Update the title
   set-notes <id> --file <md|->    Replace the notes markdown ('-' = stdin)
   set-report <id> --file <md|->   Replace the report markdown ('-' = stdin)
@@ -126,6 +130,11 @@ WRITE (needs read+write for meetings)
                                   (label/unlabel also need owner or edit access
                                   on that transcript; readers get 403)
   skill                           Print the agent workflow guide
+
+ACCOUNT-SETTINGS writes ('auto-sync off|mine|all', 'notify <kind> on|off')
+additionally require --i-have-got-consent-from-human-user: pass it ONLY when
+the human user explicitly asked for that exact settings change — never on
+your own initiative (same contract as the slack-* verbs).
 
 FILTERS (list / search / export / calendar — all AND together; a comma
 inside one value = OR; matching is case-insensitive substring)
@@ -351,6 +360,20 @@ function localTz(ctx: Ctx): string {
  * false, anything else was a swallowed positional → hand it back to `pos`
  * and set the flag true.
  */
+const CONSENT_FLAG = "i-have-got-consent-from-human-user";
+
+/** Account-settings writes (auto-sync, notify) change how the service
+ * behaves for the human LONG after this session — an agent must never flip
+ * them on its own initiative. Same contract as darth-cli's slack-* verbs. */
+function requireConsent(flags: Record<string, string | boolean>, what: string): boolean {
+  if (flags[CONSENT_FLAG] === true) return true;
+  console.error(
+    `Changing ${what} is an account-settings write. Re-run with --${CONSENT_FLAG}\n` +
+      `ONLY if the human user explicitly asked for this exact change.`
+  );
+  return false;
+}
+
 function liftBoolFlags(pos: string[], flags: Record<string, string | boolean>, names: readonly string[]): void {
   for (const name of names) {
     const v = flags[name];
@@ -679,7 +702,7 @@ const meetings: Subcommand = {
   help: HELP,
   async run(ctx, argv) {
     const { pos, flags } = parseArgs(argv);
-    liftBoolFlags(pos, flags, ["cascade", "exact"]);
+    liftBoolFlags(pos, flags, ["cascade", "exact", CONSENT_FLAG]);
     const [, cmd, ...args] = pos.length && pos[0] === "meetings" ? pos : ["", ...pos];
     if (!cmd || flags.help === true) { console.log(HELP); return 0; }
 
@@ -711,6 +734,7 @@ const meetings: Subcommand = {
         }
         ctx.requireWrite();
         if (!["off", "mine", "all"].includes(sub)) { console.error("usage: darth-cli meetings auto-sync [off|mine|all] [--mode ...] [--report ...] [--gmeet on|off] [--teams on|off]"); return 1; }
+        if (!requireConsent(flags, "account auto-sync")) return 1;
         const body: any = { scope: sub };
         const mode = str(flags.mode); const report = str(flags.report);
         if (mode) body.mode = mode;
@@ -723,6 +747,40 @@ const meetings: Subcommand = {
         }
         const data = await ctx.expectJson<any>(ctx.api("meetings", "/api/auto-sync", { method: "PUT", body: JSON.stringify(body) }));
         ctx.print(data, () => console.log(`auto-sync: ${data.autoSync.scope}${data.autoSync.scope !== "off" ? ` (mode ${data.autoSync.mode}, report ${data.autoSync.report}, since ${data.autoSync.since})` : ""}`));
+        return 0;
+      }
+
+      case "notify": {
+        const sub = args[0];
+        if (!sub) {
+          const data = await ctx.expectJson<any>(ctx.api("meetings", "/api/notify-prefs"));
+          ctx.print(data, () => {
+            console.log("Slack DM notifications (opt-out — every kind is on unless turned off):");
+            for (const k of data.kinds as string[]) {
+              const l = data.labels?.[k];
+              console.log(
+                `  ${(data.prefs?.[k] === false ? "OFF" : "on").padEnd(4)}${k.padEnd(17)}${l?.label ?? ""}${l?.hint ? ` — ${l.hint}` : ""}`
+              );
+            }
+          });
+          return 0;
+        }
+        ctx.requireWrite();
+        const val = args[1];
+        const current = await ctx.expectJson<any>(ctx.api("meetings", "/api/notify-prefs"));
+        const kinds: string[] = current.kinds ?? [];
+        if (!kinds.includes(sub) || !["on", "off"].includes(val ?? "")) {
+          console.error(`usage: darth-cli meetings notify [<kind> on|off]   kinds: ${kinds.join(", ")}`);
+          return 1;
+        }
+        if (!requireConsent(flags, `the '${sub}' notification setting`)) return 1;
+        const data = await ctx.expectJson<any>(
+          ctx.api("meetings", "/api/notify-prefs", {
+            method: "PUT",
+            body: JSON.stringify({ prefs: { [sub]: val === "on" } }),
+          })
+        );
+        ctx.print(data, () => console.log(`${sub}: ${data.prefs?.[sub] === false ? "off" : "on"}`));
         return 0;
       }
 

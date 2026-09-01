@@ -20,6 +20,7 @@ back) and the calling agent brings the intelligence with its own tokens.
 | `export --out-dir <dir> [FILTERS]` | list v2 drain (as above) → per row `GET /api/transcripts/:id/content` + `/speakers` |
 | `calendar [--view unimported\|norec] [FILTERS]` | `GET /api/calendar-meetings?view=…&<filters>` paged the same way |
 | `text / get / notes / report / audio / frame / attachments / set-*` | unchanged |
+| `notify` / `notify <kind> on\|off` | `GET` / `PUT /api/notify-prefs` — settings writes (this and `auto-sync off\|mine\|all`) require `--i-have-got-consent-from-human-user` |
 | `labels` | `GET /api/labels?counts=1` — human = indented tree (`name (count_visible · n direct) #id color`), `--json` = the flat `labels` array verbatim |
 | `label <id> <label>` | resolve `<label>` against `GET /api/labels`; if the path is new → `POST /api/labels {path}` (prints `created …` per segment); then `POST /api/transcripts/:id/labels {labelId}` |
 | `unlabel <id> <label>` | resolve → `DELETE /api/transcripts/:id/labels/:labelId` |
