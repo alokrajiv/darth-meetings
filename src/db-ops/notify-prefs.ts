@@ -17,6 +17,7 @@ export const NOTIFY_KINDS = [
   'needs_review',
   'deferred_import',
   'sync_request',
+  'resume',
 ] as const;
 export type NotifyKind = (typeof NOTIFY_KINDS)[number];
 
@@ -45,6 +46,10 @@ export const NOTIFY_KIND_LABELS: Record<NotifyKind, { label: string; hint: strin
   sync_request: {
     label: 'Colleagues need your import',
     hint: 'Auto-sync wanted a meeting only your Google account can reach — one nudge per meeting.',
+  },
+  resume: {
+    label: 'Meeting resumed after a break',
+    hint: 'An imported call restarted later (new Meet session) — its extra recording attaches by itself.',
   },
 };
 

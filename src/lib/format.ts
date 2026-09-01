@@ -204,6 +204,32 @@ export interface GmeetContext {
     status: 'waiting' | 'fetched' | 'gone' | 'gave-up';
     resolvedAt?: string;
   } | null;
+  /** Resume-sweep bookkeeping (recording poller): for a few hours after an
+   * import that captured a conference record, the meeting code's records are
+   * re-listed — hanging up and rejoining the same Meet link makes Google open
+   * a SECOND conferenceRecord whose artifacts nothing else would ever see
+   * (discovery's nearestRecord always picks the imported one, and auto-sync's
+   * occKey claim blocks a re-import). Each ended sibling record found is
+   * "adopted" by re-arming `recordingPending` against it, so its videos land
+   * as videoParts through the existing diff-attach machinery. */
+  resumeWatch?: {
+    /** Records already accounted for: the imported one + adopted siblings. */
+    knownRecords: string[];
+    since: string;
+    lastCheckedAt?: string;
+    attempts?: number;
+    status: 'watching' | 'done';
+    resolvedAt?: string;
+    /** Resumed sessions detected, latest known state. `adoptedAt` set once
+     * recordingPending was re-armed on it (or `empty` — ended unrecorded). */
+    found?: Array<{
+      recordName: string;
+      startTime?: string;
+      endTime?: string;
+      adoptedAt?: string;
+      empty?: boolean;
+    }>;
+  } | null;
   /** Background video-fetch bookkeeping: a known-but-undownloaded recording
    * (videoFileId / teams.recordingId, no local audio) is pulled by the
    * video-fetch sweeper without waiting for a page visit. Attempts are

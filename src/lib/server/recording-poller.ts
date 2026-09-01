@@ -2,13 +2,21 @@ import 'server-only';
 import {
   listDueScheduledReports,
   listRecordingPendingRows,
+  listResumeWatchRows,
   mergeGmeetContextForUser,
 } from '@/db-ops/transcripts';
+import { identityForUser } from '@/db-ops/transcript-activity';
 import { publishEvent } from '@/lib/server/event-bus';
-import { listRecordArtifacts } from '@/lib/server/gmeet';
+import {
+  listConferenceRecords,
+  listRecordArtifacts,
+  recordFilterForOccurrence,
+} from '@/lib/server/gmeet';
 import { getServerAccessToken } from '@/lib/server/google-oauth';
 import { fetchRecordingFromDrive, fetchVideoPartFromDrive } from '@/lib/server/recording-fetch';
 import { generateAutoReport } from '@/lib/server/auto-notes';
+import { notifyUser } from '@/lib/server/darth-notify';
+import { dm, meetingLine, openLink, whenLine } from '@/lib/server/dm-copy';
 import type { GmeetContext } from '@/lib/format';
 
 /**
@@ -34,6 +42,15 @@ import type { GmeetContext } from '@/lib/format';
  * owner has no usable Google connection are skipped (not counted as a check)
  * until the TTL retires them.
  *
+ * The tick also runs the RESUME SWEEP (gmeet_context.resumeWatch): hanging
+ * up and rejoining the same Meet link opens a SECOND conferenceRecord, whose
+ * artifacts neither this poller (pinned to the imported recordName) nor
+ * discovery (nearestRecord picks one record per occurrence) nor auto-sync
+ * (occKey already claimed) would ever surface. For a few hours after each
+ * import the sweep re-lists the meeting code's records; an ended sibling
+ * with recordings is adopted by re-arming recordingPending against it, and
+ * the ordinary diff-attach path above turns its videos into videoParts.
+ *
  * Started once per server boot from instrumentation.ts.
  */
 
@@ -43,8 +60,39 @@ const SLOW_EVERY_MS = 10 * 60 * 1000;
 const GIVE_UP_MS = 24 * 3600 * 1000;
 const MAX_PER_TICK = 20;
 
+/** Resume sweep: watch this long past the imported conference's end. */
+const RESUME_WATCH_WINDOW_MS = 6 * 3600 * 1000;
+/** Per-row Meet API cadence while watching. */
+const RESUME_CHECK_EVERY_MS = 5 * 60 * 1000;
+/** A resume must START within this of the imported sitting's end — beyond
+ * it, a record on the same (reused) link is a different meeting. */
+const RESUME_SIBLING_SLOP_MS = 3 * 3600 * 1000;
+/** A just-ended sibling listing zero recordings may simply not have them
+ * indexed yet — only conclude "wasn't recorded" after this grace. */
+const RESUME_EMPTY_GRACE_MS = 15 * 60 * 1000;
+const MAX_RESUME_SIBLINGS = 4;
+const MAX_RESUME_PER_TICK = 15;
+
 let started = false;
 let ticking = false;
+
+/**
+ * Union a freshly-listed record's recordings into the actuals snapshot.
+ * With resume adoption the snapshot spans MULTIPLE conference records, so a
+ * plain replace would erase the other records' entries. The fresh listing
+ * wins for its own fileIds; fileId-less placeholders from older listings
+ * drop (they only matter while their record is the one being polled).
+ */
+function mergeActualsRecordings(
+  existing: Array<{ fileId?: string; startTime?: string; endTime?: string }> | undefined,
+  listed: Array<{ fileId: string | null; startTime?: string; endTime?: string }>
+): Array<{ fileId?: string; startTime?: string; endTime?: string }> {
+  const listedIds = new Set(listed.map((r) => r.fileId).filter((x): x is string => !!x));
+  return [
+    ...(existing ?? []).filter((r) => r.fileId && !listedIds.has(r.fileId)),
+    ...listed.map((r) => ({ fileId: r.fileId ?? undefined, startTime: r.startTime, endTime: r.endTime })),
+  ].sort((a, b) => (a.startTime ?? '').localeCompare(b.startTime ?? ''));
+}
 
 /**
  * A detailed report queued while the recording was still being prepared
@@ -196,11 +244,7 @@ async function checkRow(row: {
     actuals: ctx.actuals
       ? {
           ...ctx.actuals,
-          recordings: listed.map((r) => ({
-            fileId: r.fileId ?? undefined,
-            startTime: r.startTime,
-            endTime: r.endTime,
-          })),
+          recordings: mergeActualsRecordings(ctx.actuals.recordings, listed),
         }
       : ctx.actuals,
     recordingPending: {
@@ -257,6 +301,237 @@ async function checkRow(row: {
   }
 }
 
+// ---------------------------------------------------------------------------
+// Resume sweep — hang-up-and-rejoin detection (gmeet_context.resumeWatch)
+// ---------------------------------------------------------------------------
+
+type ResumeRow = Awaited<ReturnType<typeof listResumeWatchRows>>[number];
+
+/** Everyone who should hear about a resumed session: whoever's automation or
+ * queued import created the row (+ auto-sync watchers), else the row owner's
+ * last known identity (there is no users table). */
+async function resumeRecipients(row: ResumeRow): Promise<string[]> {
+  const ctx = row.gmeet_context;
+  const set = new Set<string>();
+  for (const e of [ctx.autoSync?.byEmail, ctx.autoImport?.byEmail, ctx.deferredImport?.ownerEmail]) {
+    if (e) set.add(e.toLowerCase());
+  }
+  for (const w of ctx.autoSync?.watchers ?? []) if (w) set.add(w.toLowerCase());
+  if (set.size === 0) {
+    const id = await identityForUser(row.user_id).catch(() => null);
+    if (id?.email) set.add(id.email.toLowerCase());
+  }
+  return [...set];
+}
+
+async function checkResumeRow(row: ResumeRow): Promise<void> {
+  const ctx = row.gmeet_context;
+  const importedRecord = ctx.actuals?.conferenceRecordName;
+  const code = ctx.meetingCode;
+  if (!importedRecord || !code) return; // SQL guarantees these; belt only
+
+  const now = Date.now();
+  const nowIso = new Date(now).toISOString();
+  const watch: NonNullable<GmeetContext['resumeWatch']> = ctx.resumeWatch ?? {
+    knownRecords: [importedRecord],
+    since: nowIso,
+    status: 'watching',
+  };
+  if (watch.status !== 'watching') return;
+
+  // The watch clock runs from the imported sitting's end (fallbacks for rows
+  // missing actuals timing: event end/start, then row creation). A detected
+  // sibling that is not adopted yet keeps the watch open past the base
+  // window — its recording only starts generating when ITS sitting ends.
+  const confEndIso = ctx.actuals?.conferenceEnd ?? ctx.endTime ?? ctx.startTime ?? null;
+  const anchorMs = confEndIso ? Date.parse(confEndIso) : new Date(row.created_at).getTime();
+  const expiryMs =
+    Math.max(
+      anchorMs,
+      ...(watch.found ?? [])
+        .filter((f) => !f.adoptedAt)
+        .map((f) => Date.parse(f.endTime ?? f.startTime ?? ''))
+        .filter((t) => Number.isFinite(t))
+    ) + RESUME_WATCH_WINDOW_MS;
+  if (!Number.isFinite(anchorMs) || now > expiryMs) {
+    await mergeGmeetContextForUser(
+      row.user_id,
+      row.assemblyai_id,
+      { resumeWatch: { ...watch, status: 'done', resolvedAt: nowIso } },
+      { quiet: true }
+    );
+    return;
+  }
+
+  const lastChecked = watch.lastCheckedAt ? Date.parse(watch.lastCheckedAt) : 0;
+  if (now - lastChecked < RESUME_CHECK_EVERY_MS) return;
+
+  const minted = await getServerAccessToken(row.user_id);
+  if (!minted) return; // owner not connected — the window retires the row
+
+  const heartbeat = (extra?: Partial<NonNullable<GmeetContext['resumeWatch']>>) =>
+    mergeGmeetContextForUser(
+      row.user_id,
+      row.assemblyai_id,
+      {
+        resumeWatch: {
+          ...watch,
+          ...extra,
+          lastCheckedAt: nowIso,
+          attempts: (watch.attempts ?? 0) + 1,
+        },
+      },
+      { quiet: true }
+    );
+
+  const eventStartIso = ctx.startTime ?? ctx.actuals?.conferenceStart ?? confEndIso;
+  const records = await listConferenceRecords(
+    minted.token,
+    recordFilterForOccurrence(code, eventStartIso)
+  );
+  if (!records) {
+    await heartbeat(); // API refused — not evidence of anything
+    return;
+  }
+
+  const known = new Set([importedRecord, ...watch.knownRecords]);
+  if (ctx.recordingPending?.recordName) known.add(ctx.recordingPending.recordName);
+
+  // Same-sitting guards: a sibling must start AFTER the imported record began
+  // (an earlier record on the same code is a previous meeting on a reused
+  // link) and within the slop of the sitting's end (far beyond it, someone is
+  // reusing the link for a different meeting).
+  const confStartMs = Date.parse(ctx.actuals?.conferenceStart ?? ctx.startTime ?? '') || anchorMs;
+  const sittingEndMs = Math.max(
+    anchorMs,
+    ...[ctx.actuals?.conferenceEnd, ctx.endTime]
+      .map((t) => (t ? Date.parse(t) : NaN))
+      .filter((t) => Number.isFinite(t))
+  );
+  const siblings = records.filter((r) => {
+    if (known.has(r.name) || !r.startTime) return false;
+    const s = Date.parse(r.startTime);
+    return s >= confStartMs - 30 * 60 * 1000 && s <= sittingEndMs + RESUME_SIBLING_SLOP_MS;
+  });
+
+  const found = [...(watch.found ?? [])];
+  const byName = new Map(found.map((f) => [f.recordName, f]));
+  for (const s of siblings) {
+    const f = byName.get(s.name);
+    if (f) {
+      f.startTime = s.startTime;
+      f.endTime = s.endTime;
+    } else {
+      const fresh = { recordName: s.name, startTime: s.startTime, endTime: s.endTime };
+      found.push(fresh);
+      byName.set(s.name, fresh);
+    }
+  }
+
+  // Adopt at most ONE ended sibling per visit — recordingPending is a
+  // single-record machine, so a second adoption waits until it resolves.
+  const candidate = siblings.find((s) => s.endTime && !byName.get(s.name)?.adoptedAt);
+  if (!candidate) {
+    await heartbeat({ found });
+    return;
+  }
+  if (watch.knownRecords.length > MAX_RESUME_SIBLINGS) {
+    console.warn(`[resume-sweep] ${row.assemblyai_id}: sibling cap hit — closing the watch`);
+    await mergeGmeetContextForUser(
+      row.user_id,
+      row.assemblyai_id,
+      { resumeWatch: { ...watch, found, status: 'done', resolvedAt: nowIso } },
+      { quiet: true }
+    );
+    return;
+  }
+  if (ctx.recordingPending?.status === 'waiting') {
+    await heartbeat({ found }); // busy attaching another record — next visit
+    return;
+  }
+
+  const arts = await listRecordArtifacts(minted.token, candidate.name);
+  if (arts.checkFailed) {
+    await heartbeat({ found });
+    return;
+  }
+  const entry = byName.get(candidate.name)!;
+  if (arts.recordings.length === 0) {
+    if (now - Date.parse(candidate.endTime!) < RESUME_EMPTY_GRACE_MS) {
+      await heartbeat({ found }); // may not be indexed yet — give it a beat
+      return;
+    }
+    // Ended, nothing recorded — account for it silently.
+    entry.adoptedAt = nowIso;
+    entry.empty = true;
+    await heartbeat({ found, knownRecords: [...watch.knownRecords, candidate.name] });
+    return;
+  }
+
+  // Adopt: re-arm recordingPending on the sibling — the ordinary poller path
+  // above lists its artifacts, appends its videos as videoParts (the row has
+  // a primary already) and pulls the bytes.
+  entry.adoptedAt = nowIso;
+  console.log(
+    `[resume-sweep] ${row.assemblyai_id}: meeting resumed — adopting ${candidate.name} ` +
+      `(started ${candidate.startTime}, ${arts.recordings.length} recording(s) listed)`
+  );
+  await mergeGmeetContextForUser(row.user_id, row.assemblyai_id, {
+    resumeWatch: {
+      ...watch,
+      knownRecords: [...watch.knownRecords, candidate.name],
+      found,
+      lastCheckedAt: nowIso,
+      attempts: (watch.attempts ?? 0) + 1,
+    },
+    recordingPending: { recordName: candidate.name, since: nowIso, status: 'waiting' },
+    // Keep the sibling's transcript Docs on the snapshot — re-transcribe and
+    // evidence flows read from here.
+    ...(ctx.actuals && arts.transcriptDocIds.length > 0
+      ? {
+          actuals: {
+            ...ctx.actuals,
+            transcriptDocIds: [
+              ...new Set([...(ctx.actuals.transcriptDocIds ?? []), ...arts.transcriptDocIds]),
+            ],
+          },
+        }
+      : {}),
+  });
+
+  const link = await openLink(row.assemblyai_id, 'Open the meeting');
+  const resumedAt = whenLine(candidate.startTime);
+  for (const to of await resumeRecipients(row)) {
+    void notifyUser({
+      kind: 'resume',
+      toEmail: to,
+      text: dm(
+        `🔁 *This meeting resumed after a break — grabbing the extra recording*`,
+        meetingLine({
+          title: row.title ?? ctx.eventTitle,
+          when: row.recorded_at ?? ctx.startTime,
+          duration: row.duration,
+          speakerCount: row.speaker_count,
+        }),
+        `The call restarted${resumedAt ? ` at ${resumedAt}` : ''} as a fresh Meet session — Google keeps a separate recording for it, and it will attach here as an extra video on its own.`,
+        `For one combined transcript afterwards, use “Combine all videos & re-transcribe” → ${link}`
+      ),
+      dedupeKey: `mw-resume:${row.assemblyai_id}:${candidate.name}:${to}`,
+    });
+  }
+}
+
+async function sweepResumeWatches(): Promise<void> {
+  const rows = await listResumeWatchRows(MAX_RESUME_PER_TICK);
+  for (const row of rows) {
+    try {
+      await checkResumeRow(row);
+    } catch (err) {
+      console.warn(`[resume-sweep] check failed for ${row.assemblyai_id}:`, err);
+    }
+  }
+}
+
 async function tick(): Promise<void> {
   if (ticking) return; // a multi-GB Drive pull can outlive the interval
   ticking = true;
@@ -270,6 +545,7 @@ async function tick(): Promise<void> {
       }
     }
     await fireDueScheduledReports();
+    await sweepResumeWatches();
   } catch (err) {
     console.warn('[recording-poller] tick failed:', err);
   } finally {

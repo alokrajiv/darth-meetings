@@ -1355,6 +1355,56 @@ export async function listRecordingPendingRows(limit: number): Promise<
 }
 
 /**
+ * Recent Meet imports the resume sweep should visit: a captured conference
+ * record + meeting code, watch not concluded (absent resumeWatch counts as
+ * watching — the sweep creates it, or marks old rows done in one write).
+ * The 48h created_at bound caps the jsonb scan AND the backlog a deploy
+ * inherits. Combined (re-transcribed) rows are excluded — their primary
+ * media already contains every segment, re-adopting would attach dupes.
+ */
+export async function listResumeWatchRows(limit: number): Promise<
+  Array<{
+    id: number;
+    user_id: string;
+    assemblyai_id: string;
+    title: string | null;
+    recorded_at: string | null;
+    duration: number | null;
+    speaker_count: number | null;
+    created_at: string;
+    gmeet_context: GmeetContext;
+  }>
+> {
+  return sql<
+    Array<{
+      id: number;
+      user_id: string;
+      assemblyai_id: string;
+      title: string | null;
+      recorded_at: string | null;
+      duration: number | null;
+      speaker_count: number | null;
+      created_at: string;
+      gmeet_context: GmeetContext;
+    }>
+  >`
+    SELECT id, user_id, assemblyai_id, title, recorded_at, duration, speaker_count,
+      created_at, gmeet_context
+    FROM ${sql(SCHEMA)}.transcripts
+    WHERE status = 'completed'
+      AND deleted_at IS NULL
+      AND created_at > now() - interval '48 hours'
+      AND gmeet_context->'actuals'->>'conferenceRecordName' IS NOT NULL
+      AND gmeet_context->>'meetingCode' IS NOT NULL
+      AND COALESCE(gmeet_context->>'provider', 'gmeet') = 'gmeet'
+      AND gmeet_context->'combinedParts' IS NULL
+      AND COALESCE(gmeet_context->'resumeWatch'->>'status', 'watching') = 'watching'
+    ORDER BY created_at DESC
+    LIMIT ${limit}
+  `;
+}
+
+/**
  * Rows with known-but-unfetched recording bytes — the video-fetch sweeper's
  * work list: no local audio yet (Meet videoFileId / Teams recordingId), OR
  * extra videoParts whose files are known on Drive but not stored. Excludes
