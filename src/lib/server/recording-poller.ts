@@ -1,5 +1,6 @@
 import 'server-only';
 import {
+  findCombinedSibling,
   listDueScheduledReports,
   listRecordingPendingRows,
   listResumeWatchRows,
@@ -448,7 +449,33 @@ async function checkResumeRow(row: ResumeRow): Promise<void> {
       ctx.recordingPending?.status !== 'waiting' &&
       partsStored
     ) {
-      await runRecombine(row, ctx.pendingRecombine);
+      // Stand down when someone already combined by hand since adoption —
+      // firing anyway would mint a duplicate at full transcription cost.
+      const dupe = ctx.startTime
+        ? await findCombinedSibling(code, ctx.startTime, ctx.pendingRecombine.since).catch(
+            () => null
+          )
+        : null;
+      if (dupe) {
+        console.log(
+          `[resume-sweep] ${row.assemblyai_id}: already combined (${dupe.assemblyai_id}) — standing down`
+        );
+        await mergeGmeetContextForUser(
+          row.user_id,
+          row.assemblyai_id,
+          {
+            pendingRecombine: {
+              ...ctx.pendingRecombine,
+              status: 'fired',
+              firedAt: nowIso,
+              newId: dupe.assemblyai_id,
+            },
+          },
+          { quiet: true }
+        );
+      } else {
+        await runRecombine(row, ctx.pendingRecombine);
+      }
     }
     return;
   }

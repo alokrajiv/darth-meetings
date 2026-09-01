@@ -1334,6 +1334,33 @@ export async function listDueScheduledReports(limit: number): Promise<
   `;
 }
 
+/**
+ * A combined (re-transcribed) row for the same occurrence created since
+ * `sinceIso` — the resume sweep's stand-down check. Between adoption and the
+ * automatic fire a human may click "Combine all videos & re-transcribe"
+ * themselves; firing anyway would mint a duplicate row at full transcription
+ * cost (happened 2026-09-01). Any user's row counts — the click can come
+ * from a sharee. Both paths stamp the event's startTime verbatim, so exact
+ * string match is safe.
+ */
+export async function findCombinedSibling(
+  meetingCode: string,
+  startTime: string,
+  sinceIso: string
+): Promise<{ assemblyai_id: string } | null> {
+  const rows = await sql<Array<{ assemblyai_id: string }>>`
+    SELECT assemblyai_id
+    FROM ${sql(SCHEMA)}.transcripts
+    WHERE deleted_at IS NULL
+      AND gmeet_context->>'combinedParts' IS NOT NULL
+      AND gmeet_context->>'meetingCode' = ${meetingCode}
+      AND gmeet_context->>'startTime' = ${startTime}
+      AND created_at > ${sinceIso}
+    LIMIT 1
+  `;
+  return rows[0] ?? null;
+}
+
 export async function listRecordingPendingRows(limit: number): Promise<
   Array<{
     id: number;
