@@ -1,11 +1,13 @@
 import 'server-only';
 import {
   deleteForUser,
+  getForUser,
   listNotesBacklog,
   listSpeakerIdBacklog,
   listStaleUploads,
 } from '@/db-ops/transcripts';
-import { deleteAudioFilesByPrefix } from '@/lib/server/audio-storage';
+import { deleteUploadSession, listExpiredUploadSessions } from '@/db-ops/upload-sessions';
+import { deleteAudioFile, deleteAudioFilesByPrefix } from '@/lib/server/audio-storage';
 import { generateAutoNotes, identifySpeakers } from '@/lib/server/auto-notes';
 
 /**
@@ -30,6 +32,9 @@ const MAX_PER_SWEEP = 2;
 // (AAI re-upload leg); 15 quiet minutes means the handler is dead — closed
 // tab, network drop, or pm2 restart. Nothing is resumable, so delete.
 const UPLOAD_STALL_MINUTES = 15;
+// Chunked-upload sessions are resumable: keep the partial file this long
+// after the last acknowledged chunk before giving up on the user coming back.
+const SESSION_IDLE_HOURS = 24;
 
 let started = false;
 
@@ -47,6 +52,36 @@ async function sweep(): Promise<void> {
     }
   } catch (err) {
     console.warn('[notes-sweeper] stale-upload query failed:', err);
+  }
+
+  // Chunked-upload sessions: an OPEN one stays resumable for
+  // SESSION_IDLE_HOURS after its last acknowledged chunk (re-drop the same
+  // file → continues). Past that, or for a 'completing' one whose handler
+  // died mid-ingest, reap file + session + placeholder. Done/failed audit
+  // rows age out after a week (handled inside the query).
+  try {
+    const expired = await listExpiredUploadSessions(SESSION_IDLE_HOURS, 20);
+    for (const s of expired) {
+      if (s.status === 'open' || s.status === 'completing') {
+        console.log(`[notes-sweeper] reaping expired upload session ${s.id} (${s.status})`);
+        await deleteAudioFile(s.temp_filename).catch(() => {});
+        const firstPart = !(s.spec?.multi && s.spec.multi.index > 1);
+        if (firstPart) {
+          // Only the still-uploading placeholder — never a promoted row
+          // (a 'completing' session's ingest may have finished after all).
+          const row = await getForUser(s.user_id, s.placeholder_id).catch(() => null);
+          if (row && row.status === 'uploading') {
+            await deleteAudioFilesByPrefix(`upload-${s.placeholder_id.slice(3)}.part`);
+            await deleteForUser(s.user_id, s.placeholder_id).catch((err) =>
+              console.warn(`[notes-sweeper] session placeholder delete failed ${s.placeholder_id}:`, err)
+            );
+          }
+        }
+      }
+      await deleteUploadSession(s.id).catch(() => {});
+    }
+  } catch (err) {
+    console.warn('[notes-sweeper] upload-session sweep failed:', err);
   }
 
   try {

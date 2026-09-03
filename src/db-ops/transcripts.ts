@@ -914,21 +914,27 @@ export async function findUploadGroupRow(
 }
 
 /**
- * Uploads whose heartbeat went quiet — closed tab, network drop, or pm2
- * restart mid-stream. Nothing is recoverable (the byte stream is gone), so
- * the sweeper deletes row + temp file.
+ * One-shot uploads whose heartbeat went quiet — closed tab, network drop,
+ * or pm2 restart mid-stream. Nothing is recoverable (the byte stream is
+ * gone), so the sweeper deletes row + temp file. Placeholders backed by a
+ * live chunked-upload session are EXCLUDED: those are resumable and get the
+ * session sweeper's 24h window instead (see listExpiredUploadSessions).
  */
 export async function listStaleUploads(
   stallMinutes: number,
   limit: number
 ): Promise<Array<{ user_id: string; assemblyai_id: string }>> {
   return sql<Array<{ user_id: string; assemblyai_id: string }>>`
-    SELECT user_id, assemblyai_id
-    FROM ${sql(SCHEMA)}.transcripts
-    WHERE status = 'uploading'
-      AND deleted_at IS NULL
-      AND COALESCE(upload_progress_at, created_at) < now() - make_interval(mins => ${stallMinutes})
-    ORDER BY created_at ASC
+    SELECT t.user_id, t.assemblyai_id
+    FROM ${sql(SCHEMA)}.transcripts t
+    WHERE t.status = 'uploading'
+      AND t.deleted_at IS NULL
+      AND COALESCE(t.upload_progress_at, t.created_at) < now() - make_interval(mins => ${stallMinutes})
+      AND NOT EXISTS (
+        SELECT 1 FROM ${sql(SCHEMA)}.upload_sessions s
+        WHERE s.placeholder_id = t.assemblyai_id AND s.status IN ('open', 'completing')
+      )
+    ORDER BY t.created_at ASC
     LIMIT ${limit}
   `;
 }

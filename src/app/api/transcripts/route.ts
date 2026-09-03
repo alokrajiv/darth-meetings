@@ -1,99 +1,28 @@
 import { NextResponse } from 'next/server';
 import { withAuth } from '@/lib/auth/with-auth';
 import {
-  createUploadingPlaceholder,
-  deleteForUser,
-  findUploadGroupRow,
   listDeletedForUser,
   listPagedForUser,
   listPendingVisibleToUser,
   listVisibleToUser,
-  mergeGmeetContextForUser,
-  setRecordedAtForUser,
   updateStatusForUser,
   updateUploadProgress,
   type PendingRefreshRow,
 } from '@/db-ops/transcripts';
-import { autoShareToInternalInvitees } from '@/lib/server/auto-share';
-import { resolveAccess } from '@/db-ops/transcript-access';
 import { getTranscript } from '@/lib/server/assemblyai';
-import {
-  deleteAudioFile,
-  deleteAudioFilesByPrefix,
-  saveAudioBytes,
-  saveAudioStreamToTemp,
-} from '@/lib/server/audio-storage';
-import { concatMediaSmart, probeDurationSec } from '@/lib/server/media-concat';
-import { IngestError, ingestLocalAudio } from '@/lib/server/ingest';
+import { saveAudioBytes, saveAudioStreamToTemp } from '@/lib/server/audio-storage';
 import { onTranscriptCompleted } from '@/lib/server/post-completion';
-import type { GmeetAttendee, GmeetContext, StoredTranscript } from '@/lib/format';
 import { parseMeetingFilters } from '@/lib/server/meeting-filters';
 import { parseLabelFilter } from '@/lib/labels';
-
-/** Calendar event the upload-media stepper linked to this file — rides in
- * the `x-linked-event` header (URI-encoded JSON) because the body is the
- * raw file bytes. Shape mirrors the Meet import's event payload. */
-interface LinkedEventHeader {
-  id?: string;
-  title?: string;
-  startTime?: string;
-  endTime?: string;
-  meetingCode?: string;
-  recurringEventId?: string;
-  iCalUID?: string;
-  organizerEmail?: string;
-  attendees?: Array<{ email?: string; name?: string; responseStatus?: string }>;
-}
-
-function parseLinkedEventHeader(raw: string | null): LinkedEventHeader | null {
-  if (!raw) return null;
-  try {
-    const parsed = JSON.parse(decodeURIComponent(raw)) as LinkedEventHeader;
-    if (!parsed || typeof parsed !== 'object') return null;
-    if (parsed.startTime && Number.isNaN(Date.parse(parsed.startTime))) {
-      parsed.startTime = undefined;
-    }
-    if (parsed.endTime && Number.isNaN(Date.parse(parsed.endTime))) {
-      parsed.endTime = undefined;
-    }
-    return parsed;
-  } catch {
-    return null;
-  }
-}
-
-const REPORT_PREFS = new Set(['summary', 'detailed-video', 'detailed-text', 'later']);
-
-/** Text documents AAI can't transcode — streaming one here dies minutes
- * later as an opaque AAI error row (the sibl_minutes.rtf incident). The
- * client diverts these to /api/transcripts/import-text itself; this is the
- * belt for older tabs, darth-cli and anything else hitting the API raw. */
-const TEXT_DOC_FILE_RE =
-  /\.(txt|md|markdown|rtf|vtt|srt|docx|doc|pdf|json|csv|tsv|html|htm|log)$/i;
-const TEXT_DOC_MIMES = new Set([
-  'application/rtf',
-  'application/pdf',
-  'application/msword',
-  'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
-]);
-
-function textDocRejection(
-  originalFilename: string | null,
-  contentType: string
-): NextResponse | null {
-  const mime = contentType.split(';')[0]?.trim().toLowerCase() ?? '';
-  const isTextDoc =
-    (originalFilename && TEXT_DOC_FILE_RE.test(originalFilename)) ||
-    mime.startsWith('text/') ||
-    TEXT_DOC_MIMES.has(mime);
-  if (!isTextDoc) return null;
-  return NextResponse.json(
-    {
-      error: `${originalFilename ?? 'That file'} is a text document, not a recording — import it via POST /api/transcripts/import-text (the upload dialog's transcript lane) instead.`,
-    },
-    { status: 415 }
-  );
-}
+import {
+  abandonUpload,
+  finalizeUpload,
+  openUpload,
+  parseLinkedEventHeader,
+  parseMultiParams,
+  parseReportPref,
+  textDocRejection,
+} from '@/lib/server/upload-pipeline';
 
 export const runtime = 'nodejs';
 // Handler wall-clock budget (only enforced on serverless hosts). Receiving a
@@ -297,74 +226,28 @@ export const GET = withAuth(async ({ user, request }) => {
  * is still accepted for stale tabs, but that path buffers in memory — fine
  * for small files only.
  *
- * Either way the bytes land in a temp file first, then go to AssemblyAI via
- * the SDK's disk-streaming path, and finally get renamed to their permanent
- * `<aai-id>.<ext>` name once the transcription is accepted.
+ * This is the ONE-SHOT delivery route (darth-cli, curl, older tabs). The
+ * shipped web client uses the chunked, parallel, resumable route family
+ * under /api/uploads instead — both end in the same
+ * `finalizeUpload` tail (src/lib/server/upload-pipeline.ts).
  *
  * `?source_id=` re-transcribes an existing text-only import (`ext-…` rows)
  * from a real recording: the uploaded bytes become a NEW transcript row
  * (the import stays untouched, same convention as the Meet re-diarize flow)
  * that inherits the source's title / language / recorded_at, with the
  * source's speaker names fed to AAI as recognition-bias keyterms. This
- * rides the raw-body endpoint on purpose — it is the one route excluded
- * from the proxy matcher, so a multi-GB video still streams to disk
- * instead of being buffered in memory by the middleware.
+ * rides the raw-body endpoint on purpose — it is excluded from the proxy
+ * matcher, so a multi-GB video still streams to disk instead of being
+ * buffered in memory by the middleware.
  */
 export const POST = withAuth(async ({ user, request }) => {
   const contentType = request.headers.get('content-type') ?? '';
-
-  // Upload-media stepper extras ride in headers/query, so they're available
-  // BEFORE the body is consumed — the live-visibility placeholder row needs
-  // the linked event's title and invitees up front.
   const linkedEvent = parseLinkedEventHeader(request.headers.get('x-linked-event'));
-  const rawPref = request.nextUrl.searchParams.get('report_pref');
-  const reportPref =
-    rawPref && REPORT_PREFS.has(rawPref)
-      ? (rawPref as NonNullable<NonNullable<GmeetContext['uploadPrefs']>['report']>)
-      : null;
-  // Invitee names from the linked event double as AAI bias keyterms — they
-  // are exactly the names AAI would otherwise mis-hear.
-  const attendees: GmeetAttendee[] = (linkedEvent?.attendees ?? [])
-    .filter((a): a is { email: string; name?: string; responseStatus?: string } =>
-      typeof a?.email === 'string'
-    )
-    .slice(0, 100)
-    .map((a) => ({ email: a.email, name: a.name, responseStatus: a.responseStatus }));
-  const attendeeNames = attendees
-    .map((a) => a.name?.trim())
-    .filter((n): n is string => !!n && n.length > 1);
-
-  const gmeetContext: GmeetContext | null =
-    linkedEvent || reportPref
-      ? {
-          ...(linkedEvent
-            ? {
-                eventId: linkedEvent.id,
-                eventTitle: linkedEvent.title?.slice(0, 300),
-                startTime: linkedEvent.startTime,
-                endTime: linkedEvent.endTime,
-                meetingCode: linkedEvent.meetingCode,
-                recurringEventId: linkedEvent.recurringEventId,
-                iCalUID: linkedEvent.iCalUID,
-                organizerEmail: linkedEvent.organizerEmail,
-                attendees,
-              }
-            : {}),
-          ...(reportPref ? { uploadPrefs: { report: reportPref } } : {}),
-        }
-      : null;
-
-  let tempFilename: string;
-  let originalFilename: string | null = null;
-  let languageCode: string | undefined;
-  let sourceRow: StoredTranscript | null = null;
-  /** Set on the raw-body path: the `up-<uuid>` id of the placeholder row
-   * that makes this upload visible in every listing while bytes stream. */
-  let placeholderId: string | null = null;
+  const reportPref = parseReportPref(request.nextUrl.searchParams.get('report_pref'));
 
   if (contentType.includes('multipart/form-data')) {
     // Legacy path — whole body in memory. Kept only so an already-open old
-    // client doesn't break; the shipped client sends raw bodies.
+    // client doesn't break; the shipped clients send raw bodies / chunks.
     let form: FormData;
     try {
       form = await request.formData();
@@ -374,393 +257,124 @@ export const POST = withAuth(async ({ user, request }) => {
         { status: 400 }
       );
     }
-
     const file = form.get('file');
     if (!(file instanceof File)) {
       return NextResponse.json({ error: 'Missing `file` field' }, { status: 400 });
     }
     const rawLang = form.get('language_code');
-    languageCode =
+    const languageCode =
       typeof rawLang === 'string' && rawLang.length > 0 ? rawLang : undefined;
-    originalFilename = file.name || null;
-
+    const originalFilename = file.name || null;
     const rejected = textDocRejection(originalFilename, file.type || '');
-    if (rejected) return rejected;
+    if (rejected) return NextResponse.json({ error: rejected }, { status: 415 });
 
-    tempFilename = `upload-${crypto.randomUUID()}.part`;
-    await saveAudioBytes(tempFilename, Buffer.from(await file.arrayBuffer()));
-  } else {
-    if (!request.body) {
-      return NextResponse.json({ error: 'Empty request body' }, { status: 400 });
-    }
-
-    const rawName = request.headers.get('x-filename');
-    if (rawName) {
-      try {
-        originalFilename = decodeURIComponent(rawName);
-      } catch {
-        originalFilename = rawName;
-      }
-    }
-    const rawLang = request.nextUrl.searchParams.get('language_code');
-    languageCode = rawLang && rawLang.length > 0 ? rawLang : undefined;
-
-    // Fail fast on text documents — before the placeholder row exists and
-    // before any bytes stream, so the client gets a clear 415 instead of an
-    // AAI transcoding error minutes later.
-    const rejected = textDocRejection(originalFilename, contentType);
-    if (rejected) return rejected;
-
-    // --- Multi-file single-meeting upload (N recordings of ONE meeting,
-    // stitched server-side into one transcript). Files arrive sequentially,
-    // each tagged ?multi_group/&multi_index/&multi_total; per-file user
-    // comments ride in x-part-comment. Part 1 creates the placeholder and
-    // parks its bytes; the last part stitches and ingests. ---
-    const multiGroup = request.nextUrl.searchParams.get('multi_group');
-    const multiIndex = Number(request.nextUrl.searchParams.get('multi_index') ?? NaN);
-    const multiTotal = Number(request.nextUrl.searchParams.get('multi_total') ?? NaN);
-    const isMulti =
-      !!multiGroup &&
-      /^[0-9a-f-]{8,64}$/i.test(multiGroup) &&
-      Number.isInteger(multiIndex) &&
-      Number.isInteger(multiTotal) &&
-      multiTotal >= 2 &&
-      multiTotal <= 12 &&
-      multiIndex >= 1 &&
-      multiIndex <= multiTotal;
-    if ((multiGroup || request.nextUrl.searchParams.has('multi_index')) && !isMulti) {
-      return NextResponse.json({ error: 'Invalid multi-upload parameters' }, { status: 400 });
-    }
-    let partComment: string | undefined;
-    const rawComment = request.headers.get('x-part-comment');
-    if (rawComment) {
-      try {
-        partComment = decodeURIComponent(rawComment).trim().slice(0, 500) || undefined;
-      } catch {
-        partComment = rawComment.trim().slice(0, 500) || undefined;
-      }
-    }
-
-    if (isMulti && multiIndex > 1) {
-      const groupRow = await findUploadGroupRow(user.userId, multiGroup);
-      if (!groupRow) {
-        return NextResponse.json(
-          { error: 'Upload group not found (expired or reaped)' },
-          { status: 404 }
-        );
-      }
-      const group = groupRow.gmeet_context?.uploadGroup;
-      if (!group || group.total !== multiTotal || group.parts.some((p) => p.index === multiIndex)) {
-        return NextResponse.json({ error: 'Upload group state mismatch' }, { status: 409 });
-      }
-      const groupUuid = groupRow.assemblyai_id.slice(3);
-      const partTemp = `upload-${groupUuid}.part${multiIndex}`;
-
-      let lastFlush = 0;
-      let flushing = false;
-      const onPartProgress = (streamed: number) => {
-        const now = Date.now();
-        if (flushing || now - lastFlush < 2000) return;
-        flushing = true;
-        lastFlush = now;
-        void updateUploadProgress(user.userId, groupRow.assemblyai_id, streamed)
-          .catch(() => {})
-          .finally(() => {
-            flushing = false;
-          });
-      };
-      let partBytes: number;
-      try {
-        ({ bytes: partBytes } = await saveAudioStreamToTemp(request.body, {
-          tempFilename: partTemp,
-          onProgress: onPartProgress,
-        }));
-      } catch (error) {
-        await deleteAudioFile(partTemp);
-        return NextResponse.json(
-          { error: 'Upload stream failed', detail: String(error) },
-          { status: 400 }
-        );
-      }
-      if (partBytes === 0) {
-        await deleteAudioFile(partTemp);
-        return NextResponse.json({ error: 'Empty request body' }, { status: 400 });
-      }
-      const parts = [
-        ...group.parts,
-        {
-          index: multiIndex,
-          tempFilename: partTemp,
-          originalFilename: originalFilename ?? undefined,
-          comment: partComment,
-          bytes: partBytes,
-        },
-      ].sort((a, b) => a.index - b.index);
-      await mergeGmeetContextForUser(
-        user.userId,
-        groupRow.assemblyai_id,
-        { uploadGroup: { ...group, parts } },
-        { quiet: true }
-      );
-      await updateUploadProgress(user.userId, groupRow.assemblyai_id, partBytes).catch(() => {});
-
-      if (multiIndex < multiTotal) {
-        return NextResponse.json({ transcript: groupRow }, { status: 201 });
-      }
-
-      // Last part landed: stitch in index order and ingest as ONE transcript.
-      if (new Set(parts.map((p) => p.index)).size !== multiTotal) {
-        return NextResponse.json(
-          { error: `Upload group incomplete (${parts.length}/${multiTotal} parts)` },
-          { status: 409 }
-        );
-      }
-      const heartbeat = setInterval(() => {
-        void updateUploadProgress(user.userId, groupRow.assemblyai_id).catch(() => {});
-      }, 60_000);
-      heartbeat.unref?.();
-      try {
-        const durations: Array<number | null> = [];
-        for (const p of parts) durations.push(await probeDurationSec(p.tempFilename));
-        let offset = 0;
-        const uploadedParts = parts.map((p, i) => {
-          const entry = {
-            index: p.index,
-            originalFilename: p.originalFilename,
-            comment: p.comment,
-            durationSec: durations[i] ?? undefined,
-            offsetSec: Math.round(offset * 10) / 10,
-          };
-          offset += durations[i] ?? 0;
-          return entry;
-        });
-        const { filename: combinedTemp, reencoded } = await concatMediaSmart(
-          parts.map((p) => p.tempFilename)
-        );
-        console.log(
-          `[POST /api/transcripts] stitched ${multiTotal} recordings for ${groupRow.assemblyai_id}` +
-            (reencoded ? ' (re-encoded — mixed codecs)' : ' (stream-copy)')
-        );
-        for (const p of parts) await deleteAudioFile(p.tempFilename);
-        // Persist the stitch map on the row BEFORE ingest — the placeholder
-        // is promoted in place, context intact, so the map survives.
-        await mergeGmeetContextForUser(
-          user.userId,
-          groupRow.assemblyai_id,
-          { uploadGroup: null, uploadedParts },
-          { quiet: true }
-        );
-        const ctx = groupRow.gmeet_context ?? {};
-        const groupAttendeeNames = (ctx.attendees ?? [])
-          .map((a) => a.name?.trim())
-          .filter((n): n is string => !!n && n.length > 1);
-        const ext = combinedTemp.slice(combinedTemp.lastIndexOf('.'));
-        const row = await ingestLocalAudio(user.userId, combinedTemp, {
-          originalFilename: `stitched-${multiTotal}-recordings${ext}`,
-          languageCode: languageCode ?? groupRow.language_code ?? undefined,
-          title: groupRow.title ?? null,
-          extraKeyterms: groupAttendeeNames.length > 0 ? groupAttendeeNames : undefined,
-          gmeetContext: { ...ctx, uploadGroup: null, uploadedParts },
-          placeholderAssemblyaiId: groupRow.assemblyai_id,
-        });
-        return NextResponse.json({ transcript: row }, { status: 201 });
-      } catch (error) {
-        await deleteForUser(user.userId, groupRow.assemblyai_id).catch(() => {});
-        await deleteAudioFilesByPrefix(`upload-${groupUuid}.part`);
-        if (error instanceof IngestError) {
-          console.error(`[POST /api/transcripts] ${error.stage} failed:`, error.causeErr);
-          return NextResponse.json(
-            { error: error.message, detail: String(error.causeErr) },
-            { status: 502 }
-          );
-        }
-        console.error('[POST /api/transcripts] stitch failed:', error);
-        return NextResponse.json(
-          { error: 'Stitching the recordings failed', detail: String(error) },
-          { status: 502 }
-        );
-      } finally {
-        clearInterval(heartbeat);
-      }
-    }
-
-    // Re-transcription of an existing import: resolve the source row BEFORE
-    // consuming the (potentially huge) body so a bad id fails fast.
-    const sourceId = request.nextUrl.searchParams.get('source_id');
-    if (sourceId) {
-      const access = await resolveAccess(user.userId, user.email, sourceId);
-      if (!access) {
-        return NextResponse.json({ error: 'Source transcript not found' }, { status: 404 });
-      }
-      sourceRow = access.row;
-      languageCode = languageCode ?? sourceRow.language_code ?? undefined;
-    }
-
-    // Create the row BEFORE consuming the body so the upload is visible in
-    // the listing (owner + auto-shared invitees) from the first byte. The
-    // temp filename shares the placeholder's uuid so the stale-upload
-    // sweeper can find and delete the file when reaping an orphaned row.
-    const uploadUuid = crypto.randomUUID();
-    placeholderId = `up-${uploadUuid}`;
-    tempFilename = `upload-${uploadUuid}.part`;
-    const rawLen = request.headers.get('content-length');
-    const bytesTotal = rawLen && /^\d+$/.test(rawLen) ? Number(rawLen) : null;
-
-    const placeholder = await createUploadingPlaceholder(user.userId, {
-      placeholderId,
+    const opened = await openUpload(user, {
       originalFilename,
-      languageCode: languageCode ?? null,
-      title: sourceRow?.title ?? linkedEvent?.title?.slice(0, 300) ?? null,
-      gmeetContext: isMulti
-        ? {
-            ...(gmeetContext ?? {}),
-            uploadGroup: {
-              id: multiGroup,
-              total: multiTotal,
-              parts: [
-                {
-                  index: 1,
-                  tempFilename,
-                  originalFilename: originalFilename ?? undefined,
-                  comment: partComment,
-                },
-              ],
-            },
-          }
-        : gmeetContext,
-      bytesTotal,
+      contentType: file.type || '',
+      languageCode,
+      linkedEvent,
+      reportPref,
+      bytesTotal: file.size,
     });
-    // Same "throw them in" rule as the Meet import: internal invitees on the
-    // linked event can see (and follow) the upload from the moment it starts.
-    if (attendees.length > 0) {
-      await autoShareToInternalInvitees(
-        placeholder.id,
-        user.userId,
-        user.email,
-        attendees
-      ).catch((err) => console.warn('[POST /api/transcripts] auto-share failed:', err));
-    }
-    const earlyRecordedAt = sourceRow?.recorded_at ?? linkedEvent?.startTime;
-    if (earlyRecordedAt) {
-      await setRecordedAtForUser(
-        user.userId,
-        placeholderId,
-        new Date(earlyRecordedAt)
-      ).catch(() => {});
-    }
-
-    // Debounced progress writes: at most one UPDATE every ~2s, never more
-    // than one in flight. Each write publishes a 'status' SSE event, and the
-    // listing's own 800ms debounce coalesces the refetches.
-    let lastFlush = 0;
-    let flushing = false;
-    let pendingFlush: Promise<void> = Promise.resolve();
-    const pid = placeholderId;
-    const onProgress = (streamed: number) => {
-      const now = Date.now();
-      if (flushing || now - lastFlush < 2000) return;
-      flushing = true;
-      lastFlush = now;
-      pendingFlush = updateUploadProgress(user.userId, pid, streamed)
-        .catch(() => {})
-        .finally(() => {
-          flushing = false;
-        });
-    };
-
-    let bytes: number;
-    try {
-      ({ bytes } = await saveAudioStreamToTemp(request.body, {
-        tempFilename,
-        onProgress,
-      }));
-    } catch (error) {
-      console.error('[POST /api/transcripts] body stream failed:', error);
-      await deleteForUser(user.userId, placeholderId).catch(() => {});
-      return NextResponse.json(
-        { error: 'Upload stream failed', detail: String(error) },
-        { status: 400 }
-      );
-    }
-    if (bytes === 0) {
-      await deleteAudioFile(tempFilename);
-      await deleteForUser(user.userId, placeholderId).catch(() => {});
-      return NextResponse.json({ error: 'Empty request body' }, { status: 400 });
-    }
-    // Final progress write (after any in-flight throttled one) so viewers see
-    // 100% while the AAI re-upload leg runs.
-    await pendingFlush;
-    await updateUploadProgress(user.userId, placeholderId, bytes).catch(() => {});
-
-    if (isMulti) {
-      // Part 1 of a multi-file group: the bytes are parked, the group marker
-      // is on the placeholder — ingest waits for the last part.
-      return NextResponse.json({ transcript: placeholder }, { status: 201 });
-    }
+    if (!opened.ok) return NextResponse.json({ error: opened.error }, { status: opened.status });
+    await saveAudioBytes(opened.spec.tempFilename, Buffer.from(await file.arrayBuffer()));
+    const done = await finalizeUpload(user, opened.spec, file.size);
+    return NextResponse.json(done.body, { status: done.status });
   }
 
-  // Shared tail: AAI upload (disk-streamed) → vocab-biased submit → DB row
-  // (placeholder promoted in place on the raw-body path) → rename temp file
-  // to its permanent name. Same path as the Meet import.
-  try {
-    // Speaker names from the source import (Teams/Zoom/… labels) are exactly
-    // the words AAI tends to mis-hear — feed them in as bias keyterms.
-    const sourceSpeakers = [
-      ...new Set(
-        (sourceRow?.imported_content?.utterances ?? [])
-          .map((u) => u.speaker?.trim())
-          .filter((s): s is string => !!s && s.length > 1 && !/^speaker\s*\d+$/i.test(s))
-      ),
-    ];
+  if (!request.body) {
+    return NextResponse.json({ error: 'Empty request body' }, { status: 400 });
+  }
 
-    // The AAI re-upload leg can run many minutes with no byte-count movement;
-    // keep the placeholder's heartbeat alive so the stale-upload sweeper
-    // doesn't reap a live row.
-    const heartbeat = placeholderId
-      ? setInterval(() => {
-          void updateUploadProgress(user.userId, placeholderId!).catch(() => {});
-        }, 60_000)
-      : null;
-    heartbeat?.unref?.();
-    let row;
+  let originalFilename: string | null = null;
+  const rawName = request.headers.get('x-filename');
+  if (rawName) {
     try {
-      row = await ingestLocalAudio(user.userId, tempFilename, {
-        originalFilename,
-        languageCode,
-        title: sourceRow?.title ?? linkedEvent?.title?.slice(0, 300) ?? null,
-        extraKeyterms:
-          sourceSpeakers.length > 0 || attendeeNames.length > 0
-            ? [...sourceSpeakers, ...attendeeNames]
-            : undefined,
-        gmeetContext,
-        placeholderAssemblyaiId: placeholderId,
+      originalFilename = decodeURIComponent(rawName);
+    } catch {
+      originalFilename = rawName;
+    }
+  }
+  const rawLang = request.nextUrl.searchParams.get('language_code');
+  const languageCode = rawLang && rawLang.length > 0 ? rawLang : undefined;
+
+  // --- Multi-file single-meeting upload (N recordings of ONE meeting,
+  // stitched server-side into one transcript). Files arrive sequentially,
+  // each tagged ?multi_group/&multi_index/&multi_total; per-file user
+  // comments ride in x-part-comment. ---
+  let partComment: string | null = null;
+  const rawComment = request.headers.get('x-part-comment');
+  if (rawComment) {
+    try {
+      partComment = decodeURIComponent(rawComment);
+    } catch {
+      partComment = rawComment;
+    }
+  }
+  const multi = parseMultiParams({
+    group: request.nextUrl.searchParams.get('multi_group'),
+    index: request.nextUrl.searchParams.get('multi_index'),
+    total: request.nextUrl.searchParams.get('multi_total'),
+    comment: partComment,
+  });
+  if (multi === null) {
+    return NextResponse.json({ error: 'Invalid multi-upload parameters' }, { status: 400 });
+  }
+
+  const rawLen = request.headers.get('content-length');
+  const bytesTotal = rawLen && /^\d+$/.test(rawLen) ? Number(rawLen) : null;
+
+  const opened = await openUpload(user, {
+    originalFilename,
+    contentType,
+    languageCode,
+    linkedEvent,
+    reportPref,
+    sourceId: request.nextUrl.searchParams.get('source_id'),
+    multi: multi ?? null,
+    bytesTotal,
+  });
+  if (!opened.ok) return NextResponse.json({ error: opened.error }, { status: opened.status });
+  const { spec } = opened;
+
+  // Debounced progress writes: at most one UPDATE every ~2s, never more
+  // than one in flight. Each write publishes a 'status' SSE event, and the
+  // listing's own 800ms debounce coalesces the refetches.
+  let lastFlush = 0;
+  let flushing = false;
+  let pendingFlush: Promise<void> = Promise.resolve();
+  const onProgress = (streamed: number) => {
+    const now = Date.now();
+    if (flushing || now - lastFlush < 2000) return;
+    flushing = true;
+    lastFlush = now;
+    pendingFlush = updateUploadProgress(user.userId, spec.placeholderId, streamed)
+      .catch(() => {})
+      .finally(() => {
+        flushing = false;
       });
-    } finally {
-      if (heartbeat) clearInterval(heartbeat);
-    }
-    const recordedAt = sourceRow?.recorded_at ?? linkedEvent?.startTime;
-    if (recordedAt) {
-      await setRecordedAtForUser(
-        user.userId,
-        row.assemblyai_id,
-        new Date(recordedAt)
-      ).catch(() => {});
-    }
-    return NextResponse.json({ transcript: row }, { status: 201 });
+  };
+
+  let bytes: number;
+  try {
+    ({ bytes } = await saveAudioStreamToTemp(request.body, {
+      tempFilename: spec.tempFilename,
+      onProgress,
+    }));
   } catch (error) {
-    // A failed ingest leaves the placeholder stuck at 'uploading' — remove it
-    // so viewers see the upload vanish rather than a zombie row. (No-op once
-    // promoted: the row's id is the real AAI one by then.)
-    if (placeholderId) {
-      await deleteForUser(user.userId, placeholderId).catch(() => {});
-    }
-    if (error instanceof IngestError) {
-      console.error(`[POST /api/transcripts] ${error.stage} failed:`, error.causeErr);
-      return NextResponse.json(
-        { error: error.message, detail: String(error.causeErr) },
-        { status: 502 }
-      );
-    }
-    throw error;
+    console.error('[POST /api/transcripts] body stream failed:', error);
+    await abandonUpload(user, spec);
+    return NextResponse.json(
+      { error: 'Upload stream failed', detail: String(error) },
+      { status: 400 }
+    );
   }
+  if (bytes === 0) {
+    await abandonUpload(user, spec);
+    return NextResponse.json({ error: 'Empty request body' }, { status: 400 });
+  }
+  await pendingFlush;
+
+  const done = await finalizeUpload(user, spec, bytes);
+  return NextResponse.json(done.body, { status: done.status });
 });

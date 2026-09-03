@@ -118,6 +118,9 @@ export const config = {
   // buffers the whole request body in memory to enforce
   // proxyClientMaxBodySize, which defeats the route's streaming upload and
   // blows up RAM on multi-GB files. The route is still fully protected —
-  // withAuth verifies the session before the body is ever read.
-  matcher: ['/((?!api/transcripts$|_next/static|_next/image|favicon.ico).*)'],
+  // withAuth verifies the session before the body is ever read. Same for
+  // the chunked-upload family under `api/uploads` — chunks are 4–8MB raw
+  // bodies arriving 4 at a time; buffering them in the proxy would double
+  // the copies and serialize the positional writes.
+  matcher: ['/((?!api/transcripts$|api/uploads(?:/|$)|_next/static|_next/image|favicon.ico).*)'],
 };

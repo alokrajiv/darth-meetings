@@ -34,6 +34,7 @@ import {
   GoogleNotConnectedError,
 } from '@/lib/google-token';
 import type { StoredTranscript } from '@/lib/format';
+import { uploadFileChunked } from '@/lib/chunked-upload';
 
 /** DOM id of the hidden file input (kept for tests/debug hooks). */
 export const AUDIO_UPLOAD_INPUT_ID = 'audio-upload-file-input';
@@ -80,6 +81,9 @@ interface UploadStatus {
   progress: number;
   transcriptId?: string;
   error?: string;
+  /** Transient sub-status under the progress bar ("Resuming from 42%",
+   * "Retrying chunk 12…"). */
+  note?: string | null;
 }
 
 /** What the stepper attaches to the upload when the user links a calendar
@@ -281,11 +285,11 @@ export function AudioUpload({ onTranscriptCreated }: AudioUploadProps) {
     }
   };
 
-  // Raw-body upload via XHR: the file IS the request body (the server
-  // streams it to disk — no multipart, no server-side buffering), and
-  // xhr.upload.onprogress gives real progress, which matters when a
-  // multi-GB file takes minutes to send. Linked-event context and the
-  // report preference ride along as a header + query param.
+  // Chunked, parallel, resumable upload (src/lib/chunked-upload.ts): the
+  // file goes up as 4–8MB chunks, 4 in flight, each retried until the
+  // server verifies it; a re-dropped file resumes from the chunks already
+  // on the server. Linked-event context and the report preference ride in
+  // the session-open call.
   const uploadFile = (
     file: File,
     languageCode: string,
@@ -303,62 +307,37 @@ export function AudioUpload({ onTranscriptCreated }: AudioUploadProps) {
       base: number;
       span: number;
     }
-  ): Promise<StoredTranscript> =>
-    new Promise((resolve, reject) => {
-      const xhr = new XMLHttpRequest();
-      const params = new URLSearchParams();
-      if (languageCode) params.set('language_code', languageCode);
-      if (pref !== 'summary') params.set('report_pref', pref);
-      if (multi) {
-        params.set('multi_group', multi.group);
-        params.set('multi_index', String(multi.index));
-        params.set('multi_total', String(multi.total));
-      }
-      const qs = params.size > 0 ? `?${params}` : '';
-      xhr.open('POST', `/api/transcripts${qs}`);
-      xhr.setRequestHeader('content-type', file.type || 'application/octet-stream');
-      xhr.setRequestHeader('x-filename', encodeURIComponent(file.name));
-      if (multi?.comment) {
-        xhr.setRequestHeader('x-part-comment', encodeURIComponent(multi.comment));
-      }
-      if (linked) {
-        xhr.setRequestHeader('x-linked-event', encodeURIComponent(JSON.stringify(linked)));
-      }
-      xhr.upload.onprogress = (e) => {
-        if (e.lengthComputable && e.total > 0) {
+  ): Promise<StoredTranscript> => {
+    const target = multi?.progressFile ?? file;
+    const label = multi ? `${file.name}: ` : '';
+    return uploadFileChunked(
+      file,
+      {
+        languageCode: languageCode || undefined,
+        linkedEvent: linked,
+        reportPref: pref !== 'summary' ? pref : null,
+        multi: multi
+          ? { group: multi.group, index: multi.index, total: multi.total, comment: multi.comment }
+          : null,
+      },
+      {
+        onProgress: (loaded, total) => {
           // Upload owns the 0–50% band; transcription polling owns the rest.
-          if (multi) {
-            updateUpload(multi.progressFile, {
-              progress: Math.round(multi.base + (e.loaded / e.total) * multi.span),
-            });
-          } else {
-            updateUpload(file, { progress: Math.round((e.loaded / e.total) * 50) });
-          }
-        }
-      };
-      xhr.onload = () => {
-        if (xhr.status >= 200 && xhr.status < 300) {
-          try {
-            resolve(
-              (JSON.parse(xhr.responseText) as { transcript: StoredTranscript })
-                .transcript
-            );
-          } catch {
-            reject(new Error('Upload failed: invalid server response'));
-          }
-        } else {
-          let detail: string = xhr.responseText || String(xhr.status);
-          try {
-            detail = (JSON.parse(xhr.responseText) as { error?: string }).error ?? detail;
-          } catch {
-            // keep raw text
-          }
-          reject(new Error(`Upload failed: ${detail}`));
-        }
-      };
-      xhr.onerror = () => reject(new Error('Upload failed: network error'));
-      xhr.send(file);
-    });
+          const frac = total > 0 ? loaded / total : 0;
+          updateUpload(target, {
+            progress: multi ? Math.round(multi.base + frac * multi.span) : Math.round(frac * 50),
+          });
+        },
+        onResumed: (bytes, total) => {
+          updateUpload(target, {
+            note: `${label}Resuming — ${Math.round((bytes / total) * 100)}% was already on the server`,
+          });
+          setTimeout(() => updateUpload(target, { note: null }), 6000);
+        },
+        onNote: (note) => updateUpload(target, { note: note ? `${label}${note}` : null }),
+      }
+    );
+  };
 
   const submitForTranscription = async (
     file: File,
@@ -968,6 +947,9 @@ export function AudioUpload({ onTranscriptCreated }: AudioUploadProps) {
                 </div>
                 {(upload.status === 'uploading' || upload.status === 'transcribing') && (
                   <Progress value={upload.progress} className="mt-2 h-1" />
+                )}
+                {upload.status === 'uploading' && upload.note && (
+                  <p className="mt-1 text-xs text-muted-foreground">{upload.note}</p>
                 )}
                 {upload.status === 'error' && upload.error && (
                   <p className="mt-1 text-xs text-destructive">{upload.error}</p>

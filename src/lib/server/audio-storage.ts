@@ -4,7 +4,7 @@ import { createWriteStream, promises as fsp } from 'node:fs';
 import { Readable, Transform } from 'node:stream';
 import { pipeline } from 'node:stream/promises';
 import type { ReadableStream as NodeWebReadableStream } from 'node:stream/web';
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 
 /**
  * Local audio storage on the server filesystem.
@@ -115,6 +115,59 @@ export async function saveAudioStreamToTemp(
   }
 
   return { tempFilename, bytes };
+}
+
+/**
+ * Create the (empty) temp file a chunked upload session writes into. The
+ * chunks arrive in parallel at byte offsets, so the file has to exist
+ * before the first positional write. No-op when it already exists (a
+ * resumed session keeps its bytes).
+ */
+export async function ensureTempFileExists(tempFilename: string): Promise<void> {
+  await ensureAudioDir();
+  const fh = await fsp.open(resolveAudioPath(tempFilename), 'a');
+  await fh.close();
+}
+
+export async function audioFileSize(filename: string): Promise<number | null> {
+  try {
+    const st = await fsp.stat(resolveAudioPath(filename));
+    return st.size;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Write one chunk of a chunked upload at its byte offset (pwrite via a
+ * positioned write stream — several chunks of the same file stream in
+ * concurrently, each on its own fd). The body is counted and SHA-256'd as
+ * it streams; the caller compares against the expected length / client
+ * hash and simply lets a retry overwrite the same range on mismatch.
+ * `flags: 'r+'` never truncates, and fails loudly when the temp file is
+ * gone (session reaped) instead of silently recreating an empty one.
+ */
+export async function writeChunkAt(
+  tempFilename: string,
+  offset: number,
+  stream: ReadableStream<Uint8Array>
+): Promise<{ bytes: number; sha256: string }> {
+  const abs = resolveAudioPath(tempFilename);
+  const hash = createHash('sha256');
+  let bytes = 0;
+  const tap = new Transform({
+    transform(chunk: Buffer, _enc, cb) {
+      bytes += chunk.length;
+      hash.update(chunk);
+      cb(null, chunk);
+    },
+  });
+  await pipeline(
+    Readable.fromWeb(stream as unknown as NodeWebReadableStream<Uint8Array>),
+    tap,
+    createWriteStream(abs, { flags: 'r+', start: offset })
+  );
+  return { bytes, sha256: hash.digest('hex') };
 }
 
 /**
