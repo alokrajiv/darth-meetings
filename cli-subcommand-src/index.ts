@@ -113,6 +113,15 @@ WRITE (needs read+write for meetings)
   auto-sync                       Your account-level auto-sync switch + what it
                                   did recently (imports de-duplicated company-
                                   wide: one import per meeting, others shared in)
+  auto-sync explain <meeting-code|uuid> [--start <iso>]
+                                  What automation WILL do with one occurrence
+                                  and what it DID: owner (series setting vs
+                                  account auto-sync vs nobody + why), importer,
+                                  mode, effective report (strongest ask across
+                                  everyone in it), watchers, ledger row. The
+                                  answer to "why wasn't this auto-imported /
+                                  why only a summary". Start defaults to the
+                                  latest past occurrence of that code
   auto-sync off|mine|all [--mode transcript|video|both]
              [--report summary|detailed-video|detailed-text|later]
              [--gmeet on|off] [--teams on|off]
@@ -732,8 +741,34 @@ const meetings: Subcommand = {
           });
           return 0;
         }
+        if (sub === "explain") {
+          const ref = args[1];
+          if (!ref) { console.error("usage: darth-cli meetings auto-sync explain <meeting-code|uuid> [--start <iso>]"); return 1; }
+          const isUuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(ref);
+          const q = new URLSearchParams(isUuid ? { uuid: ref } : { code: ref });
+          const start = str(flags.start);
+          if (start) q.set("start", start);
+          const data = await ctx.expectJson<any>(ctx.api("meetings", `/api/auto-sync/plan?${q}`));
+          ctx.print(data, () => {
+            const o = data.occurrence; const p = data.plan; const l = data.ledger;
+            console.log(`${o.title ?? o.code}  ${o.startIso}  (${o.provider}, organiser ${o.organizerEmail ?? "?"}, ${o.attendees.length} attendee(s), in ${o.knownToCalendars} calendar cache(s))`);
+            console.log(`owner:    ${p.owner}${p.seriesTitle ? `  series "${p.seriesTitle}" (#${p.seriesId}${p.seriesOptedOut ? ", OPTED OUT" : ""})` : ""}`);
+            console.log(`why:      ${p.reason}`);
+            if (p.importer) console.log(`importer: ${p.importer.email}${p.fallbackImporters?.length ? `  (fallbacks: ${p.fallbackImporters.map((f: any) => f.email).join(", ")})` : ""}`);
+            if (p.mode) console.log(`mode:     ${p.mode}`);
+            if (p.report) console.log(`report:   ${p.report}  (strongest ask across everyone served)`);
+            if (p.watchers?.length) console.log(`watchers: ${p.watchers.join(", ")}`);
+            if (p.interested?.length) {
+              console.log("interested (own auto-sync covers it):");
+              for (const i of p.interested) console.log(`  ${i.email.padEnd(40)} ${i.mode.padEnd(10)} ${i.report}${i.organiser ? "  organiser" : ""}`);
+            }
+            if (l) console.log(`ledger:   ${l.kind} → ${l.outcome}${l.importerEmail ? ` by ${l.importerEmail}` : ""}${l.seriesTitle ? ` (series "${l.seriesTitle}")` : ""}${l.assemblyaiId ? `  ${l.assemblyaiId}` : ""}${l.detail ? `  — ${l.detail}` : ""}  at ${l.at}`);
+            else console.log("ledger:   nothing fired yet");
+          });
+          return 0;
+        }
         ctx.requireWrite();
-        if (!["off", "mine", "all"].includes(sub)) { console.error("usage: darth-cli meetings auto-sync [off|mine|all] [--mode ...] [--report ...] [--gmeet on|off] [--teams on|off]"); return 1; }
+        if (!["off", "mine", "all"].includes(sub)) { console.error("usage: darth-cli meetings auto-sync [explain <ref>] [off|mine|all] [--mode ...] [--report ...] [--gmeet on|off] [--teams on|off]"); return 1; }
         if (!requireConsent(flags, "account auto-sync")) return 1;
         const body: any = { scope: sub };
         const mode = str(flags.mode); const report = str(flags.report);

@@ -1,6 +1,7 @@
 import 'server-only';
 import { sql } from '@/lib/db';
 import { SCHEMAS } from '@/lib/constants/database';
+import { strongestReport } from '@/lib/auto-marker';
 
 /**
  * Per-user app preferences (migration 033). Today: the account-level
@@ -183,15 +184,23 @@ export async function listAutoSyncUsers(): Promise<AutoSyncUser[]> {
  * "auto-sync will pick this up" chip BEFORE any auto_sync_log claim exists.
  * Returns `<code>|<UTC ISO>` → importer email.
  */
+export interface PredictedAutoSync {
+  /** Likeliest importer (organiser first, mirroring the sweep's election). */
+  email: string;
+  /** Strongest report pref across everyone whose auto-sync covers it. */
+  report: AutoSyncReport;
+  interested: string[];
+}
+
 export async function predictedAutoSyncImporters(
   occs: Array<{ code: string; startIso: string }>
-): Promise<Map<string, string>> {
+): Promise<Map<string, PredictedAutoSync>> {
   const batch = occs
     .filter((o) => o.code && !Number.isNaN(Date.parse(o.startIso)))
     .map((o) => ({ code: o.code, start: new Date(o.startIso).toISOString() }));
   if (batch.length === 0) return new Map();
-  const rows = await sql<Array<{ code: string; start: string; email: string }>>`
-    SELECT DISTINCT ON (o.code, o.start) o.code, o.start, p.email
+  const rows = await sql<Array<{ code: string; start: string; email: string; report: AutoSyncReport; organizer_self: boolean | null }>>`
+    SELECT o.code, o.start, p.email, p.auto_sync_report AS report, r.organizer_self
     FROM jsonb_to_recordset(${sql.json(batch as unknown as never)})
          AS o(code text, start timestamptz)
     JOIN ${sql(SCHEMA)}.gmeet_reminders r
@@ -211,7 +220,18 @@ export async function predictedAutoSyncImporters(
          )
     ORDER BY o.code, o.start, r.organizer_self DESC, p.email
   `;
-  return new Map(rows.map((r) => [`${r.code}|${new Date(r.start).toISOString()}`, r.email]));
+  const out = new Map<string, PredictedAutoSync>();
+  for (const r of rows) {
+    const key = `${r.code}|${new Date(r.start).toISOString()}`;
+    const cur = out.get(key);
+    if (!cur) {
+      out.set(key, { email: r.email, report: r.report, interested: [r.email] });
+    } else {
+      cur.interested.push(r.email);
+      cur.report = strongestReport([cur.report, r.report]);
+    }
+  }
+  return out;
 }
 
 // ---------------------------------------------------------------------------

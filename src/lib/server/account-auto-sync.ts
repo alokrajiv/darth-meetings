@@ -27,8 +27,8 @@ import { findImportedByTeamsMeetings } from '@/db-ops/teams-import';
 import { getAnyByAssemblyaiId } from '@/db-ops/transcripts';
 import { addShare } from '@/db-ops/transcript-shares';
 import { identityForUser, userIdForEmail } from '@/db-ops/transcript-activity';
-import { findSeriesByKeys, getSeries } from '@/db-ops/series';
-import { recurringBaseId, type SeriesKeyInput } from '@/lib/series-keys';
+import { seriesOwnerFor } from '@/lib/server/auto-import-plan';
+import { strongestReport, reportLabel } from '@/lib/auto-marker';
 import { getServerAccessToken } from '@/lib/server/google-oauth';
 import { executeGmeetImport } from '@/lib/server/gmeet-import-core';
 import { executeTeamsImport } from '@/lib/server/teams-import-core';
@@ -204,7 +204,7 @@ export async function sweepAccountAutoSync(): Promise<void> {
     const prior = log.get(g.key);
     if (!retryable(prior, now)) continue;
     try {
-      if (await seriesOwnsOrOptsOut(g)) continue;
+      if (await seriesOwnsOrOptsOut(g)) continue; // enabled → series sweep fires it; off → opt-out
       // Organiser first (owns the artifacts), then earliest-connected.
       g.electors.sort((a, b) => {
         if (a.row.organizer_self !== b.row.organizer_self) return a.row.organizer_self ? -1 : 1;
@@ -237,24 +237,18 @@ export async function sweepAccountAutoSync(): Promise<void> {
 }
 
 /** A series with an explicit auto-import setting owns its occurrences:
- * enabled → the series sweep fires it (its own mode/report), disabled →
- * explicit opt-out beats the account switch. */
+ * enabled → the series sweep fires it (its own mode; report resolved by the
+ * plan), disabled → explicit opt-out beats the account switch. One shared
+ * definition (lib/server/auto-import-plan.seriesOwnerFor). */
 async function seriesOwnsOrOptsOut(g: Group): Promise<boolean> {
-  const keys: SeriesKeyInput[] = [];
-  if (g.provider === 'gmeet') keys.push({ kind: 'meeting-code', value: g.code });
-  else {
-    const url = await getTeamsJoinUrlByMeeting(g.code, g.startIso).catch(() => null);
-    if (url) keys.push({ kind: 'teams-join-url', value: url });
-  }
-  const rec = g.electors.find((e) => e.row.recurring_event_id)?.row.recurring_event_id;
-  if (rec) keys.push({ kind: 'recurring-base-id', value: recurringBaseId(rec) });
-  if (keys.length === 0) return false;
-  const hits = await findSeriesByKeys(keys);
-  for (const h of hits) {
-    const s = await getSeries(h.series_id);
-    if (s?.auto_import) return true; // enabled or explicitly off — either way not ours
-  }
-  return false;
+  const rec = g.electors.find((e) => e.row.recurring_event_id)?.row.recurring_event_id ?? null;
+  const s = await seriesOwnerFor({
+    code: g.code,
+    startIso: g.startIso,
+    provider: g.provider,
+    recurringEventId: rec,
+  });
+  return !!s;
 }
 
 /** Can this token open the artifacts the mode needs? null = unknown ids
@@ -318,6 +312,9 @@ async function fireGroup(g: Group, electors: Elector[], now: number): Promise<vo
     const cal = await findCalendarEventByOccurrence(caller.userId, g.code, g.startIso).catch(() => null);
     organizerEmail = organizerEmail ?? cal?.organizer_email ?? cacheRow?.organizer_email ?? null;
     const mode = importer.user.prefs.mode;
+    // Report = the STRONGEST ask across everyone this import serves (the
+    // plan rule) — never just the importer's own setting.
+    const report = strongestReport(electors.map((e) => e.user.prefs.report));
     const event = eventFrom(g, cal);
     const contextExtra: NonNullable<Parameters<typeof executeGmeetImport>[1]['contextExtra']> = {
       autoSync: {
@@ -327,7 +324,7 @@ async function fireGroup(g: Group, electors: Elector[], now: number): Promise<vo
         watchers: watchersOf(importer),
         at: new Date(now).toISOString(),
       },
-      uploadPrefs: { report: importer.user.prefs.report },
+      uploadPrefs: { report },
     };
 
     let outcome: { status: number; body: Record<string, unknown> };
@@ -388,12 +385,9 @@ async function fireGroup(g: Group, electors: Elector[], now: number): Promise<vo
       const link = await openLink(transcript?.assemblyai_id ?? null, 'Open the meeting');
       const dur = cal?.event_end ? (Date.parse(cal.event_end) - Date.parse(cal.event_start as unknown as string)) / 1000 : null;
       const line = meetingLine({ title: g.title, when: g.startIso, duration: dur });
-      const report =
-        importer.user.prefs.report === 'summary' ? 'summary'
-          : importer.user.prefs.report === 'later' ? 'notes' : 'detailed report';
       const status =
         kind === 'imported'
-          ? `Imported — speakers are being identified; the ${report} follows once they're confirmed.`
+          ? `Imported — speakers are being identified; the ${reportLabel(report)} follows once they're confirmed.`
           : `Queued — the recording/transcript is still being generated. It lands on its own; nothing to do.`;
       void notifyUser({
         kind: 'auto_import',

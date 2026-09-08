@@ -927,3 +927,62 @@ export async function findCalendarEventForImport(
   `;
   return rows[0] ?? null;
 }
+
+/**
+ * Everyone's cached calendar copy of ONE occurrence (meeting code + instant,
+ * ±60s) merged into a single view: attendee union, first organiser, first
+ * recurring id / title. Feeds the auto-import PLAN resolver
+ * (lib/server/auto-import-plan), which must see the whole audience of an
+ * occurrence, not one user's copy. NOT caller-scoped — callers gate with
+ * callerInvolvedCodes() before serving anything derived from it.
+ */
+export async function mergedCalendarOccurrence(
+  meetingCode: string,
+  startIso: string
+): Promise<{
+  title: string | null;
+  organizerEmail: string | null;
+  attendees: string[];
+  recurringEventId: string | null;
+  eventEnd: string | null;
+  holders: string[];
+} | null> {
+  const rows = await sql<
+    Array<{
+      user_id: string;
+      title: string | null;
+      organizer_email: string | null;
+      attendees: CalendarEventAttendee[] | null;
+      recurring_event_id: string | null;
+      event_end: string | null;
+    }>
+  >`
+    SELECT user_id, title, organizer_email, attendees, recurring_event_id, event_end
+    FROM ${sql(SCHEMA)}.calendar_event_cache
+    WHERE meeting_code = ${meetingCode}
+      AND abs(extract(epoch FROM (event_start - ${startIso}::timestamptz))) <= 60
+    ORDER BY abs(extract(epoch FROM (event_start - ${startIso}::timestamptz))), user_id
+  `;
+  if (rows.length === 0) return null;
+  const attendees = new Set<string>();
+  for (const r of rows) for (const a of r.attendees ?? []) if (a.email) attendees.add(a.email.toLowerCase());
+  return {
+    title: rows.find((r) => r.title)?.title ?? null,
+    organizerEmail: rows.find((r) => r.organizer_email)?.organizer_email?.toLowerCase() ?? null,
+    attendees: [...attendees],
+    recurringEventId: rows.find((r) => r.recurring_event_id)?.recurring_event_id ?? null,
+    eventEnd: rows.find((r) => r.event_end)?.event_end ?? null,
+    holders: [...new Set(rows.map((r) => r.user_id))],
+  };
+}
+
+/** Latest PAST occurrence instant for a meeting code across every user's
+ * calendar cache (UTC ISO) — `auto-sync explain <code>` without a start. */
+export async function latestPastOccurrenceStart(meetingCode: string): Promise<string | null> {
+  const rows = await sql<Array<{ event_start: string }>>`
+    SELECT event_start FROM ${sql(SCHEMA)}.calendar_event_cache
+    WHERE meeting_code = ${meetingCode} AND event_start < now()
+    ORDER BY event_start DESC LIMIT 1
+  `;
+  return rows[0] ? new Date(rows[0].event_start).toISOString() : null;
+}

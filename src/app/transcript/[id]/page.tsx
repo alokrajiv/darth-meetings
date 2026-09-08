@@ -10,6 +10,7 @@ import { Badge } from '@/components/ui/badge';
 import { Input } from '@/components/ui/input';
 import { Textarea } from '@/components/ui/textarea';
 import { SeriesBadge } from '@/components/series-badge';
+import { AutoProvenance } from '@/components/auto-provenance';
 import { SeriesDialog } from '@/components/series-dialog';
 import { LabelChips } from '@/components/label-chips';
 import { LabelPicker, anchorFromElement, parseError, type PickerAnchor } from '@/components/label-picker';
@@ -2438,6 +2439,11 @@ function TranscriptDetailInner({ transcriptId }: { transcriptId: string }) {
                 </>
               )}
             </span>
+            <AutoProvenance
+              ctx={row.gmeet_context}
+              generated={row.auto_notes_status === 'completed' || row.auto_report_status === 'completed'}
+              onOpenSeries={setOpenSeriesId}
+            />
             {seriesMembership !== 'loading' && (
               <SeriesBadge
                 assemblyaiId={transcriptId}

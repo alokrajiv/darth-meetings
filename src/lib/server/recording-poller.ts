@@ -1,4 +1,5 @@
 import 'server-only';
+import { autoMarkerOf, autoRecipients } from '@/lib/auto-marker';
 import {
   findCombinedSibling,
   listDueScheduledReports,
@@ -316,10 +317,8 @@ type ResumeRow = Awaited<ReturnType<typeof listResumeWatchRows>>[number];
 async function resumeRecipients(row: ResumeRow): Promise<string[]> {
   const ctx = row.gmeet_context;
   const set = new Set<string>();
-  for (const e of [ctx.autoSync?.byEmail, ctx.autoImport?.byEmail, ctx.deferredImport?.ownerEmail]) {
-    if (e) set.add(e.toLowerCase());
-  }
-  for (const w of ctx.autoSync?.watchers ?? []) if (w) set.add(w.toLowerCase());
+  for (const e of autoRecipients(autoMarkerOf(ctx))) set.add(e);
+  if (ctx.deferredImport?.ownerEmail) set.add(ctx.deferredImport.ownerEmail.toLowerCase());
   if (set.size === 0) {
     const id = await identityForUser(row.user_id).catch(() => null);
     if (id?.email) set.add(id.email.toLowerCase());

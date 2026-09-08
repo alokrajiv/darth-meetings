@@ -250,6 +250,7 @@ export async function listAutoImportEnabledSeries(): Promise<SeriesRow[]> {
 }
 
 export interface AutoImportLogRow {
+  series_id: number;
   occ_key: string;
   occ_start: string | null;
   title: string | null;
@@ -262,11 +263,44 @@ export interface AutoImportLogRow {
 /** Everything the sweep has fired for this series, keyed by occurrence. */
 export async function listAutoImportLog(seriesId: number): Promise<Map<string, AutoImportLogRow>> {
   const rows = await sql<AutoImportLogRow[]>`
-    SELECT occ_key, occ_start::text, title, outcome, assemblyai_id, detail, fired_at::text
+    SELECT series_id, occ_key, occ_start::text, title, outcome, assemblyai_id, detail, fired_at::text
     FROM ${sql(SCHEMA)}.series_auto_import_log
     WHERE series_id = ${seriesId}
   `;
   return new Map(rows.map((r) => [r.occ_key, r]));
+}
+
+/** Series-sweep ledger rows for many series at once, keyed
+ * `<series_id>|<occ_start UTC ISO>` — the listing's chip reads it so a
+ * series-owned row shows what the sweep actually did (imported / queued /
+ * gave up) instead of a forever "pending". */
+export async function listAutoImportLogForSeries(seriesIds: number[]): Promise<Map<string, AutoImportLogRow>> {
+  if (seriesIds.length === 0) return new Map();
+  const rows = await sql<AutoImportLogRow[]>`
+    SELECT series_id, occ_key, occ_start::text, title, outcome, assemblyai_id, detail, fired_at::text
+    FROM ${sql(SCHEMA)}.series_auto_import_log
+    WHERE series_id = ANY(${seriesIds}) AND occ_start IS NOT NULL
+  `;
+  return new Map(rows.map((r) => [`${r.series_id}|${new Date(r.occ_start!).toISOString()}`, r]));
+}
+
+/** The series sweep's ledger row for ONE occurrence, by series + instant
+ * (its occ_key is the calendar instance id, not the `code|iso` key the
+ * account ledger uses — so match on occ_start, ±60s). */
+export async function findAutoImportLogByStart(
+  seriesId: number,
+  startIso: string
+): Promise<AutoImportLogRow | null> {
+  const rows = await sql<AutoImportLogRow[]>`
+    SELECT series_id, occ_key, occ_start::text, title, outcome, assemblyai_id, detail, fired_at::text
+    FROM ${sql(SCHEMA)}.series_auto_import_log
+    WHERE series_id = ${seriesId}
+      AND occ_start IS NOT NULL
+      AND abs(extract(epoch FROM (occ_start - ${startIso}::timestamptz))) <= 60
+    ORDER BY fired_at DESC
+    LIMIT 1
+  `;
+  return rows[0] ?? null;
 }
 
 export async function recordAutoImportFire(input: {
@@ -518,17 +552,42 @@ export async function listUnattachedTranscripts(): Promise<
 }
 
 /** Batch series lookup for calendar rows by stripped recurringEventId. */
-export async function findSeriesByRecurringBaseIds(
-  baseIds: string[]
-): Promise<Map<string, { series_id: number; title: string }>> {
+export interface SeriesKeyHit {
+  series_id: number;
+  title: string;
+  auto_import: SeriesAutoImportCfg | null;
+}
+
+export async function findSeriesByRecurringBaseIds(baseIds: string[]): Promise<Map<string, SeriesKeyHit>> {
   if (baseIds.length === 0) return new Map();
-  const rows = await sql<Array<{ value: string; series_id: number; title: string }>>`
-    SELECT k.value, k.series_id, s.title
+  const rows = await sql<Array<{ value: string } & SeriesKeyHit>>`
+    SELECT k.value, k.series_id, s.title, s.auto_import
     FROM ${sql(SCHEMA)}.series_keys k
     JOIN ${sql(SCHEMA)}.series s ON s.id = k.series_id
     WHERE k.kind = 'recurring-base-id' AND k.value = ANY(${baseIds})
   `;
-  return new Map(rows.map((r) => [r.value, { series_id: r.series_id, title: r.title }]));
+  return new Map(rows.map((r) => [r.value, { series_id: r.series_id, title: r.title, auto_import: r.auto_import }]));
+}
+
+/** Same, keyed by Meet code (series attach on codes too — a listing row
+ * with no recurring id can still belong to an auto-importing series). */
+export async function findSeriesByMeetingCodes(codes: string[]): Promise<Map<string, SeriesKeyHit>> {
+  if (codes.length === 0) return new Map();
+  const rows = await sql<Array<{ value: string } & SeriesKeyHit>>`
+    SELECT k.value, k.series_id, s.title, s.auto_import
+    FROM ${sql(SCHEMA)}.series_keys k
+    JOIN ${sql(SCHEMA)}.series s ON s.id = k.series_id
+    WHERE k.kind = 'meeting-code' AND k.value = ANY(${codes})
+  `;
+  return new Map(rows.map((r) => [r.value, { series_id: r.series_id, title: r.title, auto_import: r.auto_import }]));
+}
+
+/** Every series carrying an explicit auto-import setting (on OR off) — the
+ * ones that override account auto-sync for their occurrences. */
+export async function listSeriesWithAutoImport(): Promise<SeriesRow[]> {
+  return sql<SeriesRow[]>`
+    SELECT * FROM ${sql(SCHEMA)}.series WHERE auto_import IS NOT NULL ORDER BY title
+  `;
 }
 
 export async function listKeys(seriesId: number): Promise<SeriesKeyRow[]> {

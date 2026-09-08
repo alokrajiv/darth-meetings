@@ -14,6 +14,8 @@ import { notifyUser, APP_URL } from '@/lib/server/darth-notify';
 import { dm, meetingLine, openLink } from '@/lib/server/dm-copy';
 import { listAutoSyncUsers, type AutoSyncUser } from '@/db-ops/user-prefs';
 import { ensureSharedWith } from '@/lib/server/account-auto-sync';
+import { planForOccurrence } from '@/lib/server/auto-import-plan';
+import { reportLabel, type ReportPref } from '@/lib/auto-marker';
 
 /**
  * Series auto-import: for every series with auto_import enabled, re-run the
@@ -21,7 +23,9 @@ import { ensureSharedWith } from '@/lib/server/account-auto-sync';
  * Google connection) and fire imports for new past occurrences that have
  * artifacts. Still-generating artifacts ride the existing deferred-import
  * machinery (defer: true); each fired row is stamped with
- * gmeet_context.autoImport + the configured report pref, which arms the
+ * gmeet_context.autoImport (+ the auto-sync WATCHERS in the meeting) and the
+ * EFFECTIVE report pref — the strongest of the series setting and every
+ * watcher's own ask, per lib/server/auto-import-plan — which arms the
  * automatic speaker-review evaluation at completion (auto-review.ts).
  *
  * Fire-once: series_auto_import_log records every occurrence acted on;
@@ -100,8 +104,12 @@ async function sweepOne(series: SeriesRow): Promise<void> {
   candidates.sort((a, b) => Date.parse(a.startIso) - Date.parse(b.startIso));
 
   let fired = 0;
+  let users: AutoSyncUser[] = [];
+  if (candidates.length > 0) {
+    users = await listAutoSyncUsers().catch(() => []);
+  }
   for (const o of candidates.slice(0, MAX_FIRES_PER_PASS)) {
-    await fireOne(series, cfg, caller, o, now);
+    await fireOne(series, cfg, caller, o, now, users);
     fired += 1;
   }
   if (fired > 0) console.log(`[series-auto-import] series ${series.id}: fired ${fired} import(s)`);
@@ -118,7 +126,8 @@ async function fireOne(
   cfg: NonNullable<SeriesRow['auto_import']>,
   caller: { userId: string; email: string },
   o: SeriesOccurrence,
-  now: number
+  now: number,
+  users: AutoSyncUser[]
 ): Promise<void> {
   // 'both' downgrades to whichever half exists once the other half is
   // clearly never coming (mirrors the deferred poller's stance).
@@ -129,6 +138,26 @@ async function fireOne(
     else if (!o.hasTranscript && o.hasRecording) mode = 'video';
   }
 
+  // The plan: report = strongest of the series pref and every auto-sync
+  // attendee's ask; watchers = those attendees minus the enabler. Series
+  // known → no key lookup.
+  const provider = providerOf(o) === 'teams' ? 'teams' : 'gmeet';
+  const plan = await planForOccurrence(
+    {
+      code: o.meetingCode ?? o.key,
+      startIso: o.startIso,
+      provider,
+      title: o.title,
+      organizerEmail: o.organizerEmail,
+      attendees: (o.attendees ?? []).map((a) => a.email).filter((e): e is string => !!e),
+      recurringEventId: o.recurringEventId,
+      teamsJoinUrl: o.teams?.joinWebUrl ?? null,
+    },
+    { users, series }
+  );
+  const report: ReportPref = plan.report ?? cfg.report;
+  const watchers = plan.watchers;
+
   const contextExtra = {
     autoImport: {
       seriesId: series.id,
@@ -136,9 +165,10 @@ async function fireOne(
       occKey: o.key,
       byUserId: cfg.byUserId,
       byEmail: cfg.byEmail,
+      watchers,
       at: new Date(now).toISOString(),
     },
-    uploadPrefs: { report: cfg.report },
+    uploadPrefs: { report },
   };
   const event = {
     id: o.eventId ?? undefined,
@@ -217,23 +247,28 @@ async function fireOne(
           `🔁 *Series auto-import: ${series.title}*`,
           meetingLine({ title: o.title, when: o.startIso, duration: dur }),
           kind === 'imported'
-            ? `Imported under your Google connection — speakers are being identified; the ${cfg.report === 'summary' ? 'summary' : cfg.report === 'later' ? 'notes' : 'detailed report'} follows once they're confirmed.`
+            ? `Imported under your Google connection — speakers are being identified; the ${reportLabel(report)} follows once they're confirmed.`
             : `Queued — Google is still generating the artifacts. It lands on its own; nothing to do.`,
+          ...(report !== cfg.report
+            ? [`Report raised from the series' ${reportLabel(cfg.report)} to ${reportLabel(report)} — an auto-sync attendee asked for more.`]
+            : []),
+          ...(watchers.length > 0 ? [`Also shared with (auto-sync): ${watchers.join(', ')}.`] : []),
           link
         ),
         dedupeKey: `mw-autoimport:${series.id}:${o.key}`,
       });
-      await notifyAutoSyncWatchers(series, cfg, o, kind, imported?.assemblyai_id ?? null, link, dur);
+      await notifyAutoSyncWatchers(series, cfg, o, kind, imported?.assemblyai_id ?? null, link, dur, watchers, report);
     })().catch((err) => console.warn('[series-auto-import] notify failed:', err));
   }
 }
 
 /**
  * A series import also satisfies ACCOUNT auto-sync users who were in the
- * meeting — the account sweep defers to the series setting
- * (seriesOwnsOrOptsOut), so without this they'd hear nothing even with
- * auto-sync + notifications on (the auto-share to invitees is silent).
- * Share + DM them exactly like the account sweep's watchers.
+ * meeting — the account sweep defers to the series setting (seriesOwnerFor),
+ * so without this they'd hear nothing even with auto-sync + notifications on
+ * (the auto-share to invitees is silent). Share + DM them exactly like the
+ * account sweep's watchers. The list comes from the plan resolver (already
+ * excludes the enabler).
  */
 async function notifyAutoSyncWatchers(
   series: SeriesRow,
@@ -242,52 +277,31 @@ async function notifyAutoSyncWatchers(
   kind: 'imported' | 'deferred',
   assemblyaiId: string | null,
   link: string,
-  dur: number | null
+  dur: number | null,
+  watchers: string[],
+  report: ReportPref
 ): Promise<void> {
-  let users: AutoSyncUser[];
-  try {
-    users = await listAutoSyncUsers();
-  } catch {
-    return;
-  }
-  const involved = new Set(
-    (o.attendees ?? [])
-      .map((a) => a.email?.toLowerCase())
-      .filter((e): e is string => !!e)
-  );
-  if (o.organizerEmail) involved.add(o.organizerEmail.toLowerCase());
-  const startMs = Date.parse(o.startIso);
-  const provider = providerOf(o) === 'teams' ? 'teams' : 'gmeet';
-  const watchers = users.filter((u) => {
-    const email = u.email.toLowerCase();
-    if (email === cfg.byEmail.toLowerCase()) return false; // enabler already DM'd
-    if (!involved.has(email)) return false;
-    if (!u.prefs.providers[provider]) return false;
-    if (u.prefs.since && startMs <= Date.parse(u.prefs.since)) return false;
-    if (u.prefs.scope === 'mine' && (o.organizerEmail ?? '').toLowerCase() !== email) return false;
-    return true;
-  });
   if (watchers.length === 0) return;
   if (assemblyaiId) {
-    await ensureSharedWith(assemblyaiId, watchers.map((w) => w.email)).catch(() => {});
+    await ensureSharedWith(assemblyaiId, watchers).catch(() => {});
   }
   for (const w of watchers) {
     void notifyUser({
       kind: 'auto_import',
-      toEmail: w.email,
+      toEmail: w,
       text: dm(
         `⚡ *Auto-sync picked up a meeting you were in*`,
         meetingLine({ title: o.title, when: o.startIso, duration: dur }),
         kind === 'imported'
-          ? `Imported — speakers are being identified; notes follow once they're confirmed.`
+          ? `Imported — speakers are being identified; the ${reportLabel(report)} follows once they're confirmed.`
           : `Queued — the recording/transcript is still being generated. It lands on its own; nothing to do.`,
         `Imported once, via ${cfg.byEmail}'s "${series.title}" series auto-import, and shared with you — no duplicate needed.`,
         link
       ),
-      dedupeKey: `mw-autoimport:${series.id}:${o.key}:${w.email}`,
+      dedupeKey: `mw-autoimport:${series.id}:${o.key}:${w}`,
     });
   }
   console.log(
-    `[series-auto-import] series ${series.id} "${o.title ?? o.key}": notified ${watchers.length} auto-sync watcher(s)`
+    `[series-auto-import] series ${series.id} "${o.title ?? o.key}": notified ${watchers.length} auto-sync watcher(s), report ${report}`
   );
 }

@@ -24,6 +24,15 @@ interface Payload {
     providers: { gmeet: boolean; teams: boolean };
   };
   googleConnected: boolean;
+  overridingSeries?: Array<{
+    id: number;
+    title: string;
+    enabled: boolean;
+    byEmail: string;
+    mine: boolean;
+    mode: Mode;
+    report: Report;
+  }>;
   activity: Array<{
     occKey: string;
     title: string | null;
@@ -47,6 +56,13 @@ const MODES: Array<{ value: Mode; label: string }> = [
   { value: 'transcript', label: 'Transcript only (fast, cheap)' },
   { value: 'both', label: 'Both' },
 ];
+const MODE_WORD: Record<Mode, string> = { video: 'recording', transcript: 'transcript only', both: 'both' };
+const REPORT_WORD: Record<Report, string> = {
+  summary: 'quick summary',
+  'detailed-video': 'detailed report + frames',
+  'detailed-text': 'detailed report',
+  later: 'no notes',
+};
 const REPORTS: Array<{ value: Report; label: string }> = [
   { value: 'detailed-video', label: 'Detailed report with video frames — recommended' },
   { value: 'summary', label: 'Quick summary' },
@@ -206,6 +222,33 @@ export function AutoSyncCard() {
                     </span>
                   )}
                 </div>
+              </div>
+            )}
+
+            {(data.overridingSeries?.length ?? 0) > 0 && (
+              <div>
+                <p className="mb-1 text-xs font-medium text-muted-foreground">
+                  Series settings that override this switch for you
+                </p>
+                <p className="mb-1.5 text-[11px] text-muted-foreground">
+                  A recurring call with its own auto-import setting is owned by that setting: on →
+                  that person’s connection imports it in their mode (you’re shared in and DMed; the
+                  report is the strongest ask among everyone in it), off → nobody imports it.
+                </p>
+                <ul className="space-y-1 text-xs">
+                  {data.overridingSeries!.map((s) => (
+                    <li key={s.id} className="flex min-w-0 items-center gap-2">
+                      <a className="min-w-0 flex-1 truncate hover:underline" href={`/series?series=${s.id}`}>
+                        {s.title}
+                      </a>
+                      <span className="shrink-0 text-muted-foreground">
+                        {s.enabled
+                          ? `on · ${s.mine ? 'you' : s.byEmail} · ${MODE_WORD[s.mode]} · ${REPORT_WORD[s.report]}`
+                          : `off (opt-out by ${s.mine ? 'you' : s.byEmail})`}
+                      </span>
+                    </li>
+                  ))}
+                </ul>
               </div>
             )}
 

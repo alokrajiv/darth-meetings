@@ -26,6 +26,13 @@ import type {
   CalendarMeetingsResponse,
 } from '@/app/api/calendar-meetings/route';
 
+const REPORT_WORDS: Record<string, string> = {
+  summary: 'quick summary',
+  'detailed-text': 'detailed report',
+  'detailed-video': 'detailed report with video frames',
+  later: 'no notes until someone picks on the page',
+};
+
 export type { CalendarMeetingRow, CalendarMeetingsResponse };
 
 export type CalendarDayGroup = CalendarMeetingsResponse['days'][number];
@@ -663,19 +670,21 @@ export function CalendarEventRow({
   // it (same mechanism as the reminder rows and the Import… button). The
   // buttons/badges inside all stopPropagation already.
   const rowClickable = !!r.meetingCode && !!onImportMeeting && layer === 'unimported';
+  const autoVia = r.autoSync
+    ? r.autoSync.source === 'series'
+      ? ` via ${r.autoSync.importerEmail ?? '?'}'s "${r.autoSync.seriesTitle ?? 'series'}" series auto-import`
+      : r.autoSync.importerEmail
+        ? ` via ${r.autoSync.importerEmail}'s connection (account auto-sync)`
+        : ''
+    : '';
+  const autoReport = r.autoSync?.report ? ` Then: ${REPORT_WORDS[r.autoSync.report] ?? r.autoSync.report}.` : '';
   const autoSyncTitle =
     r.autoSync &&
     (r.autoSync.state === 'pending'
-      ? `Auto-sync has this meeting: it will be imported automatically once the recording/transcript is ready${
-          r.autoSync.importerEmail ? ` (via ${r.autoSync.importerEmail}'s connection)` : ''
-        } and shared with everyone who was in it. No need to import it yourself — click the row if you can't wait.`
+      ? `This meeting imports by itself once the recording/transcript is ready${autoVia}, and is shared with everyone in it who has auto-sync on.${autoReport} No need to import it yourself — click the row if you can't wait.`
       : r.autoSync.state === 'queued'
-        ? `Auto-sync already queued this import${
-            r.autoSync.importerEmail ? ` via ${r.autoSync.importerEmail}` : ''
-          } — it lands on its own once the artifacts are ready.`
-        : `Auto-sync already imported this meeting${
-            r.autoSync.importerEmail ? ` via ${r.autoSync.importerEmail}` : ''
-          } — the listing catches up on the next refresh.`);
+        ? `Already queued${autoVia} — it lands on its own once the artifacts are ready.${autoReport}`
+        : `Already imported${autoVia} — the listing catches up on the next refresh.`);
 
   return (
     <TableRow
@@ -818,7 +827,9 @@ export function CalendarEventRow({
             >
               <Zap className="h-3 w-3" />
               {r.autoSync.state === 'pending'
-                ? 'Auto-sync'
+                ? r.autoSync.source === 'series'
+                  ? 'Series auto-import'
+                  : 'Auto-sync'
                 : r.autoSync.state === 'queued'
                   ? 'Auto-sync queued'
                   : 'Auto-synced'}

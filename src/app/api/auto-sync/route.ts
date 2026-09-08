@@ -15,6 +15,7 @@ import {
   type AutoSyncReport,
 } from '@/db-ops/user-prefs';
 import { getGoogleAccount } from '@/db-ops/google-accounts';
+import { listSeriesWithAutoImport, visibleSeriesIds } from '@/db-ops/series';
 
 export const runtime = 'nodejs';
 
@@ -24,12 +25,29 @@ export const runtime = 'nodejs';
  * they were the importer or a watcher on.
  */
 export const GET = withAuth(async ({ user }) => {
-  const [row, account, activity] = await Promise.all([
+  const [row, account, activity, seriesWithCfg, visible] = await Promise.all([
     getUserPrefs(user.userId),
     getGoogleAccount(user.userId),
     listAutoSyncActivityFor({ userId: user.userId, email: user.email }, 20),
+    listSeriesWithAutoImport().catch(() => []),
+    visibleSeriesIds({ userId: user.userId, email: user.email }).catch(() => new Set<number>()),
   ]);
+  // Series the caller is in whose explicit setting OVERRIDES this switch for
+  // their occurrences (on → that enabler imports in the series' mode; off →
+  // nobody). Shown on the card so "why didn't auto-sync…" is answerable.
+  const overridingSeries = seriesWithCfg
+    .filter((s) => visible.has(s.id) && s.auto_import)
+    .map((s) => ({
+      id: s.id,
+      title: s.title,
+      enabled: s.auto_import!.enabled,
+      byEmail: s.auto_import!.byEmail,
+      mine: s.auto_import!.byUserId === user.userId,
+      mode: s.auto_import!.mode,
+      report: s.auto_import!.report,
+    }));
   return NextResponse.json({
+    overridingSeries,
     autoSync: autoSyncOf(row),
     setupReviewedAt: row?.setup_reviewed_at ?? null,
     announceDismissed: !!row?.auto_sync_announce_dismissed_at || (row?.auto_sync ?? 'off') !== 'off',

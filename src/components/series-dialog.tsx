@@ -132,6 +132,12 @@ interface Occurrence {
 }
 
 interface OccurrencesResult {
+  /** Whom a series setting speaks for (server: auto-import plan resolver). */
+  autoSyncAudience?: {
+    interested: Array<{ email: string; report: AutoImportCfg['report']; organiser: boolean }>;
+    effectiveReport: AutoImportCfg['report'] | null;
+    downgrades: string[];
+  };
   googleConnected: boolean;
   meetChecked: boolean;
   graphChecked: boolean;
@@ -312,6 +318,79 @@ const fullWhen = (startIso: string, endIso: string | null) => {
  * inter-occurrence interval). Pure render over the sweep result — hidden
  * under 4 occurrences so 1-member stubs stay clean.
  */
+/**
+ * The series setting is a PERSON's setting that binds everyone in the
+ * meeting — say so. Lists the account-auto-sync attendees it speaks for
+ * (with what they asked), the effective report the resolver picks (the
+ * strongest ask — never a downgrade), and the explicit-opt-out consequence.
+ */
+function AudienceNote({
+  audience,
+  cfg,
+}: {
+  audience: OccurrencesResult['autoSyncAudience'] | undefined;
+  cfg: AutoImportCfg | null;
+}) {
+  if (!audience) return null;
+  const people = audience.interested;
+  const who = (e: string) => e.split('@')[0];
+  if (cfg && !cfg.enabled) {
+    return (
+      <p className="rounded border border-amber-300/60 bg-amber-50 px-2 py-1 text-[11px] text-amber-800 dark:bg-amber-950/30 dark:text-amber-300">
+        Switched off here = an explicit opt-out: account auto-sync will <b>not</b> import this
+        series for anyone
+        {people.length > 0
+          ? ` — including ${people.map((p) => who(p.email)).join(', ')}, who have it on. `
+          : '. '}
+        Turn it on (or remove the setting) to let their auto-sync cover it.
+      </p>
+    );
+  }
+  if (cfg?.enabled) {
+    if (people.length === 0) {
+      return (
+        <p className="text-[11px] text-muted-foreground">
+          Nobody else in these meetings has account auto-sync on — this setting only serves you.
+        </p>
+      );
+    }
+    return (
+      <div className="space-y-0.5 text-[11px] text-muted-foreground">
+        <p>
+          <span className="font-medium text-foreground/80">Speaks for</span>{' '}
+          {people.map((p, i) => (
+            <span key={p.email}>
+              {i > 0 && ', '}
+              {who(p.email)}
+              {p.organiser ? ' (organiser)' : ''}
+              <span className="opacity-70"> · {REPORT_INFO[p.report].label.toLowerCase()}</span>
+            </span>
+          ))}
+          . Their account auto-sync stands down for this series; they’re shared in and DMed at
+          every step.
+        </p>
+        {audience.downgrades.length > 0 && audience.effectiveReport && (
+          <p className="text-amber-700 dark:text-amber-400">
+            Your pick ({REPORT_INFO[cfg.report].label.toLowerCase()}) is weaker than what{' '}
+            {audience.downgrades.map(who).join(', ')} asked for — the import generates the{' '}
+            <b>{REPORT_INFO[audience.effectiveReport].label.toLowerCase()}</b> for everyone (automation
+            never lowers a colleague’s ask).
+          </p>
+        )}
+      </div>
+    );
+  }
+  if (people.length === 0) return null;
+  return (
+    <p className="text-[11px] text-muted-foreground">
+      Without a series setting, account auto-sync already covers new occurrences for{' '}
+      {people.map((p) => who(p.email)).join(', ')} (organiser first imports; report ={' '}
+      {audience.effectiveReport ? REPORT_INFO[audience.effectiveReport].label.toLowerCase() : '—'}).
+      Turning this on binds every import to <b>your</b> connection and mode instead.
+    </p>
+  );
+}
+
 function CoverageStrip({ occurrences }: { occurrences: Occurrence[] }) {
   if (occurrences.length < 4) return null;
   const chrono = [...occurrences].sort((a, b) => Date.parse(a.startIso) - Date.parse(b.startIso));
@@ -1096,12 +1175,16 @@ export function SeriesDialog({ seriesId, onClose, onChanged, onMerged }: SeriesD
                       {ai!.lastError && (
                         <p className="text-[11px] text-destructive">Last sweep problem: {ai!.lastError}</p>
                       )}
+                      <AudienceNote audience={occ?.autoSyncAudience} cfg={ai} />
                     </div>
                   ) : (
-                    <p className="mt-1 text-[11px] text-muted-foreground">
-                      Import every new occurrence of this series automatically, with your chosen
-                      report kind — you’ll be DMed as things land.
-                    </p>
+                    <div className="mt-1 space-y-1 text-[11px] text-muted-foreground">
+                      <p>
+                        Import every new occurrence of this series automatically, with your chosen
+                        report kind — you’ll be DMed as things land.
+                      </p>
+                      <AudienceNote audience={occ?.autoSyncAudience} cfg={ai} />
+                    </div>
                   )}
                 </div>
               );

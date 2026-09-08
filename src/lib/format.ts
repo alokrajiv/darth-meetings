@@ -377,6 +377,10 @@ export interface GmeetContext {
     occKey: string;
     byUserId: string;
     byEmail: string;
+    /** Account-auto-sync users who were in the meeting (since 2026-09-08):
+     * shared onto the row and DM'd at every stage, same as autoSync.watchers.
+     * Absent on older rows. Read via lib/auto-marker autoMarkerOf(). */
+    watchers?: string[];
     at: string;
   } | null;
   /** Stamped by the ACCOUNT auto-sync sweep (T2, lib/server/account-auto-

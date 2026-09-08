@@ -9,6 +9,7 @@ import { getContentCached, generateAutoNotes, generateAutoReport } from '@/lib/s
 import { enrollFromTranscript } from '@/lib/server/voiceprint';
 import { notifyUser, APP_URL } from '@/lib/server/darth-notify';
 import { dm, headlines, meetingLine } from '@/lib/server/dm-copy';
+import { autoMarkerOf, autoRecipients, autoSourceLabel } from '@/lib/auto-marker';
 
 /**
  * Automatic speaker-review for series-auto-imported rows: the human review
@@ -24,8 +25,9 @@ import { dm, headlines, meetingLine } from '@/lib/server/dm-copy';
  * VTT imports) need no resolution at all, and speakers with a single
  * utterance are noise the human reviewer routinely skips too.
  *
- * Only rows carrying gmeet_context.autoImport or .autoSync are touched — manual
- * imports and uploads keep the human gate unconditionally.
+ * Only rows carrying an automation marker (lib/auto-marker: gmeet_context
+ * .autoImport or .autoSync) are touched — manual imports and uploads keep
+ * the human gate unconditionally.
  */
 
 const VOICE_MIN = 0.62;
@@ -43,17 +45,17 @@ function isDiarizationLabel(speaker: string): boolean {
 export async function maybeAutoReview(ownerUserId: string, assemblyaiId: string): Promise<void> {
   const row = await getForUser(ownerUserId, assemblyaiId);
   if (!row || row.status !== 'completed') return;
-  const ai = row.gmeet_context?.autoImport;
-  const as = row.gmeet_context?.autoSync;
-  if (!ai && !as) return;
-  // One shape for both automatic paths: who ran it, how to describe the
-  // source in DMs, and everyone who should hear about it (account auto-sync
-  // watchers were shared onto the row and want the same notes-ready DM).
+  const marker = autoMarkerOf(row.gmeet_context);
+  if (!marker) return;
+  // One shape for both automatic paths (lib/auto-marker): who ran it, how to
+  // describe the source in DMs, and everyone who should hear about it —
+  // importer + watchers, series or account alike. (Until 2026-09-08 series
+  // rows carried no watchers, so a blocked review DM'd only the enabler.)
   const auto = {
-    byUserId: (ai ?? as)!.byUserId,
-    byEmail: (ai ?? as)!.byEmail,
-    source: ai ? `series *${ai.seriesTitle ?? ai.seriesId}*` : 'account auto-sync',
-    recipients: Array.from(new Set([(ai ?? as)!.byEmail, ...(as?.watchers ?? [])])),
+    byUserId: marker.byUserId,
+    byEmail: marker.byEmail,
+    source: autoSourceLabel(marker),
+    recipients: autoRecipients(marker),
   };
   if (row.gmeet_context?.autoReview) return; // evaluated once, ever
 
