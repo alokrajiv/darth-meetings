@@ -1,6 +1,7 @@
 import 'server-only';
 import { AssemblyAI } from 'assemblyai';
 import type { TranscriptResponse } from '@/lib/format';
+import { keytermsSupported } from '@/lib/aai-language';
 
 /**
  * Server-only AssemblyAI wrapper.
@@ -67,7 +68,15 @@ export async function submitTranscription(
     speech_model: 'universal',
   };
   if (options.languageCode) params.language_code = options.languageCode;
-  if (options.keytermsPrompt && options.keytermsPrompt.length > 0) {
+  // AAI rejects the whole submit (400) when keyterms_prompt accompanies a
+  // non-English language_code on the universal model, so only attach the
+  // bias list for English (or unset, which AAI defaults to en). Vocab is
+  // English-centric anyway; custom_spelling is language-agnostic and stays.
+  if (
+    options.keytermsPrompt &&
+    options.keytermsPrompt.length > 0 &&
+    keytermsSupported(options.languageCode)
+  ) {
     params.keyterms_prompt = options.keytermsPrompt;
   }
   if (options.customSpelling && options.customSpelling.length > 0) {
