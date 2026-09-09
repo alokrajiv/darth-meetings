@@ -2,7 +2,7 @@ import 'server-only';
 import { sql } from '@/lib/db';
 import { SCHEMAS } from '@/lib/constants/database';
 import { OCCURRENCE_WINDOW_S } from '@/lib/meeting-evidence';
-import { importedOccurrenceAntiJoin } from '@/db-ops/imported-occurrences';
+import { importedOccurrenceAntiJoin, IMPORTED_OCCURRENCE_START } from '@/db-ops/imported-occurrences';
 import { norecFilterSql, unimportedFilterSql } from '@/db-ops/meeting-filter-sql';
 import { EMPTY_MEETING_FILTERS, type MeetingFilters } from '@/lib/server/meeting-filters';
 import type { TeamsChatEvidence } from '@/lib/teams-chat-evidence';
@@ -985,4 +985,151 @@ export async function latestPastOccurrenceStart(meetingCode: string): Promise<st
     ORDER BY event_start DESC LIMIT 1
   `;
   return rows[0] ? new Date(rows[0].event_start).toISOString() : null;
+}
+
+// ---------------------------------------------------------------------------
+// Full calendar window (darth-cli `meetings calendar --view all`)
+// ---------------------------------------------------------------------------
+
+export interface CalendarWindowRow {
+  key: string;
+  event_id: string;
+  recurring_event_id: string | null;
+  title: string | null;
+  event_start: string;
+  event_end: string | null;
+  duration_secs: number | null;
+  meeting_code: string | null;
+  provider: 'gmeet' | 'teams' | null;
+  organizer_email: string | null;
+  organizer_self: boolean | null;
+  attendee_count: number | null;
+  attendees: CalendarEventAttendee[] | null;
+  muted: boolean;
+  /** Provider evidence for the occurrence (artifact cache, ±12h) plus the
+   * calendar attachments on the row itself. */
+  has_recording: boolean;
+  has_transcript: boolean;
+  recording_preparing: boolean;
+  transcript_preparing: boolean;
+  gemini_notes: boolean;
+  evidence_checked_at: string | null;
+  /** Earliest live import of the occurrence (anyone's) — id + whether the
+   * caller can open it. */
+  imported_id: string | null;
+  imported_status: string | null;
+  imported_accessible: boolean | null;
+  imported_mine: boolean | null;
+}
+
+export interface CalendarWindowOpts {
+  /** Instants (ISO) — inclusive from, exclusive to. */
+  fromIso: string;
+  toIso: string;
+  filters?: MeetingFilters;
+  limit: number;
+}
+
+/**
+ * Every timed event on the caller's OWN calendar rows inside a window —
+ * past and future, imported or not, with or without a meeting link —
+ * ascending, agenda-style. Unlike the listing layers there is no
+ * anti-join: imports are surfaced as an annotation instead of hiding the
+ * event, so an agent can go straight from a calendar row to `text <id>`.
+ * Per-user rows only (the privacy rule of this table); evidence and import
+ * lookups are keyed by the row's own meeting code / event id.
+ */
+export async function listCalendarWindow(
+  caller: Caller,
+  opts: CalendarWindowOpts
+): Promise<CalendarWindowRow[]> {
+  const filters = opts.filters ?? EMPTY_MEETING_FILTERS;
+  const occ = sql`${IMPORTED_OCCURRENCE_START}::timestamptz`;
+  const accessible = sql`(t.user_id = ${caller.userId} OR EXISTS (
+        SELECT 1 FROM ${sql(SCHEMA)}.transcript_shares s
+        WHERE s.transcript_id = t.id
+          AND LOWER(s.shared_with_email) = ${caller.email.toLowerCase()}
+      ))`;
+  return sql<CalendarWindowRow[]>`
+    SELECT
+      c.event_key AS key,
+      c.event_id,
+      c.recurring_event_id,
+      c.title,
+      c.event_start,
+      c.event_end,
+      extract(epoch FROM (c.event_end - c.event_start))::float8 AS duration_secs,
+      c.meeting_code,
+      CASE WHEN c.meeting_code IS NULL THEN NULL
+           WHEN c.meeting_code LIKE 'teams-%' THEN 'teams' ELSE 'gmeet' END AS provider,
+      c.organizer_email,
+      c.organizer_self,
+      c.attendee_count,
+      c.attendees,
+      EXISTS (
+        SELECT 1 FROM ${sql(SCHEMA)}.calendar_event_mutes m
+        WHERE m.user_id = ${caller.userId}
+          AND (
+            (m.kind = 'occurrence' AND m.value = c.event_key)
+            OR (m.kind = 'series' AND m.value = COALESCE(c.recurring_event_id, c.event_id))
+          )
+      ) AS muted,
+      (COALESCE(g.ready_recording_count, 0) > 0 OR g.video_file_id IS NOT NULL
+        OR c.attachment_video_count > 0 OR c.attachment_video_file_id IS NOT NULL) AS has_recording,
+      (COALESCE(jsonb_array_length(g.transcript_doc_ids), 0) > 0 OR g.transcript_parseable IS TRUE
+        OR c.attachment_transcript_doc_id IS NOT NULL) AS has_transcript,
+      (g.recording_state = 'generating' AND c.event_start > now() - interval '24 hours') IS TRUE
+        AS recording_preparing,
+      (g.transcript_state = 'generating' AND c.event_start > now() - interval '24 hours') IS TRUE
+        AS transcript_preparing,
+      (g.transcript_source = 'gemini' OR c.attachment_gemini_notes) IS TRUE AS gemini_notes,
+      g.updated_at AS evidence_checked_at,
+      COALESCE(ic.assemblyai_id, ie.assemblyai_id) AS imported_id,
+      COALESCE(ic.status, ie.status) AS imported_status,
+      COALESCE(ic.accessible, ie.accessible) AS imported_accessible,
+      COALESCE(ic.mine, ie.mine) AS imported_mine
+    FROM ${sql(SCHEMA)}.calendar_event_cache c
+    LEFT JOIN LATERAL (
+      SELECT g.ready_recording_count, g.video_file_id, g.transcript_doc_ids,
+             g.transcript_parseable, g.recording_state, g.transcript_state,
+             g.transcript_source, g.updated_at
+      FROM ${sql(SCHEMA)}.gmeet_meeting_cache g
+      WHERE c.meeting_code IS NOT NULL
+        AND g.meeting_code = c.meeting_code
+        AND COALESCE(g.event_start, g.conf_start)
+              BETWEEN c.event_start - ${OCCURRENCE_WINDOW_S} * interval '1 second'
+                  AND c.event_start + ${OCCURRENCE_WINDOW_S} * interval '1 second'
+      ORDER BY g.updated_at DESC
+      LIMIT 1
+    ) g ON true
+    -- Two laterals (code arm, eventId arm) instead of one OR so each rides
+    -- its own transcripts expression index.
+    LEFT JOIN LATERAL (
+      SELECT t.assemblyai_id, t.status, ${accessible} AS accessible, (t.user_id = ${caller.userId}) AS mine
+      FROM ${sql(SCHEMA)}.transcripts t
+      WHERE c.meeting_code IS NOT NULL
+        AND t.deleted_at IS NULL
+        AND t.gmeet_context IS NOT NULL
+        AND t.gmeet_context->>'meetingCode' = c.meeting_code
+        AND abs(extract(epoch FROM (${occ} - c.event_start))) <= ${OCCURRENCE_WINDOW_S}
+      ORDER BY t.created_at ASC
+      LIMIT 1
+    ) ic ON true
+    LEFT JOIN LATERAL (
+      SELECT t.assemblyai_id, t.status, ${accessible} AS accessible, (t.user_id = ${caller.userId}) AS mine
+      FROM ${sql(SCHEMA)}.transcripts t
+      WHERE ic.assemblyai_id IS NULL
+        AND t.deleted_at IS NULL
+        AND t.gmeet_context IS NOT NULL
+        AND t.gmeet_context->>'eventId' = c.event_id
+      ORDER BY t.created_at ASC
+      LIMIT 1
+    ) ie ON true
+    WHERE c.user_id = ${caller.userId}
+      AND c.event_start >= ${opts.fromIso}::timestamptz
+      AND c.event_start < ${opts.toIso}::timestamptz
+      ${norecFilterSql(filters)}
+    ORDER BY c.event_start ASC, c.event_key ASC
+    LIMIT ${opts.limit}
+  `;
 }

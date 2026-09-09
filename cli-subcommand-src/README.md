@@ -19,6 +19,7 @@ back) and the calling agent brings the intelligence with its own tokens.
 | `search <q> [people filters]` | `GET /api/transcripts/search?q=…&participant=…&organizer=…&provider=…&speaker=…` |
 | `export --out-dir <dir> [FILTERS]` | list v2 drain (as above) → per row `GET /api/transcripts/:id/content` + `/speakers` |
 | `calendar [--view unimported\|norec] [FILTERS]` | `GET /api/calendar-meetings?view=…&<filters>` paged the same way |
+| `calendar --view all [--from D] [--to D] [--cached] [FILTERS]` | `GET /api/calendar/events?from=&to=&tz=&<filters>[&sync=0]` — the caller's FULL calendar (past + upcoming, imported or not, no-link events too), ascending, one response (server cap 5000 rows, max 366-day window); the server re-reads the window live from Google under the caller's own link unless `sync=0`, writing back to their calendar cache. Rows carry `imported:{id,status,accessible,mine}` + `evidence:{recording,transcript,preparing,geminiNotes}` |
 | `text / get / notes / report / audio / frame / attachments / set-*` | unchanged |
 | `notify` / `notify <kind> on\|off` | `GET` / `PUT /api/notify-prefs` — settings writes (this and `auto-sync off\|mine\|all`) require `--i-have-got-consent-from-human-user` |
 | `labels` | `GET /api/labels?counts=1` — human = indented tree (`name (count_visible · n direct) #id color`), `--json` = the flat `labels` array verbatim |
@@ -38,6 +39,11 @@ back) and the calling agent brings the intelligence with its own tokens.
 - `calendar` rows carry no transcript id (they are NOT in the archive); the
   `[meeting-code]` tail (`teams-…` / Meet code) is printed for cross-reference.
   Importing stays a web-UI action (caller's own Google/Microsoft token).
+- `calendar --view all` rows DO carry the transcript: status `imported` +
+  a `→ <id>` tail when the occurrence is in the archive (anyone's live
+  import; `imported(no-access)` and no id tail when the caller can't open it) — `text <id>` from there. Default window 7d back →
+  30d ahead; one bound → 90 days from/to it. `--cached` skips the live Google
+  read (faster, offline-safe, but only what past sweeps captured: −7d→+24h).
 - **Filter flags** (shared; all AND together, comma inside a value = OR,
   case-insensitive substring; names are the server contract — do not rename):
   `--participant` (organizer email, attendee emails + display names, and on

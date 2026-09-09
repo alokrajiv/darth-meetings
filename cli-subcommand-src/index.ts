@@ -42,12 +42,22 @@ READ
                                   transcript, <dir>/<YYYY-MM-DD>-<title-slug>-<id>
                                   .txt (exact 'text' rendering) or .json; skips
                                   files that already exist unless --force
-  calendar [--view unimported|norec] [FILTERS except --speaker]
+  calendar [--view unimported|norec|all] [FILTERS except --speaker]
                                   Calendar-layer meetings that are NOT in the
                                   archive: unimported = a recording/transcript
                                   exists at Google/Microsoft but nobody imported
                                   it (default); norec = your past calendar
                                   events that left no artifacts at all
+  calendar --view all [--from D] [--to D] [--cached] [FILTERS except --speaker]
+                                  Your FULL calendar as an agenda: every timed
+                                  event (past + upcoming, imported or not,
+                                  with or without a meeting link). Re-reads the
+                                  window live from Google with your own link
+                                  (--cached = server cache only). Default
+                                  window: 7 days back → 30 days ahead; one
+                                  bound given → 90 days from/to it; max 366.
+                                  Imported rows end with "→ <id>" so you can
+                                  go straight to 'text <id>'
   audio <id> [--out <file>]       Download the recording (default ./<id>.<ext>)
   frame <id> <ts> [--out <file>]  Grab a video frame at a timestamp (ms, mm:ss or
                                   hh:mm:ss) as jpeg — only transcripts imported
@@ -233,7 +243,12 @@ lines ({ms, speaker, text}) plus the row metadata instead.
 'calendar' lists meetings that are NOT in the archive yet (recording exists
 at Google/Microsoft but un-imported, or no recording at all) — use it to
 tell a human "these 3 meetings have recordings nobody imported"; importing
-itself is a web-UI action.
+itself is a web-UI action. 'calendar --view all' is the human's FULL
+calendar (past + upcoming, everything) — the answer to "what's on my
+calendar next week", "who am I meeting on Thursday", "which of last
+month's calls were recorded / imported": imported rows end with "→ <id>"
+(then 'text <id>'), plus the provider evidence, organiser, attendee count.
+Add --json for attendee emails, meeting codes and the full row.
 
 ## Labels (org-wide taxonomy, many per meeting)
 
@@ -693,6 +708,83 @@ function fmtLocalDateTime(iso: string, tz: string): string {
   return `${g("year")}-${g("month")}-${g("day")} ${g("hour")}:${g("minute")}`;
 }
 
+/** Short status word for a full-calendar (`--view all`) row: what the
+ * archive / provider hold for it, or that it hasn't happened yet. */
+function calendarAllStatus(e: any): string {
+  if (e.imported) {
+    const st = e.imported.status && e.imported.status !== "completed" ? `(${e.imported.status})` : "";
+    return e.imported.accessible ? `imported${st}` : `imported(no-access)${st}`;
+  }
+  if (e.upcoming) return "upcoming";
+  const ev = e.evidence || {};
+  if (ev.recording && ev.transcript) return "recording+transcript";
+  if (ev.recording) return "recording";
+  if (ev.transcript) return ev.geminiNotes ? "gemini-notes" : "transcript";
+  if (ev.preparing) return "preparing";
+  return e.meetingCode ? "no-artifacts" : "no-meet-link";
+}
+
+function fmtDuration(secs: number | null): string {
+  if (secs == null || !Number.isFinite(secs)) return "?";
+  const m = Math.round(secs / 60);
+  return m >= 60 ? `${Math.floor(m / 60)}h${String(m % 60).padStart(2, "0")}` : `${m}m`;
+}
+
+/**
+ * `calendar --view all` — GET /api/calendar/events: the caller's whole
+ * calendar for a window (server re-reads it live from Google unless
+ * --cached), ascending, with import / evidence annotations per row.
+ */
+async function calendarAll(ctx: Ctx, flags: Record<string, string | boolean>): Promise<number> {
+  const fr = readFilterFlags(ctx, flags, ["participant", "organizer", "provider", "q", "from", "to"]);
+  if (!fr.ok) { console.error(fr.error); return 1; }
+  const q = new URLSearchParams(fr.params);
+  const tz = localTz(ctx);
+  q.set("tz", tz);
+  if (flags.cached === true) q.set("sync", "0");
+  const data = await ctx.expectJson<any>(ctx.api("meetings", `/api/calendar/events?${q.toString()}`));
+  ctx.print(data, () => {
+    const { range, events, counts, sync } = data;
+    if (!data.connected) {
+      console.error("Google is not connected for this account — connect it in the web app Settings (meetings.darth-internal.trames.io/settings) so the service can read your calendar. Showing the (empty) cache.");
+    } else if (sync?.error) {
+      console.error(`note: ${sync.error}`);
+    }
+    if (!events.length) {
+      console.log(`No calendar events between ${range.from} and ${range.to} (tz ${tz}).`);
+      return;
+    }
+    let lastDay = "";
+    for (const e of events) {
+      if (e.day !== lastDay) {
+        lastDay = e.day;
+        const dow = new Intl.DateTimeFormat("en-US", { timeZone: "UTC", weekday: "short" }).format(new Date(`${e.day}T00:00:00Z`));
+        console.log(`\n${e.day} ${dow}`);
+      }
+      const time = fmtLocalDateTime(e.start, tz).slice(11);
+      const who = e.organizerSelf ? "me" : (e.organizerEmail || "?");
+      const cols = [
+        `  ${time}`,
+        fmtDuration(e.durationSecs).padStart(5),
+        (e.provider || "-").padEnd(5),
+        calendarAllStatus(e).padEnd(22),
+        `${e.attendeeCount ?? 0} att`.padStart(7),
+        who.padEnd(28),
+        e.title || "(untitled)",
+      ];
+      const tail = [
+        e.meetingCode ? `[${e.meetingCode}]` : null,
+        e.imported?.accessible ? `→ ${e.imported.id}` : null,
+        e.muted ? "(muted)" : null,
+      ].filter(Boolean).join("  ");
+      console.log(`${cols.join("  ")}${tail ? `  ${tail}` : ""}`);
+    }
+    const src = sync?.ran ? `live from Google (${sync.fetched} fetched) + cache` : "server cache only";
+    console.log(`\n${counts.total} event(s) ${range.from} → ${range.to} (tz ${tz}): ${counts.past} past, ${counts.upcoming} upcoming · ${counts.imported} imported, ${counts.withEvidence} with a recording/transcript at the provider · ${src}${data.truncated ? " · TRUNCATED at 5000 rows — narrow --from/--to" : ""}`);
+  });
+  return 0;
+}
+
 /** What evidence the provider holds for a calendar row, and whether the web
  * UI's import flow could act on it (mirrors calendar-meeting-rows.tsx). */
 function calendarEvidence(r: any): { evidence: string; importable: boolean } {
@@ -711,7 +803,7 @@ const meetings: Subcommand = {
   help: HELP,
   async run(ctx, argv) {
     const { pos, flags } = parseArgs(argv);
-    liftBoolFlags(pos, flags, ["cascade", "exact", CONSENT_FLAG]);
+    liftBoolFlags(pos, flags, ["cascade", "exact", "cached", CONSENT_FLAG]);
     const [, cmd, ...args] = pos.length && pos[0] === "meetings" ? pos : ["", ...pos];
     if (!cmd || flags.help === true) { console.log(HELP); return 0; }
 
@@ -1290,7 +1382,9 @@ const meetings: Subcommand = {
 
       case "calendar": {
         const view = str(flags.view) || "unimported";
-        if (view !== "unimported" && view !== "norec") { console.error("--view must be unimported or norec"); return 1; }
+        if (view === "all" || view === "full") return calendarAll(ctx, flags);
+        if (flags.cached !== undefined) { console.error("--cached only applies to --view all"); return 1; }
+        if (view !== "unimported" && view !== "norec") { console.error("--view must be unimported, norec or all"); return 1; }
         const fr = readFilterFlags(ctx, flags, ["participant", "organizer", "provider", "q", "from", "to"]);
         if (!fr.ok) { console.error(fr.error); return 1; }
         const { rows, counts } = await drainDayPages<any, { unimported: number; norec: number }>(
