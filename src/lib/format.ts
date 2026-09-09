@@ -21,6 +21,9 @@ export interface StoredTranscript {
   description: string | null;
   last_accessed: string;
   source: 'uploaded' | 'imported';
+  /** AssemblyAI speech model the row was transcribed with; null = pre-column
+   * row (ran on 'universal') or a quick import that never ran AAI. */
+  speech_model: string | null;
   /** present only when source = 'imported'; the full AAI payload frozen at import time */
   imported_content: TranscriptResponse | null;
   /** cached AAI audio_url at the time of upload/import (may stop working over time) */
@@ -138,6 +141,11 @@ export interface GmeetContext {
   /** Which conferencing product the source meeting ran on. Absent or
    * 'gmeet' = Google Meet (backward compat with every pre-Teams row). */
   provider?: 'gmeet' | 'teams';
+  /** "Re-transcribe with the newer model": on the NEW row, the id of the
+   * row it was re-run from; on the OLD row, when/where the re-run went so
+   * the button turns into a pointer instead of firing twice. */
+  retranscribedFrom?: string;
+  retranscribed?: { at: string; newId: string; model: string };
   /** Microsoft Teams source facts (provider === 'teams'). Artifacts are
    * fetched app-only under the ORGANIZER's AAD id — no per-user Microsoft
    * auth exists. `callId` keys the specific occurrence of a recurring
@@ -454,6 +462,7 @@ export interface TranscriptListRow {
   description: string | null;
   last_accessed: string;
   source: 'uploaded' | 'imported';
+  speech_model?: string | null;
   recorded_at: string | null;
   auto_notes_status: string | null;
   upload_bytes_received: number | null;

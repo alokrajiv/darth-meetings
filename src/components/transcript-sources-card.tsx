@@ -4,11 +4,17 @@ import { useState } from 'react';
 import { Button } from '@/components/ui/button';
 import type { SpeakerSuggestionMap, StoredTranscript } from '@/lib/format';
 import {
+  DEFAULT_SPEECH_MODEL,
+  LEGACY_SPEECH_MODEL,
+  speechModelLabel,
+} from '@/lib/aai-language';
+import {
   AudioWaveform,
   CheckCircle2,
   FileText,
   Fingerprint,
   Loader2,
+  Sparkles,
   Video,
 } from 'lucide-react';
 
@@ -210,6 +216,41 @@ export function TranscriptSourcesCard({
     }
   };
 
+  // --- "Re-transcribe with the newer model": AAI-transcribed rows (uuid
+  // ids) that ran on the pre-2026-09 model and still have their audio. A
+  // new row is created alongside; this one stays and points at it.
+  const isAaiRow = !isMeetPrimary && !isTeamsPrimary && !row.assemblyai_id.startsWith('up-');
+  const rowModel = row.speech_model ?? LEGACY_SPEECH_MODEL;
+  const onOlderModel = isAaiRow && rowModel !== DEFAULT_SPEECH_MODEL;
+  const retranscribed = ctx?.retranscribed ?? null;
+  const canUpgradeModel = canEdit && onOlderModel && !!row.local_audio_path && !retranscribed;
+  const [upgrading, setUpgrading] = useState(false);
+  const [upgradedTo, setUpgradedTo] = useState<string | null>(retranscribed?.newId ?? null);
+  const upgradeModel = async () => {
+    if (
+      !window.confirm(
+        `Re-transcribe this meeting with AssemblyAI ${speechModelLabel(DEFAULT_SPEECH_MODEL)}? ` +
+          'Better punctuation, speaker separation and mixed-language handling; a few English words inside ' +
+          'Chinese speech may come back split ("em ail"). Takes a few minutes and uses transcription credit; ' +
+          'a new transcript is created alongside this one, which stays untouched. You get a Slack DM when it is ready.'
+      )
+    ) {
+      return;
+    }
+    setUpgrading(true);
+    setError(null);
+    try {
+      const res = await fetch(`/api/transcripts/${row.assemblyai_id}/retranscribe`, { method: 'POST' });
+      const payload = (await res.json().catch(() => ({}))) as { newId?: string; error?: string };
+      if (!res.ok || !payload.newId) throw new Error(payload.error || `Failed (${res.status})`);
+      setUpgradedTo(payload.newId);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Re-transcribe failed');
+    } finally {
+      setUpgrading(false);
+    }
+  };
+
   const pct = (c: number) => `${Math.round(c * 100)}%`;
 
   return (
@@ -400,6 +441,40 @@ export function TranscriptSourcesCard({
           {combining
             ? 'Combining & submitting…'
             : `Transcribe all ${partsStored + 1} videos together`}
+        </Button>
+      )}
+      {isAaiRow && (
+        <p className="mt-2 text-[11px] leading-snug text-muted-foreground">
+          Transcribed with AssemblyAI {speechModelLabel(rowModel)}
+          {onOlderModel ? ' (older model)' : ''}.
+          {upgradedTo && (
+            <>
+              {' '}
+              Re-run with {speechModelLabel(DEFAULT_SPEECH_MODEL)}
+              {retranscribed?.at ? ` on ${new Date(retranscribed.at).toLocaleDateString()}` : ''} →{' '}
+              <a className="underline" href={`/transcript/${upgradedTo}`}>
+                open the new transcript
+              </a>
+              .
+            </>
+          )}
+        </p>
+      )}
+      {canUpgradeModel && !upgradedTo && (
+        <Button
+          variant="outline"
+          size="sm"
+          className="mt-2 h-8 w-full justify-start gap-2 text-[13px]"
+          disabled={upgrading}
+          onClick={() => void upgradeModel()}
+          title={`Run this meeting's stored audio through AssemblyAI ${speechModelLabel(DEFAULT_SPEECH_MODEL)} — a new transcript is created alongside this one`}
+        >
+          {upgrading ? (
+            <Loader2 className="h-4 w-4 animate-spin text-muted-foreground" />
+          ) : (
+            <Sparkles className="h-4 w-4 text-primary" />
+          )}
+          {upgrading ? 'Submitting…' : `Re-transcribe with ${speechModelLabel(DEFAULT_SPEECH_MODEL)}`}
         </Button>
       )}
       {pooledMicSuspected && (

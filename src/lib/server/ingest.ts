@@ -6,6 +6,7 @@ import {
   type TranscriptRow,
 } from '@/db-ops/transcripts';
 import { uploadFile, submitTranscription } from '@/lib/server/assemblyai';
+import type { SpeechModel } from '@/lib/aai-language';
 import {
   audioFilename,
   deleteAudioFile,
@@ -62,6 +63,8 @@ export interface IngestOptions {
    * inserting a new row.
    */
   placeholderAssemblyaiId?: string | null;
+  /** AAI speech model override (re-transcribe-with-newer-model); default = current. */
+  speechModel?: SpeechModel;
 }
 
 export async function ingestLocalAudio(
@@ -102,12 +105,13 @@ export async function ingestLocalAudio(
     keytermsPrompt = [...(keytermsPrompt ?? []), ...extras].slice(0, 1000);
   }
 
-  let submitted: { id: string; status: string };
+  let submitted: { id: string; status: string; model: SpeechModel };
   try {
     submitted = await submitTranscription(audioUrl, {
       languageCode: opts.languageCode,
       keytermsPrompt,
       customSpelling,
+      model: opts.speechModel,
     });
   } catch (error) {
     await deleteAudioFile(tempFilename);
@@ -122,6 +126,7 @@ export async function ingestLocalAudio(
         assemblyaiId: submitted.id,
         status: submitted.status,
         audioUrl,
+        speechModel: submitted.model,
       });
     }
     // No placeholder, or the sweeper reaped it mid-upload → fresh insert.
@@ -131,6 +136,7 @@ export async function ingestLocalAudio(
         assemblyaiId: submitted.id,
         originalFilename: opts.originalFilename,
         status: submitted.status,
+        speechModel: submitted.model,
         languageCode: opts.languageCode ?? null,
         title: opts.title ?? null,
         audioUrl: audioUrl,

@@ -47,6 +47,8 @@ export interface TranscriptInsert {
   audioUrl?: string | null;
   driveFileId?: string | null;
   gmeetContext?: GmeetContext | null;
+  /** AAI speech model the submit ran on (null = never ran AAI). */
+  speechModel?: string | null;
 }
 
 export interface TranscriptStatusUpdate {
@@ -107,7 +109,7 @@ export async function listVisibleToUser(
     SELECT t.id, t.user_id, t.assemblyai_id, t.original_filename, t.status,
            t.created_at, t.completed_at, t.duration, t.speaker_count,
            t.language_code, t.title, t.description, t.last_accessed,
-           t.source, t.recorded_at, t.auto_notes_status,
+           t.source, t.speech_model, t.recorded_at, t.auto_notes_status,
            t.upload_bytes_received::float8 AS upload_bytes_received,
            t.upload_bytes_total::float8 AS upload_bytes_total,
            -- Which conferencing product the source meeting ran on (listing
@@ -347,7 +349,7 @@ export async function listPagedForUser(
       SELECT t.id, t.user_id, t.assemblyai_id, t.original_filename, t.status,
              t.created_at, t.completed_at, t.duration, t.speaker_count,
              t.language_code, t.title, t.description, t.last_accessed,
-             t.source, t.recorded_at, t.auto_notes_status,
+             t.source, t.speech_model, t.recorded_at, t.auto_notes_status,
              t.upload_bytes_received::float8 AS upload_bytes_received,
              t.upload_bytes_total::float8 AS upload_bytes_total,
              CASE
@@ -446,7 +448,7 @@ export async function listPagedForUser(
     SELECT b.id, b.user_id, b.assemblyai_id, b.original_filename, b.status,
            b.created_at, b.completed_at, b.duration, b.speaker_count,
            b.language_code, b.title, b.description, b.last_accessed,
-           b.source, b.recorded_at, b.auto_notes_status,
+           b.source, b.speech_model, b.recorded_at, b.auto_notes_status,
            b.upload_bytes_received, b.upload_bytes_total,
            b.provider, b.has_event, b.deferred_mode, b.deferred_error,
            b.recording_count, b.auto_state,
@@ -661,17 +663,19 @@ export async function createForUser(
   const rows = await sql<TranscriptRow[]>`
     INSERT INTO ${sql(SCHEMA)}.transcripts (
       user_id, assemblyai_id, original_filename, status, language_code, title, audio_url, source,
-      drive_file_id, gmeet_context
+      drive_file_id, gmeet_context, speech_model
     ) VALUES (
       ${userId}, ${data.assemblyaiId}, ${data.originalFilename ?? null},
       ${data.status}, ${data.languageCode ?? null}, ${data.title ?? null},
       ${data.audioUrl ?? null}, 'uploaded',
       ${data.driveFileId ?? null},
-      ${data.gmeetContext ? sql.json(data.gmeetContext as unknown as never) : null}
+      ${data.gmeetContext ? sql.json(data.gmeetContext as unknown as never) : null},
+      ${data.speechModel ?? null}
     )
     ON CONFLICT (user_id, assemblyai_id) DO UPDATE
       SET original_filename = EXCLUDED.original_filename,
           status = EXCLUDED.status,
+          speech_model = COALESCE(EXCLUDED.speech_model, ${sql(SCHEMA)}.transcripts.speech_model),
           language_code = COALESCE(EXCLUDED.language_code, ${sql(SCHEMA)}.transcripts.language_code),
           title = COALESCE(EXCLUDED.title, ${sql(SCHEMA)}.transcripts.title),
           audio_url = COALESCE(EXCLUDED.audio_url, ${sql(SCHEMA)}.transcripts.audio_url),
@@ -871,13 +875,14 @@ export async function updateUploadProgress(
 export async function promoteUploadingRow(
   userId: string,
   placeholderId: string,
-  data: { assemblyaiId: string; status: string; audioUrl?: string | null }
+  data: { assemblyaiId: string; status: string; audioUrl?: string | null; speechModel?: string | null }
 ): Promise<TranscriptRow | null> {
   const rows = await sql<TranscriptRow[]>`
     UPDATE ${sql(SCHEMA)}.transcripts
     SET assemblyai_id = ${data.assemblyaiId},
         status = ${data.status},
-        audio_url = ${data.audioUrl ?? null}
+        audio_url = ${data.audioUrl ?? null},
+        speech_model = COALESCE(${data.speechModel ?? null}, speech_model)
     WHERE user_id = ${userId} AND assemblyai_id = ${placeholderId}
       AND status IN ('uploading', 'waiting')
     RETURNING *
@@ -1564,7 +1569,7 @@ export async function listDeletedForUser(userId: string): Promise<TranscriptList
     SELECT t.id, t.user_id, t.assemblyai_id, t.original_filename, t.status,
            t.created_at, t.completed_at, t.duration, t.speaker_count,
            t.language_code, t.title, t.description, t.last_accessed,
-           t.source, t.recorded_at, t.auto_notes_status,
+           t.source, t.speech_model, t.recorded_at, t.auto_notes_status,
            t.upload_bytes_received::float8 AS upload_bytes_received,
            t.upload_bytes_total::float8 AS upload_bytes_total,
            CASE

@@ -1,7 +1,7 @@
 import 'server-only';
 import { AssemblyAI } from 'assemblyai';
 import type { TranscriptResponse } from '@/lib/format';
-import { keytermsSupported } from '@/lib/aai-language';
+import { DEFAULT_SPEECH_MODEL, keytermsSupported, type SpeechModel } from '@/lib/aai-language';
 
 /**
  * Server-only AssemblyAI wrapper.
@@ -46,16 +46,23 @@ export interface SubmitOptions {
   keytermsPrompt?: string[];
   /** Optional custom spelling rules — applied during transcription. */
   customSpelling?: Array<{ to: string; from: string[] }>;
+  /** Defaults to DEFAULT_SPEECH_MODEL; 'universal' is the pre-2026-09 path. */
+  model?: SpeechModel;
 }
 
 export async function submitTranscription(
   audioUrl: string,
   options: SubmitOptions = {}
-): Promise<{ id: string; status: string }> {
+): Promise<{ id: string; status: string; model: SpeechModel }> {
+  const model = options.model ?? DEFAULT_SPEECH_MODEL;
   const params: {
     audio: string;
     speaker_labels: boolean;
-    speech_model: 'universal';
+    /** Legacy singular field — only for 'universal'. */
+    speech_model?: 'universal';
+    /** Current plural field (3.5 Pro and later); AAI falls back to
+     * Universal-2 by itself for languages the model doesn't cover. */
+    speech_models?: SpeechModel[];
     language_code?: string;
     language_detection?: boolean;
     keyterms_prompt?: string[];
@@ -63,10 +70,12 @@ export async function submitTranscription(
   } = {
     audio: audioUrl,
     speaker_labels: true,
-    // Universal is required for keyterms_prompt (and is AAI's current
-    // flagship model). Explicit here so we don't depend on whatever the
-    // server-side default is.
-    speech_model: 'universal',
+    // Explicit model so we never depend on AAI's server-side default.
+    // 2026-09-09 side-by-side on a zh/en call: 3.5 Pro adds punctuation,
+    // finds more speakers and keeps English phrases universal dropped, but
+    // splits some English words inside Mandarin ("em ail") — acceptable
+    // because the text is mostly LLM-consumed; text search is the casualty.
+    ...(model === 'universal' ? { speech_model: 'universal' as const } : { speech_models: [model] }),
   };
   if (options.languageCode) params.language_code = options.languageCode;
   // No language chosen ("Auto Detect" in the picker, and every import) →
@@ -91,7 +100,7 @@ export async function submitTranscription(
     params.custom_spelling = options.customSpelling;
   }
   const transcript = await getClient().transcripts.submit(params as never);
-  return { id: transcript.id, status: transcript.status };
+  return { id: transcript.id, status: transcript.status, model };
 }
 
 export async function getTranscript(id: string): Promise<TranscriptResponse> {

@@ -15,6 +15,7 @@ import { concatMediaSmart, probeDurationSec } from '@/lib/server/media-concat';
 import { IngestError, ingestLocalAudio } from '@/lib/server/ingest';
 import type { GmeetAttendee, GmeetContext, StoredTranscript } from '@/lib/format';
 import type { SSOSessionData } from '@/lib/auth/sso-session';
+import type { SpeechModel } from '@/lib/aai-language';
 
 /**
  * The media-upload pipeline shared by the two byte-delivery routes:
@@ -143,6 +144,8 @@ export interface UploadSpec {
   /** Re-transcription source (`ext-…` import) — see POST /api/transcripts. */
   sourceId: string | null;
   multi: MultiParams | null;
+  /** AAI model override (re-transcribe with the newer model); default = current. */
+  speechModel?: SpeechModel;
 }
 
 export interface OpenUploadInput {
@@ -157,6 +160,11 @@ export interface OpenUploadInput {
   bytesTotal: number | null;
   /** Pin the placeholder uuid (chunked sessions reuse it as the session id). */
   uuid?: string;
+  /** AAI model override — see UploadSpec.speechModel. */
+  speechModel?: SpeechModel;
+  /** Extra gmeet_context keys stamped on the placeholder (provenance such as
+   * retranscribedFrom, or the source row's meeting identity on a re-run). */
+  contextExtra?: Partial<GmeetContext> | null;
 }
 
 export type OpenUploadResult =
@@ -283,7 +291,9 @@ export async function openUpload(
             ],
           },
         }
-      : gmeetContext,
+      : input.contextExtra
+        ? { ...(gmeetContext ?? {}), ...input.contextExtra }
+        : gmeetContext,
     bytesTotal: input.bytesTotal,
   });
   // Same "throw them in" rule as the Meet import: internal invitees on the
@@ -312,6 +322,7 @@ export async function openUpload(
       reportPref: input.reportPref,
       sourceId: input.sourceId ?? null,
       multi,
+      speechModel: input.speechModel,
     },
   };
 }
@@ -500,6 +511,7 @@ export async function finalizeUpload(
             : undefined,
         gmeetContext,
         placeholderAssemblyaiId: placeholderId,
+        speechModel: spec.speechModel,
       });
     } finally {
       clearInterval(heartbeat);
