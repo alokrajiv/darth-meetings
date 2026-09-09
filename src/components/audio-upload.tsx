@@ -857,9 +857,9 @@ export function AudioUpload({ onTranscriptCreated }: AudioUploadProps) {
       case 'uploading':
         return 'Uploading...';
       case 'transcribing':
-        return 'Transcribing...';
+        return 'Uploaded · transcribing';
       case 'completed':
-        return 'Completed';
+        return 'Transcript ready';
       case 'error':
         return upload.error || 'Error';
       default:
@@ -950,6 +950,12 @@ export function AudioUpload({ onTranscriptCreated }: AudioUploadProps) {
                 )}
                 {upload.status === 'uploading' && upload.note && (
                   <p className="mt-1 text-xs text-muted-foreground">{upload.note}</p>
+                )}
+                {upload.status === 'transcribing' && (
+                  <p className="mt-1 text-xs text-status-ok">
+                    Upload complete — safe to close this tab. You&apos;ll get a Slack DM when the
+                    transcript is ready for speaker review.
+                  </p>
                 )}
                 {upload.status === 'error' && upload.error && (
                   <p className="mt-1 text-xs text-destructive">{upload.error}</p>

@@ -57,6 +57,7 @@ export async function submitTranscription(
     speaker_labels: boolean;
     speech_model: 'universal';
     language_code?: string;
+    language_detection?: boolean;
     keyterms_prompt?: string[];
     custom_spelling?: Array<{ to: string; from: string[] }>;
   } = {
@@ -68,6 +69,13 @@ export async function submitTranscription(
     speech_model: 'universal',
   };
   if (options.languageCode) params.language_code = options.languageCode;
+  // No language chosen ("Auto Detect" in the picker, and every import) →
+  // let AAI detect it. Without this flag AAI silently assumes English and
+  // a Mandarin call comes back as gibberish. Verified 2026-09-09: universal
+  // + detection on a zh/en recording is byte-identical to explicit `zh`,
+  // and detection makes AAI ignore keyterms_prompt for non-English instead
+  // of rejecting the submit, so the bias list can stay on this path.
+  else params.language_detection = true;
   // AAI rejects the whole submit (400) when keyterms_prompt accompanies a
   // non-English language_code on the universal model, so only attach the
   // bias list for English (or unset, which AAI defaults to en). Vocab is

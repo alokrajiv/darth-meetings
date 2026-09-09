@@ -4,6 +4,10 @@ import { getContentCached, identifySpeakers } from '@/lib/server/auto-notes';
 import { maybeAutoReview } from '@/lib/server/auto-review';
 import { suggestSpeakersFromMeet } from '@/lib/server/meet-align';
 import { suggestSpeakersForTranscript } from '@/lib/server/voiceprint';
+import { identityForUser } from '@/db-ops/transcript-activity';
+import { autoMarkerOf } from '@/lib/auto-marker';
+import { notifyUser } from '@/lib/server/darth-notify';
+import { dm, meetingLine, openLink } from '@/lib/server/dm-copy';
 
 /**
  * Fire-and-forget work that should happen once, when a transcript first
@@ -77,9 +81,48 @@ export function onTranscriptCompleted(ownerUserId: string, assemblyaiId: string)
         await maybeAutoReview(ownerUserId, full.assemblyai_id).catch((err) =>
           console.warn('[post-completion] auto-review failed:', err)
         );
+
+        // Hand-started work (drag-drop upload, manual import): tell the
+        // owner it's done so they can close the tab and come back on the
+        // DM. Auto paths have their own needs_review / report_ready DMs.
+        // plagueis dedupes on the key, so re-entering this hook is safe.
+        if (!autoMarkerOf(full.gmeet_context)) {
+          await notifyTranscriptReady(ownerUserId, full).catch((err) =>
+            console.warn('[post-completion] ready DM failed:', err)
+          );
+        }
       } catch (err) {
         console.warn('[post-completion] hook failed:', err);
       }
     })();
   }, 0);
+}
+
+async function notifyTranscriptReady(
+  ownerUserId: string,
+  row: NonNullable<Awaited<ReturnType<typeof getForUser>>>
+): Promise<void> {
+  const owner = await identityForUser(ownerUserId);
+  if (!owner) return;
+  const title = row.title?.trim() || row.original_filename?.trim() || 'Untitled meeting';
+  const how =
+    row.source === 'imported' || row.gmeet_context?.provider
+      ? `Imported from ${row.gmeet_context?.provider === 'teams' ? 'Microsoft Teams' : 'Google Meet'}`
+      : `Uploaded file: ${row.original_filename ?? 'recording'}`;
+  const link = await openLink(row.assemblyai_id, 'Review speakers & generate notes');
+  await notifyUser({
+    kind: 'transcript_ready',
+    toEmail: owner.email,
+    text: dm(
+      `🎙 *Transcript ready*`,
+      meetingLine({
+        title,
+        when: row.recorded_at ?? row.created_at,
+        duration: row.duration,
+        speakerCount: row.speaker_count,
+      }),
+      `${how}. Speaker names are suggested where voices matched — confirm them and the notes generate → ${link}`
+    ),
+    dedupeKey: `mw-transcript-ready:${row.assemblyai_id}:${owner.email}`,
+  });
 }

@@ -12,6 +12,7 @@ const SCHEMA = SCHEMAS.MEETING_WHISPERER;
 
 export const NOTIFY_KINDS = [
   'share',
+  'transcript_ready',
   'auto_import',
   'report_ready',
   'needs_review',
@@ -26,6 +27,10 @@ export const NOTIFY_KIND_LABELS: Record<NotifyKind, { label: string; hint: strin
   share: {
     label: 'Meeting shared with me',
     hint: 'Someone deliberately shares a meeting with you.',
+  },
+  transcript_ready: {
+    label: 'My upload / import finished transcribing',
+    hint: 'A file you uploaded or a meeting you imported by hand is ready for speaker review — safe to close the tab meanwhile.',
   },
   auto_import: {
     label: 'Auto-import / auto-sync fired',
