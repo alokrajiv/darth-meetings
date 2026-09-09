@@ -48,7 +48,7 @@ READ
                                   exists at Google/Microsoft but nobody imported
                                   it (default); norec = your past calendar
                                   events that left no artifacts at all
-  calendar --view all [--from D] [--to D] [--cached] [FILTERS except --speaker]
+  calendar --view all [--from D] [--to D] [--details] [--cached] [FILTERS except --speaker]
                                   Your FULL calendar as an agenda: every timed
                                   event (past + upcoming, imported or not,
                                   with or without a meeting link). Re-reads the
@@ -56,8 +56,14 @@ READ
                                   (--cached = server cache only). Default
                                   window: 7 days back → 30 days ahead; one
                                   bound given → 90 days from/to it; max 366.
-                                  Imported rows end with "→ <id>" so you can
-                                  go straight to 'text <id>'
+                                  Imported rows end with "→ <id> (notes+report)"
+                                  so you can go straight to 'text <id>';
+                                  no-access imports name the owner to ask;
+                                  series:"…" = the recurring-call series.
+                                  --details adds where / attendees (with
+                                  declined/tentative) / /m link + transcript
+                                  url / Google Calendar link / invite text
+                                  under each row. --json has it all always
   audio <id> [--out <file>]       Download the recording (default ./<id>.<ext>)
   frame <id> <ts> [--out <file>]  Grab a video frame at a timestamp (ms, mm:ss or
                                   hh:mm:ss) as jpeg — only transcripts imported
@@ -247,8 +253,10 @@ itself is a web-UI action. 'calendar --view all' is the human's FULL
 calendar (past + upcoming, everything) — the answer to "what's on my
 calendar next week", "who am I meeting on Thursday", "which of last
 month's calls were recorded / imported": imported rows end with "→ <id>"
-(then 'text <id>'), plus the provider evidence, organiser, attendee count.
-Add --json for attendee emails, meeting codes and the full row.
+(then 'text <id>' / 'notes <id>' — the tail says whether notes/report are
+ready), plus the provider evidence, organiser, attendee count, series.
+--details adds location, attendee emails + RSVP, the stable /m link, the
+Google Calendar link and the invite text; --json has every field always.
 
 ## Labels (org-wide taxonomy, many per meeting)
 
@@ -724,10 +732,22 @@ function calendarAllStatus(e: any): string {
   return e.meetingCode ? "no-artifacts" : "no-meet-link";
 }
 
-function fmtDuration(secs: number | null): string {
+function fmtMins(secs: number | null): string {
   if (secs == null || !Number.isFinite(secs)) return "?";
   const m = Math.round(secs / 60);
   return m >= 60 ? `${Math.floor(m / 60)}h${String(m % 60).padStart(2, "0")}` : `${m}m`;
+}
+
+/** Collapse an invite description (often HTML) to one readable line. */
+function oneLine(text: string, max: number): string {
+  const t = text
+    .replace(/<br\s*\/?>/gi, " ")
+    .replace(/<\/(p|div|li|tr)>/gi, " ")
+    .replace(/<[^>]+>/g, "")
+    .replace(/&nbsp;/g, " ").replace(/&amp;/g, "&").replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/&quot;/g, '"').replace(/&#39;/g, "'")
+    .replace(/\s+/g, " ")
+    .trim();
+  return t.length > max ? `${t.slice(0, max - 1)}…` : t;
 }
 
 /**
@@ -743,6 +763,7 @@ async function calendarAll(ctx: Ctx, flags: Record<string, string | boolean>): P
   q.set("tz", tz);
   if (flags.cached === true) q.set("sync", "0");
   const data = await ctx.expectJson<any>(ctx.api("meetings", `/api/calendar/events?${q.toString()}`));
+  const details = flags.details === true;
   ctx.print(data, () => {
     const { range, events, counts, sync } = data;
     if (!data.connected) {
@@ -765,19 +786,38 @@ async function calendarAll(ctx: Ctx, flags: Record<string, string | boolean>): P
       const who = e.organizerSelf ? "me" : (e.organizerEmail || "?");
       const cols = [
         `  ${time}`,
-        fmtDuration(e.durationSecs).padStart(5),
+        fmtMins(e.durationSecs).padStart(5),
         (e.provider || "-").padEnd(5),
         calendarAllStatus(e).padEnd(22),
         `${e.attendeeCount ?? 0} att`.padStart(7),
         who.padEnd(28),
         e.title || "(untitled)",
       ];
+      const imp = e.imported;
+      const ai = imp?.accessible
+        ? [imp.notes === "ready" ? "notes" : imp.notes === "running" ? "notes…" : null,
+           imp.report === "ready" ? "report" : imp.report === "running" ? "report…" : null].filter(Boolean).join("+")
+        : "";
       const tail = [
         e.meetingCode ? `[${e.meetingCode}]` : null,
-        e.imported?.accessible ? `→ ${e.imported.id}` : null,
+        imp?.accessible ? `→ ${imp.id}${ai ? ` (${ai})` : ""}` : null,
+        imp && !imp.accessible && imp.ownerEmail ? `owner ${imp.ownerEmail}` : null,
+        e.series ? `series:"${e.series.title}"` : null,
         e.muted ? "(muted)" : null,
       ].filter(Boolean).join("  ");
       console.log(`${cols.join("  ")}${tail ? `  ${tail}` : ""}`);
+      if (details) {
+        const ind = "            ";
+        if (e.location) console.log(`${ind}where: ${oneLine(e.location, 160)}`);
+        if (e.attendees?.length) {
+          const names = e.attendees.map((a: any) => `${a.email}${a.responseStatus && a.responseStatus !== "accepted" ? ` (${a.responseStatus})` : ""}`);
+          console.log(`${ind}with:  ${names.slice(0, 12).join(", ")}${names.length > 12 ? ` +${names.length - 12} more` : ""}`);
+        }
+        if (e.meetingUrl) console.log(`${ind}link:  ${e.meetingUrl}${imp?.url ? `  (transcript ${imp.url})` : ""}`);
+        else if (imp?.url) console.log(`${ind}link:  ${imp.url}`);
+        if (e.calendarUrl) console.log(`${ind}gcal:  ${e.calendarUrl}`);
+        if (e.description) console.log(`${ind}about: ${oneLine(e.description, 400)}`);
+      }
     }
     const src = sync?.ran ? `live from Google (${sync.fetched} fetched) + cache` : "server cache only";
     console.log(`\n${counts.total} event(s) ${range.from} → ${range.to} (tz ${tz}): ${counts.past} past, ${counts.upcoming} upcoming · ${counts.imported} imported, ${counts.withEvidence} with a recording/transcript at the provider · ${src}${data.truncated ? " · TRUNCATED at 5000 rows — narrow --from/--to" : ""}`);
@@ -803,7 +843,7 @@ const meetings: Subcommand = {
   help: HELP,
   async run(ctx, argv) {
     const { pos, flags } = parseArgs(argv);
-    liftBoolFlags(pos, flags, ["cascade", "exact", "cached", CONSENT_FLAG]);
+    liftBoolFlags(pos, flags, ["cascade", "exact", "cached", "details", CONSENT_FLAG]);
     const [, cmd, ...args] = pos.length && pos[0] === "meetings" ? pos : ["", ...pos];
     if (!cmd || flags.help === true) { console.log(HELP); return 0; }
 
@@ -1383,7 +1423,7 @@ const meetings: Subcommand = {
       case "calendar": {
         const view = str(flags.view) || "unimported";
         if (view === "all" || view === "full") return calendarAll(ctx, flags);
-        if (flags.cached !== undefined) { console.error("--cached only applies to --view all"); return 1; }
+        for (const f of ["cached", "details"]) if (flags[f] !== undefined) { console.error(`--${f} only applies to --view all`); return 1; }
         if (view !== "unimported" && view !== "norec") { console.error("--view must be unimported, norec or all"); return 1; }
         const fr = readFilterFlags(ctx, flags, ["participant", "organizer", "provider", "q", "from", "to"]);
         if (!fr.ok) { console.error(fr.error); return 1; }

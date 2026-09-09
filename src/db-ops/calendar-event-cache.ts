@@ -51,6 +51,10 @@ export interface CalendarEventUpsert {
   attachmentVideoFileId: string | null;
   attachmentTranscriptDocId: string | null;
   attachmentGeminiNotes: boolean;
+  /** Invite details (migration 039) — overwritten per sweep. */
+  description: string | null;
+  location: string | null;
+  htmlLink: string | null;
 }
 
 /**
@@ -72,23 +76,27 @@ export async function upsertCalendarEvents(
        event_start, event_end, meeting_code, organizer_email, organizer_self,
        attendee_count, attendees, attachment_video_count,
        attachment_video_file_id, attachment_transcript_doc_id,
-       attachment_gemini_notes)
+       attachment_gemini_notes, description, location, html_link)
     SELECT ${userId}, e."eventKey", e."eventId", e."recurringEventId", e."iCalUID",
            e.title, e."eventStart", e."eventEnd", e."meetingCode",
            e."organizerEmail", e."organizerSelf", e."attendeeCount", e.attendees,
            COALESCE(e."attachmentVideoCount", 0), e."attachmentVideoFileId",
-           e."attachmentTranscriptDocId", COALESCE(e."attachmentGeminiNotes", false)
+           e."attachmentTranscriptDocId", COALESCE(e."attachmentGeminiNotes", false),
+           e.description, e.location, e."htmlLink"
     FROM jsonb_to_recordset(${sql.json(batch as unknown as never)}) AS e(
       "eventKey" text, "eventId" text, "recurringEventId" text, "iCalUID" text,
       title text, "eventStart" timestamptz, "eventEnd" timestamptz,
       "meetingCode" text, "organizerEmail" text, "organizerSelf" boolean,
       "attendeeCount" int, attendees jsonb, "attachmentVideoCount" int,
       "attachmentVideoFileId" text, "attachmentTranscriptDocId" text,
-      "attachmentGeminiNotes" boolean
+      "attachmentGeminiNotes" boolean, description text, location text, "htmlLink" text
     )
     ON CONFLICT (user_id, event_key) DO UPDATE SET
       title              = EXCLUDED.title,
       event_end          = EXCLUDED.event_end,
+      description        = EXCLUDED.description,
+      location           = EXCLUDED.location,
+      html_link          = COALESCE(EXCLUDED.html_link, calendar_event_cache.html_link),
       attendee_count     = EXCLUDED.attendee_count,
       attendees          = EXCLUDED.attendees,
       meeting_code       = COALESCE(EXCLUDED.meeting_code, calendar_event_cache.meeting_code),
@@ -1016,10 +1024,19 @@ export interface CalendarWindowRow {
   evidence_checked_at: string | null;
   /** Earliest live import of the occurrence (anyone's) — id + whether the
    * caller can open it. */
+  description: string | null;
+  location: string | null;
+  html_link: string | null;
   imported_id: string | null;
   imported_status: string | null;
   imported_accessible: boolean | null;
   imported_mine: boolean | null;
+  imported_title: string | null;
+  imported_owner_email: string | null;
+  imported_notes_status: string | null;
+  imported_has_notes: boolean | null;
+  imported_report_status: string | null;
+  imported_has_report: boolean | null;
 }
 
 export interface CalendarWindowOpts {
@@ -1084,10 +1101,19 @@ export async function listCalendarWindow(
         AS transcript_preparing,
       (g.transcript_source = 'gemini' OR c.attachment_gemini_notes) IS TRUE AS gemini_notes,
       g.updated_at AS evidence_checked_at,
+      c.description,
+      c.location,
+      c.html_link,
       COALESCE(ic.assemblyai_id, ie.assemblyai_id) AS imported_id,
       COALESCE(ic.status, ie.status) AS imported_status,
       COALESCE(ic.accessible, ie.accessible) AS imported_accessible,
-      COALESCE(ic.mine, ie.mine) AS imported_mine
+      COALESCE(ic.mine, ie.mine) AS imported_mine,
+      COALESCE(ic.title, ie.title) AS imported_title,
+      own.user_email AS imported_owner_email,
+      COALESCE(ic.auto_notes_status, ie.auto_notes_status) AS imported_notes_status,
+      COALESCE(ic.has_notes, ie.has_notes) AS imported_has_notes,
+      COALESCE(ic.auto_report_status, ie.auto_report_status) AS imported_report_status,
+      COALESCE(ic.has_report, ie.has_report) AS imported_has_report
     FROM ${sql(SCHEMA)}.calendar_event_cache c
     LEFT JOIN LATERAL (
       SELECT g.ready_recording_count, g.video_file_id, g.transcript_doc_ids,
@@ -1105,7 +1131,10 @@ export async function listCalendarWindow(
     -- Two laterals (code arm, eventId arm) instead of one OR so each rides
     -- its own transcripts expression index.
     LEFT JOIN LATERAL (
-      SELECT t.assemblyai_id, t.status, ${accessible} AS accessible, (t.user_id = ${caller.userId}) AS mine
+      SELECT t.assemblyai_id, t.status, t.title, t.user_id AS owner_user_id,
+             ${accessible} AS accessible, (t.user_id = ${caller.userId}) AS mine,
+             t.auto_notes_status, (t.auto_notes IS NOT NULL) AS has_notes,
+             t.auto_report_status, (t.auto_report IS NOT NULL) AS has_report
       FROM ${sql(SCHEMA)}.transcripts t
       WHERE c.meeting_code IS NOT NULL
         AND t.deleted_at IS NULL
@@ -1116,7 +1145,10 @@ export async function listCalendarWindow(
       LIMIT 1
     ) ic ON true
     LEFT JOIN LATERAL (
-      SELECT t.assemblyai_id, t.status, ${accessible} AS accessible, (t.user_id = ${caller.userId}) AS mine
+      SELECT t.assemblyai_id, t.status, t.title, t.user_id AS owner_user_id,
+             ${accessible} AS accessible, (t.user_id = ${caller.userId}) AS mine,
+             t.auto_notes_status, (t.auto_notes IS NOT NULL) AS has_notes,
+             t.auto_report_status, (t.auto_report IS NOT NULL) AS has_report
       FROM ${sql(SCHEMA)}.transcripts t
       WHERE ic.assemblyai_id IS NULL
         AND t.deleted_at IS NULL
@@ -1125,6 +1157,16 @@ export async function listCalendarWindow(
       ORDER BY t.created_at ASC
       LIMIT 1
     ) ie ON true
+    -- Owner identity the way the rest of the app resolves it (no users
+    -- table): the owner's latest activity row. Lets a no-access row say
+    -- who to ask for a share.
+    LEFT JOIN LATERAL (
+      SELECT a.user_email
+      FROM ${sql(SCHEMA)}.transcript_activity a
+      WHERE a.user_id = COALESCE(ic.owner_user_id, ie.owner_user_id)
+      ORDER BY a.at DESC
+      LIMIT 1
+    ) own ON true
     WHERE c.user_id = ${caller.userId}
       AND c.event_start >= ${opts.fromIso}::timestamptz
       AND c.event_start < ${opts.toIso}::timestamptz

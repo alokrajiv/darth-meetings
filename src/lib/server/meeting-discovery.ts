@@ -245,6 +245,9 @@ export function toCalendarUpsert(e: DiscoveredEvent): CalendarEventUpsert {
     attachmentVideoFileId: att.videoFileId,
     attachmentTranscriptDocId: att.transcriptDocId,
     attachmentGeminiNotes: att.geminiNotes,
+    description: e.description ? e.description.slice(0, 4000) : null,
+    location: e.location?.trim() || null,
+    htmlLink: e.htmlLink ?? null,
   };
 }
 

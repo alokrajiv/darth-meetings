@@ -5,6 +5,10 @@ import { listCalendarWindow, type CalendarWindowRow } from '@/db-ops/calendar-ev
 import { getServerAccessToken, invalidateServerToken } from '@/lib/server/google-oauth';
 import { CalendarListError, syncCalendarWindow } from '@/lib/server/meeting-discovery';
 import { parseMeetingFilters } from '@/lib/server/meeting-filters';
+import { findSeriesByMeetingCodes, findSeriesByRecurringBaseIds, type SeriesKeyHit } from '@/db-ops/series';
+import { ensureMeetingsForOccurrences } from '@/db-ops/meetings';
+import { recurringBaseId } from '@/lib/series-keys';
+import { APP_URL } from '@/lib/server/darth-notify';
 
 export const runtime = 'nodejs';
 
@@ -28,7 +32,10 @@ export const runtime = 'nodejs';
  * empty) cache + `connected:false`.
  *
  * Per row: import annotation (earliest live import of the occurrence —
- * id, status, whether the caller can open it), provider evidence
+ * id, status, whether the caller can open it, owner, notes/report state,
+ * web url), the stable /m/<uuid> link (minted here for rows with a
+ * meeting code, same as the listing), the app-level series, the invite's
+ * description / location / Google Calendar link, provider evidence
  * (recording / transcript / preparing, artifact cache + calendar
  * attachments) and the caller's mute. Same people/provider/q filters as the
  * other listing surfaces (lib/server/meeting-filters). Display-only: no
@@ -61,6 +68,17 @@ export interface CalendarEventRow {
   organizerSelf: boolean | null;
   attendeeCount: number | null;
   attendees: Array<{ email: string; displayName?: string; responseStatus?: string }>;
+  /** Invite body (≤4000 chars, as Google serves it — may be HTML) / where. */
+  description: string | null;
+  location: string | null;
+  /** Open the event in Google Calendar. */
+  calendarUrl: string | null;
+  /** Stable meeting identity (/m/<uuid>) — works before and after import.
+   * Null for events without a meeting code. */
+  meetingUuid: string | null;
+  meetingUrl: string | null;
+  /** App-level recurring-call series the occurrence belongs to. */
+  series: { id: number; title: string } | null;
   muted: boolean;
   evidence: {
     recording: boolean;
@@ -69,7 +87,20 @@ export interface CalendarEventRow {
     geminiNotes: boolean;
     checkedAt: string | null;
   };
-  imported: { id: string; status: string | null; accessible: boolean; mine: boolean } | null;
+  imported: {
+    id: string;
+    status: string | null;
+    accessible: boolean;
+    mine: boolean;
+    /** Transcript title (accessible rows only). */
+    title: string | null;
+    ownerEmail: string | null;
+    /** Web page of the transcript (accessible rows only). */
+    url: string | null;
+    /** AI notes / detailed report: ready | running | error | none. */
+    notes: 'ready' | 'running' | 'error' | 'none';
+    report: 'ready' | 'running' | 'error' | 'none';
+  } | null;
 }
 
 export interface CalendarEventsResponse {
@@ -122,8 +153,28 @@ function addDays(day: string, n: number): string {
   return new Date(Date.parse(`${day}T00:00:00Z`) + n * DAY_MS).toISOString().slice(0, 10);
 }
 
-function toRow(r: CalendarWindowRow, tz: string, now: number): CalendarEventRow {
+function aiState(has: boolean | null, status: string | null): 'ready' | 'running' | 'error' | 'none' {
+  if (has) return 'ready';
+  if (status === 'running' || status === 'queued' || status === 'pending') return 'running';
+  if (status === 'error' || status === 'failed') return 'error';
+  return 'none';
+}
+
+interface RowExtras {
+  uuids: Map<string, string>;
+  seriesByBase: Map<string, SeriesKeyHit>;
+  seriesByCode: Map<string, SeriesKeyHit>;
+}
+
+function toRow(r: CalendarWindowRow, tz: string, now: number, x: RowExtras): CalendarEventRow {
   const start = new Date(r.event_start);
+  const occKey = r.meeting_code ? `${r.meeting_code}|${start.toISOString()}` : null;
+  const uuid = occKey ? (x.uuids.get(occKey) ?? null) : null;
+  const series =
+    (r.recurring_event_id ? x.seriesByBase.get(recurringBaseId(r.recurring_event_id)) : null) ??
+    (r.meeting_code ? x.seriesByCode.get(r.meeting_code) : null) ??
+    null;
+  const accessible = r.imported_accessible === true;
   return {
     key: r.key,
     eventId: r.event_id,
@@ -140,6 +191,12 @@ function toRow(r: CalendarWindowRow, tz: string, now: number): CalendarEventRow 
     organizerSelf: r.organizer_self,
     attendeeCount: r.attendee_count,
     attendees: r.attendees ?? [],
+    description: r.description,
+    location: r.location,
+    calendarUrl: r.html_link,
+    meetingUuid: uuid,
+    meetingUrl: uuid ? `${APP_URL}/m/${uuid}` : null,
+    series: series ? { id: series.series_id, title: series.title } : null,
     muted: r.muted,
     evidence: {
       recording: r.has_recording,
@@ -152,8 +209,13 @@ function toRow(r: CalendarWindowRow, tz: string, now: number): CalendarEventRow 
       ? {
           id: r.imported_id,
           status: r.imported_status,
-          accessible: r.imported_accessible === true,
+          accessible,
           mine: r.imported_mine === true,
+          title: accessible ? r.imported_title : null,
+          ownerEmail: r.imported_owner_email,
+          url: accessible ? `${APP_URL}/transcript/${r.imported_id}` : null,
+          notes: aiState(r.imported_has_notes, r.imported_notes_status),
+          report: aiState(r.imported_has_report, r.imported_report_status),
         }
       : null,
   };
@@ -216,8 +278,27 @@ export const GET = withAuth(async ({ user, request }) => {
     { fromIso, toIso, filters: parsed.filters, limit: ROW_CAP + 1 }
   );
   const truncated = rows.length > ROW_CAP;
+  const served = rows.slice(0, ROW_CAP);
+  // Batched extras, same lookups the listing route does per page.
+  const occs = served
+    .filter((r) => r.meeting_code)
+    .map((r) => ({
+      code: r.meeting_code!,
+      startIso: new Date(r.event_start).toISOString(),
+      provider: r.meeting_code!.startsWith('teams-') ? 'teams' : 'gmeet',
+      title: r.title,
+    }));
+  const baseIds = [...new Set(served.flatMap((r) => (r.recurring_event_id ? [recurringBaseId(r.recurring_event_id)] : [])))];
+  const [uuids, seriesByBase, seriesByCode] = await Promise.all([
+    ensureMeetingsForOccurrences(occs).catch((err) => {
+      console.warn('[calendar/events] occurrence uuid mint failed:', err);
+      return new Map<string, string>();
+    }),
+    findSeriesByRecurringBaseIds(baseIds),
+    findSeriesByMeetingCodes([...new Set(occs.map((o) => o.code))]),
+  ]);
   const now = Date.now();
-  const events = rows.slice(0, ROW_CAP).map((r) => toRow(r, tz, now));
+  const events = served.map((r) => toRow(r, tz, now, { uuids, seriesByBase, seriesByCode }));
   const body: CalendarEventsResponse = {
     range: { from, to, tz },
     events,
