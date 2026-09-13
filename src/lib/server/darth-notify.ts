@@ -6,7 +6,7 @@
  * "via darth-meetings" attribution derived from our app token.
  *
  * Auth: DARTH_APP_TOKEN (dapp_… service credential, minted on darth-auth by
- * the operator — see the darth-auth repo: ~/crd-workspace/darth/auth/admin-app-token.ts).
+ * the operator — see the darth-auth repo: ~/crp-workspace/darth/auth/admin-app-token.ts).
  * Missing token → notifications are silently skipped (feature off), because
  * a share must never fail on notification plumbing.
  */

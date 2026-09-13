@@ -105,7 +105,7 @@ back) and the calling agent brings the intelligence with its own tokens.
 ## After changing anything in this folder
 
 ```bash
-cd ~/crd-workspace/darth/cli
+cd ~/crp-workspace/darth/cli
 # 1. Bump src/core/version.ts — MANDATORY. `darth-cli update` (and the passive
 #    update check) compare versions; an unbumped bundle never reaches users.
 #    New command/feature → minor; fix/copy tweak → patch.
