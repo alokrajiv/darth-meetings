@@ -1,6 +1,10 @@
 import type { NextConfig } from "next";
 
 const nextConfig: NextConfig = {
+  // Sibling repos under ~/crp-workspace/darth each carry a bun.lock; without this Next 16
+  // infers the PARENT folder as the workspace root and Tailwind's PostCSS worker crash-loops
+  // ("Can't resolve 'tailwindcss' in '/Users/alokrajiv/crp-workspace/darth'"), spawning thousands of workers.
+  turbopack: { root: __dirname },
   experimental: {
     // Body-size cap for proxied routes. The proxy BUFFERS matched request
     // bodies in memory up to this limit (default 10MB, which silently
