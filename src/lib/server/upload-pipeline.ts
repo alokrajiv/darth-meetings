@@ -14,7 +14,7 @@ import { deleteAudioFile, deleteAudioFilesByPrefix } from '@/lib/server/audio-st
 import { concatMediaSmart, probeDurationSec } from '@/lib/server/media-concat';
 import { IngestError, ingestLocalAudio } from '@/lib/server/ingest';
 import type { GmeetAttendee, GmeetContext, StoredTranscript } from '@/lib/format';
-import type { SSOSessionData } from '@/lib/auth/sso-session';
+import type { DarthUser } from '@/lib/auth/session';
 import type { SpeechModel } from '@/lib/aai-language';
 
 /**
@@ -215,7 +215,7 @@ function buildGmeetContext(
  * spec the byte-delivery route writes against.
  */
 export async function openUpload(
-  user: SSOSessionData,
+  user: DarthUser,
   input: OpenUploadInput
 ): Promise<OpenUploadResult> {
   const rejected = textDocRejection(input.originalFilename, input.contentType);
@@ -328,7 +328,7 @@ export async function openUpload(
 }
 
 /** Delete what `openUpload` created when the bytes never (fully) arrived. */
-export async function abandonUpload(user: SSOSessionData, spec: UploadSpec): Promise<void> {
+export async function abandonUpload(user: DarthUser, spec: UploadSpec): Promise<void> {
   if (spec.multi && spec.multi.index > 1) {
     await deleteAudioFile(spec.tempFilename);
     return;
@@ -349,7 +349,7 @@ export interface FinalizeResult {
  * expected failure modes — returns the HTTP status + body to send.
  */
 export async function finalizeUpload(
-  user: SSOSessionData,
+  user: DarthUser,
   spec: UploadSpec,
   bytes: number
 ): Promise<FinalizeResult> {

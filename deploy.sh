@@ -39,8 +39,10 @@ echo "==> pm2 restart"
 ssh "$VM" "pm2 restart meeting-whisperer --update-env && sleep 3 && pm2 ls | grep meeting-whisperer"
 
 echo "==> health check"
+# /login is a 302 to darth-auth since the 2026-09-13 cutover (no cookie →
+# bounce); anything else (502 from nginx, 500) means the app is not up.
 code=$(curl -sk -o /dev/null -w '%{http_code}' "$HEALTH_URL")
-if [[ "$code" != "200" ]]; then
+if [[ "$code" != "302" && "$code" != "200" ]]; then
   echo "HEALTH CHECK FAILED: $HEALTH_URL returned $code" >&2
   ssh "$VM" "pm2 logs meeting-whisperer --nostream --lines 30" || true
   exit 1

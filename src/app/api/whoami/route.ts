@@ -12,7 +12,8 @@ export const GET = withAuth(async ({ user, cliScope }) => {
   return NextResponse.json({
     userId: user.userId,
     email: user.email,
-    via: cliScope ? 'darth-cli' : 'sso',
+    via: cliScope ? 'darth-cli' : 'session',
     scope: cliScope ?? null,
+    modules: user.modules,
   });
 });

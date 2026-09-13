@@ -5,6 +5,7 @@ import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
 import { RefreshCw } from 'lucide-react';
 import { AppHeader } from '@/components/app-header';
+import { LogoutButton } from '@/components/logout-button';
 import { VocabEditor } from '@/components/vocab-editor';
 import { GoogleAccountCard } from '@/components/google-account-card';
 import { MicrosoftAccountCard } from '@/components/microsoft-account-card';
@@ -99,6 +100,7 @@ export default function SettingsPage() {
           <RefreshCw className="h-4 w-4" />
           <span className="sr-only">Refresh</span>
         </Button>
+        <LogoutButton />
       </AppHeader>
       <main className="mx-auto max-w-4xl px-6 py-6">
       <div className="mb-5">

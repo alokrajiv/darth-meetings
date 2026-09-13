@@ -1,113 +1,125 @@
 import { NextResponse } from 'next/server';
 import type { NextRequest } from 'next/server';
+import {
+  getDarthBearer,
+  hasMeetingsAccess,
+  isSessionValue,
+  resolveDarthToken,
+  NO_ACCESS_MESSAGE,
+} from '@/lib/auth/cli-auth';
+import { SESSION_COOKIE } from '@/lib/auth/session';
 
 /**
- * Cookie presence check.
+ * Edge gate (SPEC §3 + §4.2).
  *
- * We can't verify the JWT signature here — middleware runs on the Edge runtime
- * and `jsonwebtoken` + `crypto.createPublicKey` aren't available. Full
- * validation happens inside route handlers via `withAuth` / `getCurrentUser`.
+ * Every matched request is verified against darth-auth introspection — the
+ * `darth_session` cookie (opaque `dss_…`) or a `Bearer dth_…` — through the
+ * shared 60 s cache, and must carry the `meetings` module. The proxy runs on
+ * the Node runtime in Next 16 so the loopback hop is fine here; route handlers
+ * re-verify inside `withAuth` (same cache), which also covers the streaming
+ * routes excluded from the matcher below.
+ *
+ * Outcomes: no/invalid credential → API/XHR 401 JSON, document navigation
+ * 302 to darth-auth login with an absolute returnTo; valid but no `meetings`
+ * module → 403 (JSON or page). RSC/prefetch fetches are never redirected
+ * cross-origin (their CORS mode can't follow it) — they get the 401 and the
+ * Next router falls back to a browser navigation, which is then redirected.
  */
-function hasSSOSession(request: NextRequest): boolean {
-  return !!request.cookies.get('trames-auth-session')?.value;
-}
 
-/** Decode (NOT verify) the JWT's exp claim. Edge-safe: atob + JSON only.
- * Returns null when the token doesn't parse — callers must fail open and let
- * withAuth do the real verification. */
-function jwtExpMs(token: string): number | null {
-  try {
-    const payload = token.split('.')[1];
-    if (!payload) return null;
-    const json = atob(payload.replace(/-/g, '+').replace(/_/g, '/'));
-    const exp = (JSON.parse(json) as { exp?: number }).exp;
-    return typeof exp === 'number' ? exp * 1000 : null;
-  } catch {
-    return null;
-  }
-}
+const AUTH_URL = (process.env.DARTH_AUTH_URL || 'https://auth.darth-internal.trames.io').replace(/\/+$/, '');
 
-/** Top-level page navigation (address bar, link click, reload) — the only
- * requests we bounce through the SSO refresh redirect. RSC/prefetch fetches
- * must NOT be redirected cross-origin (their CORS mode can't follow it);
- * they fall through and the client fetch guard heals the session instead. */
+/** Top-level page navigation (address bar, link click, reload). */
 function isDocumentNav(request: NextRequest): boolean {
   if (request.method !== 'GET') return false;
   const dest = request.headers.get('sec-fetch-dest');
   if (dest) return dest === 'document';
-  // Old browsers without sec-fetch-*: accept-header heuristic, RSC excluded.
+  // Old browsers / curl without sec-fetch-*: accept-header heuristic, RSC excluded.
   return (
     !request.headers.get('rsc') &&
+    !request.nextUrl.searchParams.has('_rsc') &&
     (request.headers.get('accept') ?? '').includes('text/html')
   );
+}
+
+function wantsJson(request: NextRequest): boolean {
+  return (
+    request.nextUrl.pathname.startsWith('/api/') ||
+    (request.headers.get('accept') ?? '').includes('application/json') ||
+    !isDocumentNav(request)
+  );
+}
+
+/** Absolute public URL of the current request — request.url reflects the
+ * INTERNAL origin behind nginx (localhost:3002), so build it from the
+ * forwarded host/proto or darth-auth bounces the user to localhost. */
+function publicUrl(request: NextRequest, path?: string): string {
+  const host = request.headers.get('x-forwarded-host') ?? request.headers.get('host');
+  const proto = request.headers.get('x-forwarded-proto') ?? request.nextUrl.protocol.replace(/:$/, '');
+  const p = path ?? request.nextUrl.pathname + request.nextUrl.search;
+  return host ? `${proto || 'https'}://${host}${p}` : new URL(p, request.url).toString();
+}
+
+function loginRedirect(request: NextRequest) {
+  const login = new URL('/login', AUTH_URL);
+  login.searchParams.set('returnTo', publicUrl(request));
+  return NextResponse.redirect(login, 302);
+}
+
+function unauthorized(message: string) {
+  return NextResponse.json({ error: message }, { status: 401 });
+}
+
+function noAccess(request: NextRequest) {
+  if (wantsJson(request)) return NextResponse.json({ error: NO_ACCESS_MESSAGE }, { status: 403 });
+  const logout = `${AUTH_URL}/logout?returnTo=${encodeURIComponent(publicUrl(request, '/'))}`;
+  const html = `<!doctype html><meta charset="utf-8"><title>No access · Darth Meetings</title>
+<style>body{font:15px/1.5 system-ui,sans-serif;margin:0;display:grid;place-items:center;min-height:100vh;background:#fafafa;color:#111}main{max-width:32rem;padding:2rem;border:1px solid #ddd;border-radius:12px;background:#fff}a{color:#2563eb}</style>
+<main><h1 style="font-size:1.25rem;margin:0 0 .5rem">No access to Darth Meetings</h1>
+<p>Your darth account is signed in but does not hold the <code>meetings</code> module.
+Ask a darth admin at <a href="https://admin.darth-internal.trames.io">admin.darth-internal.trames.io</a>.</p>
+<p><a href="${logout}">Sign out</a></p></main>`;
+  return new NextResponse(html, { status: 403, headers: { 'content-type': 'text/html; charset=utf-8' } });
 }
 
 export async function proxy(request: NextRequest) {
   const pathname = request.nextUrl.pathname;
 
-  // Public routes — no auth required
+  // Public routes — no auth required. /login and /logout only bounce to
+  // darth-auth; /api/auth/* are self-gated diagnostics.
   if (
     pathname === '/login' ||
+    pathname === '/logout' ||
     pathname.startsWith('/_next') ||
     pathname.startsWith('/api/auth/') ||
-    pathname.startsWith('/api/public/') ||
     pathname === '/favicon.ico'
   ) {
     return NextResponse.next();
   }
 
-  // Protected API routes — 401 if no cookie. darth-cli bearer tokens (dth_…)
-  // pass through on header *presence* only — the proxy runs on Edge, so real
-  // introspection happens in withAuth; an invalid token still 401s there.
-  if (pathname.startsWith('/api/')) {
-    const authz = request.headers.get('authorization') || '';
-    if (/^Bearer\s+dth_/.test(authz)) {
-      return NextResponse.next();
-    }
-    if (!hasSSOSession(request)) {
+  // 1. Bearer (darth-cli dth_ / app dapp_) beats the cookie; an invalid token
+  //    is a hard 401 and never falls through to cookie auth.
+  const bearer = getDarthBearer(request.headers.get('authorization'));
+  if (bearer) {
+    const identity = await resolveDarthToken(bearer);
+    if (!identity) return unauthorized('Unauthorized - invalid or revoked darth token');
+    if (identity.kind === 'app') {
       return NextResponse.json(
-        { error: 'Unauthorized - No session found' },
-        { status: 401 }
+        { error: 'Forbidden - app tokens are not accepted by meetings' },
+        { status: 403 }
       );
     }
-    return NextResponse.next();
+    if (!hasMeetingsAccess(identity)) return noAccess(request);
+    return NextResponse.next(); // read-scope → GET-only is enforced in withAuth
   }
 
-  // Everything else (including `/` and `/transcript/[id]`) requires auth.
-  // Redirect to /login with a returnTo, which in turn will bounce to the SSO.
-  if (!hasSSOSession(request)) {
-    const loginUrl = new URL('/login', request.url);
-    const returnTo = request.nextUrl.pathname + request.nextUrl.search;
-    if (returnTo !== '/') {
-      loginUrl.searchParams.set('returnTo', returnTo);
-    }
-    return NextResponse.redirect(loginUrl);
+  // 2. Browser session cookie.
+  const cookie = request.cookies.get(SESSION_COOKIE)?.value;
+  const user = isSessionValue(cookie) ? await resolveDarthToken(cookie) : null;
+  if (!user || user.kind === 'app') {
+    if (wantsJson(request)) return unauthorized('Unauthorized - No valid session');
+    return loginRedirect(request);
   }
-
-  // Cookie present but JWT expired (24h life vs the cookie's 30d): silently
-  // rotate via kenoby-sso and land back here — no 401 flash, no Retry loop.
-  // The refresh route whitelists *.trames.io returnTo values; on a dead
-  // refresh token it wipes the cookies and forwards to the SSO login itself,
-  // so there is no loop through this branch. Document navigations only.
-  if (isDocumentNav(request)) {
-    const token = request.cookies.get('trames-auth-session')!.value;
-    const expMs = jwtExpMs(token);
-    if (expMs !== null && expMs <= Date.now()) {
-      const sso = process.env.NEXT_PUBLIC_SSO_LOGIN_URL || 'https://login.trames.io';
-      const refreshUrl = new URL('/api/auth/refresh', sso);
-      // request.url reflects the INTERNAL origin behind nginx
-      // (https://localhost:3002/...) — build returnTo from the forwarded
-      // public host or kenoby bounces the user to localhost.
-      const host =
-        request.headers.get('x-forwarded-host') ?? request.headers.get('host');
-      const proto = request.headers.get('x-forwarded-proto') ?? 'https';
-      const returnTo = host
-        ? `${proto}://${host}${request.nextUrl.pathname}${request.nextUrl.search}`
-        : request.url;
-      refreshUrl.searchParams.set('returnTo', returnTo);
-      return NextResponse.redirect(refreshUrl);
-    }
-  }
+  if (!hasMeetingsAccess(user)) return noAccess(request);
 
   return NextResponse.next();
 }

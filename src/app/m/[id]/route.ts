@@ -1,6 +1,7 @@
 import { NextResponse, type NextRequest } from 'next/server';
 import { getMeetingById } from '@/db-ops/meetings';
-import { getCurrentUser } from '@/lib/auth/sso-session';
+import { getCurrentUser } from '@/lib/auth/session';
+import { hasMeetingsAccess } from '@/lib/auth/cli-auth';
 import { resolveAccess } from '@/db-ops/transcript-access';
 import { callerInvolvedCodes } from '@/db-ops/calendar-event-cache';
 
@@ -27,12 +28,13 @@ export async function GET(
   const origin = `${proto}://${host}`;
   const { id } = await ctx.params;
   if (!UUID_RE.test(id)) return NextResponse.redirect(new URL('/', origin));
-  // Verify the session (the edge proxy only checks cookie PRESENCE) and the
+  // Verify the session + app access (the proxy already does both; this route
+  // re-checks so it never depends on the matcher) and the
   // caller's access to the transcript before the Location header reveals the
   // uuid → transcript-id mapping (review finding). No session/access → home,
   // indistinguishable from an unknown uuid.
   const user = await getCurrentUser();
-  if (!user) return NextResponse.redirect(new URL('/', origin));
+  if (!user || !hasMeetingsAccess(user)) return NextResponse.redirect(new URL('/', origin));
   const meeting = await getMeetingById(id);
   if (!meeting) return NextResponse.redirect(new URL('/', origin));
   if (!meeting.transcript_id) {

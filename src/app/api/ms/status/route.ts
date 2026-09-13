@@ -13,11 +13,12 @@ export const runtime = 'nodejs';
  * users have one place to see all their connected accounts; connect /
  * reconnect deep-link into Darth Tasks with `?return=` back here.
  *
- * Auth model: the browser's Trames SSO cookie is scoped to `.trames.io`, so
- * we forward the caller's Cookie header verbatim to plagueis and it validates
- * the same session under its own app name. No shared secret, no token
- * material ever touches this app. A user without Darth Tasks access gets
- * 401/403 from plagueis → we report `available:false` (card explains).
+ * Auth model: the browser's `darth_session` cookie is scoped to
+ * `.darth-internal.trames.io`, so we forward the caller's Cookie header
+ * verbatim to plagueis and it resolves the same darth-auth session (requiring
+ * its own `tasks` module). No shared secret, no token material ever touches
+ * this app. A user without Darth Tasks access gets 401/403 from plagueis → we
+ * report `available:false` (card explains).
  */
 
 const TASKS_BASE = process.env.DARTH_TASKS_URL || 'https://tasks.darth-internal.trames.io';

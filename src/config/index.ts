@@ -25,17 +25,19 @@ export const config = {
     },
   },
 
+  /**
+   * darth-auth is the only identity provider (SPEC §3.6). The browser is sent
+   * to `authUrl` for login/logout; the server resolves credentials against
+   * `internalUrl` (loopback on the VM) — see `@/lib/auth/cli-auth`.
+   */
   auth: {
-    get loginDomain() {
-      return process.env.NEXT_PUBLIC_SSO_LOGIN_URL || 'https://login.trames.io';
+    get authUrl() {
+      return (process.env.DARTH_AUTH_URL || 'https://auth.darth-internal.trames.io').replace(/\/+$/, '');
     },
-    get clonetrooperDomain() {
-      return process.env.CLONETROOPER_ENV_DOMAIN || 'https://login.trames.io';
+    get internalUrl() {
+      return (process.env.DARTH_AUTH_INTERNAL_URL || 'http://127.0.0.1:8790').replace(/\/+$/, '');
     },
-    get appName() {
-      return process.env.CLONETROOPER_ENV_APP_NAME || 'meeting-whisperer';
-    },
-    cookieName: 'trames-auth-session',
+    cookieName: 'darth_session',
   },
 
   database: {

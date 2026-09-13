@@ -3,23 +3,18 @@
 import { LogOut } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 
+/** Logout = darth-auth's `/logout` (SPEC §3.7). `/logout` here is a server
+ * route that 302s to `${DARTH_AUTH_URL}/logout?returnTo=<app root>`, so the
+ * auth base URL never has to be baked into the client bundle. */
 export function LogoutButton() {
-  const handleLogout = async () => {
-    try {
-      await fetch('/api/public/auth/logout', { method: 'POST' });
-    } catch (error) {
-      console.error('Logout request failed:', error);
-    }
-    const ssoLoginUrl = process.env.NEXT_PUBLIC_SSO_LOGIN_URL || 'https://login.trames.io';
-    window.location.href = `${ssoLoginUrl}/dashboard`;
-  };
-
   return (
     <Button
       variant="ghost"
       size="sm"
       className="h-8 w-8 p-0"
-      onClick={handleLogout}
+      onClick={() => {
+        window.location.href = '/logout';
+      }}
       title="Logout"
     >
       <LogOut className="h-4 w-4" />

@@ -44,3 +44,6 @@ yarn-error.log*
 next-env.d.ts
 .playwright-mcp/
 /tmp/
+
+# committed reference — the ignore rule above is for real env files
+!.env.example
