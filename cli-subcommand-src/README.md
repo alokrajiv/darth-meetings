@@ -105,7 +105,7 @@ back) and the calling agent brings the intelligence with its own tokens.
 ## After changing anything in this folder
 
 ```bash
-cd ~/workspace/darth-cli
+cd ~/crd-workspace/darth/cli
 # 1. Bump src/core/version.ts — MANDATORY. `darth-cli update` (and the passive
 #    update check) compare versions; an unbumped bundle never reaches users.
 #    New command/feature → minor; fix/copy tweak → patch.
@@ -120,6 +120,6 @@ darth-cli update && darth-cli --version && darth-cli meetings --help
 Everyone else picks it up via the CLI's passive update check (5-min TTL) or
 `darth-cli update`.
 
-Same rule applies to `../darth-artifacts/cli-subcommand-src/` and
-`../darth-plagueis/cli-subcommand-src/` — one deploy ships all three, since
+Same rule applies to `../holocrons/cli-subcommand-src/` and
+`../tasks/cli-subcommand-src/` — one deploy ships all three, since
 build.sh copies every subcommand folder.

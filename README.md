@@ -14,12 +14,12 @@ Formerly known as *Meeting Whisperer*.
 
 ## Darth family
 
-| Member | Web | CLI | Repo |
-|---|---|---|---|
-| darth-auth (login, tokens, installer) | `auth.darth-internal.trames.io` | `darth-cli login` | `darth-cli/auth-service` |
-| Darth Tasks (plagueis) | `tasks.darth-internal.trames.io` | `darth-cli tasks` | `darth-plagueis` |
-| Darth Artifacts | `artifacts.darth-internal.trames.io` | `darth-cli artifacts` | `darth-artifacts` |
-| Darth Meetings | `meetings.darth-internal.trames.io` | `darth-cli meetings` | `darth-meetings` (dir `meeting-whisperer`) |
+| Member | Web | CLI | Repo | Local folder |
+|---|---|---|---|---|
+| darth-auth (login, tokens, installer) | `auth.darth-internal.trames.io` | `darth-cli login` | `darth-auth` (own repo, was `darth-cli/auth-service`) | `~/crd-workspace/darth/auth` |
+| Darth Tasks (plagueis) | `tasks.darth-internal.trames.io` | `darth-cli tasks` | `darth-plagueis` | `~/crd-workspace/darth/tasks` |
+| Darth Artifacts | `artifacts.darth-internal.trames.io` | `darth-cli artifacts` | `darth-artifacts` | `~/crd-workspace/darth/holocrons` |
+| Darth Meetings | `meetings.darth-internal.trames.io` | `darth-cli meetings` | `darth-meetings` | `~/crd-workspace/darth/meetings` (was `meeting-whisperer`) |
 
 All members share: Trames SSO (`trames-auth-session` cookie, lowercased SSO
 email is the cross-app join key), one `darth-cli` with `dth_` user tokens /
