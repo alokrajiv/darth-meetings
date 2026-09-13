@@ -26,7 +26,7 @@ rsync "${RSYNC_FLAGS[@]}" \
   --exclude storage \
   --exclude tmp \
   --exclude .playwright-mcp \
-  --exclude '*.png' \
+  --exclude '/*.png' \
   "${SRC_DIR}/" "${VM}:${APP_DIR}/"
 
 [[ "${1:-}" == "--dry-run" ]] && { echo "==> dry run only, stopping."; exit 0; }
