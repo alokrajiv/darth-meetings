@@ -11,6 +11,7 @@ import { GoogleAccountCard } from '@/components/google-account-card';
 import { MicrosoftAccountCard } from '@/components/microsoft-account-card';
 import { NotifyPrefsCard } from '@/components/notify-prefs-card';
 import { AutoSyncCard } from '@/components/auto-sync-card';
+import { OfflineCard } from '@/components/offline-card';
 import type { VocabPayload } from '@/lib/format';
 
 interface OrgVocabMeta {
@@ -115,6 +116,7 @@ export default function SettingsPage() {
         <MicrosoftAccountCard />
         <AutoSyncCard />
         <NotifyPrefsCard />
+        <OfflineCard />
       </div>
 
       {loading && (

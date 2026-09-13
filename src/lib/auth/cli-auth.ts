@@ -88,13 +88,32 @@ function toModules(v: unknown): string[] {
 }
 
 /**
+ * The outcome of one introspection, with the transient case kept apart from
+ * a definitive "no": `/api/auth/session` answers 503 for `transient` so the
+ * offline provider's session probe never mistakes a darth-auth restart for
+ * a signed-out session (which would wipe the device's offline archive).
+ * Every other caller (proxy, withAuth) still treats both as "no user".
+ */
+export type ResolvedTokenOutcome = {
+  identity: ResolvedToken | null;
+  /** true = introspection unreachable / non-2xx / unparsable — not cached. */
+  transient: boolean;
+};
+
+/**
  * Resolve any darth credential value via introspection. `null` = inactive,
  * revoked, expired, disabled user, malformed, or introspection unreachable /
  * errored (the last two are not cached).
  */
 export async function resolveDarthToken(token: string): Promise<ResolvedToken | null> {
+  return (await resolveDarthTokenDetailed(token)).identity;
+}
+
+export async function resolveDarthTokenDetailed(token: string): Promise<ResolvedTokenOutcome> {
   const hit = cache.get(token);
-  if (hit && Date.now() - hit.at < (hit.identity ? TTL : NEGATIVE_TTL)) return hit.identity;
+  if (hit && Date.now() - hit.at < (hit.identity ? TTL : NEGATIVE_TTL)) {
+    return { identity: hit.identity, transient: false };
+  }
   let identity: ResolvedToken | null = null;
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   let data: any;
@@ -109,11 +128,11 @@ export async function resolveDarthToken(token: string): Promise<ResolvedToken | 
     });
     // A non-2xx (darth-auth 500 on a PG hiccup, 502 from a restart, …) is
     // transient: deny THIS request but never cache it as "inactive".
-    if (!res.ok) return null;
+    if (!res.ok) return { identity: null, transient: true };
     data = await res.json();
   } catch {
-    // unreachable / timeout / unparsable body → treat as invalid, don't cache
-    return null;
+    // unreachable / timeout / unparsable body → deny this request, don't cache
+    return { identity: null, transient: true };
   }
   if (data?.active) {
     if (data.kind === 'app' && data.app) {
@@ -135,7 +154,7 @@ export async function resolveDarthToken(token: string): Promise<ResolvedToken | 
   if (cache.size > MAX_ENTRIES) {
     for (const [k, v] of cache) if (Date.now() - v.at > TTL) cache.delete(k);
   }
-  return identity;
+  return { identity, transient: false };
 }
 
 /** dth_ only — the historical entry point, kept for call sites that want a human. */
@@ -146,9 +165,16 @@ export async function resolveCliToken(token: string): Promise<DarthIdentity | nu
 
 /** Resolve a `darth_session` cookie value (dss_…). */
 export async function resolveSession(value: string | null | undefined): Promise<DarthIdentity | null> {
-  if (!isSessionValue(value)) return null;
-  const id = await resolveDarthToken(value);
-  return id && id.kind !== 'app' ? id : null;
+  return (await resolveSessionDetailed(value)).user;
+}
+
+/** Same, but says whether a `null` was a definitive "no" or a darth-auth hiccup. */
+export async function resolveSessionDetailed(
+  value: string | null | undefined
+): Promise<{ user: DarthIdentity | null; transient: boolean }> {
+  if (!isSessionValue(value)) return { user: null, transient: false };
+  const { identity, transient } = await resolveDarthTokenDetailed(value);
+  return { user: identity && identity.kind !== 'app' ? identity : null, transient };
 }
 
 /** SPEC §3.3: may this identity use Darth Meetings at all? */

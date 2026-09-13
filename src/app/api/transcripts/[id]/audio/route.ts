@@ -5,15 +5,26 @@ import { updateStatusForUser } from '@/db-ops/transcripts';
 import { resolveAccess } from '@/db-ops/transcript-access';
 import { getTranscript } from '@/lib/server/assemblyai';
 import { resolveAudioPath } from '@/lib/server/audio-storage';
+import { ensureAudioOnly } from '@/lib/server/audio-only';
 
 export const runtime = 'nodejs';
 
 /**
- * GET /api/transcripts/:id/audio[?part=N]
+ * GET /api/transcripts/:id/audio[?part=N][&variant=audio]
  *
  * `?part=N` (N >= 2) serves an EXTRA recording segment of a multi-video
  * meeting — gmeet_context.videoParts[N-2]'s stored file (the primary video
  * is "part 1" and lives in local_audio_path, served by the plain route).
+ *
+ * `?variant=audio` asks for the SOUNDTRACK only (offline "audio" pins). A
+ * stored file with no video stream is served as-is, exactly like the plain
+ * route. A video file is served as its audio-only m4a derivative
+ * (`<storageDir>/audio-only/…`, see lib/server/audio-only.ts): present →
+ * streamed with Range; absent → ffmpeg is started in the background once
+ * and the response is 202 `{ preparing: true }` for the client to poll;
+ * a failed transcode surfaces as 500 `{ error }` on the next request.
+ * The variant only applies to locally stored files — a legacy remote
+ * audio_url row ignores it and redirects as before.
  *
  * Returns the audio for a transcript. Resolution order:
  *   1. local_audio_path (imported transcripts whose bytes we downloaded) →
@@ -36,8 +47,11 @@ export const GET = withAuth(async ({ user, request }, { params }) => {
   }
   const row = access.row;
 
+  const searchParams = new URL(request.url).searchParams;
+  const audioOnly = searchParams.get('variant') === 'audio';
+
   // Extra segment of a multi-video meeting.
-  const partParam = new URL(request.url).searchParams.get('part');
+  const partParam = searchParams.get('part');
   if (partParam) {
     const partNo = Number.parseInt(partParam, 10);
     const part = Number.isInteger(partNo)
@@ -47,7 +61,9 @@ export const GET = withAuth(async ({ user, request }, { params }) => {
       return NextResponse.json({ error: 'No such video part' }, { status: 404 });
     }
     try {
-      return await streamLocalFile(request, resolveAudioPath(part.filename));
+      return audioOnly
+        ? await streamAudioOnly(request, part.filename)
+        : await streamLocalFile(request, resolveAudioPath(part.filename));
     } catch (err) {
       console.error('[GET /api/transcripts/:id/audio] part stream failed:', err);
       return NextResponse.json({ error: 'Video part unavailable' }, { status: 404 });
@@ -57,8 +73,9 @@ export const GET = withAuth(async ({ user, request }, { params }) => {
   // Path 1 — local file (uploaded with bytes saved on the server, or imported)
   if (row.local_audio_path) {
     try {
-      const abs = resolveAudioPath(row.local_audio_path);
-      return await streamLocalFile(request, abs);
+      return audioOnly
+        ? await streamAudioOnly(request, row.local_audio_path)
+        : await streamLocalFile(request, resolveAudioPath(row.local_audio_path));
     } catch (err) {
       console.error('[GET /api/transcripts/:id/audio] local stream failed:', err);
       // Fall through to remote URL — though that's almost certainly broken
@@ -89,6 +106,28 @@ export const GET = withAuth(async ({ user, request }, { params }) => {
   return NextResponse.redirect(audioUrl, 302);
 });
 
+/**
+ * `?variant=audio` for one stored file. The 202/500 bodies are `no-store`
+ * so neither the browser nor the offline service worker ever keeps a
+ * "preparing" answer around as if it were the media.
+ */
+async function streamAudioOnly(request: NextRequest, storedFilename: string): Promise<Response> {
+  const result = await ensureAudioOnly(storedFilename);
+  if (result.status === 'ready') {
+    return streamLocalFile(request, result.path, result.derived ? 'audio/mp4' : undefined);
+  }
+  if (result.status === 'preparing') {
+    return NextResponse.json(
+      { preparing: true },
+      { status: 202, headers: { 'Cache-Control': 'private, no-store' } }
+    );
+  }
+  return NextResponse.json(
+    { error: result.error },
+    { status: 500, headers: { 'Cache-Control': 'private, no-store' } }
+  );
+}
+
 function mimeFromPath(p: string): string {
   const ext = p.toLowerCase().split('.').pop() ?? '';
   switch (ext) {
@@ -113,9 +152,16 @@ function mimeFromPath(p: string): string {
   }
 }
 
+/**
+ * Stream a file from disk with HTTP Range support. `contentTypeOverride`
+ * pins the Content-Type when the path's extension isn't the right signal
+ * (the audio-only derivative is always audio/mp4 regardless of what the
+ * source was called).
+ */
 async function streamLocalFile(
   request: NextRequest,
-  path: string
+  path: string,
+  contentTypeOverride?: string
 ): Promise<Response> {
   const fsp = await import('node:fs/promises');
   const fs = await import('node:fs');
@@ -128,7 +174,7 @@ async function streamLocalFile(
   }
 
   const fileSize = stats.size;
-  const contentType = mimeFromPath(path);
+  const contentType = contentTypeOverride ?? mimeFromPath(path);
   const rangeHeader = request.headers.get('range');
 
   if (rangeHeader) {

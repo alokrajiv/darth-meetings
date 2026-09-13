@@ -13,7 +13,7 @@
  */
 
 import { cookies } from 'next/headers';
-import { resolveSession, type DarthIdentity } from './cli-auth';
+import { resolveSession, resolveSessionDetailed, type DarthIdentity } from './cli-auth';
 
 export const SESSION_COOKIE = 'darth_session';
 
@@ -36,6 +36,17 @@ export async function getCurrentUser(): Promise<DarthUser | null> {
  */
 export async function getCurrentUserFromHeaders(headers: Headers): Promise<DarthUser | null> {
   return resolveSession(readCookie(headers.get('cookie'), SESSION_COOKIE));
+}
+
+/**
+ * Same, distinguishing "no session" from "darth-auth could not be asked"
+ * (`transient`). Only /api/auth/session cares — it is the offline
+ * provider's session probe and must not report a 401 for a hiccup.
+ */
+export async function getCurrentUserFromHeadersDetailed(
+  headers: Headers
+): Promise<{ user: DarthUser | null; transient: boolean }> {
+  return resolveSessionDetailed(readCookie(headers.get('cookie'), SESSION_COOKIE));
 }
 
 /** Minimal cookie-header parser (no deps; the value is base64url so no quoting). */

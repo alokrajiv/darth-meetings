@@ -85,13 +85,20 @@ export async function proxy(request: NextRequest) {
   const pathname = request.nextUrl.pathname;
 
   // Public routes — no auth required. /login and /logout only bounce to
-  // darth-auth; /api/auth/* are self-gated diagnostics.
+  // darth-auth; /api/auth/* are self-gated diagnostics. The service worker,
+  // manifest, icons and the static /offline fallback carry nothing
+  // user-specific and must be fetchable without a session (the SW precaches
+  // /offline at activate time, browsers fetch the manifest cookie-less).
   if (
     pathname === '/login' ||
     pathname === '/logout' ||
     pathname.startsWith('/_next') ||
     pathname.startsWith('/api/auth/') ||
-    pathname === '/favicon.ico'
+    pathname === '/favicon.ico' ||
+    pathname === '/sw.js' ||
+    pathname === '/manifest.webmanifest' ||
+    pathname.startsWith('/icons/') ||
+    pathname === '/offline'
   ) {
     return NextResponse.next();
   }

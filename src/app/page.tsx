@@ -20,9 +20,12 @@ import {
   FileAudio,
   ChevronDown,
   CircleAlert,
+  Loader2,
   Tag,
 } from 'lucide-react';
 import { labelFilterToParams, parseLabelFilter, type LabelFilter } from '@/lib/labels';
+import { OfflineArchive } from '@/components/offline-archive';
+import { useOffline } from '@/lib/offline/offline-context';
 
 const REMINDERS_COLLAPSED_KEY = 'mw-reminders-collapsed';
 
@@ -46,6 +49,13 @@ function readLabelFilterFromUrl(): LabelFilter | null {
 
 
 export default function Home() {
+  // Offline mode swaps the network-backed listing for the on-device archive
+  // and hides every control that needs the server (upload, import, reminders).
+  // `ready` = the provider restored the mode from this device; until then
+  // the listing must not mount (it would fire its requests for one commit
+  // and then be replaced by the archive in offline mode).
+  const { mode, ready: offlineReady } = useOffline();
+  const offline = mode === 'offline';
   const [refreshTrigger, setRefreshTrigger] = useState(0);
   const [gmeetOpen, setGmeetOpen] = useState(false);
   const [gmeetSyncMode, setGmeetSyncMode] = useState(false);
@@ -68,11 +78,12 @@ export default function Home() {
     setRemindersCollapsed(localStorage.getItem(REMINDERS_COLLAPSED_KEY) === '1');
   }, []);
   useEffect(() => {
+    if (offline || !offlineReady) return;
     fetch('/api/gmeet/reminders')
       .then((r) => (r.ok ? r.json() : null))
       .then((data) => setReminders(data?.reminders ?? []))
       .catch(() => {});
-  }, [refreshTrigger]);
+  }, [refreshTrigger, offline, offlineReady]);
   const reminderCount = reminders.length;
   const actOnReminder = (r: Reminder, action: 'dismiss' | 'mute') => {
     setReminders((prev) => prev.filter((x) => x.id !== r.id));
@@ -214,6 +225,8 @@ export default function Home() {
   return (
     <div className="min-h-screen">
       <AppHeader>
+        {!offline && (
+          <>
         <div className="relative" ref={importMenuRef}>
           <Button
             variant="outline"
@@ -294,6 +307,8 @@ export default function Home() {
             )}
           </div>
         )}
+          </>
+        )}
         <Link href="/settings">
           <Button variant="ghost" size="sm" className="h-8 w-8 p-0" title="Settings">
             <Settings className="h-4 w-4" />
@@ -304,6 +319,14 @@ export default function Home() {
       </AppHeader>
 
       <main className="mx-auto max-w-[1720px] px-6 py-4">
+        {!offlineReady ? (
+          <div className="flex items-center justify-center py-16">
+            <Loader2 className="h-5 w-5 animate-spin text-muted-foreground" />
+          </div>
+        ) : offline ? (
+          <OfflineArchive />
+        ) : (
+        <>
         {/* Renders the page-wide drag-drop overlay, the hidden file input the
             header button clicks, and in-flight upload progress rows. */}
         <AudioUpload onTranscriptCreated={handleTranscriptCreated} />
@@ -367,6 +390,8 @@ export default function Home() {
             />
           </div>
         </div>
+        </>
+        )}
       </main>
 
       <GmeetImportDialog

@@ -12,6 +12,7 @@ import { resolveAccess } from '@/db-ops/transcript-access';
 import { logActivity } from '@/db-ops/transcript-activity';
 import { deleteTranscript as aaiDelete } from '@/lib/server/assemblyai';
 import { deleteAudioFile } from '@/lib/server/audio-storage';
+import { dropAudioOnly } from '@/lib/server/audio-only';
 import { refreshIfPending } from '@/lib/server/transcript-sync';
 
 export const runtime = 'nodejs';
@@ -141,12 +142,18 @@ export const DELETE = withAuth(async ({ user, request }, { params }) => {
   await aaiDelete(id);
   await deleteSpeakerMappingsForUser(access.ownerUserId, id);
   await deleteForUser(access.ownerUserId, id);
+  // Each stored recording may have an audio-only derivative (offline pins);
+  // drop it with the source so nothing outlives the row.
   if (access.row.local_audio_path) {
     await deleteAudioFile(access.row.local_audio_path);
+    await dropAudioOnly(access.row.local_audio_path);
   }
   // Extra recording segments (multi-video meetings) live in sidecar files.
   for (const part of access.row.gmeet_context?.videoParts ?? []) {
-    if (part.filename) await deleteAudioFile(part.filename);
+    if (part.filename) {
+      await deleteAudioFile(part.filename);
+      await dropAudioOnly(part.filename);
+    }
   }
 
   return NextResponse.json({ ok: true });

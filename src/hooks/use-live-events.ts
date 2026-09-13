@@ -13,11 +13,17 @@ export interface LiveEvent {
  * on drops; the callback ref pattern means consumers can pass inline
  * closures without re-opening the connection every render.
  */
-export function useLiveEvents(onEvent: (e: LiveEvent) => void): void {
+export function useLiveEvents(
+  onEvent: (e: LiveEvent) => void,
+  /** `enabled: false` closes the stream (offline mode — the SSE reconnect
+   * loop would otherwise hammer a server it cannot reach every 5 s). */
+  { enabled = true }: { enabled?: boolean } = {}
+): void {
   const cb = useRef(onEvent);
   cb.current = onEvent;
 
   useEffect(() => {
+    if (!enabled) return;
     let es: EventSource | null = null;
     let retry: ReturnType<typeof setTimeout> | null = null;
     let closed = false;
@@ -45,5 +51,5 @@ export function useLiveEvents(onEvent: (e: LiveEvent) => void): void {
       es?.close();
       if (retry) clearTimeout(retry);
     };
-  }, []);
+  }, [enabled]);
 }

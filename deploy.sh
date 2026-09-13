@@ -31,8 +31,12 @@ rsync "${RSYNC_FLAGS[@]}" \
 
 [[ "${1:-}" == "--dry-run" ]] && { echo "==> dry run only, stopping."; exit 0; }
 
-echo "==> install + build on VM"
-ssh "$VM" "export PATH=\"\$HOME/.bun/bin:\$PATH\" && cd '$APP_DIR' && bun install && bun run build" \
+# One BUILD_ID per deploy: the VM checkout has no .git (excluded above), so
+# next.config.ts could not derive it there; sha + timestamp keeps it unique
+# per deploy even when the same commit is redeployed.
+BUILD_ID="$(git -C "$SRC_DIR" rev-parse --short HEAD 2>/dev/null || echo nogit)-$(date +%s)"
+echo "==> install + build on VM (BUILD_ID=$BUILD_ID)"
+ssh "$VM" "export PATH=\"\$HOME/.bun/bin:\$PATH\" BUILD_ID='$BUILD_ID' && cd '$APP_DIR' && bun install && bun run build" \
   | tail -5
 
 echo "==> pm2 restart"

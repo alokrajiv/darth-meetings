@@ -1,7 +1,9 @@
-import type { Metadata } from "next";
+import type { Metadata, Viewport } from "next";
 import { Geist, Geist_Mono } from "next/font/google";
 import "./globals.css";
 import { SessionKeeper } from "@/components/session-keeper";
+import { OfflineProvider } from "@/lib/offline/offline-context";
+import { OfflineBanner } from "@/components/offline-banner";
 
 const geistSans = Geist({
   variable: "--font-geist-sans",
@@ -19,6 +21,13 @@ export const metadata: Metadata = {
     template: "%s · Darth Meetings",
   },
   description: "Upload meeting audio, get a clean speaker-labelled transcript.",
+  // PWA manifest: lets the app be installed (Add to Dock / Home Screen), which
+  // on Safari also lifts the 7-day eviction of the offline caches.
+  manifest: "/manifest.webmanifest",
+};
+
+export const viewport: Viewport = {
+  themeColor: "#111111",
 };
 
 export default function RootLayout({
@@ -41,7 +50,12 @@ export default function RootLayout({
         className={`${geistSans.variable} ${geistMono.variable} antialiased`}
       >
         <SessionKeeper />
-        {children}
+        {/* Client-only: registers /sw.js, tracks connectivity and the offline
+            pins; the banner renders nothing unless there is something to say. */}
+        <OfflineProvider>
+          <OfflineBanner />
+          {children}
+        </OfflineProvider>
       </body>
     </html>
   );

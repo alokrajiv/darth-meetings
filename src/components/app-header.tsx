@@ -5,6 +5,7 @@ import { usePathname } from 'next/navigation';
 import { AudioLines, ChevronRight } from 'lucide-react';
 import type { ReactNode } from 'react';
 import { ThemeToggle } from '@/components/theme-toggle';
+import { OfflineChip } from '@/components/offline-chip';
 
 interface AppHeaderProps {
   /** Right-aligned actions slot. */
@@ -62,6 +63,7 @@ export function AppHeader({ children, breadcrumb }: AppHeaderProps) {
         )}
         <div className="ml-auto flex items-center gap-2">
           {children}
+          <OfflineChip />
           <ThemeToggle />
         </div>
       </div>

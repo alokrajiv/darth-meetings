@@ -33,6 +33,8 @@ export interface LabelChipsProps {
    * overflowing, keeping the "+N" badge and the add "+" visible (used by
    * the listing's width-capped Labels column). */
   fit?: boolean;
+  /** Keeps the add "+" visible but inert (offline mode — the picker needs the server). */
+  disabled?: boolean;
   className?: string;
 }
 
@@ -128,6 +130,7 @@ export function LabelChips({
   max = 2,
   variant = 'row',
   fit = false,
+  disabled = false,
   className = '',
 }: LabelChipsProps) {
   const { byId } = useLabelCatalog();
@@ -238,13 +241,14 @@ export function LabelChips({
       {onAdd && (
         <button
           type="button"
+          disabled={disabled}
           onClick={(e) => {
             e.stopPropagation();
             onAdd(e);
           }}
-          title={variant === 'full' ? 'Add a label (l)' : 'Add a label'}
+          title={disabled ? 'Not available offline' : variant === 'full' ? 'Add a label (l)' : 'Add a label'}
           data-label-add
-          className={`inline-flex shrink-0 items-center gap-0.5 rounded-full border border-dashed border-muted-foreground/30 px-1.5 py-0.5 text-[11px] text-muted-foreground/70 transition-all hover:border-primary/40 hover:text-primary ${
+          className={`inline-flex shrink-0 items-center gap-0.5 rounded-full border border-dashed border-muted-foreground/30 px-1.5 py-0.5 text-[11px] text-muted-foreground/70 transition-all hover:border-primary/40 hover:text-primary disabled:cursor-not-allowed disabled:opacity-50 disabled:hover:border-muted-foreground/30 disabled:hover:text-muted-foreground/70 ${
             variant === 'row' ? 'opacity-0 group-hover:opacity-100' : ''
           }`}
         >

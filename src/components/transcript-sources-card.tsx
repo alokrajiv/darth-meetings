@@ -22,6 +22,8 @@ interface TranscriptSourcesCardProps {
   row: StoredTranscript;
   suggestions: SpeakerSuggestionMap;
   canEdit: boolean;
+  /** Offline mode: re-transcribe actions need the server — shown but inert. */
+  disabled?: boolean;
 }
 
 /**
@@ -35,6 +37,7 @@ export function TranscriptSourcesCard({
   row,
   suggestions,
   canEdit,
+  disabled = false,
 }: TranscriptSourcesCardProps) {
   const [error, setError] = useState<string | null>(null);
 
@@ -406,9 +409,9 @@ export function TranscriptSourcesCard({
           variant="outline"
           size="sm"
           className="mt-2 h-8 w-full justify-start gap-2 text-[13px]"
-          disabled={retranscribing !== null}
+          disabled={disabled || retranscribing !== null}
           onClick={() => void retranscribeFromVideo()}
-          title={`This transcript is the text ${isTeams ? 'Teams' : 'Meet'} wrote — no acoustic speaker separation or voiceprint matching ran. Run the full AssemblyAI pipeline over the meeting video; a new transcript is created alongside this one`}
+          title={disabled ? 'Not available offline' : `This transcript is the text ${isTeams ? 'Teams' : 'Meet'} wrote — no acoustic speaker separation or voiceprint matching ran. Run the full AssemblyAI pipeline over the meeting video; a new transcript is created alongside this one`}
         >
           {retranscribing ? (
             <Loader2 className="h-4 w-4 animate-spin text-muted-foreground" />
@@ -429,9 +432,9 @@ export function TranscriptSourcesCard({
           variant="outline"
           size="sm"
           className="mt-2 h-8 w-full justify-start gap-2 text-[13px]"
-          disabled={combining}
+          disabled={disabled || combining}
           onClick={() => void combineAndRetranscribe()}
-          title="Concatenate every stored video of this meeting and run a fresh AssemblyAI transcription over the whole thing — a new transcript is created alongside this one"
+          title={disabled ? 'Not available offline' : 'Concatenate every stored video of this meeting and run a fresh AssemblyAI transcription over the whole thing — a new transcript is created alongside this one'}
         >
           {combining ? (
             <Loader2 className="h-4 w-4 animate-spin text-muted-foreground" />
@@ -465,9 +468,9 @@ export function TranscriptSourcesCard({
           variant="outline"
           size="sm"
           className="mt-2 h-8 w-full justify-start gap-2 text-[13px]"
-          disabled={upgrading}
+          disabled={disabled || upgrading}
           onClick={() => void upgradeModel()}
-          title={`Run this meeting's stored audio through AssemblyAI ${speechModelLabel(DEFAULT_SPEECH_MODEL)} — a new transcript is created alongside this one`}
+          title={disabled ? 'Not available offline' : `Run this meeting's stored audio through AssemblyAI ${speechModelLabel(DEFAULT_SPEECH_MODEL)} — a new transcript is created alongside this one`}
         >
           {upgrading ? (
             <Loader2 className="h-4 w-4 animate-spin text-muted-foreground" />

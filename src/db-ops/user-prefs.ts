@@ -333,3 +333,63 @@ export async function listAutoSyncActivityFor(
     LIMIT ${limit}
   `;
 }
+
+// ---------------------------------------------------------------------------
+// Offline support (migration 040): per-ACCOUNT auto-pin counts. The bytes
+// themselves live in each device's browser (service worker + Cache Storage);
+// these numbers only say how many of the newest meetings every device keeps.
+// ---------------------------------------------------------------------------
+
+export interface OfflinePrefs {
+  /** Newest N meetings whose page + transcript JSON are kept offline. */
+  transcripts: number;
+  /** Newest N recorded meetings that also get an audio-only copy. */
+  audio: number;
+  /** Newest N recorded meetings that also get the full recording (video). */
+  video: number;
+}
+
+export const DEFAULT_OFFLINE_PREFS: OfflinePrefs = { transcripts: 100, audio: 10, video: 0 };
+
+/** Hard caps — a laptop's browser quota is finite and the plan query pages
+ * the newest `max(counts)` rows. */
+export const OFFLINE_PREFS_MAX: OfflinePrefs = { transcripts: 500, audio: 100, video: 25 };
+
+function clampCount(v: unknown, fallback: number, max: number): number {
+  const n = typeof v === 'number' ? v : Number.parseInt(String(v ?? ''), 10);
+  if (!Number.isFinite(n)) return fallback;
+  return Math.max(0, Math.min(max, Math.trunc(n)));
+}
+
+export function offlinePrefsOf(raw: unknown): OfflinePrefs {
+  const o = (raw && typeof raw === 'object' ? raw : {}) as Record<string, unknown>;
+  return {
+    transcripts: clampCount(o.transcripts, DEFAULT_OFFLINE_PREFS.transcripts, OFFLINE_PREFS_MAX.transcripts),
+    audio: clampCount(o.audio, DEFAULT_OFFLINE_PREFS.audio, OFFLINE_PREFS_MAX.audio),
+    video: clampCount(o.video, DEFAULT_OFFLINE_PREFS.video, OFFLINE_PREFS_MAX.video),
+  };
+}
+
+export async function getOfflinePrefs(userId: string): Promise<OfflinePrefs> {
+  const rows = await sql<Array<{ offline_prefs: unknown }>>`
+    SELECT offline_prefs FROM ${sql(SCHEMA)}.user_prefs WHERE user_id = ${userId}
+  `;
+  return offlinePrefsOf(rows[0]?.offline_prefs);
+}
+
+/** Partial update; unspecified counts keep their current value. */
+export async function setOfflinePrefs(
+  user: { userId: string; email: string },
+  patch: Partial<OfflinePrefs>
+): Promise<OfflinePrefs> {
+  const cur = await getOfflinePrefs(user.userId);
+  const next = offlinePrefsOf({ ...cur, ...patch });
+  await sql`
+    INSERT INTO ${sql(SCHEMA)}.user_prefs (user_id, email, offline_prefs)
+    VALUES (${user.userId}, ${user.email.toLowerCase()}, ${sql.json(next as unknown as never)})
+    ON CONFLICT (user_id) DO UPDATE SET
+      offline_prefs = EXCLUDED.offline_prefs,
+      updated_at = now()
+  `;
+  return next;
+}

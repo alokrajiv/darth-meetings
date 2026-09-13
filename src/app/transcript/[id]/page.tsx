@@ -45,6 +45,10 @@ import { AppHeader } from '@/components/app-header';
 import { RerunDiarizationButton } from '@/components/rerun-diarization-button';
 import { TranscriptSourcesCard } from '@/components/transcript-sources-card';
 import { MeetingInfoCard } from '@/components/meeting-info-card';
+import { OfflinePinDialog, OfflinePinStatus } from '@/components/offline-pin-dialog';
+import { useOffline } from '@/lib/offline/offline-context';
+import { getPin } from '@/lib/offline/offline-pins';
+import { OFFLINE_CHANGE_EVENT, type PinRecord, type PlanMediaPart } from '@/lib/offline/offline-types';
 import type { PickerPerson } from '@/components/user-picker';
 import {
   Dialog,
@@ -73,6 +77,7 @@ import {
   Loader2,
   Sparkles,
   MoreHorizontal,
+  CloudDownload,
   Video,
   FileAudio,
   FileText,
@@ -81,6 +86,10 @@ import {
   ExternalLink,
   Trash2,
 } from 'lucide-react';
+
+/** Tooltip on every control that needs the server while in offline mode. */
+const OFFLINE_TITLE = 'Not available offline';
+const VIDEO_EXT_RE = /\.(mp4|webm|mov|mkv|m4v)$/i;
 
 /**
  * Find the index of the utterance whose [start, end) interval contains the
@@ -179,6 +188,41 @@ function TranscriptDetailInner({ transcriptId }: { transcriptId: string }) {
   const [error, setError] = useState<string | null>(null);
 
   const canEdit = access === 'owner' || access === 'edit';
+
+  // Offline mode: the page renders from the service-worker caches, so every
+  // control that needs the server is DISABLED (not hidden) with a tooltip —
+  // the layout stays familiar and it is obvious why a button does nothing.
+  // The pin record decides which media URL the player uses (an 'audio' pin
+  // only holds the audio-only derivative, a 'video' pin holds both).
+  const { mode: offlineMode, ready: offlineReady } = useOffline();
+  const offline = offlineMode === 'offline';
+  const [offlinePinOpen, setOfflinePinOpen] = useState(false);
+  const [offlinePin, setOfflinePin] = useState<PinRecord | null>(null);
+  useEffect(() => {
+    let cancelled = false;
+    const load = () => {
+      void getPin(transcriptId).then((rec) => {
+        if (!cancelled) setOfflinePin(rec ?? null);
+      });
+    };
+    load();
+    window.addEventListener(OFFLINE_CHANGE_EVENT, load);
+    return () => {
+      cancelled = true;
+      window.removeEventListener(OFFLINE_CHANGE_EVENT, load);
+    };
+  }, [transcriptId]);
+  // An 'audio' pin cached only the audio-only derivative; a 'video' pin has
+  // the full recording too, so the player keeps its normal URL there.
+  const offlineAudioOnly = offline && offlinePin?.level === 'audio';
+  // Cache keys are exactly the URLs offline-urls.ts builds: `variant=audio`
+  // FIRST, then `part=N` — the worker matches the full path+query, so any
+  // other parameter order misses the media cache for parts 2+.
+  const offlineVariant = (base: string) => {
+    if (!offlineAudioOnly) return base;
+    const [path, q] = base.split('?');
+    return `${path}?variant=audio${q ? `&${q}` : ''}`;
+  };
 
   const [speakerLabels, setSpeakerLabels] = useState<SpeakerLabel[]>([]);
   const [speakerSuggestions, setSpeakerSuggestions] = useState<SpeakerSuggestionMap>({});
@@ -331,7 +375,7 @@ function TranscriptDetailInner({ transcriptId }: { transcriptId: string }) {
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       if (e.key.toLowerCase() !== 'l' || e.shiftKey || e.metaKey || e.ctrlKey || e.altKey) return;
-      if (!labelInfo?.canEdit) return;
+      if (!labelInfo?.canEdit || offline) return;
       const el = document.activeElement as HTMLElement | null;
       if (el && (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA' || el.tagName === 'SELECT' || el.isContentEditable)) return;
       if (document.querySelector('[data-label-picker]')) return;
@@ -342,7 +386,7 @@ function TranscriptDetailInner({ transcriptId }: { transcriptId: string }) {
     };
     window.addEventListener('keydown', onKey);
     return () => window.removeEventListener('keydown', onKey);
-  }, [labelInfo?.canEdit]);
+  }, [labelInfo?.canEdit, offline]);
 
   // --- audio player state ---
   const playerRef = useRef<AudioPlayerHandle>(null);
@@ -544,7 +588,9 @@ function TranscriptDetailInner({ transcriptId }: { transcriptId: string }) {
       void loadAll({ silent: true });
       bumpActivity();
     }, 1000);
-  });
+  // Not before the provider restored the mode: in offline mode the first
+  // commit would otherwise open the SSE stream once and tear it down.
+  }, { enabled: offlineReady && !offline });
 
   // Grab the current user's email once so the speaker-pick "add to access?"
   // prompt can suppress itself when the owner picks themselves from the
@@ -805,8 +851,11 @@ function TranscriptDetailInner({ transcriptId }: { transcriptId: string }) {
       ? (row.gmeet_context.teams?.recordingId ?? null)
       : null;
   const hasLocalVideo = /\.(mp4|webm|mov|mkv|m4v)$/i.test(row?.local_audio_path ?? '');
+  // Offline: the POST would fail and paint "Video fetch failed" on a page
+  // that is otherwise correctly read-only; the auto attempt below stays
+  // untried so it runs once the user is back online.
   const canFetchVideo =
-    !!row && canEdit && !row.local_audio_path && (!!recordingFileId || !!teamsRecordingId);
+    !!row && canEdit && !offline && !row.local_audio_path && (!!recordingFileId || !!teamsRecordingId);
   // The recording exists only as a promise — Google is still preparing the
   // file (no fileId to pull yet). A video report can be QUEUED in this state;
   // the recording poller fires it when the video lands.
@@ -1022,6 +1071,8 @@ function TranscriptDetailInner({ transcriptId }: { transcriptId: string }) {
         // ⌘F still works in form fields.
         const tag = (document.activeElement?.tagName || '').toLowerCase();
         if (tag === 'input' || tag === 'textarea') return;
+        // Offline: replace writes to the server, so leave ⌘F to the browser.
+        if (offline) return;
         e.preventDefault();
         setFindReplaceOpen((v) => !v);
       } else if (e.key === 'Escape' && findReplaceOpen) {
@@ -1030,7 +1081,7 @@ function TranscriptDetailInner({ transcriptId }: { transcriptId: string }) {
     }
     window.addEventListener('keydown', onKey);
     return () => window.removeEventListener('keydown', onKey);
-  }, [findReplaceOpen]);
+  }, [findReplaceOpen, offline]);
 
   // --- click handlers ---
 
@@ -2030,9 +2081,9 @@ function TranscriptDetailInner({ transcriptId }: { transcriptId: string }) {
             variant="ghost"
             size="sm"
             className="ai-glimmer h-8 w-full justify-start gap-2 text-[13px] font-medium text-primary hover:text-primary"
-            disabled={notesGenerating || generatingReport}
+            disabled={offline || notesGenerating || generatingReport}
             onClick={() => openGenerateDialog(false)}
-            title={`Changed since the last AI run: ${staleLabels.join(', ')}. One click re-runs with the new context — the AI may well decide nothing needs updating.`}
+            title={offline ? OFFLINE_TITLE : `Changed since the last AI run: ${staleLabels.join(', ')}. One click re-runs with the new context — the AI may well decide nothing needs updating.`}
           >
             <Sparkles className="h-4 w-4" />
             Tell the AI what changed
@@ -2043,8 +2094,9 @@ function TranscriptDetailInner({ transcriptId }: { transcriptId: string }) {
             variant="ghost"
             size="sm"
             className="h-8 w-full justify-start gap-2 text-[13px]"
-            disabled={notesGenerating || row.status !== 'completed'}
+            disabled={offline || notesGenerating || row.status !== 'completed'}
             onClick={() => openGenerateDialog(false)}
+            title={offline ? OFFLINE_TITLE : undefined}
           >
             {notesGenerating ? (
               <RefreshCw className="h-4 w-4 animate-spin text-muted-foreground" />
@@ -2059,9 +2111,9 @@ function TranscriptDetailInner({ transcriptId }: { transcriptId: string }) {
             variant="ghost"
             size="sm"
             className="h-8 w-full justify-start gap-2 text-[13px]"
-            disabled={guessingSpeakers}
+            disabled={offline || guessingSpeakers}
             onClick={handleGuessSpeakers}
-            title="Match each voice against known people (local voiceprints — no AI call)"
+            title={offline ? OFFLINE_TITLE : 'Match each voice against known people (local voiceprints — no AI call)'}
           >
             {guessingSpeakers ? (
               <RefreshCw className="h-4 w-4 animate-spin text-muted-foreground" />
@@ -2075,6 +2127,7 @@ function TranscriptDetailInner({ transcriptId }: { transcriptId: string }) {
           assemblyaiId={row.assemblyai_id}
           gmeetContext={row.gmeet_context}
           hasLocalAudio={!!row.local_audio_path}
+          disabled={offline}
           size="sm"
           variant="ghost"
           className="h-8 w-full justify-start gap-2 text-[13px]"
@@ -2140,9 +2193,9 @@ function TranscriptDetailInner({ transcriptId }: { transcriptId: string }) {
             variant="ghost"
             size="sm"
             className="h-8 w-full justify-start gap-2 text-[13px]"
-            disabled={!content}
+            disabled={offline || !content}
             onClick={() => setFindReplaceOpen((v) => !v)}
-            title="Find and replace (⌘F)"
+            title={offline ? OFFLINE_TITLE : 'Find and replace (⌘F)'}
           >
             <Search className="h-4 w-4 text-muted-foreground" />
             Find &amp; replace
@@ -2156,8 +2209,9 @@ function TranscriptDetailInner({ transcriptId }: { transcriptId: string }) {
             variant="ghost"
             size="sm"
             className="h-8 w-full justify-start gap-2 text-[13px]"
+            disabled={offline}
             onClick={() => setLinkEventOpen(true)}
-            title="Attach the calendar invite this meeting came from — fills the date, title, and attendees"
+            title={offline ? OFFLINE_TITLE : 'Attach the calendar invite this meeting came from — fills the date, title, and attendees'}
           >
             <CalendarSearch className="h-4 w-4 text-muted-foreground" />
             {row.gmeet_context?.eventId ? 'Re-link calendar event' : 'Link calendar event'}
@@ -2167,8 +2221,9 @@ function TranscriptDetailInner({ transcriptId }: { transcriptId: string }) {
           variant="ghost"
           size="sm"
           className="h-8 w-full justify-start gap-2 text-[13px]"
+          disabled={offline}
           onClick={() => setShareOpen(true)}
-          title="Share access with other people"
+          title={offline ? OFFLINE_TITLE : 'Share access with other people'}
         >
           <Users className="h-4 w-4 text-muted-foreground" />
           Share
@@ -2210,8 +2265,9 @@ function TranscriptDetailInner({ transcriptId }: { transcriptId: string }) {
               variant="ghost"
               size="sm"
               className="h-8 w-full justify-start gap-2 text-[13px] text-muted-foreground hover:text-destructive"
+              disabled={offline}
               onClick={() => void handleMoveToTrash()}
-              title="Move to trash — restorable from the Trash tab on the listing page"
+              title={offline ? OFFLINE_TITLE : 'Move to trash — restorable from the Trash tab on the listing page'}
             >
               <Trash2 className="h-4 w-4" />
               Move to trash
@@ -2233,6 +2289,8 @@ function TranscriptDetailInner({ transcriptId }: { transcriptId: string }) {
             </span>
           </Badge>
         )}
+        {/* Offline pin state (renders nothing when the meeting is not saved). */}
+        <OfflinePinStatus id={row.assemblyai_id} />
         {/* Raw / Edited toggle */}
         <div className="inline-flex rounded-md bg-muted p-0.5">
           <button
@@ -2264,9 +2322,12 @@ function TranscriptDetailInner({ transcriptId }: { transcriptId: string }) {
         </div>
         <Button
           size="sm"
+          disabled={offline}
           onClick={() => setShareOpen(true)}
           title={
-            shareSuggestionCount > 0
+            offline
+              ? OFFLINE_TITLE
+              : shareSuggestionCount > 0
               ? `Share — ${shareSuggestionCount} people from this meeting aren't shared yet`
               : 'Share access with other people'
           }
@@ -2304,6 +2365,18 @@ function TranscriptDetailInner({ transcriptId }: { transcriptId: string }) {
               >
                 <RefreshCw className="h-3.5 w-3.5 text-muted-foreground" />
                 Refresh
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  setOverflowMenuOpen(false);
+                  setOfflinePinOpen(true);
+                }}
+                className="flex w-full items-center gap-2 rounded px-3 py-1.5 text-left text-sm hover:bg-muted"
+                title="Keep this meeting on this device for reading without a connection"
+              >
+                <CloudDownload className="h-3.5 w-3.5 text-muted-foreground" />
+                Save for offline…
               </button>
               <button
                 type="button"
@@ -2363,10 +2436,22 @@ function TranscriptDetailInner({ transcriptId }: { transcriptId: string }) {
             </span>
             {access === 'owner' && (
               <span className="ml-auto flex gap-2">
-                <Button size="sm" variant="outline" onClick={() => void handleRestore()}>
+                <Button
+                  size="sm"
+                  variant="outline"
+                  disabled={offline}
+                  title={offline ? OFFLINE_TITLE : undefined}
+                  onClick={() => void handleRestore()}
+                >
                   Restore
                 </Button>
-                <Button size="sm" variant="destructive" onClick={() => void handleTrashDelete()}>
+                <Button
+                  size="sm"
+                  variant="destructive"
+                  disabled={offline}
+                  title={offline ? OFFLINE_TITLE : undefined}
+                  onClick={() => void handleTrashDelete()}
+                >
                   Delete forever
                 </Button>
               </span>
@@ -2396,10 +2481,10 @@ function TranscriptDetailInner({ transcriptId }: { transcriptId: string }) {
             />
           ) : (
             <h1
-              onClick={() => canEdit && setEditingTitle(true)}
-              title={canEdit ? 'Click to edit title' : ''}
+              onClick={() => canEdit && !offline && setEditingTitle(true)}
+              title={offline ? OFFLINE_TITLE : canEdit ? 'Click to edit title' : ''}
               className={`text-2xl font-semibold tracking-tight leading-tight rounded -mx-1 px-1 py-0.5 ${
-                canEdit ? 'cursor-text hover:bg-muted/40' : ''
+                canEdit && !offline ? 'cursor-text hover:bg-muted/40' : ''
               } ${title.trim() ? '' : 'text-muted-foreground italic'}`}
             >
               {title.trim() || row.original_filename || 'Untitled transcript'}
@@ -2459,8 +2544,9 @@ function TranscriptDetailInner({ transcriptId }: { transcriptId: string }) {
                 <LabelChips
                   labels={labelInfo.labels}
                   variant="full"
+                  disabled={offline}
                   onRemove={
-                    labelInfo.canEdit
+                    labelInfo.canEdit && !offline
                       ? (l) =>
                           void toggleLabel(l, false).catch((err: unknown) => {
                             setLabelError(err instanceof Error ? err.message : 'Could not remove label');
@@ -2532,14 +2618,16 @@ function TranscriptDetailInner({ transcriptId }: { transcriptId: string }) {
             ) : (
               <button
                 type="button"
-                className={`${canEdit ? 'hover:text-foreground hover:underline decoration-dotted underline-offset-2' : 'cursor-default'}`}
+                className={`${canEdit && !offline ? 'hover:text-foreground hover:underline decoration-dotted underline-offset-2' : 'cursor-default'}`}
                 title={
-                  canEdit
-                    ? `Meeting date — click to edit (${safeFormatDate(row.recorded_at ?? row.created_at)})`
-                    : safeFormatDate(row.recorded_at ?? row.created_at)
+                  offline
+                    ? OFFLINE_TITLE
+                    : canEdit
+                      ? `Meeting date — click to edit (${safeFormatDate(row.recorded_at ?? row.created_at)})`
+                      : safeFormatDate(row.recorded_at ?? row.created_at)
                 }
                 onClick={() => {
-                  if (!canEdit) return;
+                  if (!canEdit || offline) return;
                   const base = new Date(row.recorded_at ?? row.created_at);
                   const pad = (n: number) => String(n).padStart(2, '0');
                   setDateDraft(
@@ -2626,18 +2714,19 @@ function TranscriptDetailInner({ transcriptId }: { transcriptId: string }) {
                   )}
                 </div>
                 <AudioPlayer
-                  key={`${row.assemblyai_id}-${activePart}`}
+                  key={`${row.assemblyai_id}-${activePart}-${offlineAudioOnly ? 'a' : 'v'}`}
                   ref={playerRef}
                   className="h-10 w-full"
-                  src={
+                  src={offlineVariant(
                     activePart === 1
                       ? `/api/transcripts/${row.assemblyai_id}/audio`
                       : `/api/transcripts/${row.assemblyai_id}/audio?part=${activePart}`
-                  }
+                  )}
                   hasVideo={
-                    activePart === 1
+                    !offlineAudioOnly &&
+                    (activePart === 1
                       ? hasLocalVideo
-                      : /\.(mp4|webm|mov|mkv|m4v)$/i.test(activePartInfo?.filename ?? '')
+                      : VIDEO_EXT_RE.test(activePartInfo?.filename ?? ''))
                   }
                   onTimeUpdate={(t) => setCurrentTime(t + activePartOffset)}
                   onLoadedMetadata={() => {
@@ -2761,7 +2850,8 @@ function TranscriptDetailInner({ transcriptId }: { transcriptId: string }) {
                                 variant="ghost"
                                 size="sm"
                                 className="h-7 text-xs"
-                                disabled={generatingReport}
+                                disabled={offline || generatingReport}
+                                title={offline ? OFFLINE_TITLE : undefined}
                                 onClick={() => openGenerateDialog(true)}
                               >
                                 <RefreshCw className="h-3 w-3" />
@@ -2795,7 +2885,8 @@ function TranscriptDetailInner({ transcriptId }: { transcriptId: string }) {
                             <Button
                               variant="outline"
                               size="sm"
-                              disabled={generatingReport}
+                              disabled={offline || generatingReport}
+                              title={offline ? OFFLINE_TITLE : undefined}
                               onClick={() => void handleGenerateReport()}
                             >
                               <RefreshCw className="h-3 w-3" />
@@ -2806,7 +2897,7 @@ function TranscriptDetailInner({ transcriptId }: { transcriptId: string }) {
                       ) : canEdit ? (
                         <div className="flex flex-col items-center py-6 text-center">
                           <p className="text-sm text-muted-foreground">No detailed report yet.</p>
-                          <Button size="sm" className="mt-3" disabled={generatingReport} onClick={() => openGenerateDialog(true)}>
+                          <Button size="sm" className="mt-3" disabled={offline || generatingReport} title={offline ? OFFLINE_TITLE : undefined} onClick={() => openGenerateDialog(true)}>
                             <Sparkles className="h-4 w-4" />
                             Generate detailed report
                           </Button>
@@ -2830,7 +2921,8 @@ function TranscriptDetailInner({ transcriptId }: { transcriptId: string }) {
                           variant="ghost"
                           size="sm"
                           className="h-6 shrink-0 text-[11px] text-primary hover:text-primary"
-                          disabled={generatingNotes}
+                          disabled={offline || generatingNotes}
+                          title={offline ? OFFLINE_TITLE : undefined}
                           onClick={() => void handleGenerateNotes()}
                         >
                           <RefreshCw className="h-3 w-3" />
@@ -2859,7 +2951,8 @@ function TranscriptDetailInner({ transcriptId }: { transcriptId: string }) {
                             variant="ghost"
                             size="sm"
                             className="h-6 shrink-0 text-[11px] text-primary hover:text-primary"
-                            disabled={generatingNotes}
+                            disabled={offline || generatingNotes}
+                            title={offline ? OFFLINE_TITLE : undefined}
                             onClick={() => void handleTopUpSummary()}
                           >
                             <Sparkles className="h-3 w-3" />
@@ -2904,7 +2997,8 @@ function TranscriptDetailInner({ transcriptId }: { transcriptId: string }) {
                               variant="ghost"
                               size="sm"
                               className="h-7 text-xs"
-                              disabled={generatingNotes}
+                              disabled={offline || generatingNotes}
+                              title={offline ? OFFLINE_TITLE : undefined}
                               onClick={() => openGenerateDialog(false)}
                             >
                               <RefreshCw className="h-3 w-3" />
@@ -2916,8 +3010,8 @@ function TranscriptDetailInner({ transcriptId }: { transcriptId: string }) {
                               variant="ghost"
                               size="sm"
                               className="h-7 text-xs"
-                              disabled={generatingNotes}
-                              title="Rebuild this summary from the detailed-report session — it reuses the video frames and documents the AI already verified there"
+                              disabled={offline || generatingNotes}
+                              title={offline ? OFFLINE_TITLE : 'Rebuild this summary from the detailed-report session — it reuses the video frames and documents the AI already verified there'}
                               onClick={() => void handleTopUpSummary()}
                             >
                               <Sparkles className="h-3 w-3" />
@@ -2951,7 +3045,8 @@ function TranscriptDetailInner({ transcriptId }: { transcriptId: string }) {
                           <Button
                             variant="outline"
                             size="sm"
-                            disabled={generatingNotes}
+                            disabled={offline || generatingNotes}
+                            title={offline ? OFFLINE_TITLE : undefined}
                             onClick={() => void handleGenerateNotes()}
                           >
                             <RefreshCw className="h-3 w-3" />
@@ -2988,7 +3083,8 @@ function TranscriptDetailInner({ transcriptId }: { transcriptId: string }) {
                             <Button
                               size="sm"
                               className="mt-3"
-                              disabled={generatingNotes}
+                              disabled={offline || generatingNotes}
+                              title={offline ? OFFLINE_TITLE : undefined}
                               onClick={() => void handleTopUpSummary()}
                             >
                               <Sparkles className="h-4 w-4" />
@@ -3007,7 +3103,8 @@ function TranscriptDetailInner({ transcriptId }: { transcriptId: string }) {
                             <Button
                               size="sm"
                               className="mt-3"
-                              disabled={generatingNotes}
+                              disabled={offline || generatingNotes}
+                              title={offline ? OFFLINE_TITLE : undefined}
                               onClick={() =>
                                 reviewSpeakers.length > 0 ? setReviewOpen(true) : openGenerateDialog(false)
                               }
@@ -3071,10 +3168,10 @@ function TranscriptDetailInner({ transcriptId }: { transcriptId: string }) {
                     />
                   ) : description ? (
                     <div
-                      onClick={() => canEdit && setEditingDescription(true)}
-                      title={canEdit ? 'Click to edit' : ''}
+                      onClick={() => canEdit && !offline && setEditingDescription(true)}
+                      title={offline ? OFFLINE_TITLE : canEdit ? 'Click to edit' : ''}
                       className={`markdown-body max-w-[75ch] text-sm rounded ${
-                        canEdit ? 'cursor-text hover:bg-muted/30 px-1 -mx-1' : ''
+                        canEdit && !offline ? 'cursor-text hover:bg-muted/30 px-1 -mx-1' : ''
                       }`}
                     >
                       {(() => {
@@ -3131,8 +3228,10 @@ function TranscriptDetailInner({ transcriptId }: { transcriptId: string }) {
                   ) : (
                     <button
                       type="button"
+                      disabled={offline}
+                      title={offline ? OFFLINE_TITLE : undefined}
                       onClick={() => setEditingDescription(true)}
-                      className="w-full rounded-md border border-dashed px-3 py-2 text-left text-sm text-muted-foreground transition-colors hover:border-primary/40 hover:text-foreground"
+                      className="w-full rounded-md border border-dashed px-3 py-2 text-left text-sm text-muted-foreground transition-colors hover:border-primary/40 hover:text-foreground disabled:cursor-not-allowed disabled:opacity-50"
                     >
                       + Add notes
                     </button>
@@ -3149,15 +3248,15 @@ function TranscriptDetailInner({ transcriptId }: { transcriptId: string }) {
                   utterances={content.utterances}
                   speakerLabels={speakerLabels}
                   onSave={handleSaveSpeaker}
-                  canEdit={canEdit}
+                  canEdit={canEdit && !offline}
                   onPickPerson={handlePickPerson}
                   onRequestCreatePerson={handleRequestCreatePerson}
                   audioSrc={
                     row.status === 'completed' && audioAvailable
-                      ? `/api/transcripts/${row.assemblyai_id}/audio`
+                      ? offlineVariant(`/api/transcripts/${row.assemblyai_id}/audio`)
                       : null
                   }
-                  hasVideo={hasLocalVideo}
+                  hasVideo={hasLocalVideo && !offlineAudioOnly}
                   collapsed={!!collapsedSections.speakers}
                   onToggleCollapse={() => toggleSection('speakers')}
                   suggestions={speakerSuggestions}
@@ -3222,12 +3321,12 @@ function TranscriptDetailInner({ transcriptId }: { transcriptId: string }) {
                               speakerLabels={speakerLabels}
                               highlights={highlightsByUtterance.get(index)}
                               onSeek={handleSeekToUtterance}
-                              canEdit={viewMode === 'edited' && canEdit}
+                              canEdit={viewMode === 'edited' && canEdit && !offline}
                               showSpeaker={showSpeaker}
                               onPickPerson={handlePickPerson}
                               onRequestCreatePerson={handleRequestCreatePerson}
                               onSaveText={
-                                viewMode === 'edited' && canEdit
+                                viewMode === 'edited' && canEdit && !offline
                                   ? handleSaveText
                                   : () => {
                                       /* read-only */
@@ -3268,7 +3367,7 @@ function TranscriptDetailInner({ transcriptId }: { transcriptId: string }) {
               <MeetingInfoCard
                 row={row}
                 speakerLabels={speakerLabels}
-                canEdit={canEdit}
+                canEdit={canEdit && !offline}
                 audioAvailable={audioAvailable}
                 videoFetching={videoFetching}
                 videoFetchError={videoFetchError}
@@ -3293,10 +3392,11 @@ function TranscriptDetailInner({ transcriptId }: { transcriptId: string }) {
                 row={row}
                 suggestions={speakerSuggestions}
                 canEdit={canEdit}
+                disabled={offline}
               />
               <AttachmentPanel
                 transcriptId={row.assemblyai_id}
-                canEdit={canEdit}
+                canEdit={canEdit && !offline}
                 onChanged={() => {
                   bumpActivity();
                   if (row.auto_notes || row.auto_report)
@@ -3443,7 +3543,7 @@ function TranscriptDetailInner({ transcriptId }: { transcriptId: string }) {
               <MeetingInfoCard
                 row={row}
                 speakerLabels={speakerLabels}
-                canEdit={canEdit}
+                canEdit={canEdit && !offline}
                 audioAvailable={audioAvailable}
                 videoFetching={videoFetching}
                 videoFetchError={videoFetchError}
@@ -3476,10 +3576,11 @@ function TranscriptDetailInner({ transcriptId }: { transcriptId: string }) {
                 row={row}
                 suggestions={speakerSuggestions}
                 canEdit={canEdit}
+                disabled={offline}
               />
               <AttachmentPanel
                 transcriptId={row.assemblyai_id}
-                canEdit={canEdit}
+                canEdit={canEdit && !offline}
                 onChanged={() => {
                   bumpActivity();
                   if (row.auto_notes || row.auto_report)
@@ -3519,6 +3620,33 @@ function TranscriptDetailInner({ transcriptId }: { transcriptId: string }) {
             // (The AI can map calendar attendees to speaker names.)
             if (row?.auto_notes || row?.auto_report)
               markAiStale('calendar', 'the linked calendar event (attendees, title, time)');
+          }}
+        />
+
+        <OfflinePinDialog
+          open={offlinePinOpen}
+          onClose={() => setOfflinePinOpen(false)}
+          meeting={{
+            id: row.assemblyai_id,
+            title: row.title,
+            recordedAt: row.recorded_at ?? row.created_at,
+            durationSec: row.duration ?? null,
+            // Initial media inventory from the loaded row (the dialog re-reads
+            // the authoritative one from /api/offline/plan when it opens).
+            media: {
+              hasLocal: !!row.local_audio_path,
+              isVideo: hasLocalVideo,
+              parts: [
+                ...(row.local_audio_path
+                  ? [{ part: 1, filename: row.local_audio_path, isVideo: hasLocalVideo, bytes: null }]
+                  : []),
+                ...videoParts.flatMap<PlanMediaPart>((p, i) =>
+                  p.filename
+                    ? [{ part: i + 2, filename: p.filename, isVideo: VIDEO_EXT_RE.test(p.filename), bytes: p.bytes ?? null }]
+                    : []
+                ),
+              ],
+            },
           }}
         />
 
