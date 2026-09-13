@@ -18,8 +18,9 @@ Formerly known as *Meeting Whisperer*.
 |---|---|---|---|---|
 | darth-auth (login, tokens, installer) | `auth.darth-internal.trames.io` | `darth-cli login` | `darth-auth` (own repo, was `darth-cli/auth-service`) | `~/crp-workspace/darth/auth` |
 | Darth Tasks (plagueis) | `tasks.darth-internal.trames.io` | `darth-cli tasks` | `darth-plagueis` | `~/crp-workspace/darth/tasks` |
-| Darth Artifacts | `artifacts.darth-internal.trames.io` | `darth-cli artifacts` | `darth-artifacts` | `~/crp-workspace/darth/holocrons` |
+| Holocrons (was Darth Artifacts) | `holocrons.darth-internal.trames.io` | `darth-cli holocrons` (alias `artifacts`) | `darth-artifacts` | `~/crp-workspace/darth/holocrons` |
 | Darth Meetings | `meetings.darth-internal.trames.io` | `darth-cli meetings` | `darth-meetings` | `~/crp-workspace/darth/meetings` (was `meeting-whisperer`) |
+| darth-admin (users, module grants, sessions, tokens, audit) | `admin.darth-internal.trames.io` | — | (local repo, no remote) | `~/crp-workspace/darth/admin` |
 
 All members share: darth-auth as the only identity provider (`darth_session`
 cookie — an opaque `dss_` value — resolved via `POST /api/introspect`; the
@@ -31,6 +32,18 @@ behind one nginx under the `*.darth-internal.trames.io` wildcard, and the rule
 re-grant**. The full map (who holds Google / the two Microsoft registrations /
 Slack, every cross-member call, the add-a-member checklist) is
 [`darth-cli/DARTH-FAMILY.md`](https://github.com/alokrajiv/darth-cli/blob/main/DARTH-FAMILY.md).
+
+**Auth in this member (darth-auth v2, 2026-09-13).** `src/proxy.ts` checks for
+the `darth_session` cookie and, for document navigations without one, 302s to
+`${DARTH_AUTH_URL}/login?returnTo=<absolute URL>` (streaming routes excluded;
+API/XHR get 401 JSON). `src/lib/auth/session.ts` + `with-auth.ts` resolve the
+cookie and `Bearer dth_` through the one introspect helper
+(`${DARTH_AUTH_INTERNAL_URL}/api/introspect`, 60 s cache) and require the
+`meetings` module on **both** paths — `dth_` callers included, which closed the
+old bearer bypass; read-scope tokens stay GET-only. `/login` forwards to auth,
+`api/auth/session` returns the introspect object, Settings carries the Logout
+link (`${DARTH_AUTH_URL}/logout?returnTo=`). No clonetrooper, no kenoby JWT,
+no `CLONETROOPER_*` env; grants are edited in darth-admin.
 
 What **this** member owns / consumes:
 
