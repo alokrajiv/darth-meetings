@@ -8,6 +8,7 @@ import {
   NO_ACCESS_MESSAGE,
 } from '@/lib/auth/cli-auth';
 import { SESSION_COOKIE } from '@/lib/auth/session';
+import { publicOrigin } from '@/lib/auth/public-origin';
 
 /**
  * Edge gate (SPEC §3 + §4.2).
@@ -50,13 +51,12 @@ function wantsJson(request: NextRequest): boolean {
 }
 
 /** Absolute public URL of the current request — request.url reflects the
- * INTERNAL origin behind nginx (localhost:3002), so build it from the
- * forwarded host/proto or darth-auth bounces the user to localhost. */
+ * INTERNAL origin behind nginx (localhost:3002), so build it from the public
+ * origin (`Host` + nginx's X-Forwarded-Proto, see `public-origin.ts`) or
+ * darth-auth bounces the user to localhost. */
 function publicUrl(request: NextRequest, path?: string): string {
-  const host = request.headers.get('x-forwarded-host') ?? request.headers.get('host');
-  const proto = request.headers.get('x-forwarded-proto') ?? request.nextUrl.protocol.replace(/:$/, '');
   const p = path ?? request.nextUrl.pathname + request.nextUrl.search;
-  return host ? `${proto || 'https'}://${host}${p}` : new URL(p, request.url).toString();
+  return new URL(p, publicOrigin(request)).toString();
 }
 
 function loginRedirect(request: NextRequest) {

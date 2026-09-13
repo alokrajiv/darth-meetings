@@ -79,3 +79,10 @@ DARTH_AUTH_URL=http://127.0.0.1:8797 scripts/verify-auth-cutover.sh http://local
 ```
 
 Env reference: `.env.example` (`DARTH_AUTH_URL`, `DARTH_AUTH_INTERNAL_URL`, …).
+
+Reverse-proxy contract (`src/lib/auth/public-origin.ts`): the absolute
+`returnTo` sent to darth-auth is built from the request's `Host` plus
+`X-Forwarded-Proto`, which the .6 nginx vhost owns (`proxy_set_header Host
+$host; X-Forwarded-Proto $scheme`). nginx does **not** set `X-Forwarded-Host`
+and passes client headers through, so that header is ignored unless
+`DARTH_TRUST_FORWARDED_HOST=1` — only set it behind a proxy that overwrites it.

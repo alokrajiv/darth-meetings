@@ -161,6 +161,12 @@ for one deploy) → Phase 3 (½ day).
 
 ## Addendum (2026-08-22): same disease, different organ — auth/401 self-heal
 
+> **Superseded 2026-09-13 by the darth-auth cutover** (`fa28a76`): the app now
+> holds an opaque `darth_session` cookie resolved via darth-auth introspection —
+> no kenoby JWT, no `login.trames.io/api/auth/refresh` dance, no JWT-exp branch
+> in `proxy.ts`. `auth-refresh.ts` bounces once to `/login`. Kept as history of
+> the "no shared API client" diagnosis only.
+
 Sibling session (`old-session/7. sso-401-token-renewal-design.txt`) diagnosed the "Retry loop after 24h": the `trames-auth-session` JWT lives 24h but the
 cookie 30d; `src/proxy.ts` only checks cookie *presence*, so pages load and every `/api/*` call
 401s; nothing in this app ever calls kenoby-sso's `/api/auth/refresh`. Kyloren solves it with a

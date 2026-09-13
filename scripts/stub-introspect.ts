@@ -19,13 +19,17 @@
  *   anything else     { active:false }
  *
  * GET /login and GET /logout echo their query so the redirect targets can
- * be followed in a browser during a dev run.
+ * be followed in a browser during a dev run. `POST /_fail?n=<N>` makes the
+ * next N introspect calls answer 500 `{error:'internal error'}` (what
+ * darth-auth returns on an unhandled exception) so the app's "transient
+ * failure is never cached" rule can be verified.
  */
 
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
 
 const port = Number(process.argv[2] || process.env.STUB_PORT || 8791);
 const log: Array<{ at: string; token: string; service?: string; reply: unknown }> = [];
+let failNext = 0;
 
 function reply(token: string, service?: string) {
   // userId must be uuid-shaped: transcript rows key on a uuid column, so the app's
@@ -77,6 +81,11 @@ const server = createServer(async (req, res) => {
       /* empty/invalid body → inactive */
     }
     const token = String(body.token ?? '');
+    if (failNext > 0) {
+      failNext -= 1;
+      console.log(`[stub] introspect ${token.slice(0, 20)}… → 500 (forced, ${failNext} left)`);
+      return json(res, 500, { error: 'internal error' });
+    }
     const out = reply(token, body.service);
     log.push({ at: new Date().toISOString(), token: token.slice(0, 16) + '…', service: body.service, reply: out });
     console.log(
@@ -86,6 +95,10 @@ const server = createServer(async (req, res) => {
   }
   if (url.pathname === '/login' || url.pathname === '/logout') {
     return json(res, 200, { stub: url.pathname, returnTo: url.searchParams.get('returnTo') });
+  }
+  if (req.method === 'POST' && url.pathname === '/_fail') {
+    failNext = Math.max(0, Number(url.searchParams.get('n') ?? 1) || 0);
+    return json(res, 200, { failNext });
   }
   if (url.pathname === '/health') return json(res, 200, { ok: true, calls: log.length });
   if (url.pathname === '/_log') return json(res, 200, log);

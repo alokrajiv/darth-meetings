@@ -1,5 +1,6 @@
 import { NextResponse, type NextRequest } from 'next/server';
 import { config } from '@/config';
+import { publicOrigin, sameOriginReturnTo } from '@/lib/auth/public-origin';
 
 export const runtime = 'nodejs';
 
@@ -9,19 +10,15 @@ export const runtime = 'nodejs';
  * The proxy already sends unauthenticated document navigations straight to
  * darth-auth; this route only serves old bookmarks and the client 401 guard
  * (`auth-refresh.ts`), which pass a same-origin `returnTo` path. returnTo is
- * rebuilt as an absolute URL on OUR public origin (never reflected as-is) so
- * darth-auth's same-site check accepts it and no open redirect exists here.
+ * resolved against OUR public origin and only forwarded when the resulting
+ * URL's origin IS that origin (so `//evil`, `/\evil` — the WHATWG parser
+ * treats `\` as `/` for http(s) — and `https://evil` all fall back to `/`);
+ * darth-auth's own same-site check is the second line of defence.
  */
 export async function GET(request: NextRequest) {
-  const host = request.headers.get('x-forwarded-host') ?? request.headers.get('host') ?? 'localhost';
-  const proto = request.headers.get('x-forwarded-proto') ?? request.nextUrl.protocol.replace(/:$/, '');
-  const origin = `${proto || 'https'}://${host}`;
-
-  const raw = request.nextUrl.searchParams.get('returnTo') || '/';
-  // Same-origin paths only: "/x?y" — anything with a scheme/host falls back to "/".
-  const path = raw.startsWith('/') && !raw.startsWith('//') ? raw : '/';
-
+  const origin = publicOrigin(request);
   const login = new URL('/login', config.auth.authUrl);
-  login.searchParams.set('returnTo', new URL(path, origin).toString());
+  login.searchParams.set('returnTo', sameOriginReturnTo(request.nextUrl.searchParams.get('returnTo'), origin));
   return NextResponse.redirect(login, 302);
 }
+

@@ -4,6 +4,7 @@ import { getCurrentUser } from '@/lib/auth/session';
 import { hasMeetingsAccess } from '@/lib/auth/cli-auth';
 import { resolveAccess } from '@/db-ops/transcript-access';
 import { callerInvolvedCodes } from '@/db-ops/calendar-event-cache';
+import { publicOrigin } from '@/lib/auth/public-origin';
 
 export const runtime = 'nodejs';
 
@@ -21,11 +22,8 @@ export async function GET(
   ctx: { params: Promise<{ id: string }> }
 ) {
   // Behind nginx request.url/nextUrl is localhost:<port> — build the origin
-  // from the forwarded headers or the redirect sends users to localhost.
-  const host =
-    request.headers.get('x-forwarded-host') ?? request.headers.get('host') ?? 'localhost';
-  const proto = request.headers.get('x-forwarded-proto') ?? 'https';
-  const origin = `${proto}://${host}`;
+  // from Host + the nginx-owned proto or the redirect sends users to localhost.
+  const origin = publicOrigin(request);
   const { id } = await ctx.params;
   if (!UUID_RE.test(id)) return NextResponse.redirect(new URL('/', origin));
   // Verify the session + app access (the proxy already does both; this route

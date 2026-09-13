@@ -10,7 +10,11 @@
  * Every value is POSTed to `DARTH_AUTH_INTERNAL_URL/api/introspect` (loopback on
  * the VM) with `service:'meetings'` and cached 60 s in-process keyed by the raw
  * value, so bursts of requests cost one HTTP hop per minute per credential.
- * Transient introspection failures are NOT cached.
+ * Only definitive answers are cached: a positive identity for 60 s, an
+ * `{active:false}` for 5 s. Anything transient — fetch/timeout errors, a
+ * non-2xx status (darth-auth turns any unhandled exception into a 500), or
+ * an unparsable body — is NOT cached, so one hiccup never pins a valid
+ * session to "unauthenticated" for a minute (review finding 2026-09-13).
  *
  * The userId darth-auth returns for `trames-sso` users is the kenoby userId
  * verbatim (SPEC §2.1), so it drops straight into the row-level ACLs keyed on
@@ -50,7 +54,10 @@ export type ResolvedToken = DarthIdentity | AppIdentity;
 export type CliIdentity = DarthIdentity;
 
 const cache = new Map<string, { at: number; identity: ResolvedToken | null }>();
+/** Positive answers (an identity). */
 const TTL = 60_000;
+/** Definitive negatives (`{active:false}`): short, so a revoke/grant lands fast. */
+const NEGATIVE_TTL = 5_000;
 const MAX_ENTRIES = 500;
 
 export function getCliBearer(headerValue: string | null): string | null {
@@ -82,13 +89,15 @@ function toModules(v: unknown): string[] {
 
 /**
  * Resolve any darth credential value via introspection. `null` = inactive,
- * revoked, expired, disabled user, malformed, or introspection unreachable
- * (the last is not cached).
+ * revoked, expired, disabled user, malformed, or introspection unreachable /
+ * errored (the last two are not cached).
  */
 export async function resolveDarthToken(token: string): Promise<ResolvedToken | null> {
   const hit = cache.get(token);
-  if (hit && Date.now() - hit.at < TTL) return hit.identity;
+  if (hit && Date.now() - hit.at < (hit.identity ? TTL : NEGATIVE_TTL)) return hit.identity;
   let identity: ResolvedToken | null = null;
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  let data: any;
   try {
     const res = await fetch(INTROSPECT_URL, {
       method: 'POST',
@@ -98,28 +107,29 @@ export async function resolveDarthToken(token: string): Promise<ResolvedToken | 
       body: JSON.stringify({ token, service: MEETINGS_MODULE }),
       signal: AbortSignal.timeout(3000),
     });
-    if (res.ok) {
-      const data = await res.json();
-      if (data?.active) {
-        if (data.kind === 'app' && data.app) {
-          identity = { kind: 'app', app: String(data.app) };
-        } else if (data.userId && data.email) {
-          identity = {
-            kind: data.kind === 'session' || token.startsWith('dss_') ? 'session' : 'user',
-            userId: String(data.userId),
-            email: String(data.email).toLowerCase(),
-            name: typeof data.name === 'string' ? data.name : undefined,
-            modules: toModules(data.modules),
-            scope: toScope(data.scope),
-            provider: typeof data.provider === 'string' ? data.provider : undefined,
-            expiresAt: typeof data.expiresAt === 'string' ? data.expiresAt : undefined,
-          };
-        }
-      }
-    }
+    // A non-2xx (darth-auth 500 on a PG hiccup, 502 from a restart, …) is
+    // transient: deny THIS request but never cache it as "inactive".
+    if (!res.ok) return null;
+    data = await res.json();
   } catch {
-    // introspection unreachable → treat as invalid, but don't cache a transient failure
+    // unreachable / timeout / unparsable body → treat as invalid, don't cache
     return null;
+  }
+  if (data?.active) {
+    if (data.kind === 'app' && data.app) {
+      identity = { kind: 'app', app: String(data.app) };
+    } else if (data.userId && data.email) {
+      identity = {
+        kind: data.kind === 'session' || token.startsWith('dss_') ? 'session' : 'user',
+        userId: String(data.userId),
+        email: String(data.email).toLowerCase(),
+        name: typeof data.name === 'string' ? data.name : undefined,
+        modules: toModules(data.modules),
+        scope: toScope(data.scope),
+        provider: typeof data.provider === 'string' ? data.provider : undefined,
+        expiresAt: typeof data.expiresAt === 'string' ? data.expiresAt : undefined,
+      };
+    }
   }
   cache.set(token, { at: Date.now(), identity });
   if (cache.size > MAX_ENTRIES) {

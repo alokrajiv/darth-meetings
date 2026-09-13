@@ -1,5 +1,6 @@
 import { NextResponse, type NextRequest } from 'next/server';
 import { config } from '@/config';
+import { publicUrl } from '@/lib/auth/public-origin';
 
 export const runtime = 'nodejs';
 
@@ -10,9 +11,7 @@ export const runtime = 'nodejs';
  * the issuer can clear it); nothing to clear locally.
  */
 export async function GET(request: NextRequest) {
-  const host = request.headers.get('x-forwarded-host') ?? request.headers.get('host') ?? 'localhost';
-  const proto = request.headers.get('x-forwarded-proto') ?? request.nextUrl.protocol.replace(/:$/, '');
   const logout = new URL('/logout', config.auth.authUrl);
-  logout.searchParams.set('returnTo', `${proto || 'https'}://${host}/`);
+  logout.searchParams.set('returnTo', publicUrl(request, '/'));
   return NextResponse.redirect(logout, 302);
 }

@@ -69,12 +69,27 @@ check "dth_ read-only: PUT /api/vocab/user" "403" "$(code -X PUT -H "$RO" -H 'co
 check "dth_ invalid: GET /api/whoami" "401" "$(code -H 'Authorization: Bearer dth_stubstubstubstubstubstubstubDEAD' "$APP/api/whoami")"
 check "dapp_ bearer: GET /api/whoami" "403" "$(code -H 'Authorization: Bearer dapp_stubstubstubstubstubstubstub' "$APP/api/whoami")"
 
+# 6b. transient introspect failure (darth-auth 500) is denied but NOT cached:
+#     the very next call for the same fresh session must succeed.
+FRESH="darth_session=dss_stubstubstubstubstubstubFRESHFULL"
+curl -s -o /dev/null -X POST "$AUTH/_fail?n=1"
+check "introspect 500: GET /api/whoami (denied this once)" "401" "$(code -b "$FRESH" "$APP/api/whoami")"
+check "  same session right after (500 was not cached)" "200" "$(code -b "$FRESH" "$APP/api/whoami")"
+
 # 7. login / logout bounce to darth-auth
 lloc=$(hdr "$APP/login?returnTo=/transcript/abc" | awk 'tolower($1)=="location:"{print $2}')
 check "GET /login?returnTo=/transcript/abc" "302" "$(code "$APP/login?returnTo=/transcript/abc")"
 check "  Location = $AUTH/login?returnTo=<abs app url>" "yes" "$([[ "$lloc" == "$AUTH/login?returnTo="*"%2Ftranscript%2Fabc" ]] && echo yes || echo "no ($lloc)")"
-oloc=$(hdr "$APP/login?returnTo=https://evil.example/x" | awk 'tolower($1)=="location:"{print $2}')
-check "  off-site returnTo neutralised" "yes" "$([[ "$oloc" != *"evil.example"* ]] && echo yes || echo "no ($oloc)")"
+appenc=$(printf '%s' "$APP/" | sed 's#:#%3A#g; s#/#%2F#g')
+for bad in 'https://evil.example/x' '//evil.example/x' '/\evil.example/x' '/\\evil.example/x' 'http://user@evil.example/'; do
+  oloc=$(hdr "$APP/login?returnTo=$bad" | awk 'tolower($1)=="location:"{print $2}')
+  check "  returnTo=$bad neutralised to app root" "yes" "$([[ "$oloc" == "$AUTH/login?returnTo=$appenc" ]] && echo yes || echo "no ($oloc)")"
+done
+# a client-supplied X-Forwarded-Host must not steer returnTo (nginx does not set it)
+sloc=$(hdr "${DOC[@]}" -H 'x-forwarded-host: evil.example' "$APP/settings" | awk 'tolower($1)=="location:"{print $2}')
+check "  spoofed X-Forwarded-Host ignored in sign-in returnTo" "yes" "$([[ "$sloc" != *"evil.example"* && "$sloc" == *"$(printf '%s' "$APP/settings" | sed 's#:#%3A#g; s#/#%2F#g')"* ]] && echo yes || echo "no ($sloc)")"
+sloc=$(hdr -H 'x-forwarded-host: evil.example' "$APP/login?returnTo=/x" | awk 'tolower($1)=="location:"{print $2}')
+check "  spoofed X-Forwarded-Host ignored by /login" "yes" "$([[ "$sloc" != *"evil.example"* ]] && echo yes || echo "no ($sloc)")"
 gloc=$(hdr "$APP/logout" | awk 'tolower($1)=="location:"{print $2}')
 check "GET /logout" "302" "$(code "$APP/logout")"
 check "  Location = $AUTH/logout?returnTo=<app root>" "yes" "$([[ "$gloc" == "$AUTH/logout?returnTo="* ]] && echo yes || echo "no ($gloc)")"
