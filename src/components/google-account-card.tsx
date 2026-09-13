@@ -4,6 +4,8 @@ import { useEffect, useState } from 'react';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
 import { Video, CheckCircle2, AlertTriangle } from 'lucide-react';
+import { OFFLINE_TITLE, useOfflineGate } from '@/lib/offline/offline-context';
+import { isNetworkFailure, offlineAwareError } from '@/lib/offline/offline-fetch';
 
 interface GoogleStatus {
   connected: boolean;
@@ -19,20 +21,38 @@ interface GoogleStatus {
  * powers the background sync-and-remind poller and kills the GIS popup).
  */
 export function GoogleAccountCard() {
-  const [status, setStatus] = useState<GoogleStatus | null>(null);
+  // 'unknown' = offline / network down: never show the not-connected copy
+  // (and its Connect button) for a status we could not read.
+  const [status, setStatus] = useState<GoogleStatus | 'unknown' | null>(null);
   const [busy, setBusy] = useState(false);
   // Post-callback banner: /settings?google=connected|error&reason=…
   const [banner, setBanner] = useState<{ ok: boolean; text: string } | null>(null);
+  const { blocked } = useOfflineGate();
 
   const load = () => {
+    if (blocked) {
+      setStatus('unknown');
+      return;
+    }
     fetch('/api/google/status')
-      .then((r) => (r.ok ? r.json() : null))
+      .then(async (r) => {
+        if (!r.ok) throw await offlineAwareError(r, `status ${r.status}`);
+        return r.json();
+      })
       .then((data) => setStatus(data ?? { connected: false }))
-      .catch(() => setStatus({ connected: false }));
+      .catch((err) => {
+        if (isNetworkFailure(err) || (err instanceof Error && err.message === OFFLINE_TITLE)) setStatus('unknown');
+        else setStatus({ connected: false });
+      });
   };
 
+  // Re-runs when the connection comes back (blocked flips false).
   useEffect(() => {
     load();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [blocked]);
+
+  useEffect(() => {
     const params = new URLSearchParams(window.location.search);
     const outcome = params.get('google');
     if (outcome === 'connected') {
@@ -52,15 +72,18 @@ export function GoogleAccountCard() {
     if (!window.confirm('Disconnect Google? Background sync and reminders will stop.')) return;
     setBusy(true);
     try {
-      await fetch('/api/google/status', { method: 'DELETE' });
+      const res = await fetch('/api/google/status', { method: 'DELETE' });
+      if (!res.ok) throw await offlineAwareError(res, `Disconnect failed (${res.status})`);
       setBanner(null);
       load();
+    } catch (err) {
+      setBanner({ ok: false, text: isNetworkFailure(err) ? OFFLINE_TITLE : err instanceof Error ? err.message : 'Disconnect failed' });
     } finally {
       setBusy(false);
     }
   };
 
-  const needsReconnect = status?.connected && status.status === 'revoked';
+  const needsReconnect = status !== null && status !== 'unknown' && status.connected && status.status === 'revoked';
 
   return (
     <Card>
@@ -90,6 +113,18 @@ export function GoogleAccountCard() {
 
         {status === null ? (
           <p className="text-sm text-muted-foreground">Checking connection…</p>
+        ) : status === 'unknown' ? (
+          <>
+            <p className="text-sm text-muted-foreground">{OFFLINE_TITLE}</p>
+            <div className="flex gap-2">
+              <Button size="sm" disabled title={OFFLINE_TITLE}>
+                Connect Google
+              </Button>
+              <Button size="sm" variant="outline" disabled title={OFFLINE_TITLE}>
+                Disconnect
+              </Button>
+            </div>
+          </>
         ) : !status.connected ? (
           <>
             <p className="text-sm text-muted-foreground">
@@ -99,7 +134,11 @@ export function GoogleAccountCard() {
               removes the Google popup from Meet imports. Read-only access; you can
               disconnect any time.
             </p>
-            <Button onClick={() => (window.location.href = '/api/google/connect')}>
+            <Button
+              disabled={blocked}
+              title={blocked ? OFFLINE_TITLE : undefined}
+              onClick={() => (window.location.href = '/api/google/connect')}
+            >
               Connect Google
             </Button>
           </>
@@ -126,11 +165,16 @@ export function GoogleAccountCard() {
             </div>
             <div className="flex gap-2">
               {needsReconnect && (
-                <Button size="sm" onClick={() => (window.location.href = '/api/google/connect')}>
+                <Button
+                  size="sm"
+                  disabled={blocked}
+                  title={blocked ? OFFLINE_TITLE : undefined}
+                  onClick={() => (window.location.href = '/api/google/connect')}
+                >
                   Reconnect
                 </Button>
               )}
-              <Button size="sm" variant="outline" disabled={busy} onClick={disconnect}>
+              <Button size="sm" variant="outline" disabled={busy || blocked} title={blocked ? OFFLINE_TITLE : undefined} onClick={disconnect}>
                 Disconnect
               </Button>
             </div>

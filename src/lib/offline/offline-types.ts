@@ -162,3 +162,6 @@ export const META_OWNER_USER_ID = 'ownerUserId';
 export const TRANSCRIPT_ESTIMATE_BYTES = 1024 * 1024;
 /** Audio-only derivative: mono AAC 64 kbps ≈ 8 KB per second. */
 export const AUDIO_BYTES_PER_SEC = 8 * 1024;
+
+/** The one tooltip every control that needs the network shows while blocked. */
+export const OFFLINE_TITLE = 'Not available offline';

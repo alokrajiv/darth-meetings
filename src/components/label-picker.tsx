@@ -15,6 +15,8 @@ import {
 } from '@/lib/labels';
 import { refreshLabelCatalog, useLabelCatalog } from '@/hooks/use-label-catalog';
 import { LabelDot, labelDotColor } from '@/components/label-chips';
+import { OFFLINE_TITLE, useOfflineGate } from '@/lib/offline/offline-context';
+import { isNetworkFailure } from '@/lib/offline/offline-fetch';
 
 /**
  * The shared label picker (docs/labels-design.md §4) — used by the listing
@@ -90,6 +92,9 @@ export function LabelPicker({
   resetKey,
 }: LabelPickerProps) {
   const catalog = useLabelCatalog();
+  // Offline mode / network down: every pick/create hits the server, so the
+  // rows stay visible but inert, with one line saying why.
+  const { blocked } = useOfflineGate();
   const [query, setQuery] = useState('');
   const [active, setActive] = useState(0);
   const [busyIds, setBusyIds] = useState<Set<number>>(new Set());
@@ -178,8 +183,17 @@ export function LabelPicker({
   const pick = useCallback(
     async (item: Item) => {
       setError(null);
+      if (blocked) {
+        setError(OFFLINE_TITLE);
+        return;
+      }
       if (item.kind === 'extra') {
-        await extraTop?.onPick();
+        try {
+          await extraTop?.onPick();
+        } catch (err) {
+          setError(isNetworkFailure(err) ? OFFLINE_TITLE : err instanceof Error ? err.message : 'Request failed');
+          return;
+        }
         onClose();
         return;
       }
@@ -207,7 +221,7 @@ export function LabelPicker({
           setQuery('');
           if (mode === 'pick') onClose();
         } catch (err) {
-          setError(err instanceof Error ? err.message : 'Could not create label');
+          setError(isNetworkFailure(err) ? OFFLINE_TITLE : err instanceof Error ? err.message : 'Could not create label');
         } finally {
           creatingRef.current = false;
           setCreating(false);
@@ -226,7 +240,7 @@ export function LabelPicker({
         );
         if (mode === 'pick') onClose();
       } catch (err) {
-        setError(err instanceof Error ? err.message : 'Request failed');
+        setError(isNetworkFailure(err) ? OFFLINE_TITLE : err instanceof Error ? err.message : 'Request failed');
       } finally {
         busyRef.current.delete(row.id);
         setBusyIds((s) => {
@@ -236,7 +250,7 @@ export function LabelPicker({
         });
       }
     },
-    [extraTop, onClose, onSelect, selectedIds, mode]
+    [extraTop, onClose, onSelect, selectedIds, mode, blocked]
   );
 
   if (!anchor) return null;
@@ -293,6 +307,9 @@ export function LabelPicker({
         placeholder={placeholder}
         className="mb-1 h-8 w-full rounded-md border bg-transparent px-2 text-sm outline-none focus:border-primary/50"
       />
+      {blocked && !error && (
+        <p className="px-1.5 pb-1 text-[11px] text-muted-foreground">{OFFLINE_TITLE}</p>
+      )}
       {error && <p className="px-1.5 pb-1 text-[11px] text-destructive">{error}</p>}
       <div ref={listRef} className="max-h-64 overflow-y-auto" role="listbox">
         {!catalog.loaded ? (
@@ -321,11 +338,11 @@ export function LabelPicker({
                   role="option"
                   aria-selected={isActive}
                   data-idx={idx}
-                  disabled={creating}
+                  disabled={creating || blocked}
                   onMouseEnter={() => setActive(idx)}
                   onClick={() => void pick(it)}
-                  className={`${base} ${it.error ? 'text-muted-foreground' : 'text-primary'}`}
-                  title={it.error ?? `Create ${it.path} (creates missing parents)`}
+                  className={`${base} ${it.error ? 'text-muted-foreground' : 'text-primary'} disabled:cursor-not-allowed disabled:opacity-60`}
+                  title={blocked ? OFFLINE_TITLE : (it.error ?? `Create ${it.path} (creates missing parents)`)}
                 >
                   {creating ? (
                     <Loader2 className="h-3.5 w-3.5 shrink-0 animate-spin" />
@@ -347,9 +364,11 @@ export function LabelPicker({
                   role="option"
                   aria-selected={isActive}
                   data-idx={idx}
+                  disabled={blocked}
+                  title={blocked ? OFFLINE_TITLE : undefined}
                   onMouseEnter={() => setActive(idx)}
                   onClick={() => void pick(it)}
-                  className={base}
+                  className={`${base} disabled:cursor-not-allowed disabled:opacity-60`}
                 >
                   <span className="min-w-0 flex-1 truncate">{extraTop?.label}</span>
                   {extraTop?.hint && (
@@ -370,11 +389,11 @@ export function LabelPicker({
                 aria-selected={isActive}
                 data-idx={idx}
                 data-label-option={r.id}
-                disabled={busy}
+                disabled={busy || blocked}
                 onMouseEnter={() => setActive(idx)}
                 onClick={() => void pick(it)}
-                title={r.path}
-                className={base}
+                title={blocked ? OFFLINE_TITLE : r.path}
+                className={`${base} disabled:cursor-not-allowed disabled:opacity-60`}
                 style={searching ? undefined : { paddingLeft: 6 + (r.depth - 1) * 14 }}
               >
                 <span className="grid h-3.5 w-3.5 shrink-0 place-items-center">

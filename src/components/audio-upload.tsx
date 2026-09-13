@@ -35,6 +35,8 @@ import {
 } from '@/lib/google-token';
 import type { StoredTranscript } from '@/lib/format';
 import { uploadFileChunked } from '@/lib/chunked-upload';
+import { OFFLINE_TITLE, useOfflineGate } from '@/lib/offline/offline-context';
+import { isNetworkFailure } from '@/lib/offline/offline-fetch';
 
 /** DOM id of the hidden file input (kept for tests/debug hooks). */
 export const AUDIO_UPLOAD_INPUT_ID = 'audio-upload-file-input';
@@ -168,6 +170,29 @@ function fmtEventDay(e: CalendarEventLite): string {
 }
 
 export function AudioUpload({ onTranscriptCreated }: AudioUploadProps) {
+  // Offline mode / network down: nothing here can reach the server. Every
+  // network-backed control stays visible but disabled; a dropped or picked
+  // file shows a short "Not available offline" notice instead of opening the
+  // stepper. The ref feeds the window-level drop listeners.
+  const { blocked } = useOfflineGate();
+  const blockedRef = useRef(blocked);
+  blockedRef.current = blocked;
+  const [offlineNotice, setOfflineNotice] = useState(false);
+  const offlineNoticeTimer = useRef<number | null>(null);
+  const flashOfflineNotice = useCallback(() => {
+    setOfflineNotice(true);
+    if (offlineNoticeTimer.current !== null) window.clearTimeout(offlineNoticeTimer.current);
+    offlineNoticeTimer.current = window.setTimeout(() => {
+      offlineNoticeTimer.current = null;
+      setOfflineNotice(false);
+    }, 2500);
+  }, []);
+  useEffect(
+    () => () => {
+      if (offlineNoticeTimer.current !== null) window.clearTimeout(offlineNoticeTimer.current);
+    },
+    []
+  );
   const [uploads, setUploads] = useState<UploadStatus[]>([]);
   const [isDragging, setIsDragging] = useState(false);
   const [pendingFiles, setPendingFiles] = useState<File[]>([]);
@@ -461,6 +486,10 @@ export function AudioUpload({ onTranscriptCreated }: AudioUploadProps) {
     (files: FileList) => {
       const all = Array.from(files);
       if (all.length === 0) return;
+      if (blockedRef.current) {
+        flashOfflineNotice();
+        return;
+      }
       const texts = all.filter(isTextTranscriptFile);
       const list = all.filter((f) => !isTextTranscriptFile(f));
 
@@ -522,7 +551,7 @@ export function AudioUpload({ onTranscriptCreated }: AudioUploadProps) {
       setStep(googleOk === false && !connectSkipped ? 'connect' : 'files');
       setIsDialogOpen(true);
     },
-    [googleOk, connectSkipped, isDialogOpen, prefill]
+    [googleOk, connectSkipped, isDialogOpen, prefill, flashOfflineNotice]
   );
 
   /** Load the day's calendar events for the link step and the 'pick' step's
@@ -532,6 +561,14 @@ export function AudioUpload({ onTranscriptCreated }: AudioUploadProps) {
    * pre-link is dropped so the banner never promises a link it can't make. */
   const loadDayEvents = useCallback(
     async (forDate: string, preselect?: string | null) => {
+      if (blockedRef.current) {
+        // No calendar reachable — the link step shows its own offline line.
+        if (preselect) setPrefill(null);
+        setDayEvents([]);
+        setEventsBusy(false);
+        setEventsError(null);
+        return;
+      }
       setEventsBusy(true);
       setEventsError(null);
       try {
@@ -565,6 +602,8 @@ export function AudioUpload({ onTranscriptCreated }: AudioUploadProps) {
         if (preselect) setPrefill(null);
         if (err instanceof GoogleNotConnectedError) {
           setGoogleOk(false);
+        } else if (isNetworkFailure(err)) {
+          setEventsError(OFFLINE_TITLE);
         } else {
           setEventsError(err instanceof Error ? err.message : 'Failed to load calendar');
         }
@@ -716,7 +755,7 @@ export function AudioUpload({ onTranscriptCreated }: AudioUploadProps) {
       });
       onTranscriptCreated?.();
     } catch (err) {
-      setPasteError(err instanceof Error ? err.message : 'Import failed');
+      setPasteError(isNetworkFailure(err) ? OFFLINE_TITLE : err instanceof Error ? err.message : 'Import failed');
     } finally {
       setPasteBusy(false);
     }
@@ -765,7 +804,7 @@ export function AudioUpload({ onTranscriptCreated }: AudioUploadProps) {
       setTextFiles([]);
       onTranscriptCreated?.();
     } catch (err) {
-      setTextError(err instanceof Error ? err.message : 'Import failed');
+      setTextError(isNetworkFailure(err) ? OFFLINE_TITLE : err instanceof Error ? err.message : 'Import failed');
     } finally {
       setTextBusy(false);
     }
@@ -795,7 +834,13 @@ export function AudioUpload({ onTranscriptCreated }: AudioUploadProps) {
       depth = 0;
       setIsDragging(false);
       if (!hasFiles(e)) return;
+      // Always swallow the drop — otherwise the browser navigates the tab
+      // to the file. While blocked, say why instead of opening the stepper.
       e.preventDefault();
+      if (blockedRef.current) {
+        flashOfflineNotice();
+        return;
+      }
       if (e.dataTransfer && e.dataTransfer.files.length > 0) {
         handleFilesSelected(e.dataTransfer.files);
       }
@@ -810,7 +855,7 @@ export function AudioUpload({ onTranscriptCreated }: AudioUploadProps) {
       window.removeEventListener('dragleave', onLeave);
       window.removeEventListener('drop', onDrop);
     };
-  }, [handleFilesSelected]);
+  }, [handleFilesSelected, flashOfflineNotice]);
 
   // Closing the tab kills the in-flight XHR and everything sent so far —
   // there is no resume. Once the POST returns (status 'transcribing') the
@@ -906,13 +951,31 @@ export function AudioUpload({ onTranscriptCreated }: AudioUploadProps) {
           <div className="pointer-events-none fixed inset-0 z-50 grid place-items-center bg-background/80 backdrop-blur-sm">
             <div className="rounded-xl border-2 border-dashed border-primary bg-card px-10 py-8 text-center shadow-lg">
               <Upload className="mx-auto h-6 w-6 text-primary" />
-              <p className="mt-3 text-sm font-medium">
-                Drop a recording or transcript file
-              </p>
-              <p className="mt-1 text-xs text-muted-foreground">
-                audio/video up to 4 GB · or .txt · .docx · .pdf · .rtf
-              </p>
+              {blocked ? (
+                <>
+                  <p className="mt-3 text-sm font-medium">{OFFLINE_TITLE}</p>
+                  <p className="mt-1 text-xs text-muted-foreground">Uploads need a connection.</p>
+                </>
+              ) : (
+                <>
+                  <p className="mt-3 text-sm font-medium">
+                    Drop a recording or transcript file
+                  </p>
+                  <p className="mt-1 text-xs text-muted-foreground">
+                    audio/video up to 4 GB · or .txt · .docx · .pdf · .rtf
+                  </p>
+                </>
+              )}
             </div>
+          </div>
+        )}
+        {offlineNotice && (
+          <div
+            role="status"
+            className="pointer-events-none fixed bottom-6 left-1/2 z-50 -translate-x-1/2 rounded-md border bg-card px-4 py-2 text-sm shadow-lg"
+          >
+            <AlertCircle className="mr-1.5 inline h-4 w-4 text-muted-foreground" />
+            {OFFLINE_TITLE}
           </div>
         )}
 
@@ -1054,7 +1117,9 @@ export function AudioUpload({ onTranscriptCreated }: AudioUploadProps) {
                   <button
                     type="button"
                     onClick={() => fileInputRef.current?.click()}
-                    className="w-full rounded-xl border-2 border-dashed p-6 text-center transition-colors hover:border-primary hover:bg-muted/40"
+                    disabled={blocked}
+                    title={blocked ? OFFLINE_TITLE : undefined}
+                    className="w-full rounded-xl border-2 border-dashed p-6 text-center transition-colors hover:border-primary hover:bg-muted/40 disabled:cursor-not-allowed disabled:opacity-60 disabled:hover:border-border disabled:hover:bg-transparent"
                   >
                     <Upload className="mx-auto h-6 w-6 text-primary" />
                     <p className="mt-2 text-sm font-medium">
@@ -1095,7 +1160,8 @@ export function AudioUpload({ onTranscriptCreated }: AudioUploadProps) {
                           onClick={() => void importTextFiles()}
                           // Wait for the pre-link banner to resolve, same as
                           // the paste lane — no importing without its event.
-                          disabled={textBusy || (!!prefill && eventsBusy)}
+                          disabled={blocked || textBusy || (!!prefill && eventsBusy)}
+                          title={blocked ? OFFLINE_TITLE : undefined}
                         >
                           {textBusy ? (
                             <Loader2 className="h-4 w-4 animate-spin" />
@@ -1149,10 +1215,12 @@ export function AudioUpload({ onTranscriptCreated }: AudioUploadProps) {
                         // Also wait for the pre-link banner to resolve, so a
                         // fast paste doesn't import without its event link.
                         disabled={
+                          blocked ||
                           pasteBusy ||
                           pasteText.trim().length < 20 ||
                           (!!prefill && eventsBusy)
                         }
+                        title={blocked ? OFFLINE_TITLE : undefined}
                       >
                         {pasteBusy ? (
                           <Loader2 className="h-4 w-4 animate-spin" />
@@ -1338,6 +1406,8 @@ export function AudioUpload({ onTranscriptCreated }: AudioUploadProps) {
                     size="sm"
                     variant="outline"
                     onClick={() => connectGoogle('/')}
+                    disabled={blocked}
+                    title={blocked ? OFFLINE_TITLE : undefined}
                   >
                     <CalendarDays className="h-4 w-4" />
                     Connect Google Calendar
@@ -1355,7 +1425,8 @@ export function AudioUpload({ onTranscriptCreated }: AudioUploadProps) {
                       variant="outline"
                       size="sm"
                       onClick={() => changeLinkDate(shiftDate(linkDate, -1))}
-                      disabled={eventsBusy}
+                      disabled={eventsBusy || blocked}
+                      title={blocked ? OFFLINE_TITLE : undefined}
                     >
                       <ChevronLeft className="h-4 w-4" />
                     </Button>
@@ -1364,13 +1435,15 @@ export function AudioUpload({ onTranscriptCreated }: AudioUploadProps) {
                       value={linkDate}
                       onChange={(e) => e.target.value && changeLinkDate(e.target.value)}
                       className="w-36"
-                      disabled={eventsBusy}
+                      disabled={eventsBusy || blocked}
+                      title={blocked ? OFFLINE_TITLE : undefined}
                     />
                     <Button
                       variant="outline"
                       size="sm"
                       onClick={() => changeLinkDate(shiftDate(linkDate, 1))}
-                      disabled={eventsBusy}
+                      disabled={eventsBusy || blocked}
+                      title={blocked ? OFFLINE_TITLE : undefined}
                     >
                       <ChevronRight className="h-4 w-4" />
                     </Button>
@@ -1390,7 +1463,11 @@ export function AudioUpload({ onTranscriptCreated }: AudioUploadProps) {
                         Not from a calendar meeting
                       </span>
                     </label>
-                    {dayEvents.length === 0 && !eventsBusy ? (
+                    {blocked ? (
+                      <p className="p-3 text-xs text-muted-foreground">
+                        Calendar linking — {OFFLINE_TITLE}
+                      </p>
+                    ) : dayEvents.length === 0 && !eventsBusy ? (
                       <p className="p-3 text-xs text-muted-foreground">
                         No timed events on this day.
                       </p>
@@ -1567,7 +1644,7 @@ export function AudioUpload({ onTranscriptCreated }: AudioUploadProps) {
                 >
                   Skip for now
                 </Button>
-                <Button onClick={() => connectGoogle('/')}>
+                <Button onClick={() => connectGoogle('/')} disabled={blocked} title={blocked ? OFFLINE_TITLE : undefined}>
                   <CalendarDays className="h-4 w-4" />
                   Connect Google Calendar
                 </Button>
@@ -1613,7 +1690,9 @@ export function AudioUpload({ onTranscriptCreated }: AudioUploadProps) {
                 >
                   Back
                 </Button>
-                <Button onClick={handleConfirmUpload}>Start Transcription</Button>
+                <Button onClick={handleConfirmUpload} disabled={blocked} title={blocked ? OFFLINE_TITLE : undefined}>
+                  Start Transcription
+                </Button>
               </>
             )}
           </DialogFooter>

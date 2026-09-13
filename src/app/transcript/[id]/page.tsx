@@ -46,7 +46,8 @@ import { RerunDiarizationButton } from '@/components/rerun-diarization-button';
 import { TranscriptSourcesCard } from '@/components/transcript-sources-card';
 import { MeetingInfoCard } from '@/components/meeting-info-card';
 import { OfflinePinDialog, OfflinePinStatus } from '@/components/offline-pin-dialog';
-import { useOffline } from '@/lib/offline/offline-context';
+import { OFFLINE_TITLE, useOffline, useOfflineGate } from '@/lib/offline/offline-context';
+import { isNetworkFailure } from '@/lib/offline/offline-fetch';
 import { getPin } from '@/lib/offline/offline-pins';
 import { OFFLINE_CHANGE_EVENT, type PinRecord, type PlanMediaPart } from '@/lib/offline/offline-types';
 import type { PickerPerson } from '@/components/user-picker';
@@ -87,9 +88,10 @@ import {
   Trash2,
 } from 'lucide-react';
 
-/** Tooltip on every control that needs the server while in offline mode. */
-const OFFLINE_TITLE = 'Not available offline';
 const VIDEO_EXT_RE = /\.(mp4|webm|mov|mkv|m4v)$/i;
+/** Offline mode, row still 'running'/'processing' in the cached copy. */
+const OFFLINE_IN_PROGRESS_COPY =
+  'This was still in progress when the offline copy was saved — reconnect to see the result.';
 
 /**
  * Find the index of the utterance whose [start, end) interval contains the
@@ -196,6 +198,8 @@ function TranscriptDetailInner({ transcriptId }: { transcriptId: string }) {
   // only holds the audio-only derivative, a 'video' pin holds both).
   const { mode: offlineMode, ready: offlineReady } = useOffline();
   const offline = offlineMode === 'offline';
+  // `blocked` = offline mode OR the probe says the network is down.
+  const { blocked } = useOfflineGate();
   const [offlinePinOpen, setOfflinePinOpen] = useState(false);
   const [offlinePin, setOfflinePin] = useState<PinRecord | null>(null);
   useEffect(() => {
@@ -608,6 +612,7 @@ function TranscriptDetailInner({ transcriptId }: { transcriptId: string }) {
   // running (its suggestions feed the review dialog) — poll the row and
   // refresh speaker suggestions.
   useEffect(() => {
+    if (offline) return; // offline mode: the cached copy is what it is — no polling
     if (row?.auto_notes_status !== 'running' && row?.speaker_id_status !== 'running') return;
     const timer = setInterval(async () => {
       try {
@@ -647,7 +652,7 @@ function TranscriptDetailInner({ transcriptId }: { transcriptId: string }) {
       }
     }, 5000);
     return () => clearInterval(timer);
-  }, [row?.auto_notes_status, row?.speaker_id_status, transcriptId, editingTitle]);
+  }, [row?.auto_notes_status, row?.speaker_id_status, transcriptId, editingTitle, offline]);
 
   // AI usage stats for the summary footer ("$0.31 · 52s"). Refetched when a
   // generation completes (auto_notes_at changes).
@@ -701,6 +706,7 @@ function TranscriptDetailInner({ transcriptId }: { transcriptId: string }) {
   // poll until the status settles, then do a full reload — no more manual
   // browser refreshes to see the finished transcript.
   useEffect(() => {
+    if (offline) return; // offline mode: no polling
     const status = row?.status;
     if (status !== 'processing' && status !== 'queued') return;
     const timer = setInterval(async () => {
@@ -716,7 +722,7 @@ function TranscriptDetailInner({ transcriptId }: { transcriptId: string }) {
       }
     }, 8000);
     return () => clearInterval(timer);
-  }, [row?.status, transcriptId, loadAll]);
+  }, [row?.status, transcriptId, loadAll, offline]);
 
   const [guessingSpeakers, setGuessingSpeakers] = useState(false);
   const handleGuessSpeakers = useCallback(async () => {
@@ -869,9 +875,16 @@ function TranscriptDetailInner({ transcriptId }: { transcriptId: string }) {
   const reportQueued = !!row?.gmeet_context?.pendingVideoReport;
   const reportScheduledAt = row?.gmeet_context?.pendingVideoReport?.runAfter ?? null;
 
+  const [cancelReportError, setCancelReportError] = useState<string | null>(null);
   const cancelPendingReport = useCallback(async () => {
-    const res = await fetch(`/api/transcripts/${transcriptId}/report`, { method: 'DELETE' });
-    if (res.ok) void loadAll({ silent: true });
+    setCancelReportError(null);
+    try {
+      const res = await fetch(`/api/transcripts/${transcriptId}/report`, { method: 'DELETE' });
+      if (!res.ok) throw new Error(`Could not cancel the report (${res.status})`);
+      void loadAll({ silent: true });
+    } catch (err) {
+      setCancelReportError(isNetworkFailure(err) ? OFFLINE_TITLE : err instanceof Error ? err.message : 'Could not cancel the report');
+    }
   }, [transcriptId, loadAll]);
 
   // --- Multi-video meetings (stop-restart recordings → several files) ---
@@ -1046,6 +1059,7 @@ function TranscriptDetailInner({ transcriptId }: { transcriptId: string }) {
   // Safety net for the report status: live events normally push the refresh,
   // but poll while running in case the SSE stream is down.
   useEffect(() => {
+    if (offline) return; // offline mode: no polling
     if (row?.auto_report_status !== 'running') return;
     const timer = setInterval(async () => {
       try {
@@ -1061,7 +1075,7 @@ function TranscriptDetailInner({ transcriptId }: { transcriptId: string }) {
     }, 10000);
     return () => clearInterval(timer);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [row?.auto_report_status, transcriptId]);
+  }, [row?.auto_report_status, transcriptId, offline]);
 
   // ⌘F / Ctrl+F → toggle find-and-replace panel
   useEffect(() => {
@@ -2368,12 +2382,13 @@ function TranscriptDetailInner({ transcriptId }: { transcriptId: string }) {
               </button>
               <button
                 type="button"
+                disabled={blocked}
                 onClick={() => {
                   setOverflowMenuOpen(false);
                   setOfflinePinOpen(true);
                 }}
-                className="flex w-full items-center gap-2 rounded px-3 py-1.5 text-left text-sm hover:bg-muted"
-                title="Keep this meeting on this device for reading without a connection"
+                className="flex w-full items-center gap-2 rounded px-3 py-1.5 text-left text-sm hover:bg-muted disabled:opacity-50"
+                title={blocked ? OFFLINE_TITLE : 'Keep this meeting on this device for reading without a connection'}
               >
                 <CloudDownload className="h-3.5 w-3.5 text-muted-foreground" />
                 Save for offline…
@@ -2496,9 +2511,13 @@ function TranscriptDetailInner({ transcriptId }: { transcriptId: string }) {
               (row.status === 'error' ? (
                 <Badge variant="destructive">Failed</Badge>
               ) : (
-                <Badge variant="secondary" className="gap-1">
-                  <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-status-busy" />
-                  Processing
+                <Badge
+                  variant="secondary"
+                  className="gap-1"
+                  title={offline ? OFFLINE_IN_PROGRESS_COPY : undefined}
+                >
+                  <span className={`h-1.5 w-1.5 rounded-full bg-status-busy ${offline ? '' : 'animate-pulse'}`} />
+                  {offline ? 'In progress when saved' : 'Processing'}
                 </Badge>
               ))}
             <span className="inline-flex items-center gap-1 rounded-md bg-muted px-1.5 py-0.5 text-[11px]">
@@ -2528,12 +2547,14 @@ function TranscriptDetailInner({ transcriptId }: { transcriptId: string }) {
               ctx={row.gmeet_context}
               generated={row.auto_notes_status === 'completed' || row.auto_report_status === 'completed'}
               onOpenSeries={setOpenSeriesId}
+              disabled={blocked}
             />
             {seriesMembership !== 'loading' && (
               <SeriesBadge
                 assemblyaiId={transcriptId}
                 membership={seriesMembership}
                 defaultTitle={title.trim() || row.original_filename}
+                disabled={blocked}
                 onOpenSeries={setOpenSeriesId}
                 onChanged={loadSeriesInfo}
                 variant="full"
@@ -2808,15 +2829,22 @@ function TranscriptDetailInner({ transcriptId }: { transcriptId: string }) {
                         {access !== 'read' && (
                           <button
                             type="button"
-                            className="shrink-0 rounded border px-1.5 py-0.5 hover:bg-muted"
+                            className="shrink-0 rounded border px-1.5 py-0.5 hover:bg-muted disabled:cursor-not-allowed disabled:opacity-50"
+                            disabled={blocked}
+                            title={blocked ? OFFLINE_TITLE : undefined}
                             onClick={() => void cancelPendingReport()}
                           >
                             Cancel
                           </button>
                         )}
+                        {cancelReportError && (
+                          <span className="shrink-0 text-destructive">{cancelReportError}</span>
+                        )}
                       </div>
                     )}
-                    {row.auto_report_status === 'running' ? (
+                    {row.auto_report_status === 'running' && offline ? (
+                        <p className="py-4 text-xs text-muted-foreground">{OFFLINE_IN_PROGRESS_COPY}</p>
+                      ) : row.auto_report_status === 'running' ? (
                         <div className="space-y-2 py-2">
                           {['95%', '100%', '85%', '90%', '70%'].map((w, i) => (
                             <div key={i} className="h-3 animate-pulse rounded bg-muted" style={{ width: w }} />
@@ -2960,7 +2988,9 @@ function TranscriptDetailInner({ transcriptId }: { transcriptId: string }) {
                           </Button>
                         </div>
                       )}
-                    {row.auto_notes_status === 'running' ? (
+                    {row.auto_notes_status === 'running' && offline ? (
+                      <p className="py-4 text-xs text-muted-foreground">{OFFLINE_IN_PROGRESS_COPY}</p>
+                    ) : row.auto_notes_status === 'running' ? (
                       <div className="space-y-2 py-2">
                         {['90%', '100%', '80%', '95%', '60%'].map((w, i) => (
                           <div
@@ -3071,7 +3101,8 @@ function TranscriptDetailInner({ transcriptId }: { transcriptId: string }) {
                               size="sm"
                               variant="outline"
                               className="mt-3"
-                              disabled={generatingNotes || reviewSpeakers.length === 0}
+                              disabled={blocked || generatingNotes || reviewSpeakers.length === 0}
+                              title={blocked ? OFFLINE_TITLE : undefined}
                               onClick={() => setReviewOpen(true)}
                             >
                               Review speakers now
@@ -3501,10 +3532,13 @@ function TranscriptDetailInner({ transcriptId }: { transcriptId: string }) {
           speakerLabels={speakerLabels}
           suggestions={speakerSuggestions}
           identifying={row.speaker_id_status === 'running'}
+          disabled={blocked}
           onConfirm={handleReviewConfirm}
           onSkip={() => {
             setReviewOpen(false);
-            void runPostReviewGeneration();
+            runPostReviewGeneration().catch(() => {
+              /* surfaced by the row's error state on the next reload */
+            });
           }}
         />
 

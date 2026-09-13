@@ -10,6 +10,8 @@ import {
 import { Button } from '@/components/ui/button';
 import { Badge } from '@/components/ui/badge';
 import { getGoogleAccessToken, GoogleNotConnectedError } from '@/lib/google-token';
+import { OFFLINE_TITLE, useOfflineGate } from '@/lib/offline/offline-context';
+import { isNetworkFailure, offlineAwareError } from '@/lib/offline/offline-fetch';
 import {
   Repeat,
   Loader2,
@@ -483,8 +485,19 @@ function CoverageStrip({ occurrences }: { occurrences: Occurrence[] }) {
 
 export function SeriesDialog({ seriesId, onClose, onChanged, onMerged }: SeriesDialogProps) {
   const [detail, setDetail] = useState<SeriesDetail | null>(null);
+  // Why the detail could not load (was a bare spinner forever) — Retry + Close.
+  const [detailError, setDetailError] = useState<string | null>(null);
+  // One inline line for the bare mutations (confirm/reject/remove/rename/delete).
+  const [actionError, setActionError] = useState<string | null>(null);
   const [occ, setOcc] = useState<OccurrencesResult | null>(null);
-  const [occError, setOccError] = useState(false);
+  const [occError, setOccError] = useState<false | string>(false);
+  // Offline mode / network down: nothing in this dialog works without the
+  // server — banner + one disabled <fieldset> around the body; Close stays live.
+  const { blocked } = useOfflineGate();
+  const extLink = (className: string, title?: string) =>
+    blocked
+      ? { className: `${className} pointer-events-none opacity-50`, title: OFFLINE_TITLE, 'aria-disabled': true, tabIndex: -1 }
+      : { className, title };
   const [busyIds, setBusyIds] = useState<Set<string>>(new Set());
   const [importErrors, setImportErrors] = useState<Map<string, string>>(new Map());
   const [massProgress, setMassProgress] = useState<{ done: number; total: number } | null>(null);
@@ -505,25 +518,39 @@ export function SeriesDialog({ seriesId, onClose, onChanged, onMerged }: SeriesD
 
   const loadDetail = useCallback(async () => {
     if (!seriesId) return;
-    const res = await fetch(`/api/series/${seriesId}`);
-    if (res.ok) setDetail((await res.json()) as SeriesDetail);
-  }, [seriesId]);
+    if (blocked) {
+      setDetailError(OFFLINE_TITLE);
+      return;
+    }
+    setDetailError(null);
+    try {
+      const res = await fetch(`/api/series/${seriesId}`);
+      if (!res.ok) throw await offlineAwareError(res, `Couldn't load this series (${res.status})`);
+      setDetail((await res.json()) as SeriesDetail);
+    } catch (err) {
+      setDetailError(isNetworkFailure(err) ? OFFLINE_TITLE : err instanceof Error ? err.message : "Couldn't load this series");
+    }
+  }, [seriesId, blocked]);
 
   const loadOccurrences = useCallback(
     async (forceRefresh = false) => {
       if (!seriesId) return;
+      if (blocked) {
+        setOccError(OFFLINE_TITLE);
+        return;
+      }
       setOccError(false);
       try {
         const res = await fetch(
           `/api/series/${seriesId}/occurrences${forceRefresh ? '?refresh=1' : ''}`
         );
-        if (!res.ok) throw new Error(String(res.status));
+        if (!res.ok) throw await offlineAwareError(res, String(res.status));
         setOcc((await res.json()) as OccurrencesResult);
-      } catch {
-        setOccError(true);
+      } catch (err) {
+        setOccError(isNetworkFailure(err) || (err instanceof Error && err.message === OFFLINE_TITLE) ? OFFLINE_TITLE : 'failed');
       }
     },
-    [seriesId]
+    [seriesId, blocked]
   );
 
   useEffect(() => {
@@ -534,6 +561,8 @@ export function SeriesDialog({ seriesId, onClose, onChanged, onMerged }: SeriesD
     setMergeOpen(false);
     setMergeTargets(null);
     setMergeError(null);
+    setActionError(null);
+    setDetailError(null);
     setExpanded(new Set());
     if (seriesId) {
       void loadDetail();
@@ -548,42 +577,63 @@ export function SeriesDialog({ seriesId, onClose, onChanged, onMerged }: SeriesD
   }, [loadDetail, loadOccurrences, onChanged]);
 
   // ---- membership actions -------------------------------------------------
+  /** Run one bare mutation; a failure lands on the inline error line instead
+   * of an unhandled rejection. Returns true when the request succeeded. */
+  const guarded = async (label: string, run: () => Promise<Response>): Promise<boolean> => {
+    setActionError(null);
+    try {
+      const res = await run();
+      if (!res.ok) throw await offlineAwareError(res, `${label} failed (${res.status})`);
+      return true;
+    } catch (err) {
+      setActionError(isNetworkFailure(err) ? OFFLINE_TITLE : err instanceof Error ? err.message : `${label} failed`);
+      return false;
+    }
+  };
   const confirmSuggestion = async (assemblyaiId: string) => {
     if (!seriesId) return;
-    await fetch(`/api/series/${seriesId}/members`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ transcriptId: assemblyaiId, how: 'confirmed' }),
-    });
-    refresh();
+    const ok = await guarded('Confirm', () =>
+      fetch(`/api/series/${seriesId}/members`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ transcriptId: assemblyaiId, how: 'confirmed' }),
+      })
+    );
+    if (ok) refresh();
   };
   const rejectSuggestion = async (assemblyaiId: string) => {
     if (!seriesId) return;
-    await fetch(
-      `/api/series/${seriesId}/members?transcriptId=${encodeURIComponent(assemblyaiId)}&remember=1`,
-      { method: 'DELETE' }
+    const ok = await guarded('Reject', () =>
+      fetch(
+        `/api/series/${seriesId}/members?transcriptId=${encodeURIComponent(assemblyaiId)}&remember=1`,
+        { method: 'DELETE' }
+      )
     );
-    refresh();
+    if (ok) refresh();
   };
   const removeMember = async (assemblyaiId: string) => {
     if (!seriesId) return;
     if (!confirm('Remove this meeting from the series? It won’t be suggested again.')) return;
-    await fetch(
-      `/api/series/${seriesId}/members?transcriptId=${encodeURIComponent(assemblyaiId)}&remember=1`,
-      { method: 'DELETE' }
+    const ok = await guarded('Remove', () =>
+      fetch(
+        `/api/series/${seriesId}/members?transcriptId=${encodeURIComponent(assemblyaiId)}&remember=1`,
+        { method: 'DELETE' }
+      )
     );
-    refresh();
+    if (ok) refresh();
   };
   const rename = async () => {
     if (!seriesId || !detail) return;
     const title = prompt('Series name', detail.series.title)?.trim();
     if (!title || title === detail.series.title) return;
-    await fetch(`/api/series/${seriesId}`, {
-      method: 'PATCH',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ title }),
-    });
-    refresh();
+    const ok = await guarded('Rename', () =>
+      fetch(`/api/series/${seriesId}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ title }),
+      })
+    );
+    if (ok) refresh();
   };
   // ---- auto-import config -------------------------------------------------
   // Optimistic + latest-wins: the UI flips instantly, one PATCH is in flight
@@ -663,7 +713,8 @@ export function SeriesDialog({ seriesId, onClose, onChanged, onMerged }: SeriesD
     if (!seriesId) return;
     if (!confirm('Delete this series? Transcripts are kept — only the grouping goes away.'))
       return;
-    await fetch(`/api/series/${seriesId}`, { method: 'DELETE' });
+    const ok = await guarded('Delete', () => fetch(`/api/series/${seriesId}`, { method: 'DELETE' }));
+    if (!ok) return;
     onChanged();
     onClose();
   };
@@ -673,14 +724,16 @@ export function SeriesDialog({ seriesId, onClose, onChanged, onMerged }: SeriesD
     setMergeOpen(true);
     setMergeError(null);
     if (mergeTargets === null) {
-      const res = await fetch('/api/series');
-      if (res.ok) {
+      // A failed list is an error, not "No other series".
+      try {
+        const res = await fetch('/api/series');
+        if (!res.ok) throw await offlineAwareError(res, `Couldn't list series (${res.status})`);
         const j = (await res.json()) as {
           series: Array<{ id: number; title: string; member_count: number }>;
         };
         setMergeTargets(j.series.filter((s) => s.id !== seriesId));
-      } else {
-        setMergeTargets([]);
+      } catch (err) {
+        setMergeError(isNetworkFailure(err) ? OFFLINE_TITLE : err instanceof Error ? err.message : "Couldn't list series");
       }
     }
   };
@@ -704,14 +757,14 @@ export function SeriesDialog({ seriesId, onClose, onChanged, onMerged }: SeriesD
         body: JSON.stringify({ fromSeriesId: seriesId }),
       });
       if (!res.ok) {
-        const j = (await res.json().catch(() => null)) as { error?: string } | null;
-        throw new Error(j?.error ?? `Merge failed (${res.status})`);
+        const j = (await res.json().catch(() => null)) as { error?: string; offline?: boolean } | null;
+        throw new Error(j?.offline === true ? OFFLINE_TITLE : (j?.error ?? `Merge failed (${res.status})`));
       }
       onChanged();
       if (onMerged) onMerged(target.id);
       else onClose();
     } catch (err) {
-      setMergeError(err instanceof Error ? err.message : 'Merge failed');
+      setMergeError(isNetworkFailure(err) ? OFFLINE_TITLE : err instanceof Error ? err.message : 'Merge failed');
     } finally {
       setMergeBusy(false);
     }
@@ -769,16 +822,18 @@ export function SeriesDialog({ seriesId, onClose, onChanged, onMerged }: SeriesD
         }
         if (res.ok || res.status === 409) return null; // 409 = already imported
         const j = (await res.json().catch(() => null)) as
-          | { error?: string; emptyTranscript?: boolean }
+          | { error?: string; emptyTranscript?: boolean; offline?: boolean }
           | null;
         // Empty transcript Doc (no speech captured): not a failure — the
         // sweep now shows the occurrence as "transcript empty".
         if (res.status === 422 && j?.emptyTranscript) return null;
+        if (res.status === 503 && j?.offline === true) return OFFLINE_TITLE;
         return j?.error ?? `Import failed (${res.status})`;
       } catch (err) {
         if (err instanceof GoogleNotConnectedError) {
           return 'Connect Google first (Import meeting → Connect), then retry.';
         }
+        if (isNetworkFailure(err)) return OFFLINE_TITLE;
         return err instanceof Error ? err.message : 'Import failed';
       }
     },
@@ -859,18 +914,42 @@ export function SeriesDialog({ seriesId, onClose, onChanged, onMerged }: SeriesD
               size="sm"
               className="h-6 w-6 shrink-0 p-0 text-muted-foreground"
               onClick={() => void rename()}
-              title="Rename series"
+              disabled={blocked}
+              title={blocked ? OFFLINE_TITLE : 'Rename series'}
             >
               <Pencil className="h-3 w-3" />
             </Button>
           </DialogTitle>
         </DialogHeader>
 
+        {blocked && (
+          <p className="rounded-md border border-amber-500/40 bg-amber-500/10 px-3 py-1.5 text-xs text-amber-800 dark:text-amber-300" data-series-offline-banner>
+            {OFFLINE_TITLE}
+          </p>
+        )}
+        {actionError && <p className="text-xs text-destructive">{actionError}</p>}
+
         {!detail ? (
-          <div className="flex items-center justify-center py-10 text-muted-foreground">
-            <Loader2 className="h-5 w-5 animate-spin" />
-          </div>
+          detailError ? (
+            <div className="flex flex-col items-center gap-3 py-10 text-center text-sm text-muted-foreground">
+              <p>{detailError}</p>
+              <div className="flex gap-2">
+                <Button variant="outline" size="sm" onClick={() => void loadDetail()} disabled={blocked} title={blocked ? OFFLINE_TITLE : undefined}>
+                  <RefreshCw className="h-3.5 w-3.5" />
+                  Retry
+                </Button>
+                <Button variant="ghost" size="sm" onClick={onClose}>
+                  Close
+                </Button>
+              </div>
+            </div>
+          ) : (
+            <div className="flex items-center justify-center py-10 text-muted-foreground">
+              <Loader2 className="h-5 w-5 animate-spin" />
+            </div>
+          )
         ) : (
+          <fieldset disabled={blocked} className="contents">
           <div className="space-y-4">
             {/* ---- guessed members ------------------------------------- */}
             {detail.suggestions.length > 0 && (
@@ -916,8 +995,8 @@ export function SeriesDialog({ seriesId, onClose, onChanged, onMerged }: SeriesD
                             href={`/transcript/${s.assemblyai_id}`}
                             target="_blank"
                             rel="noopener noreferrer"
-                            className="inline-flex min-w-0 flex-1 items-center gap-1 truncate text-sm hover:text-primary"
-                            title="Open this meeting (new tab)"
+                            {...extLink('inline-flex min-w-0 flex-1 items-center gap-1 truncate text-sm hover:text-primary', 'Open this meeting (new tab)')}
+
                           >
                             <span className="truncate">{s.title || 'Untitled meeting'}</span>
                             <ExternalLink className="h-3 w-3 shrink-0 text-muted-foreground/60" />
@@ -1060,8 +1139,8 @@ export function SeriesDialog({ seriesId, onClose, onChanged, onMerged }: SeriesD
                       href="/settings#notifications"
                       target="_blank"
                       rel="noopener noreferrer"
-                      className="inline-flex items-center gap-1 rounded px-1.5 py-0.5 text-[11px] text-muted-foreground hover:bg-muted hover:text-foreground"
-                      title="Which Slack DMs you get (auto-import landed, review needed, …) — opens Settings in a new tab"
+                      {...extLink('inline-flex items-center gap-1 rounded px-1.5 py-0.5 text-[11px] text-muted-foreground hover:bg-muted hover:text-foreground', 'Which Slack DMs you get (auto-import landed, review needed, …) — opens Settings in a new tab')}
+
                     >
                       <Bell className="h-3 w-3" /> Notifications
                     </a>
@@ -1230,8 +1309,8 @@ export function SeriesDialog({ seriesId, onClose, onChanged, onMerged }: SeriesD
                           href={`/series?series=${d.id}`}
                           target="_blank"
                           rel="noopener noreferrer"
-                          className="inline-flex items-center gap-1 text-xs text-primary hover:underline"
-                          title="Open the other series in a new tab to compare before merging"
+                          {...extLink('inline-flex items-center gap-1 text-xs text-primary hover:underline', 'Open the other series in a new tab to compare before merging')}
+
                         >
                           View it <ExternalLink className="h-3 w-3" />
                         </a>
@@ -1328,8 +1407,8 @@ export function SeriesDialog({ seriesId, onClose, onChanged, onMerged }: SeriesD
                 </div>
               ) : occError ? (
                 <div className="rounded-lg border py-4 text-center text-xs text-muted-foreground">
-                  Couldn’t sweep occurrences.{' '}
-                  <button className="text-primary underline" onClick={() => void loadOccurrences()}>
+                  {occError === OFFLINE_TITLE ? OFFLINE_TITLE : 'Couldn’t sweep occurrences.'}{' '}
+                  <button className="text-primary underline disabled:cursor-not-allowed disabled:opacity-50" onClick={() => void loadOccurrences()} disabled={blocked}>
                     Retry
                   </button>
                 </div>
@@ -1486,8 +1565,8 @@ export function SeriesDialog({ seriesId, onClose, onChanged, onMerged }: SeriesD
                                   href={o.calendarUrl}
                                   target="_blank"
                                   rel="noopener noreferrer"
-                                  className="inline-flex h-5 w-5 items-center justify-center rounded text-muted-foreground/60 hover:bg-muted hover:text-foreground"
-                                  title="Open this occurrence in Google Calendar (new tab)"
+                                  {...extLink('inline-flex h-5 w-5 items-center justify-center rounded text-muted-foreground/60 hover:bg-muted hover:text-foreground', 'Open this occurrence in Google Calendar (new tab)')}
+
                                 >
                                   <CalendarDays className="h-3.5 w-3.5" />
                                 </a>
@@ -1497,8 +1576,8 @@ export function SeriesDialog({ seriesId, onClose, onChanged, onMerged }: SeriesD
                                   href={o.teams.joinWebUrl}
                                   target="_blank"
                                   rel="noopener noreferrer"
-                                  className="inline-flex h-5 w-5 items-center justify-center rounded text-muted-foreground/60 hover:bg-muted hover:text-foreground"
-                                  title="Open the Teams meeting link (new tab)"
+                                  {...extLink('inline-flex h-5 w-5 items-center justify-center rounded text-muted-foreground/60 hover:bg-muted hover:text-foreground', 'Open the Teams meeting link (new tab)')}
+
                                 >
                                   <Link2 className="h-3.5 w-3.5" />
                                 </a>
@@ -1536,8 +1615,8 @@ export function SeriesDialog({ seriesId, onClose, onChanged, onMerged }: SeriesD
                                       href={`/transcript/${imp.assemblyai_id}`}
                                       target="_blank"
                                       rel="noopener noreferrer"
-                                      className="inline-flex items-center gap-1 rounded-full bg-primary/10 px-2 py-0.5 text-[11px] text-primary"
-                                      title="Import queued — runs on the server (safe to close this tab); lands within a few minutes"
+                                      {...extLink('inline-flex items-center gap-1 rounded-full bg-primary/10 px-2 py-0.5 text-[11px] text-primary', 'Import queued — runs on the server (safe to close this tab); lands within a few minutes')}
+
                                     >
                                       <Loader2 className="h-3 w-3 animate-spin" /> queued
                                     </a>
@@ -1547,8 +1626,8 @@ export function SeriesDialog({ seriesId, onClose, onChanged, onMerged }: SeriesD
                                       href={`/transcript/${imp.assemblyai_id}`}
                                       target="_blank"
                                       rel="noopener noreferrer"
-                                      className="inline-flex items-center gap-1 rounded-full bg-destructive/10 px-2 py-0.5 text-[11px] text-destructive"
-                                      title="Import failed — open the row to see why (e.g. the Transcript tab was empty); trash it to retry"
+                                      {...extLink('inline-flex items-center gap-1 rounded-full bg-destructive/10 px-2 py-0.5 text-[11px] text-destructive', 'Import failed — open the row to see why (e.g. the Transcript tab was empty); trash it to retry')}
+
                                     >
                                       <X className="h-3 w-3" /> failed
                                     </a>
@@ -1558,8 +1637,8 @@ export function SeriesDialog({ seriesId, onClose, onChanged, onMerged }: SeriesD
                                         href={`/transcript/${imp.assemblyai_id}`}
                                         target="_blank"
                                         rel="noopener noreferrer"
-                                        className="inline-flex items-center gap-1 rounded-full bg-status-ok/10 px-2 py-0.5 text-[11px] text-status-ok hover:bg-status-ok/20"
-                                        title={`${imp.title ?? 'Open transcript'} (new tab)`}
+                                        {...extLink('inline-flex items-center gap-1 rounded-full bg-status-ok/10 px-2 py-0.5 text-[11px] text-status-ok hover:bg-status-ok/20', `${imp.title ?? 'Open transcript'} (new tab)`)}
+
                                       >
                                         <Check className="h-3 w-3" /> imported
                                         <ExternalLink className="h-2.5 w-2.5" />
@@ -1649,7 +1728,8 @@ export function SeriesDialog({ seriesId, onClose, onChanged, onMerged }: SeriesD
                                           href={`/transcript/${imp.assemblyai_id}`}
                                           target="_blank"
                                           rel="noopener noreferrer"
-                                          className="text-primary underline-offset-2 hover:underline"
+                                          {...extLink('text-primary underline-offset-2 hover:underline')}
+
                                         >
                                           {imp.title || imp.assemblyai_id} ↗
                                         </a>
@@ -1670,7 +1750,8 @@ export function SeriesDialog({ seriesId, onClose, onChanged, onMerged }: SeriesD
                                         href={o.calendarUrl}
                                         target="_blank"
                                         rel="noopener noreferrer"
-                                        className="inline-flex items-center gap-1 text-primary hover:underline"
+                                        {...extLink('inline-flex items-center gap-1 text-primary hover:underline')}
+
                                       >
                                         <CalendarDays className="h-3 w-3" /> Calendar event
                                       </a>
@@ -1680,7 +1761,8 @@ export function SeriesDialog({ seriesId, onClose, onChanged, onMerged }: SeriesD
                                         href={driveUrl}
                                         target="_blank"
                                         rel="noopener noreferrer"
-                                        className="inline-flex items-center gap-1 text-primary hover:underline"
+                                        {...extLink('inline-flex items-center gap-1 text-primary hover:underline')}
+
                                       >
                                         <Video className="h-3 w-3" /> Recording on Drive
                                       </a>
@@ -1690,7 +1772,8 @@ export function SeriesDialog({ seriesId, onClose, onChanged, onMerged }: SeriesD
                                         href={docUrl}
                                         target="_blank"
                                         rel="noopener noreferrer"
-                                        className="inline-flex items-center gap-1 text-primary hover:underline"
+                                        {...extLink('inline-flex items-center gap-1 text-primary hover:underline')}
+
                                       >
                                         <FileText className="h-3 w-3" /> Meet transcript Doc
                                       </a>
@@ -1700,7 +1783,8 @@ export function SeriesDialog({ seriesId, onClose, onChanged, onMerged }: SeriesD
                                         href={o.teams.joinWebUrl}
                                         target="_blank"
                                         rel="noopener noreferrer"
-                                        className="inline-flex items-center gap-1 text-primary hover:underline"
+                                        {...extLink('inline-flex items-center gap-1 text-primary hover:underline')}
+
                                       >
                                         <Link2 className="h-3 w-3" /> Teams meeting
                                       </a>
@@ -1735,8 +1819,8 @@ export function SeriesDialog({ seriesId, onClose, onChanged, onMerged }: SeriesD
                           href={`/transcript/${m.assemblyai_id}`}
                           target="_blank"
                           rel="noopener noreferrer"
-                          title={`${m.title || 'Untitled meeting'} (new tab)`}
-                          className="min-w-0 flex-1 truncate text-left text-sm hover:text-primary"
+                          {...extLink('min-w-0 flex-1 truncate text-left text-sm hover:text-primary', `${m.title || 'Untitled meeting'} (new tab)`)}
+
                         >
                           {m.title || 'Untitled meeting'}
                         </a>
@@ -1830,6 +1914,7 @@ export function SeriesDialog({ seriesId, onClose, onChanged, onMerged }: SeriesD
               </span>
             </div>
           </div>
+          </fieldset>
         )}
       </DialogContent>
     </Dialog>

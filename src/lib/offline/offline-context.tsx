@@ -23,6 +23,9 @@ import {
 
 export { getOfflineMode } from './offline-sync';
 
+export { OFFLINE_TITLE } from './offline-types';
+import { OFFLINE_TITLE } from './offline-types';
+
 /**
  * <OfflineProvider> — the one React entry point for offline support.
  * Registers the service worker, watches connectivity, owns the
@@ -345,4 +348,28 @@ const FALLBACK: OfflineState = {
  */
 export function useOffline(): OfflineState {
   return useContext(OfflineContext) ?? FALLBACK;
+}
+
+export interface OfflineGate {
+  /** Network-needing controls must be inert: offline MODE, or the probe says the network is down. */
+  blocked: boolean;
+  /** The user chose offline mode (pinned archive view). */
+  offline: boolean;
+  /** Probe verdict. */
+  online: boolean;
+  /** `OFFLINE_TITLE` while blocked, else undefined — spread straight into `title`. */
+  title: string | undefined;
+}
+
+/**
+ * The shared predicate for "may this control hit the network?". Use
+ * `blocked` everywhere (never `mode` alone): a dropped connection that the
+ * user has not yet turned into offline mode must not let a button spin
+ * forever or throw a generic error.
+ */
+export function useOfflineGate(): OfflineGate {
+  const { mode, online } = useOffline();
+  const offline = mode === 'offline';
+  const blocked = offline || !online;
+  return { blocked, offline, online, title: blocked ? OFFLINE_TITLE : undefined };
 }

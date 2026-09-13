@@ -4,6 +4,8 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Loader2, Minus, Plus, X } from 'lucide-react';
 import type { LabelRef } from '@/lib/format';
 import { LabelPicker, anchorFromElement, parseError, type PickerAnchor } from '@/components/label-picker';
+import { OFFLINE_TITLE } from '@/lib/offline/offline-types';
+import { isNetworkFailure } from '@/lib/offline/offline-fetch';
 
 /**
  * Sticky bulk-action bar for the listing's checkbox selection
@@ -31,6 +33,8 @@ export interface BulkLabelBarProps {
   onApplied: (result: BulkResult, action: 'add' | 'remove', label: LabelRef) => void;
   /** Bump to open the Add picker from a keyboard shortcut (`l`). */
   openAddSignal?: number;
+  /** Offline mode / network down: Add/Remove are inert (Clear stays live). */
+  disabled?: boolean;
 }
 
 export function BulkLabelBar({
@@ -40,6 +44,7 @@ export function BulkLabelBar({
   onClear,
   onApplied,
   openAddSignal,
+  disabled = false,
 }: BulkLabelBarProps) {
   const [picker, setPicker] = useState<{ kind: 'add' | 'remove'; anchor: PickerAnchor } | null>(null);
   const [busy, setBusy] = useState(false);
@@ -54,10 +59,10 @@ export function BulkLabelBar({
   useEffect(() => {
     if (openAddSignal === undefined || openAddSignal === lastSignal.current) return;
     lastSignal.current = openAddSignal;
-    if (count === 0) return;
+    if (count === 0 || disabled) return;
     const el = addBtnRef.current;
     if (el) setPicker({ kind: 'add', anchor: anchorFromElement(el) });
-  }, [openAddSignal, count]);
+  }, [openAddSignal, count, disabled]);
 
   // Message auto-clears.
   useEffect(() => {
@@ -102,7 +107,7 @@ export function BulkLabelBar({
         setMessage(msg);
         onApplied(result, action, label);
       } catch (err) {
-        setMessage(err instanceof Error ? err.message : 'Bulk update failed');
+        setMessage(isNetworkFailure(err) ? OFFLINE_TITLE : err instanceof Error ? err.message : 'Bulk update failed');
         throw err;
       } finally {
         setBusy(false);
@@ -135,25 +140,27 @@ export function BulkLabelBar({
           <button
             ref={addBtnRef}
             type="button"
-            disabled={busy}
+            disabled={busy || disabled}
             onClick={(e) => setPicker({ kind: 'add', anchor: anchorFromElement(e.currentTarget) })}
             className="inline-flex items-center gap-1 rounded-full px-2 py-1 text-sm hover:bg-muted disabled:opacity-50"
-            title="Add a label to every selected meeting (l)"
+            title={disabled ? OFFLINE_TITLE : 'Add a label to every selected meeting (l)'}
           >
             {busy ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Plus className="h-3.5 w-3.5" />}
             Add label
           </button>
           <button
             type="button"
-            disabled={busy || selectedLabels.length === 0}
+            disabled={busy || disabled || selectedLabels.length === 0}
             onClick={(e) =>
               setPicker({ kind: 'remove', anchor: anchorFromElement(e.currentTarget) })
             }
             className="inline-flex items-center gap-1 rounded-full px-2 py-1 text-sm hover:bg-muted disabled:opacity-50"
             title={
-              selectedLabels.length === 0
-                ? 'The selected meetings carry no labels'
-                : 'Remove a label from every selected meeting'
+              disabled
+                ? OFFLINE_TITLE
+                : selectedLabels.length === 0
+                  ? 'The selected meetings carry no labels'
+                  : 'Remove a label from every selected meeting'
             }
           >
             <Minus className="h-3.5 w-3.5" />

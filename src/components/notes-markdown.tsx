@@ -3,6 +3,7 @@
 import ReactMarkdown, { defaultUrlTransform } from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import { Paperclip, Play, UserRound } from 'lucide-react';
+import { OFFLINE_TITLE, useOfflineGate } from '@/lib/offline/offline-context';
 
 interface NotesMarkdownProps {
   markdown: string;
@@ -21,6 +22,8 @@ interface NotesMarkdownProps {
  * Everything else renders as ordinary (externally-opening) markdown.
  */
 export function NotesMarkdown({ markdown, transcriptId, onSeek }: NotesMarkdownProps) {
+  // Attachment downloads are not pinned — inert chips while blocked.
+  const { blocked } = useOfflineGate();
   const frameMs = (src: string | undefined): number | null => {
     const m = typeof src === 'string' ? /\/frames\/(\d+)\.jpg$/.exec(src) : null;
     return m ? Number.parseInt(m[1]!, 10) : null;
@@ -68,6 +71,19 @@ export function NotesMarkdown({ markdown, transcriptId, onSeek }: NotesMarkdownP
             );
           }
           const att = /^attachment:(\d+)$/.exec(h);
+          if (att && blocked) {
+            // Download URLs are deliberately not pinned (arbitrary file sizes).
+            return (
+              <span
+                title={OFFLINE_TITLE}
+                aria-disabled="true"
+                className="mx-0.5 inline-flex cursor-not-allowed items-center gap-1 rounded bg-muted px-1.5 py-px align-middle text-[11px] font-medium leading-4 text-foreground/60"
+              >
+                <Paperclip className="h-2.5 w-2.5" />
+                {children}
+              </span>
+            );
+          }
           if (att) {
             return (
               <a

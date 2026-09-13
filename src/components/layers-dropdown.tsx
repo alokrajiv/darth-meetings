@@ -2,6 +2,7 @@
 
 import { useEffect, useRef, useState } from 'react';
 import { Check, ChevronDown, Layers } from 'lucide-react';
+import { OFFLINE_TITLE } from '@/lib/offline/offline-types';
 
 /**
  * Compact multi-select replacement for the three layer chips: one toolbar
@@ -32,6 +33,8 @@ interface LayersDropdownProps {
   norecCount: number | null;
   /** Tabs/search/label filter active — archive-only view, controls frozen. */
   inactive: boolean;
+  /** Offline mode / network down: the trigger is disabled ("Not available offline"). */
+  offline?: boolean;
   onToggle: (key: LayerDropdownKey) => void;
 }
 
@@ -40,6 +43,7 @@ export function LayersDropdown({
   unimportedCount,
   norecCount,
   inactive,
+  offline = false,
   onToggle,
 }: LayersDropdownProps) {
   const [open, setOpen] = useState(false);
@@ -92,25 +96,27 @@ export function LayersDropdown({
     <div className="relative" ref={menuRef}>
       <button
         type="button"
-        disabled={inactive}
+        disabled={inactive || offline}
         onClick={() => setOpen((v) => !v)}
         aria-expanded={open}
         aria-haspopup="menu"
         data-layers-trigger
         title={
-          inactive
-            ? 'Layers apply on the All tab with no search active'
-            : 'Choose which layers the timeline shows'
+          offline
+            ? OFFLINE_TITLE
+            : inactive
+              ? 'Layers apply on the All tab with no search active'
+              : 'Choose which layers the timeline shows'
         }
         className={`flex h-8 items-center gap-1.5 rounded-md border border-input bg-background px-2.5 text-xs transition-colors hover:bg-muted/60 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring ${
-          inactive ? 'opacity-50' : ''
+          inactive || offline ? 'opacity-50' : ''
         }`}
       >
         <Layers className="h-3.5 w-3.5 text-muted-foreground" />
         <span data-layers-summary>{summary}</span>
         <ChevronDown className="h-3 w-3 text-muted-foreground" />
       </button>
-      {open && !inactive && (
+      {open && !inactive && !offline && (
         <div
           role="menu"
           data-layers-menu

@@ -116,7 +116,11 @@ export function writePeopleFiltersToUrl(f: PeopleFilters): void {
 interface PeopleFilterProps {
   value: PeopleFilters;
   onChange: (next: PeopleFilters) => void;
+  /** Offline mode / network down: filters re-query the server, so the trigger and chips are inert. */
+  disabled?: boolean;
 }
+
+const OFFLINE_TITLE = 'Not available offline';
 
 /**
  * The "Filter" toolbar button + its popover (People / Organizer inputs and
@@ -127,7 +131,7 @@ interface PeopleFilterProps {
  * removable chips via `PeopleFilterChips` (placed by the caller so the
  * chips can sit on their own toolbar row).
  */
-export function PeopleFilterControl({ value, onChange }: PeopleFilterProps) {
+export function PeopleFilterControl({ value, onChange, disabled = false }: PeopleFilterProps) {
   const [open, setOpen] = useState(false);
   const menuRef = useRef<HTMLDivElement | null>(null);
   const [participantDraft, setParticipantDraft] = useState(value.participant.join(', '));
@@ -198,7 +202,8 @@ export function PeopleFilterControl({ value, onChange }: PeopleFilterProps) {
         variant={active > 0 ? 'secondary' : 'ghost'}
         size="sm"
         className="h-8 gap-1.5 px-2"
-        title="Filter by people, organizer or meeting provider"
+        disabled={disabled}
+        title={disabled ? OFFLINE_TITLE : 'Filter by people, organizer or meeting provider'}
         aria-expanded={open}
         aria-haspopup="dialog"
         onClick={() => (open ? close() : setOpen(true))}
@@ -211,7 +216,7 @@ export function PeopleFilterControl({ value, onChange }: PeopleFilterProps) {
           </span>
         )}
       </Button>
-      {open && (
+      {open && !disabled && (
         <div
           role="dialog"
           aria-label="Meeting filters"
@@ -325,7 +330,7 @@ export function PeopleFilterControl({ value, onChange }: PeopleFilterProps) {
 
 /** Removable chips for every active filter term. Renders nothing when no
  * filter is set. */
-export function PeopleFilterChips({ value, onChange }: PeopleFilterProps) {
+export function PeopleFilterChips({ value, onChange, disabled = false }: PeopleFilterProps) {
   if (!hasPeopleFilters(value)) return null;
   const chip = (key: string, label: string, text: string, onRemove: () => void) => (
     <span
@@ -338,7 +343,9 @@ export function PeopleFilterChips({ value, onChange }: PeopleFilterProps) {
       <button
         type="button"
         onClick={onRemove}
-        className="rounded-full p-0.5 text-muted-foreground hover:bg-muted-foreground/10 hover:text-foreground"
+        disabled={disabled}
+        title={disabled ? OFFLINE_TITLE : undefined}
+        className="rounded-full p-0.5 text-muted-foreground hover:bg-muted-foreground/10 hover:text-foreground disabled:cursor-not-allowed disabled:opacity-50"
         aria-label={`Remove filter ${label} ${text}`}
       >
         <X className="h-3 w-3" />
@@ -366,7 +373,9 @@ export function PeopleFilterChips({ value, onChange }: PeopleFilterProps) {
         <button
           type="button"
           onClick={() => onChange(EMPTY_PEOPLE_FILTERS)}
-          className="text-xs text-muted-foreground hover:text-foreground"
+          disabled={disabled}
+          title={disabled ? OFFLINE_TITLE : undefined}
+          className="text-xs text-muted-foreground hover:text-foreground disabled:cursor-not-allowed disabled:opacity-50"
         >
           Clear all
         </button>

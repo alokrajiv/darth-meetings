@@ -33,7 +33,8 @@ export interface LabelChipsProps {
    * overflowing, keeping the "+N" badge and the add "+" visible (used by
    * the listing's width-capped Labels column). */
   fit?: boolean;
-  /** Keeps the add "+" visible but inert (offline mode — the picker needs the server). */
+  /** Keeps the add "+" and the filter chips visible but inert (offline mode /
+   * network down — the picker and the filter both need the server). */
   disabled?: boolean;
   className?: string;
 }
@@ -65,6 +66,7 @@ export function LabelChip({
   onRemove,
   size = 'sm',
   flexible = false,
+  title,
 }: {
   label: LabelRef;
   color: string | null;
@@ -73,6 +75,8 @@ export function LabelChip({
   size?: 'sm' | 'md';
   /** Shrink below max-w to share a width-capped container (fit mode). */
   flexible?: boolean;
+  /** Overrides the tooltip (inert chips in offline mode say why). */
+  title?: string;
 }) {
   const dot = <LabelDot color={color} />;
   const cls = `inline-flex max-w-28 ${flexible ? 'min-w-0 shrink' : 'shrink-0'} items-center gap-1 rounded-full border border-border bg-muted/40 px-2 ${
@@ -116,7 +120,7 @@ export function LabelChip({
     );
   }
   return (
-    <span title={label.path} className={cls} data-label-chip={label.id}>
+    <span title={title ?? label.path} className={cls} data-label-chip={label.id}>
       {body}
     </span>
   );
@@ -179,10 +183,11 @@ export function LabelChips({
           key={l.id}
           label={l}
           color={labelDotColor(l, byId)}
-          onClick={onFilter ? () => onFilter(l) : undefined}
+          onClick={onFilter && !disabled ? () => onFilter(l) : undefined}
           onRemove={onRemove}
           size={variant === 'full' ? 'md' : 'sm'}
           flexible={fit}
+          title={disabled && onFilter ? 'Not available offline' : undefined}
         />
       ))}
       {rest.length > 0 && (
@@ -220,13 +225,13 @@ export function LabelChips({
                   <button
                     key={l.id}
                     type="button"
-                    disabled={!onFilter}
+                    disabled={!onFilter || disabled}
                     onClick={(e) => {
                       e.stopPropagation();
                       setMoreOpen(false);
                       onFilter?.(l);
                     }}
-                    title={onFilter ? `Filter by ${l.path}` : l.path}
+                    title={disabled && onFilter ? 'Not available offline' : onFilter ? `Filter by ${l.path}` : l.path}
                     className="flex w-full items-center gap-1.5 rounded px-1.5 py-1 text-left text-xs hover:bg-muted disabled:cursor-default disabled:hover:bg-transparent"
                   >
                     <LabelDot color={labelDotColor(l, byId)} />

@@ -3,6 +3,8 @@
 import { useEffect, useState } from 'react';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Bell, Loader2 } from 'lucide-react';
+import { OFFLINE_TITLE, useOfflineGate } from '@/lib/offline/offline-context';
+import { isNetworkFailure, offlineAwareError } from '@/lib/offline/offline-fetch';
 
 /**
  * Slack DM notification switches (settings page). Self-contained like
@@ -19,20 +21,32 @@ interface PrefsPayload {
 
 export function NotifyPrefsCard() {
   const [data, setData] = useState<PrefsPayload | null>(null);
-  const [error, setError] = useState(false);
+  const [error, setError] = useState<string | null>(null);
   const [savingKind, setSavingKind] = useState<string | null>(null);
+  // Offline mode / network down: no load, checkboxes inert.
+  const { blocked } = useOfflineGate();
 
+  // Re-runs when the connection comes back (blocked flips false).
   useEffect(() => {
+    if (blocked) {
+      setError(OFFLINE_TITLE);
+      return;
+    }
     void (async () => {
       try {
         const res = await fetch('/api/notify-prefs');
-        if (!res.ok) throw new Error(String(res.status));
+        if (!res.ok) throw await offlineAwareError(res, String(res.status));
         setData((await res.json()) as PrefsPayload);
-      } catch {
-        setError(true);
+        setError(null);
+      } catch (err) {
+        setError(
+          isNetworkFailure(err) || (err instanceof Error && err.message === OFFLINE_TITLE)
+            ? OFFLINE_TITLE
+            : 'Couldn’t load notification settings.'
+        );
       }
     })();
-  }, []);
+  }, [blocked]);
 
   const toggle = async (kind: string) => {
     if (!data || savingKind) return;
@@ -44,10 +58,12 @@ export function NotifyPrefsCard() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ prefs: { [kind]: next } }),
       });
-      if (res.ok) {
-        const { prefs } = (await res.json()) as { prefs: Record<string, boolean> };
-        setData({ ...data, prefs });
-      }
+      if (!res.ok) throw await offlineAwareError(res, `Save failed (${res.status})`);
+      const { prefs } = (await res.json()) as { prefs: Record<string, boolean> };
+      setData({ ...data, prefs });
+      setError(null);
+    } catch (err) {
+      setError(isNetworkFailure(err) ? OFFLINE_TITLE : err instanceof Error ? err.message : 'Could not save — try again');
     } finally {
       setSavingKind(null);
     }
@@ -66,21 +82,23 @@ export function NotifyPrefsCard() {
         </p>
       </CardHeader>
       <CardContent>
-        {error ? (
-          <p className="text-sm text-muted-foreground">Couldn’t load notification settings.</p>
+        {error && !data ? (
+          <p className="text-sm text-muted-foreground">{error}</p>
         ) : !data ? (
           <div className="flex items-center justify-center py-4">
             <Loader2 className="h-4 w-4 animate-spin text-muted-foreground" />
           </div>
         ) : (
           <div className="space-y-2.5">
+            {error && <p className="text-xs text-destructive">{error}</p>}
             {data.kinds.map((kind) => (
-              <label key={kind} className="flex cursor-pointer items-start gap-2.5">
+              <label key={kind} className="flex cursor-pointer items-start gap-2.5" title={blocked ? OFFLINE_TITLE : undefined}>
                 <input
                   type="checkbox"
                   className="mt-0.5 h-4 w-4 accent-primary"
                   checked={data.prefs[kind] !== false}
-                  disabled={savingKind === kind}
+                  disabled={blocked || savingKind !== null}
+                  title={blocked ? OFFLINE_TITLE : undefined}
                   onChange={() => void toggle(kind)}
                 />
                 <span className="min-w-0">

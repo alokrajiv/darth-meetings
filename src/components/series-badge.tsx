@@ -2,6 +2,8 @@
 
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { Repeat, Plus, Check, X, Loader2 } from 'lucide-react';
+import { OFFLINE_TITLE } from '@/lib/offline/offline-types';
+import { isNetworkFailure } from '@/lib/offline/offline-fetch';
 
 /**
  * The "recurring call" badge.
@@ -43,6 +45,8 @@ interface SeriesBadgeProps {
   onChanged: () => void;
   /** 'row' = ghost + reveal-on-row-hover (listing); 'full' = always visible. */
   variant?: 'row' | 'full';
+  /** Offline mode / network down: chips stay visible but inert, the popover never opens. */
+  disabled?: boolean;
 }
 
 export function SeriesBadge({
@@ -53,8 +57,10 @@ export function SeriesBadge({
   onOpenSeries,
   onChanged,
   variant = 'row',
+  disabled = false,
 }: SeriesBadgeProps) {
   const [open, setOpen] = useState(false);
+  const [error, setError] = useState<string | null>(null);
   const [pos, setPos] = useState<{ top: number; left: number } | null>(null);
   const [candidates, setCandidates] = useState<Candidate[] | null>(null);
   const [allSeries, setAllSeries] = useState<SeriesListEntry[] | null>(null);
@@ -71,6 +77,7 @@ export function SeriesBadge({
     setShowPicker(false);
     setCreating(false);
     setFilter('');
+    setError(null);
   }, []);
 
   useEffect(() => {
@@ -101,6 +108,7 @@ export function SeriesBadge({
 
   const openPopover = (e: React.MouseEvent) => {
     e.stopPropagation();
+    if (disabled) return;
     const rect = (e.currentTarget as HTMLElement).getBoundingClientRect();
     const width = 288;
     setPos({
@@ -108,32 +116,51 @@ export function SeriesBadge({
       left: Math.max(8, Math.min(rect.left, window.innerWidth - width - 8)),
     });
     setOpen(true);
+    setError(null);
     setNewTitle(defaultTitle?.trim() ?? '');
+    // A failed GET (network dropped, offline 503) is an error, not "no
+    // candidates" — otherwise the popover silently offers nothing.
     void fetch(`/api/transcripts/${assemblyaiId}/series`)
-      .then((r) => (r.ok ? r.json() : null))
+      .then((r) => {
+        if (!r.ok) throw new Error(`Could not load candidates (${r.status})`);
+        return r.json();
+      })
       .then((d) => setCandidates(d?.candidates ?? []))
-      .catch(() => setCandidates([]));
+      .catch((err) => {
+        setCandidates([]);
+        setError(isNetworkFailure(err) ? OFFLINE_TITLE : 'Could not update the series');
+      });
   };
 
   const loadAllSeries = () => {
     setShowPicker(true);
     if (allSeries) return;
     void fetch('/api/series')
-      .then((r) => (r.ok ? r.json() : null))
+      .then((r) => {
+        if (!r.ok) throw new Error(`Could not load series (${r.status})`);
+        return r.json();
+      })
       .then((d) => setAllSeries(d?.series ?? []))
-      .catch(() => setAllSeries([]));
+      .catch((err) => {
+        setAllSeries([]);
+        setError(isNetworkFailure(err) ? OFFLINE_TITLE : 'Could not update the series');
+      });
   };
 
   const attach = async (seriesId: number, how: 'confirmed' | 'manual') => {
     setBusy(true);
+    setError(null);
     try {
-      await fetch(`/api/series/${seriesId}/members`, {
+      const res = await fetch(`/api/series/${seriesId}/members`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ transcriptId: assemblyaiId, how }),
       });
+      if (!res.ok) throw new Error(`Attach failed (${res.status})`);
       close();
       onChanged();
+    } catch (err) {
+      setError(isNetworkFailure(err) ? OFFLINE_TITLE : 'Could not update the series');
     } finally {
       setBusy(false);
     }
@@ -152,16 +179,18 @@ export function SeriesBadge({
     const title = newTitle.trim();
     if (!title) return;
     setBusy(true);
+    setError(null);
     try {
       const res = await fetch('/api/series', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ title, fromTranscriptId: assemblyaiId }),
       });
-      if (res.ok) {
-        close();
-        onChanged();
-      }
+      if (!res.ok) throw new Error(`Create failed (${res.status})`);
+      close();
+      onChanged();
+    } catch (err) {
+      setError(isNetworkFailure(err) ? OFFLINE_TITLE : 'Could not update the series');
     } finally {
       setBusy(false);
     }
@@ -171,12 +200,13 @@ export function SeriesBadge({
     return (
       <button
         type="button"
+        disabled={disabled}
         onClick={(e) => {
           e.stopPropagation();
           onOpenSeries(membership.series_id);
         }}
-        title={`Recurring call: ${membership.title} — click to see the whole series`}
-        className="inline-flex max-w-44 shrink-0 items-center gap-1 rounded-full border border-primary/25 bg-primary/5 px-2 py-0.5 text-[11px] text-primary transition-colors hover:bg-primary/10"
+        title={disabled ? OFFLINE_TITLE : `Recurring call: ${membership.title} — click to see the whole series`}
+        className="inline-flex max-w-44 shrink-0 items-center gap-1 rounded-full border border-primary/25 bg-primary/5 px-2 py-0.5 text-[11px] text-primary transition-colors hover:bg-primary/10 disabled:cursor-not-allowed disabled:opacity-60"
       >
         <Repeat className="h-3 w-3 shrink-0" />
         <span className="truncate">{membership.title}</span>
@@ -190,9 +220,10 @@ export function SeriesBadge({
         <button
           ref={btnRef}
           type="button"
+          disabled={disabled}
           onClick={openPopover}
-          title={`Looks like part of "${suspected.title}" — click to confirm or dismiss`}
-          className="inline-flex max-w-44 shrink-0 items-center gap-1 rounded-full border border-dashed border-primary/35 px-2 py-0.5 text-[11px] text-primary/70 transition-colors hover:bg-primary/5 hover:text-primary"
+          title={disabled ? OFFLINE_TITLE : `Looks like part of "${suspected.title}" — click to confirm or dismiss`}
+          className="inline-flex max-w-44 shrink-0 items-center gap-1 rounded-full border border-dashed border-primary/35 px-2 py-0.5 text-[11px] text-primary/70 transition-colors hover:bg-primary/5 hover:text-primary disabled:cursor-not-allowed disabled:opacity-60"
         >
           <Repeat className="h-3 w-3 shrink-0" />
           <span className="truncate">{suspected.title}</span>
@@ -202,9 +233,10 @@ export function SeriesBadge({
         <button
           ref={btnRef}
           type="button"
+          disabled={disabled}
           onClick={openPopover}
-          title="Mark as a recurring call"
-          className={`inline-flex shrink-0 items-center gap-0.5 rounded-full border border-dashed border-muted-foreground/30 px-1.5 py-0.5 text-[11px] text-muted-foreground/70 transition-all hover:border-primary/40 hover:text-primary ${
+          title={disabled ? OFFLINE_TITLE : 'Mark as a recurring call'}
+          className={`inline-flex shrink-0 items-center gap-0.5 rounded-full border border-dashed border-muted-foreground/30 px-1.5 py-0.5 text-[11px] text-muted-foreground/70 transition-all hover:border-primary/40 hover:text-primary disabled:cursor-not-allowed disabled:opacity-50 ${
             variant === 'row' ? 'opacity-0 group-hover:opacity-100' : ''
           }`}
         >
@@ -213,13 +245,14 @@ export function SeriesBadge({
           {variant === 'full' && <span className="ml-0.5">Recurring call</span>}
         </button>
       )}
-      {open && pos && (
+      {open && pos && !disabled && (
         <div
           ref={popRef}
           onClick={(e) => e.stopPropagation()}
           style={{ position: 'fixed', top: pos.top, left: pos.left, width: 288 }}
           className="z-50 rounded-lg border bg-popover p-2 text-popover-foreground shadow-[0_4px_16px_-2px_rgb(0_0_0/0.12),0_1px_2px_0_rgb(0_0_0/0.04)]"
         >
+          {error && <p className="px-1 pb-1 text-xs text-destructive">{error}</p>}
           {candidates === null ? (
             <div className="flex items-center gap-2 px-1 py-2 text-xs text-muted-foreground">
               <Loader2 className="h-3.5 w-3.5 animate-spin" /> Looking for matching series…

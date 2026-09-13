@@ -25,7 +25,7 @@ import {
 } from 'lucide-react';
 import { labelFilterToParams, parseLabelFilter, type LabelFilter } from '@/lib/labels';
 import { OfflineArchive } from '@/components/offline-archive';
-import { useOffline } from '@/lib/offline/offline-context';
+import { OFFLINE_TITLE, useOffline, useOfflineGate } from '@/lib/offline/offline-context';
 
 const REMINDERS_COLLAPSED_KEY = 'mw-reminders-collapsed';
 
@@ -56,6 +56,9 @@ export default function Home() {
   // and then be replaced by the archive in offline mode).
   const { mode, ready: offlineReady } = useOffline();
   const offline = mode === 'offline';
+  // `blocked` = offline mode OR the probe says the network is down: every
+  // control that needs the server stays VISIBLE but disabled with a tooltip.
+  const { blocked } = useOfflineGate();
   const [refreshTrigger, setRefreshTrigger] = useState(0);
   const [gmeetOpen, setGmeetOpen] = useState(false);
   const [gmeetSyncMode, setGmeetSyncMode] = useState(false);
@@ -97,7 +100,11 @@ export default function Home() {
         title: r.title,
         eventStart: r.eventStart,
       }),
-    }).catch(() => {});
+    }).catch(() => {
+      // Dropped (network down before the probe noticed) — put it back so the
+      // dismissal is not silently lost.
+      setReminders((prev) => (prev.some((x) => x.id === r.id) ? prev : [r, ...prev]));
+    });
   };
   const dismissBanner = () => {
     setRemindersCollapsed(true);
@@ -137,17 +144,22 @@ export default function Home() {
   // Post-connect landing: the Google callback returns to /?meet=1|sync
   // (&google=connected) so the import dialog the user came from reopens —
   // now with silent server-minted tokens.
+  // Runs once the offline mode is restored: while blocked the dialog is not
+  // opened (it cannot load anything), but the params are still stripped.
+  const urlParamsHandledRef = useRef(false);
   useEffect(() => {
+    if (!offlineReady || urlParamsHandledRef.current) return;
+    urlParamsHandledRef.current = true;
     const params = new URLSearchParams(window.location.search);
     const meet = params.get('meet');
-    if (meet) {
+    if (meet && !blocked) {
       setGmeetSyncMode(meet === 'sync');
       setGmeetOpen(true);
     }
     // /m/<uuid> of a not-yet-imported occurrence lands here as
     // /?import=<code>&start=<iso> — open the import dialog focused on it.
     const importCode = params.get('import');
-    if (importCode) {
+    if (importCode && !blocked) {
       setGmeetFocus({ meetingCode: importCode, eventStart: params.get('start') });
       setGmeetOpen(true);
     }
@@ -160,7 +172,7 @@ export default function Home() {
       const qs = params.toString();
       window.history.replaceState(null, '', `${window.location.pathname}${qs ? `?${qs}` : ''}`);
     }
-  }, []);
+  }, [offlineReady, blocked]);
 
   const handleTranscriptCreated = () => {
     setRefreshTrigger((prev) => prev + 1);
@@ -225,8 +237,6 @@ export default function Home() {
   return (
     <div className="min-h-screen">
       <AppHeader>
-        {!offline && (
-          <>
         <div className="relative" ref={importMenuRef}>
           <Button
             variant="outline"
@@ -234,11 +244,13 @@ export default function Home() {
             onClick={() => setImportMenuOpen((o) => !o)}
             aria-expanded={importMenuOpen}
             aria-haspopup="menu"
+            disabled={blocked}
+            title={blocked ? OFFLINE_TITLE : undefined}
           >
             Import
             <ChevronDown className="h-4 w-4" />
           </Button>
-          {importMenuOpen && (
+          {importMenuOpen && !blocked && (
             <div
               role="menu"
               className="absolute right-0 top-full z-50 mt-1.5 w-64 rounded-lg border bg-popover p-1 text-popover-foreground shadow-[0_4px_16px_-2px_rgb(0_0_0/0.08),0_1px_2px_0_rgb(0_0_0/0.04)]"
@@ -263,11 +275,17 @@ export default function Home() {
             </div>
           )}
         </div>
-        <Button variant="outline" size="sm" onClick={() => requestMediaUpload()}>
+        <Button
+          variant="outline"
+          size="sm"
+          onClick={() => requestMediaUpload()}
+          disabled={blocked}
+          title={blocked ? OFFLINE_TITLE : undefined}
+        >
           <FileAudio className="h-4 w-4" />
           Upload media
         </Button>
-        <Button size="sm" onClick={() => setGmeetOpen(true)}>
+        <Button size="sm" onClick={() => setGmeetOpen(true)} disabled={blocked} title={blocked ? OFFLINE_TITLE : undefined}>
           <Video className="h-4 w-4" />
           Import meeting
         </Button>
@@ -294,6 +312,7 @@ export default function Home() {
                 <GmeetRemindersCard
                   reminders={reminders}
                   variant="popover"
+                  disabled={blocked}
                   onOpenSync={() => {
                     setReminderMenuOpen(false);
                     setGmeetSyncMode(true);
@@ -307,8 +326,6 @@ export default function Home() {
             )}
           </div>
         )}
-          </>
-        )}
         <Link href="/settings">
           <Button variant="ghost" size="sm" className="h-8 w-8 p-0" title="Settings">
             <Settings className="h-4 w-4" />
@@ -319,6 +336,11 @@ export default function Home() {
       </AppHeader>
 
       <main className="mx-auto max-w-[1720px] px-6 py-4">
+        {/* Renders the page-wide drag-drop overlay, the hidden file input the
+            header button clicks, and in-flight upload progress rows. Mounted in
+            BOTH modes so a dropped file never navigates the tab; it gates
+            itself while blocked. */}
+        <AudioUpload onTranscriptCreated={handleTranscriptCreated} />
         {!offlineReady ? (
           <div className="flex items-center justify-center py-16">
             <Loader2 className="h-5 w-5 animate-spin text-muted-foreground" />
@@ -327,13 +349,10 @@ export default function Home() {
           <OfflineArchive />
         ) : (
         <>
-        {/* Renders the page-wide drag-drop overlay, the hidden file input the
-            header button clicks, and in-flight upload progress rows. */}
-        <AudioUpload onTranscriptCreated={handleTranscriptCreated} />
-
         {!remindersCollapsed && (
           <GmeetRemindersCard
             reminders={reminders}
+            disabled={blocked}
             onOpenSync={() => {
               setGmeetSyncMode(true);
               setGmeetOpen(true);

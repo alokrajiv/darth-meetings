@@ -12,7 +12,7 @@ import {
 import { Button } from '@/components/ui/button';
 import { Progress } from '@/components/ui/progress';
 import { CheckCircle2, CircleAlert, CloudDownload, CloudOff, Loader2 } from 'lucide-react';
-import { useOffline } from '@/lib/offline/offline-context';
+import { OFFLINE_TITLE, useOffline, useOfflineGate } from '@/lib/offline/offline-context';
 import { pinMeeting, unpinMeeting } from '@/lib/offline/offline-pins';
 import { fetchOfflinePlan } from '@/lib/offline/offline-sync';
 import { estimatePinBytes, levelIncludes } from '@/lib/offline/offline-urls';
@@ -82,6 +82,9 @@ export function OfflinePinDialog({
   meeting: PinDialogMeeting;
 }) {
   const { pins, sw } = useOffline();
+  // Offline mode / network down: the plan can't be fetched and a save would
+  // evict the very copy being read — everything but Cancel is inert.
+  const { blocked } = useOfflineGate();
   const record = pins.find((p) => p.id === meeting.id);
   const [plan, setPlan] = useState<PlanMeeting | null>(null);
   const [planState, setPlanState] = useState<'idle' | 'loading' | 'ready' | 'gone' | 'error'>('idle');
@@ -93,9 +96,14 @@ export function OfflinePinDialog({
   useEffect(() => {
     if (!open) return;
     let cancelled = false;
-    setPlanState('loading');
     setError(null);
     setLevel(record?.level ?? 'transcript');
+    if (blocked) {
+      setPlan(null);
+      setPlanState('idle');
+      return;
+    }
+    setPlanState('loading');
     fetchOfflinePlan([meeting.id])
       .then((p) => {
         if (cancelled) return;
@@ -113,7 +121,7 @@ export function OfflinePinDialog({
     };
     // record?.level is only the initial selection — do not re-run on ledger updates.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [open, meeting.id]);
+  }, [open, meeting.id, blocked]);
 
   const media = plan?.media ?? meeting.media ?? null;
   const durationSec = plan?.durationSec ?? meeting.durationSec;
@@ -205,7 +213,12 @@ export function OfflinePinDialog({
           <p className="text-xs text-destructive">Last attempt failed: {record.error}</p>
         )}
 
-        <fieldset className="space-y-2" disabled={saving || sw === 'unsupported'}>
+        {blocked && (
+          <p className="text-xs text-muted-foreground" data-offline-pin-blocked>
+            Changes to what is kept on this device need a connection.
+          </p>
+        )}
+        <fieldset className="space-y-2" disabled={saving || sw === 'unsupported' || blocked} title={blocked ? OFFLINE_TITLE : undefined}>
           {LEVELS.map((l) => {
             const why = disabledFor(l.value);
             return (
@@ -250,9 +263,9 @@ export function OfflinePinDialog({
             <button
               type="button"
               className="text-xs text-muted-foreground underline-offset-2 hover:underline disabled:opacity-50"
-              disabled={saving}
+              disabled={saving || blocked}
               onClick={() => void resetToAuto()}
-              title="Forget your choice and let the automatic policy decide (removes the saved copy)"
+              title={blocked ? OFFLINE_TITLE : 'Forget your choice and let the automatic policy decide (removes the saved copy)'}
             >
               Reset to automatic
             </button>
@@ -263,7 +276,12 @@ export function OfflinePinDialog({
             <Button variant="outline" size="sm" onClick={onClose} disabled={saving}>
               Cancel
             </Button>
-            <Button size="sm" onClick={() => void save()} disabled={saving || sw === 'unsupported'}>
+            <Button
+              size="sm"
+              onClick={() => void save()}
+              disabled={saving || sw === 'unsupported' || blocked}
+              title={blocked ? OFFLINE_TITLE : undefined}
+            >
               {saving ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : null}
               Save
             </Button>

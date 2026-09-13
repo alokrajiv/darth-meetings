@@ -9,7 +9,8 @@ import { Input } from '@/components/ui/input';
 import { Badge } from '@/components/ui/badge';
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table';
 import { CheckCircle2, CircleAlert, CloudDownload, CloudOff, Loader2, RefreshCw, Trash2, Wifi, X } from 'lucide-react';
-import { useOffline } from '@/lib/offline/offline-context';
+import { OFFLINE_TITLE, useOffline } from '@/lib/offline/offline-context';
+import { isNetworkFailure, offlineAwareError } from '@/lib/offline/offline-fetch';
 import { clearAllOffline, pinMeeting, unpinMeeting } from '@/lib/offline/offline-pins';
 import { OFFLINE_CHANGE_EVENT, type OfflinePrefs, type PinLevel, type PinRecord } from '@/lib/offline/offline-types';
 import { formatBytes } from '@/lib/format';
@@ -73,6 +74,10 @@ function fmtDate(iso: string | null): string {
 
 export function OfflineCard() {
   const { pins, sw, mode, online, syncing, syncState, syncNow, storage, enterOffline, exitOffline, refreshPins } = useOffline();
+  // Offline mode / network down: the account defaults and per-row upgrades
+  // need the server; the per-row remove (X) stays live as the downgrade path.
+  const blocked = mode === 'offline' || !online;
+  const OFFLINE_DEFAULTS_COPY = `${OFFLINE_TITLE} — the counts apply when you're back online`;
 
   // --- account defaults -------------------------------------------------
   const [data, setData] = useState<PrefsPayload | null>(null);
@@ -80,11 +85,16 @@ export function OfflineCard() {
   const [prefsError, setPrefsError] = useState<string | null>(null);
   const [savingKey, setSavingKey] = useState<keyof OfflinePrefs | null>(null);
 
+  // Re-runs when the connection comes back (blocked flips false).
   useEffect(() => {
+    if (blocked) {
+      setPrefsError(OFFLINE_DEFAULTS_COPY);
+      return;
+    }
     void (async () => {
       try {
         const res = await fetch('/api/offline/prefs');
-        if (!res.ok) throw new Error(String(res.status));
+        if (!res.ok) throw await offlineAwareError(res, String(res.status));
         const json = (await res.json()) as PrefsPayload;
         setData(json);
         setDraft({
@@ -92,11 +102,17 @@ export function OfflineCard() {
           audio: String(json.prefs.audio),
           video: String(json.prefs.video),
         });
-      } catch {
-        setPrefsError('Couldn’t load offline defaults.');
+        setPrefsError(null);
+      } catch (err) {
+        setPrefsError(
+          isNetworkFailure(err) || (err instanceof Error && err.message === OFFLINE_TITLE)
+            ? OFFLINE_DEFAULTS_COPY
+            : 'Couldn’t load offline defaults.'
+        );
       }
     })();
-  }, []);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [blocked]);
 
   const savePref = async (key: keyof OfflinePrefs) => {
     if (!data || savingKey) return;
@@ -169,7 +185,11 @@ export function OfflineCard() {
     setBusyId(r.id);
     setRowError(null);
     const run = pinMeeting(r.id, level, { manual: true });
-    run.catch((err) => setRowError(err instanceof Error ? err.message : 'Could not change the level'));
+    run.catch((err) => {
+      const msg = err instanceof Error ? err.message : 'Could not change the level';
+      // The sync engine reports the SW's offline 503 as '<url> → 503'.
+      setRowError(blocked || isNetworkFailure(err) || /→ 503$/.test(msg) ? OFFLINE_TITLE : msg);
+    });
     try {
       await Promise.race([run, firstPinEvent(r.id)]);
     } catch {
@@ -242,7 +262,11 @@ export function OfflineCard() {
             A ladder: audio always includes the transcript, video always includes both. Meetings you
             pick by hand (below, or from a meeting page) are never touched by these counts.
           </p>
-          {prefsError && <p className="mb-2 text-xs text-destructive">{prefsError}</p>}
+          {prefsError && (
+            <p className={`mb-2 text-xs ${prefsError === OFFLINE_DEFAULTS_COPY ? 'text-muted-foreground' : 'text-destructive'}`}>
+              {prefsError}
+            </p>
+          )}
           {!data && !prefsError ? (
             <div className="flex items-center justify-center py-4">
               <Loader2 className="h-4 w-4 animate-spin text-muted-foreground" />
@@ -263,7 +287,8 @@ export function OfflineCard() {
                     step={1}
                     className="mt-1 h-8 tabular-nums"
                     value={draft[t.key]}
-                    disabled={savingKey !== null}
+                    disabled={savingKey !== null || blocked}
+                    title={blocked ? OFFLINE_TITLE : undefined}
                     onChange={(e) => setDraft((d) => ({ ...d, [t.key]: e.target.value }))}
                     onBlur={() => void savePref(t.key)}
                     onKeyDown={(e) => {
@@ -413,7 +438,8 @@ export function OfflineCard() {
                         <select
                           className="block w-full rounded-md border bg-background px-2 py-1 text-xs text-foreground"
                           value={r.level}
-                          disabled={busyId === r.id || !supported}
+                          disabled={busyId === r.id || !supported || blocked}
+                          title={blocked ? OFFLINE_TITLE : undefined}
                           onChange={(e) => void changeLevel(r, e.target.value as PinLevel)}
                           aria-label="Offline level"
                         >

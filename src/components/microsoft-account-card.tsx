@@ -5,6 +5,8 @@ import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
 import { MessageSquare, CheckCircle2, AlertTriangle, ExternalLink } from 'lucide-react';
 import { DARTH_TASKS_MS_PAGE } from '@/lib/darth-family';
+import { OFFLINE_TITLE, useOfflineGate } from '@/lib/offline/offline-context';
+import { isNetworkFailure, offlineAwareError } from '@/lib/offline/offline-fetch';
 
 interface MsStatus {
   available: boolean;
@@ -35,16 +37,34 @@ export function MicrosoftAccountCard() {
   const [status, setStatus] = useState<MsStatus | null>(null);
   const [busy, setBusy] = useState(false);
   const [banner, setBanner] = useState<{ ok: boolean; text: string } | null>(null);
+  // Offline mode / network down: reason 'offline' → "Not available offline"
+  // (never "Darth Tasks is unreachable"), every action inert.
+  const { blocked } = useOfflineGate();
 
   const load = () => {
+    if (blocked) {
+      setStatus({ available: false, reason: 'offline' });
+      return;
+    }
     fetch('/api/ms/status')
-      .then((r) => (r.ok ? r.json() : null))
+      .then(async (r) => {
+        if (!r.ok) throw await offlineAwareError(r, `status ${r.status}`);
+        return r.json();
+      })
       .then((data) => setStatus(data ?? { available: false, reason: 'load_failed' }))
-      .catch(() => setStatus({ available: false, reason: 'load_failed' }));
+      .catch((err) => {
+        const off = isNetworkFailure(err) || (err instanceof Error && err.message === OFFLINE_TITLE);
+        setStatus({ available: false, reason: off ? 'offline' : 'load_failed' });
+      });
   };
 
+  // Re-runs when the connection comes back (blocked flips false).
   useEffect(() => {
     load();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [blocked]);
+
+  useEffect(() => {
     const params = new URLSearchParams(window.location.search);
     const outcome = params.get('ms');
     if (outcome === 'connected') {
@@ -80,18 +100,23 @@ export function MicrosoftAccountCard() {
     try {
       const res = await fetch('/api/ms/status', { method: 'DELETE' });
       if (!res.ok) {
-        const d = (await res.json().catch(() => null)) as { error?: string } | null;
-        setBanner({ ok: false, text: d?.error ?? `Disconnect failed (${res.status})` });
+        const d = (await res.json().catch(() => null)) as { error?: string; offline?: boolean } | null;
+        setBanner({ ok: false, text: d?.offline === true ? OFFLINE_TITLE : (d?.error ?? `Disconnect failed (${res.status})`) });
       } else {
         setBanner(null);
       }
       load();
+    } catch (err) {
+      setBanner({ ok: false, text: isNetworkFailure(err) ? OFFLINE_TITLE : err instanceof Error ? err.message : 'Disconnect failed' });
     } finally {
       setBusy(false);
     }
   };
 
   const manageUrl = status?.manageUrl ?? DARTH_TASKS_MS_PAGE;
+  // External anchors are inert while blocked (aria-disabled + no pointer events).
+  const extLinkClass = blocked ? 'pointer-events-none opacity-50' : '';
+  const extLinkTitle = blocked ? OFFLINE_TITLE : undefined;
   const needsReconnect = status?.available && !status.connected && status.status === 'revoked';
 
   return (
@@ -146,10 +171,19 @@ export function MicrosoftAccountCard() {
           <p className="text-sm text-muted-foreground">Checking connection…</p>
         ) : !status.available ? (
           <p className="text-sm text-muted-foreground">
-            {status.reason === 'no_tasks_access'
-              ? 'Your account has no access to Darth Tasks, which holds this link — ask an admin there.'
-              : 'Darth Tasks is unreachable right now — status unavailable.'}{' '}
-            <a href={manageUrl} target="_blank" rel="noreferrer" className="underline">
+            {status.reason === 'offline'
+              ? OFFLINE_TITLE
+              : status.reason === 'no_tasks_access'
+                ? 'Your account has no access to Darth Tasks, which holds this link — ask an admin there.'
+                : 'Darth Tasks is unreachable right now — status unavailable.'}{' '}
+            <a
+              href={manageUrl}
+              target="_blank"
+              rel="noreferrer"
+              className={`underline ${extLinkClass}`}
+              aria-disabled={blocked || undefined}
+              title={extLinkTitle}
+            >
               Open Darth Tasks
             </a>
           </p>
@@ -166,12 +200,16 @@ export function MicrosoftAccountCard() {
               </p>
             )}
             <div className="flex flex-wrap items-center gap-2">
-              <Button onClick={connect}>{needsReconnect ? 'Reconnect Microsoft' : 'Connect Microsoft'}</Button>
+              <Button onClick={connect} disabled={blocked} title={blocked ? OFFLINE_TITLE : undefined}>
+                {needsReconnect ? 'Reconnect Microsoft' : 'Connect Microsoft'}
+              </Button>
               <a
                 href={manageUrl}
                 target="_blank"
                 rel="noreferrer"
-                className="inline-flex items-center gap-1 text-xs text-muted-foreground underline"
+                className={`inline-flex items-center gap-1 text-xs text-muted-foreground underline ${extLinkClass}`}
+                aria-disabled={blocked || undefined}
+                title={extLinkTitle}
               >
                 Manage on Darth Tasks <ExternalLink className="h-3 w-3" />
               </a>
@@ -195,14 +233,16 @@ export function MicrosoftAccountCard() {
               </p>
             </div>
             <div className="flex flex-wrap items-center gap-2">
-              <Button size="sm" variant="outline" disabled={busy} onClick={disconnect}>
+              <Button size="sm" variant="outline" disabled={busy || blocked} title={blocked ? OFFLINE_TITLE : undefined} onClick={disconnect}>
                 Disconnect
               </Button>
               <a
                 href={manageUrl}
                 target="_blank"
                 rel="noreferrer"
-                className="inline-flex items-center gap-1 text-xs text-muted-foreground underline"
+                className={`inline-flex items-center gap-1 text-xs text-muted-foreground underline ${extLinkClass}`}
+                aria-disabled={blocked || undefined}
+                title={extLinkTitle}
               >
                 Manage on Darth Tasks <ExternalLink className="h-3 w-3" />
               </a>

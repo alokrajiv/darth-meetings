@@ -28,6 +28,8 @@ import type { LabelRef } from '@/lib/format';
 import { refreshLabelCatalog, useLabelCatalog } from '@/hooks/use-label-catalog';
 import { LabelDot, labelDotColor } from '@/components/label-chips';
 import { LabelPicker, anchorFromElement, parseError, type PickerAnchor } from '@/components/label-picker';
+import { OFFLINE_TITLE, useOfflineGate } from '@/lib/offline/offline-context';
+import { isNetworkFailure } from '@/lib/offline/offline-fetch';
 
 /**
  * Left rail of the listing (docs/labels-design.md §4): the org-wide label
@@ -105,6 +107,11 @@ async function patchLabel(id: number, body: Record<string, unknown>): Promise<vo
 
 export function LabelRail({ filter, onFilter, onChanged, onCollapse, className = '' }: LabelRailProps) {
   const catalog = useLabelCatalog();
+  // Offline mode / network down: filters re-query the listing and every
+  // taxonomy mutation hits the server, so the whole tree + footer sits in a
+  // disabled <fieldset> (one line under the header says why). The collapse
+  // button stays live.
+  const { blocked } = useOfflineGate();
   const [openIds, setOpenIds] = useState<Set<number> | null>(null);
   const [editing, setEditing] = useState<Editing>(null);
   const [draft, setDraft] = useState('');
@@ -273,7 +280,7 @@ export function LabelRail({ filter, onFilter, onChanged, onCollapse, className =
       setDraft('');
       await afterMutation();
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Request failed');
+      setError(isNetworkFailure(err) ? OFFLINE_TITLE : err instanceof Error ? err.message : 'Request failed');
     } finally {
       setBusy(false);
     }
@@ -294,7 +301,7 @@ export function LabelRail({ filter, onFilter, onChanged, onCollapse, className =
       }
       await afterMutation();
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Move failed');
+      setError(isNetworkFailure(err) ? OFFLINE_TITLE : err instanceof Error ? err.message : 'Move failed');
     } finally {
       setBusy(false);
     }
@@ -308,7 +315,7 @@ export function LabelRail({ filter, onFilter, onChanged, onCollapse, className =
       await patchLabel(id, { color });
       await afterMutation();
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Recolor failed');
+      setError(isNetworkFailure(err) ? OFFLINE_TITLE : err instanceof Error ? err.message : 'Recolor failed');
     } finally {
       setBusy(false);
     }
@@ -340,7 +347,7 @@ export function LabelRail({ filter, onFilter, onChanged, onCollapse, className =
       if (filter?.kind === 'id' && subtreeIds(node).includes(filter.id)) onFilter(null);
       await afterMutation();
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Delete failed');
+      setError(isNetworkFailure(err) ? OFFLINE_TITLE : err instanceof Error ? err.message : 'Delete failed');
     } finally {
       setBusy(false);
     }
@@ -495,8 +502,9 @@ export function LabelRail({ filter, onFilter, onChanged, onCollapse, className =
         <button
           type="button"
           onClick={() => void refreshLabelCatalog()}
-          title="Refresh labels"
-          className="grid h-6 w-6 place-items-center rounded text-muted-foreground hover:bg-muted hover:text-foreground"
+          disabled={blocked}
+          title={blocked ? OFFLINE_TITLE : 'Refresh labels'}
+          className="grid h-6 w-6 place-items-center rounded text-muted-foreground hover:bg-muted hover:text-foreground disabled:cursor-not-allowed disabled:opacity-50"
         >
           <RefreshCw className="h-3 w-3" />
         </button>
@@ -510,7 +518,13 @@ export function LabelRail({ filter, onFilter, onChanged, onCollapse, className =
           <ChevronsLeft className="h-3.5 w-3.5" />
         </button>
       </div>
+      {blocked && (
+        <p className="border-b px-2 py-1 text-[11px] text-muted-foreground" data-label-rail-offline>
+          {OFFLINE_TITLE}
+        </p>
+      )}
 
+      <fieldset disabled={blocked} className="contents" title={blocked ? OFFLINE_TITLE : undefined}>
       {filter && (
         <div className="flex flex-wrap items-center gap-1 border-b bg-primary/5 px-2 py-1.5 text-xs" data-label-breadcrumb>
           {filter.kind === 'none' ? (
@@ -734,6 +748,7 @@ export function LabelRail({ filter, onFilter, onChanged, onCollapse, className =
           </button>
         </div>
       )}
+      </fieldset>
 
       {moveFor && moveNode && (
         <LabelPicker

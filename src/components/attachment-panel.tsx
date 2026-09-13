@@ -24,6 +24,7 @@ import {
   Upload,
 } from 'lucide-react';
 import { formatSmartDate, type TranscriptAttachment } from '@/lib/format';
+import { OFFLINE_TITLE, useOfflineGate } from '@/lib/offline/offline-context';
 
 const MAX_FILE_BYTES = 25 * 1024 * 1024;
 
@@ -50,6 +51,8 @@ interface AttachmentPanelProps {
  * anyone with access and gets injected into the AI-notes prompt server-side.
  */
 export function AttachmentPanel({ transcriptId, canEdit, onChanged }: AttachmentPanelProps) {
+  // Attachment downloads are not pinned — the title is plain text while blocked.
+  const { blocked } = useOfflineGate();
   const [attachments, setAttachments] = useState<TranscriptAttachment[]>([]);
   const [loaded, setLoaded] = useState(false);
   const [collapsed, setCollapsed] = useState(false);
@@ -277,7 +280,15 @@ export function AttachmentPanel({ transcriptId, canEdit, onChanged }: Attachment
                       <AlignLeft className="mt-0.5 h-3.5 w-3.5 shrink-0 text-muted-foreground" />
                     )}
                     <div className="min-w-0 flex-1" title={tooltipBits.join(' · ') || undefined}>
-                      {isFile ? (
+                      {isFile && blocked ? (
+                        <span
+                          className="block truncate text-[13px] font-medium text-foreground/70"
+                          title={OFFLINE_TITLE}
+                          aria-disabled="true"
+                        >
+                          {a.title}
+                        </span>
+                      ) : isFile ? (
                         <a
                           href={`/api/transcripts/${transcriptId}/attachments/${a.id}/download`}
                           target="_blank"

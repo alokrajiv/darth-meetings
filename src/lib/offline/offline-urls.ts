@@ -35,6 +35,7 @@ export const TRANSCRIPT_API_SUFFIXES = [
   '/labels',
   '/ai-runs',
   '/attachments',
+  '/activity?limit=200',
 ] as const;
 
 export interface UrlSet {

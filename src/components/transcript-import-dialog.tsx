@@ -11,6 +11,8 @@ import {
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
+import { OFFLINE_TITLE, useOfflineGate } from '@/lib/offline/offline-context';
+import { isNetworkFailure } from '@/lib/offline/offline-fetch';
 import {
   AlertCircle,
   CheckCircle2,
@@ -38,6 +40,8 @@ export function TranscriptImportDialog({ open, onClose, onImported }: Transcript
   const [step, setStep] = useState<Step>('input');
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+  // Offline mode / network down: the import POST cannot succeed.
+  const { blocked } = useOfflineGate();
   const [title, setTitle] = useState('');
   const [pasted, setPasted] = useState('');
   const [file, setFile] = useState<File | null>(null);
@@ -119,7 +123,7 @@ export function TranscriptImportDialog({ open, onClose, onImported }: Transcript
       setStep('done');
       onImported?.();
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Import failed');
+      setError(isNetworkFailure(err) ? OFFLINE_TITLE : err instanceof Error ? err.message : 'Import failed');
       setStep('input');
     } finally {
       setBusy(false);
@@ -134,6 +138,12 @@ export function TranscriptImportDialog({ open, onClose, onImported }: Transcript
             Import a transcript (any format)
           </DialogTitle>
         </DialogHeader>
+
+        {blocked && (
+          <p className="rounded-md border border-amber-500/40 bg-amber-500/10 px-3 py-1.5 text-xs text-amber-800 dark:text-amber-300">
+            {OFFLINE_TITLE}
+          </p>
+        )}
 
         {step === 'input' && (
           <div className="space-y-4 min-w-0">
@@ -256,7 +266,11 @@ export function TranscriptImportDialog({ open, onClose, onImported }: Transcript
               <Button variant="ghost" onClick={handleClose} disabled={busy}>
                 Cancel
               </Button>
-              <Button onClick={() => void runImport()} disabled={busy || (!file && pasted.trim().length < 20)}>
+              <Button
+                onClick={() => void runImport()}
+                disabled={blocked || busy || (!file && pasted.trim().length < 20)}
+                title={blocked ? OFFLINE_TITLE : undefined}
+              >
                 {busy ? (
                   <Loader2 className="h-4 w-4 mr-2 animate-spin" />
                 ) : (

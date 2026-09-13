@@ -6,6 +6,7 @@ import { AudioLines, ChevronRight } from 'lucide-react';
 import type { ReactNode } from 'react';
 import { ThemeToggle } from '@/components/theme-toggle';
 import { OfflineChip } from '@/components/offline-chip';
+import { OFFLINE_TITLE, useOfflineGate } from '@/lib/offline/offline-context';
 
 interface AppHeaderProps {
   /** Right-aligned actions slot. */
@@ -20,6 +21,9 @@ interface AppHeaderProps {
  */
 export function AppHeader({ children, breadcrumb }: AppHeaderProps) {
   const pathname = usePathname();
+  // The series index needs the server; the Meetings listing and the brand
+  // link stay live (cached shell → offline archive).
+  const { blocked } = useOfflineGate();
   return (
     <header className="sticky top-0 z-40 h-14 border-b bg-background/85 backdrop-blur">
       <div className="mx-auto flex h-14 max-w-[1720px] items-center gap-3 px-6">
@@ -34,7 +38,17 @@ export function AppHeader({ children, breadcrumb }: AppHeaderProps) {
             {[
               { href: '/', label: 'Meetings' },
               { href: '/series', label: 'Series' },
-            ].map((l) => (
+            ].map((l) =>
+              l.href === '/series' && blocked ? (
+                <span
+                  key={l.href}
+                  aria-disabled="true"
+                  title={OFFLINE_TITLE}
+                  className="rounded-md px-2 py-1 text-muted-foreground/50 cursor-not-allowed"
+                >
+                  {l.label}
+                </span>
+              ) : (
               <Link
                 key={l.href}
                 href={l.href}
@@ -46,7 +60,8 @@ export function AppHeader({ children, breadcrumb }: AppHeaderProps) {
               >
                 {l.label}
               </Link>
-            ))}
+              )
+            )}
           </nav>
         )}
         {breadcrumb && (

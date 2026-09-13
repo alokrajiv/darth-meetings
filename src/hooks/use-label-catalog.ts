@@ -12,6 +12,8 @@
 
 import { useCallback, useEffect, useState } from 'react';
 import type { LabelRow } from '@/lib/labels';
+import { OFFLINE_TITLE } from '@/lib/offline/offline-types';
+import { isNetworkFailure, offlineAwareError } from '@/lib/offline/offline-fetch';
 
 export interface LabelCatalog {
   rows: LabelRow[];
@@ -48,7 +50,7 @@ export function refreshLabelCatalog(): Promise<void> {
   inflight = (async () => {
     try {
       const res = await fetch('/api/labels?counts=1', { credentials: 'include' });
-      if (!res.ok) throw new Error(`Failed to load labels (${res.status})`);
+      if (!res.ok) throw await offlineAwareError(res, `Failed to load labels (${res.status})`);
       const data = (await res.json()) as {
         labels?: LabelRow[];
         unlabelled?: number;
@@ -66,10 +68,12 @@ export function refreshLabelCatalog(): Promise<void> {
         total: typeof data.total === 'number' ? data.total : null,
       });
     } catch (err) {
+      // Offline / network down: the rows already loaded stay (degraded
+      // scope); consumers render `error` as the reason.
       publish({
         ...current,
         loaded: true,
-        error: err instanceof Error ? err.message : 'Failed to load labels',
+        error: isNetworkFailure(err) ? OFFLINE_TITLE : err instanceof Error ? err.message : 'Failed to load labels',
       });
     } finally {
       inflight = null;

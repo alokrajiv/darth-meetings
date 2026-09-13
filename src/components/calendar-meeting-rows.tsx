@@ -16,6 +16,8 @@ import { msConnectHref, msLinkMissing, useMsLinkStatus } from '@/components/conn
 import { ExternalLink, EyeOff, FileText, Loader2, Repeat, Search, Settings2, Upload, Video, VideoOff, Zap } from 'lucide-react';
 import { MeetLogo, TeamsLogo } from '@/components/provider-icon';
 import { requestMediaUpload } from '@/components/audio-upload';
+import { OFFLINE_TITLE, useOfflineGate } from '@/lib/offline/offline-context';
+import { isNetworkFailure } from '@/lib/offline/offline-fetch';
 
 // Server-declared shapes (type-only import — erased at build, no server
 // code is pulled into the client bundle). Display-only data: importing
@@ -235,12 +237,15 @@ export function TeamsChatVerdictLine({
  * back to this page. */
 export function ConnectMicrosoftHint({ className = '' }: { className?: string }) {
   const ms = useMsLinkStatus(false);
+  // Connecting navigates to Darth Tasks — impossible offline.
+  const { blocked } = useOfflineGate();
   return (
     <button
       type="button"
       data-connect-microsoft-hint
-      className={`min-w-0 max-w-[34ch] shrink truncate text-left text-[11px] text-primary/80 underline-offset-2 hover:underline ${className}`}
-      title="Teams meeting chats record when a call started/ended and whether it was recorded. Connect your Microsoft account (via Darth Tasks) to read them."
+      disabled={blocked}
+      className={`min-w-0 max-w-[34ch] shrink truncate text-left text-[11px] text-primary/80 underline-offset-2 hover:underline disabled:cursor-not-allowed disabled:opacity-60 disabled:hover:no-underline ${className}`}
+      title={blocked ? OFFLINE_TITLE : 'Teams meeting chats record when a call started/ended and whether it was recorded. Connect your Microsoft account (via Darth Tasks) to read them.'}
       onClick={(e) => {
         e.stopPropagation();
         window.location.href = msConnectHref(ms);
@@ -271,10 +276,13 @@ function EventGearMenu({
   row: r,
   layer,
   onMuteChanged,
+  disabled = false,
 }: {
   row: CalendarMeetingRow;
   layer: CalendarLayer;
   onMuteChanged?: () => void;
+  /** Offline mode / network down: the menu opens, its actions are inert. */
+  disabled?: boolean;
 }) {
   const [open, setOpen] = useState(false);
   const [pos, setPos] = useState<{ top: number; left: number } | null>(null);
@@ -340,7 +348,7 @@ function EventGearMenu({
       close();
       onMuteChanged?.();
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Failed to hide');
+      setError(isNetworkFailure(err) ? OFFLINE_TITLE : err instanceof Error ? err.message : 'Failed to hide');
     } finally {
       setBusy(false);
     }
@@ -426,7 +434,8 @@ function EventGearMenu({
             {canUpload && (
               <button
                 type="button"
-                disabled={busy}
+                disabled={busy || disabled}
+                title={disabled ? OFFLINE_TITLE : undefined}
                 onClick={() => {
                   close();
                   requestMediaUpload({
@@ -442,7 +451,8 @@ function EventGearMenu({
             )}
             <button
               type="button"
-              disabled={busy}
+              disabled={busy || disabled}
+              title={disabled ? OFFLINE_TITLE : undefined}
               onClick={() => void mute('occurrence', r.key)}
               className="flex w-full items-center gap-1.5 rounded px-1.5 py-1 text-left text-sm hover:bg-muted disabled:opacity-50"
             >
@@ -452,7 +462,8 @@ function EventGearMenu({
             {r.recurringEventId && (
               <button
                 type="button"
-                disabled={busy}
+                disabled={busy || disabled}
+                title={disabled ? OFFLINE_TITLE : undefined}
                 onClick={() => void mute('series', r.recurringEventId!)}
                 className="flex w-full items-center gap-1.5 rounded px-1.5 py-1 text-left text-sm hover:bg-muted disabled:opacity-50"
               >
@@ -467,6 +478,7 @@ function EventGearMenu({
               <Loader2 className="h-3.5 w-3.5 animate-spin" /> Hiding…
             </div>
           )}
+          {disabled && !error && <p className="px-1 pt-1 text-xs text-muted-foreground">{OFFLINE_TITLE}</p>}
           {error && <p className="px-1 pt-1 text-xs text-destructive">{error}</p>}
         </div>
       )}
@@ -490,6 +502,9 @@ interface CalendarEventRowProps {
   onMuteChanged?: () => void;
   /** The row's series chip was clicked — host opens its SeriesDialog. */
   onOpenSeries?: (seriesId: number) => void;
+  /** Offline mode / network down: row click, Import/Check/Upload, the gear
+   * actions and the series chip are inert (visible, "Not available offline"). */
+  disabled?: boolean;
 }
 
 /**
@@ -509,6 +524,7 @@ export function CalendarEventRow({
   onImportMeeting,
   onMuteChanged,
   onOpenSeries,
+  disabled = false,
 }: CalendarEventRowProps) {
   // Unimported rows (artifacts known) import straight away. A row in the
   // "No recording" layer — Meet OR Teams — has NO known artifacts: the old
@@ -615,7 +631,7 @@ export function CalendarEventRow({
         setCheckNote(`Nothing at ${providerName} — never recorded`);
       }
     } catch (err) {
-      setCheckNote(err instanceof Error ? err.message : 'Check failed');
+      setCheckNote(isNetworkFailure(err) ? OFFLINE_TITLE : err instanceof Error ? err.message : 'Check failed');
     } finally {
       setChecking(false);
     }
@@ -669,7 +685,7 @@ export function CalendarEventRow({
   // "Going in" on a not-yet-imported meeting = the import dialog focused on
   // it (same mechanism as the reminder rows and the Import… button). The
   // buttons/badges inside all stopPropagation already.
-  const rowClickable = !!r.meetingCode && !!onImportMeeting && layer === 'unimported';
+  const rowClickable = !!r.meetingCode && !!onImportMeeting && layer === 'unimported' && !disabled;
   const autoVia = r.autoSync
     ? r.autoSync.source === 'series'
       ? ` via ${r.autoSync.importerEmail ?? '?'}'s "${r.autoSync.seriesTitle ?? 'series'}" series auto-import`
@@ -689,6 +705,8 @@ export function CalendarEventRow({
   return (
     <TableRow
       onClick={rowClickable ? () => onImportMeeting!({ meetingCode: r.meetingCode!, eventStart: r.eventStart }) : undefined}
+      aria-disabled={disabled || undefined}
+      title={disabled ? OFFLINE_TITLE : undefined}
       className={`group bg-muted/30 transition-colors hover:bg-accent/30 ${
         r.muted ? 'opacity-60' : ''
       } ${rowClickable ? 'cursor-pointer' : ''}`}
@@ -775,12 +793,13 @@ export function CalendarEventRow({
               {r.seriesId !== null && (
                 <button
                   type="button"
+                  disabled={disabled}
                   onClick={(e) => {
                     e.stopPropagation();
                     onOpenSeries?.(r.seriesId!);
                   }}
-                  title={`Recurring call: ${r.seriesTitle} — click to see the whole series`}
-                  className="inline-flex max-w-44 shrink-0 items-center gap-1 rounded-full border border-primary/25 bg-primary/5 px-2 py-0.5 text-[11px] text-primary transition-colors hover:bg-primary/10"
+                  title={disabled ? OFFLINE_TITLE : `Recurring call: ${r.seriesTitle} — click to see the whole series`}
+                  className="inline-flex max-w-44 shrink-0 items-center gap-1 rounded-full border border-primary/25 bg-primary/5 px-2 py-0.5 text-[11px] text-primary transition-colors hover:bg-primary/10 disabled:cursor-not-allowed disabled:opacity-60"
                 >
                   <Repeat className="h-3 w-3 shrink-0" />
                   <span className="truncate">{r.seriesTitle}</span>
@@ -818,7 +837,7 @@ export function CalendarEventRow({
       ))}
       <TableCell className="py-1.5 pr-3">
         <div className="flex items-center justify-end gap-0.5">
-          <EventGearMenu row={r} layer={layer} onMuteChanged={onMuteChanged} />
+          <EventGearMenu row={r} layer={layer} onMuteChanged={onMuteChanged} disabled={disabled} />
           {canImport && r.autoSync && (
             <Badge
               variant="outline"
@@ -840,6 +859,8 @@ export function CalendarEventRow({
               size="sm"
               variant="outline"
               className="h-7 px-2.5 text-xs"
+              disabled={disabled}
+              title={disabled ? OFFLINE_TITLE : undefined}
               onClick={(e) => {
                 e.stopPropagation();
                 onImportMeeting?.({
@@ -873,8 +894,8 @@ export function CalendarEventRow({
                 size="sm"
                 variant="outline"
                 className="h-7 px-2.5 text-xs"
-                disabled={checking}
-                title={`Ask ${providerName} whether this meeting left a recording or transcript${
+                disabled={checking || disabled}
+                title={disabled ? OFFLINE_TITLE : `Ask ${providerName} whether this meeting left a recording or transcript${
                   knownEmpty ? ' (re-check — nothing was there last time)' : " (the calendar hasn't shown any yet)"
                 }`}
                 onClick={(e) => {
@@ -903,7 +924,8 @@ export function CalendarEventRow({
                   eventId: r.eventId!,
                 });
               }}
-              title="Upload your own recording for this meeting"
+              disabled={disabled}
+              title={disabled ? OFFLINE_TITLE : 'Upload your own recording for this meeting'}
             >
               Upload…
             </Button>

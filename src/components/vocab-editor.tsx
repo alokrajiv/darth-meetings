@@ -8,6 +8,8 @@ import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Badge } from '@/components/ui/badge';
 import { Plus, Trash2, Save } from 'lucide-react';
 import type { VocabPayload, CustomSpellingEntry } from '@/lib/format';
+import { OFFLINE_TITLE } from '@/lib/offline/offline-types';
+import { isNetworkFailure } from '@/lib/offline/offline-fetch';
 
 interface VocabEditorProps {
   title: string;
@@ -16,6 +18,8 @@ interface VocabEditorProps {
   onSave: (payload: VocabPayload) => Promise<void>;
   /** Optional metadata to render under the title (e.g. "v3 — edited 2m ago by ..."). */
   meta?: React.ReactNode;
+  /** Offline mode / network down: Save is inert (the draft stays editable). */
+  disabled?: boolean;
 }
 
 /**
@@ -24,7 +28,7 @@ interface VocabEditorProps {
  * own vocab, once for the company-wide vocab. Fully controlled; local
  * draft state, calls `onSave` on submit.
  */
-export function VocabEditor({ title, description, initial, onSave, meta }: VocabEditorProps) {
+export function VocabEditor({ title, description, initial, onSave, meta, disabled = false }: VocabEditorProps) {
   const [keyterms, setKeyterms] = useState<string[]>(initial.keyterms_prompt);
   const [customSpelling, setCustomSpelling] = useState<CustomSpellingEntry[]>(
     initial.custom_spelling
@@ -36,6 +40,7 @@ export function VocabEditor({ title, description, initial, onSave, meta }: Vocab
   );
   const [saving, setSaving] = useState(false);
   const [savedAt, setSavedAt] = useState<number | null>(null);
+  const [saveError, setSaveError] = useState<string | null>(null);
 
   const addKeytermRow = () => {
     setKeyterms((prev) => [...prev, '']);
@@ -83,7 +88,7 @@ export function VocabEditor({ title, description, initial, onSave, meta }: Vocab
       setFromDrafts(cleanedSpelling.map((s) => s.from.join(', ')));
     } catch (err) {
       console.error('Vocab save failed:', err);
-      alert('Failed to save vocab. See console.');
+      setSaveError(isNetworkFailure(err) ? OFFLINE_TITLE : err instanceof Error ? err.message : 'Failed to save vocab');
     } finally {
       setSaving(false);
     }
@@ -98,11 +103,12 @@ export function VocabEditor({ title, description, initial, onSave, meta }: Vocab
             <p className="mt-1 text-sm text-muted-foreground">{description}</p>
             {meta}
           </div>
-          <Button onClick={handleSave} disabled={saving} size="sm">
+          <Button onClick={handleSave} disabled={saving || disabled} size="sm" title={disabled ? OFFLINE_TITLE : undefined}>
             <Save className="h-4 w-4 mr-2" />
             {saving ? 'Saving...' : 'Save'}
           </Button>
         </div>
+        {saveError && <p className="mt-2 text-xs text-destructive">{saveError}</p>}
       </CardHeader>
       <CardContent className="space-y-6">
         {/* Keyterms prompt */}

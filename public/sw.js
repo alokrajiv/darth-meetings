@@ -66,6 +66,10 @@ self.addEventListener('message', (event) => {
       (async () => {
         const names = await caches.keys();
         await Promise.all(names.filter((n) => n.startsWith('darth-')).map((n) => caches.delete(n)));
+        // The wipe also removed the /offline fallback; without re-priming it
+        // the next failed navigation gets the inline 503 until the SW is
+        // next re-installed (a sign-out followed by a flight).
+        await precacheOfflinePage();
         const reply = { type: 'CLEARED' };
         if (event.source && typeof event.source.postMessage === 'function') {
           event.source.postMessage(reply);

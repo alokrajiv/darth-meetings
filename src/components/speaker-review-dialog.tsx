@@ -29,6 +29,8 @@ interface SpeakerReviewDialogProps {
   onConfirm: (names: Record<string, string>) => Promise<void>;
   /** Generate without touching the labels. */
   onSkip: () => void;
+  /** Offline mode / network down: Skip and Confirm are inert (both generate server-side). */
+  disabled?: boolean;
 }
 
 /**
@@ -47,6 +49,7 @@ export function SpeakerReviewDialog({
   identifying,
   onConfirm,
   onSkip,
+  disabled = false,
 }: SpeakerReviewDialogProps) {
   const initialNames = useMemo(() => {
     const names: Record<string, string> = {};
@@ -168,15 +171,17 @@ export function SpeakerReviewDialog({
         <DialogFooter className="flex-col gap-2 sm:flex-row sm:items-center">
           <button
             type="button"
-            disabled={submitting}
+            disabled={submitting || disabled}
+            title={disabled ? 'Not available offline' : undefined}
             onClick={onSkip}
-            className="text-xs text-muted-foreground underline-offset-2 hover:underline sm:mr-auto"
+            className="text-xs text-muted-foreground underline-offset-2 hover:underline disabled:cursor-not-allowed disabled:opacity-50 sm:mr-auto"
           >
             Skip — generate without names
           </button>
           <Button
             size="sm"
-            disabled={submitting}
+            disabled={submitting || disabled}
+            title={disabled ? 'Not available offline' : undefined}
             onClick={async () => {
               setSubmitting(true);
               try {

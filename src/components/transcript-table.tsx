@@ -51,6 +51,8 @@ import { LabelChips } from '@/components/label-chips';
 import { LabelPicker, anchorFromElement, parseError, type PickerAnchor } from '@/components/label-picker';
 import { BulkLabelBar } from '@/components/bulk-label-bar';
 import { refreshLabelCatalog } from '@/hooks/use-label-catalog';
+import { OFFLINE_TITLE, useOffline, useOfflineGate } from '@/lib/offline/offline-context';
+import { isNetworkFailure, offlineAwareError } from '@/lib/offline/offline-fetch';
 import { labelFilterToParams, type LabelFilter } from '@/lib/labels';
 import type { LabelRef } from '@/lib/format';
 import {
@@ -386,6 +388,13 @@ export function TranscriptTable({
   onLabelFilter,
 }: TranscriptTableProps) {
   const router = useRouter();
+  // Offline mode / network down: every server-backed control stays visible
+  // but disabled with the shared tooltip; the listing fetches degrade to a
+  // "You're offline" panel with a "Go offline" shortcut to the archive.
+  const { blocked } = useOfflineGate();
+  const blockedRef = useRef(blocked);
+  blockedRef.current = blocked;
+  const { enterOffline } = useOffline();
   const [tab, setTab] = useState<TabKey>('all');
   const [query, setQuery] = useState('');
   const [debouncedQ, setDebouncedQ] = useState('');
@@ -611,7 +620,7 @@ export function TranscriptTable({
         const res = await fetch(`/api/transcripts?${params.toString()}`, {
           credentials: 'include',
         });
-        if (!res.ok) throw new Error(`Failed to load transcripts (${res.status})`);
+        if (!res.ok) throw await offlineAwareError(res, `Failed to load transcripts (${res.status})`);
         const data = (await res.json()) as TranscriptListV2Response;
         if (gen !== archiveGenRef.current) return; // superseded by a newer reset
         setError(null);
@@ -629,7 +638,7 @@ export function TranscriptTable({
       } catch (err) {
         if (gen !== archiveGenRef.current) return;
         if (mode === 'reset') {
-          setError(err instanceof Error ? err.message : 'Failed to load transcripts');
+          setError(isNetworkFailure(err) ? OFFLINE_TITLE : err instanceof Error ? err.message : 'Failed to load transcripts');
         }
         // more/silent failures are quiet — the loaded window stays usable
       } finally {
@@ -668,6 +677,15 @@ export function TranscriptTable({
       }
       const patch = (p: Partial<CalSourceState>) =>
         setCalSrc((prev) => ({ ...prev, [view]: { ...prev[view], ...p } }));
+      if (blockedRef.current) {
+        // No network: never leave the merged view on a spinner. The error
+        // strip shows the offline line with its Retry.
+        if (mode === 'reset') {
+          calSrcRef.current = { ...calSrcRef.current, [view]: { ...src, loading: false, error: OFFLINE_TITLE } };
+          patch({ loading: false, error: OFFLINE_TITLE });
+        }
+        return;
+      }
       if (mode === 'reset') {
         // Mark loading in the ref synchronously too, so the lazy-load
         // effect can't double-fire a reset within the same commit.
@@ -682,7 +700,7 @@ export function TranscriptTable({
         const res = await fetch(`/api/calendar-meetings?${params.toString()}`, {
           credentials: 'include',
         });
-        if (!res.ok) throw new Error(`Failed to load calendar meetings (${res.status})`);
+        if (!res.ok) throw await offlineAwareError(res, `Failed to load calendar meetings (${res.status})`);
         const data = (await res.json()) as CalendarMeetingsResponse;
         if (gen !== calGenRef.current[view]) return; // superseded by a newer reset
         setCalCounts(data.counts);
@@ -713,8 +731,11 @@ export function TranscriptTable({
         if (mode === 'reset') {
           patch({
             loading: false,
-            error:
-              err instanceof Error ? err.message : 'Failed to load calendar meetings',
+            error: isNetworkFailure(err)
+              ? OFFLINE_TITLE
+              : err instanceof Error
+                ? err.message
+                : 'Failed to load calendar meetings',
           });
         } else if (mode === 'more') {
           patch({ loadingMore: false });
@@ -770,6 +791,28 @@ export function TranscriptTable({
     if (!peopleLoaded || !labelFilterReady) return;
     void fetchArchive('reset');
   }, [fetchArchive, peopleLoaded, labelFilterReady]);
+
+  // Connection back (blocked flipped true → false): the listing that failed
+  // with the offline panel re-fetches on its own, and the calendar layers
+  // that errored with OFFLINE_TITLE are reset so the lazy loader retries.
+  const wasBlockedRef = useRef(blocked);
+  useEffect(() => {
+    if (wasBlockedRef.current && !blocked) {
+      void fetchArchiveRef.current('reset');
+      setCalSrc((prev) => {
+        let changed = false;
+        const next = { ...prev };
+        for (const v of CAL_VIEWS) {
+          if (prev[v].error === OFFLINE_TITLE) {
+            next[v] = EMPTY_CAL_SOURCE;
+            changed = true;
+          }
+        }
+        return changed ? next : prev;
+      });
+    }
+    wasBlockedRef.current = blocked;
+  }, [blocked]);
 
   // Range/tz changed → the calendar windows are stale. Drop them (bumping
   // gens so in-flight responses discard) and let the lazy loader below
@@ -837,9 +880,11 @@ export function TranscriptTable({
   // calendar layers. The `lastPollAt` chip is the freshness indicator for
   // everything the calendar layers show.
   const [manualSyncing, setManualSyncing] = useState(false);
+  const [manualSyncNote, setManualSyncNote] = useState<string | null>(null);
   const runManualCalSync = useCallback(async () => {
     if (manualSyncing) return;
     setManualSyncing(true);
+    setManualSyncNote(null);
     try {
       const res = await fetch('/api/calendar/sync', { method: 'POST' });
       if (res.ok) {
@@ -851,8 +896,13 @@ export function TranscriptTable({
         );
       }
       silentRefetchCalendars();
-    } catch {
-      // transient — the chip simply keeps the old timestamp
+    } catch (err) {
+      // transient — the chip simply keeps the old timestamp; a dropped
+      // network (before the probe noticed) says so for a moment.
+      if (isNetworkFailure(err)) {
+        setManualSyncNote(OFFLINE_TITLE);
+        window.setTimeout(() => setManualSyncNote(null), 2500);
+      }
     } finally {
       setManualSyncing(false);
     }
@@ -1037,7 +1087,11 @@ export function TranscriptTable({
       removeRowLocally(t.assemblyai_id);
       void fetchArchiveRef.current('silent');
     } catch (err) {
-      alert('Failed to delete transcript: ' + (err instanceof Error ? err.message : 'Unknown error'));
+      alert(
+        isNetworkFailure(err)
+          ? OFFLINE_TITLE
+          : 'Failed to delete transcript: ' + (err instanceof Error ? err.message : 'Unknown error')
+      );
     }
   };
 
@@ -1052,7 +1106,11 @@ export function TranscriptTable({
       removeRowLocally(assemblyaiId);
       void fetchArchiveRef.current('silent');
     } catch (err) {
-      alert('Failed to restore transcript: ' + (err instanceof Error ? err.message : 'Unknown error'));
+      alert(
+        isNetworkFailure(err)
+          ? OFFLINE_TITLE
+          : 'Failed to restore transcript: ' + (err instanceof Error ? err.message : 'Unknown error')
+      );
     }
   };
 
@@ -1189,6 +1247,7 @@ export function TranscriptTable({
         e.preventDefault();
         toggleSelected(id, e.shiftKey);
       } else if (key === 'l') {
+        if (blockedRef.current) return; // label mutations need the server
         if (selected.size > 0) {
           e.preventDefault();
           setBulkOpenSignal((n) => n + 1);
@@ -1381,6 +1440,7 @@ export function TranscriptTable({
             <LabelChips
               labels={t.labels}
               fit
+              disabled={blocked}
               onFilter={
                 onLabelFilter
                   ? (l) => onLabelFilter({ kind: 'id', id: l.id, exact: false })
@@ -1561,7 +1621,9 @@ export function TranscriptTable({
       key={key}
       type="button"
       onClick={() => setTab(key)}
-      className={`relative px-2.5 pb-2.5 pt-1 text-sm transition-colors ${
+      disabled={blocked}
+      title={blocked ? OFFLINE_TITLE : undefined}
+      className={`relative px-2.5 pb-2.5 pt-1 text-sm transition-colors disabled:cursor-not-allowed disabled:opacity-60 ${
         tab === key
           ? 'font-medium text-foreground after:absolute after:inset-x-0 after:-bottom-px after:h-0.5 after:rounded-full after:bg-primary'
           : 'text-muted-foreground hover:text-foreground'
@@ -1603,8 +1665,9 @@ export function TranscriptTable({
             setPickedMonth({ y: now.getFullYear(), m: now.getMonth() });
           }
         }}
-        title="Date range"
-        className="h-8 rounded-md border border-input bg-background px-2 text-xs focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+        disabled={blocked}
+        title={blocked ? OFFLINE_TITLE : 'Date range'}
+        className="h-8 rounded-md border border-input bg-background px-2 text-xs focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:cursor-not-allowed disabled:opacity-60"
       >
         <option value="all">All time</option>
         <option value="thisWeek">This week</option>
@@ -1619,7 +1682,8 @@ export function TranscriptTable({
             variant="ghost"
             size="sm"
             className="h-6 w-6 p-0"
-            title="Previous month"
+            disabled={blocked}
+            title={blocked ? OFFLINE_TITLE : 'Previous month'}
             onClick={() => stepMonth(-1)}
           >
             <ChevronLeft className="h-3.5 w-3.5" />
@@ -1630,7 +1694,8 @@ export function TranscriptTable({
             variant="ghost"
             size="sm"
             className="h-6 w-6 p-0"
-            title="Next month"
+            disabled={blocked}
+            title={blocked ? OFFLINE_TITLE : 'Next month'}
             onClick={() => stepMonth(1)}
           >
             <ChevronRight className="h-3.5 w-3.5" />
@@ -1649,6 +1714,7 @@ export function TranscriptTable({
           unimportedCount={calCounts ? calCounts.unimported : null}
           norecCount={calCounts ? calCounts.norec : null}
           inactive={!mergedMode}
+          offline={blocked}
           onToggle={toggleLayer}
         />
       </div>
@@ -1667,13 +1733,14 @@ export function TranscriptTable({
             variant="ghost"
             size="sm"
             className="h-6 px-1.5 text-[11px]"
-            disabled={manualSyncing}
-            title="Sweep your calendar and meeting artifacts now"
+            disabled={manualSyncing || blocked}
+            title={blocked ? OFFLINE_TITLE : 'Sweep your calendar and meeting artifacts now'}
             onClick={() => void runManualCalSync()}
           >
             <RefreshCw className={`h-3 w-3 ${manualSyncing ? 'animate-spin' : ''}`} />
             Sync
           </Button>
+          {manualSyncNote && <span className="ml-1 text-[11px] text-destructive">{manualSyncNote}</span>}
         </div>
       )}
       {mutes.length > 0 && (
@@ -1715,8 +1782,9 @@ export function TranscriptTable({
                     <button
                       type="button"
                       onClick={() => void handleUnmute(m)}
-                      title="Unhide"
-                      className="rounded p-1 text-muted-foreground hover:bg-muted-foreground/10 hover:text-foreground"
+                      disabled={blocked}
+                      title={blocked ? OFFLINE_TITLE : 'Unhide'}
+                      className="rounded p-1 text-muted-foreground hover:bg-muted-foreground/10 hover:text-foreground disabled:cursor-not-allowed disabled:opacity-60"
                     >
                       <X className="h-3.5 w-3.5" />
                       <span className="sr-only">Unhide</span>
@@ -1768,20 +1836,23 @@ export function TranscriptTable({
             value={query}
             onChange={(e) => setQuery(e.target.value)}
             placeholder="Search meetings…"
+            disabled={blocked}
+            title={blocked ? OFFLINE_TITLE : undefined}
             className="h-8 w-64 pl-8 pr-8"
           />
           <kbd className="pointer-events-none absolute right-2 top-1/2 -translate-y-1/2 rounded border bg-muted px-1.5 font-mono text-[10px] text-muted-foreground">
             /
           </kbd>
         </div>
-        <PeopleFilterControl value={peopleFilters} onChange={setPeopleFilters} />
+        <PeopleFilterControl value={peopleFilters} onChange={setPeopleFilters} disabled={blocked} />
         {columnChooser}
         <Button
           onClick={silentRefetchAll}
           variant="ghost"
           size="sm"
           className="h-8 w-8 p-0"
-          title="Refresh"
+          disabled={blocked}
+          title={blocked ? OFFLINE_TITLE : 'Refresh'}
         >
           <RefreshCw className="h-4 w-4" />
           <span className="sr-only">Refresh</span>
@@ -1790,7 +1861,7 @@ export function TranscriptTable({
     </div>
   );
 
-  const filterChips = <PeopleFilterChips value={peopleFilters} onChange={setPeopleFilters} />;
+  const filterChips = <PeopleFilterChips value={peopleFilters} onChange={setPeopleFilters} disabled={blocked} />;
   const peopleActive = hasPeopleFilters(peopleFilters) || !!labelFilter;
 
   const emptyState = (
@@ -1905,6 +1976,7 @@ export function TranscriptTable({
                         : null
                     }
                     defaultTitle={t.title}
+                    disabled={blocked}
                     onOpenSeries={setOpenSeriesId}
                     onChanged={() => void fetchArchiveRef.current('silent')}
                   />
@@ -1917,6 +1989,7 @@ export function TranscriptTable({
                   <LabelChips
                     labels={t.labels}
                     className="md:hidden"
+                    disabled={blocked}
                     onFilter={
                       onLabelFilter
                         ? (l) => onLabelFilter({ kind: 'id', id: l.id, exact: false })
@@ -2003,7 +2076,8 @@ export function TranscriptTable({
                 variant="ghost"
                 className="h-7 w-7 p-0 text-muted-foreground opacity-0 transition-opacity hover:text-foreground group-hover:opacity-100"
                 onClick={(e) => handleRestoreTranscript(e, t.assemblyai_id)}
-                title="Restore"
+                disabled={blocked}
+                title={blocked ? OFFLINE_TITLE : 'Restore'}
               >
                 <RotateCcw className="h-3.5 w-3.5" />
               </Button>
@@ -2014,7 +2088,8 @@ export function TranscriptTable({
                 variant="ghost"
                 className="h-7 w-7 p-0 text-muted-foreground opacity-0 transition-opacity hover:text-destructive group-hover:opacity-100"
                 onClick={(e) => handleDeleteTranscript(e, t)}
-                title={trashed ? 'Delete forever' : waiting ? 'Cancel queued import' : 'Move to trash'}
+                disabled={blocked}
+                title={blocked ? OFFLINE_TITLE : trashed ? 'Delete forever' : waiting ? 'Cancel queued import' : 'Move to trash'}
               >
                 <Trash2 className="h-3.5 w-3.5" />
               </Button>
@@ -2172,10 +2247,26 @@ export function TranscriptTable({
     </TableRow>
   );
 
-  const archiveBody = loading ? (
-    container(spinner)
-  ) : error ? (
-    container(
+  // Listing fetch failed. An offline verdict gets the "Go offline" shortcut
+  // into the on-device archive instead of a bare "(503)".
+  const archiveErrorPanel =
+    error === OFFLINE_TITLE ? (
+      <div className="flex flex-col items-center py-16 text-center">
+        <p className="text-sm font-medium">You&apos;re offline</p>
+        <p className="mt-1 max-w-sm text-xs text-muted-foreground">
+          Switch to offline mode to browse the meetings saved on this device.
+        </p>
+        <div className="mt-4 flex items-center gap-2">
+          <Button onClick={() => enterOffline()} size="sm">
+            Go offline
+          </Button>
+          <Button onClick={() => void fetchArchive('reset')} variant="outline" size="sm">
+            <RefreshCw className="h-4 w-4" />
+            Retry
+          </Button>
+        </div>
+      </div>
+    ) : (
       <div className="flex flex-col items-center py-16 text-center">
         <p className="text-sm font-medium">Couldn&apos;t load transcripts</p>
         <p className="mt-1 text-xs text-destructive">{error}</p>
@@ -2189,6 +2280,13 @@ export function TranscriptTable({
           Retry
         </Button>
       </div>
+    );
+
+  const archiveBody = loading ? (
+    container(spinner)
+  ) : error ? (
+    container(
+archiveErrorPanel
     )
   ) : (
     container(
@@ -2259,19 +2357,7 @@ export function TranscriptTable({
     if (loading || mergedGroups === null) return container(spinner);
     if (error) {
       return container(
-        <div className="flex flex-col items-center py-16 text-center">
-          <p className="text-sm font-medium">Couldn&apos;t load transcripts</p>
-          <p className="mt-1 text-xs text-destructive">{error}</p>
-          <Button
-            onClick={() => void fetchArchive('reset')}
-            variant="outline"
-            size="sm"
-            className="mt-4"
-          >
-            <RefreshCw className="h-4 w-4" />
-            Retry
-          </Button>
-        </div>
+archiveErrorPanel
       );
     }
     const strips: React.ReactNode[] = [];
@@ -2295,8 +2381,9 @@ export function TranscriptTable({
           className="flex items-center justify-between gap-2 border-b bg-destructive/5 px-4 py-1.5 text-xs text-destructive"
         >
           <span className="min-w-0 truncate">
-            Couldn&apos;t load the {v === 'unimported' ? 'Not imported' : 'No recording'}{' '}
-            layer — {calSrc[v].error}
+            {calSrc[v].error === OFFLINE_TITLE
+              ? `You're offline — switch to offline mode to browse the meetings saved on this device (${v === 'unimported' ? 'Not imported' : 'No recording'} layer unavailable)`
+              : `Couldn't load the ${v === 'unimported' ? 'Not imported' : 'No recording'} layer — ${calSrc[v].error}`}
           </span>
           <Button
             variant="outline"
@@ -2371,6 +2458,7 @@ export function TranscriptTable({
                       onImportMeeting={onImportMeeting}
                       onMuteChanged={handleMuteChanged}
                       onOpenSeries={setOpenSeriesId}
+                      disabled={blocked}
                     />
                   )
                 )}
@@ -2434,6 +2522,7 @@ export function TranscriptTable({
         />
       )}
       <BulkLabelBar
+        disabled={blocked}
         selectedIds={selectedIds}
         selectedLabels={selectedLabels}
         readOnlyCount={selectedReadOnly}
