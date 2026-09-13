@@ -24,6 +24,10 @@ export const metadata: Metadata = {
   // PWA manifest: lets the app be installed (Add to Dock / Home Screen), which
   // on Safari also lifts the 7-day eviction of the offline caches.
   manifest: "/manifest.webmanifest",
+  // Safari/iOS install polish: the home-screen/Dock icon and the standalone
+  // (no browser chrome) flag — Chrome reads the manifest, Safari reads these.
+  icons: { apple: "/icons/icon-180.png" },
+  appleWebApp: { capable: true, title: "Meetings", statusBarStyle: "default" },
 };
 
 export const viewport: Viewport = {
