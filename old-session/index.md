@@ -360,3 +360,49 @@ pre-ship check + open holes.
    org-wide dedup view.
 4. Everything is committed and deployed (af3d364, 416e84c, 615cf0e, 9986ff8);
    migration 030 applied on prod. No loose ends in the tree.
+
+## 9. Offline support (SW + pins + audio-only + PWA) and the family agent chat — 2026-09-13/14
+
+**File:** [9. offline-support-sw-pins-audio-only-pwa-and-family-agent-chat.txt](9.%20offline-support-sw-pins-audio-only-pwa-and-family-agent-chat.txt)
+
+Alok's ask: offline mode (last 100 meetings, last 10 with audio, 0 video,
+per-meeting manual override, defaults + device list in Settings, opt-in
+banner when the connection drops). Built via Workflow subagents (main
+thread = planning/comms/coordination, per Alok): service worker
+(`public/sw.js`), IndexedDB pin ledger + sync loop (`src/lib/offline/`),
+audio-only ffmpeg derivative behind `?variant=audio` (202 preparing → poll),
+`GET /api/offline/plan`, `GET|PUT /api/offline/prefs`, migration 040
+(`user_prefs.offline_prefs`), banner/pill/settings card/offline archive/pin
+dialog, PWA manifest + icons. Three-lens review (16 fixes incl. a blocker:
+ledger bound to the signed-in user, wiped on logout / confirmed 401 / account
+switch; transient darth-auth failure → `/api/auth/session` 503
+`{transient:true}`), then a 275-control offline audit (38 fixes:
+`useOfflineGate()`, `OFFLINE_TITLE`, `offline-fetch.ts`, fieldset-disabled
+dialogs, logout disabled while the network is down). Deployed (33ea9d9,
+b1d5641, bff3b1b) with migration 040; Playwright E2E against prod green
+(setOffline → banner → archive → cached page + audio seek → Back online →
+logout wipe). Coordinated with holocron-dev-agent through
+`~/crp-workspace/darth/plans/offline/generic-ai-agents-chat.jsonl` (family
+alignment on copy, prefs envelope, wipe rules, icon frame, outbox event
+shape); design docs next to it. Media investigation: Meet mp4s have the
+`moov` index at the END (phone playback stalls); VM is plenty for the fix.
+Full pending list consolidated into
+`~/crp-workspace/darth/plans/meetings-tech-debt.md`.
+
+**Next session pickup points:**
+1. Deploy 90419c7 (apple-touch-icon 180 + Safari standalone metadata) —
+   committed, NOT pushed/deployed; needs Alok's go (`./deploy.sh`, guarded).
+2. Tech-debt A1 (P1): faststart remux at import + backfill of ~205 stored
+   videos, always-on audio-only extract at import + player uses it when the
+   video toggle is off; measure time-to-first-frame before/after; ask Alok
+   whether the phone's Tailscale path to the VM is DIRECT or RELAY.
+3. Tech-debt B1: offline activity outbox (family shape agreed with
+   holocrons: IDB `outbox`, `{key, kind, subjectId, at, meta}` →
+   `POST /api/offline/outbox`, idempotent on key, `offline:true` flag).
+4. Tech-debt C2/A2: Media Session lock-screen controls, manifest shortcuts,
+   icon badge — ~1 h together; verify PWA install on a real phone once.
+5. Re-arm the chat monitor if the family chat is still active (comm-based
+   snapshot diff in `tmp/offline-chat-mon/`; macOS diff lacks GNU flags).
+6. Stray untracked files in the repo root: an older unarchived export
+   `2026-08-30-195802-docshandoff-…txt` and `appreq-light.png` — archive or
+   delete.
