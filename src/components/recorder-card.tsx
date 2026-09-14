@@ -20,7 +20,7 @@ import { callKindLabel, companionPlatformSupported, getCompanion, useCompanion }
 
 export const RECORDER_INSTALL_CMD = 'curl -fsSL https://cli.darth-internal.trames.io/setup-darth-recorder.sh | bash';
 const RECORDER_DIST_URL = 'https://cli.darth-internal.trames.io/darth-recorder/version.json';
-const RECORDER_ZIP_URL = 'https://cli.darth-internal.trames.io/darth-recorder/DarthRecorder-latest.zip';
+const RECORDER_DMG_URL = 'https://cli.darth-internal.trames.io/darth-recorder/DarthRecorder-latest.dmg';
 
 export function RecorderCard() {
   const c = useCompanion();
@@ -128,12 +128,13 @@ export function RecorderCard() {
             ) : (
               <>
                 <p>
-                  <b>Install (macOS 14 or newer, Trames Tailnet):</b> download, unzip, drag <b>Darth Recorder</b> into
-                  Applications and open it — it is notarized by Apple, so no warning dialog.
+                  <b>Install (macOS 14 or newer, Trames Tailnet):</b> download, open the disk image, drag{' '}
+                  <b>Darth Recorder</b> onto the Applications folder next to it, then open it. Notarized by Apple, so
+                  no warning dialog — and if you open it from Downloads instead, it offers to move itself.
                 </p>
                 <div className="flex flex-wrap items-center gap-2">
                   <Button size="sm" asChild>
-                    <a href={RECORDER_ZIP_URL} data-recorder-download>
+                    <a href={RECORDER_DMG_URL} data-recorder-download>
                       <Download className="mr-1.5 h-3.5 w-3.5" /> Download for Mac
                     </a>
                   </Button>

@@ -3,7 +3,7 @@ import CoreGraphics
 import ServiceManagement
 import RecorderCore
 
-let VERSION = "0.1.2"
+let VERSION = "0.1.3"
 let WS_PORT: UInt16 = 47800
 let PWA_URL = URL(string: "https://meetings.darth-internal.trames.io/")!
 
@@ -32,7 +32,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationDidFinishLaunching(_ n: Notification) {
         RLog.openFile("~/Library/Logs/DarthRecorder/tray.log")
-        rlog("darth-tray \(VERSION) starting, pid \(getpid()), bundle \(Bundle.main.bundleIdentifier ?? "none")")
+        rlog("darth-tray \(VERSION) starting, pid \(getpid()), bundle \(Bundle.main.bundleIdentifier ?? "none") at \(Bundle.main.bundlePath)")
+        if offerMoveToApplications() { return }   // relaunching from /Applications
         buildMenu()
 
         if !CGPreflightScreenCaptureAccess() {
@@ -61,6 +62,59 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             UserDefaults.standard.set(true, forKey: seenKey)
             banner.showMessage(title: "Darth Recorder is running", sub: "It lives in your menu bar (the waveform icon). Turn on “Open at login” from its menu.")
         }
+    }
+
+    // MARK: install location
+
+    /// Running from Downloads / a mounted DMG / anywhere outside an Applications folder?
+    /// Offer to move ourselves (LetsMove-style). Returns true if we are relaunching.
+    func offerMoveToApplications() -> Bool {
+        let src = Bundle.main.bundleURL
+        let home = NSHomeDirectory()
+        if src.path.hasPrefix("/Applications/") || src.path.hasPrefix(home + "/Applications/") { return false }
+        if ProcessInfo.processInfo.environment["DARTH_TRAY_NO_MOVE"] == "1" { return false }
+        NSApp.activate(ignoringOtherApps: true)
+        let alert = NSAlert()
+        alert.messageText = "Move Darth Recorder to your Applications folder?"
+        alert.informativeText = "It is running from \(src.deletingLastPathComponent().path). Moving it to Applications keeps it in one place and lets updates replace it cleanly. It will relaunch from there."
+        alert.alertStyle = .informational
+        alert.icon = NSApp.applicationIconImage
+        alert.addButton(withTitle: "Move to Applications")
+        alert.addButton(withTitle: "Not now")
+        guard alert.runModal() == .alertFirstButtonReturn else { rlog("move to /Applications declined"); return false }
+
+        let fm = FileManager.default
+        var destDir = URL(fileURLWithPath: "/Applications", isDirectory: true)
+        if !fm.isWritableFile(atPath: destDir.path) {
+            destDir = URL(fileURLWithPath: home + "/Applications", isDirectory: true)
+            try? fm.createDirectory(at: destDir, withIntermediateDirectories: true)
+        }
+        let dest = destDir.appendingPathComponent(src.lastPathComponent)
+        do {
+            if fm.fileExists(atPath: dest.path) {
+                // Replace an older copy (quit it first if it is running).
+                for app in NSRunningApplication.runningApplications(withBundleIdentifier: Bundle.main.bundleIdentifier ?? "") where app.processIdentifier != getpid() {
+                    app.terminate()
+                }
+                try fm.removeItem(at: dest)
+            }
+            try fm.copyItem(at: src, to: dest)
+            rlog("moved to \(dest.path)")
+            // Tidy the original when it came from Downloads (a DMG is read-only; a translocated
+            // copy lives under /private/var/…/AppTranslocation and is not ours to delete).
+            if src.path.hasPrefix(home + "/Downloads/") { try? fm.trashItem(at: src, resultingItemURL: nil) }
+        } catch {
+            rlog("move failed: \(error)")
+            let e = NSAlert(); e.messageText = "Could not move Darth Recorder"; e.informativeText = error.localizedDescription; e.runModal()
+            return false
+        }
+        let cfg = NSWorkspace.OpenConfiguration()
+        cfg.createsNewApplicationInstance = true
+        NSWorkspace.shared.openApplication(at: dest, configuration: cfg) { _, err in
+            if let err { rlog("relaunch failed: \(err)") }
+            DispatchQueue.main.async { NSApp.terminate(nil) }
+        }
+        return true
     }
 
     // MARK: menu

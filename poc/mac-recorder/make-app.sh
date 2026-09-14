@@ -84,8 +84,20 @@ ENT
   ditto -c -k --keepParent "$DIST" "$ZIP"
   echo "==> Gatekeeper assessment:"
   spctl --assess --type execute --verbose=2 "$DIST" 2>&1 | tail -2
-  shasum -a 256 "$ZIP"
-  echo "release ready: $ZIP"
+  # DMG: app + Applications shortcut, for drag-and-drop installs. Signed, notarized, stapled too.
+  DMG="dist/DarthRecorder-$VERSION.dmg"
+  rm -rf dist/dmgroot "$DMG" && mkdir -p dist/dmgroot
+  ditto "$DIST" "dist/dmgroot/$APP_NAME.app"
+  ln -s /Applications dist/dmgroot/Applications
+  hdiutil create -quiet -volname "$APP_NAME" -srcfolder dist/dmgroot -ov -format UDZO "$DMG"
+  rm -rf dist/dmgroot
+  codesign --force --sign "$IDENTITY" --timestamp "$DMG"
+  echo "==> notarizing $DMG"
+  xcrun notarytool submit "$DMG" --keychain-profile "$PROFILE" --wait 2>&1 | grep -E "status:" | tail -1
+  xcrun stapler staple "$DMG" 2>&1 | tail -1
+  spctl --assess --type open --context context:primary-signature --verbose=2 "$DMG" 2>&1 | tail -1
+  shasum -a 256 "$ZIP" "$DMG"
+  echo "release ready: $ZIP + $DMG"
   exit 0
 fi
 
