@@ -9,11 +9,26 @@ Native macOS side of Darth Meetings recording (the "Swift tray" angle from Darth
   banner, records, and serves the Meetings PWA over `ws://127.0.0.1:47800`.
 - **recorder-poc** — the original CLI, kept for quick capture experiments.
 
-## Darth Recorder (tray) — `./make-app.sh`
+## Darth Recorder (tray) — build, release, publish
 
-Builds, wraps into `dist/Darth Recorder.app`, signs with the Apple Development identity
-(`DARTH_SIGN_IDENTITY` to override), installs to `~/Applications`, relaunches. Signed with a
-stable Team ID, so the Screen Recording grant survives rebuilds (verified 2026-09-15).
+    ./make-app.sh                      # dev: Apple Development signature → ~/Applications, relaunch
+    ./make-app.sh --release            # Developer ID + hardened runtime + notarize + staple → dist/DarthRecorder-<ver>.zip
+    ./dist-scripts/deploy-to-dot6.sh   # publish zip + version.json + installer to cli.darth-internal.trames.io
+
+Colleagues install with
+`curl -fsSL https://cli.darth-internal.trames.io/setup-darth-recorder.sh | bash`
+(Tailnet-only; macOS 14+; verifies sha256 + notarization before installing to /Applications,
+re-run to update). Served files live in `/var/www/cli-dist/{setup-darth-recorder.sh,darth-recorder/}`
+on .6 — a serve destination, no git there.
+
+Signing facts (2026-09-15): team **SMX3ZQ2226 TRAMES PRIVATE LIMITED**; release identity
+`Developer ID Application: TRAMES PRIVATE LIMITED (SMX3ZQ2226)`; notarization uses the
+keychain profile `darth-notary` (app-specific password for mail@alokrajiv.com, stored with
+`xcrun notarytool store-credentials`). First notarization accepted in ~2 min. Version comes
+from `let VERSION` in `Sources/darth-tray/main.swift` — bump it before a release.
+TCC (Screen Recording) is keyed to the code requirement: dev-signed and Developer-ID-signed
+builds are DIFFERENT grants (one extra toggle when switching), but each survives its own
+rebuilds. Apple membership renews 14 Apr 2027 with auto-renew off — a lapse breaks notarization.
 Log: `~/Library/Logs/DarthRecorder/tray.log`. Recordings: `~/Movies/Darth Recorder/`.
 
 **Call detection** (`CallDetector.swift`): every 1.5 s poll Core Audio's process objects
