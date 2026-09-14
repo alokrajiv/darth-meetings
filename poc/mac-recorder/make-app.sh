@@ -23,6 +23,17 @@ swift build -c release --product darth-tray 2>&1 | tail -2
 rm -rf "$DIST"
 mkdir -p "$DIST/Contents/MacOS" "$DIST/Contents/Resources"
 cp .build/release/darth-tray "$DIST/Contents/MacOS/darth-tray"
+# App icon = the Darth Meetings PWA icon (public/icons/icon-512.png) as .icns
+ICONSRC="../../public/icons/icon-512.png"
+if [[ -f "$ICONSRC" ]]; then
+  rm -rf dist/AppIcon.iconset && mkdir -p dist/AppIcon.iconset
+  for sz in 16 32 128 256 512; do
+    sips -z $sz $sz "$ICONSRC" --out "dist/AppIcon.iconset/icon_${sz}x${sz}.png" >/dev/null
+    dbl=$((sz*2)); sips -z $dbl $dbl "$ICONSRC" --out "dist/AppIcon.iconset/icon_${sz}x${sz}@2x.png" >/dev/null
+  done
+  iconutil -c icns dist/AppIcon.iconset -o "$DIST/Contents/Resources/AppIcon.icns"
+  rm -rf dist/AppIcon.iconset
+fi
 cat > "$DIST/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -30,6 +41,7 @@ cat > "$DIST/Contents/Info.plist" <<PLIST
   <key>CFBundleExecutable</key><string>darth-tray</string>
   <key>CFBundleIdentifier</key><string>$BUNDLE_ID</string>
   <key>CFBundleName</key><string>$APP_NAME</string>
+  <key>CFBundleIconFile</key><string>AppIcon</string>
   <key>CFBundleDisplayName</key><string>$APP_NAME</string>
   <key>CFBundlePackageType</key><string>APPL</string>
   <key>CFBundleShortVersionString</key><string>$VERSION</string>

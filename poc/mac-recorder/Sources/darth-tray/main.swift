@@ -2,7 +2,7 @@ import AppKit
 import CoreGraphics
 import RecorderCore
 
-let VERSION = "0.1.0"
+let VERSION = "0.1.1"
 let WS_PORT: UInt16 = 47800
 let PWA_URL = URL(string: "https://meetings.darth-internal.trames.io/")!
 
@@ -59,8 +59,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func buildMenu() {
         if let b = statusItem.button {
-            b.image = NSImage(systemSymbolName: "record.circle", accessibilityDescription: "Darth Recorder")
-            b.image?.isTemplate = true
+            b.image = StatusIcon.image(.idle)
+            b.toolTip = "Darth Recorder"
         }
         let m = NSMenu()
         statusLine.isEnabled = false
@@ -98,9 +98,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         startItem.isHidden = recording || starting
         stopItem.isHidden = !recording
         if let b = statusItem.button {
-            b.image = NSImage(systemSymbolName: recording ? "record.circle.fill" : (detector.active.isEmpty ? "record.circle" : "record.circle.fill"), accessibilityDescription: nil)
-            b.image?.isTemplate = !recording
-            b.contentTintColor = recording ? .systemRed : nil
+            b.image = StatusIcon.image(recording ? .recording : (detector.active.isEmpty ? .idle : .callDetected))
         }
     }
 
@@ -275,6 +273,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 }
 
+if let dir = ProcessInfo.processInfo.environment["DARTH_TRAY_RENDER_ICONS"] {
+    StatusIcon.renderPreviews(to: dir)
+    exit(0)
+}
 let app = NSApplication.shared
 app.setActivationPolicy(.accessory)
 let delegate = AppDelegate()

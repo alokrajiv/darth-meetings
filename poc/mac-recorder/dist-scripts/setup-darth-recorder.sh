@@ -45,7 +45,7 @@ say "installed $DEST/$APP"
 
 if [[ "${DARTH_RECORDER_NO_LAUNCH:-0}" != "1" ]]; then
   open "$DEST/$APP"
-  say "launched — look for the ● icon in your menu bar"
+  say "launched — look for the waveform icon in your menu bar"
 fi
 cat <<MSG
 
