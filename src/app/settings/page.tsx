@@ -12,6 +12,7 @@ import { MicrosoftAccountCard } from '@/components/microsoft-account-card';
 import { NotifyPrefsCard } from '@/components/notify-prefs-card';
 import { AutoSyncCard } from '@/components/auto-sync-card';
 import { OfflineCard } from '@/components/offline-card';
+import { RecorderCard } from '@/components/recorder-card';
 import type { VocabPayload } from '@/lib/format';
 import { OFFLINE_TITLE, useOfflineGate } from '@/lib/offline/offline-context';
 import { isNetworkFailure, offlineAwareError } from '@/lib/offline/offline-fetch';
@@ -136,6 +137,7 @@ export default function SettingsPage() {
         <AutoSyncCard />
         <NotifyPrefsCard />
         <OfflineCard />
+        <RecorderCard />
       </div>
 
       {blocked && (

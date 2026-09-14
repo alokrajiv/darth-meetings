@@ -35,6 +35,8 @@ export type CompanionEvent =
 export type CompanionState = {
   /** A tray answered at least once during this page's life. */
   connected: boolean;
+  /** This browser has connected to a tray at some point (localStorage) — i.e. it is installed here. */
+  everSeen: boolean;
   version: string | null;
   screenPermission: boolean | null;
   calls: CompanionCall[];
@@ -51,6 +53,7 @@ const MAX_COLD_ATTEMPTS = 5;
 
 const initial: CompanionState = {
   connected: false,
+  everSeen: false,
   version: null,
   screenPermission: null,
   calls: [],
@@ -89,6 +92,24 @@ class CompanionClient {
   private ensureStarted() {
     if (this.started || typeof window === 'undefined') return;
     this.started = true;
+    let seen = false;
+    try {
+      seen = localStorage.getItem(SEEN_KEY) === '1';
+    } catch {
+      /* ignore */
+    }
+    if (seen) this.set({ everSeen: true });
+    this.connect();
+  }
+
+  /** Manual retry (Settings card "Check again"): reconnect now, reset the cold-start budget. */
+  retryNow() {
+    if (this.ws && this.ws.readyState !== WebSocket.CLOSED) return;
+    if (this.timer) {
+      clearTimeout(this.timer);
+      this.timer = null;
+    }
+    this.attempts = 0;
     this.connect();
   }
 
@@ -113,6 +134,7 @@ class CompanionClient {
       } catch {
         /* private mode */
       }
+      this.set({ everSeen: true });
     };
     ws.onmessage = (e) => {
       let m: Record<string, unknown>;
