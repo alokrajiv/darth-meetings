@@ -6,6 +6,7 @@ import { AudioLines, ChevronRight } from 'lucide-react';
 import type { ReactNode } from 'react';
 import { ThemeToggle } from '@/components/theme-toggle';
 import { OfflineChip } from '@/components/offline-chip';
+import { RecorderChip } from '@/components/recorder-chip';
 import { OFFLINE_TITLE, useOfflineGate } from '@/lib/offline/offline-context';
 
 interface AppHeaderProps {
@@ -79,6 +80,7 @@ export function AppHeader({ children, breadcrumb }: AppHeaderProps) {
         <div className="ml-auto flex items-center gap-2">
           {children}
           <OfflineChip />
+          <RecorderChip />
           <ThemeToggle />
         </div>
       </div>
