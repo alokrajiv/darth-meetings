@@ -51,6 +51,11 @@ cat > "$DIST/Contents/Info.plist" <<PLIST
   <key>NSHighResolutionCapable</key><true/>
   <key>NSMicrophoneUsageDescription</key><string>Darth Recorder records your side of meetings.</string>
   <key>NSSupportsAutomaticTermination</key><false/>
+  <key>CFBundleURLTypes</key>
+  <array><dict>
+    <key>CFBundleURLName</key><string>Darth Recorder</string>
+    <key>CFBundleURLSchemes</key><array><string>darth-recorder</string></array>
+  </dict></array>
 </dict></plist>
 PLIST
 

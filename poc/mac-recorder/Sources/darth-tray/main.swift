@@ -1,8 +1,9 @@
 import AppKit
 import CoreGraphics
+import ServiceManagement
 import RecorderCore
 
-let VERSION = "0.1.1"
+let VERSION = "0.1.2"
 let WS_PORT: UInt16 = 47800
 let PWA_URL = URL(string: "https://meetings.darth-internal.trames.io/")!
 
@@ -26,6 +27,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     let clientsLine = NSMenuItem(title: "", action: nil, keyEquivalent: "")
     let startItem = NSMenuItem(title: "Start recording (main display)", action: #selector(startFromMenu), keyEquivalent: "r")
     let stopItem = NSMenuItem(title: "Stop recording", action: #selector(stopFromMenu), keyEquivalent: "s")
+    let loginItem = NSMenuItem(title: "Open at login", action: #selector(toggleLogin), keyEquivalent: "")
+    let versionLine = NSMenuItem(title: "Darth Recorder \(VERSION)", action: nil, keyEquivalent: "")
 
     func applicationDidFinishLaunching(_ n: Notification) {
         RLog.openFile("~/Library/Logs/DarthRecorder/tray.log")
@@ -53,6 +56,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             DispatchQueue.main.asyncAfter(deadline: .now() + 4) { self.simulate(kind: sim) }
         }
         refreshMenu()
+        let seenKey = "firstRunShown"
+        if !UserDefaults.standard.bool(forKey: seenKey) {
+            UserDefaults.standard.set(true, forKey: seenKey)
+            banner.showMessage(title: "Darth Recorder is running", sub: "It lives in your menu bar (the waveform icon). Turn on “Open at login” from its menu.")
+        }
     }
 
     // MARK: menu
@@ -77,6 +85,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let reveal = NSMenuItem(title: "Show recordings folder", action: #selector(revealFolder), keyEquivalent: ""); reveal.target = self; m.addItem(reveal)
         let logs = NSMenuItem(title: "Show log", action: #selector(revealLog), keyEquivalent: ""); logs.target = self; m.addItem(logs)
         m.addItem(.separator())
+        loginItem.target = self; m.addItem(loginItem)
+        versionLine.isEnabled = false; m.addItem(versionLine)
+        m.addItem(.separator())
         let quit = NSMenuItem(title: "Quit Darth Recorder", action: #selector(quit), keyEquivalent: "q"); quit.target = self; m.addItem(quit)
         statusItem.menu = m
     }
@@ -97,6 +108,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         clientsLine.title = "PWA link: ws://127.0.0.1:\(WS_PORT) · \(clients) connected"
         startItem.isHidden = recording || starting
         stopItem.isHidden = !recording
+        loginItem.state = SMAppService.mainApp.status == .enabled ? .on : .off
         if let b = statusItem.button {
             b.image = StatusIcon.image(recording ? .recording : (detector.active.isEmpty ? .idle : .callDetected))
         }
@@ -114,6 +126,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         NSWorkspace.shared.open(URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture")!)
     }
     @objc func openPWA() { NSWorkspace.shared.open(PWA_URL) }
+    @objc func toggleLogin() {
+        do {
+            if SMAppService.mainApp.status == .enabled { try SMAppService.mainApp.unregister() } else { try SMAppService.mainApp.register() }
+        } catch { rlog("login item toggle failed: \(error)") }
+        refreshMenu()
+    }
+
+    /// darth-recorder://open | //start | //stop | //status — lets the PWA launch or drive us via a link.
+    func application(_ application: NSApplication, open urls: [URL]) {
+        for u in urls {
+            rlog("url: \(u.absoluteString)")
+            switch u.host ?? u.path.trimmingCharacters(in: CharacterSet(charactersIn: "/")) {
+            case "start": startRecording(for: detector.active.values.first)
+            case "stop": stopRecording()
+            case "open", "":
+                if let b = statusItem.button { b.performClick(nil) }
+            default: break
+            }
+        }
+    }
     @objc func revealFolder() {
         try? FileManager.default.createDirectory(at: recordingsDir, withIntermediateDirectories: true)
         NSWorkspace.shared.open(recordingsDir)
