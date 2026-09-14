@@ -18,6 +18,7 @@ JSON
 scp -q "$ZIP" dist/version.json dist-scripts/setup-darth-recorder.sh "$VM:/tmp/"
 ssh "$VM" "sudo mkdir -p $DEST/darth-recorder \
   && sudo install -m 0644 -o root -g root /tmp/DarthRecorder-$VERSION.zip $DEST/darth-recorder/DarthRecorder-$VERSION.zip \
+  && sudo ln -sfn DarthRecorder-$VERSION.zip $DEST/darth-recorder/DarthRecorder-latest.zip \
   && sudo install -m 0644 -o root -g root /tmp/version.json $DEST/darth-recorder/version.json \
   && sudo install -m 0644 -o root -g root /tmp/setup-darth-recorder.sh $DEST/setup-darth-recorder.sh \
   && rm -f /tmp/DarthRecorder-$VERSION.zip /tmp/version.json /tmp/setup-darth-recorder.sh \
@@ -25,6 +26,8 @@ ssh "$VM" "sudo mkdir -p $DEST/darth-recorder \
 
 # Prove what is SERVED is this checkout.
 SERVED_ZIP="$(curl -fsSk --max-time 60 "$BASE/darth-recorder/DarthRecorder-$VERSION.zip" | shasum -a 256 | awk '{print $1}')"
+SERVED_LATEST="$(curl -fsSk --max-time 60 "$BASE/darth-recorder/DarthRecorder-latest.zip" | shasum -a 256 | awk '{print $1}')"
+[[ "$SERVED_LATEST" == "$SHA" ]] || { echo "LATEST MISMATCH served=$SERVED_LATEST local=$SHA" >&2; exit 1; }
 SERVED_SH="$(curl -fsSk --max-time 15 "$BASE/setup-darth-recorder.sh" | shasum -a 256 | awk '{print $1}')"
 LOCAL_SH="$(shasum -a 256 dist-scripts/setup-darth-recorder.sh | awk '{print $1}')"
 [[ "$SERVED_ZIP" == "$SHA" ]] || { echo "ZIP MISMATCH served=$SERVED_ZIP local=$SHA" >&2; exit 1; }

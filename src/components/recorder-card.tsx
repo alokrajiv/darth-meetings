@@ -4,8 +4,8 @@ import { useEffect, useState } from 'react';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
 import { Badge } from '@/components/ui/badge';
-import { AppWindow, CheckCircle2, CircleAlert, Copy, ExternalLink, RefreshCw } from 'lucide-react';
-import { callKindLabel, getCompanion, useCompanion } from '@/lib/companion/companion-client';
+import { AppWindow, CheckCircle2, CircleAlert, Copy, Download, ExternalLink, RefreshCw } from 'lucide-react';
+import { callKindLabel, companionPlatformSupported, getCompanion, useCompanion } from '@/lib/companion/companion-client';
 
 /**
  * Settings card for the Mac menu-bar helper ("Darth Recorder"): install
@@ -20,19 +20,13 @@ import { callKindLabel, getCompanion, useCompanion } from '@/lib/companion/compa
 
 export const RECORDER_INSTALL_CMD = 'curl -fsSL https://cli.darth-internal.trames.io/setup-darth-recorder.sh | bash';
 const RECORDER_DIST_URL = 'https://cli.darth-internal.trames.io/darth-recorder/version.json';
-
-function isMac(): boolean {
-  if (typeof navigator === 'undefined') return true;
-  const uaData = (navigator as Navigator & { userAgentData?: { platform?: string } }).userAgentData;
-  const p = uaData?.platform ?? navigator.platform ?? '';
-  return /mac/i.test(p);
-}
+const RECORDER_ZIP_URL = 'https://cli.darth-internal.trames.io/darth-recorder/DarthRecorder-latest.zip';
 
 export function RecorderCard() {
   const c = useCompanion();
   const [copied, setCopied] = useState(false);
   const [mac, setMac] = useState(true);
-  useEffect(() => setMac(isMac()), []);
+  useEffect(() => setMac(companionPlatformSupported()), []);
 
   const copy = async () => {
     try {
@@ -76,13 +70,12 @@ export function RecorderCard() {
           cannot share theirs. Nothing is recorded until you press Record.
         </p>
 
-        {!mac && (
-          <p className="flex items-center gap-2 text-amber-700 dark:text-amber-400">
-            <CircleAlert className="h-4 w-4 shrink-0" /> macOS only for now — a Windows helper is planned.
+        {!mac && !c.connected && !c.everSeen ? (
+          <p className="flex items-center gap-2 text-amber-700 dark:text-amber-400" data-recorder-unsupported>
+            <CircleAlert className="h-4 w-4 shrink-0" /> macOS only for now — Windows and Linux helpers are planned.
+            Nothing to install on this computer yet.
           </p>
-        )}
-
-        {c.connected ? (
+        ) : c.connected ? (
           <div className="space-y-2" data-recorder-connected>
             <p className="flex items-center gap-2">
               {c.screenPermission === false ? (
@@ -133,7 +126,20 @@ export function RecorderCard() {
                 It is installed on this Mac but not running. Open it from Spotlight (⌘ Space, “Darth Recorder”) or:
               </p>
             ) : (
-              <p>Install it once from a Terminal (Trames Tailnet required, macOS 14 or newer):</p>
+              <>
+                <p>
+                  <b>Install (macOS 14 or newer, Trames Tailnet):</b> download, unzip, drag <b>Darth Recorder</b> into
+                  Applications and open it — it is notarized by Apple, so no warning dialog.
+                </p>
+                <div className="flex flex-wrap items-center gap-2">
+                  <Button size="sm" asChild>
+                    <a href={RECORDER_ZIP_URL} data-recorder-download>
+                      <Download className="mr-1.5 h-3.5 w-3.5" /> Download for Mac
+                    </a>
+                  </Button>
+                  <span className="text-xs text-muted-foreground">or from a Terminal, which also installs and launches it:</span>
+                </div>
+              </>
             )}
             {!c.everSeen && (
               <div className="flex items-center gap-2">

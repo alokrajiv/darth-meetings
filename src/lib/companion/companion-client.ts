@@ -48,6 +48,16 @@ export type CompanionState = {
 };
 
 const WS_URL = 'ws://127.0.0.1:47800';
+
+/** The helper exists for macOS only (Windows/Linux planned). Elsewhere we never
+ * touch the socket: nothing to connect to, and no console noise for those users.
+ * An `everSeen` flag still wins, so a future non-Mac helper works once installed. */
+export function companionPlatformSupported(): boolean {
+  if (typeof navigator === 'undefined') return false;
+  const uaData = (navigator as Navigator & { userAgentData?: { platform?: string } }).userAgentData;
+  const p = uaData?.platform ?? navigator.platform ?? '';
+  return /mac/i.test(p);
+}
 const SEEN_KEY = 'darth-companion-seen';
 const MAX_COLD_ATTEMPTS = 5;
 
@@ -99,11 +109,13 @@ class CompanionClient {
       /* ignore */
     }
     if (seen) this.set({ everSeen: true });
+    if (!seen && !companionPlatformSupported()) return; // Windows/Linux: stay silent
     this.connect();
   }
 
   /** Manual retry (Settings card "Check again"): reconnect now, reset the cold-start budget. */
   retryNow() {
+    if (!companionPlatformSupported() && !this.state.everSeen) return;
     if (this.ws && this.ws.readyState !== WebSocket.CLOSED) return;
     if (this.timer) {
       clearTimeout(this.timer);
