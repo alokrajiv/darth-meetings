@@ -4,6 +4,7 @@ import "./globals.css";
 import { SessionKeeper } from "@/components/session-keeper";
 import { OfflineProvider } from "@/lib/offline/offline-context";
 import { OfflineBanner } from "@/components/offline-banner";
+import { CompanionBanner } from "@/components/companion-banner";
 
 const geistSans = Geist({
   variable: "--font-geist-sans",
@@ -58,6 +59,9 @@ export default function RootLayout({
             pins; the banner renders nothing unless there is something to say. */}
         <OfflineProvider>
           <OfflineBanner />
+          {/* Client-only: talks to the local Darth Recorder tray (ws://127.0.0.1:47800)
+              when one is installed; renders nothing otherwise. */}
+          <CompanionBanner />
           {children}
         </OfflineProvider>
       </body>
