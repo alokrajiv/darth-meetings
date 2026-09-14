@@ -142,7 +142,19 @@ export const CACHE_PAGES = 'darth-offline-pages-v1';
 export const CACHE_API = 'darth-offline-api-v1';
 export const CACHE_MEDIA = 'darth-offline-media-v1';
 export const CACHE_STATIC = 'darth-static-v1';
-export const ALL_CACHES = [CACHE_PAGES, CACHE_API, CACHE_MEDIA, CACHE_STATIC] as const;
+/** One-entry cache holding the worker-visible mode flag (see SW_MODE_KEY). */
+export const CACHE_META = 'darth-meta-v1';
+export const ALL_CACHES = [CACHE_PAGES, CACHE_API, CACHE_MEDIA, CACHE_STATIC, CACHE_META] as const;
+
+/**
+ * The worker reads the mode from this CACHE_META entry (body 'offline' |
+ * 'online') on every cold start — a PWA launched with the network dead
+ * must know it is in offline mode before it answers the first request.
+ * The page writes it AND posts SET_MODE so a running worker flips at once.
+ */
+export const SW_MODE_KEY = '/__darth/mode';
+/** A cached page's flight payload lives in CACHE_API under `<pathname>?__rsc=1`. */
+export const RSC_CACHE_SUFFIX = '?__rsc=1';
 
 export const IDB_NAME = 'darth-offline';
 export const IDB_VERSION = 1;

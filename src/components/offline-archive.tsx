@@ -158,12 +158,12 @@ export function OfflineArchive({ className = '' }: { className?: string }) {
                     return (
                       <TableRow key={r.id} className="cursor-pointer">
                         <TableCell className="pl-4 text-xs tabular-nums text-muted-foreground">
-                          <Link href={href} className="block">
+                          <Link href={href} prefetch={false} className="block">
                             {when ? when.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : '—'}
                           </Link>
                         </TableCell>
                         <TableCell className="max-w-0">
-                          <Link href={href} className="block truncate text-sm font-medium hover:underline underline-offset-2">
+                          <Link href={href} prefetch={false} className="block truncate text-sm font-medium hover:underline underline-offset-2">
                             {r.title || 'Untitled meeting'}
                           </Link>
                         </TableCell>

@@ -423,6 +423,7 @@ export function OfflineCard() {
                       <TableCell className="max-w-0 pl-3">
                         <span className="flex min-w-0 items-center gap-2">
                           <Link
+                            prefetch={false}
                             href={`/transcript/${encodeURIComponent(r.id)}`}
                             className="min-w-0 truncate text-sm hover:underline underline-offset-2"
                           >

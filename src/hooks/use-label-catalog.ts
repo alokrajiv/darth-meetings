@@ -13,6 +13,7 @@
 import { useCallback, useEffect, useState } from 'react';
 import type { LabelRow } from '@/lib/labels';
 import { OFFLINE_TITLE } from '@/lib/offline/offline-types';
+import { getOfflineMode } from '@/lib/offline/offline-sync';
 import { isNetworkFailure, offlineAwareError } from '@/lib/offline/offline-fetch';
 
 export interface LabelCatalog {
@@ -49,6 +50,9 @@ export function refreshLabelCatalog(): Promise<void> {
   if (inflight) return inflight;
   inflight = (async () => {
     try {
+      // Offline mode: the catalog is never cached; the worker would answer
+      // an instant 503 — skip the request and surface the standard message.
+      if (getOfflineMode() === 'offline') throw new Error(OFFLINE_TITLE);
       const res = await fetch('/api/labels?counts=1', { credentials: 'include' });
       if (!res.ok) throw await offlineAwareError(res, `Failed to load labels (${res.status})`);
       const data = (await res.json()) as {

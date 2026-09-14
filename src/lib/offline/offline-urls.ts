@@ -1,4 +1,4 @@
-import type { PinLevel, PlanMeeting } from './offline-types';
+import { RSC_CACHE_SUFFIX, type PinLevel, type PlanMeeting } from './offline-types';
 
 /**
  * Pure URL arithmetic for offline pins: which same-origin URLs make up a
@@ -45,6 +45,13 @@ export interface UrlSet {
   api: string[];
   /** Full-body audio/video → media cache. */
   media: string[];
+  /** Flight payloads (one per document, key = `<pathname>?__rsc=1`) → api cache. */
+  rsc: string[];
+}
+
+/** Cache key of a document's flight payload (mirrors RSC_SUFFIX in public/sw.js). */
+export function rscCacheKey(pathname: string): string {
+  return `${pathname}${RSC_CACHE_SUFFIX}`;
 }
 
 /** Minimal shape urlsForLevel needs — a PlanMeeting satisfies it. */
@@ -71,10 +78,11 @@ export function partCount(meta: UrlMeta): number {
  * images belong to the transcript tier. Keys are path+query, no origin.
  */
 export function urlsForLevel(id: string, level: PinLevel, meta?: UrlMeta, markdowns: Array<string | null | undefined> = []): UrlSet {
-  const out: UrlSet = { pages: [], api: [], media: [] };
+  const out: UrlSet = { pages: [], api: [], media: [], rsc: [] };
   if (levelRank(level) < LEVEL_RANK.transcript) return out;
 
   out.pages.push(transcriptPagePath(id));
+  out.rsc.push(rscCacheKey(transcriptPagePath(id)));
   const base = transcriptApiBase(id);
   for (const suffix of TRANSCRIPT_API_SUFFIXES) out.api.push(base + suffix);
   const frames = new Set<string>();
@@ -100,7 +108,7 @@ export function urlsToDrop(id: string, from: PinLevel, to: PinLevel, meta?: UrlM
   const a = urlsForLevel(id, from, meta, markdowns);
   const b = urlsForLevel(id, to, meta, markdowns);
   const diff = (x: string[], y: string[]) => x.filter((u) => !y.includes(u));
-  return { pages: diff(a.pages, b.pages), api: diff(a.api, b.api), media: diff(a.media, b.media) };
+  return { pages: diff(a.pages, b.pages), api: diff(a.api, b.api), media: diff(a.media, b.media), rsc: diff(a.rsc, b.rsc) };
 }
 
 /**

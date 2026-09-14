@@ -1,7 +1,9 @@
 import {
+  CACHE_META,
   META_BUILD_ID,
   META_LAST_SYNC,
   OFFLINE_MODE_KEY,
+  SW_MODE_KEY,
   type OfflineMode,
   type OfflinePlan,
   type PinLevel,
@@ -62,6 +64,57 @@ export function setOfflineMode(mode: OfflineMode): void {
   } catch {
     /* private mode */
   }
+  void announceOfflineMode(mode);
+}
+
+/**
+ * Tell the service worker which mode it is in — twice, on purpose: the
+ * CACHE_META entry is what a cold-started worker reads before answering
+ * its first request (a PWA launched with the network dead), and the
+ * SET_MODE message flips the running worker at once. In offline mode the
+ * worker is cache-only; in online mode network-first with a short cap.
+ * Resolves once the running worker has acknowledged (or after 1.5 s).
+ */
+export async function announceOfflineMode(mode: OfflineMode = getOfflineMode()): Promise<void> {
+  if (typeof window === 'undefined') return;
+  try {
+    if (typeof caches !== 'undefined') {
+      const cache = await caches.open(CACHE_META);
+      await cache.put(SW_MODE_KEY, new Response(mode, { headers: { 'content-type': 'text/plain' } }));
+    }
+  } catch {
+    /* storage unavailable — the message below still reaches a live worker */
+  }
+  const sw = navigator.serviceWorker;
+  if (!sw) return;
+  await new Promise<void>((resolve) => {
+    const timer = window.setTimeout(done, 1_500);
+    function done() {
+      window.clearTimeout(timer);
+      sw.removeEventListener('message', onMsg);
+      resolve();
+    }
+    function onMsg(ev: MessageEvent) {
+      const d = ev.data as { type?: string; mode?: string } | null;
+      if (d && d.type === 'MODE_SET' && d.mode === mode) done();
+    }
+    sw.addEventListener('message', onMsg);
+    const send = (target: ServiceWorker | null | undefined) => {
+      try {
+        target?.postMessage({ type: 'SET_MODE', mode });
+      } catch {
+        /* ignore */
+      }
+    };
+    send(sw.controller);
+    // A worker that has not claimed this page yet (first load after an
+    // update) still needs the flag before the next navigation.
+    sw.ready.then((reg) => send(reg.active)).catch(() => undefined);
+    if (!sw.controller) {
+      // Nothing to acknowledge; the cache entry above is the durable copy.
+      done();
+    }
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -73,6 +126,37 @@ export function setOfflineMode(mode: OfflineMode): void {
 
 export const PROBE_URL = '/api/auth/session';
 export const PROBE_TIMEOUT_MS = 5_000;
+
+/**
+ * Connectivity probe. /api/health answers from the app process in ~1 ms
+ * with no auth and no DB, so "no answer inside HEALTH_TIMEOUT_MS" means one
+ * thing only: the app is unreachable. That cap is the whole point — on a
+ * laptop whose VPN tunnel stays up with Wi-Fi off, the OS says online and
+ * every request simply hangs, so navigator.onLine and the browser's
+ * online/offline events never fire. The worker passes `cache: 'no-store'`
+ * fetches straight to the network, so this can never be answered from a
+ * cache. The session probe (identity, 401 handling) is separate and slower;
+ * its verdict on connectivity is ignored.
+ */
+export const HEALTH_URL = '/api/health';
+export const HEALTH_TIMEOUT_MS = 2_500;
+
+export async function probeHealth(): Promise<'online' | 'offline'> {
+  if (typeof navigator !== 'undefined' && navigator.onLine === false) return 'offline';
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), HEALTH_TIMEOUT_MS);
+  try {
+    const res = await fetch(`${HEALTH_URL}?t=${Date.now()}`, { cache: 'no-store', credentials: 'omit', signal: ctrl.signal });
+    // 204 = the app; 5xx = nginx without an app behind it, or the worker's
+    // own 503 { offline } — either way the app cannot be reached. Anything
+    // else (a 404 from an older build) still proves the server answered.
+    return res.status >= 500 ? 'offline' : 'online';
+  } catch {
+    return 'offline';
+  } finally {
+    clearTimeout(timer);
+  }
+}
 
 export type ProbeResult = 'online' | 'offline' | 'unauthenticated';
 

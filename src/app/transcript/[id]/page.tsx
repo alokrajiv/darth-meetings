@@ -46,7 +46,7 @@ import { RerunDiarizationButton } from '@/components/rerun-diarization-button';
 import { TranscriptSourcesCard } from '@/components/transcript-sources-card';
 import { MeetingInfoCard } from '@/components/meeting-info-card';
 import { OfflinePinDialog, OfflinePinStatus } from '@/components/offline-pin-dialog';
-import { OFFLINE_TITLE, useOffline, useOfflineGate } from '@/lib/offline/offline-context';
+import { OFFLINE_TITLE, getOfflineMode, useOffline, useOfflineGate } from '@/lib/offline/offline-context';
 import { isNetworkFailure } from '@/lib/offline/offline-fetch';
 import { getPin } from '@/lib/offline/offline-pins';
 import { OFFLINE_CHANGE_EVENT, type PinRecord, type PlanMediaPart } from '@/lib/offline/offline-types';
@@ -159,6 +159,7 @@ function TranscriptDetailInner({ transcriptId }: { transcriptId: string }) {
   // server-side; refreshed whenever sharing changes.
   const [shareSuggestionCount, setShareSuggestionCount] = useState(0);
   const refreshShareSuggestions = useCallback(async () => {
+    if (getOfflineMode() === 'offline') return; // sharing is not available offline
     try {
       const res = await fetch(`/api/transcripts/${transcriptId}/share-suggestions`);
       if (!res.ok) return;
@@ -219,6 +220,9 @@ function TranscriptDetailInner({ transcriptId }: { transcriptId: string }) {
   // An 'audio' pin cached only the audio-only derivative; a 'video' pin has
   // the full recording too, so the player keeps its normal URL there.
   const offlineAudioOnly = offline && offlinePin?.level === 'audio';
+  // A transcript-level pin (or no pin at all) holds no recording: offline,
+  // the player would only produce an instant 503 from the worker.
+  const offlineNoMedia = offline && (!offlinePin || offlinePin.level === 'transcript');
   // Cache keys are exactly the URLs offline-urls.ts builds: `variant=audio`
   // FIRST, then `part=N` — the worker matches the full path+query, so any
   // other parameter order misses the media cache for parts 2+.
@@ -600,13 +604,14 @@ function TranscriptDetailInner({ transcriptId }: { transcriptId: string }) {
   // prompt can suppress itself when the owner picks themselves from the
   // picker. Cheap fetch; fire-and-forget.
   useEffect(() => {
+    if (!offlineReady || offline) return; // offline mode: nothing to add people to
     fetch('/api/auth/session', { credentials: 'include' })
       .then((r) => (r.ok ? r.json() : null))
       .then((data) => {
         if (data?.email) setCurrentUserEmail(String(data.email).toLowerCase());
       })
       .catch(() => {});
-  }, []);
+  }, [offlineReady, offline]);
 
   // While AI notes are generating server-side — or the speaker-ID pass is
   // running (its suggestions feed the review dialog) — poll the row and
@@ -2680,7 +2685,7 @@ function TranscriptDetailInner({ transcriptId }: { transcriptId: string }) {
         <div className="lg:grid lg:grid-cols-[minmax(0,1fr)_300px] lg:gap-8">
           <div className="min-w-0 space-y-5">
             {/* Audio player — sticky so it stays visible while scrolling the transcript */}
-            {row.status === 'completed' && audioAvailable && (
+            {row.status === 'completed' && audioAvailable && !offlineNoMedia && (
               <div
                 className={`sticky top-[60px] z-30 -mx-1 rounded-lg border bg-card/95 px-3 py-2 backdrop-blur ${FLOATING_SHADOW}`}
               >
@@ -3283,7 +3288,7 @@ function TranscriptDetailInner({ transcriptId }: { transcriptId: string }) {
                   onPickPerson={handlePickPerson}
                   onRequestCreatePerson={handleRequestCreatePerson}
                   audioSrc={
-                    row.status === 'completed' && audioAvailable
+                    row.status === 'completed' && audioAvailable && !offlineNoMedia
                       ? offlineVariant(`/api/transcripts/${row.assemblyai_id}/audio`)
                       : null
                   }

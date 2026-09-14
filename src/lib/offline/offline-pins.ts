@@ -18,6 +18,7 @@ import { STORE_PINS, dbClearAll, dbDelete, dbGet, dbGetAll, dbPut, metaGet, meta
 import {
   extractStaticAssets,
   levelRank,
+  rscCacheKey,
   transcriptApiBase,
   urlsForLevel,
   urlsToDrop,
@@ -217,13 +218,48 @@ async function ensureStaticAssets(urls: string[]): Promise<void> {
  */
 export async function cacheDocument(path: string): Promise<number> {
   const { bytes, html } = await transcriptLimiter.run(() => fetchAndStoreDocument(path));
-  await ensureStaticAssets(extractStaticAssets(html));
-  return bytes;
+  const assets = new Set(extractStaticAssets(html));
+  // The flight payload keeps a click on this page a single-page transition
+  // while offline. Best effort: without it the worker's 503 makes Next fall
+  // back to a document navigation, which the cached HTML still answers.
+  let rscBytes = 0;
+  try {
+    const rsc = await transcriptLimiter.run(() => fetchAndStoreRsc(path));
+    rscBytes = rsc.bytes;
+    for (const u of extractStaticAssets(rsc.text)) assets.add(u);
+  } catch (err) {
+    console.warn('[offline] flight payload not cached for', path, err);
+  }
+  await ensureStaticAssets([...assets]);
+  return bytes + rscBytes;
 }
 
-/** Remove a cached document (shell pages on clear, etc.). */
+/**
+ * A document's flight payload, fetched the way Next's router would on a
+ * click but WITHOUT a router state tree, so the server returns the full
+ * tree (a tree-relative diff would only be reusable from that one page).
+ * Stored under rscCacheKey(path) in the api cache — public/sw.js answers
+ * `RSC: 1` / `?_rsc=` fetches for `path` from it.
+ */
+async function fetchAndStoreRsc(path: string): Promise<{ bytes: number; text: string }> {
+  const res = await fetch(path, { ...FETCH_OPTS, headers: { RSC: '1', accept: 'text/x-component' } });
+  if (!res.ok || landedOnLogin(res)) throw new Error(`${path} (rsc) → ${res.status}`);
+  const ct = res.headers.get('content-type') ?? '';
+  if (!/text\/x-component/i.test(ct)) throw new Error(`${path} (rsc) → not a flight payload (${ct || 'no content-type'})`);
+  const text = await res.text();
+  const stored = new Response(text, {
+    status: 200,
+    statusText: 'OK',
+    headers: { 'content-type': ct, vary: 'RSC' },
+  });
+  const cache = await openCache(CACHE_API);
+  await cache.put(rscCacheKey(path), stored);
+  return { bytes: text.length, text };
+}
+
+/** Remove a cached document + its flight payload (shell pages on clear, etc.). */
 export async function dropDocument(path: string): Promise<void> {
-  await cacheDeleteAll(CACHE_PAGES, [path]);
+  await Promise.all([cacheDeleteAll(CACHE_PAGES, [path]), cacheDeleteAll(CACHE_API, [rscCacheKey(path)])]);
 }
 
 /**
@@ -634,7 +670,7 @@ async function dropUrls(id: string, from: PinLevel, to: PinLevel, meta: UrlMeta)
   if (levelRank(to) < 1) drop.api.push(...(await cachedFrameUrls(id)));
   await Promise.all([
     cacheDeleteAll(CACHE_PAGES, drop.pages),
-    cacheDeleteAll(CACHE_API, drop.api),
+    cacheDeleteAll(CACHE_API, [...drop.api, ...drop.rsc]),
     cacheDeleteAll(CACHE_MEDIA, drop.media),
   ]);
 }

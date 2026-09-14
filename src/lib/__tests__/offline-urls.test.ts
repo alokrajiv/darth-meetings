@@ -8,6 +8,7 @@ import {
   levelRank,
   maxLevel,
   partCount,
+  rscCacheKey,
   urlsForLevel,
   urlsToDrop,
 } from '@/lib/offline/offline-urls';
@@ -53,7 +54,7 @@ describe('level ladder', () => {
 
 describe('urlsForLevel', () => {
   test("'none' → nothing", () => {
-    expect(urlsForLevel(ID, 'none', meeting(1))).toEqual({ pages: [], api: [], media: [] });
+    expect(urlsForLevel(ID, 'none', meeting(1))).toEqual({ pages: [], api: [], media: [], rsc: [] });
   });
 
   test('transcript → document + the API set, no media', () => {
@@ -126,7 +127,7 @@ describe('urlsToDrop', () => {
   });
   test('upgrade drops nothing', () => {
     const d = urlsToDrop(ID, 'transcript', 'video', meeting(1));
-    expect(d).toEqual({ pages: [], api: [], media: [] });
+    expect(d).toEqual({ pages: [], api: [], media: [], rsc: [] });
   });
 });
 
@@ -193,5 +194,20 @@ describe('estimatePinBytes', () => {
   });
   test('unknown duration / bytes count as zero', () => {
     expect(estimatePinBytes('video', { durationSec: null, media: null }, c)).toBe(c.transcript);
+  });
+});
+
+describe('flight payload keys', () => {
+  test('rscCacheKey mirrors the worker suffix', () => {
+    expect(rscCacheKey('/transcript/abc')).toBe('/transcript/abc?__rsc=1');
+  });
+  test('transcript tier carries exactly one rsc key per page', () => {
+    const set = urlsForLevel(ID, 'transcript', meeting(1));
+    expect(set.rsc).toEqual([`/transcript/${ID}?__rsc=1`]);
+    expect(urlsForLevel(ID, 'none', meeting(1)).rsc).toEqual([]);
+  });
+  test('unpinning drops the rsc key, a media downgrade keeps it', () => {
+    expect(urlsToDrop(ID, 'transcript', 'none', meeting(1)).rsc).toEqual([`/transcript/${ID}?__rsc=1`]);
+    expect(urlsToDrop(ID, 'video', 'audio', meeting(1)).rsc).toEqual([]);
   });
 });

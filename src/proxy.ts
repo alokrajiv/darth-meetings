@@ -94,6 +94,7 @@ export async function proxy(request: NextRequest) {
     pathname === '/logout' ||
     pathname.startsWith('/_next') ||
     pathname.startsWith('/api/auth/') ||
+    pathname === '/api/health' ||
     pathname === '/favicon.ico' ||
     pathname === '/sw.js' ||
     pathname === '/manifest.webmanifest' ||

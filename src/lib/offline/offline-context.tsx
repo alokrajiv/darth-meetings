@@ -12,8 +12,10 @@ import {
 } from './offline-types';
 import { clearAllOffline, ensureOfflineOwner, estimateStorage, listPins, offlineSupported, requestPersistentStorage } from './offline-pins';
 import {
+  announceOfflineMode,
   getOfflineMode,
   getSyncState,
+  probeHealth,
   probeSession,
   runOfflineSync,
   setOfflineMode,
@@ -33,29 +35,42 @@ import { OFFLINE_TITLE } from './offline-types';
  * pin ledger + sync progress into React state for the header chip, the
  * banner, the settings card and the offline archive.
  *
- * Connectivity is navigator.onLine AND a real probe (GET /api/auth/session)
- * — onLine alone is true on a captive portal or a flaky tunnel. The probe
- * doubles as the session check, in two ways:
- *   - the 200 body carries the darth userId; the ledger + caches are bound
- *     to it (ensureOfflineOwner), so a different person signing in on the
- *     same browser wipes the previous user's meetings before anything
- *     renders them;
- *   - a 401 while reachable means the session is gone, and the cached
- *     meetings go with it (no signed-out laptop keeps a colleague's
- *     transcripts). Because one darth-auth hiccup must not destroy GBs of
- *     pinned media, the wipe needs two 401s at least a probe period apart
- *     (the route answers 503 for a transient failure, but this is the belt).
+ * Two probes, two jobs:
  *
- * Verdicts are debounced too: a single failed probe (a deploy's 502
- * window, one slow fetch) only schedules a confirmation re-probe 3 s
- * later; the "offline" verdict lands on the second consecutive failure.
+ *   - CONNECTIVITY = the health probe (GET /api/health, HEALTH_TIMEOUT_MS
+ *     cap, every HEALTH_PERIOD_MS while visible, plus on focus and on the
+ *     browser's online/offline events). navigator.onLine is only a hint:
+ *     on a laptop whose VPN tunnel stays up with Wi-Fi off the OS keeps
+ *     saying online and requests hang instead of failing, so a timed probe
+ *     is the only signal there is. A single miss only schedules a
+ *     confirmation re-probe HEALTH_CONFIRM_MS later; the "offline" verdict
+ *     (and the "You appear to be offline" prompt) lands on the second miss
+ *     — a few seconds after the network went, never a minute.
+ *
+ *   - IDENTITY = the session probe (GET /api/auth/session, every
+ *     SESSION_PERIOD_MS while online). Its 200 body carries the darth
+ *     userId; the ledger + caches are bound to it (ensureOfflineOwner), so a
+ *     different person signing in on the same browser wipes the previous
+ *     user's meetings before anything renders them. A 401 while reachable
+ *     means the session is gone, and the cached meetings go with it (no
+ *     signed-out laptop keeps a colleague's transcripts). Because one
+ *     darth-auth hiccup must not destroy GBs of pinned media, the wipe
+ *     needs two 401s at least UNAUTH_CONFIRM_MS apart (the route answers
+ *     503 for a transient failure, but this is the belt). Its verdict on
+ *     connectivity is ignored — the health probe owns that.
+ *
+ * The mode is also handed to the service worker (announceOfflineMode): in
+ * offline mode the worker serves cached copies instantly and never waits
+ * on the network; in online mode it caps every network-first fetch that
+ * has a cached fallback.
  */
 
-const PROBE_PERIOD_MS = 60_000;
+const HEALTH_PERIOD_MS = 15_000;
+/** Re-probe delay after a first failed health verdict. */
+const HEALTH_CONFIRM_MS = 1_000;
+const SESSION_PERIOD_MS = 60_000;
 /** Second 401 must be at least this long after the first (≈ one period, with jitter room). */
-const UNAUTH_CONFIRM_MS = PROBE_PERIOD_MS * 0.9;
-/** Re-probe delay after a first failed verdict. */
-const OFFLINE_CONFIRM_MS = 3_000;
+const UNAUTH_CONFIRM_MS = SESSION_PERIOD_MS * 0.9;
 /** "Not now" silences the offline prompt for this long. */
 const PROMPT_DISMISS_COOLDOWN_MS = 10 * 60_000;
 
@@ -74,13 +89,14 @@ export function OfflineProvider({ children }: { children: ReactNode }) {
   const [syncState, setSyncState] = useState<SyncState>(IDLE_SYNC);
   const [storage, setStorage] = useState<StorageEstimate | null>(null);
 
-  // Refs so the probe loop reads the latest values without re-arming.
+  // Refs so the probe loops read the latest values without re-arming.
   const modeRef = useRef<OfflineMode>('online');
   const onlineRef = useRef(true);
   const promptArmedRef = useRef(true); // re-arms on every online→offline flip
   const promptDismissedAtRef = useRef(0);
-  const offlineStrikesRef = useRef(0); // consecutive failed verdicts
+  const offlineStrikesRef = useRef(0); // consecutive failed health verdicts
   const confirmTimerRef = useRef<number | null>(null);
+  const healthInflightRef = useRef<Promise<'online' | 'offline'> | null>(null);
   const unauthSinceRef = useRef<number | null>(null); // first 401 of a streak
   const supported = useRef(false);
   const unmountedRef = useRef(false);
@@ -109,23 +125,20 @@ export function OfflineProvider({ children }: { children: ReactNode }) {
     }
   }, []);
 
-  const probeRef = useRef<() => Promise<ProbeOutcome>>(async () => ({ result: 'online', userId: null }));
+  // -------------------------------------------------------------------------
+  // Identity (session probe)
+  // -------------------------------------------------------------------------
 
-  /** Apply a probe verdict to state; handles the prompt rules + 401 wipe. */
-  const applyProbe = useCallback(
+  const applySession = useCallback(
     async (outcome: ProbeOutcome) => {
-      const { result } = outcome;
-
-      if (result === 'unauthenticated') {
-        setProbed(true);
-        // Session gone while reachable. Two consecutive 401s ≥ one probe
-        // period apart before the wipe — never on a single answer.
-        offlineStrikesRef.current = 0;
+      if (outcome.result === 'unauthenticated') {
+        // Session gone while reachable. Two consecutive 401s ≥ one period
+        // apart before the wipe — never on a single answer, and never while
+        // the health probe says the app is unreachable (a 401 cannot come
+        // from a dead network, but the belt costs nothing).
         const now = Date.now();
-        const reachable = typeof navigator === 'undefined' || navigator.onLine !== false;
-        if (!reachable) {
-          /* can't trust a verdict while the browser says it has no network */
-        } else if (unauthSinceRef.current === null) {
+        if (!onlineRef.current) return;
+        if (unauthSinceRef.current === null) {
           unauthSinceRef.current = now;
         } else if (now - unauthSinceRef.current >= UNAUTH_CONFIRM_MS) {
           unauthSinceRef.current = null;
@@ -134,29 +147,52 @@ export function OfflineProvider({ children }: { children: ReactNode }) {
             applyMode('online');
           }
         }
-        onlineRef.current = true;
-        setOnline(true);
         return;
       }
-
-      if (result === 'online') {
-        setProbed(true);
+      if (outcome.result === 'online') {
         unauthSinceRef.current = null;
-        offlineStrikesRef.current = 0;
-        if (confirmTimerRef.current !== null) {
-          window.clearTimeout(confirmTimerRef.current);
-          confirmTimerRef.current = null;
-        }
         // Owner binding: another user's session on this browser wipes the
         // previous user's ledger + caches before anything reads them.
         if (outcome.userId && supported.current) {
           const wiped = await ensureOfflineOwner(outcome.userId).catch(() => false);
           if (wiped) applyMode('online');
         }
+      }
+      // 'offline' from this probe says nothing the health probe doesn't.
+    },
+    [applyMode]
+  );
+
+  const checkSession = useCallback(async () => {
+    const outcome = await probeSession();
+    if (unmountedRef.current) return outcome;
+    await applySession(outcome);
+    return outcome;
+  }, [applySession]);
+
+  // -------------------------------------------------------------------------
+  // Connectivity (health probe)
+  // -------------------------------------------------------------------------
+
+  const healthRef = useRef<(reason: string) => Promise<'online' | 'offline'>>(async () => 'online');
+
+  const applyHealth = useCallback(
+    (result: 'online' | 'offline') => {
+      if (result === 'online') {
+        setProbed(true);
+        offlineStrikesRef.current = 0;
+        if (confirmTimerRef.current !== null) {
+          window.clearTimeout(confirmTimerRef.current);
+          confirmTimerRef.current = null;
+        }
+        const was = onlineRef.current;
         onlineRef.current = true;
         setOnline(true);
         promptArmedRef.current = true;
         setPromptVisible(false);
+        // Back after an outage: re-check who we are (and whether the
+        // session survived) right away rather than at the next period.
+        if (!was) void checkSession();
         return;
       }
 
@@ -167,8 +203,8 @@ export function OfflineProvider({ children }: { children: ReactNode }) {
         if (confirmTimerRef.current === null) {
           confirmTimerRef.current = window.setTimeout(() => {
             confirmTimerRef.current = null;
-            if (!unmountedRef.current) void probeRef.current();
-          }, OFFLINE_CONFIRM_MS);
+            if (!unmountedRef.current) void healthRef.current('confirm');
+          }, HEALTH_CONFIRM_MS);
         }
         return;
       }
@@ -184,18 +220,28 @@ export function OfflineProvider({ children }: { children: ReactNode }) {
         }
       }
     },
-    [applyMode]
+    [checkSession]
   );
 
-  const probe = useCallback(async () => {
-    const outcome = await probeSession();
-    if (unmountedRef.current) return outcome;
-    await applyProbe(outcome);
-    return outcome;
-  }, [applyProbe]);
-  probeRef.current = probe;
+  /** Single-flight: a burst of triggers (focus + online event + timer) costs one probe. */
+  const health = useCallback(async (reason: string) => {
+    if (healthInflightRef.current) return healthInflightRef.current;
+    const started = Date.now();
+    const p = probeHealth().then((result) => {
+      healthInflightRef.current = null;
+      // Kept at debug level on purpose: the one trace that explains a
+      // "why did it think I was offline" report after the fact.
+      console.debug(`[offline] health probe (${reason}) → ${result} in ${Date.now() - started} ms`);
+      if (!unmountedRef.current) applyHealth(result);
+      return result;
+    });
+    healthInflightRef.current = p;
+    return p;
+  }, [applyHealth]);
+  healthRef.current = health;
 
-  // Mount: SW registration, mode restore, ledger + storage, scheduler.
+  // Mount: SW registration, mode restore (+ hand it to the worker), ledger
+  // + storage, scheduler, probe loops.
   useEffect(() => {
     unmountedRef.current = false;
     supported.current = offlineSupported();
@@ -209,7 +255,12 @@ export function OfflineProvider({ children }: { children: ReactNode }) {
       navigator.serviceWorker
         .register('/sw.js', { scope: '/', updateViaCache: 'none' })
         .then(() => navigator.serviceWorker.ready)
-        .then(() => setSw('ready'))
+        .then(() => {
+          setSw('ready');
+          // A freshly installed/updated worker reads the flag from the cache
+          // on its own; the message just makes the flip immediate.
+          void announceOfflineMode(modeRef.current);
+        })
         .catch((err) => {
           console.warn('[offline] service worker registration failed', err);
           setSw('error');
@@ -220,22 +271,26 @@ export function OfflineProvider({ children }: { children: ReactNode }) {
     void refreshPins();
     void refreshStorage();
     setSyncState(getSyncState());
-    void probe();
+    void health('mount');
+    void checkSession();
 
     const stopScheduler = supported.current ? startOfflineScheduler() : () => undefined;
 
-    const onOnline = () => void probe();
+    const onOnline = () => void health('online-event');
     // The browser's 'offline' event is a hint, not a verdict — re-probe.
-    const onOffline = () => void probe();
+    const onOffline = () => void health('offline-event');
     const onVisible = () => {
-      if (document.visibilityState === 'visible') void probe();
+      if (document.visibilityState === 'visible') void health('visible');
     };
     window.addEventListener('online', onOnline);
     window.addEventListener('offline', onOffline);
     document.addEventListener('visibilitychange', onVisible);
-    const timer = window.setInterval(() => {
-      if (document.visibilityState === 'visible') void probe();
-    }, PROBE_PERIOD_MS);
+    const healthTimer = window.setInterval(() => {
+      if (document.visibilityState === 'visible') void health('timer');
+    }, HEALTH_PERIOD_MS);
+    const sessionTimer = window.setInterval(() => {
+      if (document.visibilityState === 'visible' && onlineRef.current) void checkSession();
+    }, SESSION_PERIOD_MS);
 
     return () => {
       unmountedRef.current = true;
@@ -243,13 +298,14 @@ export function OfflineProvider({ children }: { children: ReactNode }) {
       window.removeEventListener('online', onOnline);
       window.removeEventListener('offline', onOffline);
       document.removeEventListener('visibilitychange', onVisible);
-      window.clearInterval(timer);
+      window.clearInterval(healthTimer);
+      window.clearInterval(sessionTimer);
       if (confirmTimerRef.current !== null) {
         window.clearTimeout(confirmTimerRef.current);
         confirmTimerRef.current = null;
       }
     };
-  }, [probe, refreshPins, refreshStorage]);
+  }, [health, checkSession, refreshPins, refreshStorage]);
 
   // Ledger / sync progress events → React state (storage estimate debounced).
   useEffect(() => {
@@ -278,12 +334,13 @@ export function OfflineProvider({ children }: { children: ReactNode }) {
   }, [applyMode]);
 
   const exitOffline = useCallback(async () => {
-    const r = await probe();
-    if (r.result === 'offline') return false;
+    const r = await health('exit-offline');
+    if (r === 'offline') return false;
     applyMode('online');
+    void checkSession();
     void runOfflineSync('exit-offline');
     return true;
-  }, [applyMode, probe]);
+  }, [applyMode, health, checkSession]);
 
   const dismissPrompt = useCallback(() => {
     promptDismissedAtRef.current = Date.now();
