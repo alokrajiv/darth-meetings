@@ -1175,3 +1175,41 @@ export async function listCalendarWindow(
     LIMIT ${opts.limit}
   `;
 }
+
+// ---------------------------------------------------------------------------
+// Recorder matching (migration 041) — "which meeting was I recording?"
+// ---------------------------------------------------------------------------
+
+export interface CalendarOverlapRow {
+  event_key: string;
+  event_id: string;
+  title: string | null;
+  event_start: string;
+  event_end: string | null;
+  meeting_code: string | null;
+}
+
+/**
+ * The OWNER's own cached occurrences that could overlap a recording's
+ * [from, to] interval, widest first. Per-user rows only (this table's
+ * privacy rule) and cache-only — matchRecording never reads a calendar API.
+ * Events with no end are treated as 1 h by the caller, so the SQL window is
+ * padded rather than exact.
+ */
+export async function listOccurrencesOverlapping(
+  userId: string,
+  fromIso: string,
+  toIso: string,
+  limit = 25
+): Promise<CalendarOverlapRow[]> {
+  return sql<CalendarOverlapRow[]>`
+    SELECT event_key, event_id, title, event_start, event_end, meeting_code
+    FROM ${sql(SCHEMA)}.calendar_event_cache
+    WHERE user_id = ${userId}
+      AND event_start <= ${toIso}::timestamptz + interval '30 minutes'
+      AND COALESCE(event_end, event_start + interval '1 hour')
+            >= ${fromIso}::timestamptz - interval '30 minutes'
+    ORDER BY event_start ASC
+    LIMIT ${limit}
+  `;
+}

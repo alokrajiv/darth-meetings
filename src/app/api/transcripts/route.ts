@@ -257,6 +257,14 @@ export const POST = withAuth(async ({ user, request }) => {
     linkedEvent = resolved.event;
   }
   const reportPref = parseReportPref(request.nextUrl.searchParams.get('report_pref'));
+  // Darth Recorder (migration 041): the tray passes the registry id of the
+  // recording it is uploading; the finalize tail stamps transcript_id +
+  // status 'uploaded' on it. Accepted as a query param (either spelling) or
+  // an equivalent header for clients that would rather not touch the URL.
+  const recorderRecordingId =
+    request.nextUrl.searchParams.get('recorderRecordingId') ??
+    request.nextUrl.searchParams.get('recorder_recording_id') ??
+    request.headers.get('x-recorder-recording-id');
 
   if (contentType.includes('multipart/form-data')) {
     // Legacy path — whole body in memory. Kept only so an already-open old
@@ -288,6 +296,7 @@ export const POST = withAuth(async ({ user, request }) => {
       linkedEvent,
       reportPref,
       bytesTotal: file.size,
+      recorderRecordingId,
     });
     if (!opened.ok) return NextResponse.json({ error: opened.error }, { status: opened.status });
     await saveAudioBytes(opened.spec.tempFilename, Buffer.from(await file.arrayBuffer()));
@@ -346,6 +355,7 @@ export const POST = withAuth(async ({ user, request }) => {
     sourceId: request.nextUrl.searchParams.get('source_id'),
     multi: multi ?? null,
     bytesTotal,
+    recorderRecordingId,
   });
   if (!opened.ok) return NextResponse.json({ error: opened.error }, { status: opened.status });
   const { spec } = opened;

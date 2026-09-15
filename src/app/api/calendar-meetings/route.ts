@@ -13,6 +13,8 @@ import { getAutoSyncLog, predictedAutoSyncImporters, type AutoSyncLogRow, type P
 import { strongestReport, type ReportPref } from '@/lib/auto-marker';
 import { recurringBaseId } from '@/lib/series-keys';
 import { parseMeetingFilters } from '@/lib/server/meeting-filters';
+import { recordingsForOccurrences, type OccurrenceRecordingHit } from '@/db-ops/recorder';
+import type { RecorderRecordingRef } from '@/lib/recorder';
 
 export const runtime = 'nodejs';
 
@@ -103,6 +105,12 @@ export interface CalendarMeetingRow {
    * import and keeps resolving to the transcript afterwards. Minted for
    * rows with a meeting code. */
   meetingUuid: string | null;
+  /** A Darth Recorder recording matched to this occurrence (migration 041):
+   * the caller's own Mac, or a colleague's. Existence + owner + status only
+   * for other people's recordings — local paths never leave the owner. The
+   * row renders it INSTEAD of the Teams-chat "recorded elsewhere" verdict
+   * (which moves to the tooltip). */
+  recorderRecording: RecorderRecordingRef | null;
   /** Account auto-sync's intent for the occurrence (unimported rows):
    * 'imported'/'queued' = the ledger claimed it, 'pending' = an enabled
    * user's open reminder covers it and a sweep will take it — either way
@@ -227,6 +235,27 @@ function autoSyncOf(
     : null;
 }
 
+/** Recorder hit → the row's redacted reference. The caller's own recording
+ * keeps its hostname; somebody else's is reduced to "who + what state". */
+function recorderRefOf(
+  hit: OccurrenceRecordingHit | undefined,
+  callerUserId: string
+): RecorderRecordingRef | null {
+  if (!hit) return null;
+  const mine = hit.user_id === callerUserId;
+  return {
+    id: hit.id,
+    mine,
+    ownerEmail: hit.email,
+    hostname: mine ? hit.hostname : null,
+    status: hit.status,
+    startedAt: hit.started_at == null ? null : isoOf(hit.started_at),
+    durationS: hit.duration_s,
+    transcriptId: hit.transcript_id,
+    nudgedAt: hit.nudged_at == null ? null : isoOf(hit.nudged_at),
+  };
+}
+
 function toRow(
   r: CalendarMeetingDbRow,
   seriesByBase: Map<string, SeriesKeyHit>,
@@ -236,6 +265,8 @@ function toRow(
     predicted: Map<string, PredictedAutoSync>;
     seriesByCode: Map<string, SeriesKeyHit>;
     seriesLog: Map<string, AutoImportLogRow>;
+    recorder: Map<string, OccurrenceRecordingHit>;
+    callerUserId: string;
   }
 ): CalendarMeetingRow {
   const series =
@@ -245,6 +276,9 @@ function toRow(
   const occKey = occKeyOf(r);
   return {
     meetingUuid: occKey ? (extras.uuids.get(occKey) ?? null) : null,
+    recorderRecording: occKey
+      ? recorderRefOf(extras.recorder.get(occKey), extras.callerUserId)
+      : null,
     autoSync: autoSyncOf(occKey, series, extras.log, extras.predicted, extras.seriesLog),
     key: r.key,
     meetingCode: r.meeting_code,
@@ -338,7 +372,12 @@ export const GET = withAuth(async ({ user, request }) => {
       title: r.title,
     }));
   const occKeys = [...new Set(occs.map((o) => `${o.code}|${o.startIso}`))];
-  const [seriesByBase, seriesByCode, uuids, log, predicted] = await Promise.all([
+  // Darth Recorder matches for the served occurrences. Every row here has
+  // already passed the layer's involvement gate (norec = the caller's own
+  // calendar rows, unimported = unimportedVisibleTo), so folding in "someone
+  // recorded this on their Mac" adds no new exposure — and the ref itself is
+  // redacted (db-ops/recorder recordingsForOccurrences).
+  const [seriesByBase, seriesByCode, uuids, log, predicted, recorder] = await Promise.all([
     findSeriesByRecurringBaseIds(baseIds),
     findSeriesByMeetingCodes([...new Set(occs.map((o) => o.code))]),
     ensureMeetingsForOccurrences(occs).catch((err) => {
@@ -349,6 +388,13 @@ export const GET = withAuth(async ({ user, request }) => {
     view === 'unimported'
       ? predictedAutoSyncImporters(occs)
       : Promise.resolve(new Map<string, PredictedAutoSync>()),
+    recordingsForOccurrences(
+      caller,
+      occKeys.map((k) => ({ k, code: k.slice(0, k.indexOf('|')), instant: k.slice(k.indexOf('|') + 1) }))
+    ).catch((err) => {
+      console.warn('[calendar-meetings] recorder lookup failed:', err);
+      return new Map<string, OccurrenceRecordingHit>();
+    }),
   ]);
   const seriesLog =
     view === 'unimported'
@@ -356,7 +402,7 @@ export const GET = withAuth(async ({ user, request }) => {
           [...new Set([...seriesByBase.values(), ...seriesByCode.values()].filter((h) => h.auto_import).map((h) => h.series_id))]
         ).catch(() => new Map<string, AutoImportLogRow>())
       : new Map<string, AutoImportLogRow>();
-  const extras = { uuids, log, predicted, seriesByCode, seriesLog };
+  const extras = { uuids, log, predicted, seriesByCode, seriesLog, recorder, callerUserId: user.userId };
 
   const body: CalendarMeetingsResponse = {
     days: page.days.map((d) => ({ key: d.key, rows: d.rows.map((r) => toRow(r, seriesByBase, extras)) })),

@@ -9,6 +9,7 @@ import {
   updateUploadProgress,
 } from '@/db-ops/transcripts';
 import { autoShareToInternalInvitees } from '@/lib/server/auto-share';
+import { linkRecordingTranscript } from '@/db-ops/recorder';
 import { resolveAccess } from '@/db-ops/transcript-access';
 import { deleteAudioFile, deleteAudioFilesByPrefix } from '@/lib/server/audio-storage';
 import { concatMediaSmart, probeDurationSec } from '@/lib/server/media-concat';
@@ -146,6 +147,9 @@ export interface UploadSpec {
   multi: MultiParams | null;
   /** AAI model override (re-transcribe with the newer model); default = current. */
   speechModel?: SpeechModel;
+  /** Darth Recorder registry id (migration 041) — the recording these bytes
+   * came from. Linked to the transcript once the ingest succeeds. */
+  recorderRecordingId?: string | null;
 }
 
 export interface OpenUploadInput {
@@ -165,6 +169,29 @@ export interface OpenUploadInput {
   /** Extra gmeet_context keys stamped on the placeholder (provenance such as
    * retranscribedFrom, or the source row's meeting identity on a re-run). */
   contextExtra?: Partial<GmeetContext> | null;
+  /** Darth Recorder registry id — see UploadSpec.recorderRecordingId. */
+  recorderRecordingId?: string | null;
+}
+
+const RECORDER_ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/**
+ * Stamp the Darth Recorder registry row with the transcript that came out of
+ * it (status → `uploaded`). Best-effort: a registry hiccup must never fail
+ * an upload that already produced a transcript.
+ */
+async function linkRecorderRecording(
+  userId: string,
+  recordingId: string | null | undefined,
+  transcriptId: string
+): Promise<void> {
+  if (!recordingId || !RECORDER_ID_RE.test(recordingId)) return;
+  try {
+    const ok = await linkRecordingTranscript(userId, recordingId, transcriptId);
+    if (!ok) console.warn(`[upload] recorder recording ${recordingId} not found for this owner`);
+  } catch (err) {
+    console.warn('[upload] linking the recorder recording failed:', err);
+  }
 }
 
 export type OpenUploadResult =
@@ -256,6 +283,7 @@ export async function openUpload(
         reportPref: null,
         sourceId: null,
         multi,
+        recorderRecordingId: input.recorderRecordingId ?? null,
       },
     };
   }
@@ -323,6 +351,7 @@ export async function openUpload(
       sourceId: input.sourceId ?? null,
       multi,
       speechModel: input.speechModel,
+      recorderRecordingId: input.recorderRecordingId ?? null,
     },
   };
 }
@@ -444,6 +473,7 @@ export async function finalizeUpload(
         gmeetContext: { ...ctx, uploadGroup: null, uploadedParts },
         placeholderAssemblyaiId: groupRow.assemblyai_id,
       });
+      await linkRecorderRecording(user.userId, spec.recorderRecordingId, row.assemblyai_id);
       return { status: 201, body: { transcript: row } };
     } catch (error) {
       await deleteForUser(user.userId, groupRow.assemblyai_id).catch(() => {});
@@ -522,6 +552,7 @@ export async function finalizeUpload(
         () => {}
       );
     }
+    await linkRecorderRecording(user.userId, spec.recorderRecordingId, row.assemblyai_id);
     return { status: 201, body: { transcript: row } };
   } catch (error) {
     // A failed ingest leaves the placeholder stuck at 'uploading' — remove it

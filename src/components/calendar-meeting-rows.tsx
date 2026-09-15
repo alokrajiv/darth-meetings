@@ -13,6 +13,9 @@ import {
   type TeamsChatVerdict,
 } from '@/lib/format';
 import { msConnectHref, msLinkMissing, useMsLinkStatus } from '@/components/connect-nudge-banner';
+// Stream S2 owns companion-client.ts — imported here, never edited here.
+import { getCompanion, useCompanion } from '@/lib/companion/companion-client';
+import { recorderRowCopy, type RecorderRecordingRef } from '@/lib/recorder';
 import { ExternalLink, EyeOff, FileText, Loader2, Repeat, Search, Settings2, Upload, Video, VideoOff, Zap } from 'lucide-react';
 import { MeetLogo, TeamsLogo } from '@/components/provider-icon';
 import { requestMediaUpload } from '@/components/audio-upload';
@@ -253,6 +256,144 @@ export function ConnectMicrosoftHint({ className = '' }: { className?: string })
     >
       Connect Microsoft to see whether it was held
     </button>
+  );
+}
+
+/**
+ * A Darth Recorder recording matched this occurrence (migration 041). It
+ * REPLACES the Teams-chat "recorded elsewhere — not importable here" line,
+ * which survives in the tooltip: a recording on somebody's Mac is a better
+ * answer than "Microsoft owns it".
+ *
+ *  - the caller's own Mac → Upload (drives the local tray over the companion
+ *    websocket; no tray connected → say so),
+ *  - a colleague's Mac    → Ask to upload (POST …/nudge, one DM per 6 h),
+ *  - already uploaded     → straight to the transcript.
+ */
+function RecorderRecordingLine({
+  rec,
+  row: r,
+  originalNote,
+  disabled = false,
+}: {
+  rec: RecorderRecordingRef;
+  row: CalendarMeetingRow;
+  /** The Teams-chat verdict this line is standing in for, if any. */
+  originalNote?: string | null;
+  disabled?: boolean;
+}) {
+  const companion = useCompanion();
+  const [nudgedAt, setNudgedAt] = useState<string | null>(rec.nudgedAt);
+  const [busy, setBusy] = useState(false);
+  const [note, setNote] = useState<string | null>(null);
+  const { text, action, actionLabel, title } = recorderRowCopy(rec, {
+    durationText: rec.durationS ? formatDuration(rec.durationS) : null,
+    originalNote,
+  });
+
+  const askToUpload = async () => {
+    setBusy(true);
+    setNote(null);
+    try {
+      const res = await fetch(`/api/recorder/recordings/${rec.id}/nudge`, { method: 'POST' });
+      const j = (await res.json().catch(() => ({}))) as {
+        sent_at?: string;
+        error?: string;
+        transcript_id?: string;
+      };
+      if (res.ok) {
+        setNudgedAt(j.sent_at ?? new Date().toISOString());
+        setNote('asked just now');
+      } else if (res.status === 429) {
+        setNudgedAt(j.sent_at ?? new Date().toISOString());
+        setNote('already asked');
+      } else {
+        setNote(j.error ?? `Could not ask (${res.status})`);
+      }
+    } catch (err) {
+      setNote(isNetworkFailure(err) ? OFFLINE_TITLE : 'Could not ask');
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const uploadHere = () => {
+    setNote(null);
+    // Same linked-event shape the web upload sends; the tray forwards it to
+    // the one-shot route untouched.
+    const ok = getCompanion().upload(rec.id, {
+      id: r.eventId,
+      title: r.title,
+      startTime: r.eventStart,
+      endTime: r.eventEnd,
+      meetingCode: r.meetingCode,
+    });
+    setNote(ok ? 'uploading…' : 'Open Darth Recorder on that Mac to upload it');
+  };
+
+  const askedLabel = nudgedAt
+    ? `asked ${new Date(nudgedAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}`
+    : null;
+
+  return (
+    <span
+      data-recorder-recording={rec.status}
+      data-recorder-mine={rec.mine ? '1' : '0'}
+      title={title}
+      className="inline-flex min-w-0 shrink items-center gap-1 truncate text-[11px] text-foreground/70"
+    >
+      <span className="shrink-0 rounded border border-current/30 px-1 text-[9px] uppercase tracking-wide opacity-70">
+        Recorder
+      </span>
+      <span className="truncate">{text}</span>
+      {action === 'open' && rec.transcriptId && (
+        <a
+          href={`/transcript/${rec.transcriptId}`}
+          onClick={(e) => e.stopPropagation()}
+          className="shrink-0 text-primary underline-offset-2 hover:underline"
+        >
+          Open transcript
+        </a>
+      )}
+      {action === 'upload' && (
+        <button
+          type="button"
+          disabled={disabled || busy}
+          title={
+            disabled
+              ? OFFLINE_TITLE
+              : companion.connected
+                ? 'Upload it from this Mac now — it transcribes itself'
+                : 'Darth Recorder is not connected to this page; open the tray on the Mac that holds the file'
+          }
+          onClick={(e) => {
+            e.stopPropagation();
+            uploadHere();
+          }}
+          className="shrink-0 text-primary underline-offset-2 hover:underline disabled:cursor-not-allowed disabled:opacity-60"
+        >
+          {companion.connected ? actionLabel : 'Open Darth Recorder'}
+        </button>
+      )}
+      {action === 'nudge' &&
+        (askedLabel && !busy ? (
+          <span className="shrink-0 text-muted-foreground">{askedLabel}</span>
+        ) : (
+          <button
+            type="button"
+            disabled={disabled || busy}
+            title={disabled ? OFFLINE_TITLE : title}
+            onClick={(e) => {
+              e.stopPropagation();
+              void askToUpload();
+            }}
+            className="shrink-0 text-primary underline-offset-2 hover:underline disabled:cursor-not-allowed disabled:opacity-60"
+          >
+            {busy ? 'Asking…' : actionLabel}
+          </button>
+        ))}
+      {note && <span className="shrink-0 truncate text-muted-foreground">· {note}</span>}
+    </span>
   );
 }
 
@@ -821,10 +962,20 @@ export function CalendarEventRow({
                   No Meet link
                 </Badge>
               )}
-              {isTeams && layer === 'norec' && chat && (
+              {/* A matched Darth Recorder recording outranks the chat
+                  verdict — the verdict text rides along in its tooltip. */}
+              {isTeams && layer === 'norec' && chat && !r.recorderRecording && (
                 <TeamsChatVerdictLine verdict={chat} external={chatExternal} />
               )}
-              {showConnectMsHint && <ConnectMicrosoftHint />}
+              {r.recorderRecording && (
+                <RecorderRecordingLine
+                  rec={r.recorderRecording}
+                  row={r}
+                  originalNote={chat ? teamsChatVerdictCopy(chat, { external: chatExternal }).text : null}
+                  disabled={disabled}
+                />
+              )}
+              {showConnectMsHint && !r.recorderRecording && <ConnectMicrosoftHint />}
             </div>
           </div>
         </div>
