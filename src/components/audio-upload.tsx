@@ -26,7 +26,10 @@ import {
   Sparkles,
   Film,
   FileText,
+  Laptop,
 } from 'lucide-react';
+import { useCompanion } from '@/lib/companion/companion-client';
+import { RecorderRecordings } from '@/components/recorder-recordings';
 import {
   getGoogleAccessToken,
   hasValidGoogleToken,
@@ -207,6 +210,12 @@ export function AudioUpload({ onTranscriptCreated }: AudioUploadProps) {
    * when the dialog opens — the old ref-across-the-native-chooser approach
    * arrived null at handleFilesSelected, so the pre-link never applied. */
   const [prefill, setPrefill] = useState<MediaUploadPrefill | null>(null);
+
+  // --- Darth Recorder lane (a 'pick' step source: recordings already sitting
+  // on this Mac, uploaded by the tray itself rather than through this tab) ---
+  const companion = useCompanion();
+  const [recorderOpen, setRecorderOpen] = useState(false);
+  const [recorderSent, setRecorderSent] = useState<string | null>(null);
 
   // --- paste-a-transcript state (the 'pick' step's second lane) ---
   const [pasteOpen, setPasteOpen] = useState(false);
@@ -716,6 +725,8 @@ export function AudioUpload({ onTranscriptCreated }: AudioUploadProps) {
     setSelectedLanguage('');
     setPrefill(null);
     setPasteOpen(false);
+    setRecorderOpen(false);
+    setRecorderSent(null);
     setPasteText('');
     setPasteError(null);
     setPasteResult(null);
@@ -1184,6 +1195,52 @@ export function AudioUpload({ onTranscriptCreated }: AudioUploadProps) {
                       </div>
                     </div>
                   )}
+                  {(companion.connected || companion.everSeen) &&
+                    (!recorderOpen ? (
+                      <button
+                        type="button"
+                        onClick={() => setRecorderOpen(true)}
+                        className="w-full rounded-md border p-2.5 text-left text-sm text-muted-foreground hover:bg-muted/50"
+                        data-recorder-source
+                      >
+                        <Laptop className="mr-2 inline h-4 w-4" />
+                        …or from Darth Recorder on this Mac
+                      </button>
+                    ) : (
+                      <div className="space-y-2 rounded-md border p-2.5" data-recorder-source-open>
+                        <p className="flex items-center gap-2 text-sm font-medium">
+                          <Laptop className="h-4 w-4 text-primary" />
+                          From Darth Recorder on this Mac
+                        </p>
+                        {!companion.connected ? (
+                          <p className="text-xs text-muted-foreground">
+                            Darth Recorder is installed here but not running — open it and this list
+                            fills in.
+                          </p>
+                        ) : recorderSent ? (
+                          <p className="text-xs text-muted-foreground">
+                            Darth Recorder is uploading <b>{recorderSent}</b>. It keeps going even if
+                            you close this tab, and appears in your list when it is done.
+                          </p>
+                        ) : (
+                          <>
+                            <p className="text-xs text-muted-foreground">
+                              The recorder uploads these itself — the file never passes through this
+                              tab.
+                              {prefill && selectedEvent
+                                ? ' It will be linked to the meeting above.'
+                                : ''}
+                            </p>
+                            <RecorderRecordings
+                              linkedEvent={prefill ? buildLinkedEvent() : null}
+                              onUploadStarted={(r) =>
+                                setRecorderSent(r.call?.title || r.started_at || 'the recording')
+                              }
+                            />
+                          </>
+                        )}
+                      </div>
+                    ))}
                   {!pasteOpen ? (
                     <button
                       type="button"

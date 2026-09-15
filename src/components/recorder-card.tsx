@@ -4,8 +4,26 @@ import { useEffect, useState } from 'react';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
 import { Badge } from '@/components/ui/badge';
-import { AppWindow, CheckCircle2, CircleAlert, Copy, Download, ExternalLink, RefreshCw } from 'lucide-react';
-import { callKindLabel, companionPlatformSupported, getCompanion, useCompanion } from '@/lib/companion/companion-client';
+import {
+  AppWindow,
+  ArrowUpCircle,
+  CheckCircle2,
+  CircleAlert,
+  Copy,
+  Download,
+  ExternalLink,
+  LogIn,
+  RefreshCw,
+  ScreenShare,
+} from 'lucide-react';
+import {
+  callKindLabel,
+  companionPlatformSupported,
+  getCompanion,
+  shareLabel,
+  useCompanion,
+} from '@/lib/companion/companion-client';
+import { RecorderRecordings } from '@/components/recorder-recordings';
 
 /**
  * Settings card for the Mac menu-bar helper ("Darth Recorder"): install
@@ -13,6 +31,12 @@ import { callKindLabel, companionPlatformSupported, getCompanion, useCompanion }
  * does (version, Screen Recording grant, current call / recording), and an
  * "Open Darth Recorder" button that uses the app's darth-recorder:// URL
  * scheme (launches it if installed but not running).
+ *
+ * With a 0.2.0 tray it also shows who the recorder is signed in as, mirrors its
+ * "Upload recordings automatically" toggle, lists the recordings still sitting
+ * on this Mac (Upload / Retry per row), and reports a staged self-update. A
+ * 0.1.5 tray reports none of that: the sign-in block and the toggle are hidden
+ * (they are `null`, not `false`) and the list says to update the recorder.
  *
  * Distribution is the shared CLI host on the Tailnet — see
  * poc/mac-recorder/README.md. Windows helper does not exist yet.
@@ -43,6 +67,8 @@ export function RecorderCard() {
   };
 
   const call = c.calls[0];
+  const share = shareLabel(c.share);
+  const update = c.updateStaged ?? c.updateAvailable;
 
   return (
     <Card data-recorder-card>
@@ -100,6 +126,11 @@ export function RecorderCard() {
                   ? `${callKindLabel(call.kind)} in progress${call.title ? ` — ${call.title}` : ` (${call.app})`}`
                   : 'No call detected right now. Recordings are saved to ~/Movies/Darth Recorder.'}
             </p>
+            {share && (
+              <p className="flex items-center gap-2 text-muted-foreground" data-recorder-share>
+                <ScreenShare className="h-4 w-4 shrink-0" /> {share}
+              </p>
+            )}
             <div className="flex flex-wrap gap-2 pt-1">
               <Button size="sm" variant="outline" onClick={openApp}>
                 <ExternalLink className="mr-1.5 h-3.5 w-3.5" /> Open Darth Recorder
@@ -118,6 +149,76 @@ export function RecorderCard() {
                 </Button>
               )}
             </div>
+
+            {/* --- 0.2.0 only: sign-in, auto-upload, local recordings --- */}
+            {c.signedIn !== null && (
+              <div className="flex flex-wrap items-center gap-2 border-t pt-3" data-recorder-signin>
+                {c.signedIn ? (
+                  <p className="flex items-center gap-2">
+                    <CheckCircle2 className="h-4 w-4 shrink-0 text-emerald-600" />
+                    <span>
+                      Signed in as <b>{c.email ?? 'this account'}</b> — recordings upload to your
+                      Darth Meetings.
+                    </span>
+                  </p>
+                ) : (
+                  <>
+                    <p className="flex items-center gap-2 text-amber-700 dark:text-amber-400">
+                      <CircleAlert className="h-4 w-4 shrink-0" />
+                      <span>
+                        The recorder is not signed in, so nothing can upload. Signing in opens a
+                        browser tab and takes a few seconds.
+                      </span>
+                    </p>
+                    <Button size="sm" onClick={() => getCompanion().login()} data-recorder-signin-btn>
+                      <LogIn className="mr-1.5 h-3.5 w-3.5" /> Sign in recorder
+                    </Button>
+                  </>
+                )}
+              </div>
+            )}
+
+            {c.autoUpload !== null && (
+              <label className="flex items-start gap-2 text-sm" data-recorder-autoupload>
+                <input
+                  type="checkbox"
+                  className="mt-0.5 h-4 w-4 shrink-0 accent-primary"
+                  checked={c.autoUpload}
+                  onChange={(e) => getCompanion().setAutoUpload(e.target.checked)}
+                />
+                <span>
+                  Upload recordings automatically
+                  <span className="block text-xs text-muted-foreground">
+                    Mirrors the recorder&apos;s own menu item. Off means every recording waits here
+                    until you press Upload.
+                  </span>
+                </span>
+              </label>
+            )}
+
+            <div className="space-y-2 border-t pt-3" data-recorder-local>
+              <p className="flex items-center justify-between gap-2 font-medium">
+                <span>Recordings on this Mac</span>
+                {c.recordingsPendingUpload ? (
+                  <Badge variant="secondary">{c.recordingsPendingUpload} to upload</Badge>
+                ) : null}
+              </p>
+              <RecorderRecordings limit={6} />
+            </div>
+
+            <p className="flex flex-wrap items-center gap-2 border-t pt-3 text-xs text-muted-foreground" data-recorder-version>
+              <span>Version {c.version ?? 'unknown'}</span>
+              {update ? (
+                <span className="inline-flex items-center gap-1 text-amber-700 dark:text-amber-400">
+                  <ArrowUpCircle className="h-3.5 w-3.5" />
+                  {c.updateStaged
+                    ? `Update ${c.updateStaged} downloaded — it installs when you are not recording.`
+                    : `Update ${c.updateAvailable} available — the recorder fetches it within a few hours.`}
+                </span>
+              ) : (
+                <span>Up to date. It checks for updates on its own.</span>
+              )}
+            </p>
           </div>
         ) : (
           <div className="space-y-2" data-recorder-install>

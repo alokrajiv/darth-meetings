@@ -3,8 +3,8 @@
 import { useEffect, useRef, useState } from 'react';
 import Link from 'next/link';
 import { Button } from '@/components/ui/button';
-import { AudioLines, CircleDot, ExternalLink, Settings } from 'lucide-react';
-import { callKindLabel, getCompanion, useCompanion } from '@/lib/companion/companion-client';
+import { ArrowUpCircle, AudioLines, CircleDot, ExternalLink, ScreenShare, Settings } from 'lucide-react';
+import { callKindLabel, getCompanion, shareLabel, useCompanion } from '@/lib/companion/companion-client';
 
 /**
  * Header pill for the Mac helper (Darth Recorder). Mounted once in <AppHeader>.
@@ -13,7 +13,13 @@ import { callKindLabel, getCompanion, useCompanion } from '@/lib/companion/compa
  *  - connected, idle → quiet "Recorder" with a green dot;
  *  - connected, call live → emerald "Call detected" with Record;
  *  - recording → red "Recording mm:ss" with Stop.
- * The pill opens a small popover with the details and a link to Settings.
+ * A screen-share glyph rides along while the tray sees one (0.2.0+), and an
+ * amber dot appears when the tray has an update waiting.
+ *
+ * Every state is derived from the snapshot's strict `recording === true`: the
+ * 0.1.5 tray overwrote that boolean with the saved-file object on
+ * `recording_stopped`, which left the pill stuck on "Recording" after a stop.
+ * The fix lives in companion-client; the chip must never re-truthy it.
  */
 export function RecorderChip() {
   const c = useCompanion();
@@ -46,6 +52,11 @@ export function RecorderChip() {
   if (!c.connected && !c.everSeen) return null;
 
   const call = c.calls[0];
+  const share = shareLabel(c.share);
+  // An update the tray has seen but not applied yet. Ignore it while recording:
+  // the tray defers the swap until the recording ends anyway.
+  const updateReady = c.connected && !!(c.updateStaged ?? c.updateAvailable);
+  const pending = c.recordingsPendingUpload ?? 0;
   const since = c.recordingSince ? Date.parse(c.recordingSince) : Date.now();
   const s = Math.max(0, Math.floor((Date.now() - since) / 1000));
   const clock = `${String(Math.floor(s / 60)).padStart(2, '0')}:${String(s % 60).padStart(2, '0')}`;
@@ -80,8 +91,12 @@ export function RecorderChip() {
       >
         {c.recording ? <CircleDot className="h-3.5 w-3.5 animate-pulse" /> : <AudioLines className="h-3.5 w-3.5" />}
         <span className="hidden sm:inline">{pill}</span>
-        {c.connected && !c.recording && (
+        {share && <ScreenShare className="h-3.5 w-3.5 shrink-0 opacity-90" aria-label={share} data-recorder-share />}
+        {c.connected && !c.recording && !updateReady && (
           <span className={`h-1.5 w-1.5 rounded-full ${call ? 'bg-emerald-500' : 'bg-emerald-500/80'}`} aria-label="connected" />
+        )}
+        {updateReady && (
+          <span className="h-1.5 w-1.5 rounded-full bg-amber-500" aria-label="Recorder update available" data-recorder-update-dot />
         )}
       </button>
       {open && (
@@ -101,6 +116,27 @@ export function RecorderChip() {
                     ? 'Connected, but Screen Recording is not allowed yet (System Settings › Privacy & Security).'
                     : 'Connected. Watching for Teams, Meet and Zoom calls.'}
           </p>
+          {share && (
+            <p className="mt-1 flex items-center gap-1.5 text-xs text-muted-foreground" data-recorder-share-line>
+              <ScreenShare className="h-3 w-3 shrink-0" /> {share}
+            </p>
+          )}
+          {c.connected && c.signedIn === false && (
+            <p className="mt-1 text-xs text-amber-700 dark:text-amber-400">
+              Not signed in — recordings stay on this Mac until you sign the recorder in.
+            </p>
+          )}
+          {pending > 0 && (
+            <p className="mt-1 text-xs text-muted-foreground">
+              {pending} recording{pending === 1 ? '' : 's'} waiting to upload.
+            </p>
+          )}
+          {updateReady && (
+            <p className="mt-1 flex items-center gap-1.5 text-xs text-amber-700 dark:text-amber-400" data-recorder-update-line>
+              <ArrowUpCircle className="h-3 w-3 shrink-0" />
+              Update {c.updateStaged ?? c.updateAvailable} ready — it installs itself once you are not recording.
+            </p>
+          )}
           <div className="mt-3 space-y-1.5">
             {!c.connected && (
               <Button size="sm" className="h-7 w-full px-2.5 text-xs" onClick={() => (window.location.href = 'darth-recorder://open')}>

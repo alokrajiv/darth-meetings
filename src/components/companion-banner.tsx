@@ -2,8 +2,14 @@
 
 import { useEffect, useState } from 'react';
 import { Button } from '@/components/ui/button';
-import { Video, CircleDot, CheckCircle2 } from 'lucide-react';
-import { callKindLabel, getCompanion, useCompanion } from '@/lib/companion/companion-client';
+import { Video, CircleDot, CheckCircle2, ScreenShare, Upload, X } from 'lucide-react';
+import {
+  callKindLabel,
+  formatCompanionDuration,
+  getCompanion,
+  shareLabel,
+  useCompanion,
+} from '@/lib/companion/companion-client';
 
 /**
  * Call-outs driven by the local Darth Recorder tray (see companion-client.ts).
@@ -13,7 +19,11 @@ import { callKindLabel, getCompanion, useCompanion } from '@/lib/companion/compa
  *  - "Teams call detected" (+ window title) with Record / Not now while a
  *    call is live and nothing is recording. "Not now" hides that one call.
  *  - "Recording · mm:ss" with Stop while the tray records.
- *  - "Recording saved" for ~12 s after a stop (shown ahead of a still-live call).
+ *  - "Recording saved" after a stop (shown ahead of a still-live call). When
+ *    the tray did not auto-upload it — auto-upload off, or the upload failed —
+ *    the toast carries "Upload now", pre-linked to the event the tray matched,
+ *    and sticks around for 90 s instead of 12 s. A 0.1.5 tray reports no
+ *    recording id, so there is nothing to address and the plain toast shows.
  *
  * Record/Stop are commands to the tray; the tray does the capture and the
  * upload, this page is only a remote control. Ordinary users with no tray
@@ -22,10 +32,21 @@ import { callKindLabel, getCompanion, useCompanion } from '@/lib/companion/compa
 export function CompanionBanner() {
   const c = useCompanion();
   const [dismissed, setDismissed] = useState<Set<string>>(() => new Set());
+  const [closedSaved, setClosedSaved] = useState(0);
   const [, setTick] = useState(0);
 
+  const stopped = c.lastEvent?.type === 'recording_stopped' ? c.lastEvent : null;
+  const saved = stopped?.saved ?? null;
+  const savedId = saved?.recording_id ?? null;
+  const upload = savedId ? c.uploads[savedId] : undefined;
+  // Offer the manual upload when the tray is not going to do it itself: the
+  // toggle is off, or its own attempt failed. autoUpload === null means the
+  // tray never reports it (0.1.x) — no recording id either, so no offer.
+  const offer = !!savedId && (c.autoUpload === false || upload?.status === 'failed');
+  const savedVisible =
+    !!stopped && stopped.at !== closedSaved && Date.now() - stopped.at < (offer ? 90_000 : 12_000);
+
   // 1 Hz re-render while recording (for the timer) or while the saved toast is showing.
-  const savedVisible = c.lastEvent?.type === 'recording_stopped' && Date.now() - c.lastEvent.at < 12_000;
   useEffect(() => {
     if (!c.recording && !savedVisible) return;
     const t = setInterval(() => setTick((n) => n + 1), 1000);
@@ -55,26 +76,66 @@ export function CompanionBanner() {
           <p className="font-medium">
             Recording {c.recordingLabel ?? 'display'} · {mm}:{ss}
           </p>
-          <p className="truncate text-xs opacity-80">{c.recordingPath ?? 'Darth Recorder on this Mac'}</p>
+          <p className="flex min-w-0 items-center gap-1.5 truncate text-xs opacity-80">
+            {c.share && <ScreenShare className="h-3 w-3 shrink-0" />}
+            {shareLabel(c.share) ?? c.recordingPath ?? 'Darth Recorder on this Mac'}
+          </p>
         </div>
         <Button size="sm" variant="ghost" className="h-7 px-2.5 text-xs hover:bg-red-100 dark:hover:bg-red-900/50" onClick={() => getCompanion().send('stop')}>
           Stop
         </Button>
       </div>
     );
-  } else if (savedVisible && c.lastEvent?.type === 'recording_stopped') {
-    const r = c.lastEvent.recording;
+  } else if (savedVisible && stopped) {
+    const matchedTitle = typeof saved?.matched?.title === 'string' ? saved.matched.title : null;
+    const failed = upload?.status === 'failed';
     body = (
       <div
         role="status"
         data-companion-saved
-        className={`${shell} border-sky-300 bg-sky-50 text-sky-900 dark:border-sky-700/60 dark:bg-sky-950/80 dark:text-sky-200`}
+        data-companion-offer={offer ? '1' : undefined}
+        className={`${shell} ${
+          failed
+            ? 'border-amber-300 bg-amber-50 text-amber-900 dark:border-amber-700/60 dark:bg-amber-950/80 dark:text-amber-200'
+            : 'border-sky-300 bg-sky-50 text-sky-900 dark:border-sky-700/60 dark:bg-sky-950/80 dark:text-sky-200'
+        }`}
       >
         <CheckCircle2 className="h-4 w-4 shrink-0" />
         <div className="min-w-0 flex-1">
-          <p className="font-medium">Recording saved{r ? ` (${Math.floor(r.seconds / 60)}m ${r.seconds % 60}s)` : ''}</p>
-          <p className="truncate text-xs opacity-80">{r?.path ?? ''}</p>
+          <p className="font-medium">
+            {failed ? 'Recording saved — upload failed' : 'Recording saved'}
+            {saved?.seconds ? ` (${formatCompanionDuration(saved.seconds)})` : ''}
+          </p>
+          <p className="truncate text-xs opacity-80">
+            {upload?.status === 'uploading'
+              ? `Uploading ${Math.round(upload.pct)}%…`
+              : failed
+                ? (upload?.error ?? 'The recorder could not upload it.')
+                : offer
+                  ? matchedTitle
+                    ? `Not uploaded yet — it matches “${matchedTitle}”.`
+                    : 'Not uploaded yet — it is still only on this Mac.'
+                  : (saved?.path ?? '')}
+          </p>
         </div>
+        {offer && upload?.status !== 'uploading' && (
+          <Button
+            size="sm"
+            className="h-7 shrink-0 px-2.5 text-xs"
+            data-companion-upload-now
+            onClick={() => savedId && getCompanion().upload(savedId, saved?.matched ?? null)}
+          >
+            <Upload className="h-3.5 w-3.5" /> {failed ? 'Retry upload' : 'Upload now'}
+          </Button>
+        )}
+        <button
+          type="button"
+          aria-label="Dismiss"
+          className="shrink-0 rounded p-0.5 opacity-60 hover:bg-black/5 hover:opacity-100 dark:hover:bg-white/10"
+          onClick={() => setClosedSaved(stopped.at)}
+        >
+          <X className="h-3.5 w-3.5" />
+        </button>
       </div>
     );
   } else if (call) {
