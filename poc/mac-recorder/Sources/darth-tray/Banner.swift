@@ -76,6 +76,21 @@ final class BannerController {
         present(autoHideAfter: 10)
     }
 
+    /// Verified update staged while a call/recording is in progress: offer to install now.
+    func showUpdate(version: String, sub: String, onInstall: @escaping () -> Void) {
+        installAction = onInstall
+        icon.image = NSImage(systemSymbolName: "arrow.down.circle.fill", accessibilityDescription: nil)
+        icon.contentTintColor = .systemBlue
+        titleLabel.stringValue = "Darth Recorder \(version) is ready"
+        subLabel.stringValue = sub
+        primary.isHidden = false
+        primary.title = "Install and restart"
+        primary.target = self; primary.action = #selector(installTapped)
+        secondary.title = "Later"
+        secondary.target = self; secondary.action = #selector(dismissTapped)
+        present(autoHideAfter: 20)
+    }
+
     func hide() {
         hideTimer?.invalidate(); hideTimer = nil
         tickTimer?.invalidate(); tickTimer = nil
@@ -85,6 +100,7 @@ final class BannerController {
     // MARK: internals
 
     private var currentSaved: URL?
+    private var installAction: (() -> Void)?
 
     private func kindLabel(_ k: CallKind) -> String {
         switch k {
@@ -197,6 +213,7 @@ final class BannerController {
     }
     @objc private func dismissTapped() { hide() }
     @objc private func stopTapped() { onStop?() }
+    @objc private func installTapped() { hide(); installAction?() }
     @objc private func showFileTapped() {
         if let u = currentSaved { NSWorkspace.shared.activateFileViewerSelecting([u]) }
         hide()

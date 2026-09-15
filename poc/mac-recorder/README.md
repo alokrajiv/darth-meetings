@@ -6,7 +6,8 @@ Native macOS side of Darth Meetings recording (the "Swift tray" angle from Darth
 - **RecorderCore** — ScreenCaptureKit → AVAssetWriter capture (display or window + system
   audio → H.264/AAC `.mp4`). No BlackHole, no virtual devices, no device switching.
 - **darth-tray** — the menu-bar app "Darth Recorder": detects calls, shows a Notion-style
-  banner, records, and serves the Meetings PWA over `ws://127.0.0.1:47800`.
+  banner, records, serves the Meetings PWA over `ws://127.0.0.1:47800`, and updates itself
+  from `cli.darth-internal.trames.io` (see *Auto-update*).
 - **recorder-poc** — the original CLI, kept for quick capture experiments.
 
 ## Darth Recorder (tray) — build, release, publish
@@ -31,6 +32,48 @@ builds are DIFFERENT grants (one extra toggle when switching), but each survives
 rebuilds. Apple membership renews 14 Apr 2027 with auto-renew off — a lapse breaks notarization.
 Log: `~/Library/Logs/DarthRecorder/tray.log`. Recordings: `~/Movies/Darth Recorder/`.
 
+## Auto-update (`Updater.swift`, since 0.1.4)
+
+The tray updates itself — no Sparkle (the bundle is hand-assembled by `make-app.sh`, so
+embedding Sparkle's framework + XPC services is not worth it). It reuses what the installer
+already publishes: `https://cli.darth-internal.trames.io/darth-recorder/version.json`
+(`version`, `zip`, `sha256`, `min_macos`, …) and the zip next to it.
+
+**Flow.** Check 30 s after launch and every 6 h, plus **Check for Updates…** in the menu
+(reports "You're up to date (x.y.z)" via the banner, or an error banner). Off the Tailnet the
+periodic check fails silently (one debug line in tray.log, no banner). When `version` is
+semver-newer than `let VERSION`: download the zip to
+`~/Library/Caches/io.trames.darth.recorder/updates/<ver>/`, then **verify** — sha256 equals
+version.json's → `ditto -x -k` → `codesign --verify --deep --strict` → `codesign -dv` shows
+`TeamIdentifier=SMX3ZQ2226` → `spctl --assess --type execute` (notarized) → the bundle's
+`CFBundleIdentifier` + `CFBundleShortVersionString` match. Any failure → `updater: REFUSED — …`
+in tray.log, staging dir deleted, nothing installed.
+
+**Install policy.** Idle (no recording, no detected call) → installs immediately. Busy → the
+update stays staged; a banner offers "Install and restart" (stops the recording first) and
+otherwise it installs the moment the recording stops / the call ends. The menu item turns into
+"Install x.y.z and restart" while staged. A loop guard refuses to *auto*-install the same
+version twice within an hour (manual install still works).
+
+**Install mechanics.** The app writes `install.sh` into the staging dir, launches it detached
+(`nohup bash …`, output appended to tray.log) and terminates. The helper waits for our pid,
+moves `/Applications/Darth Recorder.app` to `~/.Trash/Darth Recorder <old>.app` (or `rm -rf`
+if the move fails), moves the staged bundle into place (`ditto` fallback; restores the old one
+if both fail), `open`s it and removes the staging dir. If the app does not run from
+`/Applications` it installs over wherever it runs from (`Bundle.main.bundleURL`). The
+Developer ID code requirement is unchanged, so the Screen Recording grant survives. After the
+relaunch the banner says "Darth Recorder updated to x.y.z". The PWA status snapshot carries
+`update_available` / `update_staged` (version string or null).
+
+**Testing.** `{cmd:"check_update"}` over `ws://127.0.0.1:47800` = the menu item (drive it with a
+bun one-liner: `new WebSocket(...)`, send the JSON, print messages). Env overrides read at
+launch: `DARTH_TRAY_UPDATE_INTERVAL=<seconds>` (first check after min(30, interval)),
+`DARTH_TRAY_UPDATE_URL=file:///…/version.json` (zip resolves relative to it) — e.g. tamper the
+`sha256` in a local copy, `open -n "/Applications/Darth Recorder.app" --env
+DARTH_TRAY_UPDATE_URL=file:///tmp/v.json --env DARTH_TRAY_UPDATE_INTERVAL=5` and expect a
+`REFUSED — sha256 mismatch` line. E2E proof (2026-09-15): a running 0.1.4 detected the
+published 0.1.5, verified, swapped the bundle and relaunched as 0.1.5 with no human action.
+
 **Call detection** (`CallDetector.swift`): every 1.5 s poll Core Audio's process objects
 (`kAudioHardwarePropertyProcessObjectList`) for `kAudioProcessPropertyIsRunningInput` —
 i.e. who has the microphone open. Walk the pid up to its Dock-visible app (Teams WebView →
@@ -42,9 +85,10 @@ ignored — `replayd` opens input while we ourselves record.
 **PWA protocol** (`LocalServer.swift`, Network.framework WebSocket server on loopback).
 Every message is a full status snapshot + `type`:
 `status | call_started | call_ended | recording_started | recording_stopped`, with `calls[]`,
-`recording`, `recording_since/path/label`, `screen_recording_permission`, `version`.
+`recording`, `recording_since/path/label`, `screen_recording_permission`, `version`,
+`update_available`, `update_staged`.
 Commands from the page: `{cmd:"start", pid?}`, `{cmd:"stop"}`, `{cmd:"status"}`, and the
-test hooks `{cmd:"simulate_call", kind}` / `{cmd:"end_simulated"}`. The PWA side is
+test hooks `{cmd:"simulate_call", kind}` / `{cmd:"end_simulated"}` / `{cmd:"check_update"}`. The PWA side is
 `src/lib/companion/companion-client.ts` + `src/components/companion-banner.tsx` (mounted in
 the root layout; renders nothing unless a tray answers). TODO before this leaves POC:
 pairing token + Origin allow-list; today any local page can drive the recorder.

@@ -3,7 +3,7 @@ import CoreGraphics
 import ServiceManagement
 import RecorderCore
 
-let VERSION = "0.1.3"
+let VERSION = "0.1.5"
 let WS_PORT: UInt16 = 47800
 let PWA_URL = URL(string: "https://meetings.darth-internal.trames.io/")!
 
@@ -15,6 +15,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     let detector = CallDetector()
     let server = LocalServer(port: WS_PORT)
     let banner = BannerController()
+    let updater = Updater(currentVersion: VERSION)
 
     var session: CaptureSession?
     var recordingCall: DetectedCall?
@@ -29,6 +30,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     let stopItem = NSMenuItem(title: "Stop recording", action: #selector(stopFromMenu), keyEquivalent: "s")
     let loginItem = NSMenuItem(title: "Open at login", action: #selector(toggleLogin), keyEquivalent: "")
     let versionLine = NSMenuItem(title: "Darth Recorder \(VERSION)", action: nil, keyEquivalent: "")
+    let updateItem = NSMenuItem(title: "Check for Updates…", action: #selector(checkForUpdates), keyEquivalent: "")
 
     func applicationDidFinishLaunching(_ n: Notification) {
         RLog.openFile("~/Library/Logs/DarthRecorder/tray.log")
@@ -53,14 +55,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         banner.onRecord = { [weak self] call in self?.startRecording(for: call) }
         banner.onStop = { [weak self] in self?.stopRecording() }
 
+        updater.isBusy = { [weak self] in guard let self else { return false }; return self.session != nil || self.starting || !self.detector.active.isEmpty }
+        updater.onChange = { [weak self] in self?.refreshMenu() }
+        updater.onEvent = { [weak self] ev in self?.updaterEvent(ev) }
+        updater.start()
+
         if let sim = ProcessInfo.processInfo.environment["DARTH_TRAY_SIMULATE"] {
             DispatchQueue.main.asyncAfter(deadline: .now() + 4) { self.simulate(kind: sim) }
         }
         refreshMenu()
-        let seenKey = "firstRunShown"
+        let seenKey = "firstRunShown", verKey = "lastRunVersion"
+        let lastRun = UserDefaults.standard.string(forKey: verKey)
+        UserDefaults.standard.set(VERSION, forKey: verKey)
         if !UserDefaults.standard.bool(forKey: seenKey) {
             UserDefaults.standard.set(true, forKey: seenKey)
             banner.showMessage(title: "Darth Recorder is running", sub: "It lives in your menu bar (the waveform icon). Turn on “Open at login” from its menu.")
+        } else if let lastRun, lastRun != VERSION {
+            rlog("first run after update \(lastRun) → \(VERSION)")
+            banner.showMessage(title: "Darth Recorder updated to \(VERSION)", sub: "Was \(lastRun). Updates install themselves when you are not on a call.")
         }
     }
 
@@ -141,6 +153,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         m.addItem(.separator())
         loginItem.target = self; m.addItem(loginItem)
         versionLine.isEnabled = false; m.addItem(versionLine)
+        updateItem.target = self; m.addItem(updateItem)
         m.addItem(.separator())
         let quit = NSMenuItem(title: "Quit Darth Recorder", action: #selector(quit), keyEquivalent: "q"); quit.target = self; m.addItem(quit)
         statusItem.menu = m
@@ -163,6 +176,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         startItem.isHidden = recording || starting
         stopItem.isHidden = !recording
         loginItem.state = SMAppService.mainApp.status == .enabled ? .on : .off
+        if updater.installing { updateItem.title = "Installing update…"; updateItem.isEnabled = false }
+        else if let s = updater.staged { updateItem.title = "Install \(s.version) and restart"; updateItem.isEnabled = true }
+        else if updater.checking { updateItem.title = "Checking for updates…"; updateItem.isEnabled = false }
+        else { updateItem.title = "Check for Updates…"; updateItem.isEnabled = true }
         if let b = statusItem.button {
             b.image = StatusIcon.image(recording ? .recording : (detector.active.isEmpty ? .idle : .callDetected))
         }
@@ -180,6 +197,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         NSWorkspace.shared.open(URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture")!)
     }
     @objc func openPWA() { NSWorkspace.shared.open(PWA_URL) }
+
+    // MARK: self-update
+
+    @objc func checkForUpdates() {
+        if updater.staged != nil { installUpdateNow() } else { updater.check(manual: true) }
+    }
+    /// "Install and restart" from the banner/menu: stop a running recording first, then install.
+    func installUpdateNow() {
+        if session != nil { installAfterStop = true; stopRecording(); return }
+        updater.install(auto: false)
+    }
+    var installAfterStop = false
+    func updaterEvent(_ ev: Updater.Event) {
+        switch ev {
+        case .upToDate(let v): banner.showMessage(title: "You're up to date (\(v))", sub: "Darth Recorder \(v) is the latest version.")
+        case .error(let msg): banner.showMessage(title: "Update check failed", sub: msg)
+        case .staged(let v):
+            banner.showUpdate(version: v, sub: session != nil ? "Installs itself when the recording stops." : "Installs itself when your call ends.") { [weak self] in self?.installUpdateNow() }
+        case .installing(let v): rlog("restarting to finish the update to \(v)")
+        }
+        var st = statusPayload(); st["type"] = "status"; server.broadcast(st)
+    }
     @objc func toggleLogin() {
         do {
             if SMAppService.mainApp.status == .enabled { try SMAppService.mainApp.unregister() } else { try SMAppService.mainApp.register() }
@@ -238,6 +277,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if let rc = recordingCall, rc.pid == call.pid, call.pid > 0 {
             banner.showMessage(title: "Call ended — still recording", sub: "Stop from the banner, the menu bar, or the PWA.")
         }
+        updater.installIfIdle()
     }
 
     // MARK: recording
@@ -313,6 +353,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             ev["recording"] = ["path": s.url.path, "seconds": secs, "bytes": size, "call": call?.json as Any]
             self.server.broadcast(ev)
             self.refreshMenu()
+            if self.installAfterStop { self.installAfterStop = false; self.updater.install(auto: false) } else { self.updater.installIfIdle() }
         }
     }
 
@@ -324,6 +365,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             "screen_recording_permission": CGPreflightScreenCaptureAccess(),
             "calls": detector.active.values.sorted { $0.startedAt < $1.startedAt }.map { $0.json },
             "recording": session != nil,
+            "update_available": updater.available ?? NSNull(),
+            "update_staged": updater.staged?.version ?? NSNull(),
             "ts": ISO8601DateFormatter().string(from: Date()),
         ]
         if let s = session {
@@ -346,6 +389,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             var s = statusPayload(); s["type"] = "status"; server.broadcast(s)
         case "simulate_call": simulate(kind: (obj["kind"] as? String) ?? "teams")
         case "end_simulated": detector.endInjected(pid: 0)
+        case "check_update": checkForUpdates()          // test hook: same as the menu item
         default: rlog("unknown cmd \(cmd)")
         }
     }

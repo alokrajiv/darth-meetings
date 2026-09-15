@@ -10,9 +10,10 @@ public enum RLog {
     public static func openFile(_ path: String) {
         let url = URL(fileURLWithPath: (path as NSString).expandingTildeInPath)
         try? FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
-        if !FileManager.default.fileExists(atPath: url.path) { FileManager.default.createFile(atPath: url.path, contents: nil) }
-        fileHandle = try? FileHandle(forWritingTo: url)
-        fileHandle?.seekToEndOfFile()
+        // O_APPEND: the self-update helper script appends to the same file (`>>`) while the
+        // relaunched app writes too; a plain seek-to-end handle would overwrite its lines.
+        let fd = open(url.path, O_WRONLY | O_APPEND | O_CREAT, 0o644)
+        if fd >= 0 { fileHandle = FileHandle(fileDescriptor: fd, closeOnDealloc: true) }
     }
 }
 
