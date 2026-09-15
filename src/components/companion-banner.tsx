@@ -2,7 +2,7 @@
 
 import { useEffect, useState } from 'react';
 import { Button } from '@/components/ui/button';
-import { Video, CircleDot, CheckCircle2, ScreenShare, Upload, X } from 'lucide-react';
+import { Video, CircleDot, CheckCircle2, ScreenShare, Upload, X, UserRoundCheck } from 'lucide-react';
 import {
   callKindLabel,
   formatCompanionDuration,
@@ -19,6 +19,13 @@ import {
  *  - "Teams call detected" (+ window title) with Record / Not now while a
  *    call is live and nothing is recording. "Not now" hides that one call.
  *  - "Recording · mm:ss" with Stop while the tray records.
+ *  - "Darth Recorder isn't signed in" (amber, sticky) whenever the connected
+ *    tray reports signed_in:false: nothing it records can upload until its
+ *    user approves it once. "Sign in" asks the tray to start the darth device
+ *    flow; the tray answers with `auth_prompt` (approval URL + code) and the
+ *    banner turns into "Approve in your browser — code XXXX" with a link, so
+ *    the approval happens in THIS browser, one click. Shown below any
+ *    call/recording banner, dismissable for the page's life only.
  *  - "Recording saved" after a stop (shown ahead of a still-live call). When
  *    the tray did not auto-upload it — auto-upload off, or the upload failed —
  *    the toast carries "Upload now", pre-linked to the event the tray matched,
@@ -55,9 +62,13 @@ export function CompanionBanner() {
     return () => clearInterval(t);
   }, [c.recording, savedVisible]);
 
+  const [signInHidden, setSignInHidden] = useState(false);
+
   if (!c.connected) return null;
 
   const call = c.calls.find((k) => !dismissed.has(k.id)) ?? null;
+  const prompt = c.authPrompt;
+  const needsSignIn = c.signedIn === false && !signInHidden;
   const shell =
     'pointer-events-auto mt-2 flex flex-wrap items-center gap-3 rounded-lg border px-4 py-2.5 text-sm shadow-[0_4px_16px_-2px_rgb(0_0_0/0.08),0_1px_2px_0_rgb(0_0_0/0.04)]';
 
@@ -176,10 +187,53 @@ export function CompanionBanner() {
     );
   }
 
-  if (!body) return null;
+  const signIn = needsSignIn ? (
+    <div
+      role="status"
+      data-companion-signin
+      data-companion-signin-prompt={prompt ? '1' : undefined}
+      className={`${shell} border-amber-300 bg-amber-50 text-amber-900 dark:border-amber-700/60 dark:bg-amber-950/80 dark:text-amber-200`}
+    >
+      <UserRoundCheck className="h-4 w-4 shrink-0" />
+      <div className="min-w-0 flex-1">
+        <p className="font-medium">
+          {prompt ? 'Approve Darth Recorder in your browser' : 'Darth Recorder on this Mac is not signed in'}
+        </p>
+        <p className="truncate text-xs opacity-80">
+          {prompt
+            ? `Confirm the code ${prompt.userCode ?? ''} on the approval page — one click, you are already logged in.`
+            : 'Recordings stay on this Mac and never reach Darth Meetings until you approve it once.'}
+        </p>
+      </div>
+      {prompt?.verifyUrl ? (
+        <Button size="sm" className="h-7 shrink-0 px-2.5 text-xs" asChild data-companion-signin-open>
+          <a href={prompt.verifyUrl} target="_blank" rel="noopener">
+            Open approval page
+          </a>
+        </Button>
+      ) : (
+        <Button size="sm" className="h-7 shrink-0 px-2.5 text-xs" data-companion-signin-btn onClick={() => getCompanion().login()}>
+          Sign in
+        </Button>
+      )}
+      <button
+        type="button"
+        aria-label="Dismiss"
+        className="shrink-0 rounded p-0.5 opacity-60 hover:bg-black/5 hover:opacity-100 dark:hover:bg-white/10"
+        onClick={() => setSignInHidden(true)}
+      >
+        <X className="h-3.5 w-3.5" />
+      </button>
+    </div>
+  ) : null;
+
+  if (!body && !signIn) return null;
   return (
     <div className="pointer-events-none fixed inset-x-0 top-14 z-30 px-6" data-companion-banner>
-      <div className="mx-auto max-w-[1720px]">{body}</div>
+      <div className="mx-auto max-w-[1720px]">
+        {body}
+        {signIn}
+      </div>
     </div>
   );
 }

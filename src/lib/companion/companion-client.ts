@@ -115,7 +115,8 @@ export type CompanionEvent =
   | { type: 'share_started' | 'share_ended'; share: CompanionShare | null; at: number }
   | { type: 'segment_started'; at: number; segment: number | null }
   | { type: 'upload_progress' | 'upload_done' | 'upload_failed'; at: number; recordingId: string | null }
-  | { type: 'auth_changed'; at: number };
+  | { type: 'auth_changed'; at: number }
+  | { type: 'auth_prompt'; at: number; verifyUrl: string | null; userCode: string | null; title: string | null };
 
 export type CompanionState = {
   /** A tray answered at least once during this page's life. */
@@ -133,6 +134,8 @@ export type CompanionState = {
   recordingLabel: string | null;
   /** null = the tray does not report it (legacy). */
   signedIn: boolean | null;
+  /** The device-flow approval the tray is waiting on (0.2.1+ `auth_prompt`); cleared on auth_changed. */
+  authPrompt: { verifyUrl: string | null; userCode: string | null; title: string | null; at: number } | null;
   email: string | null;
   deviceId: string | null;
   share: CompanionShare | null;
@@ -194,6 +197,7 @@ const initial: CompanionState = {
   recordingPath: null,
   recordingLabel: null,
   signedIn: null,
+  authPrompt: null,
   email: null,
   deviceId: null,
   share: null,
@@ -439,6 +443,7 @@ class CompanionClient {
 
     let lastEvent: CompanionEvent | null = this.state.lastEvent;
     let lastStopped = this.state.lastStopped;
+    let authPrompt = this.state.authPrompt;
     let uploads = this.state.uploads;
     switch (type) {
       case 'call_started':
@@ -482,7 +487,17 @@ class CompanionClient {
       }
       case 'auth_changed':
         lastEvent = { type, at };
+        authPrompt = null;
         break;
+      case 'auth_prompt': {
+        const verifyUrl = str(m.verify_url);
+        const userCode = str(m.user_code);
+        // Only a prompt that carries a URL is an approval to act on; the rest
+        // ("timed out", "could not start") are informational and clear it.
+        authPrompt = verifyUrl ? { verifyUrl, userCode, title: str(m.title), at } : null;
+        lastEvent = { type, at, verifyUrl, userCode, title: str(m.title) };
+        break;
+      }
       default:
         break;
     }
@@ -490,7 +505,7 @@ class CompanionClient {
     // Event-only messages (no snapshot on board) must not blank the snapshot.
     const isSnapshot = 'version' in m || 'calls' in m;
     if (!isSnapshot) {
-      this.set({ connected: true, lastEvent, lastStopped, uploads });
+      this.set({ connected: true, lastEvent, lastStopped, uploads, authPrompt });
       return;
     }
 
@@ -511,6 +526,8 @@ class CompanionClient {
       recordingPath: recording ? str(m.recording_path) : null,
       recordingLabel: recording ? str(m.recording_label) : null,
       signedIn: typeof m.signed_in === 'boolean' ? m.signed_in : null,
+      // A signed-in snapshot ends any pending approval prompt.
+      authPrompt: m.signed_in === true ? null : authPrompt,
       email: str(m.email),
       deviceId: str(m.device_id),
       share: parseShare(m.share),

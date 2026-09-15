@@ -140,6 +140,22 @@ final class BannerController {
     }
 
     /// Verified update staged while a call/recording is in progress: offer to install now.
+    /// Sign-in prompt: shown after an unsigned recording, on first run, and after an update when
+    /// the user never signed in. Without sign-in nothing reaches the server (Atira, 2026-09-15).
+    func showSignIn(title: String, sub: String, onSignIn: @escaping () -> Void) {
+        tickTimer?.invalidate()
+        signInAction = onSignIn
+        set(symbol: "person.crop.circle.badge.exclamationmark", accent: .warning, title: title, sub: sub)
+        primary.isHidden = false
+        primary.title = "Sign in"
+        primary.target = self; primary.action = #selector(signInTapped)
+        secondary.isHidden = false
+        secondary.title = "Later"
+        secondary.target = self; secondary.action = #selector(dismissTapped)
+        present(compact: false, autoHideAfter: 45, near: nil)
+        EventLog.shared.log("banner_shown", ["kind": "sign_in", "title": title])
+    }
+
     func showUpdate(version: String, sub: String, onInstall: @escaping () -> Void) {
         installAction = onInstall
         set(symbol: "arrow.down.circle.fill", accent: .info, title: "Darth Recorder \(version) is ready", sub: sub)
@@ -163,6 +179,7 @@ final class BannerController {
 
     private var currentSaved: URL?
     private var installAction: (() -> Void)?
+    private var signInAction: (() -> Void)?
 
     private func set(symbol: String, accent: Accent, title: String, sub: String) {
         icon.image = NSImage(systemSymbolName: symbol, accessibilityDescription: nil)
@@ -347,6 +364,7 @@ final class BannerController {
         onKeepRecording?()
     }
     @objc private func installTapped() { hide(); installAction?() }
+    @objc private func signInTapped() { EventLog.shared.log("banner_click", ["action": "sign_in"]); hide(); signInAction?() }
     @objc private func showFileTapped() {
         if let u = currentSaved { NSWorkspace.shared.activateFileViewerSelecting([u]) }
         hide()

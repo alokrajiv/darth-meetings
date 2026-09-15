@@ -3,7 +3,7 @@ import CoreGraphics
 import ServiceManagement
 import RecorderCore
 
-let VERSION = "0.2.0"
+let VERSION = "0.2.1"
 let WS_PORT: UInt16 = 47800
 let PWA_URL = URL(string: "https://meetings.darth-internal.trames.io/")!
 /// Seconds between "the call ended" and an automatic stop.
@@ -107,7 +107,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             self?.broadcast("auth_changed")
             if self?.auth.signedIn == true { self?.api.heartbeat(); self?.api.shipEvents(); self?.uploadPending() }
         }
-        auth.onPrompt = { [weak self] title, sub, _ in self?.banner.showMessage(title: title, sub: sub, accent: .info) }
+        auth.onPrompt = { [weak self] title, sub, url in
+            self?.banner.showMessage(title: title, sub: sub, accent: .info)
+            // Tell the PWA too: it shows the code + a link into the same browser, so the user
+            // never has to hunt for the tab the tray opened (or the menu item).
+            var extra: [String: Any] = ["title": title, "sub": sub]
+            if let url { extra["verify_url"] = url.absoluteString }
+            if let code = url?.query?.split(separator: "&").first(where: { $0.hasPrefix("code=") || $0.hasPrefix("user_code=") })?.split(separator: "=").last { extra["user_code"] = String(code) }
+            self?.broadcast("auth_prompt", extra)
+        }
 
         api.token = { [weak self] in self?.auth.token }
         api.deviceId = auth.deviceId
@@ -143,10 +151,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         UserDefaults.standard.set(VERSION, forKey: verKey)
         if !UserDefaults.standard.bool(forKey: seenKey) {
             UserDefaults.standard.set(true, forKey: seenKey)
-            banner.showMessage(title: "Darth Recorder is running", sub: "It lives in your menu bar (the waveform icon). Sign in from its menu to upload recordings.", accent: .info)
+            if auth.signedIn {
+                banner.showMessage(title: "Darth Recorder is running", sub: "It lives in your menu bar (the waveform icon).", accent: .info)
+            } else {
+                banner.showSignIn(title: "Darth Recorder is running — sign in", sub: "It lives in your menu bar (the waveform icon). Recordings upload to Darth Meetings only after you sign in.") { [weak self] in self?.auth.signIn() }
+            }
         } else if let lastRun, lastRun != VERSION {
             rlog("first run after update \(lastRun) → \(VERSION)")
-            banner.showMessage(title: "Darth Recorder updated to \(VERSION)", sub: "Was \(lastRun). Updates install themselves when you are not on a call.", accent: .info)
+            if auth.signedIn {
+                banner.showMessage(title: "Darth Recorder updated to \(VERSION)", sub: "Was \(lastRun). Updates install themselves when you are not on a call.", accent: .info)
+            } else {
+                banner.showSignIn(title: "Darth Recorder \(VERSION) — sign in to upload", sub: "Updated from \(lastRun). Recordings stay on this Mac until you sign in to Darth Meetings.") { [weak self] in self?.auth.signIn() }
+            }
+        } else if !auth.signedIn && Registry.shared.pendingUpload().count > 0 {
+            banner.showSignIn(title: "\(Registry.shared.pendingUpload().count) recording(s) waiting to upload", sub: "Sign in to Darth Meetings and they upload on their own.") { [weak self] in self?.auth.signIn() }
         }
         if !auth.signedIn {
             rlog("not signed in — recordings stay local until you sign in from the menu")
@@ -484,8 +502,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let id = (saved["recording_id"] as? String) ?? ""
         let willUpload = autoUpload && auth.signedIn && !id.isEmpty
         let path = (saved["path"] as? String).map { URL(fileURLWithPath: $0) }
-        banner.showSaved(path ?? Paths.recordings, seconds: (saved["seconds"] as? Int) ?? 0,
-                         segments: (saved["segments"] as? Int) ?? 1, uploading: willUpload)
+        let secs = (saved["seconds"] as? Int) ?? 0
+        if !auth.signedIn && !id.isEmpty {
+            banner.showSignIn(title: "Recording saved (\(secs / 60)m \(secs % 60)s) — sign in to upload",
+                              sub: "It is on this Mac only until you sign in to Darth Meetings.") { [weak self] in self?.auth.signIn() }
+        } else {
+            banner.showSaved(path ?? Paths.recordings, seconds: secs,
+                             segments: (saved["segments"] as? Int) ?? 1, uploading: willUpload)
+        }
         // `recording` must stay a boolean here — the file info goes under `saved`.
         broadcast("recording_stopped", ["saved": saved])
         api.shipEvents()
