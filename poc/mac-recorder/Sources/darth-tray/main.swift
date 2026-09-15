@@ -3,7 +3,7 @@ import CoreGraphics
 import ServiceManagement
 import RecorderCore
 
-let VERSION = "0.2.1"
+let VERSION = "0.2.2"
 let WS_PORT: UInt16 = 47800
 let PWA_URL = URL(string: "https://meetings.darth-internal.trames.io/")!
 /// Seconds between "the call ended" and an automatic stop.
@@ -146,6 +146,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             DispatchQueue.main.asyncAfter(deadline: .now() + 4) { self.simulate(kind: sim) }
         }
         refreshMenu()
+        // Open at login is the DEFAULT (Alok, 2026-09-15): a recorder that is not running when
+        // the call starts records nothing. Registered once on every install/update unless the
+        // user has explicitly switched it off from the menu (loginItemUserChoice).
+        if UserDefaults.standard.object(forKey: "loginItemUserChoice") == nil,
+           SMAppService.mainApp.status != .enabled {
+            do {
+                try SMAppService.mainApp.register()
+                rlog("login item: enabled by default (status \(SMAppService.mainApp.status.rawValue))")
+                EventLog.shared.log("login_item_default", ["status": SMAppService.mainApp.status.rawValue])
+            } catch { rlog("login item: default enable failed: \(error)") }
+        }
+
         let seenKey = "firstRunShown", verKey = "lastRunVersion"
         let lastRun = UserDefaults.standard.string(forKey: verKey)
         UserDefaults.standard.set(VERSION, forKey: verKey)
@@ -345,7 +357,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
     @objc func toggleLogin() {
         do {
-            if SMAppService.mainApp.status == .enabled { try SMAppService.mainApp.unregister() } else { try SMAppService.mainApp.register() }
+            let turningOff = SMAppService.mainApp.status == .enabled
+            UserDefaults.standard.set(!turningOff, forKey: "loginItemUserChoice")   // explicit choice wins over the default
+            EventLog.shared.log("login_item_toggle", ["enabled": !turningOff])
+            if turningOff { try SMAppService.mainApp.unregister() } else { try SMAppService.mainApp.register() }
         } catch { rlog("login item toggle failed: \(error)") }
         refreshMenu()
     }

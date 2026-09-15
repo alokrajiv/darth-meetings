@@ -10,6 +10,10 @@ Native macOS side of Darth Meetings recording (the "Swift tray" angle from Darth
   from `cli.darth-internal.trames.io` (see *Auto-update*).
 - **recorder-poc** — the original CLI, kept for quick capture experiments.
 
+**Open at login is on by default** (0.2.2): every launch registers the `SMAppService` login item unless
+the user switched it off in the menu (`loginItemUserChoice` in UserDefaults records an explicit choice;
+the default never overrides it). macOS may show "Darth Recorder was added as a login item" once.
+
 ## Darth Recorder (tray) — build, release, publish
 
     ./make-app.sh                      # dev: Apple Development signature → ~/Applications, relaunch
