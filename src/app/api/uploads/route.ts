@@ -16,6 +16,7 @@ import {
   textDocRejection,
 } from '@/lib/server/upload-pipeline';
 import { MAX_UPLOAD_BYTES, chunkPlanFor } from '@/lib/upload-chunking';
+import { resolveLinkedEventRef } from '@/lib/server/linked-event-ref';
 
 export const runtime = 'nodejs';
 
@@ -60,7 +61,17 @@ export const POST = withAuth(async ({ user, request }) => {
   const contentType = typeof body.contentType === 'string' ? body.contentType : '';
   const languageCode =
     typeof body.languageCode === 'string' && body.languageCode ? body.languageCode : undefined;
-  const linkedEvent = sanitizeLinkedEvent(body.linkedEvent);
+  // `eventRef` (meeting code / event key) = headless pre-link, resolved from
+  // the caller's own calendar cache; `linkedEvent` = the web stepper's whole
+  // event. The ref wins when both are present.
+  let linkedEvent = sanitizeLinkedEvent(body.linkedEvent);
+  if (typeof body.eventRef === 'string' && body.eventRef.trim()) {
+    const resolved = await resolveLinkedEventRef(user.userId, body.eventRef);
+    if (!resolved.ok) {
+      return NextResponse.json({ error: resolved.error }, { status: resolved.status });
+    }
+    linkedEvent = resolved.event;
+  }
   const reportPref = parseReportPref(typeof body.reportPref === 'string' ? body.reportPref : null);
   const sourceId = typeof body.sourceId === 'string' && body.sourceId ? body.sourceId : null;
   const rawMulti = body.multi as Record<string, unknown> | undefined | null;

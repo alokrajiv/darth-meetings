@@ -13,6 +13,7 @@ import { getTranscript } from '@/lib/server/assemblyai';
 import { saveAudioBytes, saveAudioStreamToTemp } from '@/lib/server/audio-storage';
 import { onTranscriptCompleted } from '@/lib/server/post-completion';
 import { parseMeetingFilters } from '@/lib/server/meeting-filters';
+import { resolveLinkedEventRef } from '@/lib/server/linked-event-ref';
 import { parseLabelFilter } from '@/lib/labels';
 import {
   abandonUpload,
@@ -242,7 +243,19 @@ export const GET = withAuth(async ({ user, request }) => {
  */
 export const POST = withAuth(async ({ user, request }) => {
   const contentType = request.headers.get('content-type') ?? '';
-  const linkedEvent = parseLinkedEventHeader(request.headers.get('x-linked-event'));
+  // Two ways to pre-link the recording to a calendar event: the web stepper
+  // sends the whole event (x-linked-event); headless callers (darth-cli
+  // `upload --event <ref>`) send a meeting code / event key in ?event= and
+  // the server resolves it from the caller's own calendar cache.
+  let linkedEvent = parseLinkedEventHeader(request.headers.get('x-linked-event'));
+  const eventRef = request.nextUrl.searchParams.get('event');
+  if (eventRef) {
+    const resolved = await resolveLinkedEventRef(user.userId, eventRef);
+    if (!resolved.ok) {
+      return NextResponse.json({ error: resolved.error }, { status: resolved.status });
+    }
+    linkedEvent = resolved.event;
+  }
   const reportPref = parseReportPref(request.nextUrl.searchParams.get('report_pref'));
 
   if (contentType.includes('multipart/form-data')) {

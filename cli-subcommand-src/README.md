@@ -21,6 +21,11 @@ back) and the calling agent brings the intelligence with its own tokens.
 | `calendar [--view unimported\|norec] [FILTERS]` | `GET /api/calendar-meetings?view=…&<filters>` paged the same way |
 | `calendar --view all [--from D] [--to D] [--details] [--cached] [FILTERS]` | `GET /api/calendar/events?from=&to=&tz=&<filters>[&sync=0]` — the caller's FULL calendar (past + upcoming, imported or not, no-link events too), ascending, one response (server cap 5000 rows, max 366-day window); the server re-reads the window live from Google under the caller's own link unless `sync=0`, writing back to their calendar cache. Rows carry `imported:{id,status,accessible,mine,title,ownerEmail,url,notes,report}` (notes/report = ready\|running\|error\|none), `evidence:{recording,transcript,preparing,geminiNotes}`, `meetingUuid`/`meetingUrl` (stable /m link, minted server-side), `series:{id,title}`, `description`/`location`/`calendarUrl` (migration 039) |
 | `text / get / notes / report / audio / frame / attachments / set-*` | unchanged |
+| `upload <file> [--event <ref>] [--title] [--language] [--report] [--wait] [--timeout]` | media → `POST /api/transcripts?event=&language_code=&report_pref=` with the raw file body (`Bun.file`, streamed) + `x-filename` / `content-type`; text docs (`.vtt .srt .txt .md .docx .pdf …`) → `POST /api/transcripts/import-text?event=` same headers. `?event=` is a meeting code (latest PAST occurrence) or an exact event key (`key` of a calendar row) resolved server-side from the caller's own calendar cache (`lib/server/linked-event-ref.ts`). `--title` → `PATCH /api/transcripts/:id {title}`. `--wait` polls `GET /api/transcripts/:id` (re-resolving via `/api/meetings/resolve?any=` on 404) until `status=completed`, then up to 4 more min until `speaker_id_status` is completed/error, then prints `speakers` |
+| `link <id> <ref>` | `POST /api/transcripts/:id/link-event {meetingCode}` or `{eventKey}` — server resolves the event, merges it into `gmeet_context`, sets `recorded_at`, fills an empty title, registers people, mints the backend Google token for the Meet-actuals enrichment, and re-runs the speaker-ID pass with the attendees unless names are confirmed / a pass is running (`reguessing` in the reply) |
+| `set-date <id> <when>` | `PATCH /api/transcripts/:id {recordedAt}` — ISO / `YYYY-MM-DD HH:mm` (machine-local) / `YYYY-MM-DD` (local noon) |
+| `speakers <id>` | `GET /api/transcripts/:id` + `GET /api/transcripts/:id/speakers` → one line per diarized speaker: confirmed name or guess (name, confidence, source, id-pass) + the pass status |
+| `set-speakers <id> A=Name …  [--clear]` | `GET` then `PUT /api/transcripts/:id/speakers {speakerLabels}` — merges into the existing labels (`--clear` drops them first); the server enrols voiceprints from confirmed names |
 | `notify` / `notify <kind> on\|off` | `GET` / `PUT /api/notify-prefs` — settings writes (this and `auto-sync off\|mine\|all`) require `--i-have-got-consent-from-human-user` |
 | `labels` | `GET /api/labels?counts=1` — human = indented tree (`name (count_visible · n direct) #id color`), `--json` = the flat `labels` array verbatim |
 | `label <id> <label>` | resolve `<label>` against `GET /api/labels`; if the path is new → `POST /api/labels {path}` (prints `created …` per segment); then `POST /api/transcripts/:id/labels {labelId}` |
@@ -38,6 +43,10 @@ back) and the calling agent brings the intelligence with its own tokens.
   bare AAI uuid) — the same id as the web URL `/transcript/<id>`.
 - `calendar` rows carry no transcript id (they are NOT in the archive); the
   `[meeting-code]` tail (`teams-…` / Meet code) is printed for cross-reference.
+- `calendar --view all` rows carry `key` (`<eventId>|<startIso>`) — the exact
+  reference for `upload --event` / `link` (printed under `--details`, always in
+  `--json`). A meeting code also works but resolves to the latest PAST
+  occurrence, so recurring calls need the key for an older occurrence.
   Importing stays a web-UI action (caller's own Google/Microsoft token).
 - `calendar --view all` rows DO carry the transcript: status `imported` +
   a `→ <id>` tail when the occurrence is in the archive (anyone's live

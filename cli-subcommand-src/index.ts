@@ -9,8 +9,8 @@
  */
 import type { Ctx, Subcommand } from "../../core/types";
 import { parseArgs, str } from "../../core/args";
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
+import { basename, extname, join } from "node:path";
 
 const HELP = `darth-cli meetings — meeting transcripts, notes & recordings (darth-meetings)
 
@@ -62,12 +62,18 @@ READ
                                   series:"…" = the recurring-call series.
                                   --details adds where / attendees (with
                                   declined/tentative) / /m link + transcript
-                                  url / Google Calendar link / invite text
-                                  under each row. --json has it all always
+                                  url / Google Calendar link / invite text /
+                                  key (the exact event key for 'upload
+                                  --event' and 'link') under each row. --json
+                                  has it all always
   audio <id> [--out <file>]       Download the recording (default ./<id>.<ext>)
   frame <id> <ts> [--out <file>]  Grab a video frame at a timestamp (ms, mm:ss or
                                   hh:mm:ss) as jpeg — only transcripts imported
                                   from a video recording have frames
+  speakers <id>                   Diarized speakers of a transcript: confirmed
+                                  name (if a human set one) + the machine's
+                                  guess (name, confidence, voice|context) +
+                                  the speaker-ID pass status
   attachments <id>                List attached context files
   attachment-get <id> <attId> [--out <file>]   Download one attachment
   labels                          Org-wide label tree with visible-to-you counts
@@ -104,6 +110,36 @@ LABELS (org-wide, hierarchical 'Customers/LP Global/QBR', many per transcript;
                                   meetings go with it
 
 WRITE (needs read+write for meetings)
+  upload <file> [--event <meeting-code|event-key>] [--title <t>]
+         [--language <code>] [--report summary|detailed-video|detailed-text|later]
+         [--wait] [--timeout <mins>]
+                                  Upload a recording (audio/video; text docs
+                                  like .vtt/.txt/.docx go through the text
+                                  importer) and transcribe it. --event links
+                                  it to a calendar event up front (title,
+                                  date, attendees, auto-share to invitees);
+                                  without it the row is a scratch transcript
+                                  you can 'link' later — same single
+                                  transcription run either way. --wait polls
+                                  until transcription AND the speaker-ID
+                                  guess finish, then prints 'speakers'
+  link <id> <meeting-code|event-key>
+                                  Attach an existing transcript (typically a
+                                  scratch upload) to a calendar event: sets
+                                  date + empty title + attendees, lights up
+                                  share suggestions, and re-runs the speaker
+                                  guess with the attendee list unless a human
+                                  already confirmed names. Metadata only —
+                                  nothing is re-transcribed
+  set-date <id> <when>            Set the meeting date/time of a transcript
+                                  (ISO 8601, 'YYYY-MM-DD HH:mm' in your tz,
+                                  or 'YYYY-MM-DD' = noon). For recordings
+                                  that match no calendar event
+  set-speakers <id> <Speaker>=<Name> ...
+                                  Confirm speaker names ('A="Jane Doe"'); the
+                                  names apply to 'text' output and enrol the
+                                  person's voiceprint. Others keep their
+                                  current label; '--clear' unsets all first
   import <meeting-code|event-key> [--mode transcript|video|both] [--wait]
                                   [--timeout <mins>]
                                   Import a meeting from your calendar by the
@@ -248,8 +284,8 @@ lines ({ms, speaker, text}) plus the row metadata instead.
 
 'calendar' lists meetings that are NOT in the archive yet (recording exists
 at Google/Microsoft but un-imported, or no recording at all) — use it to
-tell a human "these 3 meetings have recordings nobody imported"; importing
-itself is a web-UI action. 'calendar --view all' is the human's FULL
+tell a human "these 3 meetings have recordings nobody imported", then
+'import <meeting-code>' pulls one in server-side. 'calendar --view all' is the human's FULL
 calendar (past + upcoming, everything) — the answer to "what's on my
 calendar next week", "who am I meeting on Thursday", "which of last
 month's calls were recorded / imported": imported rows end with "→ <id>"
@@ -257,6 +293,66 @@ month's calls were recorded / imported": imported rows end with "→ <id>"
 ready), plus the provider evidence, organiser, attendee count, series.
 --details adds location, attendee emails + RSVP, the stable /m link, the
 Google Calendar link and the invite text; --json has every field always.
+
+## Someone hands you a recording ("here's the audio, do your thing")
+
+People will drop an audio/video file on you without saying which meeting
+it was. The system is built so this costs ONE transcription run: upload
+first, decide what it belongs to afterwards. Linking later is a metadata
+write (date, title, attendees, share suggestions) — nothing is re-run.
+
+    # 1. If you ALREADY know the event, link up front (best case: title,
+    #    date, attendees + auto-share to the invitees all land at once):
+    darth-cli meetings calendar --view all --from 2026-09-15 --to 2026-09-15 --json
+    darth-cli meetings upload ./call.m4a --event abc-defg-hij --wait
+    darth-cli meetings upload ./call.m4a --event 'evt123|2026-09-15T06:00:00.000Z' --wait
+
+    # 2. If you DON'T know: upload as a scratch transcript and wait. --wait
+    #    returns after transcription AND the speaker-ID guess (voiceprints +
+    #    self-introductions), and prints 'speakers <id>' for you:
+    darth-cli meetings upload ./call.m4a --wait
+    darth-cli meetings text <id>            # skim: who, what, any dates said aloud
+
+    # 3. Work out which calendar event it was. Signals you now hold: the
+    #    guessed names, the duration, anything said in the first minutes
+    #    ("thanks for joining the QBR"), and the file's own mtime. The upload
+    #    date is NOT the meeting date — a scratch row is stamped with the
+    #    upload time. If the human didn't say when, ASK ("when was this
+    #    recorded, roughly?") before searching the calendar.
+    darth-cli meetings calendar --view all --from <day-2> --to <day+1> --participant "<guessed name>" --json
+    #    Compare durationSecs with the transcript duration; prefer events
+    #    whose attendees include the guessed names. Show the human the 1-3
+    #    candidates (title, time, attendees) and let them pick — don't link
+    #    on a coin flip. A [meeting-code] resolves to its LATEST past
+    #    occurrence, so for an older occurrence of a recurring call pass the
+    #    row's exact 'key' ('<eventId>|<startIso>') instead.
+
+    # 4a. It matches an event → link it. Date, empty title and attendees come
+    #     from the event; the speaker guess re-runs with the attendee list
+    #     (unless names were already confirmed); invitees become share
+    #     suggestions in the web UI. Works for events WITHOUT a meeting link
+    #     too (in-person / phone calls) — use the key.
+    darth-cli meetings link <id> 'evt123|2026-09-15T06:00:00.000Z'
+    darth-cli meetings speakers <id>        # a minute later: refreshed guesses
+
+    # 4b. No event matches (ad-hoc call, hallway chat) → settle it by hand:
+    darth-cli meetings set-title <id> "Pricing call with Wei (ad hoc)"
+    darth-cli meetings set-date <id> '2026-09-14 15:30'      # local time, or ISO
+    #     Do NOT create a calendar event for it — the archive lists by date,
+    #     a title + the right date is all it needs.
+
+    # 5. Settle the speakers when you're confident (confirmed names flow
+    #    into 'text', notes and the person's voiceprint — so only confirm what
+    #    the human agreed to, and leave the rest as guesses):
+    darth-cli meetings set-speakers <id> A="Wei Lin" B="Alok Rajiv"
+    # 6. Then the normal loop: read 'text <id>', write notes with your model,
+    #    'set-notes <id> --file notes.md'; 'label' it; share via the web UI.
+
+Notes: media goes to AssemblyAI; .vtt/.srt/.txt/.docx/.pdf transcripts go
+through the text importer (same verb, no transcription). Uploads over a few
+hundred MB are fine (streamed) but transcription time scales with length —
+raise --timeout. A 415 means the server thinks the file is a text document
+under a media extension (or vice versa) — rename it.
 
 ## Labels (org-wide taxonomy, many per meeting)
 
@@ -755,6 +851,101 @@ function oneLine(text: string, max: number): string {
  * calendar for a window (server re-reads it live from Google unless
  * --cached), ascending, with import / evidence annotations per row.
  */
+/** Text documents the media route 415s — they go through the text importer. */
+const TEXT_DOC_RE = /\.(txt|md|markdown|rtf|vtt|srt|docx|doc|pdf|json|csv|tsv|html|htm|log)$/i;
+const MIME_BY_EXT: Record<string, string> = {
+  mp3: "audio/mpeg", m4a: "audio/mp4", aac: "audio/aac", wav: "audio/wav", flac: "audio/flac",
+  ogg: "audio/ogg", oga: "audio/ogg", opus: "audio/ogg", weba: "audio/webm", aiff: "audio/aiff", aif: "audio/aiff",
+  wma: "audio/x-ms-wma", amr: "audio/amr", caf: "audio/x-caf",
+  mp4: "video/mp4", m4v: "video/mp4", mov: "video/quicktime", webm: "video/webm", mkv: "video/x-matroska",
+  avi: "video/x-msvideo", vtt: "text/vtt", srt: "text/plain", txt: "text/plain", md: "text/markdown",
+  rtf: "application/rtf", pdf: "application/pdf", docx: "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+};
+function mimeFor(name: string): string { return MIME_BY_EXT[extname(name).slice(1).toLowerCase()] ?? "application/octet-stream"; }
+
+/** '<eventId>|<startIso>' = event key; anything else = meeting code. */
+function eventRefBody(ref: string): { eventKey: string } | { meetingCode: string } {
+  return ref.includes("|") ? { eventKey: ref } : { meetingCode: ref };
+}
+
+/** Parse the 'set-date' argument: ISO 8601 (offset/Z honoured), 'YYYY-MM-DD HH:mm'
+ * (machine-local time), or 'YYYY-MM-DD' (local noon, so the day is right in
+ * every nearby timezone). */
+function parseWhen(raw: string): Date | null {
+  const t = raw.trim();
+  if (/^\d{4}-\d{2}-\d{2}$/.test(t)) { const d = new Date(`${t}T12:00:00`); return Number.isNaN(d.getTime()) ? null : d; }
+  if (/^\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}(:\d{2})?$/.test(t)) { const d = new Date(t.replace(" ", "T")); return Number.isNaN(d.getTime()) ? null : d; }
+  const d = new Date(t);
+  return Number.isNaN(d.getTime()) ? null : d;
+}
+
+/** One line per diarized speaker: confirmed name, else the guess. */
+function printSpeakers(id: string, t: any, sp: { speakerLabels: any[]; suggestions: Record<string, any> }): void {
+  const labels = new Map<string, any>((sp.speakerLabels || []).map((l: any) => [l.originalSpeaker, l]));
+  const names = new Set<string>([...labels.keys(), ...Object.keys(sp.suggestions || {})]);
+  const pass = t?.speaker_id_status ?? "not run";
+  console.log(`speakers of ${id}  (${t?.speaker_count ?? names.size} diarized · speaker-ID pass: ${pass}${pass === "running" ? " — guesses may still change" : ""})`);
+  if (!names.size) { console.log("  (no speaker information yet)"); return; }
+  for (const orig of [...names].sort()) {
+    const l = labels.get(orig); const g = sp.suggestions?.[orig];
+    const confirmed = l?.customName?.trim();
+    const guess = g ? `${g.name} (${Math.round((g.confidence ?? 0) * 100)}%${g.source ? `, ${g.source}` : ""}${g.via === "id" ? ", id-pass" : ""})` : null;
+    let line = `  ${orig.padEnd(10)} `;
+    if (confirmed) line += `= ${confirmed}   [confirmed${guess ? `; guess was ${guess}` : ""}]`;
+    else if (guess) line += `? ${guess}${g.evidence ? `  — ${oneLine(String(g.evidence), 140)}` : ""}`;
+    else line += "? (no guess)";
+    console.log(line);
+  }
+  if (![...labels.values()].some((l: any) => l?.customName?.trim()))
+    console.log("  confirm with: darth-cli meetings set-speakers <id> A=\"Full Name\" B=\"Full Name\"");
+}
+
+async function fetchSpeakers(ctx: Ctx, id: string): Promise<{ t: any; sp: any }> {
+  const [tr, sp] = await Promise.all([
+    ctx.expectJson<{ transcript: any }>(ctx.api("meetings", `/api/transcripts/${id}`)),
+    ctx.expectJson<any>(ctx.api("meetings", `/api/transcripts/${id}/speakers`)),
+  ]);
+  return { t: tr.transcript, sp };
+}
+
+/** Poll a fresh upload until transcription is done, then (briefly) until the
+ * speaker-ID pass settles. Returns the final id or null on failure/timeout. */
+async function waitForUpload(ctx: Ctx, startId: string, capMin: number, say: (l: string) => void): Promise<{ id: string; t: any } | null> {
+  const deadline = Date.now() + capMin * 60_000;
+  let id = startId; let t: any = null;
+  say(`Waiting for transcription (up to ${capMin} min, poll 10s)…`);
+  while (Date.now() < deadline) {
+    await new Promise((r) => setTimeout(r, 10_000));
+    const gr = await ctx.api("meetings", `/api/transcripts/${id}`);
+    if (!gr.ok) {
+      // Placeholder ids can be renamed on promotion — re-resolve, then retry.
+      const rr = await ctx.api("meetings", `/api/meetings/resolve?any=${encodeURIComponent(id)}`);
+      const j: any = rr.ok ? await rr.json().catch(() => null) : null;
+      if (j?.transcriptId && j.transcriptId !== id) { id = j.transcriptId; say(`… promoted to ${id}`); continue; }
+      if (gr.status === 404) { console.error(`Transcript ${id} vanished (upload reaped?) — check the web app.`); return null; }
+      continue;
+    }
+    const gj: any = await gr.json().catch(() => null);
+    t = gj?.transcript; const st = t?.status;
+    if (st === "error") { console.error(`Transcription failed: ${t?.error ?? "see the web app"}`); return null; }
+    if (st !== "completed") continue;
+    // Completed. The speaker-ID pass starts right after completion and takes
+    // ~1-2 min; give it a bounded window so the caller gets names, not labels.
+    say(`Transcribed: ${id}  "${t.title ?? t.original_filename ?? ""}"  (${fmtDuration(t.duration)}, ${t.speaker_count ?? "?"} speakers)`);
+    const idDeadline = Math.min(deadline, Date.now() + 4 * 60_000);
+    while (Date.now() < idDeadline) {
+      const s = t?.speaker_id_status;
+      if (s === "completed" || s === "error") break;
+      await new Promise((r) => setTimeout(r, 10_000));
+      const g2: any = await ctx.expectJson<{ transcript: any }>(ctx.api("meetings", `/api/transcripts/${id}`));
+      t = g2.transcript;
+    }
+    return { id, t };
+  }
+  console.error(`Still transcribing after ${capMin} min — it keeps running server-side; check later with 'get ${id}'.`);
+  return null;
+}
+
 async function calendarAll(ctx: Ctx, flags: Record<string, string | boolean>): Promise<number> {
   const fr = readFilterFlags(ctx, flags, ["participant", "organizer", "provider", "q", "from", "to"]);
   if (!fr.ok) { console.error(fr.error); return 1; }
@@ -816,6 +1007,7 @@ async function calendarAll(ctx: Ctx, flags: Record<string, string | boolean>): P
         if (e.meetingUrl) console.log(`${ind}link:  ${e.meetingUrl}${imp?.url ? `  (transcript ${imp.url})` : ""}`);
         else if (imp?.url) console.log(`${ind}link:  ${imp.url}`);
         if (e.calendarUrl) console.log(`${ind}gcal:  ${e.calendarUrl}`);
+        console.log(`${ind}key:   ${e.key}`);
         if (e.description) console.log(`${ind}about: ${oneLine(e.description, 400)}`);
       }
     }
@@ -843,7 +1035,7 @@ const meetings: Subcommand = {
   help: HELP,
   async run(ctx, argv) {
     const { pos, flags } = parseArgs(argv);
-    liftBoolFlags(pos, flags, ["cascade", "exact", "cached", "details", CONSENT_FLAG]);
+    liftBoolFlags(pos, flags, ["cascade", "exact", "cached", "details", "wait", "clear", CONSENT_FLAG]);
     const [, cmd, ...args] = pos.length && pos[0] === "meetings" ? pos : ["", ...pos];
     if (!cmd || flags.help === true) { console.log(HELP); return 0; }
 
@@ -1482,6 +1674,136 @@ const meetings: Subcommand = {
       case "attachment-get": {
         if (!args[0] || !args[1]) { console.error("usage: darth-cli meetings attachment-get <id> <attachmentId> [--out <file>]"); return 1; }
         return download(ctx, `/api/transcripts/${args[0]}/attachments/${args[1]}/download`, str(flags.out), `attachment-${args[1]}`);
+      }
+
+      case "upload": {
+        const file = args[0];
+        if (!file) { console.error("usage: darth-cli meetings upload <file> [--event <meeting-code|event-key>] [--title <t>] [--language <code>] [--report summary|detailed-video|detailed-text|later] [--wait] [--timeout <mins>]"); return 1; }
+        if (!existsSync(file) || !statSync(file).isFile()) { console.error(`No such file: ${file}`); return 1; }
+        ctx.requireWrite();
+        const report = str(flags.report);
+        if (report && !["summary", "detailed-video", "detailed-text", "later"].includes(report)) { console.error("--report must be summary, detailed-video, detailed-text or later"); return 1; }
+        const capMin = Number(str(flags.timeout) ?? "60");
+        if (!Number.isFinite(capMin) || capMin <= 0) { console.error(`--timeout must be a number of minutes (got '${str(flags.timeout)}')`); return 1; }
+        const name = basename(file); const size = statSync(file).size;
+        if (size === 0) { console.error("File is empty"); return 1; }
+        const isText = TEXT_DOC_RE.test(name);
+        const q = new URLSearchParams();
+        const ev = str(flags.event);
+        if (ev) q.set("event", ev);
+        const lang = str(flags.language);
+        if (lang) q.set("language_code", lang);
+        if (report) q.set("report_pref", report);
+        const say = (line: string) => { if (!ctx.json) console.log(line); };
+        // Bun streams a Bun.file body (multi-GB safe); node fallback reads it whole.
+        const B: any = (globalThis as any).Bun;
+        const body: any = B?.file ? B.file(file) : new Blob([readFileSync(file)]);
+        say(`Uploading ${name} (${(size / 1048576).toFixed(1)} MB)${ev ? ` → event ${ev}` : " as a scratch transcript"}…`);
+        const path = isText ? `/api/transcripts/import-text?${q}` : `/api/transcripts?${q}`;
+        const res = await ctx.api("meetings", path, {
+          method: "POST", body,
+          headers: { "content-type": mimeFor(name), "x-filename": encodeURIComponent(name), "content-length": String(size) },
+        });
+        const data: any = await res.json().catch(() => null);
+        if (!res.ok) {
+          console.error(`Upload failed (HTTP ${res.status}): ${data?.error ?? "unknown error"}${data?.detail ? ` — ${data.detail}` : ""}`);
+          if (res.status === 404 && ev) console.error("Tip: 'darth-cli meetings calendar --view all --json' lists your events with their [meeting-code] and exact 'key'.");
+          return 1;
+        }
+        // Text importer, unknown format → 202 {queued, id, assemblyaiId}: an
+        // LLM normalizes it behind a placeholder row (minutes). Read the
+        // placeholder so the printout has a status like the 201 path.
+        let t: any = data.transcript;
+        let id: string = t?.assemblyai_id ?? data.assemblyaiId;
+        if (!t && id) {
+          const g: any = await ctx.expectJson<{ transcript: any }>(ctx.api("meetings", `/api/transcripts/${id}`));
+          t = g.transcript;
+        }
+        if (!id) { console.error(`Unexpected reply: ${JSON.stringify(data).slice(0, 300)}`); return 1; }
+        const title = str(flags.title);
+        if (title && id) {
+          await ctx.expectJson<any>(ctx.api("meetings", `/api/transcripts/${id}`, { method: "PATCH", body: JSON.stringify({ title }) }));
+          t = { ...t, title };
+        }
+        const linked = t?.gmeet_context?.eventTitle || t?.gmeet_context?.eventId;
+        say(`${data.queued ? "Queued (text normalizing via LLM)" : isText ? "Imported" : "Uploaded"}: ${id}  "${t?.title ?? t?.original_filename ?? ""}"  status: ${t?.status}${linked ? `  linked to "${t.gmeet_context.eventTitle ?? t.gmeet_context.eventId}"` : "  (not linked to any calendar event)"}`);
+        say(`Web: ${webBase(ctx)}/transcript/${id}`);
+        if (flags.wait === true && t?.status !== "completed") {
+          const done = await waitForUpload(ctx, id, capMin, say);
+          if (!done) return 1;
+          id = done.id; t = done.t;
+          if (!ctx.json) {
+            const sp = await ctx.expectJson<any>(ctx.api("meetings", `/api/transcripts/${id}/speakers`));
+            printSpeakers(id, t, sp);
+            if (!linked) console.log(`Not linked to a calendar event yet — see 'darth-cli meetings skill' (§ "Someone hands you a recording") for the link / set-date flow.`);
+          }
+        }
+        ctx.print({ transcript: t, linked: !!linked, url: `${webBase(ctx)}/transcript/${id}` }, () => {});
+        return 0;
+      }
+
+      case "link": {
+        const [id, ref] = args;
+        if (!id || !ref) { console.error("usage: darth-cli meetings link <id> <meeting-code|event-key>   (key = the 'key' field of 'calendar --view all --json' / --details)"); return 1; }
+        ctx.requireWrite();
+        const res = await ctx.api("meetings", `/api/transcripts/${id}/link-event`, { method: "POST", body: JSON.stringify(eventRefBody(ref)) });
+        const data: any = await res.json().catch(() => null);
+        if (!res.ok) {
+          console.error(`Link failed (HTTP ${res.status}): ${data?.error ?? "unknown error"}`);
+          if (res.status === 404) console.error("Tip: 'darth-cli meetings calendar --view all --json' lists your events with their [meeting-code] and exact 'key'; a meeting code resolves to its latest PAST occurrence — use the key for an older one.");
+          return 1;
+        }
+        const e = data.event ?? {};
+        ctx.print(data, () => {
+          const when = e.startTime ? fmtLocalDateTime(e.startTime, localTz(ctx)) : "?";
+          console.log(`Linked ${data.transcript?.assemblyai_id ?? id} → "${e.title ?? "(untitled)"}"  ${when}  (${e.provider ?? "no meeting link"}, ${e.attendees ?? 0} attendees${e.enriched ? ", Meet participants captured" : ""})`);
+          console.log(`Date set to the event start; title ${data.transcript?.title ? `"${data.transcript.title}"` : "(empty)"}; invitees now appear as share suggestions in the web UI.`);
+          if (data.reguessing) console.log(`Re-guessing speaker names with the attendee list — 'darth-cli meetings speakers ${id}' in a minute or two.`);
+        });
+        return 0;
+      }
+
+      case "set-date": {
+        const [id, ...rest] = args;
+        const raw = rest.join(" ").trim();
+        if (!id || !raw) { console.error("usage: darth-cli meetings set-date <id> <ISO-8601 | 'YYYY-MM-DD HH:mm' | YYYY-MM-DD>"); return 1; }
+        const when = parseWhen(raw);
+        if (!when) { console.error(`Cannot parse '${raw}' — use ISO 8601 (2026-09-15T14:00:00+08:00), 'YYYY-MM-DD HH:mm' (local) or YYYY-MM-DD`); return 1; }
+        ctx.requireWrite();
+        const data = await ctx.expectJson<any>(ctx.api("meetings", `/api/transcripts/${id}`, { method: "PATCH", body: JSON.stringify({ recordedAt: when.toISOString() }) }));
+        ctx.print(data, () => console.log(`Date set: ${fmtLocalDateTime(when.toISOString(), localTz(ctx))} (${when.toISOString()})`));
+        return 0;
+      }
+
+      case "speakers": {
+        const id = args[0];
+        if (!id) { console.error("usage: darth-cli meetings speakers <id>"); return 1; }
+        const { t, sp } = await fetchSpeakers(ctx, id);
+        ctx.print({ speaker_id_status: t?.speaker_id_status ?? null, speaker_count: t?.speaker_count ?? null, ...sp }, () => printSpeakers(id, t, sp));
+        return 0;
+      }
+
+      case "set-speakers": {
+        const [id, ...pairs] = args;
+        if (!id || (!pairs.length && flags.clear !== true)) { console.error("usage: darth-cli meetings set-speakers <id> <Speaker>=<Name> [...]  [--clear]   e.g. A=\"Jane Doe\" B=\"Wei Lin\""); return 1; }
+        ctx.requireWrite();
+        const parsed: Array<{ originalSpeaker: string; customName: string }> = [];
+        for (const p of pairs) {
+          const eq = p.indexOf("=");
+          if (eq <= 0) { console.error(`bad assignment '${p}' — expected <Speaker>=<Name>`); return 1; }
+          parsed.push({ originalSpeaker: p.slice(0, eq).trim(), customName: p.slice(eq + 1).trim() });
+        }
+        const cur = await ctx.expectJson<any>(ctx.api("meetings", `/api/transcripts/${id}/speakers`));
+        const byOrig = new Map<string, any>();
+        if (flags.clear !== true) for (const l of cur.speakerLabels || []) byOrig.set(l.originalSpeaker, { ...l });
+        for (const a of parsed) byOrig.set(a.originalSpeaker, { originalSpeaker: a.originalSpeaker, customName: a.customName, description: byOrig.get(a.originalSpeaker)?.description ?? "" });
+        const speakerLabels = [...byOrig.values()].filter((l) => l.customName || l.description);
+        const data = await ctx.expectJson<any>(ctx.api("meetings", `/api/transcripts/${id}/speakers`, { method: "PUT", body: JSON.stringify({ speakerLabels }) }));
+        ctx.print(data, () => {
+          for (const l of data.speakerLabels || []) if (l.customName) console.log(`  ${String(l.originalSpeaker).padEnd(10)} = ${l.customName}`);
+          console.log(`${(data.speakerLabels || []).filter((l: any) => l.customName).length} speaker(s) confirmed — 'text ${id}' now uses these names; voiceprints enrol in the background.`);
+        });
+        return 0;
       }
 
       case "set-title": {

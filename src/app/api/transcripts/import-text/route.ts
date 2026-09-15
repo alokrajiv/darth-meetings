@@ -24,6 +24,7 @@ import {
   type LinkedEventIngestFields,
 } from '@/lib/server/linked-event';
 import { tryParseTranscriptText } from '@/lib/server/transcript-text-parse';
+import { resolveLinkedEventRef } from '@/lib/server/linked-event-ref';
 import { updateMetaForUser, updateStatusForUser, type TranscriptRow } from '@/db-ops/transcripts';
 import { publishEvent } from '@/lib/server/event-bus';
 import type { MeetUtterance } from '@/lib/format';
@@ -352,7 +353,17 @@ export const POST = withAuth(async ({ user, request }) => {
     }
   }
 
-  const linkedEvent = sanitizeLinkedEvent(linkedEventRaw);
+  let linkedEvent = sanitizeLinkedEvent(linkedEventRaw);
+  // Headless pre-link by reference (darth-cli `upload --event <ref>` on a
+  // text document) — same resolver as the media routes.
+  const eventRef = request.nextUrl.searchParams.get('event');
+  if (eventRef) {
+    const resolved = await resolveLinkedEventRef(user.userId, eventRef);
+    if (!resolved.ok) {
+      return NextResponse.json({ error: resolved.error }, { status: resolved.status });
+    }
+    linkedEvent = resolved.event;
+  }
   const link = linkedEvent ? linkedEventIngestFields(linkedEvent) : null;
 
   sourceText = sourceText.trim();

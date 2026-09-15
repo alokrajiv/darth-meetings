@@ -9,6 +9,10 @@ import {
 } from '@/db-ops/transcripts';
 import { logActivity } from '@/db-ops/transcript-activity';
 import { registerPeopleFromMeeting } from '@/lib/server/import-helpers';
+import { resolveLinkedEventRef } from '@/lib/server/linked-event-ref';
+import { getServerAccessToken } from '@/lib/server/google-oauth';
+import { identifySpeakers } from '@/lib/server/auto-notes';
+import { getForUser as getSpeakerMappings } from '@/db-ops/speaker-mappings';
 import {
   captureMeetActuals,
   findConferenceRecordName,
@@ -29,11 +33,18 @@ export const runtime = 'nodejs';
  * POST /api/transcripts/:id/link-event
  *
  * Retro-link a transcript (typically an uploaded recording) to the calendar
- * event it came from. The client browses the user's calendar with their own
- * Google token and sends the picked event; we merge it into gmeet_context —
- * which immediately lights up share suggestions for the invitees — set the
- * meeting date, fill an empty title, and register the attendees in the
- * people directory. Owner and editors.
+ * event it came from. Two callers:
+ *   - the web link dialog browses the user's calendar with their own Google
+ *     token and sends the picked `event` (+ `accessToken` for enrichment);
+ *   - headless callers (darth-cli `link <id> <ref>`) send `meetingCode` or
+ *     `eventKey` and the server resolves the event from the caller's own
+ *     calendar cache, minting its backend Google token for enrichment.
+ * Either way we merge the event into gmeet_context — which immediately
+ * lights up share suggestions for the invitees — set the meeting date, fill
+ * an empty title, register the attendees in the people directory and, when
+ * the row is completed and nobody has confirmed speaker names yet, re-run
+ * the speaker-ID pass with the attendee list as hints (a scratch upload's
+ * first pass ran blind). Owner and editors.
  */
 export const POST = withAuth(async ({ user, request }, { params }) => {
   const { id } = await params;
@@ -46,6 +57,10 @@ export const POST = withAuth(async ({ user, request }, { params }) => {
   let body: {
     /** Caller's Google token — enables the Meet API enrichment pass. */
     accessToken?: string;
+    /** Headless form: resolve the event server-side from the caller's
+     * calendar cache. Either one; `event` wins when also present. */
+    meetingCode?: string;
+    eventKey?: string;
     event?: {
       id?: string;
       title?: string;
@@ -54,6 +69,9 @@ export const POST = withAuth(async ({ user, request }, { params }) => {
       meetingCode?: string;
       /** Teams meetup-join link found on the event (raw is fine). */
       teamsUrl?: string;
+      recurringEventId?: string;
+      iCalUID?: string;
+      organizerEmail?: string;
       attendees?: GmeetAttendee[];
     };
   };
@@ -62,9 +80,42 @@ export const POST = withAuth(async ({ user, request }, { params }) => {
   } catch {
     return NextResponse.json({ error: 'Invalid JSON body' }, { status: 400 });
   }
-  const event = body.event;
-  if (!event || typeof event !== 'object') {
-    return NextResponse.json({ error: 'event is required' }, { status: 400 });
+  let event: NonNullable<typeof body.event>;
+  if (body.event && typeof body.event === 'object') {
+    event = body.event;
+  } else {
+    const ref =
+      typeof body.eventKey === 'string' && body.eventKey.trim()
+        ? body.eventKey
+        : typeof body.meetingCode === 'string' && body.meetingCode.trim()
+          ? body.meetingCode
+          : null;
+    if (!ref) {
+      return NextResponse.json(
+        { error: 'event (object) or meetingCode / eventKey (reference) is required' },
+        { status: 400 }
+      );
+    }
+    const resolved = await resolveLinkedEventRef(user.userId, ref);
+    if (!resolved.ok) {
+      return NextResponse.json({ error: resolved.error }, { status: resolved.status });
+    }
+    event = {
+      id: resolved.event.id,
+      title: resolved.event.title,
+      startTime: resolved.event.startTime,
+      endTime: resolved.event.endTime,
+      meetingCode: resolved.event.meetingCode,
+      teamsUrl: resolved.event.teamsUrl,
+      recurringEventId: resolved.event.recurringEventId,
+      iCalUID: resolved.event.iCalUID,
+      organizerEmail: resolved.event.organizerEmail,
+      attendees: resolved.event.attendees.map((a) => ({
+        email: a.email,
+        name: a.name,
+        responseStatus: a.responseStatus,
+      })),
+    };
   }
 
   const attendees: GmeetAttendee[] = Array.isArray(event.attendees)
@@ -80,14 +131,26 @@ export const POST = withAuth(async ({ user, request }, { params }) => {
   // deliberately skipped here (an uploaded recording's t=0 is arbitrary, so
   // overlap voting against Meet's clock could misattribute speakers).
   let actuals: MeetActuals | null = null;
-  if (typeof body.accessToken === 'string' && body.accessToken.length > 20 && event.meetingCode) {
+  const isTeams = !!event.meetingCode?.startsWith('teams-') || typeof event.teamsUrl === 'string';
+  let accessToken: string | null =
+    typeof body.accessToken === 'string' && body.accessToken.length > 20 ? body.accessToken : null;
+  if (!accessToken && event.meetingCode && !isTeams) {
+    // Headless caller: the backend Google link stands in for the browser
+    // token (best-effort — no link, no enrichment, still a valid link).
+    try {
+      accessToken = (await getServerAccessToken(user.userId))?.token ?? null;
+    } catch (err) {
+      console.warn('[link-event] server token mint failed (continuing):', err);
+    }
+  }
+  if (accessToken && event.meetingCode && !isTeams) {
     try {
       const recordName = await findConferenceRecordName(
-        body.accessToken,
+        accessToken,
         event.meetingCode,
         event.startTime
       );
-      if (recordName) actuals = await captureMeetActuals(body.accessToken, recordName);
+      if (recordName) actuals = await captureMeetActuals(accessToken, recordName);
     } catch (err) {
       console.warn('[link-event] actuals capture failed (continuing):', err);
     }
@@ -100,6 +163,9 @@ export const POST = withAuth(async ({ user, request }, { params }) => {
     endTime: event.endTime,
     meetingCode: event.meetingCode,
     attendees,
+    ...(event.recurringEventId ? { recurringEventId: event.recurringEventId } : {}),
+    ...(event.iCalUID ? { iCalUID: event.iCalUID } : {}),
+    ...(event.organizerEmail ? { organizerEmail: event.organizerEmail } : {}),
   };
 
   // Linked event is a Teams meeting → stamp provider + join facts so the
@@ -183,10 +249,44 @@ export const POST = withAuth(async ({ user, request }, { params }) => {
     details: { linkedEvent: event.title ?? event.id ?? true },
   });
 
+  // Speaker re-guess: a scratch upload's ID pass ran with no attendee hints.
+  // Now that the audience is known, run it again — but only while nobody
+  // has confirmed names (a human's review must never be overwritten) and
+  // no pass is in flight. Fire-and-forget; results land in the usual
+  // suggestions map (GET /speakers).
+  let reguessing = false;
+  if (
+    attendees.length > 0 &&
+    access.row.status === 'completed' &&
+    access.row.local_audio_path &&
+    access.row.speaker_id_status !== 'running'
+  ) {
+    const mappings = await getSpeakerMappings(access.ownerUserId, id);
+    const confirmed = (mappings?.speaker_labels ?? []).some((l) => l.customName?.trim());
+    if (!confirmed) {
+      reguessing = true;
+      void identifySpeakers(access.ownerUserId, id, {
+        force: true,
+        triggeredBy: { userId: user.userId, email: user.email },
+      });
+    }
+  }
+
   const updated = await getForUser(access.ownerUserId, id);
   return NextResponse.json({
     transcript: updated
       ? { ...updated, access: access.access, owner_email: null, owner_name: null }
       : null,
+    event: {
+      id: event.id ?? null,
+      title: event.title ?? null,
+      startTime: event.startTime ?? null,
+      endTime: event.endTime ?? null,
+      meetingCode: event.meetingCode ?? null,
+      provider: isTeams ? 'teams' : event.meetingCode ? 'gmeet' : null,
+      attendees: attendees.length,
+      enriched: !!actuals,
+    },
+    reguessing,
   });
 });
