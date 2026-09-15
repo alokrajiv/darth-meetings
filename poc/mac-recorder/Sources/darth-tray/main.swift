@@ -3,31 +3,54 @@ import CoreGraphics
 import ServiceManagement
 import RecorderCore
 
-let VERSION = "0.1.5"
+let VERSION = "0.2.0"
 let WS_PORT: UInt16 = 47800
 let PWA_URL = URL(string: "https://meetings.darth-internal.trames.io/")!
+/// Seconds between "the call ended" and an automatic stop.
+let STOP_GRACE: TimeInterval = 60
 
-/// Menu-bar app: detects calls (CallDetector), shows the banner (BannerController),
-/// serves the Meetings PWA over ws://127.0.0.1:47800 (LocalServer) and records the display
-/// the call's window is on (RecorderCore.CaptureSession).
+/// Menu-bar app "Darth Recorder".
+///
+/// Detects calls (CallDetector: who has the microphone open), knows who is screen-sharing
+/// (ShareDetector: the unified log), records the CALL WINDOW with system audio and the
+/// microphone as separate tracks (RecordingController), tells the user where they are looking
+/// (BannerController), talks to the Meetings PWA over ws://127.0.0.1:47800 (LocalServer),
+/// registers every recording with the server and uploads it (Auth + ApiClient + Uploader),
+/// logs everything to events.jsonl, and updates itself (Updater).
 final class AppDelegate: NSObject, NSApplicationDelegate {
     let statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
     let detector = CallDetector()
+    let shares = ShareDetector()
     let server = LocalServer(port: WS_PORT)
     let banner = BannerController()
     let updater = Updater(currentVersion: VERSION)
+    let auth = Auth(appVersion: VERSION)
+    let api = ApiClient(appVersion: VERSION)
+    lazy var uploader = Uploader(api: api)
+    let recorder = RecordingController()
 
-    var session: CaptureSession?
-    var recordingCall: DetectedCall?
-    var starting = false
     var clients = 0
+    var graceTimer: Timer?
+    var graceDeadline: Date?
+    var lastSaved: [String: Any]?
+
+    /// "Upload recordings automatically" — on by default.
+    var autoUpload: Bool {
+        get { UserDefaults.standard.object(forKey: "autoUpload") as? Bool ?? true }
+        set { UserDefaults.standard.set(newValue, forKey: "autoUpload"); refreshMenu(); broadcast("status") }
+    }
 
     // menu items we update
     let statusLine = NSMenuItem(title: "", action: nil, keyEquivalent: "")
     let permLine = NSMenuItem(title: "", action: #selector(openScreenRecordingSettings), keyEquivalent: "")
+    let shareLine = NSMenuItem(title: "", action: nil, keyEquivalent: "")
     let clientsLine = NSMenuItem(title: "", action: nil, keyEquivalent: "")
-    let startItem = NSMenuItem(title: "Start recording (main display)", action: #selector(startFromMenu), keyEquivalent: "r")
+    let startItem = NSMenuItem(title: "Start recording", action: #selector(startFromMenu), keyEquivalent: "r")
+    let displayItem = NSMenuItem(title: "Record this display", action: #selector(recordDisplay), keyEquivalent: "")
     let stopItem = NSMenuItem(title: "Stop recording", action: #selector(stopFromMenu), keyEquivalent: "s")
+    let authItem = NSMenuItem(title: "Sign in to Darth Meetings…", action: #selector(toggleAuth), keyEquivalent: "")
+    let uploadItem = NSMenuItem(title: "Upload recordings automatically", action: #selector(toggleAutoUpload), keyEquivalent: "")
+    let pendingLine = NSMenuItem(title: "", action: nil, keyEquivalent: "")
     let loginItem = NSMenuItem(title: "Open at login", action: #selector(toggleLogin), keyEquivalent: "")
     let versionLine = NSMenuItem(title: "Darth Recorder \(VERSION)", action: nil, keyEquivalent: "")
     let updateItem = NSMenuItem(title: "Check for Updates…", action: #selector(checkForUpdates), keyEquivalent: "")
@@ -37,6 +60,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         rlog("darth-tray \(VERSION) starting, pid \(getpid()), bundle \(Bundle.main.bundleIdentifier ?? "none") at \(Bundle.main.bundlePath)")
         if offerMoveToApplications() { return }   // relaunching from /Applications
         buildMenu()
+        EventLog.shared.log("app_launched", [
+            "version": VERSION, "pid": getpid(), "bundle_path": Bundle.main.bundlePath,
+            "device_id": auth.deviceId, "signed_in": auth.signedIn, "os": ProcessInfo.processInfo.operatingSystemVersionString,
+        ])
 
         if !CGPreflightScreenCaptureAccess() {
             rlog("screen recording not granted → requesting")
@@ -45,7 +72,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         detector.onStart = { [weak self] call in self?.callStarted(call) }
         detector.onEnd = { [weak self] call in self?.callEnded(call) }
+        // A share by the call's own app keeps the call alive even though the mic closed.
+        detector.holdOpen = { [weak self] call in
+            guard let self, !call.bundleId.isEmpty, let s = self.shares.shareBy(bundlePrefix: call.bundleId) else { return false }
+            rlog("call end held open: \(call.appName) is still sharing \(s.kind) (\(s.target))")
+            return true
+        }
         detector.start()
+
+        shares.onStart = { [weak self] s in self?.shareStarted(s) }
+        shares.onEnd = { [weak self] s in self?.shareEnded(s) }
 
         server.statusProvider = { [weak self] in self?.statusPayload() ?? [:] }
         server.onCommand = { [weak self] cmd, obj in self?.handleCommand(cmd, obj) }
@@ -53,9 +89,47 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         do { try server.start() } catch { rlog("local server failed: \(error)") }
 
         banner.onRecord = { [weak self] call in self?.startRecording(for: call) }
-        banner.onStop = { [weak self] in self?.stopRecording() }
+        banner.onStop = { [weak self] in self?.stopRecording(reason: "user") }
+        banner.onKeepRecording = { [weak self] in self?.keepRecording() }
 
-        updater.isBusy = { [weak self] in guard let self else { return false }; return self.session != nil || self.starting || !self.detector.active.isEmpty }
+        recorder.api = api
+        recorder.deviceId = auth.deviceId
+        recorder.willStopOwnStreams = { [weak self] n in for _ in 0..<n { self?.shares.expectOwnTeardown() } }
+        recorder.onStarted = { [weak self] in self?.recordingStarted() }
+        recorder.onSegment = { [weak self] index, reason in self?.broadcast("segment_started", ["segment": index, "reason": reason]) }
+        recorder.onStopped = { [weak self] saved in self?.recordingStopped(saved) }
+        recorder.onError = { [weak self] msg in
+            self?.banner.showMessage(title: "Recording problem", sub: msg, stoppable: self?.recorder.isRecording ?? false)
+        }
+
+        auth.onChange = { [weak self] in
+            self?.refreshMenu()
+            self?.broadcast("auth_changed")
+            if self?.auth.signedIn == true { self?.api.heartbeat(); self?.api.shipEvents(); self?.uploadPending() }
+        }
+        auth.onPrompt = { [weak self] title, sub, _ in self?.banner.showMessage(title: title, sub: sub, accent: .info) }
+
+        api.token = { [weak self] in self?.auth.token }
+        api.deviceId = auth.deviceId
+        api.statusProvider = { [weak self] in self?.statusPayload() ?? [:] }
+        api.start()
+
+        uploader.onProgress = { [weak self] id, seg, pct in
+            self?.broadcast("upload_progress", ["recording_id": id, "segment": seg, "pct": pct])
+        }
+        uploader.onDone = { [weak self] id, tid in
+            self?.broadcast("upload_done", ["recording_id": id, "transcript_id": tid])
+            self?.refreshMenu()
+        }
+        uploader.onFailed = { [weak self] id, err in
+            self?.broadcast("upload_failed", ["recording_id": id, "error": err])
+            self?.refreshMenu()
+        }
+
+        updater.isBusy = { [weak self] in
+            guard let self else { return false }
+            return self.recorder.isRecording || !self.detector.active.isEmpty
+        }
         updater.onChange = { [weak self] in self?.refreshMenu() }
         updater.onEvent = { [weak self] ev in self?.updaterEvent(ev) }
         updater.start()
@@ -69,11 +143,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         UserDefaults.standard.set(VERSION, forKey: verKey)
         if !UserDefaults.standard.bool(forKey: seenKey) {
             UserDefaults.standard.set(true, forKey: seenKey)
-            banner.showMessage(title: "Darth Recorder is running", sub: "It lives in your menu bar (the waveform icon). Turn on “Open at login” from its menu.")
+            banner.showMessage(title: "Darth Recorder is running", sub: "It lives in your menu bar (the waveform icon). Sign in from its menu to upload recordings.", accent: .info)
         } else if let lastRun, lastRun != VERSION {
             rlog("first run after update \(lastRun) → \(VERSION)")
-            banner.showMessage(title: "Darth Recorder updated to \(VERSION)", sub: "Was \(lastRun). Updates install themselves when you are not on a call.")
+            banner.showMessage(title: "Darth Recorder updated to \(VERSION)", sub: "Was \(lastRun). Updates install themselves when you are not on a call.", accent: .info)
         }
+        if !auth.signedIn {
+            rlog("not signed in — recordings stay local until you sign in from the menu")
+        }
+        uploadPending()
+    }
+
+    /// Quitting must take the `log stream` child with us.
+    func applicationWillTerminate(_ n: Notification) {
+        shares.stop()
+        EventLog.shared.log("app_terminating", ["recording": recorder.isRecording])
     }
 
     // MARK: install location
@@ -141,11 +225,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         m.addItem(statusLine)
         permLine.target = self
         m.addItem(permLine)
+        shareLine.isEnabled = false
+        m.addItem(shareLine)
         clientsLine.isEnabled = false
         m.addItem(clientsLine)
         m.addItem(.separator())
         startItem.target = self; m.addItem(startItem)
+        displayItem.target = self; m.addItem(displayItem)
         stopItem.target = self; m.addItem(stopItem)
+        m.addItem(.separator())
+        authItem.target = self; m.addItem(authItem)
+        uploadItem.target = self; m.addItem(uploadItem)
+        pendingLine.target = self; pendingLine.action = #selector(uploadPendingFromMenu); m.addItem(pendingLine)
         m.addItem(.separator())
         let open = NSMenuItem(title: "Open Darth Meetings", action: #selector(openPWA), keyEquivalent: "o"); open.target = self; m.addItem(open)
         let reveal = NSMenuItem(title: "Show recordings folder", action: #selector(revealFolder), keyEquivalent: ""); reveal.target = self; m.addItem(reveal)
@@ -160,10 +251,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func refreshMenu() {
-        let recording = session != nil
-        if let s = session {
-            let secs = Int(Date().timeIntervalSince(s.startedAt))
-            statusLine.title = String(format: "● Recording %@ · %02d:%02d", recordingCall.map { kindName($0.kind) } ?? "display", secs / 60, secs % 60)
+        let recording = recorder.isRecording
+        if recording, let since = recorder.startedAt {
+            let secs = Int(Date().timeIntervalSince(since))
+            let seg = recorder.segments.count
+            statusLine.title = String(format: "● Recording %@ · %02d:%02d%@", recorder.call.map { kindName($0.kind) } ?? "display", secs / 60, secs % 60, seg > 1 ? " · part \(seg)" : "")
         } else if let c = detector.active.values.sorted(by: { $0.startedAt < $1.startedAt }).first {
             statusLine.title = "\(kindName(c.kind)) in progress — \(c.appName)"
         } else {
@@ -172,9 +264,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let perm = CGPreflightScreenCaptureAccess()
         permLine.title = perm ? "Screen recording: allowed" : "Screen recording: NOT allowed — open settings…"
         permLine.isEnabled = !perm
+        if let s = shares.active.last {
+            shareLine.title = "Sharing: \(s.appName ?? s.appBundle) · \(s.target)"
+            shareLine.isHidden = false
+        } else {
+            shareLine.isHidden = true
+        }
         clientsLine.title = "PWA link: ws://127.0.0.1:\(WS_PORT) · \(clients) connected"
-        startItem.isHidden = recording || starting
+        startItem.title = detector.active.isEmpty ? "Start recording (main display)" : "Record this call"
+        startItem.isHidden = recording
+        displayItem.isHidden = recording
         stopItem.isHidden = !recording
+        authItem.title = auth.signingIn ? "Signing in…" : (auth.signedIn ? "Signed in as \(auth.email ?? "?") — sign out" : "Sign in to Darth Meetings…")
+        authItem.isEnabled = !auth.signingIn
+        uploadItem.state = autoUpload ? .on : .off
+        let pending = Registry.shared.pendingUpload().count
+        pendingLine.title = pending == 0 ? "No recordings waiting to upload" : "Upload \(pending) recording\(pending == 1 ? "" : "s") now"
+        pendingLine.isEnabled = pending > 0 && auth.signedIn
         loginItem.state = SMAppService.mainApp.status == .enabled ? .on : .off
         if updater.installing { updateItem.title = "Installing update…"; updateItem.isEnabled = false }
         else if let s = updater.staged { updateItem.title = "Install \(s.version) and restart"; updateItem.isEnabled = true }
@@ -205,19 +311,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
     /// "Install and restart" from the banner/menu: stop a running recording first, then install.
     func installUpdateNow() {
-        if session != nil { installAfterStop = true; stopRecording(); return }
+        if recorder.isRecording { installAfterStop = true; stopRecording(reason: "update install"); return }
         updater.install(auto: false)
     }
     var installAfterStop = false
     func updaterEvent(_ ev: Updater.Event) {
         switch ev {
-        case .upToDate(let v): banner.showMessage(title: "You're up to date (\(v))", sub: "Darth Recorder \(v) is the latest version.")
+        case .upToDate(let v): banner.showMessage(title: "You're up to date (\(v))", sub: "Darth Recorder \(v) is the latest version.", accent: .info)
         case .error(let msg): banner.showMessage(title: "Update check failed", sub: msg)
         case .staged(let v):
-            banner.showUpdate(version: v, sub: session != nil ? "Installs itself when the recording stops." : "Installs itself when your call ends.") { [weak self] in self?.installUpdateNow() }
+            banner.showUpdate(version: v, sub: recorder.isRecording ? "Installs itself when the recording stops." : "Installs itself when your call ends.") { [weak self] in self?.installUpdateNow() }
         case .installing(let v): rlog("restarting to finish the update to \(v)")
         }
-        var st = statusPayload(); st["type"] = "status"; server.broadcast(st)
+        broadcast("status")
     }
     @objc func toggleLogin() {
         do {
@@ -226,13 +332,34 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         refreshMenu()
     }
 
+    // MARK: auth + uploads
+
+    @objc func toggleAuth() {
+        if auth.signedIn { auth.signOut() } else { auth.signIn() }
+    }
+    @objc func toggleAutoUpload() {
+        autoUpload = !autoUpload
+        EventLog.shared.log("auto_upload_toggled", ["enabled": autoUpload], summary: "auto-upload \(autoUpload ? "ON" : "OFF")")
+    }
+    @objc func uploadPendingFromMenu() { uploadPending(force: true) }
+
+    /// Upload everything still local (auto-upload on, signed in) — also runs at launch, so a
+    /// recording made while signed out goes up as soon as somebody signs in.
+    func uploadPending(force: Bool = false) {
+        guard auth.signedIn, force || autoUpload else { return }
+        for row in Registry.shared.pendingUpload() {
+            guard let id = row["id"] as? String, !uploader.isUploading(id) else { continue }
+            uploader.upload(recordingId: id)
+        }
+    }
+
     /// darth-recorder://open | //start | //stop | //status — lets the PWA launch or drive us via a link.
     func application(_ application: NSApplication, open urls: [URL]) {
         for u in urls {
             rlog("url: \(u.absoluteString)")
             switch u.host ?? u.path.trimmingCharacters(in: CharacterSet(charactersIn: "/")) {
             case "start": startRecording(for: detector.active.values.first)
-            case "stop": stopRecording()
+            case "stop": stopRecording(reason: "url")
             case "open", "":
                 if let b = statusItem.button { b.performClick(nil) }
             default: break
@@ -240,165 +367,286 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
     @objc func revealFolder() {
-        try? FileManager.default.createDirectory(at: recordingsDir, withIntermediateDirectories: true)
-        NSWorkspace.shared.open(recordingsDir)
+        try? FileManager.default.createDirectory(at: Paths.recordings, withIntermediateDirectories: true)
+        NSWorkspace.shared.open(Paths.recordings)
     }
     @objc func revealLog() {
         NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: NSString("~/Library/Logs/DarthRecorder/tray.log").expandingTildeInPath)])
     }
     @objc func quit() {
-        if let s = session {
-            session = nil
-            Task { @MainActor in await s.stop(); NSApp.terminate(nil) }
+        if recorder.isRecording {
+            recorder.onStopped = { [weak self] saved in
+                self?.recordingStopped(saved)
+                NSApp.terminate(nil)
+            }
+            stopRecording(reason: "quit")
         } else { NSApp.terminate(nil) }
     }
     @objc func startFromMenu() { startRecording(for: detector.active.values.first) }
-    @objc func stopFromMenu() { stopRecording() }
+    @objc func stopFromMenu() { stopRecording(reason: "menu") }
+    /// Explicit "record everything on this screen" — the display the mouse is on.
+    @objc func recordDisplay() {
+        let mouse = NSEvent.mouseLocation
+        let screen = NSScreen.screens.first { NSMouseInRect(mouse, $0.frame, false) } ?? NSScreen.screens.first
+        let id = (screen?.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber)?.uint32Value ?? CGMainDisplayID()
+        startRecording(for: detector.active.values.first, displayOverride: id)
+    }
 
     // MARK: calls
 
-    var recordingsDir: URL {
-        FileManager.default.urls(for: .moviesDirectory, in: .userDomainMask)[0].appendingPathComponent("Darth Recorder", isDirectory: true)
+    /// The share watcher streams the unified log, so it runs only while there is something to
+    /// watch: a live call or a recording.
+    func updateShareWatcher() {
+        let needed = !detector.active.isEmpty || recorder.isRecording
+        if needed {
+            if !shares.isWatching { shares.start() }
+        } else if shares.isWatching {
+            shares.stop()
+            rlog("share detector: no call and not recording — watcher stopped")
+        }
     }
 
     func callStarted(_ call: DetectedCall) {
+        updateShareWatcher()
         refreshMenu()
-        if session == nil { banner.showCall(call) }
-        var ev = statusPayload(); ev["type"] = "call_started"; ev["call"] = call.json
-        server.broadcast(ev)
+        EventLog.shared.log("call_started", call.json)
+        if call.pid > 0 {
+            let pick = WindowPicker.pick(kind: call.kind, pid: call.pid)
+            WindowPicker.logCandidates(phase: "detect", call: call, pick: pick)
+        }
+        if !recorder.isRecording { banner.showCall(call) }
+        broadcast("call_started", ["call": call.json])
     }
 
     func callEnded(_ call: DetectedCall) {
         refreshMenu()
-        if session == nil { banner.hide() }
-        var ev = statusPayload(); ev["type"] = "call_ended"; ev["call"] = call.json
-        server.broadcast(ev)
-        // If we were recording this call, the call ending is a strong hint to stop.
-        if let rc = recordingCall, rc.pid == call.pid, call.pid > 0 {
-            banner.showMessage(title: "Call ended — still recording", sub: "Stop from the banner, the menu bar, or the PWA.")
+        defer { updateShareWatcher() }
+        EventLog.shared.log("call_ended", call.json)
+        broadcast("call_ended", ["call": call.json])
+        if recorder.isRecording, let rc = recorder.call, rc.pid == call.pid, call.pid > 0 {
+            startGrace()
+        } else if !recorder.isRecording {
+            banner.hide()
         }
         updater.installIfIdle()
     }
 
-    // MARK: recording
+    // MARK: shares
 
-    func displayForCall(_ call: DetectedCall?) -> CGDirectDisplayID {
-        guard let f = call?.windowFrame else { return CGMainDisplayID() }
-        var ids = [CGDirectDisplayID](repeating: 0, count: 8)
-        var n: UInt32 = 0
-        // Display whose bounds contain the window's centre (CG coords = top-left origin, same as CGWindowBounds).
-        let centre = CGRect(x: f.midX, y: f.midY, width: 1, height: 1)
-        if CGGetDisplaysWithRect(centre, 8, &ids, &n) == .success, n > 0 { return ids[0] }
-        return CGMainDisplayID()
+    func shareStarted(_ s: ShareInfo) {
+        refreshMenu()
+        broadcast("share_started", ["share": s.json])
+        recorder.shareStarted(s)
     }
 
-    func startRecording(for call: DetectedCall?) {
-        guard session == nil, !starting else { return }
+    func shareEnded(_ s: ShareInfo) {
+        refreshMenu()
+        broadcast("share_ended", ["share": s.json])
+        recorder.shareEnded(s)
+    }
+
+    // MARK: recording
+
+    func startRecording(for call: DetectedCall?, displayOverride: CGDirectDisplayID? = nil) {
+        guard !recorder.isRecording else { return }
         guard CGPreflightScreenCaptureAccess() else {
             banner.showMessage(title: "Screen recording not allowed", sub: "Enable Darth Recorder in System Settings → Privacy & Security → Screen Recording.")
             CGRequestScreenCaptureAccess()
             return
         }
-        starting = true
+        cancelGrace(reason: "new recording")
+        recorder.start(call: call, displayOverride: displayOverride)
         refreshMenu()
-        let displayID = displayForCall(call)
-        let f = DateFormatter(); f.dateFormat = "yyyy-MM-dd HH.mm.ss"
-        let name = "\(f.string(from: Date())) \(call?.kind.rawValue ?? "display").mp4"
-        let url = recordingsDir.appendingPathComponent(name)
-        Task { @MainActor in
-            do {
-                let (filter, label) = try await CaptureSession.displayFilter(displayID: displayID)
-                let s = try await CaptureSession.start(filter: filter, label: label, fps: 5, audio: true, url: url)
-                s.recorder.onStop = { [weak self] err in
-                    DispatchQueue.main.async {
-                        self?.banner.showMessage(title: "Recording interrupted", sub: err.localizedDescription)
-                        self?.stopRecording()
-                    }
-                }
-                self.session = s
-                self.recordingCall = call
-                self.starting = false
-                self.refreshMenu()
-                self.banner.showRecording(label: call.map { self.kindName($0.kind) } ?? "display", since: s.startedAt)
-                self.tick()
-                var ev = self.statusPayload(); ev["type"] = "recording_started"
-                self.server.broadcast(ev)
-            } catch {
-                self.starting = false
-                self.refreshMenu()
-                rlog("start recording failed: \(error)")
-                self.banner.showMessage(title: "Could not start recording", sub: error.localizedDescription)
-            }
+    }
+
+    /// Where the recording is happening — the banner belongs on that display.
+    var recordingFrame: CGRect? { recorder.lastWindowFrame ?? recorder.call?.windowFrame }
+
+    func recordingStarted() {
+        updateShareWatcher()
+        refreshMenu()
+        banner.showRecording(label: recorder.call.map { kindName($0.kind) } ?? "display",
+                             since: recorder.startedAt ?? Date(), near: recordingFrame)
+        tick()
+        broadcast("recording_started")
+    }
+
+    func stopRecording(reason: String) {
+        cancelGrace(reason: "stopping")
+        recorder.stop(reason: reason)
+        refreshMenu()
+    }
+
+    func recordingStopped(_ saved: [String: Any]) {
+        lastSaved = saved
+        updateShareWatcher()
+        refreshMenu()
+        let id = (saved["recording_id"] as? String) ?? ""
+        let willUpload = autoUpload && auth.signedIn && !id.isEmpty
+        let path = (saved["path"] as? String).map { URL(fileURLWithPath: $0) }
+        banner.showSaved(path ?? Paths.recordings, seconds: (saved["seconds"] as? Int) ?? 0,
+                         segments: (saved["segments"] as? Int) ?? 1, uploading: willUpload)
+        // `recording` must stay a boolean here — the file info goes under `saved`.
+        broadcast("recording_stopped", ["saved": saved])
+        api.shipEvents()
+        if willUpload {
+            uploader.upload(recordingId: id)
+        } else if !auth.signedIn && !id.isEmpty {
+            rlog("recording \(id) stays local — not signed in")
         }
+        if installAfterStop { installAfterStop = false; updater.install(auto: false) } else { updater.installIfIdle() }
     }
 
     func tick() {
-        guard session != nil else { return }
+        guard recorder.isRecording else { return }
         refreshMenu()
         DispatchQueue.main.asyncAfter(deadline: .now() + 1) { [weak self] in self?.tick() }
     }
 
-    func stopRecording() {
-        guard let s = session else { return }
-        session = nil
-        let call = recordingCall
-        recordingCall = nil
-        refreshMenu()
-        Task { @MainActor in
-            await s.stop()
-            let secs = Int(Date().timeIntervalSince(s.startedAt))
-            let size = (try? FileManager.default.attributesOfItem(atPath: s.url.path)[.size] as? Int) ?? 0
-            self.banner.showSaved(s.url, seconds: secs)
-            var ev = self.statusPayload(); ev["type"] = "recording_stopped"
-            ev["recording"] = ["path": s.url.path, "seconds": secs, "bytes": size, "call": call?.json as Any]
-            self.server.broadcast(ev)
-            self.refreshMenu()
-            if self.installAfterStop { self.installAfterStop = false; self.updater.install(auto: false) } else { self.updater.installIfIdle() }
+    // MARK: stop grace
+
+    /// The call ended while we were recording: 60 s, a banner with Stop now / Keep recording,
+    /// then an automatic stop.
+    func startGrace() {
+        guard graceTimer == nil else { return }
+        let deadline = Date().addingTimeInterval(STOP_GRACE)
+        graceDeadline = deadline
+        banner.showGrace(secondsLeft: Int(STOP_GRACE), deadline: deadline, near: recordingFrame)
+        EventLog.shared.log("stop_grace_started", ["seconds": STOP_GRACE], summary: "record: call ended — auto-stop in \(Int(STOP_GRACE)) s")
+        graceTimer = Timer.scheduledTimer(withTimeInterval: STOP_GRACE, repeats: false) { [weak self] _ in
+            self?.graceTimer = nil
+            self?.graceDeadline = nil
+            EventLog.shared.log("stop_grace_elapsed", [:], summary: "record: grace elapsed — stopping")
+            self?.stopRecording(reason: "call ended (grace elapsed)")
+        }
+    }
+
+    func cancelGrace(reason: String) {
+        guard graceTimer != nil else { return }
+        graceTimer?.invalidate(); graceTimer = nil; graceDeadline = nil
+        EventLog.shared.log("stop_grace_cancelled", ["reason": reason])
+    }
+
+    /// "Keep recording" — the user says the call is still going.
+    func keepRecording() {
+        cancelGrace(reason: "user kept recording")
+        if recorder.isRecording {
+            banner.showRecording(label: recorder.call.map { kindName($0.kind) } ?? "display",
+                                 since: recorder.startedAt ?? Date(), near: recordingFrame)
+        } else {
+            banner.hide()
         }
     }
 
     // MARK: PWA protocol
 
     func statusPayload() -> [String: Any] {
+        let pending = Registry.shared.pendingUpload().count
         var d: [String: Any] = [
             "version": VERSION,
             "screen_recording_permission": CGPreflightScreenCaptureAccess(),
             "calls": detector.active.values.sorted { $0.startedAt < $1.startedAt }.map { $0.json },
-            "recording": session != nil,
+            "recording": recorder.isRecording,
+            "signed_in": auth.signedIn,
+            "email": auth.email ?? NSNull(),
+            "device_id": auth.deviceId,
+            "share": shares.active.last?.json ?? NSNull(),
+            "recordings_pending_upload": pending,
+            "auto_upload": autoUpload,
             "update_available": updater.available ?? NSNull(),
             "update_staged": updater.staged?.version ?? NSNull(),
-            "ts": ISO8601DateFormatter().string(from: Date()),
+            "ts": isoNow(),
         ]
-        if let s = session {
-            d["recording_since"] = ISO8601DateFormatter().string(from: s.startedAt)
-            d["recording_path"] = s.url.path
-            d["recording_label"] = recordingCall.map { kindName($0.kind) } ?? "display"
+        if recorder.isRecording {
+            d["recording_since"] = isoString(recorder.startedAt ?? Date())
+            d["recording_path"] = (recorder.segments.last?["path"] as? String) ?? ""
+            d["recording_label"] = recorder.call.map { kindName($0.kind) } ?? "display"
+            d["recording_id"] = recorder.recordingId ?? NSNull()
+            d["segment"] = recorder.segments.count
+            d["mic"] = recorder.micActive
+        }
+        if let deadline = graceDeadline {
+            d["stopping_in"] = max(0, Int(deadline.timeIntervalSinceNow.rounded()))
         }
         return d
     }
 
+    /// Broadcast a full snapshot with `type` plus any event-specific fields.
+    func broadcast(_ type: String, _ extra: [String: Any] = [:]) {
+        var ev = statusPayload()
+        ev["type"] = type
+        for (k, v) in extra { ev[k] = v }
+        server.broadcast(ev)
+    }
+
     func handleCommand(_ cmd: String, _ obj: [String: Any]) {
         rlog("ws cmd: \(cmd)")
+        EventLog.shared.log("ws_command", ["cmd": cmd, "args": obj.filter { $0.key != "cmd" }])
         switch cmd {
         case "start":
             let pid = (obj["pid"] as? Int).map { pid_t($0) }
             let call = pid.flatMap { detector.active[$0] } ?? detector.active.values.first
             startRecording(for: call)
-        case "stop": stopRecording()
-        case "status":
-            var s = statusPayload(); s["type"] = "status"; server.broadcast(s)
-        case "simulate_call": simulate(kind: (obj["kind"] as? String) ?? "teams")
-        case "end_simulated": detector.endInjected(pid: 0)
+        case "stop": stopRecording(reason: "pwa")
+        case "status": broadcast("status")
+        case "simulate_call":
+            simulate(kind: (obj["kind"] as? String) ?? "teams", pid: pid_t((obj["pid"] as? Int) ?? 0),
+                     bundleOverride: obj["bundle_id"] as? String)
+        case "end_simulated": detector.endInjected(pid: pid_t((obj["pid"] as? Int) ?? 0))
         case "check_update": checkForUpdates()          // test hook: same as the menu item
+        case "simulate_share":
+            let kind = (obj["kind"] as? String) == "display" ? "display" : "window"
+            let wid = (obj["window_id"] as? Int).map { UInt32($0) }
+            let did = (obj["display_id"] as? Int).map { UInt32($0) }
+            let bundle = (obj["bundle_id"] as? String) ?? recorder.call?.bundleId ?? "com.microsoft.teams2.modulehost"
+            let info = ShareInfo(id: "sim-share-\(Int(Date().timeIntervalSince1970))", appBundle: bundle,
+                                 appName: obj["app"] as? String, kind: kind,
+                                 displayID: kind == "display" ? (did ?? CGMainDisplayID()) : nil,
+                                 windowID: kind == "window" ? wid : nil,
+                                 windowOwner: wid.flatMap { ShareDetector.windowInfo($0)?.owner },
+                                 windowTitle: wid.flatMap { ShareDetector.windowInfo($0)?.title },
+                                 startedAt: Date())
+            shares.injectShare(info)
+        case "end_simulated_share": shares.endInjectedShare(id: obj["id"] as? String)
+        case "login": if !auth.signedIn { auth.signIn() } else { broadcast("auth_changed") }
+        case "logout": auth.signOut()
+        case "set_auto_upload":
+            if let v = obj["enabled"] as? Bool { autoUpload = v }
+        case "upload":
+            guard let id = obj["recording_id"] as? String else { rlog("upload: no recording_id"); return }
+            let linked = obj["linked_event"] as? [String: Any]
+            uploader.upload(recordingId: id, linkedEvent: linked)
+        case "list_recordings":
+            var msg: [String: Any] = statusPayload()
+            msg["type"] = "recordings"
+            msg["recordings"] = Registry.shared.all()
+            if let req = obj["req"] { msg["req"] = req }
+            server.broadcast(msg)
         default: rlog("unknown cmd \(cmd)")
         }
     }
 
-    func simulate(kind: String) {
+    /// `{cmd:"simulate_call", kind, pid?}`. Without a pid it is a pure fake (records the main
+    /// display). WITH a pid it pretends that real app is on a call, so the window picker, the
+    /// window filter and the banner placement all run against a real window — that is how the
+    /// window path is tested without dialling into a meeting.
+    func simulate(kind: String, pid: pid_t = 0, bundleOverride: String? = nil) {
         let k = CallKind(rawValue: kind) ?? .teams
-        let call = DetectedCall(id: "sim-\(Int(Date().timeIntervalSince1970))", pid: 0, appName: k == .teams ? "Microsoft Teams" : "Google Chrome",
-                                bundleId: k == .teams ? "com.microsoft.teams2" : "com.google.Chrome", kind: k,
-                                title: "Simulated call — MSC Contract, Rates overview", windowFrame: nil, startedAt: Date())
+        var name = k == .teams ? "Microsoft Teams" : "Google Chrome"
+        var bundle = k == .teams ? "com.microsoft.teams2" : "com.google.Chrome"
+        var title = "Simulated call — MSC Contract, Rates overview"
+        var frame: CGRect?
+        if pid > 0 {
+            let pick = WindowPicker.pick(kind: k, pid: pid)
+            WindowPicker.logCandidates(phase: "simulate", call: nil, pick: pick)
+            if let w = pick.window { title = w.title; frame = w.frame; name = w.owner }
+            if let app = NSRunningApplication(processIdentifier: pid) {
+                name = app.localizedName ?? name
+                bundle = app.bundleIdentifier ?? "sim.pid.\(pid)"
+            }
+        }
+        let call = DetectedCall(id: "sim-\(Int(Date().timeIntervalSince1970))", pid: pid, appName: name,
+                                bundleId: bundleOverride ?? bundle, kind: k, title: title, windowFrame: frame, startedAt: Date())
         detector.inject(call)
     }
 }

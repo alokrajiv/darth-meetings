@@ -74,30 +74,119 @@ DARTH_TRAY_UPDATE_URL=file:///tmp/v.json --env DARTH_TRAY_UPDATE_INTERVAL=5` and
 `REFUSED — sha256 mismatch` line. E2E proof (2026-09-15): a running 0.1.4 detected the
 published 0.1.5, verified, swapped the bundle and relaunched as 0.1.5 with no human action.
 
+## What 0.2.0 does (the beta build)
+
 **Call detection** (`CallDetector.swift`): every 1.5 s poll Core Audio's process objects
 (`kAudioHardwarePropertyProcessObjectList`) for `kAudioProcessPropertyIsRunningInput` —
 i.e. who has the microphone open. Walk the pid up to its Dock-visible app (Teams WebView →
 Microsoft Teams, Chrome Helper → Google Chrome), classify by bundle id, and for browsers use
-the window title to tell Meet / Teams-web / Zoom-web apart. 2 polls to start (mic-permission
-flickers), 3 polls to end. Needs NO mic permission. System daemons (`/System`, `/usr`) are
-ignored — `replayd` opens input while we ourselves record.
+the window title to tell Meet / Teams-web / Zoom-web apart. 2 polls to start, 3 to end. Needs
+NO mic permission. System daemons (`/System`, `/usr`) are ignored — `replayd` opens input
+while we ourselves record. **A screen share by the same app holds the call open** even after
+the mic device closes (`holdOpen`).
+
+**Which window is the call** (`WindowPicker.swift`): title patterns first, the app's
+*frontmost* window second, **never largest-by-area** (that is always Teams' Chat/Calendar
+window). Teams: skip `Chat |`, `Calendar |`, `Activity |`, `Teams |`, `Calls |`, `OneDrive |`,
+`Apps |`, `Copilot |`; prefer a title with "Meeting"/"Call", then a non-nav `… | Microsoft
+Teams`. Zoom: `Zoom Meeting`/`Zoom Webinar`. Slack: `Huddle`. Meet: the Meet title. The window
+is re-resolved when Record is pressed and every 5 s while recording, and **every candidate
+(id, title, frame, z-index, on-screen) is logged** at detection, at record and at each
+re-resolve — that log is the field data the beta is for.
+
+**Share detection** (`ShareDetector.swift`, no extra permission): a `/usr/bin/log stream`
+subprocess on a narrow predicate over `replayd` + `tccd`, parsed line by line. It runs **only
+while a call is live or we are recording** — streaming the unified log costs ~17% of a core,
+which a tray must not burn all day — and an orphan left by a force-quit is swept at the next
+launch (the predicate carries a `DarthRecorderShareWatch` marker for exactly that). WHO comes from tccd (`AUTHREQ_ATTRIBUTION … accessing={identifier=…}`
+whose `requesting=` is `com.apple.replayd`; new Teams shares as
+`com.microsoft.teams2.modulehost`), WHAT from SkyLight (`SLContentFilter initWithDisplay:
+displayID = 0x…` / `initWithDesktopIndependentWindow: windowID = 0x…`, ids in the clear —
+resolved to owner/title through CGWindowList immediately, because window ids die with the
+window), START from `Created New Stream … Hash=<id>`, TEARDOWN from
+`RPRecordingManager invalidateFilterTimerForStream` (two lines per teardown, collapsed; never
+`SLContentStream stop:`, which only fires for picker thumbnails and never when someone leaves
+a meeting mid-share). Our own capture is filtered out by bundle id, and our own teardowns are
+suppressed explicitly. A 5 s sweep closes shares whose window or app has gone away.
+
+**Recording** (`RecordingController.swift` + `RecorderCore`): one recording = one uuid, one
+folder `~/Movies/Darth Recorder/<id>/`, N segments `<base> part<N>.mp4`, three tracks each:
+
+| track | source | how |
+|---|---|---|
+| video | the CALL WINDOW (`SCContentFilter(desktopIndependentWindow:)`) | its own SCStream, 5 fps |
+| audio 1 `mul` | all system audio on the display containing that window | a SECOND SCStream, `capturesAudio`, `excludesCurrentProcessAudio`, 16×16 video nobody reads |
+| audio 2 `eng` | the microphone | `AVAudioEngine` input tap → CMSampleBuffer on the host clock |
+
+Never mixed at capture. ffprobe shows `Stream #0:0 Video`, `#0:1(mul) Audio` = system,
+`#0:2(eng) Audio` = mic (mp4 drops per-track *names*, so the language tag is the label).
+A new segment starts when the call's app starts or stops sharing (video follows the shared
+window/display), when the recorded window disappears (falls back to its display), and after an
+encoder hiccup. Audio and mic run continuously across segment boundaries. **Every segment
+keeps the first segment's pixel size** (`scalesToFit` letterboxes the rest) because the server
+stitches multi-file uploads with `ffmpeg -f concat -c copy`, which refuses inputs whose stream
+parameters differ. Stop: the call ending shows a 60 s "Call ended — stopping in N s" banner
+with **Stop now** / **Keep recording**, then stops by itself.
+
+**Banner** (`Banner.swift`): placed on the display that contains the recorded window (mouse
+display as fallback, never `NSScreen.main` — for an accessory app that is an arbitrary
+monitor), 6 px accent bar (green call / red recording / amber warning / blue update), slides
+in from the top edge, forced `.darkAqua` so labels stay white on the HUD material, and it
+stays as a compact pill for as long as the call/recording lasts instead of auto-hiding. Every
+warning shown while recording carries a Stop button.
+
+**Sign-in, registry, telemetry, upload** (`Auth.swift`, `Api.swift`, `Registry.swift`,
+`EventLog.swift`): sign-in is the darth device flow (`auth.darth-internal.trames.io`,
+scopes `meetings=readwrite`) — the menu item and ws `{cmd:"login"}` both start it, the token
+lands in `~/Library/Application Support/DarthRecorder/auth.json` mode 0600 next to a
+`device.json` holding the device uuid. With a token the tray talks to
+`https://meetings.darth-internal.trames.io` (override `DARTH_TRAY_API_URL`):
+`POST /api/recorder/heartbeat` on launch and every 5 min, `POST /api/recorder/events` every
+60 s and at every stop (batches of ≤500 lines of `events.jsonl`, with a shipped-offset file),
+`POST/PATCH /api/recorder/recordings` at start, at every segment and at stop. **Every server
+call is fail-soft**: it logs (throttled), sets `needs_sync`, and a 60 s sweep re-upserts —
+a recording never waits on the network. Auto-upload (default ON, menu toggle) sends the
+segments at stop to the one-shot `POST /api/transcripts?recorderRecordingId=<id>` route
+darth-cli uses (raw body, `x-filename`; multi-segment = one `multi_group` stitch group;
+`linked_event` from the PWA rides as `x-linked-event`). Local files are kept.
+
+**Logs.** `~/Library/Logs/DarthRecorder/tray.log` is the narrative;
+`~/Library/Logs/DarthRecorder/events.jsonl` is the data (one JSON object per line: `ts`,
+`kind`, `payload`; rotates at 20 MB, keeps 5) — every detection, candidate list, share event,
+banner show/click, user action, segment, upload step, auth step and error, and it is what the
+telemetry endpoint ships.
 
 **PWA protocol** (`LocalServer.swift`, Network.framework WebSocket server on loopback).
 Every message is a full status snapshot + `type`:
-`status | call_started | call_ended | recording_started | recording_stopped`, with `calls[]`,
-`recording`, `recording_since/path/label`, `screen_recording_permission`, `version`,
-`update_available`, `update_staged`.
-Commands from the page: `{cmd:"start", pid?}`, `{cmd:"stop"}`, `{cmd:"status"}`, and the
-test hooks `{cmd:"simulate_call", kind}` / `{cmd:"end_simulated"}` / `{cmd:"check_update"}`. The PWA side is
-`src/lib/companion/companion-client.ts` + `src/components/companion-banner.tsx` (mounted in
-the root layout; renders nothing unless a tray answers). TODO before this leaves POC:
-pairing token + Origin allow-list; today any local page can drive the recorder.
+`status | call_started | call_ended | recording_started | recording_stopped | share_started |
+share_ended | segment_started | upload_progress | upload_done | upload_failed | auth_changed |
+recordings`, with `calls[]`, `recording` (**always a boolean** — the saved file rides under
+`saved` on `recording_stopped`; 0.1.5 overwrote the boolean and flipped the PWA chip back to
+"Recording"), `recording_since/path/label/id`, `screen_recording_permission`, `signed_in`,
+`email`, `device_id`, `share`, `recordings_pending_upload`, `auto_upload`, `version`,
+`update_available`, `update_staged`, and `stopping_in` during the grace period.
+Commands from the page: `{cmd:"start", pid?}`, `{cmd:"stop"}`, `{cmd:"status"}`,
+`{cmd:"login"}`, `{cmd:"logout"}`, `{cmd:"upload", recording_id, linked_event?}`,
+`{cmd:"list_recordings", req}` → `{type:"recordings", recordings:[…], req}`,
+`{cmd:"set_auto_upload", enabled}`.
+Test hooks: `{cmd:"simulate_call", kind, pid?, bundle_id?}` (with a **real pid** it treats that
+app as the call, so the window picker, the window filter and the banner run for real),
+`{cmd:"end_simulated", pid}`, `{cmd:"simulate_share", kind, window_id?, display_id?,
+bundle_id?}`, `{cmd:"end_simulated_share"}`, `{cmd:"check_update"}`. The PWA side is
+`src/lib/companion/companion-client.ts` + `src/components/recorder-*`. TODO before this leaves
+POC: pairing token + Origin allow-list; today any local page can drive the recorder.
 
-**Recording** = display filter of the display containing the call's window (all windows +
-all system audio), 5 fps. Mic is NOT captured yet.
+**Verified 2026-09-15 (0.2.0, dev machine):** window recording of a real window with
+1 video + 2 audio tracks (`mul` system carries the `afplay` sound, `eng` mic is separate);
+segment rolls on share start/end and on the recorded window disappearing; 60 s grace banner
+and automatic stop; no "already stopped" error on any stop; sign-in through the device flow;
+heartbeat/events/recordings rows on the server; auto-upload of a 1-segment and a 2-segment
+recording (stitched) with `transcript_id` coming back; `matched` (calendar match) flowing back
+into the local registry. Not yet verified live: a real Teams call and a real Teams screen
+share (the share parser is proven on real log lines only for our own captures), the banner on
+a second display (the external monitors were disconnected mid-session), and hold-open of a
+call while its app keeps sharing.
 
-**Verified 2026-09-15:** simulated + real (ffmpeg mic) detection; banner; PWA banner →
-Record → 30 s display recording (3456x2234, 148 frames, AAC track) → Stop from PWA → file.
 
 ## CLI POC (`recorder-poc`)
 
@@ -144,13 +233,50 @@ verified on macOS 15.0.1 / Xcode SDK 15.2 / Swift 6.0.3 (language mode 5).
 - Audio arrives as 48 kHz stereo LPCM buffers roughly every 20 ms (~50/s); AAC via
   AVAssetWriter is fine in real time. `excludesCurrentProcessAudio = true` avoids feedback.
 
+## Gotchas learned building 0.2.0 (keep — each cost a test run)
+
+- **`outputType` in the replayd log is a bitmask of the stream's outputs, not an identity.**
+  0 = no output (the share picker's thumbnail streams — dozens per picker open, ignore), 1 =
+  screen, 2 = audio, 3 = both. Our own window-only stream logs 1 (exactly like a real Teams
+  share) and our audio-only stream logs 2, so **only the client bundle id can identify our own
+  capture**. The older "3 = our own recording" note was simply the 0.1.x display+audio stream.
+- **AAC settings are validated lazily and kill the whole writer.** `AVEncoderBitRateKey:
+  96_000` on the Mac's 24 kHz mono mic is outside the encoder's legal range for that format;
+  the first append then fails with `-11861 "Cannot Encode Media / The encoding parameters are
+  not supported"`, the AVAssetWriter goes to `.failed`, and every later sample is silently
+  dropped → a 0-byte mp4 and an "Empty request body" from the upload route. Do not set a
+  bitrate; let the encoder choose.
+- **A CMSampleBuffer built with `dataReady: false` must be marked ready.**
+  `CMSampleBufferSetDataBufferFromAudioBufferList` does not do it, and appending an unready
+  buffer fails the writer the same way.
+- **The server stitches multi-file uploads with `ffmpeg -f concat -c copy`**, which refuses
+  inputs whose stream parameters differ (`Stitching the recordings failed`, HTTP 502). Every
+  segment of one recording must therefore carry the same pixel size and the same track layout.
+- **TCC: the dev signature and the Developer ID signature are different grants**, and
+  installing a Developer-ID build over the same bundle id takes the Screen Recording grant
+  with it — after `./make-app.sh` (dev) the tray can come up with
+  `screen_recording_permission: false` and empty window titles until the human toggles it. For
+  testing against the real grant, sign a local build with
+  `DARTH_SIGN_IDENTITY="Developer ID Application: …" ./make-app.sh --no-run` and run it from
+  `/Applications` (no notarization needed for a locally built bundle — Gatekeeper only gates
+  quarantined downloads).
+- **`log stream --debug --info` triples the cost for nothing**: the lines we need
+  (`SLContentFilter`, `outputType`, `Created New Stream`, `invalidateFilterTimerForStream`,
+  tccd `AUTHREQ_ATTRIBUTION`) are all DEFAULT level — the `[INFO]` inside the text is
+  replayd's own prefix. With the flags the watcher sits at 52% of a core, without them 17%.
+  Narrowing with `--process` instead of process clauses in the predicate changes nothing.
+- **The `log stream` child outlives a force-quit** unless you terminate it in
+  `applicationWillTerminate` and sweep orphans at launch.
+- **A window stream dies when its window goes away** (`Failed to find any displays or windows
+  to capture`) — that is a segment roll to the window's display, not the end of the recording.
+- `NSWindow` constrains a freshly created window to one screen; multi-display test windows have
+  to be moved with `setFrameOrigin` *after* they are on screen.
+
 ## Not done yet (next steps)
 
-1. Mic as a second audio track (`AVAudioEngine` input tap, or SCK's `.microphone` output on
-   macOS 15) — keep it separate from system audio, never mix at capture.
-2. Segmenting: fragmented MP4 / 30 s segments into `pending/`, uploader loop with retry,
-   upload into the Meetings backend (chunked /api/uploads) — today files stay in ~/Movies.
-3. Pairing token + Origin allow-list on the local socket; launch-at-login (LaunchAgent).
-4. Auto-stop when the detected call ends (currently a warning banner only).
-5. Sign with the Trames Developer ID + notarize for colleagues (cert expires 14 Apr 2027,
-   auto-renew off). Windows companion (C#/.NET, WGC + WASAPI process loopback).
+1. Pairing token + Origin allow-list on the local socket (any local page can drive the tray).
+2. Teams mute mirroring (needs the Accessibility API), Windows companion (C#/.NET, WGC +
+   WASAPI process loopback), deleting local files after upload.
+3. Server-side stitching of segments with different geometry (today the tray pins the size).
+4. Launch-at-login is a menu toggle (`SMAppService`); no LaunchAgent plist yet.
+5. Apple membership renews 14 Apr 2027 with auto-renew off — a lapse breaks notarization.

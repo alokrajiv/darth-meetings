@@ -40,6 +40,10 @@ struct DetectedCall: Equatable {
 final class CallDetector {
     var onStart: ((DetectedCall) -> Void)?
     var onEnd: ((DetectedCall) -> Void)?
+    /// Consulted before a call is declared over: a screen share by the same app keeps it open
+    /// (people mute/close the mic path while presenting, and Teams closes the mic device only
+    /// on leave — but a share outliving the mic still means the meeting is running).
+    var holdOpen: ((DetectedCall) -> Bool)?
     private(set) var active: [pid_t: DetectedCall] = [:]
 
     private var timer: Timer?
@@ -69,12 +73,17 @@ final class CallDetector {
 
     func stop() { timer?.invalidate(); timer = nil }
 
-    /// Test hook (WS `simulate_call` / DARTH_TRAY_SIMULATE): inject a fake call.
+    /// Test hook (WS `simulate_call` / DARTH_TRAY_SIMULATE): inject a fake call. It may carry
+    /// a REAL pid (so the window picker and the window filter run for real against a chosen
+    /// app) — such a call is never ended by polling, only by `endInjected`.
+    private var injected: Set<pid_t> = []
     func inject(_ call: DetectedCall) {
         active[call.pid] = call
+        injected.insert(call.pid)
         onStart?(call)
     }
     func endInjected(pid: pid_t) {
+        injected.remove(pid)
         if let c = active.removeValue(forKey: pid) { onEnd?(c) }
     }
 
@@ -105,10 +114,11 @@ final class CallDetector {
         for pid in seenCount.keys where roots[pid] == nil { seenCount[pid] = 0 }
 
         // ends
-        for (pid, call) in active where roots[pid] == nil && pid > 0 {   // pid 0 = injected fake
+        for (pid, call) in active where roots[pid] == nil && pid > 0 && !injected.contains(pid) {
             let n = (missingCount[pid] ?? 0) + 1
             missingCount[pid] = n
             if n >= endPolls {
+                if holdOpen?(call) == true { missingCount[pid] = 0; continue }
                 active.removeValue(forKey: pid)
                 missingCount[pid] = 0
                 rlog("call ended: \(call.appName) pid=\(pid) after \(Int(Date().timeIntervalSince(call.startedAt)))s")
