@@ -35,7 +35,9 @@ export function CompanionBanner() {
   const [closedSaved, setClosedSaved] = useState(0);
   const [, setTick] = useState(0);
 
-  const stopped = c.lastEvent?.type === 'recording_stopped' ? c.lastEvent : null;
+  // Not `lastEvent`: the upload_* events that "Upload now" triggers would
+  // otherwise tear the toast down mid-upload.
+  const stopped = c.lastStopped;
   const saved = stopped?.saved ?? null;
   const savedId = saved?.recording_id ?? null;
   const upload = savedId ? c.uploads[savedId] : undefined;

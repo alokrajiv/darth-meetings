@@ -147,6 +147,9 @@ export type CompanionState = {
   updateStaged: string | null;
   uploads: Record<string, CompanionUploadState>;
   lastEvent: CompanionEvent | null;
+  /** The most recent stop, held separately from `lastEvent`: the saved-recording
+   * toast has to survive the upload_* events its own "Upload now" sets off. */
+  lastStopped: { at: number; saved: CompanionSaved | null } | null;
 };
 
 const WS_URL = 'ws://127.0.0.1:47800';
@@ -201,6 +204,7 @@ const initial: CompanionState = {
   updateStaged: null,
   uploads: {},
   lastEvent: null,
+  lastStopped: null,
 };
 
 export class CompanionError extends Error {
@@ -434,6 +438,7 @@ class CompanionClient {
     }
 
     let lastEvent: CompanionEvent | null = this.state.lastEvent;
+    let lastStopped = this.state.lastStopped;
     let uploads = this.state.uploads;
     switch (type) {
       case 'call_started':
@@ -442,11 +447,13 @@ class CompanionClient {
         break;
       case 'recording_started':
         lastEvent = { type, at };
+        lastStopped = null;
         break;
       case 'recording_stopped': {
         // 0.2.0: `saved`; 0.1.x: the file object sat on `recording` itself.
         const saved = parseSaved(m.saved) ?? (typeof m.recording === 'object' ? parseSaved(m.recording) : null);
         lastEvent = { type, at, saved };
+        lastStopped = { at, saved };
         break;
       }
       case 'share_started':
@@ -483,7 +490,7 @@ class CompanionClient {
     // Event-only messages (no snapshot on board) must not blank the snapshot.
     const isSnapshot = 'version' in m || 'calls' in m;
     if (!isSnapshot) {
-      this.set({ connected: true, lastEvent, uploads });
+      this.set({ connected: true, lastEvent, lastStopped, uploads });
       return;
     }
 
@@ -513,6 +520,7 @@ class CompanionClient {
       updateStaged: str(m.update_staged),
       uploads,
       lastEvent,
+      lastStopped,
     });
   }
 
