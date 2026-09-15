@@ -49,8 +49,14 @@ const RECORDER_DMG_URL = 'https://cli.darth-internal.trames.io/darth-recorder/Da
 export function RecorderCard() {
   const c = useCompanion();
   const [copied, setCopied] = useState(false);
+  // Optimistic mirror: the tray owns the setting, but the box must move on the
+  // click rather than a round-trip later. Cleared as soon as a snapshot agrees.
+  const [pendingAuto, setPendingAuto] = useState<boolean | null>(null);
   const [mac, setMac] = useState(true);
   useEffect(() => setMac(companionPlatformSupported()), []);
+  useEffect(() => {
+    if (pendingAuto !== null && c.autoUpload === pendingAuto) setPendingAuto(null);
+  }, [c.autoUpload, pendingAuto]);
 
   const copy = async () => {
     try {
@@ -127,7 +133,7 @@ export function RecorderCard() {
                   : 'No call detected right now. Recordings are saved to ~/Movies/Darth Recorder.'}
             </p>
             {share && (
-              <p className="flex items-center gap-2 text-muted-foreground" data-recorder-share>
+              <p className="flex items-center gap-2 text-muted-foreground" data-recorder-share-card>
                 <ScreenShare className="h-4 w-4 shrink-0" /> {share}
               </p>
             )}
@@ -183,8 +189,11 @@ export function RecorderCard() {
                 <input
                   type="checkbox"
                   className="mt-0.5 h-4 w-4 shrink-0 accent-primary"
-                  checked={c.autoUpload}
-                  onChange={(e) => getCompanion().setAutoUpload(e.target.checked)}
+                  checked={pendingAuto ?? c.autoUpload}
+                  onChange={(e) => {
+                    setPendingAuto(e.target.checked);
+                    getCompanion().setAutoUpload(e.target.checked);
+                  }}
                 />
                 <span>
                   Upload recordings automatically
