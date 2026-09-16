@@ -21,6 +21,11 @@ final class ApiClient {
     var deviceId: String = ""
     /// Snapshot included in the heartbeat.
     var statusProvider: () -> [String: Any] = { [:] }
+    /// The heartbeat answer carried `latest_app_version` newer than us (0.2.5): the app starts
+    /// an update check at once instead of waiting for the updater's own timer. Main queue.
+    var onNewerVersion: ((String) -> Void)?
+    /// Newest version the server has told us about (newer than `appVersion`), for the status.
+    private(set) var serverLatest: String?
 
     private var heartbeatConfirmed = false
     private var eventsConfirmed = false
@@ -114,7 +119,17 @@ final class ApiClient {
             if let min = json?["min_app_version"] as? String, Updater.compare(min, self.appVersion) > 0 {
                 rlog("api: server wants at least \(min), we are \(self.appVersion)")
             }
+            self.noteServerLatest(json?["latest_app_version"] as? String)
         }
+    }
+
+    /// `latest_app_version` from a heartbeat answer (or the ws test hook `simulate_server_latest`).
+    func noteServerLatest(_ latest: String?) {
+        guard let latest, Updater.compare(latest, appVersion) > 0 else { serverLatest = nil; return }
+        let isNew = serverLatest != latest
+        serverLatest = latest
+        if isNew { rlog("api: server says \(latest) is out, we are \(appVersion) → checking") }
+        onNewerVersion?(latest)
     }
 
     /// Ship unshipped events.jsonl lines. Called every 60 s and at recording stop.

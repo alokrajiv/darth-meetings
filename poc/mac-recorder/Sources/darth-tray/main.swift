@@ -3,7 +3,7 @@ import CoreGraphics
 import ServiceManagement
 import RecorderCore
 
-let VERSION = "0.2.4"
+let VERSION = "0.2.5"
 let WS_PORT: UInt16 = 47800
 let PWA_URL = URL(string: "https://meetings.darth-internal.trames.io/")!
 /// Seconds between "the call ended" and an automatic stop.
@@ -136,6 +136,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         api.token = { [weak self] in self?.auth.token }
         api.deviceId = auth.deviceId
         api.statusProvider = { [weak self] in self?.statusPayload() ?? [:] }
+        api.onNewerVersion = { [weak self] _ in
+            guard let self, !self.updater.checking, !self.updater.installing else { return }
+            self.updater.check(manual: false)
+        }
         api.start()
 
         uploader.onProgress = { [weak self] id, seg, pct in
@@ -681,7 +685,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             "share": shares.active.last?.json ?? NSNull(),
             "recordings_pending_upload": pending,
             "auto_upload": autoUpload,
-            "update_available": updater.available ?? NSNull(),
+            "update_available": updater.available ?? api.serverLatest ?? NSNull(),
             "update_staged": updater.staged?.version ?? NSNull(),
             "ts": isoNow(),
         ]
@@ -741,6 +745,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                      bundleOverride: obj["bundle_id"] as? String)
         case "end_simulated": detector.endInjected(pid: pid_t((obj["pid"] as? Int) ?? 0))
         case "check_update": checkForUpdates()          // test hook: same as the menu item
+        case "simulate_server_latest":                    // test hook: as if a heartbeat answered latest_app_version
+            if let v = obj["version"] as? String { api.noteServerLatest(v) }
         case "simulate_share":
             let kind = (obj["kind"] as? String) == "display" ? "display" : "window"
             let wid = (obj["window_id"] as? Int).map { UInt32($0) }

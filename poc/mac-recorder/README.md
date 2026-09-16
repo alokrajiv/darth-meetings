@@ -14,6 +14,16 @@ Native macOS side of Darth Meetings recording (the "Swift tray" angle from Darth
 the user switched it off in the menu (`loginItemUserChoice` in UserDefaults records an explicit choice;
 the default never overrides it). macOS may show "Darth Recorder was added as a login item" once.
 
+**0.2.5 (2026-09-16):**
+- **Updates land within minutes.** The updater checks every **5 min** (`Updater.defaultInterval`,
+  was 6 h; `DARTH_TRAY_UPDATE_INTERVAL` still overrides; first check still 30 s after launch).
+  The heartbeat (already every 5 min, `ApiClient.start`) is a second trigger: when the server's
+  `POST /api/recorder/heartbeat` answer carries `latest_app_version` newer than the running
+  version, `Api.onNewerVersion` starts a check at once (log "api: server says X is out, we are
+  Y → checking"), unless one is already running/installing. `latest_app_version` also shows as
+  `update_available` in the ws status until the updater has its own answer. Installs still wait
+  for the app to be idle. Test hook: `{cmd:"simulate_server_latest", version}`.
+
 **0.2.4 (2026-09-16):**
 - **Record… dialog** (menu, ⌘⇧R; replaces "Record this display"). A non-modal floating panel:
   pick a display (name + pixel size; default = the one under the mouse) or a window (windows of
@@ -91,7 +101,8 @@ embedding Sparkle's framework + XPC services is not worth it). It reuses what th
 already publishes: `https://cli.darth-internal.trames.io/darth-recorder/version.json`
 (`version`, `zip`, `sha256`, `min_macos`, …) and the zip next to it.
 
-**Flow.** Check 30 s after launch and every 6 h, plus **Check for Updates…** in the menu
+**Flow.** Check 30 s after launch and every 5 min (0.2.5; was 6 h), plus a check as soon as a
+heartbeat answer reports a newer `latest_app_version`, plus **Check for Updates…** in the menu
 (reports "You're up to date (x.y.z)" via the banner, or an error banner). Off the Tailnet the
 periodic check fails silently (one debug line in tray.log, no banner). When `version` is
 semver-newer than `let VERSION`: download the zip to

@@ -9,6 +9,11 @@ import RecorderCore
 ///
 /// Env (testing): DARTH_TRAY_UPDATE_URL (version.json URL, file:// allowed; zip resolves relative
 /// to it), DARTH_TRAY_UPDATE_INTERVAL (seconds between checks; the first check is min(30, interval)).
+///
+/// Cadence (0.2.5): every 5 min, not 6 h — version.json is ~300 bytes, and a beta fix must land
+/// on every Mac within minutes. The heartbeat is a second trigger: the server answers it with
+/// `latest_app_version`, and a newer one starts a check at once (Api.onNewerVersion). Installs
+/// still wait for the app to be idle.
 final class Updater {
     struct Release { let version: String; let zip: URL; let sha256: String; let minMacOS: String? }
     struct Staged { let version: String; let app: URL; let dir: URL }
@@ -23,6 +28,7 @@ final class Updater {
     static let teamID = "SMX3ZQ2226"
     static let defaultFeed = URL(string: "https://cli.darth-internal.trames.io/darth-recorder/version.json")!
     static let bundleName = "Darth Recorder.app"
+    static let defaultInterval: TimeInterval = 5 * 60
 
     let currentVersion: String
     let feedURL: URL
@@ -47,7 +53,7 @@ final class Updater {
         self.currentVersion = currentVersion
         let env = ProcessInfo.processInfo.environment
         feedURL = env["DARTH_TRAY_UPDATE_URL"].flatMap { URL(string: $0) } ?? Updater.defaultFeed
-        interval = env["DARTH_TRAY_UPDATE_INTERVAL"].flatMap { Double($0) }.map { max(5, $0) } ?? 6 * 3600
+        interval = env["DARTH_TRAY_UPDATE_INTERVAL"].flatMap { Double($0) }.map { max(5, $0) } ?? Updater.defaultInterval
     }
 
     // MARK: schedule
@@ -57,7 +63,7 @@ final class Updater {
         rlog("updater: feed \(feedURL.absoluteString), first check in \(Int(first)) s, then every \(Int(interval)) s")
         DispatchQueue.main.asyncAfter(deadline: .now() + first) { [weak self] in
             self?.check(manual: false)
-            self?.timer = Timer.scheduledTimer(withTimeInterval: self?.interval ?? 21600, repeats: true) { [weak self] _ in
+            self?.timer = Timer.scheduledTimer(withTimeInterval: self?.interval ?? Updater.defaultInterval, repeats: true) { [weak self] _ in
                 self?.check(manual: false)
             }
         }
