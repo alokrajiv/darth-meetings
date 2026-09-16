@@ -65,7 +65,10 @@ final class Registry {
     func pendingUpload() -> [[String: Any]] {
         all().filter {
             let s = ($0["status"] as? String) ?? "local"
-            return s == "local" || s == "upload_failed"
+            // "uploading" is included on purpose: a row left there by a process that died
+            // mid-upload (quit, crash, update) must be retried at the next launch; live
+            // uploads are skipped by the caller via `uploader.isUploading`.
+            return s == "local" || s == "upload_failed" || s == "uploading"
         }
     }
 

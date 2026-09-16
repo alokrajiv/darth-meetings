@@ -270,13 +270,25 @@ public final class CaptureSession {
         return (SCContentFilter(desktopIndependentWindow: w), "window \(w.windowID) \(w.owningApplication?.applicationName ?? "?") \"\(w.title ?? "")\"", cands)
     }
 
-    /// Pixel size of what a filter captures, rounded to even numbers (H.264 wants that).
+    /// Longest edge of a recording, in pixels. Full Retina (3456×2234 for a 14" display,
+    /// 3024×1890 for a Slack window) at 5 fps is wasteful: a 2-min real recording measured
+    /// 42 MB at full Retina vs 24 MB at 2560 wide with slides still readable (2026-09-16).
+    /// Every stream config sets `scalesToFit`, so SCK scales into the smaller size.
+    public static let maxPixelEdge: CGFloat = 2560
+
+    /// Pixel size of what a filter captures: Retina scale applied, longest edge capped at
+    /// `maxPixelEdge` keeping aspect, both dimensions rounded down to even (H.264 wants that).
     public static func pixelSize(of filter: SCContentFilter) -> (Int, Int) {
         let scale = CGFloat(filter.pointPixelScale)
-        var w = Int(filter.contentRect.width * scale) & ~1
-        var h = Int(filter.contentRect.height * scale) & ~1
+        var w = filter.contentRect.width * scale
+        var h = filter.contentRect.height * scale
         if w < 2 || h < 2 { w = 1920; h = 1080 }
-        return (w, h)
+        let longest = max(w, h)
+        if longest > maxPixelEdge {
+            let f = maxPixelEdge / longest
+            w *= f; h *= f
+        }
+        return (max(2, Int(w) & ~1), max(2, Int(h) & ~1))
     }
 
     public static func start(filter: SCContentFilter, label: String, fps: Int, audio: Bool, url: URL) async throws -> CaptureSession {

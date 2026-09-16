@@ -14,6 +14,27 @@ Native macOS side of Darth Meetings recording (the "Swift tray" angle from Darth
 the user switched it off in the menu (`loginItemUserChoice` in UserDefaults records an explicit choice;
 the default never overrides it). macOS may show "Darth Recorder was added as a login item" once.
 
+**0.2.3 (2026-09-16):**
+- **Window-gone hold.** When the recorded window vanishes the tray no longer falls back to a
+  display at once. Video stops, system audio + mic keep flowing into the current file, and it
+  waits 6 s (`RecordingController.WINDOW_GONE_HOLD`, longer than the detector's 4.5 s end
+  confirmation). If the call ends inside that window — Slack closes the huddle window ~4 s
+  before it releases the mic — the recording ends normally through the grace/stop path with
+  no error banner and no extra part (`main.swift` calls `recorder.noteCallEnded()`). Only a
+  call that is still live gets the old fallback (re-picked call window, else the display),
+  with the "Recording problem" banner. Events: `window_gone_hold`, `window_gone_held`
+  (outcome `call_ended` | `fallback`).
+- **Clean stop on quit.** `applicationWillTerminate` finalises an in-flight recording (both
+  SCK streams stopped, writer finished, registry row → `local`) before the process exits,
+  capped at 5 s; SIGTERM is routed through `NSApp.terminate` so `kill <pid>` and the update
+  helper's fallback take the same path. The teardown in `RecordingController.stop` runs on a
+  detached task (never the main actor) so the main thread can block on it. A row left at
+  `uploading` by a dead process is retried at the next launch. Background: six SCK streams
+  leaked by killed 0.1.x trays were found thrashing in replayd before a kernel panic.
+- **2560 px cap.** `CaptureSession.pixelSize` caps the longest edge at 2560 px (aspect kept,
+  even dimensions); every stream config already sets `scalesToFit`. A 14" display records at
+  2560×1654 instead of 3456×2234 (about −40 % bytes on a busy screen; slides stay readable).
+
 ## Darth Recorder (tray) — build, release, publish
 
     ./make-app.sh                      # dev: Apple Development signature → ~/Applications, relaunch

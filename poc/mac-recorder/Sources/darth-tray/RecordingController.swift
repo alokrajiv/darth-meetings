@@ -83,6 +83,20 @@ final class RecordingController {
     private var errorRolls = 0
     private var resolveTimer: Timer?
     private var shares: [[String: Any]] = []
+    /// Window-gone hold (0.2.3): Slack closes the huddle window ~4 s BEFORE it releases the
+    /// mic, and the detector needs 4.5 s to confirm a call end. Falling back to a display the
+    /// moment the window vanishes therefore ended every huddle with a "Recording problem"
+    /// banner and a few seconds of somebody's desktop. Now the video just stops (audio + mic
+    /// keep flowing into the current writer) and we wait `WINDOW_GONE_HOLD` s: if the call
+    /// ends in that window, the recording ends normally; only a call that is still live gets
+    /// today's fallback.
+    static let WINDOW_GONE_HOLD: TimeInterval = 6
+    private var holdTimer: Timer?
+    private var holdReason = ""
+    /// Set by `noteCallEnded()`: the call this recording belongs to is over, so no source
+    /// fallback may happen any more — the grace/stop path owns the ending.
+    private var callOver = false
+    private var loggedGoneAfterEnd = false
 
     var isRecording: Bool { state == .recording || state == .starting }
 
@@ -107,6 +121,9 @@ final class RecordingController {
         segments = []
         shares = []
         segmentIndex = 0
+        callOver = false
+        loggedGoneAfterEnd = false
+        holdTimer?.invalidate(); holdTimer = nil
         let f = DateFormatter(); f.dateFormat = "yyyy-MM-dd HH.mm.ss"
         base = "\(f.string(from: now)) \(call?.kind.rawValue ?? "display")"
         let folder = Paths.recordings.appendingPathComponent(id, isDirectory: true)
@@ -382,20 +399,12 @@ final class RecordingController {
     private func videoStreamFailed(_ err: Error) {
         guard state == .recording else { return }
         videoStopped = true
-        errorRolls += 1
-        let display = lastWindowFrame.map { WindowPicker.display(containing: $0) }
-            ?? call?.windowFrame.map { WindowPicker.display(containing: $0) } ?? CGMainDisplayID()
         EventLog.shared.log("video_stream_error", [
-            "recording_id": recordingId ?? "", "error": err.localizedDescription,
-            "attempt": errorRolls, "fallback_display": Int(display),
-        ], summary: "record: video stream died (\(err.localizedDescription)) — attempt \(errorRolls)")
-        guard errorRolls <= 3 else {
-            onError?("Recording interrupted: \(err.localizedDescription)")
-            stop(reason: "stream error")
-            return
-        }
-        onError?("The window we were recording went away — recording display \(display) instead.")
-        rollSegment(to: .display(display), reason: "video stream ended (window gone)")
+            "recording_id": recordingId ?? "", "error": err.localizedDescription, "call_over": callOver,
+        ], summary: "record: video stream died (\(err.localizedDescription))\(callOver ? " after call end — audio continues until stop" : " — holding for a call end")")
+        // Audio + mic keep flowing into the current writer; only the video stops. Fall back
+        // to another source only if the call turns out to be still live.
+        beginWindowGoneHold(reason: err.localizedDescription)
     }
 
     /// The AVAssetWriter failed: nothing more will be written to this file, so stop instead of
@@ -477,14 +486,73 @@ final class RecordingController {
         guard case .window(let id, _)? = currentSource else { return }
         if let f = ShareDetector.windowFrame(id) { lastWindowFrame = f }
         if ShareDetector.windowInfo(id) == nil {
-            // The window we were recording is gone.
-            if let w = pick.window {
-                rollSegment(to: .window(w.id, w.title), reason: "recorded window disappeared")
-            } else {
-                let display = call.windowFrame.map { WindowPicker.display(containing: $0) } ?? CGMainDisplayID()
-                rollSegment(to: .display(display), reason: "recorded window disappeared, no replacement")
-            }
+            // The window we were recording is gone — hold, do not fall back yet.
+            beginWindowGoneHold(reason: "recorded window disappeared")
         }
+    }
+
+    // MARK: window-gone hold
+
+    private func beginWindowGoneHold(reason: String) {
+        guard state == .recording, holdTimer == nil else { return }
+        if callOver {
+            if !loggedGoneAfterEnd {
+                loggedGoneAfterEnd = true
+                rlog("record: window gone (\(reason)) after call end — no fallback, waiting for stop")
+            }
+            return
+        }
+        holdReason = reason
+        EventLog.shared.log("window_gone_hold", [
+            "recording_id": recordingId ?? "", "reason": reason, "seconds": Self.WINDOW_GONE_HOLD,
+            "video_stopped": videoStopped,
+        ], summary: "record: recorded window gone (\(reason)) — holding \(Int(Self.WINDOW_GONE_HOLD)) s for a call end before falling back")
+        holdTimer = Timer.scheduledTimer(withTimeInterval: Self.WINDOW_GONE_HOLD, repeats: false) { [weak self] _ in
+            self?.holdElapsed()
+        }
+        holdTimer?.tolerance = 0.2
+    }
+
+    /// The call this recording belongs to has ended (main.swift, before the grace logic).
+    /// Cancels a pending window-gone hold so no display fallback can follow a call end.
+    func noteCallEnded() {
+        guard state == .recording || state == .starting else { return }
+        callOver = true
+        if holdTimer != nil {
+            holdTimer?.invalidate(); holdTimer = nil
+            EventLog.shared.log("window_gone_held", [
+                "recording_id": recordingId ?? "", "outcome": "call_ended", "reason": holdReason,
+            ], summary: "record: window gone and the call ended — no fallback, ending normally")
+        }
+    }
+
+    private func holdElapsed() {
+        holdTimer = nil
+        guard state == .recording, !callOver else { return }
+        // The window is gone but the call is still live (a popped-out window was closed, the
+        // app re-created its window, …): today's fallback — the call window if there is a new
+        // one, else the display the old one was on.
+        errorRolls += 1
+        guard errorRolls <= 3 else {
+            onError?("Recording interrupted: the window we were recording went away repeatedly.")
+            stop(reason: "window gone repeatedly")
+            return
+        }
+        var target: Source
+        if let call, call.pid > 0, let w = WindowPicker.pick(kind: call.kind, pid: call.pid).window,
+           case .window(let oldId, _)? = currentSource, w.id != oldId {
+            target = .window(w.id, w.title)
+        } else {
+            let display = lastWindowFrame.map { WindowPicker.display(containing: $0) }
+                ?? call?.windowFrame.map { WindowPicker.display(containing: $0) } ?? CGMainDisplayID()
+            target = .display(display)
+        }
+        EventLog.shared.log("window_gone_held", [
+            "recording_id": recordingId ?? "", "outcome": "fallback", "reason": holdReason,
+            "target": target.json, "attempt": errorRolls,
+        ], summary: "record: window gone and the call is still live — falling back to \(target.label)")
+        onError?("The window we were recording went away — recording \(target.label) instead.")
+        rollSegment(to: target, reason: "window gone, call still live (\(holdReason))")
     }
 
     // MARK: stop
@@ -492,13 +560,19 @@ final class RecordingController {
     /// Idempotent. The 0.1.x double-stop ("Failed to stop a stream that is already stopped")
     /// came from the stream-error path calling back into stop while stop was already running;
     /// `state` and `videoStopped` are the guards.
-    func stop(reason: String) {
+    ///
+    /// The teardown (stopCapture ×2, writer finish) runs on a DETACHED task, never on the main
+    /// actor: applicationWillTerminate blocks the main thread waiting for it (0.2.3), and a
+    /// main-actor task can never run while the main thread is blocked. `onFinalised` fires
+    /// from that task the moment the file is complete; `onStopped` follows on the main queue.
+    func stop(reason: String, onFinalised: (() -> Void)? = nil) {
         guard state == .recording || state == .starting else {
             rlog("record: stop ignored (state=\(state.rawValue), reason=\(reason))")
             return
         }
         state = .stopping
         resolveTimer?.invalidate(); resolveTimer = nil
+        holdTimer?.invalidate(); holdTimer = nil
         let id = recordingId ?? ""
         let started = startedAt ?? Date()
         let lastIndex = segmentIndex
@@ -519,7 +593,7 @@ final class RecordingController {
         micActive = false
 
         willStopOwnStreams?((wasStopped ? 0 : 1) + (aStream != nil ? 1 : 0))
-        Task { @MainActor in
+        Task.detached { [self] in
             if let vStream, !wasStopped { try? await vStream.stopCapture() }
             if let aStream { try? await aStream.stopCapture() }
             if let w {
@@ -545,7 +619,6 @@ final class RecordingController {
                 "segments": self.segments.count, "files": files,
                 "mic_buffers": micBuffers, "mic_peak": Double(micPeak),
             ], summary: "record: stopped \(id) (\(reason)) — \(self.segments.count) segment(s), \(secs)s, \(bytes) bytes, mic buffers \(micBuffers)")
-            self.state = .idle
             let saved: [String: Any] = [
                 "recording_id": id,
                 "path": files.first as Any,
@@ -555,9 +628,13 @@ final class RecordingController {
                 "segments": self.segments.count,
                 "call": self.call?.json as Any,
             ]
-            self.call = nil
-            self.currentSource = nil
-            self.onStopped?(saved)
+            onFinalised?()
+            DispatchQueue.main.async {
+                self.state = .idle
+                self.call = nil
+                self.currentSource = nil
+                self.onStopped?(saved)
+            }
         }
     }
 }

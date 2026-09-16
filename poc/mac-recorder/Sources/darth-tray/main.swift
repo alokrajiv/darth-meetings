@@ -3,7 +3,7 @@ import CoreGraphics
 import ServiceManagement
 import RecorderCore
 
-let VERSION = "0.2.2"
+let VERSION = "0.2.3"
 let WS_PORT: UInt16 = 47800
 let PWA_URL = URL(string: "https://meetings.darth-internal.trames.io/")!
 /// Seconds between "the call ended" and an automatic stop.
@@ -30,6 +30,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     let recorder = RecordingController()
 
     var clients = 0
+    /// SIGTERM (updater helper's fallback, `kill <pid>`, logout) → the same clean path as Quit.
+    var sigterm: DispatchSourceSignal?
+    /// Set in applicationWillTerminate: a recording finalised on the way out must not start
+    /// an upload (the process is about to die — the row would be stuck at "uploading") and
+    /// must not poke the updater (it would call terminate again).
+    var terminating = false
     var graceTimer: Timer?
     var graceDeadline: Date?
     var lastSaved: [String: Any]?
@@ -59,6 +65,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         RLog.openFile("~/Library/Logs/DarthRecorder/tray.log")
         rlog("darth-tray \(VERSION) starting, pid \(getpid()), bundle \(Bundle.main.bundleIdentifier ?? "none") at \(Bundle.main.bundlePath)")
         if offerMoveToApplications() { return }   // relaunching from /Applications
+        installSignalHandlers()
         buildMenu()
         EventLog.shared.log("app_launched", [
             "version": VERSION, "pid": getpid(), "bundle_path": Bundle.main.bundlePath,
@@ -184,10 +191,39 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         uploadPending()
     }
 
-    /// Quitting must take the `log stream` child with us.
+    /// Quitting must take the `log stream` child with us — and must finalise an in-flight
+    /// recording: a process that dies with SCK streams open leaves them orphaned in replayd
+    /// (six such streams from killed 0.1.x trays were found thrashing before the 2026-09-16
+    /// kernel panic). The teardown runs on a detached task, so blocking the main thread on a
+    /// semaphore is safe; 5 s cap so a wedged writer can never hold up Quit or the updater.
     func applicationWillTerminate(_ n: Notification) {
         shares.stop()
-        EventLog.shared.log("app_terminating", ["recording": recorder.isRecording])
+        terminating = true
+        let wasRecording = recorder.isRecording
+        var finalised = false
+        if wasRecording {
+            let started = Date()
+            let sem = DispatchSemaphore(value: 0)
+            rlog("terminating while recording — stopping the recording first")
+            recorder.stop(reason: "quit") { sem.signal() }
+            finalised = sem.wait(timeout: .now() + 5) == .success
+            rlog("terminate: recording \(finalised ? "finalised" : "NOT finalised (5 s cap)") in \(String(format: "%.1f", Date().timeIntervalSince(started))) s")
+        }
+        EventLog.shared.log("app_terminating", ["recording": wasRecording, "finalised": finalised])
+    }
+
+    /// Route SIGTERM through NSApp.terminate so applicationWillTerminate runs (a raw SIGTERM
+    /// would kill the process with the SCK streams still open).
+    func installSignalHandlers() {
+        signal(SIGTERM, SIG_IGN)
+        let src = DispatchSource.makeSignalSource(signal: SIGTERM, queue: .main)
+        src.setEventHandler { [weak self] in
+            rlog("SIGTERM received → terminating cleanly")
+            EventLog.shared.log("sigterm", ["recording": self?.recorder.isRecording ?? false])
+            NSApp.terminate(nil)
+        }
+        src.resume()
+        sigterm = src
     }
 
     // MARK: install location
@@ -457,6 +493,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         EventLog.shared.log("call_ended", call.json)
         broadcast("call_ended", ["call": call.json])
         if recorder.isRecording, let rc = recorder.call, rc.pid == call.pid, call.pid > 0 {
+            recorder.noteCallEnded()   // cancels a window-gone hold: no display fallback after a call end
             startGrace()
         } else if !recorder.isRecording {
             banner.hide()
@@ -528,6 +565,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // `recording` must stay a boolean here — the file info goes under `saved`.
         broadcast("recording_stopped", ["saved": saved])
         api.shipEvents()
+        if terminating {
+            rlog("recording \(id) saved on the way out — uploads at next launch")
+            return
+        }
         if willUpload {
             uploader.upload(recordingId: id)
         } else if !auth.signedIn && !id.isEmpty {
