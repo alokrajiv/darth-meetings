@@ -3,7 +3,7 @@ import CoreGraphics
 import ServiceManagement
 import RecorderCore
 
-let VERSION = "0.2.5"
+let VERSION = "0.2.6"
 let WS_PORT: UInt16 = 47800
 let PWA_URL = URL(string: "https://meetings.darth-internal.trames.io/")!
 /// Seconds between "the call ended" and an automatic stop.
@@ -117,6 +117,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         recorder.onError = { [weak self] msg in
             self?.banner.showMessage(title: "Recording problem", sub: msg, stoppable: self?.recorder.isRecording ?? false)
         }
+        recorder.onTrackHealth = { [weak self] track, ok in self?.trackHealthChanged(track, ok: ok) }
 
         auth.onChange = { [weak self] in
             self?.refreshMenu()
@@ -356,7 +357,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if recording, let since = recorder.startedAt {
             let secs = Int(Date().timeIntervalSince(since))
             let seg = recorder.segments.count
-            statusLine.title = String(format: "● Recording %@ · %02d:%02d%@", recorder.call.map { kindName($0.kind) } ?? "display", secs / 60, secs % 60, seg > 1 ? " · part \(seg)" : "")
+            statusLine.title = String(format: "● Recording %@ · %02d:%02d%@ · %@", recorder.call.map { kindName($0.kind) } ?? "display", secs / 60, secs % 60, seg > 1 ? " · part \(seg)" : "", recorder.healthLine())
         } else if let c = detector.active.values.sorted(by: { $0.startedAt < $1.startedAt }).first {
             statusLine.title = "\(kindName(c.kind)) in progress — \(c.appName)"
         } else {
@@ -584,10 +585,34 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func recordingStarted() {
         updateShareWatcher()
         refreshMenu()
-        banner.showRecording(label: recorder.call.map { kindName($0.kind) } ?? "display",
-                             since: recorder.startedAt ?? Date(), near: recordingFrame)
+        systemWarned = false
+        showRecordingBanner()
         tick()
         broadcast("recording_started")
+    }
+
+    func showRecordingBanner() {
+        banner.showRecording(label: recorder.call.map { kindName($0.kind) } ?? "display",
+                             since: recorder.startedAt ?? Date(), near: recordingFrame) { [weak self] in
+            self?.recorder.healthLine() ?? "Darth Recorder"
+        }
+    }
+
+    /// Once per recording: system audio silent past the threshold → a warning that stays until
+    /// dismissed (the recording itself continues). Mic and video only change the tick + event.
+    var systemWarned = false
+    func trackHealthChanged(_ track: String, ok: Bool) {
+        guard recorder.isRecording else { return }
+        if track == "system", !ok, !systemWarned {
+            systemWarned = true
+            banner.showMessage(title: "No system audio is being captured",
+                               sub: "The other side will be missing from this recording — check the call app's audio output and this Mac's sound settings.",
+                               accent: .warning, stoppable: true, near: recordingFrame, autoHide: nil)
+        } else if track == "system", ok, systemWarned {
+            // Back: replace the warning with the normal recording pill.
+            showRecordingBanner()
+        }
+        broadcast("track_health", ["track": track, "ok": ok])
     }
 
     func stopRecording(reason: String) {
@@ -663,8 +688,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func keepRecording() {
         cancelGrace(reason: "user kept recording")
         if recorder.isRecording {
-            banner.showRecording(label: recorder.call.map { kindName($0.kind) } ?? "display",
-                                 since: recorder.startedAt ?? Date(), near: recordingFrame)
+            showRecordingBanner()
         } else {
             banner.hide()
         }
@@ -697,6 +721,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             d["segment"] = recorder.segments.count
             d["mic"] = recorder.micActive
             d["options"] = recorder.options.json
+            d["audio"] = recorder.healthJSON()
         }
         if let deadline = graceDeadline {
             d["stopping_in"] = max(0, Int(deadline.timeIntervalSinceNow.rounded()))

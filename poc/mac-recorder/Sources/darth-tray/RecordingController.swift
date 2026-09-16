@@ -72,6 +72,9 @@ final class RecordingController {
     var onSegment: ((Int, String) -> Void)?
     var onStopped: (([String: Any]) -> Void)?
     var onError: ((String) -> Void)?
+    /// 0.2.6 audio health: a track went silent past its threshold (`ok == false`) or came back.
+    /// Main queue. track ∈ "system" | "mic" | "video".
+    var onTrackHealth: ((String, Bool) -> Void)?
     /// Called before we tear our own SCK streams down, so the share detector can ignore the
     /// teardown lines they produce.
     var willStopOwnStreams: ((Int) -> Void)?
@@ -117,6 +120,126 @@ final class RecordingController {
     private var callOver = false
     private var loggedGoneAfterEnd = false
 
+    // MARK: audio/video health (0.2.6)
+    /// The other side is never quiet for 30 s on a real call; people do listen quietly for 3 min.
+    static let SYSTEM_SILENT_S: TimeInterval = 30
+    static let MIC_SILENT_S: TimeInterval = 180
+    static let VIDEO_STALL_S: TimeInterval = 10
+    private var healthTimer: Timer?
+    private var systemStreamFailed: String?
+    private var streamFailure = false
+    private var lastVideoAt = Date()
+    private var lastVideoCount = -1
+    private var lastVideoWriter: ObjectIdentifier?
+    private var videoFramesTotal = 0
+    private var videoDupTotal = 0
+    private var flags: [String: Bool] = [:]   // track → ok, transitions drive events/callback
+    private var healthTicks = 0
+    private var micDenied = false
+
+    var systemMeter: LevelMeter { audioForwarder.meter }
+    var micMeter: LevelMeter? { mic?.meter }
+
+    private func videoAliveCount() -> Int {
+        guard let w = currentWriter() else { return lastVideoCount }
+        return w.videoFrames + w.duplicatedFrames + w.idleFrames + w.droppedVideo
+    }
+
+    /// One pass per second while recording: fold counters, compute the three ticks, fire
+    /// transitions (events + callback), log a health line every 60 s.
+    private func healthTick() {
+        guard state == .recording else { return }
+        healthTicks += 1
+        let now = Date()
+        if let w = currentWriter() {
+            let wid = ObjectIdentifier(w)
+            let n = videoAliveCount()
+            if wid != lastVideoWriter || n != lastVideoCount { lastVideoAt = now }
+            lastVideoWriter = wid; lastVideoCount = n
+        }
+        let h = health()
+        for (track, ok) in [("video", h.videoOK), ("system", h.systemOK), ("mic", h.micOK)] {
+            guard let ok else { continue }
+            let prev = flags[track] ?? true
+            flags[track] = ok
+            guard ok != prev else { continue }
+            let meter = track == "system" ? systemMeter : micMeter
+            let payload: [String: Any] = [
+                "recording_id": recordingId ?? "", "track": track,
+                "silent_s": track == "video" ? Int(now.timeIntervalSince(lastVideoAt)) : Int(meter?.secondsSinceAudible ?? 0),
+                "level": meter.map { Double($0.levelDb) } ?? NSNull(),
+                "stream_alive": track == "system" ? (audioStream != nil) : (track == "mic" ? (mic != nil) : !videoStopped),
+                "call": call?.json ?? NSNull(),
+            ]
+            EventLog.shared.log(ok ? "audio_resumed" : "audio_silent", payload,
+                                summary: "health: \(track) \(ok ? "back" : "SILENT/STALLED") — \(healthLine())")
+            onTrackHealth?(track, ok)
+        }
+        if healthTicks % 60 == 1 { rlog("health: \(healthLine()) · \(healthDetail())") }
+    }
+
+    struct Health { var videoOK: Bool?; var systemOK: Bool?; var micOK: Bool? }
+
+    /// nil = the track was not requested. system ✗ needs a live call (a display recording with
+    /// nothing playing is legitimately silent) unless the stream itself failed.
+    func health() -> Health {
+        var h = Health()
+        guard state == .recording else { return h }
+        h.videoOK = !videoStopped && Date().timeIntervalSince(lastVideoAt) < Self.VIDEO_STALL_S
+        if options.systemAudio {
+            if audioStream == nil { h.systemOK = false }
+            else if call != nil && !callOver { h.systemOK = systemMeter.secondsSinceAudible < Self.SYSTEM_SILENT_S }
+            else { h.systemOK = true }
+        }
+        if options.mic {
+            if let m = mic { h.micOK = m.meter.secondsSinceAudible < Self.MIC_SILENT_S } else { h.micOK = false }
+        }
+        return h
+    }
+
+    /// "video ✓ · mic ✓ · system ✗" — the banner sub line and the menu.
+    func healthLine() -> String {
+        let h = health()
+        var parts: [String] = []
+        func tick(_ ok: Bool?) -> String { ok == nil ? "–" : (ok! ? "✓" : "✗") }
+        parts.append("video \(tick(h.videoOK))")
+        if options.mic { parts.append("mic \(tick(h.micOK))") }
+        if options.systemAudio {
+            // Quiet system audio outside a call is neutral, not a fault.
+            let quiet = audioStream != nil && !(call != nil && !callOver) && !systemMeter.audible
+            parts.append(quiet ? "system ·" : "system \(tick(h.systemOK))")
+        }
+        return parts.joined(separator: " · ")
+    }
+
+    private func healthDetail() -> String {
+        var s = "video frames=\(videoFramesTotal + (currentWriter()?.videoFrames ?? 0)) stall=\(Int(Date().timeIntervalSince(lastVideoAt)))s"
+        if options.systemAudio { s += " · system \(audioStream == nil ? "NO STREAM" : String(format: "%.0f dB", systemMeter.levelDb)) silent=\(Int(systemMeter.secondsSinceAudible))s bufs=\(systemMeter.buffers)" }
+        if options.mic { s += " · mic \(mic == nil ? "NONE" : String(format: "%.0f dB", micMeter!.levelDb)) silent=\(Int(micMeter?.secondsSinceAudible ?? 0))s bufs=\(micMeter?.buffers ?? 0)" }
+        return s
+    }
+
+    /// For the ws status payload: `audio: {system:{…}, mic:{…}, video:{…}}`.
+    func healthJSON() -> [String: Any] {
+        let h = health()
+        var d: [String: Any] = [
+            "video": ["ok": h.videoOK ?? NSNull(), "frames": videoFramesTotal + (currentWriter()?.videoFrames ?? 0),
+                      "silent_s": Int(Date().timeIntervalSince(lastVideoAt)), "stream_alive": !videoStopped] as [String: Any],
+            "line": healthLine(),
+        ]
+        if options.systemAudio {
+            var s = systemMeter.snapshot(); s["ok"] = h.systemOK ?? NSNull(); s["stream_alive"] = audioStream != nil
+            if let e = systemStreamFailed { s["error"] = e }
+            d["system"] = s
+        }
+        if options.mic {
+            var m = micMeter?.snapshot() ?? ["level_db": -120, "audible": false, "silent_s": 0, "audible_s": 0, "buffers": 0]
+            m["ok"] = h.micOK ?? NSNull(); m["stream_alive"] = mic != nil
+            d["mic"] = m
+        }
+        return d
+    }
+
     var isRecording: Bool { state == .recording || state == .starting }
 
     private func currentWriter() -> Recorder? {
@@ -150,6 +273,9 @@ final class RecordingController {
         callOver = false
         loggedGoneAfterEnd = false
         holdTimer?.invalidate(); holdTimer = nil
+        systemStreamFailed = nil; streamFailure = false; flags = [:]; healthTicks = 0; micDenied = false
+        videoFramesTotal = 0; videoDupTotal = 0; lastVideoCount = -1; lastVideoWriter = nil
+        audioForwarder.reset()
         let f = DateFormatter(); f.dateFormat = "yyyy-MM-dd HH.mm.ss"
         base = "\(f.string(from: now)) \(call?.kind.rawValue ?? "display")"
         let folder = Paths.recordings.appendingPathComponent(id, isDirectory: true)
@@ -220,6 +346,7 @@ final class RecordingController {
         MicCapture.requestPermission { [weak self] granted in
             guard let self else { return }
             EventLog.shared.log("mic_permission", ["granted": granted], summary: "record: microphone permission \(granted ? "granted" : "DENIED — recording without the mic track")")
+            self.micDenied = !granted
             var micFormat: AVAudioFormat?
             if granted {
                 let m = MicCapture()
@@ -269,8 +396,20 @@ final class RecordingController {
         videoStopped = false
         if options.systemAudio {
             audioForwarder.sink = { [weak self] sb in self?.currentWriter()?.appendAudio(sb, track: 0) }
-            audioStream = try? await Self.startAudioStream(displayID: displayID, output: audioForwarder)
-            if audioStream == nil { rlog("record: system-audio stream failed to start — video\(mic == nil ? " only" : " + mic only")") }
+            audioForwarder.onStopped = { [weak self] err in
+                DispatchQueue.main.async { self?.systemStreamStopped(err) }
+            }
+            do {
+                audioStream = try await Self.startAudioStream(displayID: displayID, output: audioForwarder)
+            } catch {
+                audioStream = nil
+                systemStreamFailed = error.localizedDescription
+                streamFailure = true
+                rlog("record: system-audio stream failed to start — \(error.localizedDescription) — video\(mic == nil ? " only" : " + mic only")")
+                EventLog.shared.log("system_audio_failed", [
+                    "recording_id": recordingId ?? "", "error": error.localizedDescription, "display_id": Int(displayID),
+                ], summary: "record: SYSTEM AUDIO FAILED TO START — \(error.localizedDescription)")
+            }
         } else {
             audioForwarder.sink = nil
             audioStream = nil
@@ -281,16 +420,30 @@ final class RecordingController {
 
         state = .recording
         errorRolls = 0
+        lastVideoAt = Date()
+        healthTimer?.invalidate()
+        healthTimer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in self?.healthTick() }
+        healthTimer?.tolerance = 0.2
         if case .window(let id, _) = source { lastWindowFrame = ShareDetector.windowFrame(id) }
         segments = [[
             "index": 1, "path": url.path, "source": source.json,
             "started_at": isoString(segmentStart), "bytes": 0, "seconds": 0,
         ]]
         persist(status: "recording")
+        // Which tracks REALLY started: a file track with no stream behind it stays silent.
+        var started: [String] = []
+        if options.systemAudio && audioStream != nil { started.append("system") }
+        if mic != nil { started.append("mic") }
         EventLog.shared.log("recording_started", [
             "recording_id": recordingId ?? "", "source": source.json, "width": w, "height": h,
-            "tracks": tracks.map { $0.name }, "path": url.path, "options": options.json,
-        ], summary: "record: \(recordingId ?? "") \(w)x\(h) tracks=[\(tracks.map { $0.name }.joined(separator: ","))] \(options.summary) → \(url.lastPathComponent)")
+            "tracks": tracks.map { $0.name }, "tracks_started": started,
+            "system_stream": options.systemAudio ? (audioStream != nil) : NSNull(),
+            "system_error": systemStreamFailed ?? NSNull(),
+            "mic_stream": options.mic ? (mic != nil) : NSNull(),
+            "mic_denied": micDenied,
+            "audio_display_id": Int(displayID),
+            "path": url.path, "options": options.json,
+        ], summary: "record: \(recordingId ?? "") \(w)x\(h) tracks=[\(tracks.map { $0.name }.joined(separator: ","))] started=[\(started.joined(separator: ","))] \(options.summary) → \(url.lastPathComponent)")
         onStarted?()
         startResolveTimer()
     }
@@ -351,8 +504,10 @@ final class RecordingController {
         cfg.excludesCurrentProcessAudio = true
         let s = SCStream(filter: SCContentFilter(display: d, excludingWindows: []), configuration: cfg, delegate: output)
         try s.addStreamOutput(output, type: .audio, sampleHandlerQueue: output.queue)
+        output.streamStartedAt = Date()
+        rlog("record: starting system audio stream — display \(d.displayID) (\(d.width)x\(d.height), asked for \(displayID)), \(cfg.sampleRate) Hz × \(cfg.channelCount) ch, excludesCurrentProcessAudio=\(cfg.excludesCurrentProcessAudio)")
         try await s.startCapture()
-        rlog("record: system audio stream on display \(d.displayID)")
+        rlog("record: system audio stream on display \(d.displayID) started in \(Int(Date().timeIntervalSince(output.streamStartedAt ?? Date()) * 1000)) ms")
         return s
     }
 
@@ -401,6 +556,7 @@ final class RecordingController {
                 self.videoStopped = false
                 if let old {
                     await old.finish()
+                    self.videoFramesTotal += old.videoFrames; self.videoDupTotal += old.duplicatedFrames
                     self.closeSegment(index: oldIndex, url: old.url, started: oldStart, stats: old.stats)
                 }
                 self.persist(status: "recording")
@@ -450,6 +606,7 @@ final class RecordingController {
     private func videoStreamFailed(_ err: Error) {
         guard state == .recording else { return }
         videoStopped = true
+        streamFailure = true
         EventLog.shared.log("video_stream_error", [
             "recording_id": recordingId ?? "", "error": err.localizedDescription, "call_over": callOver,
         ], summary: "record: video stream died (\(err.localizedDescription))\(callOver ? " after call end — audio continues until stop" : " — holding for a call end")")
@@ -458,11 +615,25 @@ final class RecordingController {
         beginWindowGoneHold(reason: err.localizedDescription)
     }
 
+    /// The system-audio SCK stream died mid-recording (0.2.6: shipped as an event; before, one
+    /// tray.log line nobody saw). The recording continues with whatever tracks are left.
+    private func systemStreamStopped(_ err: Error) {
+        guard state == .recording else { return }
+        audioStream = nil
+        streamFailure = true
+        systemStreamFailed = err.localizedDescription
+        EventLog.shared.log("system_audio_stopped", [
+            "recording_id": recordingId ?? "", "error": err.localizedDescription,
+            "buffers": systemMeter.buffers, "level": Double(systemMeter.levelDb),
+        ], summary: "record: SYSTEM AUDIO STREAM STOPPED — \(err.localizedDescription) (after \(systemMeter.buffers) buffers)")
+    }
+
     /// The AVAssetWriter failed: nothing more will be written to this file, so stop instead of
     /// pretending to record (0.2.0 shipped one of these during testing — never again silently).
     private func writerFailed(_ err: Error) {
         guard state == .recording else { return }
         errorRolls += 1
+        streamFailure = true
         EventLog.shared.log("writer_failed", [
             "recording_id": recordingId ?? "", "error": String(describing: err), "attempt": errorRolls,
         ], summary: "record: WRITER FAILED — \(err.localizedDescription) (attempt \(errorRolls))")
@@ -624,6 +795,13 @@ final class RecordingController {
         state = .stopping
         resolveTimer?.invalidate(); resolveTimer = nil
         holdTimer?.invalidate(); holdTimer = nil
+        healthTimer?.invalidate(); healthTimer = nil
+        let endHealth = flags
+        let endLine = "video \(flags["video"].map { $0 ? "✓" : "✗" } ?? "–") · mic \(flags["mic"].map { $0 ? "✓" : "✗" } ?? "–") · system \(flags["system"].map { $0 ? "✓" : "✗" } ?? "–")"
+        let unwell = endHealth.values.contains(false) || streamFailure || systemStreamFailed != nil
+        let sysSnap = options.systemAudio ? systemMeter.snapshot() : nil
+        let micSnap = micMeter?.snapshot()
+        let sysStreamAlive = audioStream != nil
         let id = recordingId ?? ""
         let started = startedAt ?? Date()
         let lastIndex = segmentIndex
@@ -649,6 +827,7 @@ final class RecordingController {
             if let aStream { try? await aStream.stopCapture() }
             if let w {
                 await w.finish()
+                self.videoFramesTotal += w.videoFrames; self.videoDupTotal += w.duplicatedFrames
                 self.closeSegment(index: lastIndex, url: w.url, started: lastStart, stats: w.stats)
             }
             let secs = Int(Date().timeIntervalSince(started))
@@ -669,7 +848,18 @@ final class RecordingController {
                 "recording_id": id, "reason": reason, "seconds": secs, "bytes": bytes,
                 "segments": self.segments.count, "files": files,
                 "mic_buffers": micBuffers, "mic_peak": Double(micPeak),
-            ], summary: "record: stopped \(id) (\(reason)) — \(self.segments.count) segment(s), \(secs)s, \(bytes) bytes, mic buffers \(micBuffers)")
+                "mic_peak_db": micSnap?["peak_db"] ?? NSNull(), "mic_audible_s": micSnap?["audible_s"] ?? NSNull(),
+                "system_buffers": sysSnap?["buffers"] ?? NSNull(), "system_peak_db": sysSnap?["peak_db"] ?? NSNull(),
+                "system_audible_s": sysSnap?["audible_s"] ?? NSNull(), "system_stream": self.options.systemAudio ? sysStreamAlive : NSNull(),
+                "system_error": self.systemStreamFailed ?? NSNull(),
+                "video_frames": self.videoFramesTotal, "video_dup": self.videoDupTotal,
+                "health": endHealth, "health_line": endLine, "stream_failure": self.streamFailure,
+            ], summary: "record: stopped \(id) (\(reason)) — \(self.segments.count) segment(s), \(secs)s, \(bytes) bytes, mic buffers \(micBuffers), \(endLine), video frames \(self.videoFramesTotal)")
+            if unwell {
+                let lines = LogTail.excerpt()
+                EventLog.shared.log("log_excerpt", ["recording_id": id, "lines": lines, "why": endLine],
+                                    summary: "record: shipping \(lines.count) tray.log lines — recording ended with \(endLine)\(self.streamFailure ? " and a stream failure" : "")")
+            }
             let saved: [String: Any] = [
                 "recording_id": id,
                 "path": files.first as Any,
@@ -696,13 +886,34 @@ final class RecordingController {
 final class AudioForwarder: NSObject, SCStreamOutput, SCStreamDelegate {
     let queue = DispatchQueue(label: "recorder.system-audio")
     var sink: ((CMSampleBuffer) -> Void)?
+    /// Main-queue-agnostic; the controller hops to main.
+    var onStopped: ((Error) -> Void)?
+    private(set) var meter = LevelMeter()
+    var streamStartedAt: Date?
+    private var buffers = 0
+    private var unmeasured = 0
+
+    /// New meter per recording (the forwarder itself survives across recordings).
+    func reset() { meter = LevelMeter(); buffers = 0; unmeasured = 0; streamStartedAt = nil }
 
     func stream(_ stream: SCStream, didOutputSampleBuffer sb: CMSampleBuffer, of type: SCStreamOutputType) {
         guard type == .audio, sb.isValid else { return }
+        buffers += 1
+        if let m = LevelMeter.measure(sb) {
+            meter.note(peak: m.peak, rms: m.rms)
+        } else {
+            unmeasured += 1
+            if unmeasured == 1 { rlog("record: system audio buffer is not Float32 PCM — level meter off (buffers still counted)") }
+        }
+        if buffers == 1 {
+            let asbd = CMSampleBufferGetFormatDescription(sb).flatMap { CMAudioFormatDescriptionGetStreamBasicDescription($0)?.pointee }
+            rlog("record: first system audio buffer \(streamStartedAt.map { "\(Int(Date().timeIntervalSince($0) * 1000)) ms after start" } ?? "") — \(asbd.map { "\(Int($0.mSampleRate)) Hz × \($0.mChannelsPerFrame) ch, \($0.mBitsPerChannel)-bit\($0.mFormatFlags & kAudioFormatFlagIsFloat != 0 ? " float" : "")\($0.mFormatFlags & kAudioFormatFlagIsNonInterleaved != 0 ? " non-interleaved" : "")" } ?? "?"), \(CMSampleBufferGetNumSamples(sb)) frames, peak \(String(format: "%.1f", meter.peakDb)) dB")
+        }
         sink?(sb)
     }
 
     func stream(_ stream: SCStream, didStopWithError error: Error) {
         rlog("record: system-audio stream stopped: \(error.localizedDescription)")
+        onStopped?(error)
     }
 }

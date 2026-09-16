@@ -14,6 +14,36 @@ Native macOS side of Darth Meetings recording (the "Swift tray" angle from Darth
 the user switched it off in the menu (`loginItemUserChoice` in UserDefaults records an explicit choice;
 the default never overrides it). macOS may show "Darth Recorder was added as a login item" once.
 
+**0.2.6 (2026-09-16):**
+- **Live audio/video health.** `LevelMeter` (AudioHealth.swift) on the system track (inside
+  `AudioForwarder`) and the mic tap: per-buffer peak + RMS folded into a 5 s window, "audible" =
+  window RMS above −60 dBFS, seconds-since-audible and audible-seconds per track. The recording
+  banner's sub line is now `03:12 · video ✓ · mic ✓ · system ✓` (also the menu status line).
+  ✗ when: system silent ≥ 30 s **while a call is live** (`SYSTEM_SILENT_S`; outside a call quiet
+  system audio shows `system ·`, neutral) or the system stream failed/stopped; mic silent
+  ≥ 180 s (`MIC_SILENT_S`) or no mic; video no sample for 10 s (`VIDEO_STALL_S`). ws status
+  carries `audio: {system:{level_db, audible, silent_s, audible_s, peak_db, buffers, ok,
+  stream_alive}, mic:{…}, video:{ok, frames, silent_s, stream_alive}, line}`; broadcast
+  `track_health {track, ok}` on transitions.
+- **Warn once.** System ✗ → banner "No system audio is being captured — the other side will be
+  missing" (warning, Stop button, stays until dismissed; once per recording); when audio comes
+  back the recording pill returns. Events on every transition: `audio_silent` /
+  `audio_resumed {track, silent_s, level, stream_alive, call}`. Mic/video only tick + event.
+- **Diagnostics that used to be tray.log-only now ship as events:** `system_audio_failed
+  {error, display_id}` when the SCK audio stream cannot start, `system_audio_stopped {error,
+  buffers, level}` on `didStopWithError`; `recording_started` carries `tracks_started`,
+  `system_stream`, `system_error`, `mic_stream`, `mic_denied`, `audio_display_id`;
+  `recording_stopped` adds `system_buffers/peak_db/audible_s`, `mic_peak_db/audible_s`,
+  `video_frames/dup`, `health`, `health_line`, `stream_failure`. When a recording ends with any
+  ✗ or a stream failure, `log_excerpt {lines}` ships the last 60 tray.log lines (≤ 8 KB).
+- **More logging:** audio stream config (display, rate, channels, excludesCurrentProcessAudio),
+  start latency, first system/mic buffer timing + format + peak, a `health:` line every 60 s.
+- Background: Atira's 53-min Teams call (recording 58759a71) had a system track silent for the
+  whole call; nobody knew until AssemblyAI said "no spoken audio".
+- Verified 2026-09-16: with the Mac's output volume at 0, `say` still reached the system track
+  at ≈ −14 dBFS — ScreenCaptureKit taps before the output-volume stage, so a muted Mac does NOT
+  explain a silent system track.
+
 **0.2.5 (2026-09-16):**
 - **Updates land within minutes.** The updater checks every **5 min** (`Updater.defaultInterval`,
   was 6 h; `DARTH_TRAY_UPDATE_INTERVAL` still overrides; first check still 30 s after launch).

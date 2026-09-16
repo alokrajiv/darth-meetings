@@ -16,6 +16,9 @@ final class MicCapture {
     var onBuffer: ((CMSampleBuffer) -> Void)?
     private(set) var buffersSeen = 0
     private(set) var peak: Float = 0
+    /// Level meter (0.2.6): window RMS, audible flag, seconds since audible.
+    let meter = LevelMeter()
+    private var startedAt = Date()
 
     static var authorization: AVAuthorizationStatus { AVCaptureDevice.authorizationStatus(for: .audio) }
 
@@ -42,18 +45,22 @@ final class MicCapture {
         input.installTap(onBus: 0, bufferSize: 2048, format: fmt) { [weak self] buf, when in
             guard let self else { return }
             self.buffersSeen += 1
-            if let ch = buf.floatChannelData?[0] {
-                var m: Float = 0
-                for i in 0..<Int(buf.frameLength) { m = max(m, abs(ch[i])) }
-                self.peak = max(self.peak, m)
+            if let m = LevelMeter.measure(buf) {
+                self.peak = max(self.peak, m.peak)
+                self.meter.note(peak: m.peak, rms: m.rms)
+            }
+            if self.buffersSeen == 1 {
+                rlog("mic: first buffer \(Int(Date().timeIntervalSince(self.startedAt) * 1000)) ms after start — \(Int(buf.format.sampleRate)) Hz × \(buf.format.channelCount) ch, \(buf.frameLength) frames")
             }
             guard let sb = MicCapture.sampleBuffer(from: buf, when: when) else { return }
             self.onBuffer?(sb)
         }
         tapped = true
+        startedAt = Date()
         engine.prepare()
         try engine.start()
-        rlog("mic: capturing \(Int(fmt.sampleRate)) Hz × \(fmt.channelCount) ch")
+        let dev = AVCaptureDevice.default(for: .audio)
+        rlog("mic: capturing \(Int(fmt.sampleRate)) Hz × \(fmt.channelCount) ch from \(dev?.localizedName ?? "default input")")
     }
 
     func stop() {

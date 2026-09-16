@@ -70,7 +70,8 @@ final class BannerController {
     }
 
     /// Recording: compact pill with the clock and Stop, stays for the whole recording.
-    func showRecording(label: String, since: Date, near frame: CGRect?) {
+    /// `detail` (0.2.6) is asked every second for the health ticks ("video ✓ · mic ✓ · system ✗").
+    func showRecording(label: String, since: Date, near frame: CGRect?, detail: (() -> String)? = nil) {
         set(symbol: "record.circle.fill", accent: .recording, title: "Recording \(label)", sub: "00:00 · Darth Recorder")
         primary.isHidden = true
         secondary.isHidden = false
@@ -79,7 +80,8 @@ final class BannerController {
         tickTimer?.invalidate()
         let update = { [weak self] in
             let s = Int(Date().timeIntervalSince(since))
-            self?.subLabel.stringValue = String(format: "%02d:%02d · Darth Recorder", s / 60, s % 60)
+            let tail = detail?() ?? "Darth Recorder"
+            self?.subLabel.stringValue = String(format: "%02d:%02d · %@", s / 60, s % 60, tail)
         }
         update()
         tickTimer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { _ in update() }
@@ -126,7 +128,7 @@ final class BannerController {
 
     /// Transient message. `stoppable` adds a Stop button — every warning shown while we are
     /// recording must have one.
-    func showMessage(title: String, sub: String, accent: Accent = .warning, stoppable: Bool = false, near frame: CGRect? = nil) {
+    func showMessage(title: String, sub: String, accent: Accent = .warning, stoppable: Bool = false, near frame: CGRect? = nil, autoHide: TimeInterval? = 10) {
         tickTimer?.invalidate()
         set(symbol: accent == .success ? "checkmark.circle.fill" : "exclamationmark.triangle.fill", accent: accent, title: title, sub: sub)
         primary.isHidden = !stoppable
@@ -137,7 +139,7 @@ final class BannerController {
         secondary.isHidden = false
         secondary.title = "OK"
         secondary.target = self; secondary.action = #selector(dismissTapped)
-        present(compact: false, autoHideAfter: 10, near: frame)
+        present(compact: false, autoHideAfter: autoHide, near: frame)
         EventLog.shared.log("banner_shown", ["kind": "message", "title": title, "sub": sub])
     }
 
