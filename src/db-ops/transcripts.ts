@@ -847,6 +847,18 @@ export async function resetForIngestRetry(userId: string, placeholderId: string)
   return rows.length > 0;
 }
 
+/** Success after a retry: drop the marker (a `|| {ingestFailure: null}` merge
+ * would leave a JSON null behind, which every `->>` filter treats as absent
+ * but which still shows in exports). */
+export async function clearIngestFailure(userId: string, assemblyaiId: string): Promise<void> {
+  await sql`
+    UPDATE ${sql(SCHEMA)}.transcripts
+    SET gmeet_context = gmeet_context - 'ingestFailure'
+    WHERE user_id = ${userId} AND assemblyai_id = ${assemblyaiId}
+  `;
+  publishEvent({ kind: 'meta', assemblyaiId });
+}
+
 /** Kept-failure rows whose backoff has elapsed, oldest due first. */
 export async function listIngestRetryRows(limit: number): Promise<TranscriptRow[]> {
   return sql<TranscriptRow[]>`

@@ -1,9 +1,9 @@
 import 'server-only';
 import {
+  clearIngestFailure,
   getForUser,
   listIngestRetryRows,
   markIngestFailed,
-  mergeGmeetContextForUser,
   resetForIngestRetry,
   updateUploadProgress,
   type TranscriptRow,
@@ -78,9 +78,7 @@ export async function retryIngest(
         gmeetContext: fresh.gmeet_context,
         placeholderAssemblyaiId: fresh.assemblyai_id,
       });
-      await mergeGmeetContextForUser(fresh.user_id, out.assemblyai_id, {
-        ingestFailure: null as unknown as undefined,
-      });
+      await clearIngestFailure(fresh.user_id, out.assemblyai_id);
       const relinked = await relinkRecordingTranscript(fresh.assemblyai_id, out.assemblyai_id).catch(
         () => 0
       );
