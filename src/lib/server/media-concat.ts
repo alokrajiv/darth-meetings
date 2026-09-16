@@ -42,6 +42,10 @@ export async function concatMediaToTemp(filenames: string[]): Promise<string> {
         '-f', 'concat',
         '-safe', '0',
         '-i', listPath,
+        // Every stream, not ffmpeg's one-per-type default: Darth Recorder
+        // segments carry two audio tracks (system + mic) and the default
+        // selection silently dropped the mic (2026-09-16).
+        '-map', '0',
         '-c', 'copy',
         '-movflags', '+faststart',
         '-y',

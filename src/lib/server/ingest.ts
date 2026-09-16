@@ -17,6 +17,7 @@ import { getForUser as getUserVocab } from '@/db-ops/user-vocab';
 import { getCurrentPayload as getOrgVocabPayload } from '@/db-ops/org-vocab';
 import { mergeVocabs } from '@/lib/server/vocab-merge';
 import { sniffMediaExtension } from '@/lib/server/video-frames';
+import { normalizeMultiTrack } from '@/lib/server/multitrack';
 import { autoAttachSeries } from '@/lib/server/series-attach';
 import type { GmeetContext } from '@/lib/format';
 
@@ -72,13 +73,34 @@ export async function ingestLocalAudio(
   tempFilename: string,
   opts: IngestOptions
 ): Promise<TranscriptRow> {
+  // Multi-track recordings (Darth Recorder: system + mic as separate tracks)
+  // must not go to AssemblyAI raw — it hears one track. Mix first; the mix
+  // becomes the stored file's default track and the (small) AAI upload.
+  // Non-fatal: on any ffmpeg failure the raw file goes up as before.
+  let aaiSourceFilename = tempFilename;
+  let mixFilename: string | null = null;
+  try {
+    const mt = await normalizeMultiTrack(tempFilename);
+    if (mt.mixed) {
+      aaiSourceFilename = mt.aaiSource;
+      mixFilename = mt.aaiSource;
+      console.log(`[ingest] ${tempFilename}: ${mt.tracks} audio tracks → mixed for transcription + default playback track`);
+    }
+  } catch (error) {
+    console.warn('[ingest] multi-track normalisation failed (uploading raw file):', error);
+  }
+
   let audioUrl: string;
   try {
     // Path input → the SDK streams the file from disk.
-    audioUrl = await uploadFile(resolveAudioPath(tempFilename));
+    audioUrl = await uploadFile(resolveAudioPath(aaiSourceFilename));
   } catch (error) {
     await deleteAudioFile(tempFilename);
     throw new IngestError('aai-upload', 'Upload to AssemblyAI failed', error);
+  } finally {
+    // AAI has the bytes (or the upload failed); the mix lives on inside the
+    // re-muxed stored file, so the standalone copy is not needed any more.
+    if (mixFilename) await deleteAudioFile(mixFilename).catch(() => {});
   }
 
   // Merge org + user vocab and pass to AAI as keyterms_prompt / custom_spelling.

@@ -127,6 +127,9 @@ async function transcode(src: string, out: string): Promise<void> {
     const args = [
       '-y', '-loglevel', 'error',
       '-i', src,
+      // The FIRST audio track, not ffmpeg's most-channels pick: multi-track
+      // recordings carry their mix as track 0 (see multitrack.ts).
+      '-map', '0:a:0',
       '-vn', '-ac', '1', '-c:a', 'aac', '-b:a', '64k',
       '-movflags', '+faststart',
       '-f', 'mp4',
