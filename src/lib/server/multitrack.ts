@@ -45,12 +45,18 @@ export interface AudioStreamInfo {
   sampleRate: number;
   language: string | null;
   title: string | null;
+  handler: string | null;
 }
 
-/** Stream title stamped on the mix track so a second pass (ingest retry of a
- * kept-failure row) recognises an already-normalised file instead of mixing
+/** Stamped on the mix track (as the MP4 handler name — the mov muxer drops a
+ * per-stream `title`, verified 2026-09-16) so a second pass (ingest retry of
+ * a kept-failure row) recognises an already-normalised file instead of mixing
  * the mix back in with the raw tracks. */
 export const MIX_TRACK_TITLE = 'darth-mix';
+
+export function isMixTrack(s: AudioStreamInfo): boolean {
+  return s.handler === MIX_TRACK_TITLE || s.title === MIX_TRACK_TITLE;
+}
 
 export async function probeAudioStreams(filename: string): Promise<AudioStreamInfo[]> {
   const { stdout } = await execFileP(
@@ -58,7 +64,7 @@ export async function probeAudioStreams(filename: string): Promise<AudioStreamIn
     [
       '-v', 'error',
       '-select_streams', 'a',
-      '-show_entries', 'stream=index,channels,sample_rate:stream_tags=language,title',
+      '-show_entries', 'stream=index,channels,sample_rate:stream_tags=language,title,handler_name',
       '-of', 'json',
       resolveAudioPath(filename),
     ],
@@ -69,7 +75,7 @@ export async function probeAudioStreams(filename: string): Promise<AudioStreamIn
       index?: number;
       channels?: number;
       sample_rate?: string;
-      tags?: { language?: string; title?: string };
+      tags?: { language?: string; title?: string; handler_name?: string };
     }>;
   };
   return (parsed.streams ?? []).map((s, i) => ({
@@ -78,6 +84,7 @@ export async function probeAudioStreams(filename: string): Promise<AudioStreamIn
     sampleRate: Number(s.sample_rate ?? 48000) || 48000,
     language: s.tags?.language ?? null,
     title: s.tags?.title ?? null,
+    handler: s.tags?.handler_name ?? null,
   }));
 }
 
@@ -112,7 +119,7 @@ export async function normalizeMultiTrack(tempFilename: string): Promise<MultiTr
 
   // Already normalised (ingest retry of a kept-failure row): the mix is
   // track 0 — just pull it out for AssemblyAI, never mix again.
-  if (streams[0].title === MIX_TRACK_TITLE) {
+  if (isMixTrack(streams[0])) {
     try {
       await execFileP(
         'ffmpeg',
@@ -171,6 +178,7 @@ export async function normalizeMultiTrack(tempFilename: string): Promise<MultiTr
         '-map', '0:a',
         '-c', 'copy',
         '-disposition:a:0', 'default',
+        '-metadata:s:a:0', `handler_name=${MIX_TRACK_TITLE}`,
         '-metadata:s:a:0', `title=${MIX_TRACK_TITLE}`,
         ...clearDispositions,
         '-movflags', '+faststart',
