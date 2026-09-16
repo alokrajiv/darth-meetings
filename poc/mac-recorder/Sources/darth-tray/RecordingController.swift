@@ -39,8 +39,27 @@ final class RecordingController {
         }
     }
 
+    /// What the user asked for (0.2.4 Record… dialog / ws `start` fields). The defaults are
+    /// exactly the 0.2.3 behaviour: auto-picked source, both audio tracks, upload when signed in.
+    struct RecordOptions {
+        /// nil = auto: the call window when there is a call, else the main display.
+        var source: Source? = nil
+        var systemAudio = true
+        var mic = true
+        /// false = keep the file on this Mac: no automatic upload (the PWA / menu can still push it).
+        var upload = true
+
+        var json: [String: Any] {
+            ["source": source?.json ?? "auto", "system_audio": systemAudio, "mic": mic, "upload": upload]
+        }
+        var summary: String {
+            "audio=\(systemAudio ? "system" : "-")\(mic ? "+mic" : "") upload=\(upload)"
+        }
+    }
+
     private(set) var state: State = .idle
     private(set) var recordingId: String?
+    private(set) var options = RecordOptions()
     private(set) var startedAt: Date?
     private(set) var call: DetectedCall?
     private(set) var segments: [[String: Any]] = []
@@ -111,9 +130,16 @@ final class RecordingController {
     // MARK: start
 
     func start(call: DetectedCall?, displayOverride: CGDirectDisplayID? = nil) {
+        var o = RecordOptions()
+        if let d = displayOverride { o.source = .display(d) }
+        start(call: call, options: o)
+    }
+
+    func start(call: DetectedCall?, options: RecordOptions) {
         guard state == .idle else { rlog("record: start ignored, state=\(state.rawValue)"); return }
         state = .starting
         self.call = call
+        self.options = options
         let id = UUID().uuidString.lowercased()
         recordingId = id
         let now = Date()
@@ -132,8 +158,8 @@ final class RecordingController {
 
         // Where to point the camera.
         var source: Source
-        if let override = displayOverride {
-            source = .display(override)
+        if let chosen = options.source {
+            source = chosen
         } else if let call, call.pid > 0 {
             let pick = WindowPicker.pick(kind: call.kind, pid: call.pid)
             WindowPicker.logCandidates(phase: "record", call: call, pick: pick)
@@ -149,7 +175,8 @@ final class RecordingController {
 
         EventLog.shared.log("recording_starting", [
             "recording_id": id, "source": source.json, "call": call?.json ?? NSNull(), "dir": folder.path,
-        ], summary: "record: starting \(id) on \(source.label)")
+            "options": options.json,
+        ], summary: "record: starting \(id) on \(source.label) (\(options.summary))")
 
         Registry.shared.insert([
             "id": id,
@@ -163,10 +190,32 @@ final class RecordingController {
             "transcript_id": NSNull(),
             "error": NSNull(),
             "matched": NSNull(),
+            "upload": options.upload,
             "needs_sync": true,
         ])
         api?.syncRecording(id, insert: true)
 
+        let begin: (AVAudioFormat?) -> Void = { [weak self] micFormat in
+            guard let self else { return }
+            Task { @MainActor in
+                do {
+                    try await self.beginCapture(source: source, micFormat: micFormat)
+                } catch {
+                    self.mic?.stop(); self.mic = nil; self.micActive = false
+                    self.state = .idle
+                    Registry.shared.update(id, ["status": "upload_failed", "error": "capture failed: \(error.localizedDescription)"])
+                    EventLog.shared.log("recording_failed", ["recording_id": id, "error": error.localizedDescription],
+                                        summary: "record: could not start — \(error.localizedDescription)")
+                    self.onError?(error.localizedDescription)
+                }
+            }
+        }
+        if !options.mic {
+            // Asked for no microphone: never touch the device, never show the permission prompt.
+            rlog("record: microphone off by request")
+            begin(nil)
+            return
+        }
         // Mic first: the permission prompt must not race the capture start.
         MicCapture.requestPermission { [weak self] granted in
             guard let self else { return }
@@ -184,20 +233,19 @@ final class RecordingController {
                     EventLog.shared.log("mic_failed", ["error": error.localizedDescription])
                 }
             }
-            Task { @MainActor in
-                do {
-                    try await self.beginCapture(source: source, micFormat: micFormat)
-                } catch {
-                    self.mic?.stop(); self.mic = nil; self.micActive = false
-                    self.state = .idle
-                    Registry.shared.update(id, ["status": "upload_failed", "error": "capture failed: \(error.localizedDescription)"])
-                    EventLog.shared.log("recording_failed", ["recording_id": id, "error": error.localizedDescription],
-                                        summary: "record: could not start — \(error.localizedDescription)")
-                    self.onError?(error.localizedDescription)
-                }
-            }
+            begin(micFormat)
         }
     }
+
+    /// The audio tracks of every segment, in file order, from the options: system first (when
+    /// wanted), then the mic (when captured). Track INDICES follow from this — see `micTrack`.
+    private func audioTracks(micFormat: AVAudioFormat?) -> [AudioTrackSpec] {
+        var tracks: [AudioTrackSpec] = options.systemAudio ? [.system] : []
+        if let micFormat { tracks.append(.mic(channels: Int(micFormat.channelCount), sampleRate: micFormat.sampleRate)) }
+        return tracks
+    }
+    /// Index of the mic track in the writer: 1 after the system track, 0 when there is none.
+    private var micTrack: Int { options.systemAudio ? 1 : 0 }
 
     @MainActor
     private func beginCapture(source: Source, micFormat: AVAudioFormat?) async throws {
@@ -205,10 +253,7 @@ final class RecordingController {
         let (w, h) = CaptureSession.pixelSize(of: filter)
         pinnedSize = (w, h)
 
-        var tracks: [AudioTrackSpec] = [.system]
-        if let micFormat {
-            tracks.append(.mic(channels: Int(micFormat.channelCount), sampleRate: micFormat.sampleRate))
-        }
+        let tracks = audioTracks(micFormat: micFormat)
         let url = segmentURL(1)
         let rec = try Recorder(url: url, width: w, height: h, fps: fps, audioTracks: tracks)
         rec.onStop = { [weak self] err in
@@ -222,10 +267,17 @@ final class RecordingController {
 
         videoStream = try await Self.startVideoStream(filter: filter, fps: fps, output: rec, size: (w, h))
         videoStopped = false
-        audioForwarder.sink = { [weak self] sb in self?.currentWriter()?.appendAudio(sb, track: 0) }
-        audioStream = try? await Self.startAudioStream(displayID: displayID, output: audioForwarder)
-        if audioStream == nil { rlog("record: system-audio stream failed to start — video + mic only") }
-        mic?.onBuffer = { [weak self] sb in self?.currentWriter()?.appendAudio(sb, track: 1) }
+        if options.systemAudio {
+            audioForwarder.sink = { [weak self] sb in self?.currentWriter()?.appendAudio(sb, track: 0) }
+            audioStream = try? await Self.startAudioStream(displayID: displayID, output: audioForwarder)
+            if audioStream == nil { rlog("record: system-audio stream failed to start — video\(mic == nil ? " only" : " + mic only")") }
+        } else {
+            audioForwarder.sink = nil
+            audioStream = nil
+            rlog("record: system audio off by request")
+        }
+        let micIndex = micTrack
+        mic?.onBuffer = { [weak self] sb in self?.currentWriter()?.appendAudio(sb, track: micIndex) }
 
         state = .recording
         errorRolls = 0
@@ -237,8 +289,8 @@ final class RecordingController {
         persist(status: "recording")
         EventLog.shared.log("recording_started", [
             "recording_id": recordingId ?? "", "source": source.json, "width": w, "height": h,
-            "tracks": tracks.map { $0.name }, "path": url.path,
-        ], summary: "record: \(recordingId ?? "") \(w)x\(h) tracks=[\(tracks.map { $0.name }.joined(separator: ","))] → \(url.lastPathComponent)")
+            "tracks": tracks.map { $0.name }, "path": url.path, "options": options.json,
+        ], summary: "record: \(recordingId ?? "") \(w)x\(h) tracks=[\(tracks.map { $0.name }.joined(separator: ","))] \(options.summary) → \(url.lastPathComponent)")
         onStarted?()
         startResolveTimer()
     }
@@ -320,8 +372,7 @@ final class RecordingController {
             do {
                 let (filter, _) = try await Self.filter(for: source)
                 let (w, h) = self.pinnedSize ?? CaptureSession.pixelSize(of: filter)
-                var tracks: [AudioTrackSpec] = [.system]
-                if let f = self.mic?.format { tracks.append(.mic(channels: Int(f.channelCount), sampleRate: f.sampleRate)) }
+                let tracks = self.audioTracks(micFormat: self.mic?.format)
                 let index = oldIndex + 1
                 let url = self.segmentURL(index)
                 let rec = try Recorder(url: url, width: w, height: h, fps: self.fps, audioTracks: tracks)
@@ -627,6 +678,7 @@ final class RecordingController {
                 "bytes": bytes,
                 "segments": self.segments.count,
                 "call": self.call?.json as Any,
+                "upload": self.options.upload,
             ]
             onFinalised?()
             DispatchQueue.main.async {

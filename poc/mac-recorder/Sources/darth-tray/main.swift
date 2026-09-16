@@ -3,11 +3,15 @@ import CoreGraphics
 import ServiceManagement
 import RecorderCore
 
-let VERSION = "0.2.3"
+let VERSION = "0.2.4"
 let WS_PORT: UInt16 = 47800
 let PWA_URL = URL(string: "https://meetings.darth-internal.trames.io/")!
 /// Seconds between "the call ended" and an automatic stop.
 let STOP_GRACE: TimeInterval = 60
+/// How often a failed upload is retried on its own (0.2.4). The server answers 502 whenever
+/// its transcription hand-off fails (AssemblyAI down / out of credit): the bytes stay on this
+/// Mac as `upload_failed` and must go up later without anyone clicking.
+let UPLOAD_RETRY_INTERVAL: TimeInterval = 30 * 60
 
 /// Menu-bar app "Darth Recorder".
 ///
@@ -52,7 +56,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     let shareLine = NSMenuItem(title: "", action: nil, keyEquivalent: "")
     let clientsLine = NSMenuItem(title: "", action: nil, keyEquivalent: "")
     let startItem = NSMenuItem(title: "Start recording", action: #selector(startFromMenu), keyEquivalent: "r")
-    let displayItem = NSMenuItem(title: "Record this display", action: #selector(recordDisplay), keyEquivalent: "")
+    let displayItem: NSMenuItem = {
+        let i = NSMenuItem(title: "Record… (choose screen, window & audio)", action: #selector(openRecordDialog), keyEquivalent: "R")
+        i.keyEquivalentModifierMask = [.command, .shift]
+        return i
+    }()
+    var retryTimer: Timer?
     let stopItem = NSMenuItem(title: "Stop recording", action: #selector(stopFromMenu), keyEquivalent: "s")
     let authItem = NSMenuItem(title: "Sign in to Darth Meetings…", action: #selector(toggleAuth), keyEquivalent: "")
     let uploadItem = NSMenuItem(title: "Upload recordings automatically", action: #selector(toggleAutoUpload), keyEquivalent: "")
@@ -189,6 +198,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             rlog("not signed in — recordings stay local until you sign in from the menu")
         }
         uploadPending()
+        retryTimer = Timer.scheduledTimer(withTimeInterval: UPLOAD_RETRY_INTERVAL, repeats: true) { [weak self] _ in
+            self?.retryFailedUploads()
+        }
+        retryTimer?.tolerance = 60
+    }
+
+    /// Every UPLOAD_RETRY_INTERVAL: push `upload_failed` rows that still have bytes on disk
+    /// (never capture-failed rows, which have no files). Signed in + auto-upload only, and
+    /// never a recording the user chose to keep on this Mac.
+    func retryFailedUploads() {
+        guard auth.signedIn, autoUpload else { return }
+        let rows = Registry.shared.retryableFailed().filter { row in
+            guard let id = row["id"] as? String else { return false }
+            return !uploader.isUploading(id)
+        }
+        guard !rows.isEmpty else { return }
+        for row in rows {
+            guard let id = row["id"] as? String else { continue }
+            EventLog.shared.log("upload_retry", ["recording_id": id, "error": row["error"] ?? NSNull()],
+                                summary: "upload: retrying \(id) (was: \((row["error"] as? String) ?? "?"))")
+            uploader.upload(recordingId: id)
+        }
     }
 
     /// Quitting must take the `log stream` child with us — and must finalise an in-flight
@@ -344,7 +375,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         authItem.title = auth.signingIn ? "Signing in…" : (auth.signedIn ? "Signed in as \(auth.email ?? "?") — sign out" : "Sign in to Darth Meetings…")
         authItem.isEnabled = !auth.signingIn
         uploadItem.state = autoUpload ? .on : .off
-        let pending = Registry.shared.pendingUpload().count
+        let pending = Registry.shared.pendingUpload(automatic: false).count
         pendingLine.title = pending == 0 ? "No recordings waiting to upload" : "Upload \(pending) recording\(pending == 1 ? "" : "s") now"
         pendingLine.isEnabled = pending > 0 && auth.signedIn
         loginItem.state = SMAppService.mainApp.status == .enabled ? .on : .off
@@ -416,7 +447,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// recording made while signed out goes up as soon as somebody signs in.
     func uploadPending(force: Bool = false) {
         guard auth.signedIn, force || autoUpload else { return }
-        for row in Registry.shared.pendingUpload() {
+        for row in Registry.shared.pendingUpload(automatic: !force) {
             guard let id = row["id"] as? String, !uploader.isUploading(id) else { continue }
             uploader.upload(recordingId: id)
         }
@@ -453,12 +484,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
     @objc func startFromMenu() { startRecording(for: detector.active.values.first) }
     @objc func stopFromMenu() { stopRecording(reason: "menu") }
-    /// Explicit "record everything on this screen" — the display the mouse is on.
-    @objc func recordDisplay() {
-        let mouse = NSEvent.mouseLocation
-        let screen = NSScreen.screens.first { NSMouseInRect(mouse, $0.frame, false) } ?? NSScreen.screens.first
-        let id = (screen?.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber)?.uint32Value ?? CGMainDisplayID()
-        startRecording(for: detector.active.values.first, displayOverride: id)
+    /// "Record…": the 0.2.4 panel — pick a display or window, system audio / mic / upload.
+    @objc func openRecordDialog() {
+        guard !recorder.isRecording else { return }
+        guard CGPreflightScreenCaptureAccess() else {
+            banner.showMessage(title: "Screen recording not allowed", sub: "Enable Darth Recorder in System Settings → Privacy & Security → Screen Recording.")
+            CGRequestScreenCaptureAccess()
+            return
+        }
+        let pids = detector.active.values.sorted { $0.startedAt < $1.startedAt }.map { $0.pid }.filter { $0 > 0 }
+        RecordDialog.shared.present(callPids: pids, signedIn: auth.signedIn, autoUpload: autoUpload) { [weak self] options in
+            guard let self, let options else { return }
+            self.startRecording(for: self.detector.active.values.first, options: options)
+        }
     }
 
     // MARK: calls
@@ -518,6 +556,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     // MARK: recording
 
     func startRecording(for call: DetectedCall?, displayOverride: CGDirectDisplayID? = nil) {
+        var o = RecordingController.RecordOptions()
+        if let d = displayOverride { o.source = .display(d) }
+        startRecording(for: call, options: o)
+    }
+
+    func startRecording(for call: DetectedCall?, options: RecordingController.RecordOptions) {
         guard !recorder.isRecording else { return }
         guard CGPreflightScreenCaptureAccess() else {
             banner.showMessage(title: "Screen recording not allowed", sub: "Enable Darth Recorder in System Settings → Privacy & Security → Screen Recording.")
@@ -525,7 +569,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             return
         }
         cancelGrace(reason: "new recording")
-        recorder.start(call: call, displayOverride: displayOverride)
+        if RecordDialog.shared.isOpen { RecordDialog.shared.cancel() }
+        recorder.start(call: call, options: options)
         refreshMenu()
     }
 
@@ -552,7 +597,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         updateShareWatcher()
         refreshMenu()
         let id = (saved["recording_id"] as? String) ?? ""
-        let willUpload = autoUpload && auth.signedIn && !id.isEmpty
+        let keepLocal = (saved["upload"] as? Bool) == false
+        let willUpload = autoUpload && auth.signedIn && !id.isEmpty && !keepLocal
         let path = (saved["path"] as? String).map { URL(fileURLWithPath: $0) }
         let secs = (saved["seconds"] as? Int) ?? 0
         if !auth.signedIn && !id.isEmpty {
@@ -560,7 +606,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                               sub: "It is on this Mac only until you sign in to Darth Meetings.") { [weak self] in self?.auth.signIn() }
         } else {
             banner.showSaved(path ?? Paths.recordings, seconds: secs,
-                             segments: (saved["segments"] as? Int) ?? 1, uploading: willUpload)
+                             segments: (saved["segments"] as? Int) ?? 1, uploading: willUpload, keptLocal: keepLocal)
         }
         // `recording` must stay a boolean here — the file info goes under `saved`.
         broadcast("recording_stopped", ["saved": saved])
@@ -571,6 +617,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         if willUpload {
             uploader.upload(recordingId: id)
+        } else if keepLocal {
+            rlog("recording \(id) kept on this Mac by request — not uploaded")
         } else if !auth.signedIn && !id.isEmpty {
             rlog("recording \(id) stays local — not signed in")
         }
@@ -644,6 +692,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             d["recording_id"] = recorder.recordingId ?? NSNull()
             d["segment"] = recorder.segments.count
             d["mic"] = recorder.micActive
+            d["options"] = recorder.options.json
         }
         if let deadline = graceDeadline {
             d["stopping_in"] = max(0, Int(deadline.timeIntervalSinceNow.rounded()))
@@ -664,9 +713,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         EventLog.shared.log("ws_command", ["cmd": cmd, "args": obj.filter { $0.key != "cmd" }])
         switch cmd {
         case "start":
+            // {cmd:"start", pid?, display_id?, window_id?, system_audio?, mic?, upload?} —
+            // every field optional; absent = the automatic behaviour (0.2.4).
             let pid = (obj["pid"] as? Int).map { pid_t($0) }
             let call = pid.flatMap { detector.active[$0] } ?? detector.active.values.first
-            startRecording(for: call)
+            var o = RecordingController.RecordOptions()
+            if let wid = obj["window_id"] as? Int {
+                o.source = .window(CGWindowID(wid), ShareDetector.windowInfo(CGWindowID(wid))?.title ?? "")
+            } else if let did = obj["display_id"] as? Int {
+                o.source = .display(CGDirectDisplayID(did))
+            }
+            if let v = obj["system_audio"] as? Bool { o.systemAudio = v }
+            if let v = obj["mic"] as? Bool { o.mic = v }
+            if let v = obj["upload"] as? Bool { o.upload = v }
+            startRecording(for: call, options: o)
+        case "open_record_dialog":
+            // Test hook: same as the menu item. `auto_cancel_s` closes it again unattended.
+            openRecordDialog()
+            if let secs = obj["auto_cancel_s"] as? Double, secs > 0 {
+                DispatchQueue.main.asyncAfter(deadline: .now() + secs) { RecordDialog.shared.cancel() }
+            }
+        case "retry_failed_uploads": retryFailedUploads()   // test hook: the 30-minute timer's body
         case "stop": stopRecording(reason: "pwa")
         case "status": broadcast("status")
         case "simulate_call":

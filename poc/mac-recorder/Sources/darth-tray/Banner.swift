@@ -107,11 +107,13 @@ final class BannerController {
         EventLog.shared.log("banner_shown", ["kind": "grace", "seconds": secondsLeft])
     }
 
-    func showSaved(_ url: URL, seconds: Int, segments: Int, uploading: Bool) {
+    func showSaved(_ url: URL, seconds: Int, segments: Int, uploading: Bool, keptLocal: Bool = false) {
         tickTimer?.invalidate()
         set(symbol: "checkmark.circle.fill", accent: .success,
             title: "Recording saved (\(seconds / 60)m \(seconds % 60)s\(segments > 1 ? ", \(segments) parts" : ""))",
-            sub: uploading ? "Uploading to Darth Meetings…" : url.lastPathComponent)
+            sub: uploading ? "Uploading to Darth Meetings…"
+                : keptLocal ? "Kept on this Mac, not uploaded — \(url.lastPathComponent)"
+                : url.lastPathComponent)
         primary.isHidden = false
         primary.title = "Show"
         primary.target = self; primary.action = #selector(showFileTapped)

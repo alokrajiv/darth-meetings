@@ -14,6 +14,33 @@ Native macOS side of Darth Meetings recording (the "Swift tray" angle from Darth
 the user switched it off in the menu (`loginItemUserChoice` in UserDefaults records an explicit choice;
 the default never overrides it). macOS may show "Darth Recorder was added as a login item" once.
 
+**0.2.4 (2026-09-16):**
+- **Record… dialog** (menu, ⌘⇧R; replaces "Record this display"). A non-modal floating panel:
+  pick a display (name + pixel size; default = the one under the mouse) or a window (windows of
+  any detected call's app first, then other on-screen windows grouped by app, capped at 25),
+  tick **System audio** / **Microphone** / **Upload to Darth Meetings when it stops** (upload
+  defaults to the auto-upload setting and is disabled until signed in). It must never be an
+  `NSAlert.runModal`: a nested modal loop entered from a main-queue block (the ws command path)
+  never drains the main queue again and wedges every timer — the first cut did exactly that.
+  `RecordDialog.swift`; events `record_dialog_opened` / `_start` / `_cancelled`.
+- **`RecordingController.RecordOptions`** — `source` (explicit window/display or auto),
+  `systemAudio`, `mic`, `upload`. Mic off = the device is never opened and no permission prompt;
+  system audio off = no SCK audio stream and no `mul` track; both off = a video-only mp4. The
+  track layout is fixed for the whole recording (every segment roll uses the same options); the
+  mic is track index 1 after the system track, or 0 when there is none. Options are in the
+  `recording_starting` / `recording_started` events and in the ws status while recording.
+- **Keep on this Mac.** `upload: false` on the registry row: no automatic upload (launch,
+  sign-in, the retry timer), while the menu "Upload N now" and the PWA's Upload still push it.
+  The saved banner says "Kept on this Mac, not uploaded".
+- **ws `start` fields** `{cmd:"start", pid?, display_id?, window_id?, system_audio?, mic?, upload?}`
+  (all optional; absent = automatic). Test hooks: `open_record_dialog` (+ `auto_cancel_s`),
+  `retry_failed_uploads`.
+- **Failed uploads retry themselves** every 30 min (`UPLOAD_RETRY_INTERVAL`) while signed in
+  with auto-upload on: rows at `upload_failed` that still have bytes on disk (never capture-failed
+  rows, never keep-local rows), event `upload_retry`. Reason: the server answers 502 whenever
+  its transcription hand-off fails (AssemblyAI out of credit on 2026-09-16), and the recording
+  must reach Darth Meetings later without anyone clicking.
+
 **0.2.3 (2026-09-16):**
 - **Window-gone hold.** When the recorded window vanishes the tray no longer falls back to a
   display at once. Video stops, system audio + mic keep flowing into the current file, and it

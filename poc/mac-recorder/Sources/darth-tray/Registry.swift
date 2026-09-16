@@ -12,6 +12,7 @@ import RecorderCore
 /// `needs_sync`) the page ignores.
 ///
 /// status: recording | local | uploading | uploaded | upload_failed | deleted
+/// `upload: false` (0.2.4) marks a recording the user chose to keep on this Mac.
 final class Registry {
     static let shared = Registry()
     private let lock = NSLock()
@@ -61,14 +62,27 @@ final class Registry {
         return rows[i]
     }
 
-    /// Recordings whose bytes are still only on this Mac.
-    func pendingUpload() -> [[String: Any]] {
+    /// Recordings whose bytes are still only on this Mac. `automatic` (the default: launch,
+    /// sign-in, the retry timer) leaves out rows recorded with "upload: false" — the user asked
+    /// to keep those on this Mac; only an explicit push (menu "Upload … now", PWA Upload) takes
+    /// them, via `automatic: false`.
+    func pendingUpload(automatic: Bool = true) -> [[String: Any]] {
         all().filter {
             let s = ($0["status"] as? String) ?? "local"
+            if automatic, ($0["upload"] as? Bool) == false { return false }
             // "uploading" is included on purpose: a row left there by a process that died
             // mid-upload (quit, crash, update) must be retried at the next launch; live
             // uploads are skipped by the caller via `uploader.isUploading`.
             return s == "local" || s == "upload_failed" || s == "uploading"
+        }
+    }
+
+    /// `upload_failed` rows that still have bytes on disk — what the 30-minute retry timer
+    /// (0.2.4) works through. Capture-failed rows have no files and are left alone.
+    func retryableFailed() -> [[String: Any]] {
+        pendingUpload().filter {
+            ($0["status"] as? String) == "upload_failed"
+                && ($0["files"] as? [String] ?? []).contains { FileManager.default.fileExists(atPath: $0) }
         }
     }
 
