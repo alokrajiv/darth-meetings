@@ -14,6 +14,29 @@ Native macOS side of Darth Meetings recording (the "Swift tray" angle from Darth
 the user switched it off in the menu (`loginItemUserChoice` in UserDefaults records an explicit choice;
 the default never overrides it). macOS may show "Darth Recorder was added as a login item" once.
 
+**0.2.9 (2026-09-16):**
+- **Capture profile per call** (`RecordingController.profile(for:)`): `audio` for WhatsApp voice
+  calls (title contains "voice call"), Slack huddles and FaceTime audio (no window / "audio" in
+  the title); `window` (as before) for Teams, Meet, Zoom, Webex, WhatsApp video calls, browser
+  calls and anything unknown. `call_started` and `recording_starting` carry `profile` +
+  `profile_reason`.
+- **Audio-only recordings**: no SCK video stream and no window pick at all. `Recorder` now has an
+  audio-only writer (`init(audioOnlyURL:audioTracks:)`, `.m4a`, same AAC tracks `mul` + `eng`,
+  `videoIn` optional). Segments `<base> part<N>.m4a`, `source: {kind:"audio"}`, rolls only on
+  writer failure, health line `mic ✓ · system ✓`, banner "Recording WhatsApp call (audio)".
+  A share during an audio-only recording is NOT captured (v1): banner "Screen share not captured
+  — this call is recorded as audio only" once + event `share_not_captured {share}` every time.
+- **Record… dialog** has a "Video" tick-box (default from the profile of the active call; off
+  greys the source list); ws `start` accepts `video:false`; `RecordOptions.video` (nil = auto).
+- **BUG-2 false alarm fixed**: a video stream that dies and a call that ends inside the 6 s hold
+  is the normal end of a call — no `stream_failure`, video stays ✓, no `log_excerpt`. A hold
+  that elapses with the call still live (fallback) and a writer failure remain real failures.
+- Verified: WhatsApp voice / Slack / Teams-with-`video:false` simulations produced `.m4a` files
+  with exactly two audio tracks (60 s of WhatsApp ≈ 550 KB ≈ 33 MB/h); Teams still records the
+  window; a simulated share during an audio-only recording gave the banner + event and one file;
+  an audio-only upload transcribed on the server (`.m4a` stored with the mix track, audio route
+  206); the window-gone-then-call-ended pattern ended with `stream_failure:false` and no excerpt.
+
 **0.2.8 (2026-09-16):**
 - **A start can no longer wedge the tray.** 21:23 SGT: SCK never called back for a WhatsApp
   voice-call window; `state` stayed `.starting` forever, every later Record click was ignored,

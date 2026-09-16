@@ -24,6 +24,7 @@ final class RecordDialog: NSObject, NSWindowDelegate {
     private var sysBox: NSButton?
     private var micBox: NSButton?
     private var upBox: NSButton?
+    private var videoBox: NSButton?
 
     var isOpen: Bool { panel != nil }
 
@@ -76,7 +77,7 @@ final class RecordDialog: NSObject, NSWindowDelegate {
 
     /// Open the panel (or bring the open one to the front). `completion` runs once, on the
     /// main queue: the options on Start, nil on Cancel / close.
-    func present(callPids: [pid_t], signedIn: Bool, autoUpload: Bool,
+    func present(callPids: [pid_t], signedIn: Bool, autoUpload: Bool, videoDefault: Bool = true,
                  completion: @escaping (RecordingController.RecordOptions?) -> Void) {
         if let panel {
             NSApp.activate(ignoringOtherApps: true)
@@ -119,6 +120,10 @@ final class RecordDialog: NSObject, NSWindowDelegate {
         self.popup = popup
         self.entries = entries
 
+        let videoBox = NSButton(checkboxWithTitle: "Video (record the screen or window above)", target: self, action: #selector(videoToggled))
+        videoBox.state = videoDefault ? .on : .off
+        popup.isEnabled = videoDefault
+        self.videoBox = videoBox
         let sysBox = NSButton(checkboxWithTitle: "System audio (what the others say)", target: nil, action: nil)
         sysBox.state = .on
         let micBox = NSButton(checkboxWithTitle: "Microphone (your side)", target: nil, action: nil)
@@ -148,7 +153,7 @@ final class RecordDialog: NSObject, NSWindowDelegate {
         buttons.orientation = .horizontal
         buttons.spacing = 8
 
-        let stack = NSStackView(views: [title, sub, srcLabel, popup, sysBox, micBox, upBox, hint, buttons])
+        let stack = NSStackView(views: [title, sub, srcLabel, popup, videoBox, sysBox, micBox, upBox, hint, buttons])
         stack.orientation = .vertical
         stack.alignment = .leading
         stack.spacing = 8
@@ -187,11 +192,13 @@ final class RecordDialog: NSObject, NSWindowDelegate {
     }
 
     @objc private func cancelTapped() { cancel() }
+    @objc private func videoToggled() { popup?.isEnabled = videoBox?.state == .on }
 
     @objc private func startTapped() {
         var o = RecordingController.RecordOptions()
         let idx = popup?.indexOfSelectedItem ?? -1
         o.source = (idx >= 0 && idx < entries.count ? entries[idx]?.source : nil) ?? displays.first?.source
+        o.video = videoBox?.state == .on
         o.systemAudio = sysBox?.state == .on
         o.mic = micBox?.state == .on
         o.upload = (upBox?.isEnabled ?? false) && upBox?.state == .on
@@ -210,7 +217,7 @@ final class RecordDialog: NSObject, NSWindowDelegate {
         panel?.delegate = nil
         panel?.orderOut(nil)
         panel = nil
-        popup = nil; sysBox = nil; micBox = nil; upBox = nil
+        popup = nil; sysBox = nil; micBox = nil; upBox = nil; videoBox = nil
         entries = []; displays = []
         done?(options)
     }

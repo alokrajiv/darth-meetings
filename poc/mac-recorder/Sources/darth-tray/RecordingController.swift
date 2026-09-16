@@ -24,18 +24,42 @@ final class RecordingController {
     enum Source {
         case window(CGWindowID, String)
         case display(CGDirectDisplayID)
+        /// 0.2.9: no video at all — an `.m4a` with the system + mic tracks.
+        case audio
 
         var label: String {
             switch self {
             case .window(let id, let title): return "window #\(id) \"\(title)\""
             case .display(let id): return "display \(id)"
+            case .audio: return "audio only"
             }
         }
         var json: [String: Any] {
             switch self {
             case .window(let id, let title): return ["kind": "window", "window_id": Int(id), "title": title]
             case .display(let id): return ["kind": "display", "display_id": Int(id)]
+            case .audio: return ["kind": "audio"]
             }
+        }
+        var isAudioOnly: Bool { if case .audio = self { return true }; return false }
+    }
+
+    /// How a detected call is captured (0.2.9). Voice-only calls have no window worth a video
+    /// track (WhatsApp shows a tiny avatar card, a huddle is a sidebar, FaceTime audio nothing),
+    /// and SCK hung on the WhatsApp voice window on 2026-09-16 — so those are audio-only.
+    enum CaptureProfile: String { case audioOnly = "audio", window }
+    static func profile(for call: DetectedCall) -> (CaptureProfile, String) {
+        let t = call.title.lowercased()
+        switch call.kind {
+        case .whatsapp:
+            if t.contains("voice call") { return (.audioOnly, "WhatsApp voice call") }
+            if t.contains("video call") { return (.window, "WhatsApp video call") }
+            return (.window, "WhatsApp call, kind unknown from the title")
+        case .slack: return (.audioOnly, "Slack huddle")
+        case .facetime:
+            if call.windowFrame == nil || t.contains("audio") { return (.audioOnly, "FaceTime audio") }
+            return (.window, "FaceTime with a video window")
+        default: return (.window, "\(call.kind.rawValue): window capture")
         }
     }
 
@@ -46,14 +70,18 @@ final class RecordingController {
         var source: Source? = nil
         var systemAudio = true
         var mic = true
+        /// false = audio-only recording (`.m4a`, no SCK video stream, no window pick). nil = decide
+        /// from the call's CaptureProfile (0.2.9).
+        var video: Bool? = nil
         /// false = keep the file on this Mac: no automatic upload (the PWA / menu can still push it).
         var upload = true
 
         var json: [String: Any] {
-            ["source": source?.json ?? "auto", "system_audio": systemAudio, "mic": mic, "upload": upload]
+            ["source": source?.json ?? "auto", "system_audio": systemAudio, "mic": mic, "upload": upload,
+             "video": video ?? "auto"]
         }
         var summary: String {
-            "audio=\(systemAudio ? "system" : "-")\(mic ? "+mic" : "") upload=\(upload)"
+            "video=\(video.map { $0 ? "on" : "off" } ?? "auto") audio=\(systemAudio ? "system" : "-")\(mic ? "+mic" : "") upload=\(upload)"
         }
     }
 
@@ -226,6 +254,10 @@ final class RecordingController {
     private var flags: [String: Bool] = [:]   // track → ok, transitions drive events/callback
     private var healthTicks = 0
     private var micDenied = false
+    private var shareNoticeShown = false
+    /// Set by the window-gone hold when the video stream died; cleared when the call ends inside
+    /// the hold (the normal Slack/Teams end-of-call pattern — NOT a stream failure, 0.2.9).
+    private var pendingVideoFailure = false
 
     var systemMeter: LevelMeter { audioForwarder.meter }
     var micMeter: LevelMeter? { mic?.meter }
@@ -275,7 +307,14 @@ final class RecordingController {
     func health() -> Health {
         var h = Health()
         guard state == .recording else { return h }
-        h.videoOK = !videoStopped && Date().timeIntervalSince(lastVideoAt) < Self.VIDEO_STALL_S
+        if currentSource?.isAudioOnly == true {
+            h.videoOK = nil
+        } else if videoStopped {
+            // Dead video is only a fault when the call is still live and no hold is pending.
+            h.videoOK = callOver || holdTimer != nil
+        } else {
+            h.videoOK = Date().timeIntervalSince(lastVideoAt) < Self.VIDEO_STALL_S
+        }
         if options.systemAudio {
             if audioStream == nil { h.systemOK = false }
             else if call != nil && !callOver { h.systemOK = systemMeter.secondsSinceAudible < Self.SYSTEM_SILENT_S }
@@ -292,7 +331,7 @@ final class RecordingController {
         let h = health()
         var parts: [String] = []
         func tick(_ ok: Bool?) -> String { ok == nil ? "–" : (ok! ? "✓" : "✗") }
-        parts.append("video \(tick(h.videoOK))")
+        if currentSource?.isAudioOnly != true { parts.append("video \(tick(h.videoOK))") }
         if options.mic { parts.append("mic \(tick(h.micOK))") }
         if options.systemAudio {
             // Quiet system audio outside a call is neutral, not a fault.
@@ -314,7 +353,8 @@ final class RecordingController {
         let h = health()
         var d: [String: Any] = [
             "video": ["ok": h.videoOK ?? NSNull(), "frames": videoFramesTotal + (currentWriter()?.videoFrames ?? 0),
-                      "silent_s": Int(Date().timeIntervalSince(lastVideoAt)), "stream_alive": !videoStopped] as [String: Any],
+                      "silent_s": Int(Date().timeIntervalSince(lastVideoAt)), "stream_alive": !videoStopped,
+                      "audio_only": currentSource?.isAudioOnly == true] as [String: Any],
             "line": healthLine(),
         ]
         if options.systemAudio {
@@ -364,6 +404,7 @@ final class RecordingController {
         loggedGoneAfterEnd = false
         holdTimer?.invalidate(); holdTimer = nil
         systemStreamFailed = nil; streamFailure = false; flags = [:]; healthTicks = 0; micDenied = false
+        shareNoticeShown = false; pendingVideoFailure = false; currentSource = nil
         videoFramesTotal = 0; videoDupTotal = 0; lastVideoCount = -1; lastVideoWriter = nil
         audioForwarder.reset()
         let f = DateFormatter(); f.dateFormat = "yyyy-MM-dd HH.mm.ss"
@@ -372,9 +413,16 @@ final class RecordingController {
         dir = folder
         try? FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
 
-        // Where to point the camera.
+        // Where to point the camera — or not at all.
         var source: Source
-        if let chosen = options.source {
+        var profileReason = "explicit"
+        let profile: CaptureProfile? = call.map { Self.profile(for: $0).0 }
+        if let call { profileReason = Self.profile(for: call).1 }
+        let wantVideo = options.video ?? (profile != .audioOnly)
+        if !wantVideo {
+            source = .audio
+            if options.video == false { profileReason = "video off by request" }
+        } else if let chosen = options.source {
             source = chosen
         } else if let call, call.pid > 0 {
             let pick = WindowPicker.pick(kind: call.kind, pid: call.pid)
@@ -391,8 +439,9 @@ final class RecordingController {
 
         EventLog.shared.log("recording_starting", [
             "recording_id": id, "source": source.json, "call": call?.json ?? NSNull(), "dir": folder.path,
-            "options": options.json,
-        ], summary: "record: starting \(id) on \(source.label) (\(options.summary))")
+            "options": options.json, "profile": source.isAudioOnly ? "audio" : "window",
+            "profile_reason": profileReason,
+        ], summary: "record: starting \(id) on \(source.label) — \(profileReason) (\(options.summary))")
 
         Registry.shared.insert([
             "id": id,
@@ -507,31 +556,41 @@ final class RecordingController {
             rlog("record: TEST — simulating a \(Int(s)) s hang in the video start")
             try await timed("simulated hang", deadline: deadline) { try await Task.sleep(nanoseconds: UInt64(s * 1_000_000_000)) }
         }
-        let (filter, displayID) = try await timed("shareable content + filter for \(source.label)", deadline: deadline) { try await Self.filter(for: source) }
-        try Task.checkCancellation()
-        let t0 = Date()
-        let (w, h) = CaptureSession.pixelSize(of: filter)
-        rlog("record: pixel size \(w)x\(h) took \(Int(Date().timeIntervalSince(t0) * 1000)) ms")
-        pinnedSize = (w, h)
-
         let tracks = audioTracks(micFormat: micFormat)
+        currentSource = source
         let url = segmentURL(1)
-        let rec = try Recorder(url: url, width: w, height: h, fps: fps, audioTracks: tracks)
-        rec.onStop = { [weak self] err in
-            DispatchQueue.main.async { self?.videoStreamFailed(err) }
+        let rec: Recorder
+        let displayID: CGDirectDisplayID
+        var w = 0, h = 0
+        if source.isAudioOnly {
+            // No SCK video stream, no window pick: just the two AAC tracks in an .m4a. The
+            // system-audio stream still needs a display to attach to — the call's, else main.
+            displayID = call?.windowFrame.map { WindowPicker.display(containing: $0) } ?? CGMainDisplayID()
+            rec = try Recorder(audioOnlyURL: url, audioTracks: tracks)
+            rlog("record: audio-only writer → \(url.lastPathComponent)")
+        } else {
+            let (filter, did) = try await timed("shareable content + filter for \(source.label)", deadline: deadline) { try await Self.filter(for: source) }
+            try Task.checkCancellation()
+            displayID = did
+            let t0 = Date()
+            (w, h) = CaptureSession.pixelSize(of: filter)
+            rlog("record: pixel size \(w)x\(h) took \(Int(Date().timeIntervalSince(t0) * 1000)) ms")
+            pinnedSize = (w, h)
+            rec = try Recorder(url: url, width: w, height: h, fps: fps, audioTracks: tracks)
+            rec.onStop = { [weak self] err in
+                DispatchQueue.main.async { self?.videoStreamFailed(err) }
+            }
+            videoStream = try await timed("video stream start on \(source.label)", deadline: deadline,
+                                          orphan: { s in Task { try? await s.stopCapture() } }) {
+                try await Self.startVideoStream(filter: filter, fps: self.fps, output: rec, size: (w, h))
+            }
+            try Task.checkCancellation()
         }
         rec.onWriterFailure = { [weak self] err in self?.writerFailed(err) }
         setWriter(rec)
         segmentIndex = 1
         segmentStart = Date()
-        currentSource = source
-
-        videoStream = try await timed("video stream start on \(source.label)", deadline: deadline,
-                                      orphan: { s in Task { try? await s.stopCapture() } }) {
-            try await Self.startVideoStream(filter: filter, fps: self.fps, output: rec, size: (w, h))
-        }
-        try Task.checkCancellation()
-        videoStopped = false
+        videoStopped = source.isAudioOnly
         if options.systemAudio {
             audioForwarder.sink = { [weak self] sb in self?.currentWriter()?.appendAudio(sb, track: 0) }
             audioForwarder.onStopped = { [weak self] err in
@@ -596,7 +655,8 @@ final class RecordingController {
     // MARK: sources
 
     private func segmentURL(_ index: Int) -> URL {
-        (dir ?? Paths.recordings).appendingPathComponent("\(base) part\(index).mp4")
+        let ext = (currentSource?.isAudioOnly ?? (options.video == false)) ? "m4a" : "mp4"
+        return (dir ?? Paths.recordings).appendingPathComponent("\(base) part\(index).\(ext)")
     }
 
     @MainActor
@@ -608,6 +668,8 @@ final class RecordingController {
                 throw NSError(domain: "record", code: 10, userInfo: [NSLocalizedDescriptionKey: "window \(id) is gone"])
             }
             return (SCContentFilter(desktopIndependentWindow: w), WindowPicker.display(containing: w.frame))
+        case .audio:
+            throw NSError(domain: "record", code: 13, userInfo: [NSLocalizedDescriptionKey: "audio-only source has no video filter"])
         case .display(let id):
             guard let d = content.displays.first(where: { $0.displayID == id }) ?? content.displays.first else {
                 throw NSError(domain: "record", code: 11, userInfo: [NSLocalizedDescriptionKey: "no display"])
@@ -676,17 +738,24 @@ final class RecordingController {
         Task { @MainActor in
             defer { self.rolling = false }
             do {
-                let (filter, _) = try await Self.filter(for: source)
-                let (w, h) = self.pinnedSize ?? CaptureSession.pixelSize(of: filter)
                 let tracks = self.audioTracks(micFormat: self.mic?.format)
                 let index = oldIndex + 1
                 let url = self.segmentURL(index)
-                let rec = try Recorder(url: url, width: w, height: h, fps: self.fps, audioTracks: tracks)
-                rec.onStop = { [weak self] err in
-                    DispatchQueue.main.async { self?.videoStreamFailed(err) }
+                let rec: Recorder
+                var newStream: SCStream?
+                var w = 0, h = 0
+                if source.isAudioOnly {
+                    rec = try Recorder(audioOnlyURL: url, audioTracks: tracks)
+                } else {
+                    let (filter, _) = try await Self.filter(for: source)
+                    (w, h) = self.pinnedSize ?? CaptureSession.pixelSize(of: filter)
+                    rec = try Recorder(url: url, width: w, height: h, fps: self.fps, audioTracks: tracks)
+                    rec.onStop = { [weak self] err in
+                        DispatchQueue.main.async { self?.videoStreamFailed(err) }
+                    }
+                    newStream = try await Self.startVideoStream(filter: filter, fps: self.fps, output: rec, size: (w, h))
                 }
                 rec.onWriterFailure = { [weak self] err in self?.writerFailed(err) }
-                let newStream = try await Self.startVideoStream(filter: filter, fps: self.fps, output: rec, size: (w, h))
                 // Swap: audio + mic follow the current writer, so this is the cut point.
                 self.setWriter(rec)
                 self.segmentIndex = index
@@ -700,11 +769,11 @@ final class RecordingController {
                 // Retire the old one — but never call stopCapture on a stream the system
                 // already tore down (that is what logged "Failed to stop a stream that is
                 // already stopped" in 0.1.x).
-                if !oldDead {
+                if !oldDead, let oldStream {
                     self.willStopOwnStreams?(1)
-                    if let oldStream { try? await oldStream.stopCapture() }
+                    try? await oldStream.stopCapture()
                 }
-                self.videoStopped = false
+                self.videoStopped = source.isAudioOnly
                 if let old {
                     await old.finish()
                     self.videoFramesTotal += old.videoFrames; self.videoDupTotal += old.duplicatedFrames
@@ -755,9 +824,10 @@ final class RecordingController {
     /// tore the stream down. The plan says: fall back to the display that contained it and log
     /// it. Only give up after three of these.
     private func videoStreamFailed(_ err: Error) {
-        guard state == .recording else { return }
+        guard state == .recording, currentSource?.isAudioOnly != true else { return }
         videoStopped = true
-        streamFailure = true
+        pendingVideoFailure = true
+        if callOver { streamFailure = true }   // died after the call ended: nothing to hold for
         EventLog.shared.log("video_stream_error", [
             "recording_id": recordingId ?? "", "error": err.localizedDescription, "call_over": callOver,
         ], summary: "record: video stream died (\(err.localizedDescription))\(callOver ? " after call end — audio continues until stop" : " — holding for a call end")")
@@ -811,6 +881,16 @@ final class RecordingController {
     func shareStarted(_ share: ShareInfo) {
         guard state == .recording else { return }
         shares.append(share.json)
+        if currentSource?.isAudioOnly == true {
+            // v1: no video part for an audio-only recording — say so once, log every share.
+            EventLog.shared.log("share_not_captured", ["recording_id": recordingId ?? "", "share": share.json],
+                                summary: "record: share by \(share.appName ?? share.appBundle) NOT captured — audio-only recording")
+            if !shareNoticeShown {
+                shareNoticeShown = true
+                onNotice?("Screen share not captured", "This call is recorded as audio only.")
+            }
+            return
+        }
         guard related(share) else {
             rlog("record: share by \(share.appBundle) is not this call's app (\(call?.bundleId ?? "-")) — video source unchanged")
             return
@@ -827,7 +907,7 @@ final class RecordingController {
         if let i = shares.firstIndex(where: { ($0["id"] as? String) == share.id }) {
             shares[i]["ended_at"] = isoNow()
         }
-        guard related(share) else { return }
+        guard currentSource?.isAudioOnly != true, related(share) else { return }
         // Back to the call window (re-resolved: it may have moved while the share was up).
         guard let call, call.pid > 0 else {
             if let f = call?.windowFrame { rollSegment(to: .display(WindowPicker.display(containing: f)), reason: "share ended") }
@@ -853,7 +933,7 @@ final class RecordingController {
     /// Every 5 s while recording: log the candidate list again (field data) and make sure the
     /// window we are pointed at still exists.
     private func reresolve() {
-        guard state == .recording, let call, call.pid > 0 else { return }
+        guard state == .recording, currentSource?.isAudioOnly != true, let call, call.pid > 0 else { return }
         let pick = WindowPicker.pick(kind: call.kind, pid: call.pid)
         WindowPicker.logCandidates(phase: "reresolve", call: call, pick: pick)
         guard case .window(let id, _)? = currentSource else { return }
@@ -891,6 +971,7 @@ final class RecordingController {
     func noteCallEnded() {
         guard state == .recording || state == .starting else { return }
         callOver = true
+        if pendingVideoFailure { pendingVideoFailure = false }   // benign: the window went with the call
         if holdTimer != nil {
             holdTimer?.invalidate(); holdTimer = nil
             EventLog.shared.log("window_gone_held", [
@@ -904,7 +985,9 @@ final class RecordingController {
         guard state == .recording, !callOver else { return }
         // The window is gone but the call is still live (a popped-out window was closed, the
         // app re-created its window, …): today's fallback — the call window if there is a new
-        // one, else the display the old one was on.
+        // one, else the display the old one was on. THIS is a real stream failure.
+        streamFailure = true
+        pendingVideoFailure = false
         errorRolls += 1
         guard errorRolls <= 3 else {
             onError?("Recording interrupted: the window we were recording went away repeatedly.")
@@ -953,7 +1036,8 @@ final class RecordingController {
         holdTimer?.invalidate(); holdTimer = nil
         healthTimer?.invalidate(); healthTimer = nil
         let endHealth = flags
-        let endLine = "video \(flags["video"].map { $0 ? "✓" : "✗" } ?? "–") · mic \(flags["mic"].map { $0 ? "✓" : "✗" } ?? "–") · system \(flags["system"].map { $0 ? "✓" : "✗" } ?? "–")"
+        let endLine = (currentSource?.isAudioOnly == true ? "" : "video \(flags["video"].map { $0 ? "✓" : "✗" } ?? "–") · ")
+            + "mic \(flags["mic"].map { $0 ? "✓" : "✗" } ?? "–") · system \(flags["system"].map { $0 ? "✓" : "✗" } ?? "–")"
         let unwell = endHealth.values.contains(false) || streamFailure || systemStreamFailed != nil
         let sysSnap = options.systemAudio ? systemMeter.snapshot() : nil
         let micSnap = micMeter?.snapshot()

@@ -35,10 +35,12 @@ public struct AudioTrackSpec {
 /// host clock, so the tracks line up without any extra bookkeeping.
 public final class Recorder: NSObject, SCStreamOutput, SCStreamDelegate {
     let writer: AVAssetWriter
-    let videoIn: AVAssetWriterInput
+    /// nil for an audio-only recording (0.2.9: `.m4a`, no SCK video stream at all).
+    let videoIn: AVAssetWriterInput?
     public private(set) var audioIns: [AVAssetWriterInput] = []
     public let specs: [AudioTrackSpec]
-    let adaptor: AVAssetWriterInputPixelBufferAdaptor
+    let adaptor: AVAssetWriterInputPixelBufferAdaptor?
+    public var hasVideo: Bool { videoIn != nil }
     public let queue = DispatchQueue(label: "recorder.samples")
     private let sessionLock = NSLock()
     private var sessionStarted = false
@@ -61,12 +63,18 @@ public final class Recorder: NSObject, SCStreamOutput, SCStreamDelegate {
     public var onWriterFailure: ((Error) -> Void)?
     public let url: URL
 
-    public init(url: URL, width: Int, height: Int, fps: Int, audioTracks: [AudioTrackSpec]) throws {
+    /// Audio-only writer: the same AAC tracks (system `mul`, mic `eng`) in an `.m4a`, no video.
+    public convenience init(audioOnlyURL url: URL, audioTracks: [AudioTrackSpec]) throws {
+        try self.init(url: url, width: 0, height: 0, fps: 0, audioTracks: audioTracks, video: false)
+    }
+
+    public init(url: URL, width: Int, height: Int, fps: Int, audioTracks: [AudioTrackSpec], video: Bool = true) throws {
         try? FileManager.default.removeItem(at: url)
         self.url = url
         configuredSize = (width, height)
         specs = audioTracks
-        writer = try AVAssetWriter(outputURL: url, fileType: .mp4)
+        writer = try AVAssetWriter(outputURL: url, fileType: video ? .mp4 : .m4a)
+        if video {
         let vs: [String: Any] = [
             AVVideoCodecKey: AVVideoCodecType.h264,
             AVVideoWidthKey: width,
@@ -78,10 +86,15 @@ public final class Recorder: NSObject, SCStreamOutput, SCStreamDelegate {
                 AVVideoProfileLevelKey: AVVideoProfileLevelH264HighAutoLevel,
             ],
         ]
-        videoIn = AVAssetWriterInput(mediaType: .video, outputSettings: vs)
-        videoIn.expectsMediaDataInRealTime = true
-        adaptor = AVAssetWriterInputPixelBufferAdaptor(assetWriterInput: videoIn, sourcePixelBufferAttributes: nil)
-        writer.add(videoIn)
+        let vIn = AVAssetWriterInput(mediaType: .video, outputSettings: vs)
+        vIn.expectsMediaDataInRealTime = true
+        adaptor = AVAssetWriterInputPixelBufferAdaptor(assetWriterInput: vIn, sourcePixelBufferAttributes: nil)
+        writer.add(vIn)
+        videoIn = vIn
+        } else {
+            videoIn = nil
+            adaptor = nil
+        }
         // Track order in the file: video, then the audio tracks in the order given.
         for spec in audioTracks {
             // No AVEncoderBitRateKey: the AAC encoder's legal bitrate range depends on the
@@ -190,6 +203,7 @@ public final class Recorder: NSObject, SCStreamOutput, SCStreamDelegate {
                 rlog("recorder: first video frame \(CVPixelBufferGetWidth(pixelBuffer))x\(CVPixelBufferGetHeight(pixelBuffer)), writer configured \(configuredSize.w)x\(configuredSize.h)")
             }
             if lastVideoPTS.isValid, CMTimeCompare(pts, lastVideoPTS) <= 0 { return }
+            guard let videoIn, let adaptor else { return }
             guard videoIn.isReadyForMoreMediaData else { droppedVideo += 1; return }
             if adaptor.append(pixelBuffer, withPresentationTime: pts) {
                 lastVideoPTS = pts
@@ -214,7 +228,7 @@ public final class Recorder: NSObject, SCStreamOutput, SCStreamDelegate {
     }
 
     public func finish() async {
-        videoIn.markAsFinished()
+        videoIn?.markAsFinished()
         for a in audioIns { a.markAsFinished() }
         if writer.status == .writing { await writer.finishWriting() }
         if let e = writer.error { rlog("writer error: \(String(describing: e))") }

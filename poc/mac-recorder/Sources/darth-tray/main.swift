@@ -3,7 +3,7 @@ import CoreGraphics
 import ServiceManagement
 import RecorderCore
 
-let VERSION = "0.2.8"
+let VERSION = "0.2.9"
 let WS_PORT: UInt16 = 47800
 let PWA_URL = URL(string: "https://meetings.darth-internal.trames.io/")!
 /// Seconds between "the call ended" and an automatic stop.
@@ -514,7 +514,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             return
         }
         let pids = detector.active.values.sorted { $0.startedAt < $1.startedAt }.map { $0.pid }.filter { $0 > 0 }
-        RecordDialog.shared.present(callPids: pids, signedIn: auth.signedIn, autoUpload: autoUpload) { [weak self] options in
+        let videoDefault = detector.active.values.sorted { $0.startedAt < $1.startedAt }.first.map { RecordingController.profile(for: $0).0 != .audioOnly } ?? true
+        RecordDialog.shared.present(callPids: pids, signedIn: auth.signedIn, autoUpload: autoUpload, videoDefault: videoDefault) { [weak self] options in
             guard let self, let options else { return }
             self.startRecording(for: self.detector.active.values.first, options: options)
         }
@@ -537,7 +538,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func callStarted(_ call: DetectedCall) {
         updateShareWatcher()
         refreshMenu()
-        EventLog.shared.log("call_started", call.json)
+        var ev = call.json
+        let (profile, why) = RecordingController.profile(for: call)
+        ev["profile"] = profile.rawValue; ev["profile_reason"] = why
+        EventLog.shared.log("call_started", ev, summary: "call started: \(call.appName) [\(call.kind.rawValue)] \"\(call.title)\" → \(profile.rawValue) (\(why))")
         if call.pid > 0 {
             let pick = WindowPicker.pick(kind: call.kind, pid: call.pid)
             WindowPicker.logCandidates(phase: "detect", call: call, pick: pick)
@@ -612,8 +616,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         broadcast("recording_started")
     }
 
+    func recordingLabel() -> String {
+        let audio = recorder.currentSource?.isAudioOnly == true
+        guard let c = recorder.call else { return audio ? "audio" : "display" }
+        return audio ? "\(kindName(c.kind)) (audio)" : kindName(c.kind)
+    }
+
     func showRecordingBanner() {
-        banner.showRecording(label: recorder.call.map { kindName($0.kind) } ?? "display",
+        banner.showRecording(label: recordingLabel(),
                              since: recorder.startedAt ?? Date(), near: recordingFrame) { [weak self] in
             self?.recorder.healthLine() ?? "Darth Recorder"
         }
@@ -737,7 +747,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if recorder.isRecording {
             d["recording_since"] = isoString(recorder.startedAt ?? Date())
             d["recording_path"] = (recorder.segments.last?["path"] as? String) ?? ""
-            d["recording_label"] = recorder.call.map { kindName($0.kind) } ?? "display"
+            d["recording_label"] = recordingLabel()
             d["recording_id"] = recorder.recordingId ?? NSNull()
             d["segment"] = recorder.segments.count
             d["mic"] = recorder.micActive
@@ -776,6 +786,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             if let v = obj["system_audio"] as? Bool { o.systemAudio = v }
             if let v = obj["mic"] as? Bool { o.mic = v }
             if let v = obj["upload"] as? Bool { o.upload = v }
+            if let v = obj["video"] as? Bool { o.video = v }
             startRecording(for: call, options: o)
         case "open_record_dialog":
             // Test hook: same as the menu item. `auto_cancel_s` closes it again unattended.
@@ -796,7 +807,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         case "status": broadcast("status")
         case "simulate_call":
             simulate(kind: (obj["kind"] as? String) ?? "teams", pid: pid_t((obj["pid"] as? Int) ?? 0),
-                     bundleOverride: obj["bundle_id"] as? String)
+                     bundleOverride: obj["bundle_id"] as? String, titleOverride: obj["title"] as? String)
         case "end_simulated": detector.endInjected(pid: pid_t((obj["pid"] as? Int) ?? 0))
         case "check_update": checkForUpdates()          // test hook: same as the menu item
         case "simulate_server_latest":                    // test hook: as if a heartbeat answered latest_app_version
@@ -837,7 +848,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// display). WITH a pid it pretends that real app is on a call, so the window picker, the
     /// window filter and the banner placement all run against a real window — that is how the
     /// window path is tested without dialling into a meeting.
-    func simulate(kind: String, pid: pid_t = 0, bundleOverride: String? = nil) {
+    func simulate(kind: String, pid: pid_t = 0, bundleOverride: String? = nil, titleOverride: String? = nil) {
         let k = CallKind(rawValue: kind) ?? .teams
         var name = k == .teams ? "Microsoft Teams" : "Google Chrome"
         var bundle = k == .teams ? "com.microsoft.teams2" : "com.google.Chrome"
@@ -853,7 +864,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
         }
         let call = DetectedCall(id: "sim-\(Int(Date().timeIntervalSince1970))", pid: pid, appName: name,
-                                bundleId: bundleOverride ?? bundle, kind: k, title: title, windowFrame: frame, startedAt: Date())
+                                bundleId: bundleOverride ?? bundle, kind: k, title: titleOverride ?? title, windowFrame: frame, startedAt: Date())
         detector.inject(call)
     }
 }
