@@ -19,6 +19,10 @@ final class BannerController {
     var onStop: (() -> Void)?
     var onKeepRecording: (() -> Void)?
     var onDismiss: (() -> Void)?
+    /// 0.3.0: the "Preview" capsule on the recording pill.
+    var onPreview: (() -> Void)?
+    var frame: NSRect? { panel?.isVisible == true ? panel?.frame : nil }
+    var screen: NSScreen? { panel?.screen }
 
     enum Accent {
         case call, recording, warning, info, success
@@ -80,10 +84,12 @@ final class BannerController {
         set(symbol: "record.circle.fill", accent: .recording, title: "Recording \(label)", sub: "00:00 · Darth Recorder")
         dot.isHidden = false
         startPulse()
-        primary.isHidden = true
+        primary.isHidden = false
+        primary.title = "Stop"
+        primary.target = self; primary.action = #selector(stopTapped)
         secondary.isHidden = false
-        secondary.title = "Stop"
-        secondary.target = self; secondary.action = #selector(stopTapped)
+        secondary.title = "Preview"
+        secondary.target = self; secondary.action = #selector(previewTapped)
         tickTimer?.invalidate()
         let update = { [weak self] in
             let s = Int(Date().timeIntervalSince(since))
@@ -356,10 +362,17 @@ final class BannerController {
     /// the tray has the Screen Recording grant, the shell driving the tests does not.
     @discardableResult
     func screenSnapshot(to path: String, margin: CGFloat = 24) -> Bool {
-        guard let p = panel, p.isVisible, let s = p.screen ?? NSScreen.screens.first else { return false }
-        let f = p.frame.insetBy(dx: -margin, dy: -margin)
+        guard let p = panel, p.isVisible else { return false }
+        return Self.screenSnapshot(of: p.frame, to: path, margin: margin)
+    }
+
+    /// Real on-screen pixels of any window frame (Cocoa coordinates) — shared with the preview.
+    @discardableResult
+    static func screenSnapshot(of frame: NSRect, to path: String, margin: CGFloat = 24) -> Bool {
+        guard let s = NSScreen.screens.first else { return false }
+        let f = frame.insetBy(dx: -margin, dy: -margin)
         // Cocoa (bottom-left, per-screen) → CG global (top-left of the primary display).
-        let primaryH = NSScreen.screens.first?.frame.height ?? s.frame.height
+        let primaryH = s.frame.height
         let cg = CGRect(x: f.origin.x, y: primaryH - f.maxY, width: f.width, height: f.height)
         guard let img = CGWindowListCreateImage(cg, .optionOnScreenOnly, kCGNullWindowID, [.bestResolution]) else {
             rlog("banner: on-screen snapshot failed (no image)"); return false
@@ -443,6 +456,10 @@ final class BannerController {
         EventLog.shared.log("banner_click", ["button": "dismiss"], summary: "banner: dismissed")
         hide()
         onDismiss?()
+    }
+    @objc private func previewTapped() {
+        EventLog.shared.log("banner_click", ["button": "preview"], summary: "banner: Preview clicked")
+        onPreview?()
     }
     @objc private func stopTapped() {
         EventLog.shared.log("banner_click", ["button": "stop"], summary: "banner: Stop clicked")

@@ -193,6 +193,8 @@ final class RecordingController {
     var onNotice: ((String, String) -> Void)?
     /// 0.2.8: a pending start was cancelled (Stop / second Record / quit) before it produced a file.
     var onStartCancelled: ((String) -> Void)?
+    /// 0.3.0: downscale-worthy frames from the current writer (sample queue, ≤ 4 fps).
+    var onPreviewFrame: ((CVPixelBuffer) -> Void)?
     /// Called before we tear our own SCK streams down, so the share detector can ignore the
     /// teardown lines they produce.
     var willStopOwnStreams: ((Int) -> Void)?
@@ -587,6 +589,7 @@ final class RecordingController {
             try Task.checkCancellation()
         }
         rec.onWriterFailure = { [weak self] err in self?.writerFailed(err) }
+        rec.onPreviewFrame = { [weak self] pb in self?.onPreviewFrame?(pb) }
         setWriter(rec)
         segmentIndex = 1
         segmentStart = Date()
@@ -756,6 +759,7 @@ final class RecordingController {
                     newStream = try await Self.startVideoStream(filter: filter, fps: self.fps, output: rec, size: (w, h))
                 }
                 rec.onWriterFailure = { [weak self] err in self?.writerFailed(err) }
+                rec.onPreviewFrame = { [weak self] pb in self?.onPreviewFrame?(pb) }
                 // Swap: audio + mic follow the current writer, so this is the cut point.
                 self.setWriter(rec)
                 self.segmentIndex = index

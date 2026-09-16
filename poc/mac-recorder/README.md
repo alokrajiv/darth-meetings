@@ -14,6 +14,24 @@ Native macOS side of Darth Meetings recording (the "Swift tray" angle from Darth
 the user switched it off in the menu (`loginItemUserChoice` in UserDefaults records an explicit choice;
 the default never overrides it). macOS may show "Darth Recorder was added as a login item" once.
 
+**0.3.0 (2026-09-16):**
+- **Preview panel** (`PreviewPanel.swift`): "Preview" capsule on the recording pill (the pill's
+  buttons are now Stop (red) + Preview) and menu "Show/Hide preview" (⌘P while recording). A
+  340 px non-activating floating card under the banner, on the banner's display: a live thumbnail
+  of the video being recorded — `Recorder.onPreviewFrame` hands the pixel buffer just appended
+  to the encoder every 250 ms (`previewInterval`), downscaled off-main with CoreImage — or an
+  "audio only" placeholder; two level bars (system, mic; `LevelBar`) fed by the 0.2.6 meters at
+  10 Hz: −60…0 dBFS, green fill when audible / grey when quiet / red when the track is ✗,
+  peak-hold marker (1.5 s), "silent Ns" label when quiet ≥ 5 s or ✗. Closable (✕, menu, Preview
+  again); open/closed remembered in UserDefaults `previewOpen` (reopens on the next recording);
+  closes with the recording. Excluded from capture like the banner (display captures exclude
+  this app since 0.2.7; window captures only see the call window).
+  Hooks: `{cmd:"preview", open}`, `{cmd:"snapshot_preview", onscreen_path}` (on-screen PNG + bar
+  values in the answer and tray.log).
+- Measured on this Mac during a display recording: tray CPU ≈ 3.7 % with the preview closed,
+  ≈ 7.3 % open (10 Hz bars + 4 fps CoreImage downscale). A display-3 recording with the preview
+  open on that display contains neither the preview nor the banner.
+
 **0.2.9 (2026-09-16):**
 - **Capture profile per call** (`RecordingController.profile(for:)`): `audio` for WhatsApp voice
   calls (title contains "voice call"), Slack huddles and FaceTime audio (no window / "audio" in

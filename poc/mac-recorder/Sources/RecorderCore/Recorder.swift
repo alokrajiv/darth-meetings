@@ -59,6 +59,11 @@ public final class Recorder: NSObject, SCStreamOutput, SCStreamDelegate {
     private var loggedFirstAudio: Set<Int> = []
     private let configuredSize: (w: Int, h: Int)
     public var onStop: ((Error) -> Void)?
+    /// 0.3.0 preview: every `previewInterval` seconds the pixel buffer just appended is handed
+    /// here on the sample queue (the receiver must not block). Retained only for the call.
+    public var onPreviewFrame: ((CVPixelBuffer) -> Void)?
+    public var previewInterval: TimeInterval = 0.25
+    private var lastPreviewAt = Date.distantPast
     /// Main queue. The writer went to .failed — the file is unusable, tell the user.
     public var onWriterFailure: ((Error) -> Void)?
     public let url: URL
@@ -208,6 +213,10 @@ public final class Recorder: NSObject, SCStreamOutput, SCStreamDelegate {
             if adaptor.append(pixelBuffer, withPresentationTime: pts) {
                 lastVideoPTS = pts
                 if isDup { duplicatedFrames += 1 } else { videoFrames += 1; lastPixelBuffer = pixelBuffer }
+                if let cb = onPreviewFrame, Date().timeIntervalSince(lastPreviewAt) >= previewInterval {
+                    lastPreviewAt = Date()
+                    cb(pixelBuffer)
+                }
             } else {
                 droppedVideo += 1
                 logFailureOnce("video append failed")

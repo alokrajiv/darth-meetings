@@ -3,7 +3,7 @@ import CoreGraphics
 import ServiceManagement
 import RecorderCore
 
-let VERSION = "0.2.9"
+let VERSION = "0.3.0"
 let WS_PORT: UInt16 = 47800
 let PWA_URL = URL(string: "https://meetings.darth-internal.trames.io/")!
 /// Seconds between "the call ended" and an automatic stop.
@@ -32,6 +32,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     let api = ApiClient(appVersion: VERSION)
     lazy var uploader = Uploader(api: api)
     let recorder = RecordingController()
+    let preview = PreviewPanel()
 
     var clients = 0
     /// SIGTERM (updater helper's fallback, `kill <pid>`, logout) → the same clean path as Quit.
@@ -63,6 +64,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }()
     var retryTimer: Timer?
     let stopItem = NSMenuItem(title: "Stop recording", action: #selector(stopFromMenu), keyEquivalent: "s")
+    let previewItem = NSMenuItem(title: "Show preview", action: #selector(togglePreview), keyEquivalent: "p")
     let authItem = NSMenuItem(title: "Sign in to Darth Meetings…", action: #selector(toggleAuth), keyEquivalent: "")
     let uploadItem = NSMenuItem(title: "Upload recordings automatically", action: #selector(toggleAutoUpload), keyEquivalent: "")
     let pendingLine = NSMenuItem(title: "", action: nil, keyEquivalent: "")
@@ -121,6 +123,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         recorder.onNotice = { [weak self] title, sub in
             self?.banner.showMessage(title: title, sub: sub, accent: .warning, stoppable: true, near: self?.recordingFrame)
         }
+        recorder.onPreviewFrame = { [weak self] pb in self?.preview.showFrame(pb) }
+        preview.levelsProvider = { [weak self] in
+            guard let self else { return (nil, nil, nil, nil, false) }
+            let h = self.recorder.health()
+            let o = self.recorder.options
+            return (o.systemAudio ? self.recorder.systemMeter : nil, o.mic ? self.recorder.micMeter : nil,
+                    h.systemOK, h.micOK, self.recorder.currentSource?.isAudioOnly == true)
+        }
+        preview.onClosed = { [weak self] in self?.refreshMenu() }
+        banner.onPreview = { [weak self] in self?.togglePreview() }
         recorder.onStartCancelled = { [weak self] reason in
             guard let self else { return }
             self.cancelGrace(reason: "start cancelled")
@@ -351,6 +363,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         startItem.target = self; m.addItem(startItem)
         displayItem.target = self; m.addItem(displayItem)
         stopItem.target = self; m.addItem(stopItem)
+        previewItem.target = self; m.addItem(previewItem)
         m.addItem(.separator())
         authItem.target = self; m.addItem(authItem)
         uploadItem.target = self; m.addItem(uploadItem)
@@ -393,6 +406,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         startItem.isHidden = recording
         displayItem.isHidden = recording
         stopItem.isHidden = !recording
+        previewItem.isHidden = !recording
+        previewItem.title = preview.isOpen ? "Hide preview" : "Show preview"
         authItem.title = auth.signingIn ? "Signing in…" : (auth.signedIn ? "Signed in as \(auth.email ?? "?") — sign out" : "Sign in to Darth Meetings…")
         authItem.isEnabled = !auth.signingIn
         uploadItem.state = autoUpload ? .on : .off
@@ -614,6 +629,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         showRecordingBanner()
         tick()
         broadcast("recording_started")
+        if PreviewPanel.wantedOpen { openPreview() }
+    }
+
+    /// Preview panel (0.3.0): next to the banner, on the banner's display.
+    func openPreview() {
+        guard recorder.isRecording else { return }
+        preview.open(below: banner.frame, on: banner.screen)
+        refreshMenu()
+    }
+    @objc func togglePreview() {
+        if preview.isOpen { preview.close(remember: true) } else { openPreview() }
+        refreshMenu()
     }
 
     func recordingLabel() -> String {
@@ -654,6 +681,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func recordingStopped(_ saved: [String: Any]) {
         lastSaved = saved
+        preview.close(remember: false)   // closes with the recording; the preference is untouched
         updateShareWatcher()
         refreshMenu()
         let id = (saved["recording_id"] as? String) ?? ""
@@ -795,6 +823,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 DispatchQueue.main.asyncAfter(deadline: .now() + secs) { RecordDialog.shared.cancel() }
             }
         case "retry_failed_uploads": retryFailedUploads()   // test hook: the 30-minute timer's body
+        case "preview":                                     // {open: true|false}
+            if (obj["open"] as? Bool) ?? !preview.isOpen { openPreview() } else { preview.close(remember: true) }
+            refreshMenu()
+        case "snapshot_preview":                            // test hook: on-screen PNG of the preview + bar values
+            var out: [String: Any] = ["open": preview.isOpen, "levels": preview.lastLevels]
+            if let path = obj["onscreen_path"] as? String, let f = preview.frame {
+                out["onscreen"] = BannerController.screenSnapshot(of: f, to: path, margin: 16)
+            }
+            rlog("preview: levels \(preview.lastLevels)")
+            broadcast("preview_snapshot", out)
         case "simulate_start_hang":                         // test hook: next start sleeps N s inside a timed step
             recorder.simulateStartHang(seconds: (obj["seconds"] as? Double) ?? 20)
         case "snapshot_banner":                             // test hook: render the banner to a PNG
