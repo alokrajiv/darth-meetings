@@ -3,7 +3,7 @@ import CoreGraphics
 import ServiceManagement
 import RecorderCore
 
-let VERSION = "0.2.6"
+let VERSION = "0.2.7"
 let WS_PORT: UInt16 = 47800
 let PWA_URL = URL(string: "https://meetings.darth-internal.trames.io/")!
 /// Seconds between "the call ended" and an automatic stop.
@@ -763,6 +763,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 DispatchQueue.main.asyncAfter(deadline: .now() + secs) { RecordDialog.shared.cancel() }
             }
         case "retry_failed_uploads": retryFailedUploads()   // test hook: the 30-minute timer's body
+        case "snapshot_banner":                             // test hook: render the banner to a PNG
+            let path = (obj["path"] as? String) ?? "~/Library/Logs/DarthRecorder/banner-snapshot.png"
+            broadcast("banner_snapshot", ["ok": banner.snapshot(to: path), "path": path])
         case "stop": stopRecording(reason: "pwa")
         case "status": broadcast("status")
         case "simulate_call":

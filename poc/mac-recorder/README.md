@@ -14,6 +14,21 @@ Native macOS side of Darth Meetings recording (the "Swift tray" angle from Darth
 the user switched it off in the menu (`loginItemUserChoice` in UserDefaults records an explicit choice;
 the default never overrides it). macOS may show "Darth Recorder was added as a login item" once.
 
+**0.2.7 (2026-09-16):**
+- **Our own banner is never recorded.** Display captures (explicit display, display fallback,
+  share-of-display) use `SCContentFilter(display:excludingApplications:[this app]
+  exceptingWindows:[])`; window mode already captures only the call window; the audio stream
+  keeps its own filter (`excludesCurrentProcessAudio`). Verified: the 5 s frame of a 0.2.6
+  display recording shows the pill top-centre, the same frame of a 0.2.7 recording does not.
+- **Banner restyle.** 16 pt continuous corners on the HUD material, 1 px hairline tinted by the
+  accent, SF Symbol in a tinted circle (red recording / amber warning / blue info / green call),
+  capsule buttons (`CapsuleButton`: accent-filled primary, translucent secondary), a pulsing red
+  dot next to the elapsed time while recording, monospaced digits on the sub line. Placement,
+  stoppable rule, auto-hide timings, accent enum and the health tick line are unchanged. Test
+  hook `{cmd:"snapshot_banner", path?}` renders the banner to a PNG
+  (`~/Library/Logs/DarthRecorder/banner-snapshot.png`) — the way to see it from a shell without a
+  Screen Recording grant.
+
 **0.2.6 (2026-09-16):**
 - **Live audio/video health.** `LevelMeter` (AudioHealth.swift) on the system track (inside
   `AudioForwarder`) and the mic tap: per-buffer peak + RMS folded into a 5 s window, "audible" =

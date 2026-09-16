@@ -467,7 +467,13 @@ final class RecordingController {
             guard let d = content.displays.first(where: { $0.displayID == id }) ?? content.displays.first else {
                 throw NSError(domain: "record", code: 11, userInfo: [NSLocalizedDescriptionKey: "no display"])
             }
-            return (SCContentFilter(display: d, excludingWindows: []), d.displayID)
+            // 0.2.7: never record our own banner/panels. Display captures exclude this app
+            // (window mode already captures only the call window; the audio stream keeps its
+            // own filter — excludesCurrentProcessAudio covers audio).
+            let me = Bundle.main.bundleIdentifier ?? "io.trames.darth.recorder"
+            let ours = content.applications.filter { $0.bundleIdentifier == me }
+            if ours.isEmpty { rlog("record: our app (\(me)) not in shareable content — display capture may include the banner") }
+            return (SCContentFilter(display: d, excludingApplications: ours, exceptingWindows: []), d.displayID)
         }
     }
 

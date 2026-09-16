@@ -39,12 +39,16 @@ final class BannerController {
     private var tickTimer: Timer?
     private var targetFrame: CGRect?
 
-    private let accentBar = NSView()
+    /// 0.2.7 look: tinted icon circle instead of the left accent bar, capsule buttons, a
+    /// pulsing red dot next to the elapsed time while recording, 16 pt corners.
+    private let iconCircle = NSView()
     private let icon = NSImageView()
     private let titleLabel = NSTextField(labelWithString: "")
     private let subLabel = NSTextField(labelWithString: "")
-    private let primary = NSButton(title: "Record", target: nil, action: nil)
-    private let secondary = NSButton(title: "Not now", target: nil, action: nil)
+    private let dot = NSView()
+    private let primary = CapsuleButton(title: "Record", filled: true)
+    private let secondary = CapsuleButton(title: "Not now", filled: false)
+    private var currentAccent: Accent = .call
 
     private let fullWidth: CGFloat = 480
     private let fullHeight: CGFloat = 64
@@ -73,6 +77,8 @@ final class BannerController {
     /// `detail` (0.2.6) is asked every second for the health ticks ("video ✓ · mic ✓ · system ✗").
     func showRecording(label: String, since: Date, near frame: CGRect?, detail: (() -> String)? = nil) {
         set(symbol: "record.circle.fill", accent: .recording, title: "Recording \(label)", sub: "00:00 · Darth Recorder")
+        dot.isHidden = false
+        startPulse()
         primary.isHidden = true
         secondary.isHidden = false
         secondary.title = "Stop"
@@ -186,11 +192,42 @@ final class BannerController {
     private var signInAction: (() -> Void)?
 
     private func set(symbol: String, accent: Accent, title: String, sub: String) {
+        currentAccent = accent
         icon.image = NSImage(systemSymbolName: symbol, accessibilityDescription: nil)
         icon.contentTintColor = accent.color
-        accentBar.layer?.backgroundColor = accent.color.cgColor
+        iconCircle.layer?.backgroundColor = accent.color.withAlphaComponent(0.22).cgColor
+        iconCircle.layer?.borderColor = accent.color.withAlphaComponent(0.55).cgColor
+        (panel?.contentView as? NSVisualEffectView)?.layer?.borderColor = accent.color.withAlphaComponent(0.35).cgColor
+        primary.fill = accent.color
+        dot.isHidden = true
+        dot.layer?.removeAllAnimations()
         titleLabel.stringValue = title
         subLabel.stringValue = sub
+    }
+
+    /// The little red dot breathes while we record.
+    private func startPulse() {
+        dot.layer?.removeAllAnimations()
+        let a = CABasicAnimation(keyPath: "opacity")
+        a.fromValue = 1.0; a.toValue = 0.25
+        a.duration = 0.9
+        a.autoreverses = true
+        a.repeatCount = .infinity
+        a.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
+        dot.layer?.add(a, forKey: "pulse")
+    }
+
+    /// Test hook (0.2.7): render the banner's content view to a PNG — this is how the look is
+    /// checked from a shell that has no Screen Recording grant.
+    @discardableResult
+    func snapshot(to path: String) -> Bool {
+        guard let v = panel?.contentView, panel?.isVisible == true,
+              let rep = v.bitmapImageRepForCachingDisplay(in: v.bounds) else { return false }
+        v.cacheDisplay(in: v.bounds, to: rep)
+        guard let png = rep.representation(using: .png, properties: [:]) else { return false }
+        let url = URL(fileURLWithPath: (path as NSString).expandingTildeInPath)
+        do { try png.write(to: url); rlog("banner: snapshot \(Int(rep.pixelsWide))x\(Int(rep.pixelsHigh)) → \(url.path)"); return true }
+        catch { rlog("banner: snapshot failed: \(error)"); return false }
     }
 
     private func shorten(_ s: String) -> String {
@@ -233,57 +270,64 @@ final class BannerController {
         fx.blendingMode = .behindWindow
         fx.state = .active
         fx.wantsLayer = true
-        fx.layer?.cornerRadius = 14
+        fx.layer?.cornerRadius = 16
+        fx.layer?.cornerCurve = .continuous
         fx.layer?.masksToBounds = true
-        fx.layer?.borderWidth = 0.5
-        fx.layer?.borderColor = NSColor.white.withAlphaComponent(0.15).cgColor
+        fx.layer?.borderWidth = 1
+        fx.layer?.borderColor = NSColor.white.withAlphaComponent(0.14).cgColor
         p.contentView = fx
 
-        accentBar.wantsLayer = true
-        accentBar.layer?.backgroundColor = NSColor.systemGreen.cgColor
-        accentBar.translatesAutoresizingMaskIntoConstraints = false
-        fx.addSubview(accentBar)
-
-        icon.symbolConfiguration = .init(pointSize: 18, weight: .semibold)
+        iconCircle.wantsLayer = true
+        iconCircle.layer?.cornerRadius = 15
+        iconCircle.layer?.borderWidth = 1
+        iconCircle.translatesAutoresizingMaskIntoConstraints = false
+        icon.symbolConfiguration = .init(pointSize: 14, weight: .semibold)
         icon.translatesAutoresizingMaskIntoConstraints = false
+        iconCircle.addSubview(icon)
+
         titleLabel.font = .systemFont(ofSize: 13, weight: .semibold)
         titleLabel.textColor = .labelColor
         titleLabel.lineBreakMode = .byTruncatingTail
-        subLabel.font = .systemFont(ofSize: 11)
+        subLabel.font = .monospacedDigitSystemFont(ofSize: 11, weight: .regular)
         subLabel.textColor = .secondaryLabelColor
         subLabel.lineBreakMode = .byTruncatingTail
-        let text = NSStackView(views: [titleLabel, subLabel])
+        dot.wantsLayer = true
+        dot.layer?.backgroundColor = NSColor.systemRed.cgColor
+        dot.layer?.cornerRadius = 4
+        dot.translatesAutoresizingMaskIntoConstraints = false
+        dot.isHidden = true
+        let subRow = NSStackView(views: [dot, subLabel])
+        subRow.orientation = .horizontal
+        subRow.alignment = .centerY
+        subRow.spacing = 5
+        let text = NSStackView(views: [titleLabel, subRow])
         text.orientation = .vertical
         text.alignment = .leading
         text.spacing = 1
         text.translatesAutoresizingMaskIntoConstraints = false
-        for b in [primary, secondary] {
-            b.bezelStyle = .rounded
-            b.controlSize = .small
-            b.font = .systemFont(ofSize: 11, weight: .medium)
-            b.translatesAutoresizingMaskIntoConstraints = false
-        }
+        for b in [primary, secondary] { b.translatesAutoresizingMaskIntoConstraints = false }
         primary.keyEquivalent = "\r"
         let buttons = NSStackView(views: [primary, secondary])
         buttons.orientation = .horizontal
-        buttons.spacing = 6
+        buttons.spacing = 8
         buttons.translatesAutoresizingMaskIntoConstraints = false
 
-        let row = NSStackView(views: [icon, text, buttons])
+        let row = NSStackView(views: [iconCircle, text, buttons])
         row.orientation = .horizontal
         row.alignment = .centerY
         row.spacing = 12
         row.translatesAutoresizingMaskIntoConstraints = false
         fx.addSubview(row)
         NSLayoutConstraint.activate([
-            accentBar.leadingAnchor.constraint(equalTo: fx.leadingAnchor),
-            accentBar.topAnchor.constraint(equalTo: fx.topAnchor),
-            accentBar.bottomAnchor.constraint(equalTo: fx.bottomAnchor),
-            accentBar.widthAnchor.constraint(equalToConstant: 6),
-            row.leadingAnchor.constraint(equalTo: accentBar.trailingAnchor, constant: 12),
+            row.leadingAnchor.constraint(equalTo: fx.leadingAnchor, constant: 14),
             row.trailingAnchor.constraint(equalTo: fx.trailingAnchor, constant: -14),
             row.centerYAnchor.constraint(equalTo: fx.centerYAnchor),
-            icon.widthAnchor.constraint(equalToConstant: 24),
+            iconCircle.widthAnchor.constraint(equalToConstant: 30),
+            iconCircle.heightAnchor.constraint(equalToConstant: 30),
+            icon.centerXAnchor.constraint(equalTo: iconCircle.centerXAnchor),
+            icon.centerYAnchor.constraint(equalTo: iconCircle.centerYAnchor),
+            dot.widthAnchor.constraint(equalToConstant: 8),
+            dot.heightAnchor.constraint(equalToConstant: 8),
             text.widthAnchor.constraint(greaterThanOrEqualToConstant: 160),
         ])
         text.setContentHuggingPriority(.defaultLow, for: .horizontal)
@@ -372,5 +416,44 @@ final class BannerController {
     @objc private func showFileTapped() {
         if let u = currentSaved { NSWorkspace.shared.activateFileViewerSelecting([u]) }
         hide()
+    }
+}
+
+
+/// Capsule button for the banner: no AppKit bezel, a rounded layer, filled with the accent
+/// (primary) or a translucent white (secondary), white label.
+final class CapsuleButton: NSButton {
+    var fill: NSColor = .systemRed { didSet { needsDisplay = true; layer?.backgroundColor = bg } }
+    let filled: Bool
+    private var bg: CGColor { (filled ? fill : NSColor.white.withAlphaComponent(0.14)).cgColor }
+
+    init(title: String, filled: Bool) {
+        self.filled = filled
+        super.init(frame: .zero)
+        self.title = title
+        isBordered = false
+        wantsLayer = true
+        bezelStyle = .rounded
+        font = .systemFont(ofSize: 11, weight: .semibold)
+        contentTintColor = .white
+        layer?.cornerRadius = 12
+        layer?.cornerCurve = .continuous
+        layer?.backgroundColor = bg
+        setButtonType(.momentaryChange)
+    }
+    required init?(coder: NSCoder) { fatalError() }
+
+    override var title: String {
+        didSet { attributedTitle = NSAttributedString(string: title, attributes: [.foregroundColor: NSColor.white, .font: font ?? .systemFont(ofSize: 11, weight: .semibold)]) }
+    }
+    override var intrinsicContentSize: NSSize {
+        let s = super.intrinsicContentSize
+        return NSSize(width: s.width + 22, height: 24)
+    }
+    override func layout() { super.layout(); layer?.cornerRadius = bounds.height / 2 }
+    override func mouseDown(with event: NSEvent) {
+        layer?.backgroundColor = (filled ? fill.withAlphaComponent(0.7) : NSColor.white.withAlphaComponent(0.26)).cgColor
+        super.mouseDown(with: event)
+        layer?.backgroundColor = bg
     }
 }
