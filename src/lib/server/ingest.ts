@@ -1,6 +1,8 @@
 import 'server-only';
 import {
   createForUser,
+  getForUser,
+  markIngestFailed,
   promoteUploadingRow,
   setLocalAudioPathForUser,
   type TranscriptRow,
@@ -30,19 +32,102 @@ import type { GmeetContext } from '@/lib/format';
  * Used by both the raw-body upload route (POST /api/transcripts) and the
  * Google Meet import route (which downloads the bytes from Drive first).
  *
- * On failure the temp file is deleted and an IngestError is thrown carrying
- * the stage, so callers can map it to a precise HTTP response.
+ * On failure an IngestError is thrown carrying the stage, so callers can map
+ * it to a precise HTTP response. When the call had a placeholder row, the
+ * failure is KEPT instead of thrown away (`keptRow`): the bytes are renamed
+ * under the placeholder id, the row flips to 'error' with an ingestFailure
+ * marker, and the ingest-retry sweeper re-submits it later. Without a
+ * placeholder (Meet/Teams import paths) the temp file is deleted as before.
+ *
+ * Why: on 2026-09-16 AssemblyAI's balance went negative for an afternoon and a
+ * colleague's 147 MB recording was accepted, rejected at submit, and vanished
+ * from the listing — "it should have just been failed transcribe and be
+ * there" (Alok).
  */
 
 export class IngestError extends Error {
   constructor(
     public stage: 'aai-upload' | 'aai-submit',
     message: string,
-    public causeErr?: unknown
+    public causeErr?: unknown,
+    /** Set when the failure was kept as a visible 'error' row owning the file. */
+    public keptRow?: TranscriptRow
   ) {
     super(message);
     this.name = 'IngestError';
   }
+}
+
+/** Retry backoff: 5, 10, 20, 40 min, then hourly; give up after 72 h. */
+const RETRY_GIVE_UP_MS = 72 * 3600_000;
+function retryDelayMs(attempts: number): number {
+  return Math.min(60, 5 * 2 ** Math.max(0, attempts - 1)) * 60_000;
+}
+
+function errorText(err: unknown): string {
+  const raw = err instanceof Error ? err.message : typeof err === 'string' ? err : JSON.stringify(err);
+  return (raw || 'unknown error').replace(/\s+/g, ' ').slice(0, 300);
+}
+
+/**
+ * Keep a failed hand-off: file → `<placeholderId><ext>`, row → 'error' with
+ * the retry marker. Returns null when there is no placeholder to keep it on
+ * (or the placeholder is gone), in which case the caller deletes the file.
+ */
+async function keepFailedIngest(
+  userId: string,
+  tempFilename: string,
+  opts: IngestOptions,
+  stage: 'aai-upload' | 'aai-submit',
+  causeErr: unknown
+): Promise<TranscriptRow | null> {
+  const placeholderId = opts.placeholderAssemblyaiId;
+  if (!placeholderId) return null;
+  const existing = await getForUser(userId, placeholderId);
+  if (!existing) return null;
+  const prev = existing.gmeet_context?.ingestFailure;
+  const now = new Date();
+  const firstAt = prev?.firstAt ?? now.toISOString();
+  const attempts = (prev?.attempts ?? 0) + 1;
+  const retryable = now.getTime() - new Date(firstAt).getTime() < RETRY_GIVE_UP_MS;
+  let filename = audioFilename(placeholderId, opts.originalFilename);
+  if (filename.endsWith('.bin')) {
+    const sniffed = await sniffMediaExtension(tempFilename).catch(() => null);
+    if (sniffed) filename = `${placeholderId}${sniffed}`;
+  }
+  if (filename !== tempFilename) await renameAudioFile(tempFilename, filename);
+  const row = await markIngestFailed(
+    userId,
+    placeholderId,
+    {
+      stage,
+      message: errorText(causeErr),
+      firstAt,
+      at: now.toISOString(),
+      attempts,
+      nextAt: retryable ? new Date(now.getTime() + retryDelayMs(attempts)).toISOString() : null,
+      retryable,
+      opts: {
+        originalFilename: opts.originalFilename,
+        languageCode: opts.languageCode,
+        title: opts.title ?? null,
+        extraKeyterms: opts.extraKeyterms,
+        speechModel: opts.speechModel,
+      },
+    },
+    filename
+  );
+  if (!row) {
+    // Placeholder reaped between the check and the update: nothing owns the
+    // file any more — hand it back under the temp name for the caller's delete.
+    if (filename !== tempFilename) await renameAudioFile(filename, tempFilename).catch(() => {});
+    return null;
+  }
+  console.warn(
+    `[ingest] ${stage} failed — kept as ${row.assemblyai_id} (attempt ${attempts}, ` +
+      `${retryable ? 'retry ' + row.gmeet_context?.ingestFailure?.nextAt : 'gave up'}): ${errorText(causeErr)}`
+  );
+  return row;
 }
 
 export interface IngestOptions {
@@ -95,8 +180,12 @@ export async function ingestLocalAudio(
     // Path input → the SDK streams the file from disk.
     audioUrl = await uploadFile(resolveAudioPath(aaiSourceFilename));
   } catch (error) {
-    await deleteAudioFile(tempFilename);
-    throw new IngestError('aai-upload', 'Upload to AssemblyAI failed', error);
+    const kept = await keepFailedIngest(userId, tempFilename, opts, 'aai-upload', error).catch((e) => {
+      console.error('[ingest] keeping the failed upload failed too:', e);
+      return null;
+    });
+    if (!kept) await deleteAudioFile(tempFilename);
+    throw new IngestError('aai-upload', 'Upload to AssemblyAI failed', error, kept ?? undefined);
   } finally {
     // AAI has the bytes (or the upload failed); the mix lives on inside the
     // re-muxed stored file, so the standalone copy is not needed any more.
@@ -136,8 +225,12 @@ export async function ingestLocalAudio(
       model: opts.speechModel,
     });
   } catch (error) {
-    await deleteAudioFile(tempFilename);
-    throw new IngestError('aai-submit', 'Transcription submission failed', error);
+    const kept = await keepFailedIngest(userId, tempFilename, opts, 'aai-submit', error).catch((e) => {
+      console.error('[ingest] keeping the failed submit failed too:', e);
+      return null;
+    });
+    if (!kept) await deleteAudioFile(tempFilename);
+    throw new IngestError('aai-submit', 'Transcription submission failed', error, kept ?? undefined);
   }
 
   let row: TranscriptRow;

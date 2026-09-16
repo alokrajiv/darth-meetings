@@ -124,7 +124,8 @@ export async function listVisibleToUser(
            -- Deferred-import placeholders: mode drives the "waiting for
            -- Google to prepare the X" listing copy; error shows after give-up.
            t.gmeet_context->'deferredImport'->>'mode' AS deferred_mode,
-           t.gmeet_context->'deferredImport'->>'error' AS deferred_error,
+           COALESCE(t.gmeet_context->'deferredImport'->>'error',
+                    t.gmeet_context->'ingestFailure'->>'message') AS deferred_error,
            t.gmeet_context->'deferredImport'->>'background' AS deferred_background,
            sm.series_id, se.title AS series_title,
            sus.series_id AS suspected_series_id, sus.title AS suspected_series_title,
@@ -359,7 +360,8 @@ export async function listPagedForUser(
              END AS provider,
              (t.gmeet_context->>'eventId') IS NOT NULL AS has_event,
              t.gmeet_context->'deferredImport'->>'mode' AS deferred_mode,
-             t.gmeet_context->'deferredImport'->>'error' AS deferred_error,
+             COALESCE(t.gmeet_context->'deferredImport'->>'error',
+                      t.gmeet_context->'ingestFailure'->>'message') AS deferred_error,
              t.gmeet_context->'deferredImport'->>'background' AS deferred_background,
              -- Meetings with more than one recording: extra Meet segments
              -- (videoParts, on top of the primary), a stitched multi-file
@@ -800,6 +802,61 @@ export async function markDeferredImportFailed(
     WHERE user_id = ${userId} AND assemblyai_id = ${placeholderId}
   `;
   publishEvent({ kind: 'status', assemblyaiId: placeholderId });
+}
+
+/**
+ * Transcription hand-off failed after the bytes landed on our disk: keep the
+ * placeholder as a visible 'error' row that owns the stored file (under its
+ * own id) and carries the retry marker. Returns null when the placeholder is
+ * gone (reaped mid-upload) — the caller then falls back to deleting the file.
+ */
+export async function markIngestFailed(
+  userId: string,
+  placeholderId: string,
+  failure: NonNullable<GmeetContext['ingestFailure']>,
+  localAudioPath: string
+): Promise<TranscriptRow | null> {
+  const rows = await sql<TranscriptRow[]>`
+    UPDATE ${sql(SCHEMA)}.transcripts
+    SET status = 'error',
+        local_audio_path = ${localAudioPath},
+        gmeet_context = COALESCE(gmeet_context, '{}'::jsonb) ||
+          ${sql.json({ ingestFailure: failure } as unknown as never)}
+    WHERE user_id = ${userId} AND assemblyai_id = ${placeholderId}
+      AND status IN ('uploading', 'waiting', 'error')
+      AND deleted_at IS NULL
+    RETURNING *
+  `;
+  if (rows[0]) publishEvent({ kind: 'status', assemblyaiId: placeholderId });
+  return rows[0] ?? null;
+}
+
+/** Flip a kept-failure row back to 'uploading' for one retry attempt (the
+ * promote-in-place path only accepts uploading/waiting rows). Returns false
+ * when the row is not in the retryable state any more (someone else got it). */
+export async function resetForIngestRetry(userId: string, placeholderId: string): Promise<boolean> {
+  const rows = await sql<Array<{ id: number }>>`
+    UPDATE ${sql(SCHEMA)}.transcripts
+    SET status = 'uploading', upload_progress_at = now()
+    WHERE user_id = ${userId} AND assemblyai_id = ${placeholderId}
+      AND status = 'error' AND deleted_at IS NULL
+      AND gmeet_context->'ingestFailure' IS NOT NULL
+    RETURNING id
+  `;
+  if (rows[0]) publishEvent({ kind: 'status', assemblyaiId: placeholderId });
+  return rows.length > 0;
+}
+
+/** Kept-failure rows whose backoff has elapsed, oldest due first. */
+export async function listIngestRetryRows(limit: number): Promise<TranscriptRow[]> {
+  return sql<TranscriptRow[]>`
+    SELECT * FROM ${sql(SCHEMA)}.transcripts
+    WHERE status = 'error' AND deleted_at IS NULL
+      AND gmeet_context->'ingestFailure'->>'retryable' = 'true'
+      AND COALESCE((gmeet_context->'ingestFailure'->>'nextAt')::timestamptz, now()) <= now()
+    ORDER BY (gmeet_context->'ingestFailure'->>'nextAt')::timestamptz ASC NULLS FIRST
+    LIMIT ${limit}
+  `;
 }
 
 export interface UploadingPlaceholderInsert {
@@ -1579,7 +1636,8 @@ export async function listDeletedForUser(userId: string): Promise<TranscriptList
            END AS provider,
            (t.gmeet_context->>'eventId') IS NOT NULL AS has_event,
            t.gmeet_context->'deferredImport'->>'mode' AS deferred_mode,
-           t.gmeet_context->'deferredImport'->>'error' AS deferred_error,
+           COALESCE(t.gmeet_context->'deferredImport'->>'error',
+                    t.gmeet_context->'ingestFailure'->>'message') AS deferred_error,
            t.deleted_at::text AS deleted_at
     FROM ${sql(SCHEMA)}.transcripts t
     WHERE t.user_id = ${userId} AND t.deleted_at IS NOT NULL

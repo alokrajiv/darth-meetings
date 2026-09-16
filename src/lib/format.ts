@@ -315,6 +315,29 @@ export interface GmeetContext {
    * `request` with the owner's server token the moment the dependency lands.
    * On success the placeholder is promoted (video modes) or deleted in favor
    * of the real imported row (transcript mode). */
+  /** Transcription hand-off failed AFTER the bytes were safely stored on our
+   * disk (AssemblyAI upload/submit error — account balance negative, AAI 5xx,
+   * network). The placeholder row stays visible as Failed, the file is kept
+   * under the placeholder id, and the ingest-retry sweeper re-submits it with
+   * backoff until it lands or `retryable` is cleared (72 h). Cleared on
+   * success. POST /api/transcripts/:id/retry-ingest does it on demand. */
+  ingestFailure?: {
+    stage: 'aai-upload' | 'aai-submit';
+    message: string;
+    firstAt: string;
+    at: string;
+    attempts: number;
+    nextAt: string | null;
+    retryable: boolean;
+    /** The ingest options frozen for the replay. */
+    opts: {
+      originalFilename: string | null;
+      languageCode?: string;
+      title?: string | null;
+      extraKeyterms?: string[];
+      speechModel?: string;
+    };
+  };
   deferredImport?: {
     mode: 'video' | 'transcript' | 'both';
     /** Owner's email at queue time (needed for dedupe + share resolution —

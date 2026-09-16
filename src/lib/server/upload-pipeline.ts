@@ -476,6 +476,13 @@ export async function finalizeUpload(
       await linkRecorderRecording(user.userId, spec.recorderRecordingId, row.assemblyai_id);
       return { status: 201, body: { transcript: row } };
     } catch (error) {
+      if (error instanceof IngestError && error.keptRow) {
+        // Bytes are stored, the row stays visible as Failed and the sweeper
+        // retries the hand-off: for the client this upload succeeded.
+        console.error(`[upload] ${error.stage} failed — kept for retry:`, error.causeErr);
+        await linkRecorderRecording(user.userId, spec.recorderRecordingId, error.keptRow.assemblyai_id);
+        return { status: 201, body: { transcript: error.keptRow } };
+      }
       await deleteForUser(user.userId, groupRow.assemblyai_id).catch(() => {});
       await deleteAudioFilesByPrefix(`upload-${groupUuid}.part`);
       if (error instanceof IngestError) {
@@ -555,9 +562,16 @@ export async function finalizeUpload(
     await linkRecorderRecording(user.userId, spec.recorderRecordingId, row.assemblyai_id);
     return { status: 201, body: { transcript: row } };
   } catch (error) {
-    // A failed ingest leaves the placeholder stuck at 'uploading' — remove it
-    // so viewers see the upload vanish rather than a zombie row. (No-op once
-    // promoted: the row's id is the real AAI one by then.)
+    if (error instanceof IngestError && error.keptRow) {
+      // Bytes are stored, the row stays visible as Failed and the sweeper
+      // retries the hand-off: for the client this upload succeeded.
+      console.error(`[upload] ${error.stage} failed — kept for retry:`, error.causeErr);
+      await linkRecorderRecording(user.userId, spec.recorderRecordingId, error.keptRow.assemblyai_id);
+      return { status: 201, body: { transcript: error.keptRow } };
+    }
+    // A failed ingest that could NOT be kept leaves the placeholder stuck at
+    // 'uploading' — remove it so viewers see the upload vanish rather than a
+    // zombie row. (No-op once promoted: the row's id is the real AAI one.)
     await deleteForUser(user.userId, placeholderId).catch(() => {});
     if (error instanceof IngestError) {
       console.error(`[upload] ${error.stage} failed:`, error.causeErr);

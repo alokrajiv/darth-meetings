@@ -363,6 +363,19 @@ export async function linkRecordingTranscript(
   return rows.length > 0;
 }
 
+/** A kept-failure placeholder was promoted to its real AAI id on retry: move
+ * every registry row that pointed at the old id. */
+export async function relinkRecordingTranscript(oldTranscriptId: string, newTranscriptId: string): Promise<number> {
+  if (oldTranscriptId === newTranscriptId) return 0;
+  const rows = await sql<Array<{ id: string }>>`
+    UPDATE ${sql(SCHEMA)}.recorder_recordings
+    SET transcript_id = ${newTranscriptId}, updated_at = now()
+    WHERE transcript_id = ${oldTranscriptId}
+    RETURNING id
+  `;
+  return rows.length;
+}
+
 // ---------------------------------------------------------------------------
 // Nudges ("Ask to upload")
 // ---------------------------------------------------------------------------

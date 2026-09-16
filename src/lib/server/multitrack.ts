@@ -44,7 +44,13 @@ export interface AudioStreamInfo {
   channels: number;
   sampleRate: number;
   language: string | null;
+  title: string | null;
 }
+
+/** Stream title stamped on the mix track so a second pass (ingest retry of a
+ * kept-failure row) recognises an already-normalised file instead of mixing
+ * the mix back in with the raw tracks. */
+export const MIX_TRACK_TITLE = 'darth-mix';
 
 export async function probeAudioStreams(filename: string): Promise<AudioStreamInfo[]> {
   const { stdout } = await execFileP(
@@ -52,7 +58,7 @@ export async function probeAudioStreams(filename: string): Promise<AudioStreamIn
     [
       '-v', 'error',
       '-select_streams', 'a',
-      '-show_entries', 'stream=index,channels,sample_rate:stream_tags=language',
+      '-show_entries', 'stream=index,channels,sample_rate:stream_tags=language,title',
       '-of', 'json',
       resolveAudioPath(filename),
     ],
@@ -63,7 +69,7 @@ export async function probeAudioStreams(filename: string): Promise<AudioStreamIn
       index?: number;
       channels?: number;
       sample_rate?: string;
-      tags?: { language?: string };
+      tags?: { language?: string; title?: string };
     }>;
   };
   return (parsed.streams ?? []).map((s, i) => ({
@@ -71,6 +77,7 @@ export async function probeAudioStreams(filename: string): Promise<AudioStreamIn
     channels: s.channels ?? 1,
     sampleRate: Number(s.sample_rate ?? 48000) || 48000,
     language: s.tags?.language ?? null,
+    title: s.tags?.title ?? null,
   }));
 }
 
@@ -102,6 +109,23 @@ export async function normalizeMultiTrack(tempFilename: string): Promise<MultiTr
   const mixName = `mix-${randomUUID()}.m4a`;
   const mixAbs = resolveAudioPath(mixName);
   const remuxTmp = `${src}.remux.tmp`;
+
+  // Already normalised (ingest retry of a kept-failure row): the mix is
+  // track 0 — just pull it out for AssemblyAI, never mix again.
+  if (streams[0].title === MIX_TRACK_TITLE) {
+    try {
+      await execFileP(
+        'ffmpeg',
+        ['-hide_banner', '-loglevel', 'error', '-y', '-i', src, '-map', '0:a:0', '-c', 'copy',
+         '-movflags', '+faststart', '-f', 'mp4', mixAbs],
+        EXEC_OPTS
+      );
+    } catch (err) {
+      await fsp.unlink(mixAbs).catch(() => {});
+      throw new Error(`multitrack mix extract failed: ${describe(err)}`);
+    }
+    return { mixed: true, tracks: streams.length, aaiSource: mixName };
+  }
 
   // 1. Mix: every audio stream → mono 48 kHz → summed (normalize=0 keeps
   //    each voice at its recorded level; the limiter catches the rare overlap
@@ -147,6 +171,7 @@ export async function normalizeMultiTrack(tempFilename: string): Promise<MultiTr
         '-map', '0:a',
         '-c', 'copy',
         '-disposition:a:0', 'default',
+        '-metadata:s:a:0', `title=${MIX_TRACK_TITLE}`,
         ...clearDispositions,
         '-movflags', '+faststart',
         '-f', 'mp4',

@@ -14,5 +14,7 @@ export async function register() {
     startVideoFetchSweeper();
     const { startDeferredImportPoller } = await import('@/lib/server/deferred-import-poller');
     startDeferredImportPoller();
+    const { startIngestRetrySweeper } = await import('@/lib/server/ingest-retry');
+    startIngestRetrySweeper();
   }
 }

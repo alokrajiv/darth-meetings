@@ -43,6 +43,7 @@ import { ActivityBar } from '@/components/activity-bar';
 import { TranscriptOutline } from '@/components/transcript-outline';
 import { AppHeader } from '@/components/app-header';
 import { RerunDiarizationButton } from '@/components/rerun-diarization-button';
+import { IngestFailureNote } from '@/components/ingest-failure-note';
 import { TranscriptSourcesCard } from '@/components/transcript-sources-card';
 import { MeetingInfoCard } from '@/components/meeting-info-card';
 import { OfflinePinDialog, OfflinePinStatus } from '@/components/offline-pin-dialog';
@@ -2514,7 +2515,16 @@ function TranscriptDetailInner({ transcriptId }: { transcriptId: string }) {
           <div className="mt-1.5 flex flex-wrap items-center gap-x-2 gap-y-1 text-xs text-muted-foreground">
             {row.status !== 'completed' &&
               (row.status === 'error' ? (
-                <Badge variant="destructive">Failed</Badge>
+                <>
+                  <Badge variant="destructive">Failed</Badge>
+                  {row.gmeet_context?.ingestFailure && (
+                    <IngestFailureNote
+                      id={row.assemblyai_id}
+                      failure={row.gmeet_context.ingestFailure}
+                      canRetry={canEdit && !offline}
+                    />
+                  )}
+                </>
               ) : (
                 <Badge
                   variant="secondary"

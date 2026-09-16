@@ -648,10 +648,12 @@ export function useCompanionRecordings(enabled = true): CompanionRecordingsState
   return { recordings: merged, loading, error, refresh };
 }
 
+// NOT upload_progress: the tray broadcasts it for every debounced byte-count
+// step (≈40 in 3 s on a 150 MB upload — 2026-09-16), and the `merged` fold
+// below already moves the row to 'uploading' with the live pct.
 const REGISTRY_DIRTYING_EVENTS = new Set([
   'recording_started',
   'recording_stopped',
-  'upload_progress',
   'upload_done',
   'upload_failed',
   'auth_changed',
