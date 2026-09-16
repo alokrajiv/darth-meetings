@@ -14,6 +14,29 @@ Native macOS side of Darth Meetings recording (the "Swift tray" angle from Darth
 the user switched it off in the menu (`loginItemUserChoice` in UserDefaults records an explicit choice;
 the default never overrides it). macOS may show "Darth Recorder was added as a login item" once.
 
+**0.2.8 (2026-09-16):**
+- **A start can no longer wedge the tray.** 21:23 SGT: SCK never called back for a WhatsApp
+  voice-call window; `state` stayed `.starting` forever, every later Record click was ignored,
+  SIGTERM hung. Now every awaited start step (shareable content + filter, video stream start,
+  system audio stream start) races an 8 s deadline (`VIDEO_START_TIMEOUT`, `timed(_:deadline:)`)
+  and logs its duration. A window capture that times out is torn down, event
+  `video_start_timeout {step, source, fallback}`, banner "Couldn't capture the call window —
+  recording the display instead", and the display containing the window is recorded (the
+  window-gone fallback). A display capture that times out fails the recording. The abandoned SCK
+  call is disposed of if it ever returns (`orphan`).
+- **Cancelling a pending start.** Stop, a second Record click (cancels and starts over) and Quit
+  while `.starting` call `cancelStart`: task cancelled, mic stopped, partial streams/file torn
+  down, state `.idle`, row `upload_failed` "capture never started (…)", event
+  `recording_cancelled`; `applicationWillTerminate` never waits on a pending start.
+  Test hook `{cmd:"simulate_start_hang", seconds}` (the next start sleeps inside a timed step).
+- **Banner corners.** The rounded card had a square material behind it: a layer mask does not
+  clip an NSVisualEffectView's behind-window backdrop. Fixed with `maskImage` (stretchable
+  rounded rect, cap insets = radius), `invalidateShadow()` after frame changes, styleMask
+  `[.nonactivatingPanel, .borderless]`. The window logs `opaque=false background=clear
+  shadow=true maskImage=true` once. `snapshot_banner` now also takes `onscreen_path` — real
+  on-screen pixels around the banner via CGWindowListCreateImage (the tray has the Screen
+  Recording grant; a shell driving tests does not).
+
 **0.2.7 (2026-09-16):**
 - **Our own banner is never recorded.** Display captures (explicit display, display fallback,
   share-of-display) use `SCContentFilter(display:excludingApplications:[this app]

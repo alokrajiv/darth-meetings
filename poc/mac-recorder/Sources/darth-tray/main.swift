@@ -3,7 +3,7 @@ import CoreGraphics
 import ServiceManagement
 import RecorderCore
 
-let VERSION = "0.2.7"
+let VERSION = "0.2.8"
 let WS_PORT: UInt16 = 47800
 let PWA_URL = URL(string: "https://meetings.darth-internal.trames.io/")!
 /// Seconds between "the call ended" and an automatic stop.
@@ -118,6 +118,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             self?.banner.showMessage(title: "Recording problem", sub: msg, stoppable: self?.recorder.isRecording ?? false)
         }
         recorder.onTrackHealth = { [weak self] track, ok in self?.trackHealthChanged(track, ok: ok) }
+        recorder.onNotice = { [weak self] title, sub in
+            self?.banner.showMessage(title: title, sub: sub, accent: .warning, stoppable: true, near: self?.recordingFrame)
+        }
+        recorder.onStartCancelled = { [weak self] reason in
+            guard let self else { return }
+            self.cancelGrace(reason: "start cancelled")
+            self.updateShareWatcher()
+            self.refreshMenu()
+            self.banner.showMessage(title: "Recording cancelled", sub: "It never started (\(reason)).", accent: .warning)
+            self.broadcast("recording_cancelled", ["reason": reason])
+        }
 
         auth.onChange = { [weak self] in
             self?.refreshMenu()
@@ -237,7 +248,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         terminating = true
         let wasRecording = recorder.isRecording
         var finalised = false
-        if wasRecording {
+        if recorder.state == .starting {
+            // A pending start has no file to finalise and may be wedged in SCK — cancel, never wait.
+            rlog("terminating while a start is pending — cancelling it")
+            recorder.cancelStart(reason: "quit")
+            finalised = true
+        } else if wasRecording {
             let started = Date()
             let sem = DispatchSemaphore(value: 0)
             rlog("terminating while recording — stopping the recording first")
@@ -567,6 +583,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func startRecording(for call: DetectedCall?, options: RecordingController.RecordOptions) {
+        if recorder.state == .starting {
+            // Record clicked again while the first start is still pending: cancel it and start
+            // over (a wedged SCK start used to swallow every later click, 2026-09-16).
+            recorder.cancelStart(reason: "record clicked again")
+        }
         guard !recorder.isRecording else { return }
         guard CGPreflightScreenCaptureAccess() else {
             banner.showMessage(title: "Screen recording not allowed", sub: "Enable Darth Recorder in System Settings → Privacy & Security → Screen Recording.")
@@ -763,9 +784,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 DispatchQueue.main.asyncAfter(deadline: .now() + secs) { RecordDialog.shared.cancel() }
             }
         case "retry_failed_uploads": retryFailedUploads()   // test hook: the 30-minute timer's body
+        case "simulate_start_hang":                         // test hook: next start sleeps N s inside a timed step
+            recorder.simulateStartHang(seconds: (obj["seconds"] as? Double) ?? 20)
         case "snapshot_banner":                             // test hook: render the banner to a PNG
             let path = (obj["path"] as? String) ?? "~/Library/Logs/DarthRecorder/banner-snapshot.png"
-            broadcast("banner_snapshot", ["ok": banner.snapshot(to: path), "path": path])
+            let ok = banner.snapshot(to: path)
+            // Real on-screen pixels around the banner (this app has the Screen Recording grant).
+            let onscreen = (obj["onscreen_path"] as? String).map { banner.screenSnapshot(to: $0) }
+            broadcast("banner_snapshot", ["ok": ok, "path": path, "onscreen": onscreen ?? NSNull()])
         case "stop": stopRecording(reason: "pwa")
         case "status": broadcast("status")
         case "simulate_call":

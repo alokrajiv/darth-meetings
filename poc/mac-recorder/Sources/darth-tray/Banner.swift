@@ -34,6 +34,7 @@ final class BannerController {
     }
 
     private var panel: NSPanel?
+    private var panelLoggedOnce = false
     private var currentCall: DetectedCall?
     private var hideTimer: Timer?
     private var tickTimer: Timer?
@@ -251,7 +252,7 @@ final class BannerController {
 
     private func makePanel() -> NSPanel {
         let p = NSPanel(contentRect: NSRect(x: 0, y: 0, width: fullWidth, height: fullHeight),
-                        styleMask: [.nonactivatingPanel, .borderless, .fullSizeContentView],
+                        styleMask: [.nonactivatingPanel, .borderless],
                         backing: .buffered, defer: false)
         p.level = .statusBar
         p.isOpaque = false
@@ -273,6 +274,9 @@ final class BannerController {
         fx.layer?.cornerRadius = 16
         fx.layer?.cornerCurve = .continuous
         fx.layer?.masksToBounds = true
+        // 0.2.8: the layer mask does NOT clip a behind-window material — its backdrop still drew
+        // as a square behind the rounded card. NSVisualEffectView needs its own maskImage.
+        fx.maskImage = Self.roundedMask(radius: 16)
         fx.layer?.borderWidth = 1
         fx.layer?.borderColor = NSColor.white.withAlphaComponent(0.14).cgColor
         p.contentView = fx
@@ -335,6 +339,38 @@ final class BannerController {
         return p
     }
 
+    /// A stretchable rounded-rect mask for NSVisualEffectView (cap insets = the radius).
+    private static func roundedMask(radius r: CGFloat) -> NSImage {
+        let side = r * 2 + 1
+        let img = NSImage(size: NSSize(width: side, height: side), flipped: false) { rect in
+            NSColor.black.setFill()
+            NSBezierPath(roundedRect: rect, xRadius: r, yRadius: r).fill()
+            return true
+        }
+        img.capInsets = NSEdgeInsets(top: r, left: r, bottom: r, right: r)
+        img.resizingMode = .stretch
+        return img
+    }
+
+    /// Test hook (0.2.8): real on-screen pixels around the banner via CGWindowListCreateImage —
+    /// the tray has the Screen Recording grant, the shell driving the tests does not.
+    @discardableResult
+    func screenSnapshot(to path: String, margin: CGFloat = 24) -> Bool {
+        guard let p = panel, p.isVisible, let s = p.screen ?? NSScreen.screens.first else { return false }
+        let f = p.frame.insetBy(dx: -margin, dy: -margin)
+        // Cocoa (bottom-left, per-screen) → CG global (top-left of the primary display).
+        let primaryH = NSScreen.screens.first?.frame.height ?? s.frame.height
+        let cg = CGRect(x: f.origin.x, y: primaryH - f.maxY, width: f.width, height: f.height)
+        guard let img = CGWindowListCreateImage(cg, .optionOnScreenOnly, kCGNullWindowID, [.bestResolution]) else {
+            rlog("banner: on-screen snapshot failed (no image)"); return false
+        }
+        let rep = NSBitmapImageRep(cgImage: img)
+        guard let png = rep.representation(using: .png, properties: [:]) else { return false }
+        let url = URL(fileURLWithPath: (path as NSString).expandingTildeInPath)
+        do { try png.write(to: url); rlog("banner: on-screen snapshot \(img.width)x\(img.height) → \(url.path)"); return true }
+        catch { rlog("banner: on-screen snapshot failed: \(error)"); return false }
+    }
+
     /// The NSScreen that contains `frame` (CoreGraphics coordinates, top-left origin — what
     /// CGWindowListCopyWindowInfo gives us), else the screen under the mouse. NEVER
     /// `NSScreen.main`, which for an accessory app is whichever screen last had a key window.
@@ -364,19 +400,24 @@ final class BannerController {
         let target = NSRect(x: x, y: y, width: width, height: height)
         targetFrame = target
 
+        if panelLoggedOnce == false {
+            panelLoggedOnce = true
+            rlog("banner: window opaque=\(p.isOpaque) background=\(p.backgroundColor == .clear ? "clear" : "\(p.backgroundColor)") shadow=\(p.hasShadow) styleMask=\(p.styleMask.rawValue) maskImage=\((p.contentView as? NSVisualEffectView)?.maskImage != nil)")
+        }
         if p.isVisible {
             p.setFrame(target, display: true, animate: false)
+            p.invalidateShadow()
         } else {
             // Slide in from just above the top edge of that screen.
             p.setFrame(NSRect(x: x, y: vf.maxY + 4, width: width, height: height), display: false)
             p.alphaValue = 0
             p.orderFrontRegardless()
-            NSAnimationContext.runAnimationGroup { ctx in
+            NSAnimationContext.runAnimationGroup({ ctx in
                 ctx.duration = 0.22
                 ctx.timingFunction = CAMediaTimingFunction(name: .easeOut)
                 p.animator().setFrame(target, display: true)
                 p.animator().alphaValue = 1
-            }
+            }, completionHandler: { p.invalidateShadow() })
         }
         hideTimer?.invalidate()
         hideTimer = nil

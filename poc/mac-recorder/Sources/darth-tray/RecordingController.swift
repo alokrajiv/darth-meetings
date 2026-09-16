@@ -60,6 +60,91 @@ final class RecordingController {
     private(set) var state: State = .idle
     private(set) var recordingId: String?
     private(set) var options = RecordOptions()
+
+    // MARK: start timeouts (0.2.8)
+    /// Every awaited start step (shareable content, filter, stream start) races this deadline.
+    /// 2026-09-16 21:23 SGT: SCK never called back for a WhatsApp voice-call window, `state`
+    /// stayed .starting for good, every later Record click was ignored and even SIGTERM hung.
+    static let VIDEO_START_TIMEOUT: TimeInterval = 8
+    struct StartTimeout: Error { let step: String }
+    /// Shared settle flag between the work / deadline / cancel branches of `timed` (main actor).
+    final class StartRace<T> { var settled = false; var cont: CheckedContinuation<T, Error>? }
+    private var startTask: Task<Void, Never>?
+    private var startAttempt = 0
+    private var simulatedStartHang: TimeInterval = 0
+    /// Test hook: the next start sleeps this long inside a timed step (`simulate_start_hang`).
+    func simulateStartHang(seconds: TimeInterval) { simulatedStartHang = seconds }
+
+    /// Race one awaited start step against `deadline`. The SCK call itself cannot be cancelled:
+    /// when it loses the race it is abandoned and `orphan` disposes of whatever it eventually
+    /// returns. Cancelling the surrounding Task settles immediately with CancellationError.
+    @MainActor
+    private func timed<T>(_ step: String, deadline: Date, orphan: (@MainActor (T) -> Void)? = nil,
+                          _ op: @escaping () async throws -> T) async throws -> T {
+        let t0 = Date()
+        let remaining = deadline.timeIntervalSinceNow
+        guard remaining > 0 else { throw StartTimeout(step: step) }
+        rlog("record: \(step)…")
+        let box = StartRace<T>()
+        let work = Task { try await op() }
+        let value: T = try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { (cont: CheckedContinuation<T, Error>) in
+                box.cont = cont
+                Task { @MainActor in
+                    do {
+                        let v = try await work.value
+                        if box.settled { rlog("record: \(step) finished \(Int(Date().timeIntervalSince(t0) * 1000)) ms in, after its deadline — discarded"); orphan?(v) }
+                        else { box.settled = true; box.cont?.resume(returning: v) }
+                    } catch {
+                        if !box.settled { box.settled = true; box.cont?.resume(throwing: error) }
+                    }
+                }
+                Task { @MainActor in
+                    try? await Task.sleep(nanoseconds: UInt64(remaining * 1_000_000_000))
+                    if !box.settled { box.settled = true; box.cont?.resume(throwing: StartTimeout(step: step)) }
+                }
+            }
+        } onCancel: {
+            Task { @MainActor in
+                if !box.settled { box.settled = true; box.cont?.resume(throwing: CancellationError()) }
+            }
+        }
+        rlog("record: \(step) took \(Int(Date().timeIntervalSince(t0) * 1000)) ms")
+        return value
+    }
+
+    /// Undo a half-started capture (timeout / cancel): streams, writer, the empty segment file.
+    @MainActor
+    private func abortPartialStart(_ why: String) {
+        let v = videoStream, a = audioStream, w = currentWriter()
+        videoStream = nil; audioStream = nil; setWriter(nil)
+        audioForwarder.sink = nil
+        if v != nil || a != nil { willStopOwnStreams?((v != nil ? 1 : 0) + (a != nil ? 1 : 0)) }
+        Task.detached {
+            if let v { try? await v.stopCapture() }
+            if let a { try? await a.stopCapture() }
+            if let w { await w.finish(); try? FileManager.default.removeItem(at: w.url) }
+        }
+        rlog("record: partial start torn down (\(why))")
+    }
+
+    /// Stop / a second Record click / quit while the start is still pending: cancel it. Nothing
+    /// was recorded, so the row is `upload_failed` "capture never started". Synchronous — the
+    /// terminate path must never wait on this.
+    func cancelStart(reason: String) {
+        guard state == .starting, let id = recordingId else { return }
+        rlog("record: cancelling pending start \(id) (\(reason))")
+        startTask?.cancel(); startTask = nil
+        state = .idle
+        mic?.onBuffer = nil; mic?.stop(); mic = nil; micActive = false
+        Task { @MainActor in self.abortPartialStart("cancelled: \(reason)") }
+        Registry.shared.update(id, ["status": "upload_failed", "error": "capture never started (\(reason))", "ended_at": isoNow()])
+        api?.syncRecording(id)
+        EventLog.shared.log("recording_cancelled", ["recording_id": id, "reason": reason, "options": options.json],
+                            summary: "record: start cancelled (\(reason)) — nothing recorded")
+        call = nil; currentSource = nil
+        onStartCancelled?(reason)
+    }
     private(set) var startedAt: Date?
     private(set) var call: DetectedCall?
     private(set) var segments: [[String: Any]] = []
@@ -75,6 +160,11 @@ final class RecordingController {
     /// 0.2.6 audio health: a track went silent past its threshold (`ok == false`) or came back.
     /// Main queue. track ∈ "system" | "mic" | "video".
     var onTrackHealth: ((String, Bool) -> Void)?
+    /// 0.2.8: a non-fatal notice for the banner (title, sub) — e.g. the window capture timed out
+    /// and we fell back to the display.
+    var onNotice: ((String, String) -> Void)?
+    /// 0.2.8: a pending start was cancelled (Stop / second Record / quit) before it produced a file.
+    var onStartCancelled: ((String) -> Void)?
     /// Called before we tear our own SCK streams down, so the share detector can ignore the
     /// teardown lines they produce.
     var willStopOwnStreams: ((Int) -> Void)?
@@ -321,12 +411,15 @@ final class RecordingController {
         ])
         api?.syncRecording(id, insert: true)
 
+        startAttempt += 1
+        let attempt = startAttempt
         let begin: (AVAudioFormat?) -> Void = { [weak self] micFormat in
             guard let self else { return }
-            Task { @MainActor in
-                do {
-                    try await self.beginCapture(source: source, micFormat: micFormat)
-                } catch {
+            guard self.state == .starting, self.recordingId == id else { rlog("record: start \(id) no longer pending — not capturing"); return }
+            self.startTask = Task { @MainActor in
+                @MainActor func fail(_ error: Error) {
+                    guard self.recordingId == id, self.startAttempt == attempt, self.state == .starting else { return }
+                    self.abortPartialStart("start failed")
                     self.mic?.stop(); self.mic = nil; self.micActive = false
                     self.state = .idle
                     Registry.shared.update(id, ["status": "upload_failed", "error": "capture failed: \(error.localizedDescription)"])
@@ -334,6 +427,38 @@ final class RecordingController {
                                         summary: "record: could not start — \(error.localizedDescription)")
                     self.onError?(error.localizedDescription)
                 }
+                do {
+                    try await self.beginCapture(source: source, micFormat: micFormat)
+                } catch is CancellationError {
+                    rlog("record: start \(id) cancelled")
+                } catch let t as StartTimeout {
+                    guard self.recordingId == id, self.state == .starting else { return }
+                    // Window capture never came up (WhatsApp, 2026-09-16): record the display it
+                    // is on instead — the same fallback the window-gone path uses.
+                    let display: CGDirectDisplayID
+                    if case .window(let wid, _) = source, let f = ShareDetector.windowFrame(wid) { display = WindowPicker.display(containing: f) }
+                    else { display = call?.windowFrame.map { WindowPicker.display(containing: $0) } ?? CGMainDisplayID() }
+                    self.abortPartialStart("timeout at \(t.step)")
+                    EventLog.shared.log("video_start_timeout", [
+                        "recording_id": id, "step": t.step, "source": source.json, "seconds": Self.VIDEO_START_TIMEOUT,
+                        "fallback": ["kind": "display", "display_id": Int(display)],
+                    ], summary: "record: START TIMED OUT at \(t.step) on \(source.label) — falling back to display \(display)")
+                    if case .display = source {
+                        fail(NSError(domain: "record", code: 20, userInfo: [NSLocalizedDescriptionKey: "capture did not start within \(Int(Self.VIDEO_START_TIMEOUT)) s (\(t.step))"]))
+                        return
+                    }
+                    self.onNotice?("Couldn't capture the call window", "Recording the display instead.")
+                    do {
+                        try await self.beginCapture(source: .display(display), micFormat: micFormat)
+                    } catch is CancellationError {
+                        rlog("record: fallback start \(id) cancelled")
+                    } catch {
+                        fail(error)
+                    }
+                } catch {
+                    fail(error)
+                }
+                if self.startAttempt == attempt { self.startTask = nil }
             }
         }
         if !options.mic {
@@ -376,8 +501,17 @@ final class RecordingController {
 
     @MainActor
     private func beginCapture(source: Source, micFormat: AVAudioFormat?) async throws {
-        let (filter, displayID) = try await Self.filter(for: source)
+        let deadline = Date().addingTimeInterval(Self.VIDEO_START_TIMEOUT)
+        if simulatedStartHang > 0 {
+            let s = simulatedStartHang; simulatedStartHang = 0
+            rlog("record: TEST — simulating a \(Int(s)) s hang in the video start")
+            try await timed("simulated hang", deadline: deadline) { try await Task.sleep(nanoseconds: UInt64(s * 1_000_000_000)) }
+        }
+        let (filter, displayID) = try await timed("shareable content + filter for \(source.label)", deadline: deadline) { try await Self.filter(for: source) }
+        try Task.checkCancellation()
+        let t0 = Date()
         let (w, h) = CaptureSession.pixelSize(of: filter)
+        rlog("record: pixel size \(w)x\(h) took \(Int(Date().timeIntervalSince(t0) * 1000)) ms")
         pinnedSize = (w, h)
 
         let tracks = audioTracks(micFormat: micFormat)
@@ -392,7 +526,11 @@ final class RecordingController {
         segmentStart = Date()
         currentSource = source
 
-        videoStream = try await Self.startVideoStream(filter: filter, fps: fps, output: rec, size: (w, h))
+        videoStream = try await timed("video stream start on \(source.label)", deadline: deadline,
+                                      orphan: { s in Task { try? await s.stopCapture() } }) {
+            try await Self.startVideoStream(filter: filter, fps: self.fps, output: rec, size: (w, h))
+        }
+        try Task.checkCancellation()
         videoStopped = false
         if options.systemAudio {
             audioForwarder.sink = { [weak self] sb in self?.currentWriter()?.appendAudio(sb, track: 0) }
@@ -400,7 +538,14 @@ final class RecordingController {
                 DispatchQueue.main.async { self?.systemStreamStopped(err) }
             }
             do {
-                audioStream = try await Self.startAudioStream(displayID: displayID, output: audioForwarder)
+                // Its own budget: a slow audio start must not cost the video its fallback.
+                audioStream = try await timed("system audio stream start", deadline: Date().addingTimeInterval(Self.VIDEO_START_TIMEOUT),
+                                              orphan: { s in Task { try? await s.stopCapture() } }) {
+                    try await Self.startAudioStream(displayID: displayID, output: self.audioForwarder)
+                }
+                try Task.checkCancellation()
+            } catch is CancellationError {
+                throw CancellationError()
             } catch {
                 audioStream = nil
                 systemStreamFailed = error.localizedDescription
@@ -794,7 +939,12 @@ final class RecordingController {
     /// main-actor task can never run while the main thread is blocked. `onFinalised` fires
     /// from that task the moment the file is complete; `onStopped` follows on the main queue.
     func stop(reason: String, onFinalised: (() -> Void)? = nil) {
-        guard state == .recording || state == .starting else {
+        if state == .starting {
+            cancelStart(reason: reason)
+            onFinalised?()
+            return
+        }
+        guard state == .recording else {
             rlog("record: stop ignored (state=\(state.rawValue), reason=\(reason))")
             return
         }
