@@ -26,8 +26,12 @@ export async function autoAttachSeries(row: {
   gmeet_context: GmeetContext | null;
   title: string | null;
   user_id: string;
+  /** Temporary rows (migration 042) never auto-attach — they are out of the
+   * archive, so they must not become series evidence either. */
+  scratch?: boolean;
 }): Promise<void> {
   try {
+    if (row.scratch) return;
     const keys = keysFromContext(row.gmeet_context, row.title);
     const strong = strongKeys(keys);
     if (strong.length === 0) return;

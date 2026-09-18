@@ -41,6 +41,8 @@ export interface IngestParsedOptions {
   shareList?: Array<{ email: string; name?: string | null }>;
   /** Prefix for warn logs, e.g. '[gmeet/import]'. */
   logTag?: string;
+  /** Temporary transcript (migration 042) — import-text only. */
+  scratch?: boolean;
 }
 
 /**
@@ -53,7 +55,13 @@ export interface IngestParsedOptions {
  */
 export async function createTextImportPlaceholder(
   user: { userId: string },
-  opts: { sourceId: string; title?: string | null; originalFilename?: string | null }
+  opts: {
+    sourceId: string;
+    title?: string | null;
+    originalFilename?: string | null;
+    /** Temporary transcript (migration 042). */
+    scratch?: boolean;
+  }
 ): Promise<TranscriptRow> {
   return createImportedForUser(user.userId, {
     assemblyaiId: opts.sourceId,
@@ -67,6 +75,7 @@ export async function createTextImportPlaceholder(
     audioUrl: null,
     importedContent: synthesizeTranscriptResponse(opts.sourceId, { attendees: [], utterances: [] }),
     title: opts.title ?? null,
+    scratch: opts.scratch ?? false,
   });
 }
 
@@ -87,6 +96,7 @@ export async function ingestParsedUtterances(
     participants,
     shareList = [],
     logTag = '[ingest-parsed]',
+    scratch = false,
   } = opts;
 
   const content = synthesizeTranscriptResponse(sourceId, parsed, {
@@ -109,6 +119,7 @@ export async function ingestParsedUtterances(
     importedContent: content,
     title,
     gmeetContext: gmeetContext ?? undefined,
+    scratch,
   });
 
   if (recordedAtIso) {
@@ -137,6 +148,7 @@ export async function ingestParsedUtterances(
     gmeet_context: row.gmeet_context,
     title: row.title,
     user_id: row.user_id,
+    scratch: row.scratch,
   });
 
   return { row, autoShared };

@@ -31,6 +31,10 @@ export interface ChunkedUploadParams {
   reportPref?: string | null;
   sourceId?: string | null;
   multi?: { group: string; index: number; total: number; comment?: string } | null;
+  /** Temporary transcript (migration 042): out of the archive, under the
+   * Temporary tab, auto-trashed after 30 days. Server ignores it when
+   * `linkedEvent` is set. */
+  scratch?: boolean;
 }
 
 export interface ChunkedUploadHooks {
@@ -159,6 +163,7 @@ async function openSession(
             reportPref: params.reportPref ?? undefined,
             sourceId: params.sourceId ?? undefined,
             multi: params.multi ?? undefined,
+            scratch: params.scratch ? true : undefined,
           }),
         },
         signal

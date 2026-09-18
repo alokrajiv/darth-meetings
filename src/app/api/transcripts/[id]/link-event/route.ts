@@ -5,6 +5,7 @@ import {
   getForUser,
   mergeGmeetContextForUser,
   setRecordedAtForUser,
+  setScratchForUser,
   updateMetaForUser,
 } from '@/db-ops/transcripts';
 import { logActivity } from '@/db-ops/transcript-activity';
@@ -44,7 +45,9 @@ export const runtime = 'nodejs';
  * an empty title, register the attendees in the people directory and, when
  * the row is completed and nobody has confirmed speaker names yet, re-run
  * the speaker-ID pass with the attendee list as hints (a scratch upload's
- * first pass ran blind). Owner and editors.
+ * first pass ran blind). Linking also clears the temporary flag (migration
+ * 042): a transcript tied to a calendar event is a real meeting and belongs
+ * in the archive. Owner and editors.
  */
 export const POST = withAuth(async ({ user, request }, { params }) => {
   const { id } = await params;
@@ -220,6 +223,10 @@ export const POST = withAuth(async ({ user, request }, { params }) => {
     }
   }
   await mergeGmeetContextForUser(access.ownerUserId, id, patch);
+  // Temporary → permanent: linking says "this is a real meeting".
+  if (access.row.scratch) {
+    await setScratchForUser(access.ownerUserId, id, false);
+  }
 
   const startIso = event.startTime ?? actuals?.conferenceStart;
   if (startIso && !Number.isNaN(Date.parse(startIso))) {
@@ -246,7 +253,10 @@ export const POST = withAuth(async ({ user, request }, { params }) => {
     userId: user.userId,
     email: user.email,
     action: 'edit_meta',
-    details: { linkedEvent: event.title ?? event.id ?? true },
+    details: {
+      linkedEvent: event.title ?? event.id ?? true,
+      ...(access.row.scratch ? { scratch: false } : {}),
+    },
   });
 
   // Speaker re-guess: a scratch upload's ID pass ran with no attendee hints.

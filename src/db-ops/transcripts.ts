@@ -49,6 +49,8 @@ export interface TranscriptInsert {
   gmeetContext?: GmeetContext | null;
   /** AAI speech model the submit ran on (null = never ran AAI). */
   speechModel?: string | null;
+  /** Temporary transcript (migration 042) — see StoredTranscript.scratch. */
+  scratch?: boolean;
 }
 
 export interface TranscriptStatusUpdate {
@@ -74,6 +76,9 @@ export interface ImportedTranscriptInsert {
   title?: string | null;
   driveFileId?: string | null;
   gmeetContext?: GmeetContext | null;
+  /** Temporary transcript (migration 042) — text imports only; Meet/Teams
+   * imports are never scratch. */
+  scratch?: boolean;
 }
 
 export async function listForUser(userId: string): Promise<TranscriptRow[]> {
@@ -97,12 +102,19 @@ export async function listForUser(userId: string): Promise<TranscriptRow[]> {
  *
  * Owner identity (name/email) is not available here because we only have
  * the owner's SSO user_id, not their email.
+ *
+ * Temporary (scratch, migration 042) rows are excluded by default; `opts.scratch`
+ * flips the query to serve ONLY the caller's visible scratch rows (the
+ * legacy-shape `?scratch=1` view) — same visibility, no suspected-series
+ * hint (scratch rows never get sibling hints).
  */
 export async function listVisibleToUser(
   userId: string,
-  email: string
+  email: string,
+  opts?: { scratch?: boolean }
 ): Promise<TranscriptListRow[]> {
   const normEmail = email.trim().toLowerCase();
+  const scratchOnly = !!opts?.scratch;
   const rows = await sql<
     Array<TranscriptListRow & { __access: 'owner' | 'edit' | 'read' }>
   >`
@@ -112,6 +124,7 @@ export async function listVisibleToUser(
            t.source, t.speech_model, t.recorded_at, t.auto_notes_status,
            t.upload_bytes_received::float8 AS upload_bytes_received,
            t.upload_bytes_total::float8 AS upload_bytes_total,
+           t.scratch,
            -- Which conferencing product the source meeting ran on (listing
            -- provider glyphs). 'teams' is stamped explicitly; anything with
            -- Meet identity (gmeet- id or a meeting code) is 'gmeet'.
@@ -175,9 +188,10 @@ export async function listVisibleToUser(
             )
       ORDER BY k.series_id
       LIMIT 1
-    ) sus ON sm.id IS NULL
+    ) sus ON ${scratchOnly ? sql`false` : sql`sm.id IS NULL`}
     WHERE (t.user_id = ${userId} OR s.id IS NOT NULL)
       AND t.deleted_at IS NULL
+      AND ${scratchOnly ? sql`t.scratch` : sql`NOT t.scratch`}
     ORDER BY t.created_at DESC
   `;
 
@@ -229,7 +243,8 @@ export async function listPendingVisibleToUser(
 }
 
 export interface TranscriptListPageOpts {
-  tab: 'all' | 'mine' | 'shared' | 'trash';
+  /** 'scratch' = the caller's visible temporary rows (migration 042). */
+  tab: 'all' | 'mine' | 'shared' | 'trash' | 'scratch';
   /** YYYY-MM-DD inclusive bounds on the day key, interpreted in `tz`. */
   from: string | null;
   to: string | null;
@@ -311,7 +326,10 @@ type PagedRawRow = Omit<TranscriptListRow, 'access' | 'owner_email' | 'owner_nam
  *    auto_notes/imported text and stamps matched_in + a SQL-cut snippet on
  *    each row (same approach as searchVisibleTranscripts);
  *  - tab=trash serves the caller's own soft-deleted rows (owner-only, no
- *    series joins) with the same bucketing.
+ *    series joins) with the same bucketing;
+ *  - tab=scratch serves the caller's visible temporary rows (owned + shared,
+ *    migration 042) — same bucketing, series membership shown, no
+ *    suspected-series hint. Every other tab excludes scratch rows.
  */
 export async function listPagedForUser(
   userId: string,
@@ -323,6 +341,7 @@ export async function listPagedForUser(
   const labelFilter = opts.labelFilter ?? null;
   const normEmail = email.trim().toLowerCase();
   const isTrash = tab === 'trash';
+  const isScratch = tab === 'scratch';
   const pattern = q ? `%${q.replace(/[%_\\]/g, (m) => `\\${m}`)}%` : null;
 
   // Fragment builders (fresh fragment per use site).
@@ -381,6 +400,7 @@ export async function listPagedForUser(
                WHEN t.gmeet_context ? 'autoImport' THEN 'auto'
              END AS auto_state,
              ${isTrash ? sql`t.deleted_at::text` : sql`NULL::text`} AS deleted_at,
+             t.scratch,
              ${
                isTrash
                  ? sql`'owner'`
@@ -423,7 +443,9 @@ export async function listPagedForUser(
       WHERE ${
         isTrash
           ? sql`t.user_id = ${userId} AND t.deleted_at IS NOT NULL`
-          : sql`(t.user_id = ${userId} OR s.id IS NOT NULL) AND t.deleted_at IS NULL`
+          : isScratch
+            ? sql`(t.user_id = ${userId} OR s.id IS NOT NULL) AND t.deleted_at IS NULL AND t.scratch`
+            : sql`(t.user_id = ${userId} OR s.id IS NOT NULL) AND t.deleted_at IS NULL AND NOT t.scratch`
       }
         ${tab === 'mine' ? sql`AND t.user_id = ${userId}` : sql``}
         ${tab === 'shared' ? sql`AND t.user_id <> ${userId}` : sql``}
@@ -461,14 +483,17 @@ export async function listPagedForUser(
            -- Org-wide labels on the row (docs/labels-design.md §7), page rows
            -- only — outside the materialized base, next to the series join.
            lbl.labels AS labels,
-           b.deleted_at, b.__access, b.matched_in, b.snippet,
+           b.deleted_at, b.scratch, b.__access, b.matched_in, b.snippet,
            b.day_key::text AS day_key,
            ${
              isTrash
                ? sql`NULL::int AS series_id, NULL::text AS series_title,
                      NULL::int AS suspected_series_id, NULL::text AS suspected_series_title,`
-               : sql`sm.series_id, se.title AS series_title,
-                     sus.series_id AS suspected_series_id, sus.title AS suspected_series_title,`
+               : isScratch
+                 ? sql`sm.series_id, se.title AS series_title,
+                       NULL::int AS suspected_series_id, NULL::text AS suspected_series_title,`
+                 : sql`sm.series_id, se.title AS series_title,
+                       sus.series_id AS suspected_series_id, sus.title AS suspected_series_title,`
            }
            (SELECT count(*)::int FROM day_counts) AS __total_days,
            (SELECT count(*)::int FROM page_days) AS __page_days
@@ -486,7 +511,11 @@ export async function listPagedForUser(
     ${
       isTrash
         ? sql``
-        : sql`
+        : isScratch
+          ? sql`
+          LEFT JOIN ${sql(SCHEMA)}.series_members sm ON sm.transcript_id = b.id
+          LEFT JOIN ${sql(SCHEMA)}.series se ON se.id = sm.series_id`
+          : sql`
           LEFT JOIN ${sql(SCHEMA)}.series_members sm ON sm.transcript_id = b.id
           LEFT JOIN ${sql(SCHEMA)}.series se ON se.id = sm.series_id
           -- Same suspected-series lookup as listVisibleToUser, applied only to
@@ -534,8 +563,10 @@ export async function listPagedForUser(
   // count, global over from/to/q (as it always was) but narrowed by the
   // people/provider filters so the badge agrees with the filtered trash tab
   // (the scalar subquery re-aliases transcripts as `t` for archiveFilterSql).
+  // scratch (the Temporary tab) counts the caller's visible live temporary
+  // rows, global over from/to/q like trash, narrowed the same way.
   const countsPromise = sql<
-    [{ all_count: number; mine_count: number; shared_count: number; trash_count: number }]
+    [{ all_count: number; mine_count: number; shared_count: number; trash_count: number; scratch_count: number }]
   >`
     SELECT
       count(*)::int AS all_count,
@@ -544,13 +575,22 @@ export async function listPagedForUser(
       (SELECT count(*)::int FROM ${sql(SCHEMA)}.transcripts t
         WHERE t.user_id = ${userId} AND t.deleted_at IS NOT NULL
         ${archiveFilterSql(filters)}
-        ${labelFilterSql(labelFilter)}) AS trash_count
+        ${labelFilterSql(labelFilter)}) AS trash_count,
+      (SELECT count(*)::int FROM ${sql(SCHEMA)}.transcripts t
+        LEFT JOIN ${sql(SCHEMA)}.transcript_shares s2
+          ON s2.transcript_id = t.id
+          AND s2.shared_with_email = ${normEmail}
+        WHERE (t.user_id = ${userId} OR s2.id IS NOT NULL)
+          AND t.deleted_at IS NULL AND t.scratch
+        ${archiveFilterSql(filters)}
+        ${labelFilterSql(labelFilter)}) AS scratch_count
     FROM ${sql(SCHEMA)}.transcripts t
     LEFT JOIN ${sql(SCHEMA)}.transcript_shares s
       ON s.transcript_id = t.id
       AND s.shared_with_email = ${normEmail}
     WHERE (t.user_id = ${userId} OR s.id IS NOT NULL)
       AND t.deleted_at IS NULL
+      AND NOT t.scratch
       ${rangeAndSearch()}
   `;
 
@@ -565,6 +605,7 @@ export async function listPagedForUser(
     const row: TranscriptListRow = {
       ...rest,
       ...(isTrash ? { deleted_at } : {}),
+      scratch: !!r.scratch,
       ...(q ? { matched_in, snippet } : {}),
       access: __access ?? 'read',
       owner_email: null,
@@ -590,6 +631,7 @@ export async function listPagedForUser(
       mine: c?.mine_count ?? 0,
       shared: c?.shared_count ?? 0,
       trash: c?.trash_count ?? 0,
+      scratch: c?.scratch_count ?? 0,
     },
     nextCursor: hasMore && dayGroups.length > 0 ? dayGroups[dayGroups.length - 1]!.key : null,
     hasMore,
@@ -665,14 +707,15 @@ export async function createForUser(
   const rows = await sql<TranscriptRow[]>`
     INSERT INTO ${sql(SCHEMA)}.transcripts (
       user_id, assemblyai_id, original_filename, status, language_code, title, audio_url, source,
-      drive_file_id, gmeet_context, speech_model
+      drive_file_id, gmeet_context, speech_model, scratch
     ) VALUES (
       ${userId}, ${data.assemblyaiId}, ${data.originalFilename ?? null},
       ${data.status}, ${data.languageCode ?? null}, ${data.title ?? null},
       ${data.audioUrl ?? null}, 'uploaded',
       ${data.driveFileId ?? null},
       ${data.gmeetContext ? sql.json(data.gmeetContext as unknown as never) : null},
-      ${data.speechModel ?? null}
+      ${data.speechModel ?? null},
+      ${data.scratch ?? false}
     )
     ON CONFLICT (user_id, assemblyai_id) DO UPDATE
       SET original_filename = EXCLUDED.original_filename,
@@ -880,6 +923,10 @@ export interface UploadingPlaceholderInsert {
   gmeetContext?: GmeetContext | null;
   /** Content-Length of the incoming body; null when the client omitted it. */
   bytesTotal?: number | null;
+  /** Temporary transcript (migration 042). The flag lives on the row from
+   * the first byte, so the placeholder already sits under the Temporary tab
+   * and promote-in-place carries it over untouched. */
+  scratch?: boolean;
 }
 
 /**
@@ -896,13 +943,14 @@ export async function createUploadingPlaceholder(
     INSERT INTO ${sql(SCHEMA)}.transcripts (
       user_id, assemblyai_id, original_filename, status, language_code, title,
       source, gmeet_context, upload_bytes_received, upload_bytes_total,
-      upload_progress_at
+      upload_progress_at, scratch
     ) VALUES (
       ${userId}, ${data.placeholderId}, ${data.originalFilename ?? null},
       'uploading', ${data.languageCode ?? null}, ${data.title ?? null},
       'uploaded',
       ${data.gmeetContext ? sql.json(data.gmeetContext as unknown as never) : null},
-      0, ${data.bytesTotal ?? null}, now()
+      0, ${data.bytesTotal ?? null}, now(),
+      ${data.scratch ?? false}
     )
     RETURNING *
   `;
@@ -1026,7 +1074,8 @@ export async function createImportedForUser(
     INSERT INTO ${sql(SCHEMA)}.transcripts (
       user_id, assemblyai_id, original_filename, status,
       created_at, completed_at, duration, speaker_count, language_code,
-      audio_url, source, imported_content, title, drive_file_id, gmeet_context
+      audio_url, source, imported_content, title, drive_file_id, gmeet_context,
+      scratch
     ) VALUES (
       ${userId}, ${data.assemblyaiId}, ${data.originalFilename ?? null}, ${data.status},
       ${data.createdAt ?? sql`now()`}, ${data.completedAt ?? null},
@@ -1035,7 +1084,8 @@ export async function createImportedForUser(
       ${sql.json(data.importedContent as unknown as never)},
       ${data.title ?? null},
       ${data.driveFileId ?? null},
-      ${data.gmeetContext ? sql.json(data.gmeetContext as unknown as never) : null}
+      ${data.gmeetContext ? sql.json(data.gmeetContext as unknown as never) : null},
+      ${data.scratch ?? false}
     )
     ON CONFLICT (user_id, assemblyai_id) DO UPDATE
       SET status = EXCLUDED.status,
@@ -1083,6 +1133,7 @@ export async function findVisibleByDriveFileId(
       AND s.shared_with_email = ${normEmail}
     WHERE t.drive_file_id = ${driveFileId}
       AND t.deleted_at IS NULL
+      AND NOT t.scratch
       AND (t.user_id = ${userId} OR s.id IS NOT NULL)
     ORDER BY (t.user_id = ${userId}) DESC, t.created_at DESC
     LIMIT 1
@@ -1109,6 +1160,7 @@ export async function findVisibleByAssemblyaiId(
       AND s.shared_with_email = ${normEmail}
     WHERE t.assemblyai_id = ${assemblyaiId}
       AND t.deleted_at IS NULL
+      AND NOT t.scratch
       AND (t.user_id = ${userId} OR s.id IS NOT NULL)
     ORDER BY (t.user_id = ${userId}) DESC, t.created_at DESC
     LIMIT 1
@@ -1613,14 +1665,20 @@ export async function softDeleteForUser(
   return rows.length > 0;
 }
 
-/** Undo a soft delete. Publishes 'created' so open listings pick it back up. */
+/**
+ * Undo a soft delete. Publishes 'created' so open listings pick it back up.
+ * Also clears the temporary flag (migration 042): a restored row past its
+ * 30 days would otherwise be auto-trashed again by the very next sweep —
+ * restoring says "I want this", so it comes back permanent (Move to
+ * temporary is one click away if that was not the intent).
+ */
 export async function restoreForUser(
   userId: string,
   assemblyaiId: string
 ): Promise<boolean> {
   const rows = await sql<{ id: number }[]>`
     UPDATE ${sql(SCHEMA)}.transcripts
-    SET deleted_at = NULL
+    SET deleted_at = NULL, scratch = false
     WHERE user_id = ${userId} AND assemblyai_id = ${assemblyaiId} AND deleted_at IS NOT NULL
     RETURNING id
   `;
@@ -1650,10 +1708,53 @@ export async function listDeletedForUser(userId: string): Promise<TranscriptList
            t.gmeet_context->'deferredImport'->>'mode' AS deferred_mode,
            COALESCE(t.gmeet_context->'deferredImport'->>'error',
                     t.gmeet_context->'ingestFailure'->>'message') AS deferred_error,
-           t.deleted_at::text AS deleted_at
+           t.deleted_at::text AS deleted_at,
+           t.scratch
     FROM ${sql(SCHEMA)}.transcripts t
     WHERE t.user_id = ${userId} AND t.deleted_at IS NOT NULL
     ORDER BY t.deleted_at DESC
   `;
   return rows.map((r) => ({ ...r, access: 'owner' as const, owner_email: null, owner_name: null }));
+}
+
+/**
+ * Flip the temporary flag (migration 042). Keyed by the OWNER's user_id —
+ * editors go through resolveAccess and pass ownerUserId, same as renames.
+ * Publishes 'meta' so open listings move the row between the main list and
+ * the Temporary tab. Returns false when the row is gone or already in that
+ * state.
+ */
+export async function setScratchForUser(
+  userId: string,
+  assemblyaiId: string,
+  scratch: boolean
+): Promise<boolean> {
+  const rows = await sql<{ id: number }[]>`
+    UPDATE ${sql(SCHEMA)}.transcripts
+    SET scratch = ${scratch}
+    WHERE user_id = ${userId} AND assemblyai_id = ${assemblyaiId} AND scratch <> ${scratch}
+    RETURNING id
+  `;
+  if (rows.length > 0) publishEvent({ kind: 'meta', assemblyaiId });
+  return rows.length > 0;
+}
+
+/**
+ * Temporary rows past their time-to-live — the auto-trash sweep's work list
+ * (rides the partial index from migration 042). Oldest first, so a backlog
+ * after a long outage drains in creation order.
+ */
+export async function listExpiredScratch(
+  ttlDays: number,
+  limit: number
+): Promise<Array<{ user_id: string; assemblyai_id: string; created_at: string }>> {
+  return sql<Array<{ user_id: string; assemblyai_id: string; created_at: string }>>`
+    SELECT user_id, assemblyai_id, created_at::text AS created_at
+    FROM ${sql(SCHEMA)}.transcripts
+    WHERE scratch
+      AND deleted_at IS NULL
+      AND created_at < now() - make_interval(days => ${ttlDays})
+    ORDER BY created_at ASC
+    LIMIT ${limit}
+  `;
 }

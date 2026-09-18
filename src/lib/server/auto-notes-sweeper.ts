@@ -2,13 +2,16 @@ import 'server-only';
 import {
   deleteForUser,
   getForUser,
+  listExpiredScratch,
   listNotesBacklog,
   listSpeakerIdBacklog,
   listStaleUploads,
+  softDeleteForUser,
 } from '@/db-ops/transcripts';
 import { deleteUploadSession, listExpiredUploadSessions } from '@/db-ops/upload-sessions';
 import { deleteAudioFile, deleteAudioFilesByPrefix } from '@/lib/server/audio-storage';
 import { generateAutoNotes, identifySpeakers } from '@/lib/server/auto-notes';
+import { SCRATCH_TTL_DAYS } from '@/lib/format';
 
 /**
  * Watchdog for the AI passes. Every SWEEP_MS:
@@ -19,6 +22,10 @@ import { generateAutoNotes, identifySpeakers } from '@/lib/server/auto-notes';
  *     kill in-flight generations). Never-ran notes are NOT picked up:
  *     generation waits for a human to review speaker labels and click
  *     "confirm & generate" on the detail page, however long that takes.
+ *   - temporary transcripts (migration 042): soft-delete scratch rows
+ *     created more than SCRATCH_TTL_DAYS ago — the same soft delete the
+ *     DELETE route performs, so they land in the trash like any other row
+ *     (there is no automatic purge of the trash; that stays a human click).
  *
  * Started once per server boot from instrumentation.ts. Serial, capped per
  * sweep, so a backlog drains gently instead of stampeding the model.
@@ -35,10 +42,33 @@ const UPLOAD_STALL_MINUTES = 15;
 // Chunked-upload sessions are resumable: keep the partial file this long
 // after the last acknowledged chunk before giving up on the user coming back.
 const SESSION_IDLE_HOURS = 24;
+// Temporary transcripts live SCRATCH_TTL_DAYS (lib/format — shared with the
+// listing hint and the detail-page banner) from creation before they are
+// moved to the trash.
+const SCRATCH_PER_SWEEP = 50;
 
 let started = false;
 
 async function sweep(): Promise<void> {
+  // Temporary transcripts past their 30 days → trash. One line per row so a
+  // "where did my transcript go?" question has an answer in the pm2 log.
+  try {
+    const expired = await listExpiredScratch(SCRATCH_TTL_DAYS, SCRATCH_PER_SWEEP);
+    for (const s of expired) {
+      const trashed = await softDeleteForUser(s.user_id, s.assemblyai_id).catch((err) => {
+        console.warn(`[notes-sweeper] scratch auto-trash failed ${s.assemblyai_id}:`, err);
+        return false;
+      });
+      if (trashed) {
+        console.log(
+          `[notes-sweeper] auto-trashed temporary transcript ${s.assemblyai_id} (owner ${s.user_id}, created ${s.created_at})`
+        );
+      }
+    }
+  } catch (err) {
+    console.warn('[notes-sweeper] scratch expiry query failed:', err);
+  }
+
   try {
     const stale = await listStaleUploads(UPLOAD_STALL_MINUTES, 10);
     for (const s of stale) {

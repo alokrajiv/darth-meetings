@@ -151,6 +151,10 @@ export interface IngestOptions {
   placeholderAssemblyaiId?: string | null;
   /** AAI speech model override (re-transcribe-with-newer-model); default = current. */
   speechModel?: SpeechModel;
+  /** Temporary transcript (migration 042). A promoted placeholder already
+   * carries the flag; this is for the fresh-insert fallback when the
+   * placeholder was reaped mid-upload. */
+  scratch?: boolean;
 }
 
 export async function ingestLocalAudio(
@@ -257,6 +261,7 @@ export async function ingestLocalAudio(
         audioUrl: audioUrl,
         driveFileId: opts.driveFileId ?? null,
         gmeetContext: opts.gmeetContext ?? null,
+        scratch: opts.scratch ?? false,
       }));
   } catch (error) {
     // Transcription was submitted but we lost the row — don't also leak the
@@ -273,6 +278,7 @@ export async function ingestLocalAudio(
     gmeet_context: row.gmeet_context,
     title: row.title,
     user_id: row.user_id,
+    scratch: row.scratch,
   });
 
   // Keep our own copy of the audio. AAI deletes uploaded audio immediately

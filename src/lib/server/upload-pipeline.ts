@@ -150,6 +150,10 @@ export interface UploadSpec {
   /** Darth Recorder registry id (migration 041) — the recording these bytes
    * came from. Linked to the transcript once the ingest succeeds. */
   recorderRecordingId?: string | null;
+  /** Temporary transcript (migration 042): the placeholder is created with
+   * scratch = true and promote-in-place keeps it; replayed into the
+   * fresh-insert fallback when the placeholder was reaped. */
+  scratch?: boolean;
 }
 
 export interface OpenUploadInput {
@@ -171,6 +175,10 @@ export interface OpenUploadInput {
   contextExtra?: Partial<GmeetContext> | null;
   /** Darth Recorder registry id — see UploadSpec.recorderRecordingId. */
   recorderRecordingId?: string | null;
+  /** Temporary transcript — see UploadSpec.scratch. Ignored when a calendar
+   * event is linked (linking = "this is a real meeting"; the link-event
+   * route clears the flag for the same reason). */
+  scratch?: boolean;
 }
 
 const RECORDER_ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -284,11 +292,13 @@ export async function openUpload(
         sourceId: null,
         multi,
         recorderRecordingId: input.recorderRecordingId ?? null,
+        scratch: groupRow.scratch,
       },
     };
   }
 
   const { gmeetContext, attendees } = buildGmeetContext(input.linkedEvent, input.reportPref);
+  const scratch = !!input.scratch && !input.linkedEvent;
 
   // Create the row BEFORE the bytes so the upload is visible in the listing
   // (owner + auto-shared invitees) from the first byte. The temp filename
@@ -323,6 +333,7 @@ export async function openUpload(
         ? { ...(gmeetContext ?? {}), ...input.contextExtra }
         : gmeetContext,
     bytesTotal: input.bytesTotal,
+    scratch,
   });
   // Same "throw them in" rule as the Meet import: internal invitees on the
   // linked event can see (and follow) the upload from the moment it starts.
@@ -352,6 +363,7 @@ export async function openUpload(
       multi,
       speechModel: input.speechModel,
       recorderRecordingId: input.recorderRecordingId ?? null,
+      scratch,
     },
   };
 }
@@ -472,6 +484,7 @@ export async function finalizeUpload(
         extraKeyterms: groupAttendeeNames.length > 0 ? groupAttendeeNames : undefined,
         gmeetContext: { ...ctx, uploadGroup: null, uploadedParts },
         placeholderAssemblyaiId: groupRow.assemblyai_id,
+        scratch: groupRow.scratch,
       });
       await linkRecorderRecording(user.userId, spec.recorderRecordingId, row.assemblyai_id);
       return { status: 201, body: { transcript: row } };
@@ -549,6 +562,7 @@ export async function finalizeUpload(
         gmeetContext,
         placeholderAssemblyaiId: placeholderId,
         speechModel: spec.speechModel,
+        scratch: spec.scratch ?? false,
       });
     } finally {
       clearInterval(heartbeat);
