@@ -26,7 +26,13 @@ READ
                                   archive). With no filter flags: everything,
                                   legacy shape. With filters: server-side
                                   filtered + paged until exhausted, same columns
+  list --scratch                  Your temporary (scratch) transcripts only —
+                                  'upload --scratch' rows; hidden from the
+                                  archive, trashed 30 days after creation
+                                  unless kept in the web UI or linked. No
+                                  other filters (legacy shape)
   get <id>                        One transcript's metadata + AI-notes/report status
+                                  ('scratch: yes' marks a temporary row)
   text <id>                       Full transcript as "[mm:ss] Speaker: …" lines
                                   (confirmed speaker names applied; grep/regex this)
   notes <id>                      Print the meeting-notes markdown
@@ -111,21 +117,26 @@ LABELS (org-wide, hierarchical 'Customers/LP Global/QBR', many per transcript;
 
 WRITE (needs read+write for meetings)
   upload <file> [--event <meeting-code|event-key>] [--title <t>]
-         [--language <code>] [--report summary|detailed-video|detailed-text|later]
-         [--wait] [--timeout <mins>]
+         [--language <code>] [--scratch] [--wait] [--timeout <mins>]
                                   Upload a recording (audio/video; text docs
                                   like .vtt/.txt/.docx go through the text
                                   importer) and transcribe it. --event links
                                   it to a calendar event up front (title,
                                   date, attendees, auto-share to invitees);
-                                  without it the row is a scratch transcript
-                                  you can 'link' later — same single
-                                  transcription run either way. --wait polls
+                                  without it the row is unlinked and you can
+                                  'link' it later — same single transcription
+                                  run either way. --scratch = temporary: kept
+                                  out of everyone's main archive ('list
+                                  --scratch' / the web UI's Temporary tab)
+                                  and trashed 30 days after creation unless
+                                  kept in the web UI or linked. --wait polls
                                   until transcription AND the speaker-ID
-                                  guess finish, then prints 'speakers'
+                                  guess finish, then prints 'speakers'.
+                                  Uploads get summary notes only — a detailed
+                                  report is requested by a human in the web UI
   link <id> <meeting-code|event-key>
-                                  Attach an existing transcript (typically a
-                                  scratch upload) to a calendar event: sets
+                                  Attach an existing transcript (typically an
+                                  unlinked upload) to a calendar event: sets
                                   date + empty title + attendees, lights up
                                   share suggestions, and re-runs the speaker
                                   guess with the attendee list unless a human
@@ -187,6 +198,12 @@ WRITE (needs read+write for meetings)
   set-title <id> <title>          Update the title
   set-notes <id> --file <md|->    Replace the notes markdown ('-' = stdin)
   set-report <id> --file <md|->   Replace the report markdown ('-' = stdin)
+  trash <id>                      Move a transcript you OWN to the trash (soft
+                                  delete: gone from listings/search/series for
+                                  everyone, transcript + audio + notes kept).
+                                  Reversible with 'restore'; permanent
+                                  deletion is web-only (Trash tab)
+  restore <id>                    Bring a trashed transcript back (owner only)
   label / unlabel / label-create / label-rename / label-mv / label-rm
                                   (label/unlabel also need owner or edit access
                                   on that transcript; readers get 403)
@@ -245,6 +262,11 @@ own tokens, then write results back so humans see them in the web UI.
 set-notes/set-report replace the markdown shown in the web UI's Summary /
 Report tabs and are logged as "updated notes via darth-cli" in the activity
 feed. Notes = quick summary tier; report = detailed wiki-style tier.
+
+The CLI never starts the service's own AI runs: an upload gets the default
+summary notes, and a DETAILED report is something a human requests in the
+web UI (Generate…). You READ whatever exists with 'report <id>' and WRITE
+your own with 'set-report <id> --file report.md' — that is the whole point.
 
 ## Grounding in what was on screen
 
@@ -307,8 +329,8 @@ write (date, title, attendees, share suggestions) — nothing is re-run.
     darth-cli meetings upload ./call.m4a --event abc-defg-hij --wait
     darth-cli meetings upload ./call.m4a --event 'evt123|2026-09-15T06:00:00.000Z' --wait
 
-    # 2. If you DON'T know: upload as a scratch transcript and wait. --wait
-    #    returns after transcription AND the speaker-ID guess (voiceprints +
+    # 2. If you DON'T know: upload it unlinked and wait. --wait returns
+    #    after transcription AND the speaker-ID guess (voiceprints +
     #    self-introductions), and prints 'speakers <id>' for you:
     darth-cli meetings upload ./call.m4a --wait
     darth-cli meetings text <id>            # skim: who, what, any dates said aloud
@@ -316,7 +338,7 @@ write (date, title, attendees, share suggestions) — nothing is re-run.
     # 3. Work out which calendar event it was. Signals you now hold: the
     #    guessed names, the duration, anything said in the first minutes
     #    ("thanks for joining the QBR"), and the file's own mtime. The upload
-    #    date is NOT the meeting date — a scratch row is stamped with the
+    #    date is NOT the meeting date — an unlinked row is stamped with the
     #    upload time. If the human didn't say when, ASK ("when was this
     #    recorded, roughly?") before searching the calendar.
     darth-cli meetings calendar --view all --from <day-2> --to <day+1> --participant "<guessed name>" --json
@@ -354,6 +376,13 @@ hundred MB are fine (streamed) but transcription time scales with length —
 raise --timeout. A 415 means the server thinks the file is a text document
 under a media extension (or vice versa) — rename it.
 
+Someone hands you a THROWAWAY recording (a voice memo, a test clip, "just
+tell me what they said") → 'upload --scratch'. It stays out of everyone's
+main archive ('list --scratch' / the web UI's Temporary tab) and is trashed
+30 days after creation unless a human keeps it in the web UI or you 'link'
+it to a calendar event. Same transcription, same 'text' / 'speakers' /
+'set-notes' afterwards — only the shelf life differs.
+
 ## Labels (org-wide taxonomy, many per meeting)
 
 Labels are hierarchical paths ('Customers/LP Global/QBR') shared by the
@@ -390,6 +419,8 @@ Use them in set-report markdown to produce rich, clickable reports.
   as agent-written (e.g. a trailing "— summarized by <agent>" line).
 - set-notes/set-report REPLACE content. Read the existing markdown first
   ('notes <id>') if the human may have curated it.
+- 'trash <id>' is reversible ('restore <id>'; owner only) — the row just
+  leaves everyone's listings. Permanent delete is web-only, on purpose.
 - Write commands need a read+write token for meetings; on a 403, tell your
   human to re-run 'darth-cli login' and pick Read + write.
 `;
@@ -1035,7 +1066,7 @@ const meetings: Subcommand = {
   help: HELP,
   async run(ctx, argv) {
     const { pos, flags } = parseArgs(argv);
-    liftBoolFlags(pos, flags, ["cascade", "exact", "cached", "details", "wait", "clear", CONSENT_FLAG]);
+    liftBoolFlags(pos, flags, ["cascade", "exact", "cached", "details", "wait", "clear", "scratch", CONSENT_FLAG]);
     const [, cmd, ...args] = pos.length && pos[0] === "meetings" ? pos : ["", ...pos];
     if (!cmd || flags.help === true) { console.log(HELP); return 0; }
 
@@ -1151,6 +1182,21 @@ const meetings: Subcommand = {
       }
 
       case "list": {
+        if (flags.scratch === true) {
+          // Temporary rows only — legacy shape like ?trash=1, nothing else
+          // composes (the server ignores filters on this path, so refuse
+          // them here instead of silently listing everything).
+          const other = [...ALL_FILTER_FLAGS, "label", "exact"].filter(f => flags[f] !== undefined);
+          if (other.length) { console.error(`--scratch lists your temporary transcripts only — it does not combine with ${other.map(f => `--${f}`).join(", ")}`); return 1; }
+          const data = await ctx.expectJson<{ transcripts: any[] }>(ctx.api("meetings", "/api/transcripts?scratch=1"));
+          const rows = data.transcripts;
+          ctx.print(rows, () => {
+            if (!rows.length) return console.log("No temporary (scratch) transcripts — 'upload --scratch' creates one.");
+            printTranscriptRows(rows);
+            console.log(`\n${rows.length} temporary transcript(s) — trashed 30 days after creation unless kept in the web UI or linked ('link <id> <ref>')`);
+          });
+          return 0;
+        }
         const fr = readFilterFlags(ctx, flags, [...ALL_FILTER_FLAGS, "label", "exact"]);
         if (!fr.ok) { console.error(fr.error); return 1; }
         const lf = await resolveLabelFilter(ctx, flags, fr.params);
@@ -1291,6 +1337,7 @@ const meetings: Subcommand = {
           console.log(`date:        ${t.recorded_at || t.completed_at || t.created_at}`);
           console.log(`duration:    ${fmtDuration(t.duration)}  speakers: ${t.speaker_count ?? "?"}  status: ${t.status}`);
           console.log(`access:      ${t.access}  source: ${t.source}${t.local_audio_path ? "  (audio stored locally)" : ""}`);
+          if (t.scratch === true) console.log(`scratch:     yes  (temporary — trashed 30 days after creation unless kept in the web UI or linked)`);
           console.log(`notes:       ${t.auto_notes_status ?? "never run"}${t.auto_notes ? ` (${t.auto_notes.length} chars)` : ""}`);
           console.log(`report:      ${t.auto_report_status ?? "never run"}${t.auto_report ? ` (${t.auto_report.length} chars)` : ""}`);
         });
@@ -1678,11 +1725,13 @@ const meetings: Subcommand = {
 
       case "upload": {
         const file = args[0];
-        if (!file) { console.error("usage: darth-cli meetings upload <file> [--event <meeting-code|event-key>] [--title <t>] [--language <code>] [--report summary|detailed-video|detailed-text|later] [--wait] [--timeout <mins>]"); return 1; }
+        if (!file) { console.error("usage: darth-cli meetings upload <file> [--event <meeting-code|event-key>] [--title <t>] [--language <code>] [--scratch] [--wait] [--timeout <mins>]"); return 1; }
         if (!existsSync(file) || !statSync(file).isFile()) { console.error(`No such file: ${file}`); return 1; }
+        // No --report here on purpose: the CLI never starts the service's AI
+        // runs (a detailed report is a human's web-UI ask); the caller's own
+        // agent writes reports via set-report.
+        if (flags.report !== undefined) { console.error("--report is not a CLI option: uploads get the default summary notes; a detailed report is requested by a human in the web UI, or written by you with 'set-report'."); return 1; }
         ctx.requireWrite();
-        const report = str(flags.report);
-        if (report && !["summary", "detailed-video", "detailed-text", "later"].includes(report)) { console.error("--report must be summary, detailed-video, detailed-text or later"); return 1; }
         const capMin = Number(str(flags.timeout) ?? "60");
         if (!Number.isFinite(capMin) || capMin <= 0) { console.error(`--timeout must be a number of minutes (got '${str(flags.timeout)}')`); return 1; }
         const name = basename(file); const size = statSync(file).size;
@@ -1693,12 +1742,15 @@ const meetings: Subcommand = {
         if (ev) q.set("event", ev);
         const lang = str(flags.language);
         if (lang) q.set("language_code", lang);
-        if (report) q.set("report_pref", report);
+        // Temporary row: sent even alongside --event — the server decides
+        // whether a linked upload can be scratch.
+        const scratch = flags.scratch === true;
+        if (scratch) q.set("scratch", "1");
         const say = (line: string) => { if (!ctx.json) console.log(line); };
         // Bun streams a Bun.file body (multi-GB safe); node fallback reads it whole.
         const B: any = (globalThis as any).Bun;
         const body: any = B?.file ? B.file(file) : new Blob([readFileSync(file)]);
-        say(`Uploading ${name} (${(size / 1048576).toFixed(1)} MB)${ev ? ` → event ${ev}` : " as a scratch transcript"}…`);
+        say(`Uploading ${name} (${(size / 1048576).toFixed(1)} MB)${ev ? ` → event ${ev}` : " unlinked"}${scratch ? " as a temporary (scratch) transcript" : ""}…`);
         const path = isText ? `/api/transcripts/import-text?${q}` : `/api/transcripts?${q}`;
         const res = await ctx.api("meetings", path, {
           method: "POST", body,
@@ -1726,7 +1778,8 @@ const meetings: Subcommand = {
           t = { ...t, title };
         }
         const linked = t?.gmeet_context?.eventTitle || t?.gmeet_context?.eventId;
-        say(`${data.queued ? "Queued (text normalizing via LLM)" : isText ? "Imported" : "Uploaded"}: ${id}  "${t?.title ?? t?.original_filename ?? ""}"  status: ${t?.status}${linked ? `  linked to "${t.gmeet_context.eventTitle ?? t.gmeet_context.eventId}"` : "  (not linked to any calendar event)"}`);
+        const isScratch = t?.scratch === true || (scratch && t?.scratch === undefined);
+        say(`${data.queued ? "Queued (text normalizing via LLM)" : isText ? "Imported" : "Uploaded"}: ${id}  "${t?.title ?? t?.original_filename ?? ""}"  status: ${t?.status}${linked ? `  linked to "${t.gmeet_context.eventTitle ?? t.gmeet_context.eventId}"` : "  (not linked to any calendar event)"}${isScratch ? "  temporary (scratch): trashed in 30 days unless kept or linked" : ""}`);
         say(`Web: ${webBase(ctx)}/transcript/${id}`);
         if (flags.wait === true && t?.status !== "completed") {
           const done = await waitForUpload(ctx, id, capMin, say);
@@ -1738,7 +1791,7 @@ const meetings: Subcommand = {
             if (!linked) console.log(`Not linked to a calendar event yet — see 'darth-cli meetings skill' (§ "Someone hands you a recording") for the link / set-date flow.`);
           }
         }
-        ctx.print({ transcript: t, linked: !!linked, url: `${webBase(ctx)}/transcript/${id}` }, () => {});
+        ctx.print({ transcript: t, linked: !!linked, scratch: isScratch, url: `${webBase(ctx)}/transcript/${id}` }, () => {});
         return 0;
       }
 
@@ -1829,6 +1882,48 @@ const meetings: Subcommand = {
           method: "PUT", body: JSON.stringify({ markdown }),
         }));
         console.log(`${kind} updated (${markdown.length} chars) — visible in the web UI now`);
+        return 0;
+      }
+
+      case "trash":
+      case "restore": {
+        const id = args[0];
+        if (!id || args.length > 1) { console.error(`usage: darth-cli meetings ${cmd} <id>`); return 1; }
+        ctx.requireWrite();
+        // DELETE /api/transcripts/:id is a SOFT delete for a live row (the
+        // server only deletes for good on ?permanent=1, on a row already in
+        // the trash, or on an upload placeholder). The CLI never sends
+        // ?permanent=1 — permanent deletion stays a web-UI action — and
+        // refuses to DELETE a row the server reports as already trashed,
+        // since that second DELETE would be the permanent one.
+        if (cmd === "trash") {
+          const cur = await ctx.expectJson<{ transcript: any }>(ctx.api("meetings", `/api/transcripts/${id}`));
+          const t = cur.transcript;
+          if (t?.access !== "owner") { console.error(`Only the owner can trash ${id} (your access: ${t?.access ?? "?"}).`); return 1; }
+          if (t?.deleted_at) { console.error(`${id} is already in the trash — 'darth-cli meetings restore ${id}' brings it back; permanent delete is web-only.`); return 1; }
+          if (t?.status === "uploading" || t?.status === "waiting") { console.error(`${id} is a placeholder (status ${t.status}) — the server would delete it for good, not trash it. Use the web UI if that is what you want.`); return 1; }
+        }
+        const res = await ctx.api("meetings", cmd === "trash" ? `/api/transcripts/${id}` : `/api/transcripts/${id}/restore`, { method: cmd === "trash" ? "DELETE" : "POST" });
+        const data: any = await res.json().catch(() => null);
+        if (!res.ok) {
+          const msg = data?.error ?? `HTTP ${res.status}`;
+          if (res.status === 404) console.error(`No transcript ${id} visible to you (${msg}).`);
+          else if (res.status === 403) console.error(`${msg} (${id}) — ask its owner.`);
+          else if (res.status === 409) console.error(`${id} is not in the trash (${msg}) — nothing to restore.`);
+          else console.error(`${cmd} failed (HTTP ${res.status}): ${msg}`);
+          return res.status === 401 ? 3 : 1;
+        }
+        if (cmd === "trash" && data?.trashed !== true) {
+          // Should not happen given the pre-check, but never report a soft
+          // delete the server did not confirm.
+          console.error(`Server deleted ${id} outright (no 'trashed' flag) — it is gone, not in the trash.`);
+          ctx.print(data, () => {});
+          return 1;
+        }
+        ctx.print({ ...data, id, action: cmd }, () =>
+          console.log(cmd === "trash"
+            ? `trashed ${id} — restore with 'darth-cli meetings restore ${id}'`
+            : `restored ${id} — back in the listing for everyone it is shared with`));
         return 0;
       }
 
