@@ -454,6 +454,10 @@ export interface GmeetContext {
     /** What was generated unattended (mirrors uploadPrefs.report). */
     generated?: 'summary' | 'detailed-video' | 'detailed-text' | null;
   } | null;
+  /** Stamped by the notes sweeper when a temporary (scratch) row's 30 days
+   * ran out and the owner was DM'd about the auto-trash — one DM per row,
+   * ever (the plagueis dedupe key is the belt, this marker the braces). */
+  scratchTrashDm?: { at: string; to: string } | null;
 }
 
 /** Access level for the current user on a transcript. */

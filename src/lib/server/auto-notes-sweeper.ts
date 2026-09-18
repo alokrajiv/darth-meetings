@@ -6,12 +6,16 @@ import {
   listNotesBacklog,
   listSpeakerIdBacklog,
   listStaleUploads,
+  mergeGmeetContextForUser,
   softDeleteForUser,
 } from '@/db-ops/transcripts';
+import { identityForUser } from '@/db-ops/transcript-activity';
 import { deleteUploadSession, listExpiredUploadSessions } from '@/db-ops/upload-sessions';
 import { uploadsStore } from '@/lib/server/darth-uploads-store';
 import { deleteAudioFile, deleteAudioFilesByPrefix } from '@/lib/server/audio-storage';
 import { generateAutoNotes, identifySpeakers } from '@/lib/server/auto-notes';
+import { sendDarthDm } from '@/lib/server/darth-notify';
+import { scratchTrashedDm } from '@/lib/server/dm-copy';
 import { SCRATCH_TTL_DAYS } from '@/lib/format';
 
 /**
@@ -50,6 +54,37 @@ const SCRATCH_PER_SWEEP = 50;
 
 let started = false;
 
+/**
+ * Tell the owner their temporary transcript went to the trash — once per
+ * row, ever: the gmeet_context.scratchTrashDm marker is checked first and
+ * stamped after, and the plagueis dedupe key backs it up. Restore clears
+ * `scratch`, so a restored row can never be auto-trashed (or DM'd) twice.
+ * The DM is house style (dm-copy.ts) and links to the listing's Trash tab.
+ */
+async function notifyScratchTrashed(ownerUserId: string, assemblyaiId: string): Promise<void> {
+  if (!process.env.DARTH_APP_TOKEN) return; // notifications off — nothing to mark either
+  const row = await getForUser(ownerUserId, assemblyaiId);
+  if (!row || row.gmeet_context?.scratchTrashDm) return;
+  const owner = await identityForUser(ownerUserId);
+  if (!owner) return; // never opened the app → no email on record
+  await mergeGmeetContextForUser(
+    ownerUserId,
+    assemblyaiId,
+    { scratchTrashDm: { at: new Date().toISOString(), to: owner.email } },
+    { quiet: true }
+  );
+  await sendDarthDm({
+    toEmail: owner.email,
+    text: scratchTrashedDm({
+      title: row.title?.trim() || row.original_filename?.trim() || 'Untitled meeting',
+      when: row.recorded_at ?? row.created_at,
+      duration: row.duration,
+      speakerCount: row.speaker_count,
+    }),
+    dedupeKey: `mw-scratch-trash:${assemblyaiId}:${owner.email}`,
+  });
+}
+
 async function sweep(): Promise<void> {
   // Temporary transcripts past their 30 days → trash. One line per row so a
   // "where did my transcript go?" question has an answer in the pm2 log.
@@ -63,6 +98,9 @@ async function sweep(): Promise<void> {
       if (trashed) {
         console.log(
           `[notes-sweeper] auto-trashed temporary transcript ${s.assemblyai_id} (owner ${s.user_id}, created ${s.created_at})`
+        );
+        await notifyScratchTrashed(s.user_id, s.assemblyai_id).catch((err) =>
+          console.warn(`[notes-sweeper] scratch auto-trash DM failed ${s.assemblyai_id}:`, err)
         );
       }
     }
