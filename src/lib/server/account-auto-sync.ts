@@ -24,8 +24,11 @@ import {
 } from '@/db-ops/gmeet-meeting-cache';
 import { findImportedByMeetingCodes } from '@/db-ops/gmeet-sync';
 import { findImportedByTeamsMeetings } from '@/db-ops/teams-import';
-import { getAnyByAssemblyaiId } from '@/db-ops/transcripts';
+import { createDeferredPlaceholder, getAnyByAssemblyaiId } from '@/db-ops/transcripts';
 import { addShare } from '@/db-ops/transcript-shares';
+import { autoShareToInternalInvitees } from '@/lib/server/auto-share';
+import { kickDeferredImportPoller } from '@/lib/server/deferred-import-poller';
+import { randomUUID } from 'node:crypto';
 import { identityForUser, userIdForEmail } from '@/db-ops/transcript-activity';
 import { seriesOwnerFor } from '@/lib/server/auto-import-plan';
 import { strongestReport, reportLabel } from '@/lib/auto-marker';
@@ -361,6 +364,31 @@ async function fireGroup(g: Group, electors: Elector[], now: number): Promise<vo
           event,
           contextExtra,
         });
+        // EARLY FIRE (needsPreparing): the recording is still generating, so
+        // there is no file id yet. executeGmeetImport can only defer when the
+        // Meet API lists the pending recording under THIS token — for a
+        // non-organiser it lists nothing, so the call falls through to the
+        // video path's `videoFileId is required` 400 (D2, 2026-09-08; ledger
+        // jur-komt-mab 09-10). Queue our own defer- placeholder instead: the
+        // deferred-import poller watches the artifact cache / calendar
+        // attachments for the file (see deferred-import-poller checkRow) and
+        // runs the import the moment it lands — the claim, uuid and shares
+        // land now, which is what "lock in early" means.
+        if (
+          outcome.status === 400 &&
+          mode !== 'transcript' &&
+          !videoId &&
+          /videoFileId is required/i.test(String(outcome.body.error ?? '')) &&
+          recordingPreparing(g, now)
+        ) {
+          outcome = await queueAwaitingRecording(caller, g, {
+            mode,
+            docId,
+            event,
+            contextExtra,
+            teamsUrl: null,
+          });
+        }
       }
     } catch (err) {
       outcome = { status: 500, body: { error: err instanceof Error ? err.message : String(err) } };
@@ -457,6 +485,90 @@ async function fireGroup(g: Group, electors: Elector[], now: number): Promise<vo
   }
   await settleAutoSync(g.key, { outcome: 'failed', detail: lastErr?.error ?? 'no usable importer' });
   console.warn(`[auto-sync] ${g.key} failed: ${lastErr?.error ?? 'no usable importer'}`);
+}
+
+/** The cache says the occurrence's recording is still generating (same 24h
+ * freshness guard the elector gate and the calendar layer use). */
+function recordingPreparing(g: Group, now: number): boolean {
+  return (
+    g.cacheRow?.recording_state === 'generating' &&
+    Date.parse(g.startIso) > now - 24 * 3600 * 1000
+  );
+}
+
+/**
+ * Queue a `defer-` placeholder for a video-mode import whose recording file
+ * does not exist yet and that executeGmeetImport could not defer itself (no
+ * Meet-API-visible pending recording under the importer's token). Frozen
+ * request carries NO conferenceRecordName on purpose: the deferred poller
+ * would list that record under the importer's token, see nothing (non-
+ * organiser) and retire the row as "never appeared". Without one, checkRow
+ * takes its artifact-cache / calendar-attachment path — the same sources
+ * this sweep reads video ids from. Dedupes against an existing import of
+ * the occurrence first (409 like the core does).
+ */
+async function queueAwaitingRecording(
+  caller: Caller,
+  g: Group,
+  q: {
+    mode: 'video' | 'both';
+    docId: string | null;
+    event: ReturnType<typeof eventFrom>;
+    contextExtra: NonNullable<Parameters<typeof executeGmeetImport>[1]['contextExtra']>;
+    teamsUrl: string | null;
+  }
+): Promise<{ status: number; body: Record<string, unknown> }> {
+  const existing = await findExisting(g, q.teamsUrl, caller);
+  if (existing) {
+    return { status: 409, body: { error: 'This meeting was already imported.', existing: { assemblyai_id: existing } } };
+  }
+  const placeholderId = `defer-${randomUUID()}`;
+  const attendees = (q.event.attendees ?? [])
+    .filter((a) => a && typeof a.email === 'string')
+    .map((a) => ({ email: a.email, name: a.displayName, responseStatus: a.responseStatus }));
+  const placeholder = await createDeferredPlaceholder(caller.userId, {
+    placeholderId,
+    title: q.event.title ?? g.title ?? null,
+    recordedAt: q.event.startTime ?? g.startIso,
+    gmeetContext: {
+      eventId: q.event.id,
+      recurringEventId: q.event.recurringEventId,
+      iCalUID: q.event.iCalUID,
+      organizerEmail: q.event.organizerEmail,
+      eventTitle: q.event.title,
+      startTime: q.event.startTime,
+      endTime: q.event.endTime,
+      meetingCode: g.code,
+      attendees,
+      transcriptDocId: q.docId ?? undefined,
+      ...q.contextExtra,
+      deferredImport: {
+        mode: q.mode,
+        ownerEmail: caller.email,
+        request: {
+          transcriptDocId: q.docId ?? undefined,
+          event: { ...q.event, meetingCode: g.code },
+          contextExtra: q.contextExtra,
+        },
+        since: new Date().toISOString(),
+        status: 'waiting',
+      },
+    },
+  });
+  const autoShared = await autoShareToInternalInvitees(
+    placeholder.id,
+    caller.userId,
+    caller.email,
+    attendees.map((a) => ({ email: a.email, name: a.name }))
+  ).catch(() => 0);
+  kickDeferredImportPoller();
+  console.log(
+    `[auto-sync] ${g.key}: recording still generating — queued ${placeholderId} to wait for the file (${q.mode})`
+  );
+  return {
+    status: 202,
+    body: { deferred: true, waitingFor: 'video', transcript: placeholder, mode: q.mode, autoShared },
+  };
 }
 
 async function findExisting(g: Group, teamsUrl: string | null, caller: Caller): Promise<string | null> {

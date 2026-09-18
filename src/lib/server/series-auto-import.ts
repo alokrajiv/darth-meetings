@@ -32,6 +32,14 @@ import { reportLabel, type ReportPref } from '@/lib/auto-marker';
  * 'failed' fires may retry after FAILED_RETRY_MS, everything else is final
  * (the deferred poller owns any waiting from there).
  *
+ * No-artifact (D2, 2026-09-18): a past occurrence whose mode's artifact
+ * never appeared used to have NO ledger row, so the listing chip and
+ * `auto-sync explain` said "pending" forever. Once the dependency window
+ * passes with nothing listed (transcript → NO_ARTIFACT_AFTER_MS.transcript,
+ * video/both → the deferred poller's 24h give-up), the sweep records a
+ * terminal 'no-artifact' row instead. It is terminal for the UI; should an
+ * artifact turn up later after all, the candidate filter still fires it.
+ *
  * Called from the gmeet poller's 30-minute pass. The dialog's external
  * sweep cache is 6h — too slow for "the call just ended", so this forces a
  * fresh external sweep once the config's lastSweepAt is older than
@@ -42,6 +50,16 @@ const REFRESH_MS = 55 * 60 * 1000; // force a fresh external sweep hourly
 const FAILED_RETRY_MS = 12 * 3600 * 1000;
 const DOWNGRADE_AFTER_MS = 12 * 3600 * 1000; // 'both' waits this long for the missing half
 const MAX_FIRES_PER_PASS = 4; // per series — video imports are heavy
+/** How long after the call an occurrence may stay artifact-less before the
+ * ledger calls it 'no-artifact': transcript Docs land within the hour
+ * (6h = the deferred poller's BOTH_TRANSCRIPT_WAIT), recordings can take
+ * much longer (24h = its GIVE_UP). */
+const NO_ARTIFACT_AFTER_MS: Record<'transcript' | 'video' | 'both', number> = {
+  transcript: 6 * 3600 * 1000,
+  video: 24 * 3600 * 1000,
+  both: 24 * 3600 * 1000,
+};
+const MAX_NO_ARTIFACT_PER_PASS = 25; // ledger writes only — cheap, but bounded
 
 export async function sweepAutoImportSeries(): Promise<void> {
   let list: SeriesRow[];
@@ -88,20 +106,74 @@ async function sweepOne(series: SeriesRow): Promise<void> {
   const wantVideo = cfg.mode !== 'transcript';
   const wantTranscript = cfg.mode !== 'video';
 
+  const wanted = (o: SeriesOccurrence) =>
+    (wantVideo && o.hasRecording) || (wantTranscript && o.hasTranscript);
+  const eligible = (o: SeriesOccurrence) =>
+    !o.upcoming && o.imported.length === 0 && Date.parse(o.startIso) > sinceMs && !!providerOf(o);
+
   const candidates = result.occurrences.filter((o) => {
-    if (o.upcoming || o.imported.length > 0) return false;
-    if (Date.parse(o.startIso) <= sinceMs) return false;
+    if (!eligible(o)) return false;
     const prior = log.get(o.key);
-    if (prior && !(prior.outcome === 'failed' && now - Date.parse(prior.fired_at) > FAILED_RETRY_MS))
+    // 'failed' retries after a cool-off; 'no-artifact' fires as soon as an
+    // artifact exists after all (the `wanted` check below); the rest are final.
+    if (
+      prior &&
+      prior.outcome !== 'no-artifact' &&
+      !(prior.outcome === 'failed' && now - Date.parse(prior.fired_at) > FAILED_RETRY_MS)
+    )
       return false;
-    if (!providerOf(o)) return false;
     // At least one artifact the mode wants must be listed — bare occurrences
     // just wait (they stay visible in the dialog's coverage strip).
-    return (wantVideo && o.hasRecording) || (wantTranscript && o.hasTranscript);
+    return wanted(o);
   });
 
   // Oldest first so a backlog drains in order across passes.
   candidates.sort((a, b) => Date.parse(a.startIso) - Date.parse(b.startIso));
+
+  // Bare occurrences past the mode's dependency window with nothing listed
+  // (and nothing "generating") → terminal 'no-artifact' ledger row, so the
+  // chip / explain stop saying "pending". Never for rows already in the
+  // ledger (a queued/deferred row is the poller's business).
+  const stale = result.occurrences.filter((o) => {
+    if (!eligible(o) || wanted(o) || log.has(o.key)) return false;
+    const generating =
+      (wantVideo && o.meet?.videoPending === true) || (wantTranscript && o.meet?.transcriptPending === true);
+    if (generating) return false;
+    const end = o.endIso && !Number.isNaN(Date.parse(o.endIso)) ? Date.parse(o.endIso) : Date.parse(o.startIso);
+    return now - end > NO_ARTIFACT_AFTER_MS[cfg.mode];
+  });
+  for (const o of stale.slice(0, MAX_NO_ARTIFACT_PER_PASS)) {
+    const want =
+      cfg.mode === 'both' ? 'recording or transcript' : cfg.mode === 'video' ? 'recording' : 'transcript';
+    const hours = Math.round(NO_ARTIFACT_AFTER_MS[cfg.mode] / 3600_000);
+    const detail = o.emptyTranscript
+      ? `the transcript Doc holds no speech (Google: not enough conversation) — nothing to import`
+      : `no ${want} appeared within ${hours} h of the call — nothing to import`;
+    await recordAutoImportFire({
+      seriesId: series.id,
+      occKey: o.key,
+      occStart: o.startIso,
+      title: o.title,
+      outcome: 'no-artifact',
+      assemblyaiId: null,
+      detail,
+    }).catch((err) => console.warn(`[series-auto-import] no-artifact ledger write failed for ${o.key}:`, err));
+    log.set(o.key, {
+      series_id: series.id,
+      occ_key: o.key,
+      occ_start: o.startIso,
+      title: o.title,
+      outcome: 'no-artifact',
+      assemblyai_id: null,
+      detail,
+      fired_at: new Date(now).toISOString(),
+    });
+  }
+  if (stale.length > 0) {
+    console.log(
+      `[series-auto-import] series ${series.id}: ${Math.min(stale.length, MAX_NO_ARTIFACT_PER_PASS)} occurrence(s) marked no-artifact (${cfg.mode})`
+    );
+  }
 
   let fired = 0;
   let users: AutoSyncUser[] = [];
