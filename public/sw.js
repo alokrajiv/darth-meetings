@@ -156,6 +156,87 @@ self.addEventListener('message', (event) => {
 });
 
 // ---------------------------------------------------------------------------
+// Background Sync — the offline activity outbox (src/lib/offline/
+// offline-outbox.ts registers OUTBOX_SYNC_TAG after every write). Chrome
+// fires 'sync' once the network is back, tab open or not; the worker reads
+// the IndexedDB 'outbox' store the page filled and POSTs it with the same
+// wire format the page uses. Both may flush at once — the server dedupes on
+// each row's `key`, and deleting an already-deleted key is a no-op.
+// Browsers without Background Sync never fire this; the page flushes then.
+// ---------------------------------------------------------------------------
+
+const IDB_NAME = 'darth-offline';
+const OUTBOX_STORE = 'outbox';
+const OUTBOX_URL = '/api/offline/outbox';
+const OUTBOX_SYNC_TAG = 'darth-outbox';
+const OUTBOX_BATCH = 200;
+
+self.addEventListener('sync', (event) => {
+  if (event.tag !== OUTBOX_SYNC_TAG) return;
+  event.waitUntil(flushOutboxFromWorker().catch((err) => console.warn('[sw] outbox flush failed', err)));
+});
+
+function openOutboxDb() {
+  return new Promise((resolve, reject) => {
+    // Version-less open: never upgrade from the worker — the page owns the
+    // schema. A db that predates the store simply yields nothing to send.
+    const req = indexedDB.open(IDB_NAME);
+    req.onsuccess = () => resolve(req.result);
+    req.onerror = () => reject(req.error || new Error('IndexedDB open failed'));
+    req.onblocked = () => reject(new Error('IndexedDB open blocked'));
+  });
+}
+
+function idbRequest(req) {
+  return new Promise((resolve, reject) => {
+    req.onsuccess = () => resolve(req.result);
+    req.onerror = () => reject(req.error || new Error('IndexedDB request failed'));
+  });
+}
+
+async function flushOutboxFromWorker() {
+  const db = await openOutboxDb();
+  try {
+    if (!db.objectStoreNames.contains(OUTBOX_STORE)) return;
+    const rows = await idbRequest(db.transaction(OUTBOX_STORE, 'readonly').objectStore(OUTBOX_STORE).getAll());
+    if (!rows || rows.length === 0) return;
+    rows.sort((a, b) => String(a.at).localeCompare(String(b.at)));
+    for (let i = 0; i < rows.length; i += OUTBOX_BATCH) {
+      const batch = rows.slice(i, i + OUTBOX_BATCH);
+      const res = await fetch(OUTBOX_URL, {
+        method: 'POST',
+        credentials: 'include',
+        cache: 'no-store',
+        headers: { 'content-type': 'application/json', accept: 'application/json' },
+        body: JSON.stringify({ events: batch }),
+      });
+      let drop;
+      if (res.status === 400) {
+        drop = batch.map((r) => r.key); // contract mismatch: never retry these
+      } else if (!res.ok) {
+        // 401/403/5xx: keep everything and let Chrome retry the sync later.
+        throw new Error(`outbox → ${res.status}`);
+      } else {
+        const body = await res.json();
+        drop = [].concat(body.accepted || [], (body.rejected || []).map((r) => r && r.key)).filter(Boolean);
+      }
+      if (drop.length > 0) {
+        const tx = db.transaction(OUTBOX_STORE, 'readwrite');
+        const store = tx.objectStore(OUTBOX_STORE);
+        for (const k of drop) store.delete(k);
+        await new Promise((resolve, reject) => {
+          tx.oncomplete = () => resolve();
+          tx.onerror = () => reject(tx.error || new Error('IndexedDB transaction failed'));
+          tx.onabort = () => reject(tx.error || new Error('IndexedDB transaction aborted'));
+        });
+      }
+    }
+  } finally {
+    db.close();
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Router
 // ---------------------------------------------------------------------------
 

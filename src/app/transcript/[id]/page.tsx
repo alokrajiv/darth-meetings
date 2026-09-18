@@ -51,6 +51,7 @@ import { OfflinePinDialog, OfflinePinStatus } from '@/components/offline-pin-dia
 import { OFFLINE_TITLE, getOfflineMode, useOffline, useOfflineGate } from '@/lib/offline/offline-context';
 import { isNetworkFailure } from '@/lib/offline/offline-fetch';
 import { getPin } from '@/lib/offline/offline-pins';
+import { recordOfflineActivity } from '@/lib/offline/offline-outbox';
 import { OFFLINE_CHANGE_EVENT, type PinRecord, type PlanMediaPart } from '@/lib/offline/offline-types';
 import type { PickerPerson } from '@/components/user-picker';
 import {
@@ -89,6 +90,7 @@ import {
   ExternalLink,
   Trash2,
   Hourglass,
+  Archive,
 } from 'lucide-react';
 
 const VIDEO_EXT_RE = /\.(mp4|webm|mov|mkv|m4v)$/i;
@@ -234,6 +236,61 @@ function TranscriptDetailInner({ transcriptId }: { transcriptId: string }) {
     const [path, q] = base.split('?');
     return `${path}?variant=audio${q ? `&${q}` : ''}`;
   };
+
+  // --- offline activity outbox (tech-debt B1) --------------------------------
+  // While the server is unreachable the worker answers this page from the
+  // caches, so the 'view' the GET route would log never happens. Record it
+  // locally with the real timestamp; the sync loop replays it on reconnect.
+  // `blocked` is read through a ref so the listeners below never re-arm.
+  const blockedRef = useRef(blocked);
+  blockedRef.current = blocked;
+  const loadedId = row?.assemblyai_id ?? null;
+  useEffect(() => {
+    if (!loadedId) return;
+    let done = false;
+    const tryRecord = () => {
+      if (done || !blockedRef.current) return;
+      done = true;
+      void recordOfflineActivity('view', loadedId);
+    };
+    tryRecord();
+    // Online mode on a stalled network: the worker served the cached copy
+    // after its cap, but the health probe's verdict lands a few seconds
+    // later — keep looking for a short grace so that view is not lost.
+    // (The server throttles views ±10 min, so a view it DID log never
+    // double-counts.)
+    const poll = window.setInterval(tryRecord, 3_000);
+    const stop = window.setTimeout(() => window.clearInterval(poll), 15_000);
+    return () => {
+      window.clearInterval(poll);
+      window.clearTimeout(stop);
+    };
+  }, [loadedId]);
+  // Player interaction offline: 'play' / 'seeked' don't bubble, but they
+  // are observable in the capture phase — no changes to the player itself.
+  useEffect(() => {
+    if (!loadedId) return;
+    const position = (ev: Event) => {
+      const el = ev.target;
+      return el instanceof HTMLMediaElement ? Math.round(el.currentTime) : null;
+    };
+    const onPlay = (ev: Event) => {
+      const pos = position(ev);
+      if (pos === null || !blockedRef.current) return;
+      void recordOfflineActivity('play', loadedId, { positionSec: pos });
+    };
+    const onSeeked = (ev: Event) => {
+      const pos = position(ev);
+      if (pos === null || !blockedRef.current) return;
+      void recordOfflineActivity('seek', loadedId, { positionSec: pos });
+    };
+    document.addEventListener('play', onPlay, true);
+    document.addEventListener('seeked', onSeeked, true);
+    return () => {
+      document.removeEventListener('play', onPlay, true);
+      document.removeEventListener('seeked', onSeeked, true);
+    };
+  }, [loadedId]);
 
   const [speakerLabels, setSpeakerLabels] = useState<SpeakerLabel[]>([]);
   const [speakerSuggestions, setSpeakerSuggestions] = useState<SpeakerSuggestionMap>({});
@@ -452,19 +509,6 @@ function TranscriptDetailInner({ transcriptId }: { transcriptId: string }) {
     }
     return cur;
   }, [row?.auto_segments, currentTime]);
-
-  /**
-   * Resolve a raw speaker key into the display name, applying speaker_mappings.
-   * In raw view we deliberately bypass mappings to show the original AAI labels.
-   */
-  const speakerDisplayName = useCallback(
-    (originalSpeaker: string): string => {
-      if (viewMode === 'raw') return defaultSpeakerLabel(originalSpeaker);
-      const mapping = speakerLabels.find((m) => m.originalSpeaker === originalSpeaker);
-      return mapping?.customName || defaultSpeakerLabel(originalSpeaker);
-    },
-    [speakerLabels, viewMode]
-  );
 
   /**
    * Compose the display text for one utterance — raw text or with the user's
@@ -1352,7 +1396,8 @@ function TranscriptDetailInner({ transcriptId }: { transcriptId: string }) {
         if (newText === raw) {
           // Edit reverts to raw → drop the override entirely
           if (next[key]) {
-            const { text: _omit, ...rest } = next[key]!;
+            const rest = { ...next[key]! };
+            delete rest.text;
             if (rest.speaker !== undefined) next[key] = rest;
             else delete next[key];
           }
@@ -1524,7 +1569,8 @@ function TranscriptDetailInner({ transcriptId }: { transcriptId: string }) {
     const key = String(i);
     if (newText === raw) {
       if (nextEdits[key]) {
-        const { text: _omit, ...rest } = nextEdits[key]!;
+        const rest = { ...nextEdits[key]! };
+        delete rest.text;
         if (rest.speaker !== undefined) nextEdits[key] = rest;
         else delete nextEdits[key];
       }
@@ -1586,7 +1632,8 @@ function TranscriptDetailInner({ transcriptId }: { transcriptId: string }) {
       const key = String(i);
       if (text === raw) {
         if (nextEdits[key]) {
-          const { text: _omit, ...rest } = nextEdits[key]!;
+          const rest = { ...nextEdits[key]! };
+          delete rest.text;
           if (rest.speaker !== undefined) nextEdits[key] = rest;
           else delete nextEdits[key];
         }
@@ -2071,22 +2118,26 @@ function TranscriptDetailInner({ transcriptId }: { transcriptId: string }) {
     }
   };
 
-  /** Temporary → permanent (migration 042): clears the flag so the row
-   * moves from the Temporary tab to the main list and stops the 30-day
-   * auto-trash. Editors. */
-  const handleKeepScratch = async () => {
+  /** Temporary flag (migration 042). false = "Keep": the row moves from
+   * the Temporary tab to the main list and the 30-day auto-trash stops.
+   * true = "Move to temporary": out of the main list, trashed automatically
+   * SCRATCH_TTL_DAYS after upload. Editors; same PATCH the listing uses. */
+  const handleSetScratch = async (scratch: boolean) => {
     try {
       const res = await fetch(`/api/transcripts/${row.assemblyai_id}`, {
         method: 'PATCH',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ scratch: false }),
+        body: JSON.stringify({ scratch }),
       });
       if (!res.ok) throw new Error(await res.text().catch(() => `Update failed (${res.status})`));
       await loadAll({ silent: true });
     } catch (err) {
-      alert('Failed to keep: ' + (err instanceof Error ? err.message : 'Unknown error'));
+      alert(`Failed to ${scratch ? 'move to temporary' : 'keep'}: ` + (err instanceof Error ? err.message : 'Unknown error'));
     }
   };
+  // Same rule as the listing's row toggle: never on placeholders / deferred
+  // rows or in the trash.
+  const scratchToggleAllowed = canEdit && !row.deleted_at && row.status !== 'uploading' && row.status !== 'waiting';
 
   const handleTrashDelete = async () => {
     if (!confirm('Delete forever? This cannot be undone.')) return;
@@ -2108,8 +2159,8 @@ function TranscriptDetailInner({ transcriptId }: { transcriptId: string }) {
    * instance rendered last).
    */
   // (dropdown now always opens below the button, so the dialog/sidebar
-  // distinction no longer matters — param kept for call-site stability)
-  const renderQuickActions = (_inDialog = false) => (
+  // distinction no longer matters)
+  const renderQuickActions = () => (
     <div className="rounded-lg border bg-card p-3">
       <div className="text-[11px] font-semibold uppercase tracking-wider text-muted-foreground">
         Quick actions
@@ -2297,9 +2348,29 @@ function TranscriptDetailInner({ transcriptId }: { transcriptId: string }) {
             ))}
           </>
         )}
+        {(scratchToggleAllowed || (access === 'owner' && !row.deleted_at)) && <div className="my-1.5 border-t" />}
+        {scratchToggleAllowed && (
+          <Button
+            variant="ghost"
+            size="sm"
+            className="h-8 w-full justify-start gap-2 text-[13px] text-muted-foreground"
+            disabled={offline}
+            onClick={() => void handleSetScratch(!row.scratch)}
+            title={
+              offline
+                ? OFFLINE_TITLE
+                : row.scratch
+                  ? 'Keep — make this transcript permanent (moves it to the main list)'
+                  : 'Move to temporary — out of the main list, trashed automatically after 30 days'
+            }
+            data-scratch-toggle
+          >
+            {row.scratch ? <Archive className="h-4 w-4" /> : <Hourglass className="h-4 w-4" />}
+            {row.scratch ? 'Keep (make permanent)' : 'Move to temporary'}
+          </Button>
+        )}
         {access === 'owner' && !row.deleted_at && (
           <>
-            <div className="my-1.5 border-t" />
             <Button
               variant="ghost"
               size="sm"
@@ -2480,7 +2551,7 @@ function TranscriptDetailInner({ transcriptId }: { transcriptId: string }) {
                 className="ml-auto"
                 disabled={offline}
                 title={offline ? OFFLINE_TITLE : 'Make it permanent — moves it to the main list and stops the auto-trash'}
-                onClick={() => void handleKeepScratch()}
+                onClick={() => void handleSetScratch(false)}
               >
                 Keep
               </Button>
@@ -2854,7 +2925,7 @@ function TranscriptDetailInner({ transcriptId }: { transcriptId: string }) {
                         },
                         { key: 'summary' as const, label: 'Summary', spinning: false },
                       ]
-                        .sort((a, b) =>
+                        .sort((a) =>
                           row.auto_report ? (a.key === 'report' ? -1 : 1) : a.key === 'summary' ? -1 : 1
                         )
                         .map((t) => (
@@ -3676,7 +3747,7 @@ function TranscriptDetailInner({ transcriptId }: { transcriptId: string }) {
                     markAiStale('attachments', 'attached context files');
                 }}
               />
-              {renderQuickActions(true)}
+              {renderQuickActions()}
             </div>
           </DialogContent>
         </Dialog>

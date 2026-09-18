@@ -83,6 +83,41 @@ export interface MetaRecord {
   value: unknown;
 }
 
+/** What an offline read can leave behind (B1). Content edits are never queued. */
+export type OutboxKind = 'view' | 'play' | 'seek';
+
+/**
+ * IndexedDB 'outbox' store row — one activity event recorded while the
+ * device could not reach the server. Append-only until the sync loop
+ * flushes it to POST /api/offline/outbox; `key` is the idempotency token
+ * the server dedupes on, `at` is the ORIGINAL timestamp (the server writes
+ * it into transcript_activity as-is, so a view on the plane lands on the
+ * day it happened, not the day the laptop reconnected).
+ */
+export interface OutboxRecord {
+  key: string;
+  kind: OutboxKind;
+  transcriptId: string;
+  /** ISO timestamp of the event itself. */
+  at: string;
+  /** Small extras (play/seek position). Never content. */
+  meta?: Record<string, string | number | boolean>;
+}
+
+/** Wire shape of one POST /api/offline/outbox call. */
+export interface OutboxFlushRequest {
+  events: OutboxRecord[];
+}
+
+export interface OutboxFlushResponse {
+  /** Keys the server now holds (inserted OR already known) — drop locally. */
+  accepted: string[];
+  /** Keys the server refused for good (no access, malformed) — drop locally too. */
+  rejected: Array<{ key: string; reason: string }>;
+  /** Rows actually written this call (diagnostics). */
+  inserted: number;
+}
+
 export type OfflineMode = 'online' | 'offline';
 
 export type SwStatus = 'unsupported' | 'registering' | 'ready' | 'error';
@@ -157,7 +192,8 @@ export const SW_MODE_KEY = '/__darth/mode';
 export const RSC_CACHE_SUFFIX = '?__rsc=1';
 
 export const IDB_NAME = 'darth-offline';
-export const IDB_VERSION = 1;
+/** 1 = pins + meta; 2 = + outbox (B1, 2026-09-18). */
+export const IDB_VERSION = 2;
 
 export const OFFLINE_MODE_KEY = 'darth-offline-mode';
 /** Window event fired after every pin/sync mutation. */
@@ -169,6 +205,17 @@ export const META_LAST_SYNC = 'lastSync';
 export const META_PERSIST_REQUESTED = 'persistRequested';
 /** userId the ledger + caches belong to; a different session wipes them. */
 export const META_OWNER_USER_ID = 'ownerUserId';
+
+/** Outbox limits shared by the recorder, the flusher and the server route. */
+export const OUTBOX_URL = '/api/offline/outbox';
+/** Events per POST; the server refuses larger batches. */
+export const OUTBOX_BATCH = 200;
+/** Oldest rows are dropped past this many queued events (a device offline for weeks). */
+export const OUTBOX_MAX_ROWS = 2_000;
+/** Chrome Background Sync tag — the worker flushes the store under it with the tab closed. */
+export const OUTBOX_SYNC_TAG = 'darth-outbox';
+/** Deep link (manifest shortcut) that opens the app straight into offline mode. */
+export const OFFLINE_DEEPLINK_PARAM = 'offline';
 
 /** Rough size the pin dialog quotes for a transcript-level pin. */
 export const TRANSCRIPT_ESTIMATE_BYTES = 1024 * 1024;
