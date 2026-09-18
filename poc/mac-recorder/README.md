@@ -37,7 +37,16 @@ the default never overrides it). macOS may show "Darth Recorder was added as a l
   offers (call windows first). A pick rolls a new segment onto it (`source_switch` event with from / to /
   how; `source_mode` auto | manual in `status` and `recording_stopped`). ws: `redetect_source`,
   `set_auto_source`, `set_source {window_id|display_id}`, `set_discreet {enabled}`,
-  `set_banner_auto_hide {enabled}`, `show_banner`, `hide_banner`, `resources`, `show_test_banner`.
+  `set_banner_auto_hide {enabled}`, `show_banner`, `hide_banner`, `resources`, `show_test_banner`,
+  `snapshot_display {path, display_id?}` (an SCK display screenshot = what a sharing app sees).
+- **Verified on the notarized 0.3.6 (2026-09-18 23:32–23:36 SGT):** `snapshot_display` with the test banner up vs
+  hidden — 0 of 154,000 pixels differ in the banner's region, while an ordinary window at the same spot
+  changes 39.9 % of them (positive control); a display recording kept local: the pill was hidden 13 s after
+  start, `show_banner` brought it back, `set_source` to the second display rolled segment 2 (`source_mode`
+  manual, `source_switch` event), `recording_stopped.resources` = CPU 6.9 % avg / 10.7 % max, 171 MB avg /
+  239 MB max, 17.7 threads, CPU die 67 °C, 3 `resource_sample` events in 27 s; a window recording moved
+  from the built-in display to the DELL mid-recording kept capturing (37 → 94 frames, teal content in the
+  file before and after the move) — window capture follows the window across displays.
 
 **Resource profile, measured 2026-09-18 15:54–22:50 SGT (sampler: `top` per 5 s on the tray pid, IOKit GPU
 utilisation, `pmset`, SMC die temperatures via `smctemp` from 16:23; CSV in
