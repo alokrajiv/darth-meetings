@@ -9,7 +9,9 @@ import {
   chatCallEndMs,
   chatEvidenceWindow,
   classifyChatCallEvents,
+  classifyChatCallEventsUnion,
   needsChatLookup,
+  summarizeCallEvents,
   type ChatCallEventsResponse,
   type TeamsChatEvidence,
 } from '@/lib/teams-chat-evidence';
@@ -115,10 +117,208 @@ describe('classifyChatCallEvents', () => {
   });
 });
 
+// ---------------------------------------------------------------------------
+// D3 (2026-09-18): union across linked readers + events[]-based verdicts.
+// The APP Hypercare shape: alok's copy of the host-tenant chat holds the
+// call, an external colleague's copy of the SAME thread is empty for the
+// same window (they did not join that day).
+// ---------------------------------------------------------------------------
+
+const EMPTY_SUMMARY = {
+  held: false,
+  callStart: null,
+  callEnd: null,
+  durationMs: null,
+  recorded: false,
+  transcribed: false,
+  humanMessages: 0,
+};
+
+const HYPERCARE_EVENTS = [
+  { at: '2026-08-19T02:01:10Z', type: 'callStarted' },
+  { at: '2026-08-19T02:44:00Z', type: 'callEnded' },
+  // 5-second reconnect at the end — plagueis' summary.durationMs would be
+  // THIS pair only (0 min).
+  { at: '2026-08-19T02:44:30Z', type: 'callStarted' },
+  { at: '2026-08-19T02:44:35Z', type: 'callEnded' },
+  { at: '2026-08-19T02:50:00Z', type: 'callRecording' },
+];
+
+const emptyReader: ChatCallEventsResponse = { ok: true, events: [], summary: EMPTY_SUMMARY };
+const fullReader: ChatCallEventsResponse = {
+  ok: true,
+  events: HYPERCARE_EVENTS,
+  // Deliberately the unreliable plagueis summary: last pair only.
+  summary: {
+    held: true,
+    callStart: '2026-08-19T02:44:30Z',
+    callEnd: '2026-08-19T02:44:35Z',
+    durationMs: 5_000,
+    recorded: true,
+    transcribed: false,
+    humanMessages: 3,
+  },
+};
+
+describe('classifyChatCallEventsUnion', () => {
+  test('two readers — one empty copy, one with the call — verdict is HELD', () => {
+    const v = classifyChatCallEventsUnion(
+      [
+        { email: 'aniq.danial@trames.sg', resp: emptyReader },
+        { email: 'alok@trames.sg', resp: fullReader },
+      ],
+      { checkedAt: META.checkedAt, byEmail: 'aniq.danial@trames.sg' }
+    );
+    expect(v.held).toBe(true);
+    expect(v.recorded).toBe(true);
+    expect(v.transcribed).toBe(false);
+    expect(v.reason).toBeUndefined();
+    // Sum of BOTH started→ended pairs (42m50s + 5s), not the last pair.
+    expect(v.durationMs).toBe((42 * 60 + 50) * 1000 + 5_000);
+    expect(v.callStart).toBe('2026-08-19T02:01:10Z');
+    expect(v.callEnd).toBe('2026-08-19T02:44:35Z');
+    // Only the copy that carried call events is named; both counted.
+    expect(v.byEmail).toBe('alok@trames.sg');
+    expect(v.readerCount).toBe(2);
+    expect(v.humanMessages).toBe(3);
+  });
+  test('the same two readers in the other order give the same verdict', () => {
+    const a = classifyChatCallEventsUnion(
+      [{ email: 'a@trames.sg', resp: fullReader }, { email: 'b@trames.sg', resp: emptyReader }],
+      META
+    );
+    const b = classifyChatCallEventsUnion(
+      [{ email: 'b@trames.sg', resp: emptyReader }, { email: 'a@trames.sg', resp: fullReader }],
+      META
+    );
+    expect({ ...a, byEmail: null }).toEqual({ ...b, byEmail: null });
+  });
+  test('one reader alone with an empty copy is NOT HELD (honest, readerCount 1)', () => {
+    const v = classifyChatCallEventsUnion([{ email: 'aniq.danial@trames.sg', resp: emptyReader }], META);
+    expect(v.held).toBe(false);
+    expect(v.readerCount).toBe(1);
+    expect(v.reason).toBeUndefined();
+  });
+  test('duplicate events across copies are counted once', () => {
+    const v = classifyChatCallEventsUnion(
+      [{ email: 'a@trames.sg', resp: fullReader }, { email: 'b@trames.sg', resp: fullReader }],
+      META
+    );
+    expect(v.durationMs).toBe((42 * 60 + 50) * 1000 + 5_000);
+    expect(v.byEmail).toBe('a@trames.sg+b@trames.sg');
+  });
+  test('callRecording / callTranscript alone (callStarted outside the window) = held, duration unknown', () => {
+    const v = classifyChatCallEventsUnion(
+      [
+        {
+          email: 'a@trames.sg',
+          resp: {
+            ok: true,
+            events: [
+              { at: '2026-08-19T05:10:00Z', type: 'callEnded' },
+              { at: '2026-08-19T05:12:00Z', type: 'callRecording' },
+              { at: '2026-08-19T05:12:30Z', type: 'callTranscript' },
+            ],
+            summary: EMPTY_SUMMARY, // plagueis says not held — events say otherwise
+          },
+        },
+      ],
+      META
+    );
+    expect(v.held).toBe(true);
+    expect(v.recorded).toBe(true);
+    expect(v.transcribed).toBe(true);
+    expect(v.durationMs).toBeNull();
+  });
+  test('a failed reader next to an ok one does not poison the verdict', () => {
+    const v = classifyChatCallEventsUnion(
+      [
+        { email: 'x@trames.sg', resp: { ok: false, reason: 'forbidden' } },
+        { email: 'y@trames.sg', resp: null }, // transport failure
+        { email: 'alok@trames.sg', resp: fullReader },
+      ],
+      META
+    );
+    expect(v.held).toBe(true);
+    expect(v.reason).toBeUndefined();
+    expect(v.readerCount).toBe(1);
+  });
+  test('no ok reader: transient reason wins over forbidden, link reasons only when alone', () => {
+    const mixed = classifyChatCallEventsUnion(
+      [
+        { email: 'a@trames.sg', resp: { ok: false, reason: 'forbidden' } },
+        { email: 'b@trames.sg', resp: { ok: false, reason: 'throttled' } },
+        { email: 'c@trames.sg', resp: { ok: false, reason: 'not_linked' } },
+      ],
+      META
+    );
+    expect(mixed.held).toBeNull();
+    expect(mixed.reason).toBe('throttled');
+    const linkOnly = classifyChatCallEventsUnion(
+      [{ email: 'c@trames.sg', resp: { ok: false, reason: 'not_linked' } }],
+      META
+    );
+    expect(linkOnly.reason).toBe('not_linked');
+    const forbiddenAndLink = classifyChatCallEventsUnion(
+      [
+        { email: 'a@trames.sg', resp: { ok: false, reason: 'not_linked' } },
+        { email: 'b@trames.sg', resp: { ok: false, reason: 'forbidden' } },
+      ],
+      META
+    );
+    expect(forbiddenAndLink.reason).toBe('forbidden');
+  });
+  test('legacy responses without events[] fall back to the summaries, OR-ed', () => {
+    const v = classifyChatCallEventsUnion(
+      [
+        { email: 'a@trames.sg', resp: { ok: true, summary: EMPTY_SUMMARY } },
+        {
+          email: 'b@trames.sg',
+          resp: {
+            ok: true,
+            summary: { ...EMPTY_SUMMARY, held: true, durationMs: 60_000, callStart: '2026-08-19T02:00:00Z', callEnd: '2026-08-19T02:01:00Z' },
+          },
+        },
+      ],
+      META
+    );
+    expect(v.held).toBe(true);
+    expect(v.durationMs).toBe(60_000);
+    expect(v.byEmail).toBe('b@trames.sg');
+    expect(v.readerCount).toBe(2);
+  });
+});
+
+describe('summarizeCallEvents', () => {
+  test('sums every started→ended pair in time order', () => {
+    const s = summarizeCallEvents([
+      { at: '2026-08-19T03:00:00Z', type: 'callEnded' }, // ended before any start: ignored
+      { at: '2026-08-19T02:00:00Z', type: 'callStarted' },
+      { at: '2026-08-19T02:30:00Z', type: 'callEnded' },
+      { at: '2026-08-19T02:35:00Z', type: 'callStarted' },
+      { at: '2026-08-19T02:36:00Z', type: 'callStarted' }, // duplicate start: first wins
+      { at: '2026-08-19T02:45:00Z', type: 'callEnded' },
+      { at: '2026-08-19T02:46:00Z', type: 'somethingElse' },
+    ]);
+    // 30 min + 10 min; the stray 03:00 callEnded closes nothing (open is null then).
+    expect(s.durationMs).toBe(40 * 60_000);
+    expect(s.held).toBe(true);
+    expect(s.callStart).toBe('2026-08-19T02:00:00Z');
+    expect(s.callEnd).toBe('2026-08-19T03:00:00Z');
+  });
+  test('no call events → not held', () => {
+    expect(summarizeCallEvents([{ at: '2026-08-19T02:00:00Z', type: 'membersAdded' }]).held).toBe(false);
+  });
+});
+
 describe('asTeamsChatEvidence', () => {
   test('round-trips a persisted verdict', () => {
     const v = classifyChatCallEvents({ ok: false, reason: 'throttled' }, META);
     expect(asTeamsChatEvidence(JSON.parse(JSON.stringify(v)))).toEqual(v);
+  });
+  test('keeps readerCount', () => {
+    const v = classifyChatCallEventsUnion([{ email: 'a@trames.sg', resp: fullReader }], META);
+    expect(asTeamsChatEvidence(JSON.parse(JSON.stringify(v)))?.readerCount).toBe(1);
   });
   test('garbage → null', () => {
     expect(asTeamsChatEvidence(null)).toBeNull();
@@ -176,6 +376,17 @@ describe('needsChatLookup', () => {
   });
   test('unparseable checkedAt → lookup', () => {
     expect(needsChatLookup({ ...solid('garbage') }, END, END + 1)).toBe(true);
+  });
+  test('external pre-union "not held" (no readerCount) is re-asked once; unioned ones are final', () => {
+    const late = new Date(END + RECAP_SETTLE_MS + 60_000).toISOString();
+    const preUnion: TeamsChatEvidence = { ...solid(late), held: false };
+    expect(needsChatLookup(preUnion, END, END + 30 * 86_400_000, { external: true })).toBe(true);
+    // Own tenant: one copy is the whole chat — final as before.
+    expect(needsChatLookup(preUnion, END, END + 30 * 86_400_000, { external: false })).toBe(false);
+    // After the union ran (readerCount stamped, even if still not held): final.
+    expect(needsChatLookup({ ...preUnion, readerCount: 1 }, END, END + 30 * 86_400_000, { external: true })).toBe(false);
+    // Held verdicts are never re-asked on this rule.
+    expect(needsChatLookup(solid(late), END, END + 30 * 86_400_000, { external: true })).toBe(false);
   });
 });
 

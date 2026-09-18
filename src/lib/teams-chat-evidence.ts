@@ -34,6 +34,11 @@ export interface TeamsChatEvidence {
   /** Set when no verdict could be formed:
    * not_linked | revoked | forbidden | not_found | throttled | graph_error. */
   reason?: string;
+  /** How many linked readers' chat copies answered ok and were UNIONED into
+   * this verdict (D3, 2026-09-18). Absent on verdicts taken before the
+   * union existed — those came from ONE reader, and for an external-tenant
+   * meeting one reader's empty copy proves nothing (see needsChatLookup). */
+  readerCount?: number;
 }
 
 /** Wire shape of plagueis GET /api/ms/internal/chat-call-events (contract). */
@@ -84,14 +89,117 @@ export function chatEvidenceWindow(
  * (ok:true without a summary) classifies as a `graph_error`-style unknown
  * rather than "not held" — never turn transport noise into a confident
  * "nobody joined".
+ *
+ * One-reader form of classifyChatCallEventsUnion (below) — kept for the
+ * tests and any caller holding a single response.
  */
 export function classifyChatCallEvents(
   resp: ChatCallEventsResponse,
   meta: { checkedAt: string; byEmail: string | null }
 ): TeamsChatEvidence {
+  return classifyChatCallEventsUnion([{ email: meta.byEmail ?? '', resp }], meta);
+}
+
+/** Chat system events that prove a call took place. callRecording /
+ * callTranscript count too: long workshops whose callStarted fell outside
+ * the window still carry the recap events (2026-09-02 APP inventory). */
+export const CALL_EVENT_TYPES = new Set(['callStarted', 'callEnded', 'callRecording', 'callTranscript']);
+
+export type ChatCallEvent = { at: string; type: string };
+
+/** One reader's answer for the union: their SSO email and the plagueis body
+ * (null = transport failure / feature off — nothing came back). */
+export interface ChatReaderResponse {
+  email: string;
+  resp: ChatCallEventsResponse | null;
+}
+
+/**
+ * Held / duration / recorded from the raw `events[]` — NOT from plagueis'
+ * `summary`: its durationMs is the LAST callStarted→callEnded pair (a
+ * 5-second reconnect at the end reads as 0 min) and its `held` misses
+ * calls whose callStarted fell outside the window. Duration = the SUM of
+ * every started→ended pair in order; a lone callEnded (start outside the
+ * window) contributes nothing, so a verdict with call events but no
+ * complete pair has held=true and durationMs=null (unknown), never 0.
+ */
+export function summarizeCallEvents(events: readonly ChatCallEvent[]): {
+  held: boolean;
+  callStart: string | null;
+  callEnd: string | null;
+  durationMs: number | null;
+  recorded: boolean;
+  transcribed: boolean;
+} {
+  const calls = events
+    .filter((e) => CALL_EVENT_TYPES.has(e.type) && !Number.isNaN(Date.parse(e.at)))
+    .sort((a, b) => Date.parse(a.at) - Date.parse(b.at));
+  if (calls.length === 0) {
+    return { held: false, callStart: null, callEnd: null, durationMs: null, recorded: false, transcribed: false };
+  }
+  let total = 0;
+  let pairs = 0;
+  let open: number | null = null;
+  for (const e of calls) {
+    const t = Date.parse(e.at);
+    if (e.type === 'callStarted') {
+      if (open === null) open = t;
+    } else if (e.type === 'callEnded' && open !== null) {
+      if (t > open) {
+        total += t - open;
+        pairs++;
+      }
+      open = null;
+    }
+  }
+  const starts = calls.filter((e) => e.type === 'callStarted');
+  const ends = calls.filter((e) => e.type === 'callEnded');
+  return {
+    held: true,
+    callStart: (starts[0] ?? calls[0])!.at,
+    callEnd: (ends.length ? ends[ends.length - 1] : calls[calls.length - 1])!.at,
+    durationMs: pairs > 0 ? total : null,
+    recorded: calls.some((e) => e.type === 'callRecording'),
+    transcribed: calls.some((e) => e.type === 'callTranscript'),
+  };
+}
+
+/** Which failure to persist when NO reader could read the chat: a transient
+ * reason (retry soon) beats a settled one; link problems describe the
+ * readers, not the meeting, and only win when nothing else was seen. */
+const FAILURE_RANK: Record<string, number> = {
+  throttled: 0,
+  graph_error: 1,
+  forbidden: 2,
+  not_found: 3,
+  revoked: 4,
+  not_linked: 5,
+};
+
+/**
+ * THE verdict: the UNION of every linked reader's copy of the meeting chat.
+ * An external participant's copy of a host-tenant chat holds ONLY the
+ * occurrences they personally joined (proven 2026-09-02: alok saw 10
+ * Hypercare days that aniq/atira/kawen could not), so "ok but no events"
+ * from one reader is not evidence of not-held — every ok copy's events are
+ * merged (deduped by at|type) before summarizeCallEvents runs.
+ *
+ *  - ≥1 ok response carrying `events[]` → events-based verdict.
+ *  - ok responses WITHOUT `events[]` (older plagueis) → the summaries,
+ *    OR-ed: held/recorded/transcribed if any says so; durationMs from the
+ *    first held summary (the only figure available then).
+ *  - no ok response → the highest-ranked failure reason, held unknown.
+ *
+ * `byEmail` names the readers whose copies contributed call events ('+'
+ * joined), else every reader that answered ok; `readerCount` = ok copies.
+ */
+export function classifyChatCallEventsUnion(
+  readers: readonly ChatReaderResponse[],
+  meta: { checkedAt: string; byEmail?: string | null }
+): TeamsChatEvidence {
   const base: TeamsChatEvidence = {
     checkedAt: meta.checkedAt,
-    byEmail: meta.byEmail,
+    byEmail: meta.byEmail ?? null,
     held: null,
     callStart: null,
     callEnd: null,
@@ -100,22 +208,80 @@ export function classifyChatCallEvents(
     transcribed: false,
     humanMessages: null,
   };
-  if (!resp.ok) {
-    return { ...base, reason: resp.reason || 'graph_error' };
+  const ok: Array<{ email: string; resp: ChatCallEventsResponse }> = [];
+  const failures: string[] = [];
+  for (const r of readers) {
+    if (!r.resp) continue;
+    if (!r.resp.ok) {
+      failures.push(r.resp.reason || 'graph_error');
+      continue;
+    }
+    const s = r.resp.summary;
+    const hasEvents = Array.isArray(r.resp.events);
+    if (!hasEvents && (!s || typeof s.held !== 'boolean')) {
+      // Malformed 200 — neither events nor a usable summary.
+      failures.push('graph_error');
+      continue;
+    }
+    ok.push({ email: r.email, resp: r.resp });
   }
-  const s = resp.summary;
-  if (!s || typeof s.held !== 'boolean') {
-    return { ...base, reason: 'graph_error' };
+  if (ok.length === 0) {
+    const reason = failures.sort((a, b) => (FAILURE_RANK[a] ?? 1) - (FAILURE_RANK[b] ?? 1))[0];
+    return { ...base, reason: reason ?? 'graph_error' };
   }
+
+  const humanMessages = ok
+    .map((o) => o.resp.summary?.humanMessages)
+    .filter((n): n is number => typeof n === 'number');
+  const okEmails = ok.map((o) => o.email).filter(Boolean);
+  const withEvents = ok.filter((o) => Array.isArray(o.resp.events));
+
+  if (withEvents.length > 0) {
+    const seen = new Set<string>();
+    const merged: ChatCallEvent[] = [];
+    const contributors: string[] = [];
+    for (const o of withEvents) {
+      let contributed = false;
+      for (const e of o.resp.events ?? []) {
+        if (!e || typeof e.at !== 'string' || typeof e.type !== 'string') continue;
+        if (CALL_EVENT_TYPES.has(e.type)) contributed = true;
+        const k = `${e.at}|${e.type}`;
+        if (seen.has(k)) continue;
+        seen.add(k);
+        merged.push(e);
+      }
+      if (contributed && o.email) contributors.push(o.email);
+    }
+    const s = summarizeCallEvents(merged);
+    return {
+      ...base,
+      byEmail: (contributors.length ? contributors : okEmails).join('+') || base.byEmail,
+      held: s.held,
+      callStart: s.callStart,
+      callEnd: s.callEnd,
+      durationMs: s.durationMs,
+      recorded: s.recorded,
+      transcribed: s.transcribed,
+      humanMessages: humanMessages.length ? Math.max(...humanMessages) : null,
+      readerCount: ok.length,
+    };
+  }
+
+  // Legacy shape: summaries only.
+  const summaries = ok.map((o) => o.resp.summary!);
+  const heldOne = summaries.find((s) => s.held);
+  const contributors = ok.filter((o) => o.resp.summary?.held).map((o) => o.email).filter(Boolean);
   return {
     ...base,
-    held: s.held,
-    callStart: s.callStart ?? null,
-    callEnd: s.callEnd ?? null,
-    durationMs: typeof s.durationMs === 'number' ? s.durationMs : null,
-    recorded: s.recorded === true,
-    transcribed: s.transcribed === true,
-    humanMessages: typeof s.humanMessages === 'number' ? s.humanMessages : null,
+    byEmail: (contributors.length ? contributors : okEmails).join('+') || base.byEmail,
+    held: !!heldOne,
+    callStart: heldOne?.callStart ?? null,
+    callEnd: heldOne?.callEnd ?? null,
+    durationMs: typeof heldOne?.durationMs === 'number' ? heldOne.durationMs : null,
+    recorded: summaries.some((s) => s.recorded === true),
+    transcribed: summaries.some((s) => s.transcribed === true),
+    humanMessages: humanMessages.length ? Math.max(...humanMessages) : null,
+    readerCount: ok.length,
   };
 }
 
@@ -135,6 +301,7 @@ export function asTeamsChatEvidence(v: unknown): TeamsChatEvidence | null {
     transcribed: o.transcribed === true,
     humanMessages: typeof o.humanMessages === 'number' ? o.humanMessages : null,
     ...(typeof o.reason === 'string' && o.reason ? { reason: o.reason } : {}),
+    ...(typeof o.readerCount === 'number' ? { readerCount: o.readerCount } : {}),
   };
 }
 
@@ -156,12 +323,16 @@ export const LINK_RETRY_MS = 3600_000;
 /**
  * THE staleness/retry predicate: should a sweep spend one of its capped
  * lookups on this occurrence? `callEndMs` = the best known end of the call
- * (max of the calendar end and the verdict's own callEnd).
+ * (max of the calendar end and the verdict's own callEnd). `opts.external`
+ * = organised outside our tenant: a pre-union "not held" there came from
+ * ONE reader's partial copy and is re-asked once (the union stamps
+ * readerCount, so this fires at most once per occurrence).
  */
 export function needsChatLookup(
   existing: TeamsChatEvidence | null | undefined,
   callEndMs: number,
-  nowMs: number
+  nowMs: number,
+  opts?: { external?: boolean | null }
 ): boolean {
   if (!existing) return true;
   const checked = Date.parse(existing.checkedAt);
@@ -172,6 +343,9 @@ export function needsChatLookup(
         ? LINK_RETRY_MS
         : FAILED_RETRY_MS;
     return nowMs - checked >= wait;
+  }
+  if (opts?.external === true && existing.held === false && existing.readerCount === undefined) {
+    return true;
   }
   // Solid verdict — only re-ask when it was taken before the recap events
   // could have landed (and enough time has passed for them to land now).

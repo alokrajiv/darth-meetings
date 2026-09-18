@@ -41,7 +41,7 @@ import {
   fetchMsLinkStatusOne,
   isDarthTasksConfigured,
 } from '@/lib/server/darth-tasks-client';
-import { lookupAndPersistTeamsChat } from '@/lib/server/teams-chat-evidence';
+import { lookupAndPersistTeamsChat, type LinkStatusCache } from '@/lib/server/teams-chat-evidence';
 import {
   CHAT_MIN_AGE_MS,
   chatCallEndMs,
@@ -264,8 +264,10 @@ async function sweepTeamsArtifacts(
 // Teams chat evidence sweep (own + external tenant, via Darth Tasks)
 // ---------------------------------------------------------------------------
 
-/** At most this many chat-call-events lookups per user sweep (regular window
- * and backfill share the budget; an unfinished backfill resumes next sweep). */
+/** At most this many chat-call-events lookups (plagueis calls — one per
+ * linked reader asked, see lookupAndPersistTeamsChat) per user sweep
+ * (regular window and backfill share the budget; an unfinished backfill
+ * resumes next sweep). */
 const CHAT_LOOKUP_CAP = 40;
 const CHAT_BACKFILL_DAYS = 60;
 
@@ -327,12 +329,15 @@ interface ChatSweepStats {
 const TRANSIENT_CHAT_REASONS = new Set(['throttled', 'graph_error']);
 
 /** One pass over a candidate list: skip imported + fresh verdicts, spend the
- * shared budget on the rest, persist via lookupAndPersistTeamsChat. */
+ * shared budget on the rest, persist via lookupAndPersistTeamsChat (which
+ * unions every linked reader's copy — the budget is charged per reader
+ * asked; `linkCache` memoises link-status across the whole sweep). */
 async function sweepTeamsChatEvents(
   caller: { userId: string; email: string },
   candidates: ChatCandidate[],
   budget: { left: number },
-  now: number
+  now: number,
+  linkCache: LinkStatusCache
 ): Promise<ChatSweepStats> {
   const stats: ChatSweepStats = {
     candidates: candidates.length,
@@ -366,7 +371,7 @@ async function sweepTeamsChatEvents(
     if (imported[i]) continue;
     const existing = cacheRows[i] ?? null;
     const verdict = existing?.teams_chat ?? null;
-    if (!needsChatLookup(verdict, chatCallEndMs(c.endIso, verdict), now)) {
+    if (!needsChatLookup(verdict, chatCallEndMs(c.endIso, verdict), now, { external: c.external })) {
       if (verdict?.reason && TRANSIENT_CHAT_REASONS.has(verdict.reason)) {
         stats.transientPending++;
       }
@@ -382,14 +387,14 @@ async function sweepTeamsChatEvents(
       stats.leftover++;
       continue;
     }
-    budget.left--;
-    stats.lookups++;
     const result = await lookupAndPersistTeamsChat({
       info: c.info,
       external: c.external,
       eventStart: c.startIso,
       eventEnd: c.endIso,
       email: caller.email,
+      attendees: (c.e.attendees ?? []).map((a) => a.email).filter((e): e is string => !!e),
+      linkCache,
       event: {
         recurringEventId: c.e.recurringEventId ?? null,
         iCalUID: c.e.iCalUID ?? null,
@@ -398,6 +403,11 @@ async function sweepTeamsChatEvents(
       capturedBy: caller.userId,
       existing,
     });
+    // Charge what was actually spent (one call per reader asked); a null
+    // result still cost at least the attempt.
+    const spent = Math.max(1, result?.lookups ?? 1);
+    budget.left -= spent;
+    stats.lookups += spent;
     if (!result?.persisted) {
       // Plagueis unreachable, or it says this user isn't linked after all —
       // nothing written, retry next sweep.
@@ -437,7 +447,10 @@ async function sweepTeamsChatForUser(
   if (!link.linked) return; // not connected (or revoked) — nothing to read with
 
   const budget = { left: CHAT_LOOKUP_CAP };
-  const stats = await sweepTeamsChatEvents(caller, candidates, budget, now);
+  // Link-status memo for the whole sweep (regular window + backfill): the
+  // union asks about the same colleagues occurrence after occurrence.
+  const linkCache: LinkStatusCache = new Map([[caller.email.toLowerCase(), true]]);
+  const stats = await sweepTeamsChatEvents(caller, candidates, budget, now, linkCache);
 
   let backfill: ChatSweepStats | null = null;
   // No point listing 60 days of calendar (up to 20 pages) when the regular
@@ -455,7 +468,8 @@ async function sweepTeamsChatForUser(
         caller,
         chatCandidatesOf(bfEvents, mutedKeys, now),
         budget,
-        now
+        now,
+        linkCache
       );
       // Stamp only when NOTHING remains to ask: no budget/transport
       // leftovers AND no transient failure verdicts awaiting their retry —
