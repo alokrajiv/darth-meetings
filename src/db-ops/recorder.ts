@@ -140,12 +140,21 @@ export async function insertRecorderEvents(
     kind: e.kind,
     payload: e.payload === undefined ? null : e.payload,
   }));
+  // Skip exact duplicates (same device, ts, kind, payload). A tray whose main queue died
+  // (2026-09-17) re-sent the same batch every minute for 12 h — 21,095 rows for 34 events —
+  // because its commit callback never ran. The tray now guards in-flight sends too; this is
+  // the server-side belt. Uses recorder_events_device_ts_idx.
   const rows = await sql<Array<{ n: string }>>`
     WITH ins AS (
       INSERT INTO ${sql(SCHEMA)}.recorder_events (device_id, user_id, ts, kind, payload)
       SELECT ${deviceId}::uuid, ${userId}, e.ts, e.kind, e.payload
       FROM jsonb_to_recordset(${sql.json(batch as unknown as never)})
            AS e(ts timestamptz, kind text, payload jsonb)
+      WHERE NOT EXISTS (
+        SELECT 1 FROM ${sql(SCHEMA)}.recorder_events r
+        WHERE r.device_id = ${deviceId}::uuid AND r.ts = e.ts AND r.kind = e.kind
+          AND r.payload IS NOT DISTINCT FROM e.payload
+      )
       RETURNING 1
     )
     SELECT count(*)::text AS n FROM ins

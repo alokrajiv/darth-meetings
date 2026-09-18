@@ -93,6 +93,9 @@ enum WindowPicker {
             }) { return p }
         case .slack:
             if let p = firstMatch("slack: huddle window", { $0.title.localizedCaseInsensitiveContains("huddle") }) { return p }
+        case .whatsapp:
+            // "<name> - WhatsApp voice call" / "… video call"; the main window is just "WhatsApp".
+            if let p = firstMatch("whatsapp: call window", { $0.title.localizedCaseInsensitiveContains("call") }) { return p }
         case .meet:
             if let p = firstMatch("meet: title names Google Meet", {
                 $0.title.localizedCaseInsensitiveContains("meet.google") || $0.title.localizedCaseInsensitiveContains("google meet")

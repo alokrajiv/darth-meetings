@@ -15,9 +15,12 @@ let package = Package(
             ]
         ),
         .executableTarget(name: "recorder-poc", dependencies: ["RecorderCore"], path: "Sources/recorder-poc"),
+        // Objective-C @try/@catch for Swift (0.3.1): AVFoundation raises NSException for bad
+        // settings, and one that escapes a main-queue block zombifies the app.
+        .target(name: "ObjCTry", path: "Sources/ObjCTry", publicHeadersPath: "include"),
         .executableTarget(
             name: "darth-tray",
-            dependencies: ["RecorderCore"],
+            dependencies: ["RecorderCore", "ObjCTry"],
             path: "Sources/darth-tray",
             linkerSettings: [
                 .linkedFramework("AppKit"),

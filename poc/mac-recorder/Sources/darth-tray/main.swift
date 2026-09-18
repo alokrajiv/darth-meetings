@@ -3,7 +3,7 @@ import CoreGraphics
 import ServiceManagement
 import RecorderCore
 
-let VERSION = "0.3.0"
+let VERSION = "0.3.1"
 let WS_PORT: UInt16 = 47800
 let PWA_URL = URL(string: "https://meetings.darth-internal.trames.io/")!
 /// Seconds between "the call ended" and an automatic stop.
@@ -33,6 +33,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     lazy var uploader = Uploader(api: api)
     let recorder = RecordingController()
     let preview = PreviewPanel()
+    let watchdog = MainQueueWatchdog()
 
     var clients = 0
     /// SIGTERM (updater helper's fallback, `kill <pid>`, logout) → the same clean path as Quit.
@@ -165,6 +166,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             self.updater.check(manual: false)
         }
         api.start()
+        // 0.3.1: relaunch when the main dispatch queue stops draining (never mid-recording).
+        watchdog.canRelaunch = { [weak self] in self?.recorder.state != .recording }
+        watchdog.onStall = { [weak self] seconds in
+            guard let self, self.recorder.state == .recording else { return }
+            self.banner.showMessage(title: "Darth Recorder needs a restart", sub: "Something inside stalled \(Int(seconds)) s ago. It restarts itself when this recording ends.", accent: .warning, stoppable: true)
+        }
+        watchdog.start()
 
         uploader.onProgress = { [weak self] id, seg, pct in
             self?.broadcast("upload_progress", ["recording_id": id, "segment": seg, "pct": pct])
@@ -835,6 +843,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             broadcast("preview_snapshot", out)
         case "simulate_start_hang":                         // test hook: next start sleeps N s inside a timed step
             recorder.simulateStartHang(seconds: (obj["seconds"] as? Double) ?? 20)
+        case "simulate_start_exception":                    // test hook: next start raises an NSException in the guarded writer setup
+            recorder.simulateStartException()
+        case "simulate_main_queue_death":                   // test hook: the 2026-09-17 zombie — an NSException escaping a main-actor job
+            // mode "task" (default) = raise inside `Task { @MainActor }`, exactly where the real
+            // one came from (Recorder.init in the start task) — AppKit swallowed that one and the
+            // main queue died. mode "block" = a plain DispatchQueue.main.async block; measured
+            // 2026-09-18: that one is NOT swallowed, the process crashes (uncaught exception).
+            let mode = (obj["mode"] as? String) ?? "task"
+            rlog("TEST — raising an NSException inside a main-queue \(mode); the watchdog should relaunch this app")
+            EventLog.shared.log("test_main_queue_death", ["mode": mode])
+            let boom = { NSException(name: .genericException, reason: "simulated exception escaping a main-queue \(mode)", userInfo: nil).raise() }
+            if mode == "block" { DispatchQueue.main.async(execute: boom) } else { Task { @MainActor in boom() } }
         case "snapshot_banner":                             // test hook: render the banner to a PNG
             let path = (obj["path"] as? String) ?? "~/Library/Logs/DarthRecorder/banner-snapshot.png"
             let ok = banner.snapshot(to: path)

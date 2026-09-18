@@ -52,9 +52,15 @@ final class RecordingController {
         let t = call.title.lowercased()
         switch call.kind {
         case .whatsapp:
-            if t.contains("voice call") { return (.audioOnly, "WhatsApp voice call") }
-            if t.contains("video call") { return (.window, "WhatsApp video call") }
-            return (.window, "WhatsApp call, kind unknown from the title")
+            // Look at EVERY window of the app, live: `call.title` alone was the main window's
+            // ("WhatsApp") on both real voice calls, and the call card can appear after detection.
+            // Unknown stays audio-only — the WhatsApp window is a Catalyst view SCK has hung on,
+            // and a voice call has nothing worth a video track anyway (0.2.9 design).
+            var titles = [t]
+            if call.pid > 0 { titles += WindowPicker.candidates(pid: call.pid).map { $0.title.lowercased() } }
+            if titles.contains(where: { $0.contains("video call") }) { return (.window, "WhatsApp video call") }
+            if titles.contains(where: { $0.contains("voice call") }) { return (.audioOnly, "WhatsApp voice call") }
+            return (.audioOnly, "WhatsApp call, kind unknown from the titles — audio only")
         case .slack: return (.audioOnly, "Slack huddle")
         case .facetime:
             if call.windowFrame == nil || t.contains("audio") { return (.audioOnly, "FaceTime audio") }
@@ -102,6 +108,10 @@ final class RecordingController {
     private var simulatedStartHang: TimeInterval = 0
     /// Test hook: the next start sleeps this long inside a timed step (`simulate_start_hang`).
     func simulateStartHang(seconds: TimeInterval) { simulatedStartHang = seconds }
+    private var simulatedStartException = false
+    /// Test hook (0.3.1): the next start raises an NSException inside the guarded writer setup
+    /// (`simulate_start_exception`) — must end as a normal `recording_failed`, app still alive.
+    func simulateStartException() { simulatedStartException = true }
 
     /// Race one awaited start step against `deadline`. The SCK call itself cannot be cancelled:
     /// when it loses the race it is abandoned and `orphan` disposes of whatever it eventually
@@ -558,6 +568,13 @@ final class RecordingController {
             rlog("record: TEST — simulating a \(Int(s)) s hang in the video start")
             try await timed("simulated hang", deadline: deadline) { try await Task.sleep(nanoseconds: UInt64(s * 1_000_000_000)) }
         }
+        if simulatedStartException {
+            simulatedStartException = false
+            rlog("record: TEST — raising an NSException inside the guarded writer setup")
+            try catchingObjC {
+                NSException(name: .invalidArgumentException, reason: "simulated: Missing required key AVChannelLayoutKey", userInfo: nil).raise()
+            }
+        }
         let tracks = audioTracks(micFormat: micFormat)
         currentSource = source
         let url = segmentURL(1)
@@ -568,7 +585,8 @@ final class RecordingController {
             // No SCK video stream, no window pick: just the two AAC tracks in an .m4a. The
             // system-audio stream still needs a display to attach to — the call's, else main.
             displayID = call?.windowFrame.map { WindowPicker.display(containing: $0) } ?? CGMainDisplayID()
-            rec = try Recorder(audioOnlyURL: url, audioTracks: tracks)
+            // catchingObjC (0.3.1): AVFoundation RAISES for bad settings; see ObjCSafe.swift.
+            rec = try catchingObjC { try Recorder(audioOnlyURL: url, audioTracks: tracks) }
             rlog("record: audio-only writer → \(url.lastPathComponent)")
         } else {
             let (filter, did) = try await timed("shareable content + filter for \(source.label)", deadline: deadline) { try await Self.filter(for: source) }
@@ -578,7 +596,7 @@ final class RecordingController {
             (w, h) = CaptureSession.pixelSize(of: filter)
             rlog("record: pixel size \(w)x\(h) took \(Int(Date().timeIntervalSince(t0) * 1000)) ms")
             pinnedSize = (w, h)
-            rec = try Recorder(url: url, width: w, height: h, fps: fps, audioTracks: tracks)
+            rec = try catchingObjC { try Recorder(url: url, width: w, height: h, fps: fps, audioTracks: tracks) }
             rec.onStop = { [weak self] err in
                 DispatchQueue.main.async { self?.videoStreamFailed(err) }
             }
@@ -748,11 +766,11 @@ final class RecordingController {
                 var newStream: SCStream?
                 var w = 0, h = 0
                 if source.isAudioOnly {
-                    rec = try Recorder(audioOnlyURL: url, audioTracks: tracks)
+                    rec = try catchingObjC { try Recorder(audioOnlyURL: url, audioTracks: tracks) }
                 } else {
                     let (filter, _) = try await Self.filter(for: source)
                     (w, h) = self.pinnedSize ?? CaptureSession.pixelSize(of: filter)
-                    rec = try Recorder(url: url, width: w, height: h, fps: self.fps, audioTracks: tracks)
+                    rec = try catchingObjC { try Recorder(url: url, width: w, height: h, fps: self.fps, audioTracks: tracks) }
                     rec.onStop = { [weak self] err in
                         DispatchQueue.main.async { self?.videoStreamFailed(err) }
                     }

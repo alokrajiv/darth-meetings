@@ -29,6 +29,13 @@ final class ApiClient {
 
     private var heartbeatConfirmed = false
     private var eventsConfirmed = false
+    /// In-flight guards (0.3.1). When the main queue is dead (2026-09-17) no completion ever
+    /// runs: without these the 60 s sweeps re-POSTed the same event batch and registry row
+    /// every minute for 12 h (21,095 rows for 34 events). One send at a time per thing.
+    private var eventsInFlight = false
+    private var syncInFlight = Set<String>()
+    /// Rows updated while their sync was in flight — re-sent as soon as it returns.
+    private var syncDirty = Set<String>()
     private var lastLogged: [String: Date] = [:]
     private let logLock = NSLock()
     private var timers: [Timer] = []
@@ -135,9 +142,12 @@ final class ApiClient {
     /// Ship unshipped events.jsonl lines. Called every 60 s and at recording stop.
     func shipEvents() {
         guard token() != nil else { return }
+        guard !eventsInFlight else { throttledLog("events-inflight", "api: previous events batch still in flight — not re-sending"); return }
         guard let batch = EventLog.shared.takeBatch(max: 500) else { return }
         let body: [String: Any] = ["device_id": deviceId, "events": batch.events]
+        eventsInFlight = true
         send("POST", "/api/recorder/events", body: body, label: "events") { ok, json in
+            self.eventsInFlight = false
             guard ok else { return }
             EventLog.shared.commit(batch.endOffset)
             if !self.eventsConfirmed {
@@ -155,10 +165,24 @@ final class ApiClient {
     /// PATCH and fall back to a full POST on the next sweep if they fail.
     func syncRecording(_ id: String, insert: Bool = false) {
         guard let row = Registry.shared.get(id) else { return }
+        if syncInFlight.contains(id) {
+            // The row changed under an in-flight send: mark it and re-send when that returns.
+            syncDirty.insert(id)
+            Registry.shared.update(id, ["needs_sync": true])
+            return
+        }
         let body = Registry.serverBody(row, deviceId: deviceId)
         let method = insert ? "POST" : "PATCH"
         let path = insert ? "/api/recorder/recordings" : "/api/recorder/recordings/\(id)"
-        send(method, path, body: body, label: "recordings-\(method.lowercased())") { ok, json in
+        syncInFlight.insert(id)
+        send(method, path, body: body, label: "recordings-\(method.lowercased())") { [weak self] ok, json in
+            guard let self else { return }
+            self.syncInFlight.remove(id)
+            if self.syncDirty.remove(id) != nil {
+                // Newer local state exists: this answer is stale, send the current row now.
+                self.syncRecording(id, insert: insert)
+                return
+            }
             if ok {
                 Registry.shared.update(id, ["needs_sync": false])
                 // The server answers {recording:{… matched …}} (it re-runs matchRecording on

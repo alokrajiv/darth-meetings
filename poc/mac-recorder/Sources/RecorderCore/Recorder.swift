@@ -102,6 +102,14 @@ public final class Recorder: NSObject, SCStreamOutput, SCStreamDelegate {
         }
         // Track order in the file: video, then the audio tracks in the order given.
         for spec in audioTracks {
+            // 0.3.1: AVAssetWriterInput RAISES NSInvalidArgumentException ("Missing required key
+            // AVChannelLayoutKey") for more than 2 channels without a layout. Swift cannot catch
+            // that; on 2026-09-17 AppKit swallowed it and the tray's main queue was dead for 12 h.
+            // Refuse with a Swift error instead (MicCapture downmixes to mono before we get here).
+            guard (1...2).contains(spec.channels), spec.sampleRate > 0 else {
+                throw NSError(domain: "recorder", code: 2, userInfo: [NSLocalizedDescriptionKey:
+                    "unsupported audio format for the \(spec.name) track: \(spec.channels) ch @ \(Int(spec.sampleRate)) Hz (1–2 channels required)"])
+            }
             // No AVEncoderBitRateKey: the AAC encoder's legal bitrate range depends on the
             // sample rate AND the channel count, and asking for one outside it fails the WHOLE
             // writer with -11861 "Cannot Encode Media / The encoding parameters are not

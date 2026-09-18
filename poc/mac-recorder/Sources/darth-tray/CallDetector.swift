@@ -240,7 +240,12 @@ final class CallDetector {
         case "us.zoom.xos": kind = .zoom
         case "com.tinyspeck.slackmacgap": kind = .slack
         case "com.apple.FaceTime": kind = .facetime
-        case "net.whatsapp.WhatsApp": kind = .whatsapp
+        case "net.whatsapp.WhatsApp":
+            kind = .whatsapp
+            // The call card ("<name> - WhatsApp voice call", 800×642) is SMALLER than the main
+            // window, so largest-by-area handed the profile the title "WhatsApp" and every voice
+            // call was treated as "kind unknown" → window capture (2026-09-16 21:23, 2026-09-17 22:53).
+            if let w = wins.first(where: { $0.title.lowercased().contains(" call") }) { pick = w }
         case "Cisco-Systems.Spark": kind = .webex
         case "com.hnc.Discord": kind = .discord
         case let b where browsers.contains(b):

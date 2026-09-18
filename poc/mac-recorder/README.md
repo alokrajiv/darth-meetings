@@ -14,6 +14,41 @@ Native macOS side of Darth Meetings recording (the "Swift tray" angle from Darth
 the user switched it off in the menu (`loginItemUserChoice` in UserDefaults records an explicit choice;
 the default never overrides it). macOS may show "Darth Recorder was added as a login item" once.
 
+**0.3.1 (2026-09-18) — the WhatsApp "hang" was never SCK:**
+- **Root cause of both WhatsApp start failures** (2026-09-16 21:23, 2026-09-17 22:53 SGT): during a
+  WhatsApp voice call the built-in mic reports **48 kHz × 3 ch** (every working recording had 1 ch).
+  `AVAssetWriterInput` with 3 channels and no `AVChannelLayoutKey` RAISES `NSInvalidArgumentException`
+  ("Missing required key AVChannelLayoutKey") inside `Recorder.init` — an Objective-C exception Swift
+  cannot catch. It was raised inside a main-queue block (the `Task { @MainActor }` start), AppKit
+  swallowed it (thread `SOME_OTHER_THREAD_SWALLOWED_AT_LEAST_ONE_EXCEPTION` at 22:53:41.814 in the
+  process sample), and the main DISPATCH queue never drained again: menu, banners and run-loop
+  Timers kept working, but every `DispatchQueue.main.async`, URLSession completion and MainActor
+  task sat forever. So: no `timed` deadline fired, the audio-only retry never reached the mic
+  permission callback, the updater stuck at "check already running", and the 60 s sweeps re-POSTed
+  the same registry row and event batch for 12 h (21,095 `recorder_events` rows for 34 events).
+  The 0.2.8 `simulate_start_hang` fix addressed a hang that did not exist.
+- **Fixes**: `MicCapture` downmixes anything above 2 channels to mono in the tap (`format` is
+  now the track's format, `hardwareFormat` the device's; log line "→ mono track");
+  `Recorder.init` refuses 0 or > 2 channel tracks with a Swift error; every `Recorder(...)`
+  creation runs under `catchingObjC {}` (new `ObjCTry` target: `@try/@catch` → NSError) so a raise
+  becomes a normal `recording_failed`; `MainQueueWatchdog` (run-loop Timer, 15 s ping / 45 s
+  stall) logs `main_queue_stalled` and relaunches the app via `open` (never mid-recording: warning
+  banner, relaunch when the recording ends); `ApiClient` sends one events batch / one sync per
+  row at a time (`eventsInFlight`, `syncInFlight` + `syncDirty` re-send) so a dead queue cannot
+  become a POST storm; the server's `insertRecorderEvents` skips exact duplicates.
+- **WhatsApp profile**: `CallDetector.classify` took the LARGEST window's title ("WhatsApp") so
+  `profile(for:)` never saw "voice call" and chose window capture. Now the call card wins in
+  `classify`, `WindowPicker.pick` has a `whatsapp: call window` rule, and `profile(for:)` looks at
+  every live window of the app; a WhatsApp call whose kind is still unknown is **audio-only**.
+- Hooks: `{cmd:"simulate_start_exception"}` (next start raises inside the guarded setup → must end
+  as `recording_failed`, app alive), `{cmd:"simulate_main_queue_death", mode:"task"|"block"}`.
+  Measured 2026-09-18 11:19 SGT: an NSException escaping a `Task { @MainActor }` job is SWALLOWED
+  (no crash report; the main queue stops draining — the exact 2026-09-17 state) and the watchdog
+  relaunched the app 56 s later (45 s stall + 15 s tick), new pid bound the ws port and answered
+  `status`. The same exception in a plain `DispatchQueue.main.async` block is NOT swallowed: the
+  process aborts with a crash report (`darth-tray-2026-09-18-111547.ips`). So the zombie needs
+  Swift concurrency on the main actor — which is where every capture start runs.
+
 **0.3.0 (2026-09-16):**
 - **Preview panel** (`PreviewPanel.swift`): "Preview" capsule on the recording pill (the pill's
   buttons are now Stop (red) + Preview) and menu "Show/Hide preview" (⌘P while recording). A
