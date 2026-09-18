@@ -47,3 +47,4 @@ next-env.d.ts
 
 # committed reference — the ignore rule above is for real env files
 !.env.example
+old-session/
