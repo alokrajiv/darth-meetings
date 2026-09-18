@@ -11,6 +11,7 @@ import {
   saveAudioStreamToTemp,
 } from '@/lib/server/audio-storage';
 import { sniffMediaExtension } from '@/lib/server/video-frames';
+import { prepareMediaForPlayback } from '@/lib/server/media-sweeper';
 
 /** Drive-side refusal with an HTTP status the API route can pass through. */
 export class RecordingFetchError extends Error {
@@ -123,6 +124,7 @@ async function doFetchPart({
     filename,
     bytes: dl.bytes,
   });
+  prepareMediaForPlayback(ownerUserId, assemblyaiId);
   return { bytes: dl.bytes };
 }
 
@@ -153,6 +155,7 @@ async function doFetchTeams({
   const filename = `${assemblyaiId}${sniffed ?? '.mp4'}`;
   await renameAudioFile(dl.tempFilename, filename);
   await setLocalAudioPathForUser(ownerUserId, assemblyaiId, filename);
+  prepareMediaForPlayback(ownerUserId, assemblyaiId);
   return { bytes: dl.bytes };
 }
 
@@ -188,5 +191,7 @@ async function doFetch({
   }
   await renameAudioFile(dl.tempFilename, filename);
   await setLocalAudioPathForUser(ownerUserId, assemblyaiId, filename);
+  // Meet recordings are the moov-last case (tech-debt A1) — remux + extract now.
+  prepareMediaForPlayback(ownerUserId, assemblyaiId);
   return { bytes: dl.bytes };
 }

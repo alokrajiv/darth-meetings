@@ -21,6 +21,7 @@ import { mergeVocabs } from '@/lib/server/vocab-merge';
 import { sniffMediaExtension } from '@/lib/server/video-frames';
 import { normalizeMultiTrack } from '@/lib/server/multitrack';
 import { autoAttachSeries } from '@/lib/server/series-attach';
+import { prepareMediaForPlayback } from '@/lib/server/media-sweeper';
 import type { GmeetContext } from '@/lib/format';
 
 /**
@@ -296,6 +297,9 @@ export async function ingestLocalAudio(
     await renameAudioFile(tempFilename, filename);
     await setLocalAudioPathForUser(userId, submitted.id, filename);
     row.local_audio_path = filename;
+    // Faststart remux + audio-only extract, in the background: AAI already
+    // has the bytes, so nothing on the transcription path waits for ffmpeg.
+    prepareMediaForPlayback(userId, submitted.id);
   } catch (error) {
     // Non-fatal: the transcription itself succeeded. Audio playback for this
     // row will fall back to (broken) remote URL until/unless we re-upload.

@@ -281,6 +281,21 @@ export interface GmeetContext {
     status: 'pending' | 'gave-up';
     lastError?: string;
   } | null;
+  /** Playback-media preparation state (lib/server/media-sweeper.ts):
+   * `faststart` = every stored file (primary + fetched videoParts) has its
+   * mp4 index up front; `audioOnly` = the 64 kbps mono extract exists (or
+   * is not needed — the source has no video); `parts` = how many stored
+   * videoParts were covered, so a part that lands later re-qualifies the
+   * row. Stamped at import and by the 5-min backfill sweeper; `attempts`
+   * + `error` throttle retries of a row whose ffmpeg keeps failing. */
+  media?: {
+    faststart: boolean;
+    audioOnly: boolean;
+    parts: number;
+    at: string;
+    attempts?: number;
+    error?: string;
+  } | null;
   /** A "detailed report — with video frames" requested while the recording
    * was still being prepared (recordingPending 'waiting', no fileId to pull
    * yet). The recording poller fires the report the moment the video lands
