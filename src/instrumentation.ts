@@ -16,5 +16,7 @@ export async function register() {
     startDeferredImportPoller();
     const { startIngestRetrySweeper } = await import('@/lib/server/ingest-retry');
     startIngestRetrySweeper();
+    const { startMediaSweeper } = await import('@/lib/server/media-sweeper');
+    startMediaSweeper();
   }
 }
