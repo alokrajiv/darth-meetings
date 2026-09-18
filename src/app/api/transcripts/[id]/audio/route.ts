@@ -16,13 +16,18 @@ export const runtime = 'nodejs';
  * meeting — gmeet_context.videoParts[N-2]'s stored file (the primary video
  * is "part 1" and lives in local_audio_path, served by the plain route).
  *
- * `?variant=audio` asks for the SOUNDTRACK only (offline "audio" pins). A
- * stored file with no video stream is served as-is, exactly like the plain
- * route. A video file is served as its audio-only m4a derivative
- * (`<storageDir>/audio-only/…`, see lib/server/audio-only.ts): present →
- * streamed with Range; absent → ffmpeg is started in the background once
- * and the response is 202 `{ preparing: true }` for the client to poll;
- * a failed transcode surfaces as 500 `{ error }` on the next request.
+ * `?variant=audio` asks for the SOUNDTRACK only — offline "audio" pins, and
+ * since 2026-09-18 the player itself whenever its video toggle is off
+ * (components/audio-player.tsx probes this URL with a 2-byte Range and uses
+ * it on 206, so phones pull ~30 MB/h instead of the whole mp4). A stored
+ * file with no video stream is served as-is, exactly like the plain route.
+ * A video file is served as its audio-only m4a derivative
+ * (`<storageDir>/audio-only/…`, see lib/server/audio-only.ts — built at
+ * import and backfilled by media-sweeper.ts): present → streamed with
+ * Range; absent → ffmpeg is started in the background once and the
+ * response is 202 `{ preparing: true }` for the client to poll (the player
+ * falls back to the full recording on anything but 206/200); a failed
+ * transcode surfaces as 500 `{ error }` on the next request.
  * The variant only applies to locally stored files — a legacy remote
  * audio_url row ignores it and redirects as before.
  *
