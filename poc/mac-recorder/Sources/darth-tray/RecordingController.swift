@@ -488,7 +488,11 @@ final class RecordingController {
                     self.abortPartialStart("start failed")
                     self.mic?.stop(); self.mic = nil; self.micActive = false
                     self.state = .idle
-                    Registry.shared.update(id, ["status": "upload_failed", "error": "capture failed: \(error.localizedDescription)"])
+                    // ended_at + sync (0.3.7): without the PATCH the server kept the row at
+                    // 'recording' for good (80eddbe9, 2026-09-18 — its calendar row said
+                    // "Recording on your Mac now…" for a day).
+                    Registry.shared.update(id, ["status": "upload_failed", "error": "capture failed: \(error.localizedDescription)", "ended_at": isoNow(), "needs_sync": true])
+                    self.api?.syncRecording(id)
                     EventLog.shared.log("recording_failed", ["recording_id": id, "error": error.localizedDescription],
                                         summary: "record: could not start — \(error.localizedDescription)")
                     self.onError?(error.localizedDescription)

@@ -14,6 +14,19 @@ Native macOS side of Darth Meetings recording (the "Swift tray" angle from Darth
 the user switched it off in the menu (`loginItemUserChoice` in UserDefaults records an explicit choice;
 the default never overrides it). macOS may show "Darth Recorder was added as a login item" once.
 
+**0.3.7 (2026-09-19) — no registry row stays "recording" forever:**
+- `Registry.reconcileAfterLaunch()` runs before the launch upload drain: a row still at
+  `recording` when the tray starts (a process that died mid-recording — the 2026-09-16
+  main-queue zombie left 3936556e that way) becomes `local` when its files hold bytes (the
+  drain then uploads it) or `upload_failed` ("capture never finished — the recorder was not
+  running when the call ended"), `ended_at` set, and is PATCHed to the server
+  (`registry_reconciled` event). Until now the PWA's upload picker showed such a row as a
+  spinner that never resolved and the calendar row as "Recording on your Mac now…" for days.
+- The "capture failed" path (writer exception at start) now sets `ended_at` and syncs the
+  server too — 80eddbe9 stayed `recording` server-side while the Mac said `upload_failed`.
+- `Registry.pendingUpload()` skips `upload_failed` rows with no file on disk, so a capture-failed
+  row is no longer re-tried (and re-failed with "no files on disk") at every launch.
+
 **0.3.6 (2026-09-18) — hide-able while sharing, resource telemetry, preview source control:**
 - **Nothing of ours in a screen share.** The banner, the preview panel, the Record… dialog and the
   menu bar item's own window set `sharingType = .none`: Teams / Meet / Zoom sharing this display (and

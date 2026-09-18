@@ -4,7 +4,7 @@ import ScreenCaptureKit
 import ServiceManagement
 import RecorderCore
 
-let VERSION = "0.3.6"
+let VERSION = "0.3.7"
 let WS_PORT: UInt16 = 47800
 let PWA_URL = URL(string: "https://meetings.darth-internal.trames.io/")!
 /// Seconds between "the call ended" and an automatic stop.
@@ -282,6 +282,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         if !auth.signedIn {
             rlog("not signed in — recordings stay local until you sign in from the menu")
+        }
+        // 0.3.7: rows a dead process left at 'recording' become local / upload_failed before
+        // the drain below looks at them, and the server hears about it.
+        for id in Registry.shared.reconcileAfterLaunch() {
+            let row = Registry.shared.get(id)
+            EventLog.shared.log("registry_reconciled", ["recording_id": id, "status": row?["status"] ?? NSNull(), "error": row?["error"] ?? NSNull(), "bytes": row?["bytes"] ?? 0],
+                                summary: "registry: \(id) was still 'recording' at launch → \((row?["status"] as? String) ?? "?")")
+            api.syncRecording(id)
         }
         uploadPending()
         retryTimer = Timer.scheduledTimer(withTimeInterval: UPLOAD_RETRY_INTERVAL, repeats: true) { [weak self] _ in

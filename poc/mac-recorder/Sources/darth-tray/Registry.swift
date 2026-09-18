@@ -73,8 +73,44 @@ final class Registry {
             // "uploading" is included on purpose: a row left there by a process that died
             // mid-upload (quit, crash, update) must be retried at the next launch; live
             // uploads are skipped by the caller via `uploader.isUploading`.
-            return s == "local" || s == "upload_failed" || s == "uploading"
+            if s == "local" || s == "uploading" { return true }
+            // A failed row is worth another go only while its bytes are still here. Capture-
+            // failed rows (no files) used to be re-tried at every launch and fail again with
+            // "no files on disk" each time (311b6289, 2026-09-18) — they are left alone now.
+            return s == "upload_failed" && ($0["files"] as? [String] ?? []).contains { FileManager.default.fileExists(atPath: $0) }
         }
+    }
+
+    /// Launch-time repair (0.3.7). A row still at `recording` when the tray starts belongs to
+    /// a process that died mid-recording (the 2026-09-16 main-queue zombie left one; the PWA
+    /// showed it as an Upload spinner that never resolved and the calendar row as "Recording
+    /// now…" for days). Nothing is being recorded at launch, so the row becomes `local` when
+    /// its files are on disk with bytes (the auto-uploader then takes it) and `upload_failed`
+    /// otherwise. Returns the ids changed so the caller can sync them to the server.
+    func reconcileAfterLaunch() -> [String] {
+        lock.lock(); defer { lock.unlock() }
+        var changed: [String] = []
+        for i in rows.indices where (rows[i]["status"] as? String) == "recording" {
+            let files = (rows[i]["files"] as? [String] ?? []).filter { Self.fileSize($0) > 0 }
+            rows[i]["files"] = files
+            rows[i]["bytes"] = files.reduce(0) { $0 + Self.fileSize($1) }
+            if !(rows[i]["ended_at"] is String) { rows[i]["ended_at"] = isoNow() }
+            if files.isEmpty {
+                rows[i]["status"] = "upload_failed"
+                rows[i]["error"] = "capture never finished — the recorder was not running when the call ended"
+            } else {
+                rows[i]["status"] = "local"
+                rows[i]["error"] = NSNull()
+            }
+            rows[i]["needs_sync"] = true
+            if let id = rows[i]["id"] as? String { changed.append(id) }
+        }
+        if !changed.isEmpty { saveLocked() }
+        return changed
+    }
+
+    private static func fileSize(_ path: String) -> Int {
+        ((try? FileManager.default.attributesOfItem(atPath: path)[.size]) as? Int) ?? 0
     }
 
     /// `upload_failed` rows that still have bytes on disk — what the 30-minute retry timer
