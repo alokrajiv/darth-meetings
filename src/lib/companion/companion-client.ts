@@ -116,6 +116,7 @@ export type CompanionEvent =
   | { type: 'segment_started'; at: number; segment: number | null }
   | { type: 'upload_progress' | 'upload_done' | 'upload_failed'; at: number; recordingId: string | null }
   | { type: 'auth_changed'; at: number }
+  | { type: 'recording_deleted'; at: number; recordingId: string | null; error: string | null }
   | { type: 'auth_prompt'; at: number; verifyUrl: string | null; userCode: string | null; title: string | null };
 
 export type CompanionState = {
@@ -318,6 +319,14 @@ class CompanionClient {
     return this.send('upload', extra);
   }
 
+  /** Delete a recording from the Mac (tray 0.3.8+: files + folder go, the
+   * registry row becomes `deleted` and is synced to the server; an uploaded
+   * transcript is untouched). The tray answers with `recording_deleted`; an
+   * older tray logs "unknown cmd" and the row simply stays. */
+  deleteRecording(recordingId: string): boolean {
+    return this.send('delete_recording', { recording_id: recordingId });
+  }
+
   /** Flip the tray's "Upload recordings automatically" setting (0.2.0+). The
    * tray confirms by broadcasting a status with the new `auto_upload`. */
   setAutoUpload(enabled: boolean): boolean {
@@ -492,6 +501,10 @@ class CompanionClient {
         lastEvent = { type, at };
         authPrompt = null;
         break;
+      case 'recording_deleted':
+        // The tray answered a delete_recording (0.3.8): the registry changed, refetch.
+        lastEvent = { type, at, recordingId: str(m.recording_id), error: str(m.error) };
+        break;
       case 'auth_prompt': {
         const verifyUrl = str(m.verify_url);
         const userCode = str(m.user_code);
@@ -640,14 +653,17 @@ export function useCompanionRecordings(enabled = true): CompanionRecordingsState
   const live = { recording: c.recording, recordingId: c.recordingId };
   const merged = useMemo(
     () =>
-      recordings.map((raw) => {
-        const r = foldStaleRecording(raw, live);
-        const u = c.uploads[r.id];
-        if (!u) return r;
-        if (u.status === 'uploading') return { ...r, status: 'uploading' as const };
-        if (u.status === 'done') return { ...r, status: 'uploaded' as const, transcript_id: r.transcript_id ?? u.transcriptId };
-        return { ...r, status: 'upload_failed' as const, error: r.error ?? u.error };
-      }),
+      recordings
+        // Trays before 0.3.8 list deleted rows too; nothing on the page wants them.
+        .filter((r) => r.status !== 'deleted')
+        .map((raw) => {
+          const r = foldStaleRecording(raw, live);
+          const u = c.uploads[r.id];
+          if (!u) return r;
+          if (u.status === 'uploading') return { ...r, status: 'uploading' as const };
+          if (u.status === 'done') return { ...r, status: 'uploaded' as const, transcript_id: r.transcript_id ?? u.transcriptId };
+          return { ...r, status: 'upload_failed' as const, error: r.error ?? u.error };
+        }),
     // eslint-disable-next-line react-hooks/exhaustive-deps -- `live` is rebuilt every render; its two scalars are the real inputs
     [recordings, c.uploads, live.recording, live.recordingId]
   );
@@ -686,6 +702,7 @@ const REGISTRY_DIRTYING_EVENTS = new Set([
   'upload_done',
   'upload_failed',
   'auth_changed',
+  'recording_deleted',
 ]);
 
 /** "sharing the PowerPoint window" / "sharing Display 2" — chip + banner copy. */

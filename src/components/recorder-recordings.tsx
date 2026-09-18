@@ -9,6 +9,7 @@ import {
   Film,
   Loader2,
   RefreshCw,
+  Trash2,
   Upload,
 } from 'lucide-react';
 import {
@@ -31,8 +32,9 @@ import {
  *  - no tray on the socket        → "Darth Recorder isn't running"
  *  - a pre-0.2.0 tray (0.1.5)     → "Update your recorder" + the version it is on
  *  - a 0.2.0 tray, empty registry → "No recordings on this Mac yet"
- * The list itself is read-only apart from Upload / Retry, which are ws commands;
- * the tray owns the files and the actual upload.
+ * The list itself is read-only apart from Upload / Retry and Delete (0.3.8 —
+ * files + folder off the Mac, row synced to the server as deleted, an uploaded
+ * transcript untouched), which are ws commands; the tray owns the files.
  */
 
 export type RecorderRecordingsProps = {
@@ -104,6 +106,12 @@ export function RecorderRecordings({
             getCompanion().upload(r.id, linkedEvent ?? r.matched ?? null);
             onUploadStarted?.(r);
           }}
+          onDelete={() => {
+            getCompanion().deleteRecording(r.id);
+            // The tray's recording_deleted answer refetches; an older tray never
+            // answers, so refetch anyway and the row simply stays.
+            setTimeout(refresh, 800);
+          }}
         />
       ))}
       <div className="flex items-center gap-3 pt-0.5">
@@ -129,11 +137,13 @@ function Row({
   pct,
   compact,
   onUpload,
+  onDelete,
 }: {
   r: CompanionRecording;
   pct: number | null;
   compact: boolean;
   onUpload: () => void;
+  onDelete: () => void;
 }) {
   const when = r.started_at ? new Date(r.started_at) : null;
   const title =
@@ -189,6 +199,25 @@ function Row({
           )}
           {compact ? '' : r.status === 'upload_failed' ? 'Retry' : 'Upload'}
         </Button>
+      )}
+      {!busy && r.status !== 'deleted' && (
+        <button
+          type="button"
+          title={
+            r.status === 'uploaded'
+              ? 'Delete the file from this Mac (the transcript stays)'
+              : 'Delete this recording from this Mac — it was never uploaded, so it is gone for good'
+          }
+          aria-label="Delete from this Mac"
+          onClick={() => {
+            const what = r.status === 'uploaded' ? 'the local file (the transcript stays)' : 'this recording — it was never uploaded';
+            if (window.confirm(`Delete ${what}?\n\n${title}`)) onDelete();
+          }}
+          className="shrink-0 rounded p-1 text-muted-foreground hover:bg-muted hover:text-destructive"
+          data-recorder-delete
+        >
+          <Trash2 className="h-3.5 w-3.5" />
+        </button>
       )}
     </div>
   );
