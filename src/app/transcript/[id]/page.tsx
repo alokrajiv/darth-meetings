@@ -18,6 +18,7 @@ import { refreshLabelCatalog } from '@/hooks/use-label-catalog';
 import {
   formatDuration,
   formatTime,
+  scratchTrashDate,
   type LabelRef,
   type StoredTranscript,
   type TranscriptResponse,
@@ -87,6 +88,7 @@ import {
   CalendarSearch,
   ExternalLink,
   Trash2,
+  Hourglass,
 } from 'lucide-react';
 
 const VIDEO_EXT_RE = /\.(mp4|webm|mov|mkv|m4v)$/i;
@@ -2069,6 +2071,23 @@ function TranscriptDetailInner({ transcriptId }: { transcriptId: string }) {
     }
   };
 
+  /** Temporary → permanent (migration 042): clears the flag so the row
+   * moves from the Temporary tab to the main list and stops the 30-day
+   * auto-trash. Editors. */
+  const handleKeepScratch = async () => {
+    try {
+      const res = await fetch(`/api/transcripts/${row.assemblyai_id}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ scratch: false }),
+      });
+      if (!res.ok) throw new Error(await res.text().catch(() => `Update failed (${res.status})`));
+      await loadAll({ silent: true });
+    } catch (err) {
+      alert('Failed to keep: ' + (err instanceof Error ? err.message : 'Unknown error'));
+    }
+  };
+
   const handleTrashDelete = async () => {
     if (!confirm('Delete forever? This cannot be undone.')) return;
     try {
@@ -2447,6 +2466,27 @@ function TranscriptDetailInner({ transcriptId }: { transcriptId: string }) {
       </AppHeader>
 
       <div className="mx-auto max-w-[1200px] px-6 py-6">
+        {row.scratch && !row.deleted_at && (
+          <div className="mb-4 flex flex-wrap items-center gap-3 rounded-md border border-amber-400/60 bg-amber-50 px-3 py-2 text-sm dark:bg-amber-950/30">
+            <Hourglass className="h-4 w-4 shrink-0 text-amber-600 dark:text-amber-500" />
+            <span>
+              Temporary transcript — kept out of the main list, auto-trashed on{' '}
+              {scratchTrashDate(row.created_at).toLocaleDateString()}.
+            </span>
+            {canEdit && (
+              <Button
+                size="sm"
+                variant="outline"
+                className="ml-auto"
+                disabled={offline}
+                title={offline ? OFFLINE_TITLE : 'Make it permanent — moves it to the main list and stops the auto-trash'}
+                onClick={() => void handleKeepScratch()}
+              >
+                Keep
+              </Button>
+            )}
+          </div>
+        )}
         {row.deleted_at && (
           <div className="mb-4 flex flex-wrap items-center gap-3 rounded-md border border-amber-400/60 bg-amber-50 p-3 text-sm dark:bg-amber-950/30">
             <Trash2 className="h-4 w-4 shrink-0 text-amber-600 dark:text-amber-500" />

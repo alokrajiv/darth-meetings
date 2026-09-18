@@ -65,6 +65,14 @@ What **this** member owns / consumes:
 - AI notes, titles, topical segments and a detailed wiki-style report
   (Claude Agent SDK on the VM), with video-frame screenshots embedded.
 - Sharing with per-user read/edit access, deep search, Ask-AI archive chat.
+- Temporary transcripts: tick "Temporary" on an upload (or `?scratch=1` on
+  `POST /api/transcripts`, `scratch: true` on `POST /api/uploads` /
+  `import-text`) for a quick one-off transcription that stays out of the
+  main list, search, series and calendar "imported" markers. It lives under
+  the **Temporary** tab (`?v=2&tab=scratch`, legacy `?scratch=1`), is still a
+  full transcript (AI passes, sharing, labels, `/m/` link), can be kept
+  (`PATCH {scratch:false}`, or link it to a calendar event), and is moved to
+  the trash automatically 30 days after creation (migration 042).
 
 ## Stack
 

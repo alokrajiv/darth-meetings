@@ -264,6 +264,11 @@ export function AudioUpload({ onTranscriptCreated }: AudioUploadProps) {
   const [eventsError, setEventsError] = useState<string | null>(null);
   const [selectedEventId, setSelectedEventId] = useState<string | null>(null);
   const [reportPref, setReportPref] = useState<ReportPref>('summary');
+  // Temporary transcript (migration 042): out of the main list, under the
+  // Temporary tab, trashed automatically after 30 days. Default off; the
+  // server ignores it when a calendar event is linked, and the dialog hides
+  // the tick-box in that case so the two never disagree.
+  const [scratch, setScratch] = useState(false);
 
   const formatFileSize = (bytes: number): string => {
     if (bytes === 0) return '0 Bytes';
@@ -340,7 +345,9 @@ export function AudioUpload({ onTranscriptCreated }: AudioUploadProps) {
       progressFile: File;
       base: number;
       span: number;
-    }
+    },
+    /** Temporary transcript — see the `scratch` state. */
+    temporary = false
   ): Promise<StoredTranscript> => {
     const target = multi?.progressFile ?? file;
     const label = multi ? `${file.name}: ` : '';
@@ -353,6 +360,7 @@ export function AudioUpload({ onTranscriptCreated }: AudioUploadProps) {
         multi: multi
           ? { group: multi.group, index: multi.index, total: multi.total, comment: multi.comment }
           : null,
+        scratch: temporary && !linked,
       },
       {
         onProgress: (loaded, total) => {
@@ -377,7 +385,8 @@ export function AudioUpload({ onTranscriptCreated }: AudioUploadProps) {
     file: File,
     languageCode: string,
     linked: LinkedEvent | null,
-    pref: ReportPref
+    pref: ReportPref,
+    temporary = false
   ) => {
     if (file.size > MAX_FILE_BYTES) {
       throw new Error(
@@ -387,7 +396,7 @@ export function AudioUpload({ onTranscriptCreated }: AudioUploadProps) {
 
     updateUpload(file, { status: 'uploading', progress: 0 });
 
-    const transcript = await uploadFile(file, languageCode, linked, pref);
+    const transcript = await uploadFile(file, languageCode, linked, pref, undefined, temporary);
 
     updateUpload(file, {
       status: 'transcribing',
@@ -409,7 +418,8 @@ export function AudioUpload({ onTranscriptCreated }: AudioUploadProps) {
     comments: string[],
     languageCode: string,
     linked: LinkedEvent | null,
-    pref: ReportPref
+    pref: ReportPref,
+    temporary = false
   ) => {
     const progressFile = files[0]!;
     for (const file of files) {
@@ -425,15 +435,24 @@ export function AudioUpload({ onTranscriptCreated }: AudioUploadProps) {
     let doneBytes = 0;
     let last: StoredTranscript | null = null;
     for (const [i, file] of files.entries()) {
-      last = await uploadFile(file, languageCode, i === 0 ? linked : null, i === 0 ? pref : 'summary', {
-        group,
-        index: i + 1,
-        total: files.length,
-        comment: comments[i]?.trim() || undefined,
-        progressFile,
-        base: (doneBytes / totalBytes) * 50,
-        span: (file.size / totalBytes) * 50,
-      });
+      // Part 1 opens the group row (link, report pref, temporary flag all
+      // land there); parts 2..N inherit from it server-side.
+      last = await uploadFile(
+        file,
+        languageCode,
+        i === 0 ? linked : null,
+        i === 0 ? pref : 'summary',
+        {
+          group,
+          index: i + 1,
+          total: files.length,
+          comment: comments[i]?.trim() || undefined,
+          progressFile,
+          base: (doneBytes / totalBytes) * 50,
+          span: (file.size / totalBytes) * 50,
+        },
+        i === 0 && temporary
+      );
       doneBytes += file.size;
     }
     updateUpload(progressFile, {
@@ -451,7 +470,10 @@ export function AudioUpload({ onTranscriptCreated }: AudioUploadProps) {
       languageCode: string,
       linked: LinkedEvent | null,
       pref: ReportPref,
-      stitch?: { comments: string[] }
+      stitch?: { comments: string[] },
+      /** Temporary transcript (migration 042) — passed in, never read from
+       * state: this callback is memoised once. */
+      temporary = false
     ) => {
       if (stitch && files.length > 1) {
         const progressFile = files[0]!;
@@ -460,7 +482,7 @@ export function AudioUpload({ onTranscriptCreated }: AudioUploadProps) {
           { file: progressFile, status: 'uploading', progress: 0 },
         ]);
         try {
-          await submitStitchGroup(files, stitch.comments, languageCode, linked, pref);
+          await submitStitchGroup(files, stitch.comments, languageCode, linked, pref, temporary);
         } catch (error) {
           updateUpload(progressFile, {
             status: 'error',
@@ -478,7 +500,7 @@ export function AudioUpload({ onTranscriptCreated }: AudioUploadProps) {
         setUploads((prev) => [...prev, uploadStatus]);
 
         try {
-          await submitForTranscription(file, languageCode, linked, pref);
+          await submitForTranscription(file, languageCode, linked, pref, temporary);
         } catch (error) {
           updateUpload(file, {
             status: 'error',
@@ -710,11 +732,13 @@ export function AudioUpload({ onTranscriptCreated }: AudioUploadProps) {
       selectedLanguage,
       linked,
       reportPref,
-      stitching ? { comments: partComments } : undefined
+      stitching ? { comments: partComments } : undefined,
+      scratch && !linked
     );
     setPendingFiles([]);
     setStitchMode(false);
     setPartComments([]);
+    setScratch(false);
   };
 
   const handleCancelUpload = () => {
@@ -722,6 +746,7 @@ export function AudioUpload({ onTranscriptCreated }: AudioUploadProps) {
     setPendingFiles([]);
     setStitchMode(false);
     setPartComments([]);
+    setScratch(false);
     setSelectedLanguage('');
     setPrefill(null);
     setPasteOpen(false);
@@ -750,6 +775,7 @@ export function AudioUpload({ onTranscriptCreated }: AudioUploadProps) {
         body: JSON.stringify({
           text: pasteText,
           ...(linked ? { linkedEvent: linked } : {}),
+          ...(scratch && !linked ? { scratch: true } : {}),
         }),
       });
       if (!res.ok) {
@@ -785,7 +811,7 @@ export function AudioUpload({ onTranscriptCreated }: AudioUploadProps) {
       let anyQueued = false;
       let lastId: string | null = null;
       for (const f of textFiles) {
-        const res = await fetch('/api/transcripts/import-text', {
+        const res = await fetch(`/api/transcripts/import-text${scratch && !linked ? '?scratch=1' : ''}`, {
           method: 'POST',
           headers: {
             'Content-Type': f.type || 'application/octet-stream',
@@ -1165,6 +1191,16 @@ export function AudioUpload({ onTranscriptCreated }: AudioUploadProps) {
                           {textError}
                         </p>
                       )}
+                      {!prefill && (
+                        <label className="flex cursor-pointer items-center gap-2 text-xs text-muted-foreground">
+                          <input
+                            type="checkbox"
+                            checked={scratch}
+                            onChange={(e) => setScratch(e.target.checked)}
+                          />
+                          Temporary — kept out of the archive, deleted after 30 days
+                        </label>
+                      )}
                       <div className="flex items-center gap-2">
                         <Button
                           size="sm"
@@ -1265,6 +1301,17 @@ export function AudioUpload({ onTranscriptCreated }: AudioUploadProps) {
                           <AlertCircle className="h-4 w-4" />
                           {pasteError}
                         </p>
+                      )}
+                      {!prefill && (
+                        <label className="flex cursor-pointer items-center gap-2 text-xs text-muted-foreground">
+                          <input
+                            type="checkbox"
+                            checked={scratch}
+                            onChange={(e) => setScratch(e.target.checked)}
+                            disabled={pasteBusy}
+                          />
+                          Temporary — kept out of the archive, deleted after 30 days
+                        </label>
                       )}
                       <Button
                         size="sm"
@@ -1670,6 +1717,22 @@ export function AudioUpload({ onTranscriptCreated }: AudioUploadProps) {
                   />
                   Don&apos;t generate anything yet — I&apos;ll decide on the meeting page
                 </label>
+                {/* Temporary (migration 042) — only when no calendar event is
+                    linked: a linked upload is a real meeting and the server
+                    would drop the flag anyway. */}
+                {!selectedEvent && (
+                  <label
+                    className="flex cursor-pointer items-center gap-2 px-1 pt-1 text-xs text-muted-foreground"
+                    title="A quick one-off: stays out of the main list (under the Temporary tab) and is moved to the trash automatically 30 days after upload. You can keep it later."
+                  >
+                    <input
+                      type="checkbox"
+                      checked={scratch}
+                      onChange={(e) => setScratch(e.target.checked)}
+                    />
+                    Temporary — kept out of the archive, deleted after 30 days
+                  </label>
+                )}
               </div>
             </div>
           )}

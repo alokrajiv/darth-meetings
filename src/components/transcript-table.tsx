@@ -18,12 +18,14 @@ import {
   formatAgo,
   formatDuration,
   formatSmartDate,
+  scratchTrashDate,
   type TranscriptListRow,
   type TranscriptDayGroup,
   type TranscriptListV2Response,
 } from '@/lib/format';
 import { useLiveEvents } from '@/hooks/use-live-events';
 import {
+  Archive,
   RotateCcw,
   Trash2,
   RefreshCw,
@@ -34,6 +36,7 @@ import {
   FileAudio,
   FileText,
   Filter,
+  Hourglass,
   Search,
   ChevronRight,
   Inbox,
@@ -95,7 +98,9 @@ interface TranscriptTableProps {
   onLabelFilter?: (f: LabelFilter | null) => void;
 }
 
-type TabKey = 'all' | 'mine' | 'shared' | 'trash';
+/** 'scratch' = the Temporary tab (migration 042): the caller's visible
+ * temporary transcripts, which every other tab excludes. */
+type TabKey = 'all' | 'mine' | 'shared' | 'trash' | 'scratch';
 
 /**
  * The merged timeline's multi-select layers. 'archive' = imported rows
@@ -1095,6 +1100,36 @@ export function TranscriptTable({
     }
   };
 
+  /**
+   * Temporary ⇄ permanent (migration 042). Either direction moves the row
+   * out of the tab it is on (the main tabs exclude temporary rows, the
+   * Temporary tab holds nothing else), so it is dropped locally and the
+   * silent refetch reconciles counts. Editors only — same rule as renaming.
+   */
+  const handleSetScratch = async (e: React.MouseEvent, t: ListRow, scratch: boolean) => {
+    e.stopPropagation();
+    try {
+      const res = await fetch(`/api/transcripts/${t.assemblyai_id}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ scratch }),
+      });
+      if (!res.ok) {
+        const detail = await res.text().catch(() => res.statusText);
+        throw new Error(detail || `Update failed (${res.status})`);
+      }
+      removeRowLocally(t.assemblyai_id);
+      void fetchArchiveRef.current('silent');
+    } catch (err) {
+      alert(
+        isNetworkFailure(err)
+          ? OFFLINE_TITLE
+          : `Failed to ${scratch ? 'move to temporary' : 'keep'}: ` +
+              (err instanceof Error ? err.message : 'Unknown error')
+      );
+    }
+  };
+
   const handleRestoreTranscript = async (e: React.MouseEvent, assemblyaiId: string) => {
     e.stopPropagation();
     try {
@@ -1823,6 +1858,7 @@ export function TranscriptTable({
           {tabButton('all', 'All', counts?.all)}
           {tabButton('mine', 'Mine', counts?.mine)}
           {tabButton('shared', 'Shared', counts?.shared)}
+          {tabButton('scratch', 'Temporary', counts?.scratch)}
           {tabButton('trash', 'Trash', counts?.trash)}
         </div>
       )}
@@ -1901,6 +1937,10 @@ export function TranscriptTable({
     const waiting = t.status === 'waiting';
     const placeholder = uploading || t.assemblyai_id.startsWith('defer-');
     const trashed = !!t.deleted_at;
+    // Temporary (migration 042): the hint + Keep / Move-to-temporary
+    // buttons only make sense on live, real rows an editor can act on.
+    const scratch = !!t.scratch && !trashed;
+    const scratchToggle = !placeholder && !waiting && !trashed && canEditRow(t);
     const selectable = !placeholder && !trashed;
     const isSelected = selected.has(t.assemblyai_id);
     return (
@@ -1999,11 +2039,20 @@ export function TranscriptTable({
                 )}
                 {!uploading && !waiting && !trashed && recordingsChip(t)}
                 {!trashed && autoDot(t)}
+                {scratch && (
+                  <span
+                    className="inline-flex shrink-0 items-center gap-1 rounded-full border border-amber-400/50 bg-amber-50 px-1.5 py-px text-[10px] text-amber-800 dark:bg-amber-950/30 dark:text-amber-300"
+                    title="Temporary transcript — kept out of the archive and moved to the trash automatically 30 days after upload. Keep it to make it permanent."
+                  >
+                    <Hourglass className="h-2.5 w-2.5" />
+                    temporary · trashed on {scratchTrashDate(t.created_at).toLocaleDateString()}
+                  </span>
+                )}
               </div>
               {trashed ? (
                 <div className="truncate text-xs text-muted-foreground">
                   deleted {new Date(t.deleted_at!).toLocaleString()} — restore, or delete
-                  forever
+                  forever{t.scratch ? ' · was temporary' : ''}
                 </div>
               ) : uploading ? (
                 <div className="truncate font-mono text-[11px] text-muted-foreground">
@@ -2080,6 +2129,24 @@ export function TranscriptTable({
                 title={blocked ? OFFLINE_TITLE : 'Restore'}
               >
                 <RotateCcw className="h-3.5 w-3.5" />
+              </Button>
+            )}
+            {scratchToggle && (
+              <Button
+                size="sm"
+                variant="ghost"
+                className="h-7 w-7 p-0 text-muted-foreground opacity-0 transition-opacity hover:text-foreground group-hover:opacity-100"
+                onClick={(e) => handleSetScratch(e, t, !scratch)}
+                disabled={blocked}
+                title={
+                  blocked
+                    ? OFFLINE_TITLE
+                    : scratch
+                      ? 'Keep — make this transcript permanent (moves it to the main list)'
+                      : 'Move to temporary — out of the main list, trashed automatically after 30 days'
+                }
+              >
+                {scratch ? <Archive className="h-3.5 w-3.5" /> : <Hourglass className="h-3.5 w-3.5" />}
               </Button>
             )}
             {t.access === 'owner' && !uploading && (
@@ -2308,6 +2375,12 @@ archiveErrorPanel
             <Trash2 className="h-5 w-5 text-muted-foreground" />,
             'Trash is empty',
             'Deleted transcripts land here and can be restored or removed forever.'
+          )
+        ) : tab === 'scratch' ? (
+          emptyState(
+            <Hourglass className="h-5 w-5 text-muted-foreground" />,
+            'No temporary transcripts',
+            'Tick "Temporary" when uploading a quick one-off. It stays out of the main list and is trashed automatically after 30 days — or keep it to make it permanent.'
           )
         ) : tab === 'shared' ? (
           emptyState(
