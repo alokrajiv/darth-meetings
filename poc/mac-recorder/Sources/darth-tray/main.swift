@@ -4,7 +4,7 @@ import ScreenCaptureKit
 import ServiceManagement
 import RecorderCore
 
-let VERSION = "0.3.7"
+let VERSION = "0.3.8"
 let WS_PORT: UInt16 = 47800
 let PWA_URL = URL(string: "https://meetings.darth-internal.trames.io/")!
 /// Seconds between "the call ended" and an automatic stop.
@@ -1028,10 +1028,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             guard let id = obj["recording_id"] as? String else { rlog("upload: no recording_id"); return }
             let linked = obj["linked_event"] as? [String: Any]
             uploader.upload(recordingId: id, linkedEvent: linked)
+        case "delete_recording":                        // {recording_id} → recording_deleted {recording_id, files_removed | error}
+            guard let id = obj["recording_id"] as? String else { rlog("delete: no recording_id"); return }
+            var reply: [String: Any] = ["type": "recording_deleted", "recording_id": id]
+            if recorder.isRecording && recorder.recordingId == id {
+                reply["error"] = "still recording"
+            } else if uploader.isUploading(id) {
+                reply["error"] = "upload in flight"
+            } else if let r = Registry.shared.markDeleted(id) {
+                reply["files_removed"] = r.removed
+                api.syncRecording(id)
+                EventLog.shared.log("recording_deleted", ["recording_id": id, "files": r.files, "removed": r.removed],
+                                    summary: "delete: \(id) — \(r.removed) of \(r.files) file(s) removed")
+                refreshMenu()
+            } else {
+                reply["error"] = "unknown recording"
+            }
+            server.broadcast(reply)
         case "list_recordings":
             var msg: [String: Any] = statusPayload()
             msg["type"] = "recordings"
-            msg["recordings"] = Registry.shared.all()
+            msg["recordings"] = Registry.shared.listed()
             if let req = obj["req"] { msg["req"] = req }
             server.broadcast(msg)
         default: rlog("unknown cmd \(cmd)")

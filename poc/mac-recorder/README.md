@@ -14,6 +14,13 @@ Native macOS side of Darth Meetings recording (the "Swift tray" angle from Darth
 the user switched it off in the menu (`loginItemUserChoice` in UserDefaults records an explicit choice;
 the default never overrides it). macOS may show "Darth Recorder was added as a login item" once.
 
+**0.3.8 (2026-09-19) — delete from this Mac:** ws `delete_recording {recording_id}` →
+`recording_deleted {recording_id, files_removed | error}`. Removes the recording's files and its
+`~/Movies/Darth Recorder/<id>/` folder, keeps the registry row as `deleted` (PATCHed to the
+server; a transcript already uploaded is untouched) and drops it from `list_recordings` (which
+no longer returns deleted rows at all). Refused while that recording is live or uploading. The
+PWA's upload picker / Settings list has a trash button per row.
+
 **0.3.7 (2026-09-19) — no registry row stays "recording" forever:**
 - `Registry.reconcileAfterLaunch()` runs before the launch upload drain: a row still at
   `recording` when the tray starts (a process that died mid-recording — the 2026-09-16

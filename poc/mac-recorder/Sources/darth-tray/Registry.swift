@@ -109,6 +109,37 @@ final class Registry {
         return changed
     }
 
+    /// Delete from this Mac (0.3.8, ws `delete_recording`): the files and the per-recording
+    /// folder under ~/Movies/Darth Recorder/<id>/ go; the row STAYS as `deleted` with
+    /// `needs_sync` so the server hears it (its transcript, if any, is untouched), and it no
+    /// longer appears in `listed()`. Callers refuse a recording that is live or uploading.
+    func markDeleted(_ id: String) -> (files: Int, removed: Int)? {
+        lock.lock(); defer { lock.unlock() }
+        guard let i = rows.firstIndex(where: { $0["id"] as? String == id }) else { return nil }
+        let fm = FileManager.default
+        let files = rows[i]["files"] as? [String] ?? []
+        var removed = 0
+        for f in files where fm.fileExists(atPath: f) {
+            do { try fm.removeItem(atPath: f); removed += 1 } catch { rlog("delete: \(f): \(error)") }
+        }
+        let dir = Paths.recordings.appendingPathComponent(id, isDirectory: true)
+        if fm.fileExists(atPath: dir.path) {
+            do { try fm.removeItem(at: dir) } catch { rlog("delete: \(dir.path): \(error)") }
+        }
+        rows[i]["status"] = "deleted"
+        rows[i]["files"] = []
+        rows[i]["bytes"] = 0
+        rows[i]["error"] = NSNull()
+        rows[i]["needs_sync"] = true
+        saveLocked()
+        return (files.count, removed)
+    }
+
+    /// What `list_recordings` answers (0.3.8): everything but deleted rows.
+    func listed() -> [[String: Any]] {
+        all().filter { ($0["status"] as? String) != "deleted" }
+    }
+
     private static func fileSize(_ path: String) -> Int {
         ((try? FileManager.default.attributesOfItem(atPath: path)[.size]) as? Int) ?? 0
     }
