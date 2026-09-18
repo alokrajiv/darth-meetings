@@ -61,6 +61,15 @@ export interface LabelRailProps {
   onChanged: () => void;
   onCollapse: () => void;
   className?: string;
+  /**
+   * `inline` (default): the rail sits beside the table (page.tsx decides the
+   * sticky/height classes via `className`). `drawer`: narrow viewports — a
+   * fixed, left-anchored, full-height panel over a dimmed backdrop so the
+   * table keeps its width; it closes on backdrop click, Escape, the collapse
+   * chevron, and after any filter pick (`onFilter`). z-40 keeps it above the
+   * table but below Radix dialogs (z-50).
+   */
+  variant?: 'inline' | 'drawer';
 }
 
 type Editing =
@@ -105,7 +114,15 @@ async function patchLabel(id: number, body: Record<string, unknown>): Promise<vo
   }
 }
 
-export function LabelRail({ filter, onFilter, onChanged, onCollapse, className = '' }: LabelRailProps) {
+export function LabelRail({
+  filter,
+  onFilter: onFilterProp,
+  onChanged,
+  onCollapse,
+  className = '',
+  variant = 'inline',
+}: LabelRailProps) {
+  const drawer = variant === 'drawer';
   const catalog = useLabelCatalog();
   // Offline mode / network down: filters re-query the listing and every
   // taxonomy mutation hits the server, so the whole tree + footer sits in a
@@ -124,6 +141,16 @@ export function LabelRail({ filter, onFilter, onChanged, onCollapse, className =
   const menuRef = useRef<HTMLDivElement>(null);
   const colorRef = useRef<HTMLDivElement>(null);
   const exactRef = useRef<HTMLDivElement>(null);
+
+  // On a phone the rail is a drawer over the listing: picking a filter is the
+  // end of the interaction, so close it and let the (now filtered) table show.
+  const onFilter = useCallback(
+    (f: LabelFilter | null) => {
+      onFilterProp(f);
+      if (drawer) onCollapse();
+    },
+    [onFilterProp, drawer, onCollapse],
+  );
 
   const tree = useMemo(() => buildTree(catalog.rows), [catalog.rows]);
   const flat = useMemo(() => flattenTree(tree), [tree]);
@@ -217,6 +244,26 @@ export function LabelRail({ filter, onFilter, onChanged, onCollapse, className =
       document.removeEventListener('keydown', onKey);
     };
   }, [menu, colorFor, exactOpen]);
+
+  // Drawer only: Escape closes the drawer itself — but not while an inner
+  // popover / inline editor is open (those consume their own Escape first;
+  // the picker stops propagation, the ⋯ menu + color + exact popovers and
+  // the rename input do not, hence the guards). Also lock body scroll so a
+  // phone can't scroll the listing underneath the backdrop.
+  const innerOpen = !!(menu || colorFor || exactOpen || moveFor || editing);
+  useEffect(() => {
+    if (!drawer) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape' && !innerOpen) onCollapse();
+    };
+    document.addEventListener('keydown', onKey);
+    const prevOverflow = document.body.style.overflow;
+    document.body.style.overflow = 'hidden';
+    return () => {
+      document.removeEventListener('keydown', onKey);
+      document.body.style.overflow = prevOverflow;
+    };
+  }, [drawer, innerOpen, onCollapse]);
 
   const afterMutation = useCallback(async () => {
     await refreshLabelCatalog();
@@ -343,8 +390,10 @@ export function LabelRail({ filter, onFilter, onChanged, onCollapse, className =
         const txt = await res.text().catch(() => '');
         throw new Error(parseError(txt) || `Delete failed (${res.status})`);
       }
-      // If the filter pointed into the deleted subtree, clear it.
-      if (filter?.kind === 'id' && subtreeIds(node).includes(filter.id)) onFilter(null);
+      // If the filter pointed into the deleted subtree, clear it. Raw prop on
+      // purpose: this is a side effect of a mutation, not a pick — the drawer
+      // stays open so the user sees the tree they were editing.
+      if (filter?.kind === 'id' && subtreeIds(node).includes(filter.id)) onFilterProp(null);
       await afterMutation();
     } catch (err) {
       setError(isNetworkFailure(err) ? OFFLINE_TITLE : err instanceof Error ? err.message : 'Delete failed');
@@ -486,9 +535,26 @@ export function LabelRail({ filter, onFilter, onChanged, onCollapse, className =
   const moveNode = moveFor ? nodeById.get(moveFor.id) ?? null : null;
 
   return (
+    <>
+    {drawer && (
+      <div
+        data-label-rail-backdrop
+        aria-hidden
+        onClick={onCollapse}
+        className="fixed inset-0 z-40 bg-black/50"
+      />
+    )}
     <aside
       data-label-rail
-      className={`flex w-60 shrink-0 flex-col rounded-lg border bg-card shadow-[0_1px_2px_0_rgb(0_0_0/0.04)] ${className}`}
+      data-label-rail-variant={variant}
+      role={drawer ? 'dialog' : undefined}
+      aria-modal={drawer ? true : undefined}
+      aria-label={drawer ? 'Labels' : undefined}
+      className={
+        drawer
+          ? `fixed inset-y-0 left-0 z-40 flex w-72 max-w-[85vw] flex-col border-r bg-card shadow-xl ${className}`
+          : `flex w-60 shrink-0 flex-col rounded-lg border bg-card shadow-[0_1px_2px_0_rgb(0_0_0/0.04)] ${className}`
+      }
     >
       <div className="flex items-center gap-1 border-b px-2 py-1.5">
         <Tag className="h-3.5 w-3.5 text-muted-foreground" />
@@ -769,5 +835,6 @@ export function LabelRail({ filter, onFilter, onChanged, onCollapse, className =
         />
       )}
     </aside>
+    </>
   );
 }
