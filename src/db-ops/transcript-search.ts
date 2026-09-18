@@ -6,8 +6,9 @@ import { EMPTY_MEETING_FILTERS, type MeetingFilters } from '@/lib/server/meeting
 
 // Deep search across everything we hold for a transcript: title, filename,
 // description, the AI summary, and the full transcript text (cached in
-// imported_content). Same visibility rules as the listing. Snippets are cut
-// in SQL so we never ship megabytes of transcript text to the client.
+// imported_content). Same visibility rules as the listing (trashed and
+// temporary/scratch rows excluded). Snippets are cut in SQL so we never ship
+// megabytes of transcript text to the client.
 
 const SCHEMA = SCHEMAS.MEETING_WHISPERER;
 
@@ -58,6 +59,7 @@ export async function searchVisibleTranscripts(
        AND s.shared_with_email = ${normEmail}
       WHERE (t.user_id = ${userId} OR s.id IS NOT NULL)
         AND t.deleted_at IS NULL
+        AND NOT t.scratch
         AND (
           t.title ILIKE ${pattern}
           OR t.original_filename ILIKE ${pattern}
@@ -142,6 +144,7 @@ export async function regexSearchVisibleTranscripts(
            AND s.shared_with_email = ${normEmail}
           WHERE (t.user_id = ${userId} OR s.id IS NOT NULL)
             AND t.deleted_at IS NULL
+        AND NOT t.scratch
             AND (
               t.title ~* ${re}
               OR t.original_filename ~* ${re}

@@ -5,6 +5,16 @@
  * state — this file is imported from client components.
  */
 
+/** Temporary (scratch) transcripts are moved to the trash this many days
+ * after creation (migration 042). The sweeper, the listing hint and the
+ * detail-page banner all read this one number. */
+export const SCRATCH_TTL_DAYS = 30;
+
+/** When a temporary transcript created at `createdAt` gets auto-trashed. */
+export function scratchTrashDate(createdAt: string): Date {
+  return new Date(new Date(createdAt).getTime() + SCRATCH_TTL_DAYS * 86_400_000);
+}
+
 /** A row from our `transcripts` table, as returned by /api/transcripts. */
 export interface StoredTranscript {
   id: number;
@@ -64,6 +74,12 @@ export interface StoredTranscript {
    * and every background job; restore clears it. Row, AAI transcript,
    * audio, shares, and notes all survive until a permanent delete. */
   deleted_at: string | null;
+  /** Temporary (scratch) transcript (migration 042): kept out of the main
+   * listing / search / series / dedupe / already-imported lookups, listed
+   * under the Temporary tab instead, auto-trashed 30 days after creation.
+   * Still a real transcript everywhere else (detail page, AI passes,
+   * sharing, labels). Linking a calendar event clears it. */
+  scratch: boolean;
 }
 
 /** One invitee of the source calendar event (Google Meet import). */
@@ -520,6 +536,11 @@ export interface TranscriptListRow {
   auto_state?: 'passed' | 'gated' | 'auto' | null;
   /** Set on trash-view rows only (the main listing never returns them). */
   deleted_at?: string | null;
+  /** Temporary (scratch) transcript — see StoredTranscript.scratch. The main
+   * listing never returns scratch rows; the Temporary tab (`?scratch=1` /
+   * `?v=2&tab=scratch`) and the trash view carry the flag so clients can
+   * hint "temporary · trashed on <date>". */
+  scratch?: boolean;
   /** v2 listing with `q`: which field the search matched (first-match
    * priority title→filename→description→notes→content). */
   matched_in?: 'title' | 'filename' | 'description' | 'notes' | 'content';
@@ -545,12 +566,15 @@ export interface TranscriptDayGroup {
 }
 
 /** Tab badge counts for the v2 listing. all/mine/shared respect the active
- * from/to + q filters; trash is the caller's global trashed-row count. */
+ * from/to + q filters; trash is the caller's global trashed-row count;
+ * scratch is the caller's visible (owned + shared) live temporary-row count. */
 export interface TranscriptListCounts {
   all: number;
   mine: number;
   shared: number;
   trash: number;
+  /** Absent on payloads cached before migration 042 — treat as 0. */
+  scratch?: number;
 }
 
 /** Envelope of GET /api/transcripts?v=2 — day-bucketed pagination. The

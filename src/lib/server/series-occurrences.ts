@@ -298,6 +298,7 @@ async function loadImportedCandidates(
     LEFT JOIN ${sql(SCHEMA)}.transcript_shares sh
       ON sh.transcript_id = t.id AND sh.shared_with_email = ${normEmail}
     WHERE t.deleted_at IS NULL
+      AND NOT t.scratch
       AND (m.series_id = ${seriesId} OR k.id IS NOT NULL)
   `;
 }

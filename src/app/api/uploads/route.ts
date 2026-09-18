@@ -24,7 +24,9 @@ export const runtime = 'nodejs';
  * POST /api/uploads — open (or resume) a chunked upload session.
  *
  * Body (JSON): { fingerprint, size, filename, contentType?, languageCode?,
- *   linkedEvent?, reportPref?, sourceId?, multi?: {group,index,total,comment} }
+ *   linkedEvent?, reportPref?, sourceId?, multi?: {group,index,total,comment},
+ *   scratch?: true (temporary transcript, migration 042 — ignored when a
+ *   calendar event is linked) }
  *
  * Same user + same fingerprint + same size while a session is still open →
  * that session comes back with the chunks already acknowledged, so the
@@ -74,6 +76,7 @@ export const POST = withAuth(async ({ user, request }) => {
   }
   const reportPref = parseReportPref(typeof body.reportPref === 'string' ? body.reportPref : null);
   const sourceId = typeof body.sourceId === 'string' && body.sourceId ? body.sourceId : null;
+  const scratch = body.scratch === true;
   const rawMulti = body.multi as Record<string, unknown> | undefined | null;
   const multi = rawMulti
     ? parseMultiParams({
@@ -130,6 +133,7 @@ export const POST = withAuth(async ({ user, request }) => {
     multi: multi ?? null,
     bytesTotal: size,
     uuid,
+    scratch,
   });
   if (!opened.ok) return NextResponse.json({ error: opened.error }, { status: opened.status });
 

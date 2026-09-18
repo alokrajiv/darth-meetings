@@ -9,7 +9,9 @@ export const runtime = 'nodejs';
  * POST /api/transcripts/:id/restore
  * Owner-only. Undo a soft delete — clears deleted_at so the row reappears
  * everywhere (listing, search, series, shares for everyone it was shared
- * with).
+ * with). A restored row is always permanent: the temporary flag (migration
+ * 042) is cleared too, otherwise an auto-trashed temporary row would be
+ * trashed again by the next sweep.
  */
 export const POST = withAuth(async ({ user }, { params }) => {
   const { id } = await params;

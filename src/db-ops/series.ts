@@ -335,6 +335,7 @@ export async function seriesTotals(): Promise<{ memberships: number; unattached:
     FROM ${sql(SCHEMA)}.transcripts t
     LEFT JOIN ${sql(SCHEMA)}.series_members m ON m.transcript_id = t.id
     WHERE t.deleted_at IS NULL
+      AND NOT t.scratch
       AND t.status NOT IN ('uploading', 'waiting')
   `;
   return row ?? { memberships: 0, unattached: 0 };
@@ -546,6 +547,7 @@ export async function listUnattachedTranscripts(): Promise<
     LEFT JOIN ${sql(SCHEMA)}.series_members m ON m.transcript_id = t.id
     WHERE m.id IS NULL
       AND t.deleted_at IS NULL
+      AND NOT t.scratch
       AND t.status NOT IN ('uploading', 'waiting')
     ORDER BY COALESCE(t.recorded_at, t.created_at) DESC
   `;
@@ -796,6 +798,7 @@ export async function listSuggestedMembers(
       AND (t.user_id = ${caller.userId} OR sh.id IS NOT NULL)
       AND t.status NOT IN ('uploading', 'waiting')
       AND t.deleted_at IS NULL
+      AND NOT t.scratch
     GROUP BY t.id
     ORDER BY COALESCE(t.recorded_at, t.created_at) DESC
   `;

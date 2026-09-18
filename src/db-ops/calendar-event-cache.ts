@@ -1138,6 +1138,7 @@ export async function listCalendarWindow(
       FROM ${sql(SCHEMA)}.transcripts t
       WHERE c.meeting_code IS NOT NULL
         AND t.deleted_at IS NULL
+        AND NOT t.scratch
         AND t.gmeet_context IS NOT NULL
         AND t.gmeet_context->>'meetingCode' = c.meeting_code
         AND abs(extract(epoch FROM (${occ} - c.event_start))) <= ${OCCURRENCE_WINDOW_S}
@@ -1152,6 +1153,7 @@ export async function listCalendarWindow(
       FROM ${sql(SCHEMA)}.transcripts t
       WHERE ic.assemblyai_id IS NULL
         AND t.deleted_at IS NULL
+        AND NOT t.scratch
         AND t.gmeet_context IS NOT NULL
         AND t.gmeet_context->>'eventId' = c.event_id
       ORDER BY t.created_at ASC

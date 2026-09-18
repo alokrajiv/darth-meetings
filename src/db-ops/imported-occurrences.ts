@@ -13,6 +13,9 @@ import {
 // findImportedByTeamsCallId, /api/gmeet/check, the poller's reminder
 // reconciliation and the series sweep all resolve through here; the calendar
 // SQL views use importedOccurrenceAntiJoin for the same rule in SQL.
+//
+// Trashed rows AND temporary (scratch, migration 042) rows never count as an
+// import — a scratch upload must not make a calendar event look imported.
 
 const SCHEMA = SCHEMAS.MEETING_WHISPERER;
 
@@ -67,7 +70,7 @@ export function importedOccurrenceAntiJoin(input: {
   return sql`(
     NOT EXISTS (
       SELECT 1 FROM ${sql(SCHEMA)}.transcripts t
-      WHERE t.deleted_at IS NULL
+      WHERE t.deleted_at IS NULL AND NOT t.scratch
         AND t.gmeet_context IS NOT NULL
         AND t.gmeet_context->>'meetingCode' = ${input.meetingCode}
         AND abs(extract(epoch FROM (${occ} - ${input.instant}))) <= ${OCCURRENCE_WINDOW_S}
@@ -76,7 +79,7 @@ export function importedOccurrenceAntiJoin(input: {
       input.joinWebUrl
         ? sql`AND NOT EXISTS (
       SELECT 1 FROM ${sql(SCHEMA)}.transcripts t
-      WHERE t.deleted_at IS NULL
+      WHERE t.deleted_at IS NULL AND NOT t.scratch
         AND ${input.joinWebUrl} IS NOT NULL
         AND t.gmeet_context IS NOT NULL
         AND t.gmeet_context->'teams'->>'joinWebUrl' = ${input.joinWebUrl}
@@ -91,7 +94,7 @@ export function importedOccurrenceAntiJoin(input: {
       FROM ${input.eventIdIn} AS _ids(event_id)
       JOIN ${sql(SCHEMA)}.transcripts t
         ON t.gmeet_context->>'eventId' = _ids.event_id
-      WHERE t.deleted_at IS NULL
+      WHERE t.deleted_at IS NULL AND NOT t.scratch
         AND t.gmeet_context IS NOT NULL
     )`
         : sql``
@@ -185,7 +188,7 @@ export async function findImportedOccurrences(
       ORDER BY a.at DESC
       LIMIT 1
     ) AS owner_act ON true
-    WHERE t.deleted_at IS NULL
+    WHERE t.deleted_at IS NULL AND NOT t.scratch
       AND (${where})
     ORDER BY t.created_at ASC
   `;

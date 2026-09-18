@@ -9,8 +9,10 @@ import type { GmeetContext } from '@/lib/format';
  *
  * Visibility is the SAME predicate as listVisibleToUser (owner OR a
  * transcript_shares row for the caller's lower-cased email, not soft-
- * deleted), narrowed to status = 'completed' — an offline copy of a row
- * that is still transcribing would be frozen mid-flight.
+ * deleted, not temporary/scratch), narrowed to status = 'completed' — an
+ * offline copy of a row that is still transcribing would be frozen
+ * mid-flight. Scratch rows are excluded even when asked for by id: an
+ * explicit pin of a temporary transcript would outlive its auto-trash.
  */
 
 const SCHEMA = SCHEMAS.MEETING_WHISPERER;
@@ -91,6 +93,7 @@ export async function listOfflinePlanRows(
        AND s.shared_with_email = ${normEmail}
       WHERE (t.user_id = ${userId} OR s.id IS NOT NULL)
         AND t.deleted_at IS NULL
+        AND NOT t.scratch
         AND t.status = 'completed'
         ${ids !== null ? sql`AND t.assemblyai_id = ANY(${ids})` : sql``}
     )

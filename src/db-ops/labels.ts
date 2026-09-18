@@ -205,6 +205,7 @@ export async function listLabelsWithCounts(
         ON s.transcript_id = t.id AND s.shared_with_email = ${normEmail}
       WHERE (t.user_id = ${userId} OR s.id IS NOT NULL)
         AND t.deleted_at IS NULL
+        AND NOT t.scratch
     ),
     vis_assign AS MATERIALIZED (
       SELECT tl.transcript_id, tl.label_id, l2.path_key
@@ -241,6 +242,7 @@ export async function listLabelsWithCounts(
         ON s.transcript_id = t.id AND s.shared_with_email = ${normEmail}
       WHERE (t.user_id = ${userId} OR s.id IS NOT NULL)
         AND t.deleted_at IS NULL
+        AND NOT t.scratch
     `;
     return { labels: [], unlabelled: t[0]?.unlabelled ?? 0, total: t[0]?.total ?? 0 };
   }

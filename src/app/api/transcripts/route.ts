@@ -110,7 +110,9 @@ function clampInt(raw: string | null, dflt: number, min: number, max: number): n
 
 /**
  * GET /api/transcripts?v=2 — day-bucketed pagination + unified search.
- * Params: tab=all|mine|shared|trash, from/to (YYYY-MM-DD in tz), tz (IANA),
+ * Params: tab=all|mine|shared|trash|scratch (scratch = the caller's visible
+ * temporary rows, migration 042 — every other tab excludes them),
+ * from/to (YYYY-MM-DD in tz), tz (IANA),
  * q (>= 2 chars → server-side search with matched_in/snippet), days (max day
  * buckets, default 14 cap 60), minRows (soft row target, default 40 cap 200),
  * cursor (exclusive day key — only strictly older days), plus the shared
@@ -128,7 +130,9 @@ async function listingV2(
 ) {
   const tabRaw = params.get('tab');
   const tab =
-    tabRaw === 'mine' || tabRaw === 'shared' || tabRaw === 'trash' ? tabRaw : 'all';
+    tabRaw === 'mine' || tabRaw === 'shared' || tabRaw === 'trash' || tabRaw === 'scratch'
+      ? tabRaw
+      : 'all';
   const fromRaw = params.get('from');
   const toRaw = params.get('to');
   const cursorRaw = params.get('cursor');
@@ -187,8 +191,10 @@ async function listingV2(
  * the All / Mine / Shared tabs and gate read-only vs editor controls.
  *
  * `?v=2` switches to the paginated day-bucketed listing (listingV2 above).
- * Without it the legacy shape (`{transcripts: [...]}` full array, `?trash=1`)
- * is preserved byte-for-byte — darth-cli consumes it.
+ * Without it the legacy shape (`{transcripts: [...]}` full array, `?trash=1`,
+ * `?scratch=1` = the caller's visible temporary rows) is preserved
+ * byte-for-byte — darth-cli consumes it. Temporary (scratch) rows never
+ * appear in the default listing; every row carries `scratch`.
  *
  * This is a DB-only, pure-Postgres path — no AssemblyAI calls. The query
  * deliberately omits the large `imported_content` JSONB so responses stay
@@ -206,6 +212,14 @@ export const GET = withAuth(async ({ user, request }) => {
   // trashed rows never join the AAI refresh fan-out.
   if (params.get('trash') === '1') {
     return NextResponse.json({ transcripts: await listDeletedForUser(user.userId) });
+  }
+
+  // ?scratch=1: the caller's visible temporary rows (owned + shared) —
+  // real transcripts, so still-transcribing ones join the AAI refresh.
+  if (params.get('scratch') === '1') {
+    const scratchRows = await listVisibleToUser(user.userId, user.email, { scratch: true });
+    await refreshPendingAgainstAai(scratchRows);
+    return NextResponse.json({ transcripts: scratchRows });
   }
 
   const rows = await listVisibleToUser(user.userId, user.email);
@@ -240,9 +254,14 @@ export const GET = withAuth(async ({ user, request }) => {
  * rides the raw-body endpoint on purpose — it is excluded from the proxy
  * matcher, so a multi-GB video still streams to disk instead of being
  * buffered in memory by the middleware.
+ *
+ * `?scratch=1` creates a TEMPORARY transcript (migration 042): out of the
+ * main listing, under the Temporary tab, auto-trashed after 30 days.
+ * Ignored when the upload is pre-linked to a calendar event.
  */
 export const POST = withAuth(async ({ user, request }) => {
   const contentType = request.headers.get('content-type') ?? '';
+  const scratch = request.nextUrl.searchParams.get('scratch') === '1';
   // Two ways to pre-link the recording to a calendar event: the web stepper
   // sends the whole event (x-linked-event); headless callers (darth-cli
   // `upload --event <ref>`) send a meeting code / event key in ?event= and
@@ -297,6 +316,7 @@ export const POST = withAuth(async ({ user, request }) => {
       reportPref,
       bytesTotal: file.size,
       recorderRecordingId,
+      scratch,
     });
     if (!opened.ok) return NextResponse.json({ error: opened.error }, { status: opened.status });
     await saveAudioBytes(opened.spec.tempFilename, Buffer.from(await file.arrayBuffer()));
@@ -356,6 +376,7 @@ export const POST = withAuth(async ({ user, request }) => {
     multi: multi ?? null,
     bytesTotal,
     recorderRecordingId,
+    scratch,
   });
   if (!opened.ok) return NextResponse.json({ error: opened.error }, { status: opened.status });
   const { spec } = opened;

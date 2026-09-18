@@ -3,6 +3,7 @@ import { withAuth } from '@/lib/auth/with-auth';
 import {
   deleteForUser,
   setRecordedAtForUser,
+  setScratchForUser,
   softDeleteForUser,
   touchLastAccessedForUser,
   updateMetaForUser,
@@ -46,8 +47,10 @@ export const GET = withAuth(async ({ user }, { params }) => {
 
 /**
  * PATCH /api/transcripts/:id
- * Update title and/or description. Editors (owner + 'edit' shares) can
- * update; read-only shares cannot.
+ * Update title and/or description, the meeting date (`recordedAt`), and the
+ * temporary flag (`scratch: boolean`, migration 042 — "Keep" / "Move to
+ * temporary"). Editors (owner + 'edit' shares) can update; read-only shares
+ * cannot.
  */
 export const PATCH = withAuth(async ({ user, request }, { params }) => {
   const { id } = await params;
@@ -70,11 +73,19 @@ export const PATCH = withAuth(async ({ user, request }, { params }) => {
     return NextResponse.json({ error: 'Body must be an object' }, { status: 400 });
   }
 
-  const { title, description, recordedAt } = body as {
+  const { title, description, recordedAt, scratch } = body as {
     title?: unknown;
     description?: unknown;
     recordedAt?: unknown;
+    scratch?: unknown;
   };
+
+  if (scratch !== undefined && typeof scratch !== 'boolean') {
+    return NextResponse.json({ error: 'scratch must be a boolean' }, { status: 400 });
+  }
+  if (typeof scratch === 'boolean') {
+    await setScratchForUser(access.ownerUserId, id, scratch);
+  }
 
   // Meeting date: ISO string sets it, explicit null clears it.
   if (recordedAt === null) {
@@ -100,6 +111,7 @@ export const PATCH = withAuth(async ({ user, request }, { params }) => {
     details: {
       changedTitle: typeof title === 'string',
       changedDescription: typeof description === 'string',
+      ...(typeof scratch === 'boolean' ? { scratch } : {}),
     },
   });
 

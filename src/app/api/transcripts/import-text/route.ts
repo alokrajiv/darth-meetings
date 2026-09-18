@@ -238,6 +238,9 @@ async function normalizeTextInBackground(
       gmeetContext: link?.gmeetContext ?? null,
       attendees: link?.attendees ?? [],
       logTag: '[import-text]',
+      // The placeholder already carries the flag (the upsert never touches
+      // it) — restated so the row's intent is explicit on the fill-in too.
+      scratch: row.scratch,
     });
     publishEvent({ kind: 'status', assemblyaiId: sourceId });
     publishEvent({ kind: 'meta', assemblyaiId: sourceId });
@@ -283,7 +286,9 @@ async function normalizeTextInBackground(
  * media-upload route). `linkedEvent` is the calendar event this transcript
  * belongs to — it's stamped into gmeet_context exactly like an uploaded
  * recording's link (title/recorded_at fallbacks, invitee context for speaker
- * naming, series auto-attach).
+ * naming, series auto-attach). `?scratch=1` (or `scratch: true` in the JSON
+ * body) makes the import a TEMPORARY transcript (migration 042) — ignored
+ * when an event is linked.
  *
  * Known machine-regular formats (VTT, SRT, "Name | MM:SS", …) are parsed
  * deterministically and ingest synchronously → 201 with `fastPath` set.
@@ -298,9 +303,18 @@ export const POST = withAuth(async ({ user, request }) => {
   let title: string | null = null;
   let originalFilename: string | null = null;
   let linkedEventRaw: unknown = null;
+  // Temporary transcript (migration 042): `?scratch=1` on either body shape,
+  // or `scratch: true` in the JSON body. Ignored once an event is linked.
+  let wantScratch = request.nextUrl.searchParams.get('scratch') === '1';
 
   if (contentType.includes('application/json')) {
-    let body: { text?: string; title?: string; filename?: string; linkedEvent?: unknown };
+    let body: {
+      text?: string;
+      title?: string;
+      filename?: string;
+      linkedEvent?: unknown;
+      scratch?: unknown;
+    };
     try {
       body = (await request.json()) as typeof body;
     } catch {
@@ -310,6 +324,7 @@ export const POST = withAuth(async ({ user, request }) => {
     title = body.title?.trim() || null;
     originalFilename = body.filename?.trim() || null;
     linkedEventRaw = body.linkedEvent ?? null;
+    if (body.scratch === true) wantScratch = true;
   } else {
     const rawLinked = request.headers.get('x-linked-event');
     if (rawLinked) {
@@ -365,6 +380,7 @@ export const POST = withAuth(async ({ user, request }) => {
     linkedEvent = resolved.event;
   }
   const link = linkedEvent ? linkedEventIngestFields(linkedEvent) : null;
+  const scratch = wantScratch && !linkedEvent;
 
   sourceText = sourceText.trim();
   if (sourceText.length < 20) {
@@ -396,6 +412,7 @@ export const POST = withAuth(async ({ user, request }) => {
         gmeetContext: link?.gmeetContext ?? null,
         attendees: link?.attendees ?? [],
         logTag: '[import-text]',
+        scratch,
       }
     );
     return NextResponse.json({ transcript: row, fastPath: parsed.format }, { status: 201 });
@@ -407,6 +424,8 @@ export const POST = withAuth(async ({ user, request }) => {
     .update('\0')
     // Same text linked to a different event is a distinct import.
     .update(linkedEvent?.id ?? '')
+    .update('\0')
+    .update(scratch ? 'scratch' : '')
     .update('\0')
     .update(sourceText)
     .digest('hex');
@@ -424,7 +443,7 @@ export const POST = withAuth(async ({ user, request }) => {
   const syntheticId = `ext-${randomUUID().slice(0, 12)}`;
   const placeholderPromise = createTextImportPlaceholder(
     { userId: user.userId },
-    { sourceId: syntheticId, title: title ?? link?.eventTitle ?? null, originalFilename }
+    { sourceId: syntheticId, title: title ?? link?.eventTitle ?? null, originalFilename, scratch }
   );
   const infoPromise = placeholderPromise.then((r) => ({
     id: r.id,
