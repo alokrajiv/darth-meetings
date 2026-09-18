@@ -10,6 +10,32 @@ import type { StoredTranscript, TranscriptAccess } from '@/lib/format';
 
 const SCHEMA = SCHEMAS.MEETING_WHISPERER;
 
+/**
+ * Boolean form of `resolveAccess` — the SAME owner-or-share predicate, but
+ * an EXISTS instead of `t.*` (gmeet_context alone can be ~16 KB per row).
+ * For hot paths that only need yes/no: the /api/events visibility gate
+ * (lib/server/event-bus) asks this once per (user, transcript) and caches.
+ */
+export async function canAccessTranscript(
+  userId: string,
+  email: string,
+  assemblyaiId: string
+): Promise<boolean> {
+  const normEmail = email.trim().toLowerCase();
+  const rows = await sql<Array<{ ok: boolean }>>`
+    SELECT EXISTS (
+      SELECT 1
+      FROM ${sql(SCHEMA)}.transcripts t
+      LEFT JOIN ${sql(SCHEMA)}.transcript_shares s
+        ON s.transcript_id = t.id
+        AND s.shared_with_email = ${normEmail}
+      WHERE t.assemblyai_id = ${assemblyaiId}
+        AND (t.user_id = ${userId} OR s.id IS NOT NULL)
+    ) AS ok
+  `;
+  return rows[0]?.ok === true;
+}
+
 export interface ResolvedAccess {
   row: StoredTranscript;
   access: TranscriptAccess;

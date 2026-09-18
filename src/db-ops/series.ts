@@ -10,6 +10,11 @@ import {
   syncSeriesLabelOnMemberAdd,
 } from '@/lib/server/series-labels';
 import type { GmeetContext } from '@/lib/format';
+import {
+  seriesManageVerdict,
+  type SeriesManagementFacts,
+  type SeriesManageVerdict,
+} from '@/lib/series-owner';
 
 /**
  * Recurring-call series: the curated first-class object behind the
@@ -184,6 +189,41 @@ export async function updateSeries(
       console.warn(`[series-labels] rename hook failed for series ${id}:`, err);
     }
   }
+}
+
+/**
+ * OWNERSHIP GATE (tech-debt D4, 2026-09-18) — the facts behind
+ * lib/series-owner's rule for DELETE + merge: who created the series, and
+ * the organizer emails of its live member transcripts (gmeet_context
+ * .organizerEmail — Meet and Teams imports both carry it). Visibility is
+ * still checked first by the routes; this only answers "may they destroy
+ * it". Returns null when the series does not exist.
+ */
+export async function seriesManagementFacts(id: number): Promise<SeriesManagementFacts | null> {
+  const [row] = await sql<Array<{ created_by: string | null; organizers: string[] | null }>>`
+    SELECT s.created_by,
+           (
+             SELECT array_agg(DISTINCT lower(t.gmeet_context->>'organizerEmail'))
+             FROM ${sql(SCHEMA)}.series_members m
+             JOIN ${sql(SCHEMA)}.transcripts t
+               ON t.id = m.transcript_id AND t.deleted_at IS NULL
+             WHERE m.series_id = s.id
+               AND t.gmeet_context->>'organizerEmail' IS NOT NULL
+           ) AS organizers
+    FROM ${sql(SCHEMA)}.series s
+    WHERE s.id = ${id}
+  `;
+  if (!row) return null;
+  return { createdBy: row.created_by, memberOrganizerEmails: row.organizers ?? [] };
+}
+
+/** Delete/merge gate: `seriesManageVerdict` over `seriesManagementFacts`. */
+export async function seriesManageVerdictFor(
+  id: number,
+  caller: { userId: string; email: string }
+): Promise<SeriesManageVerdict | null> {
+  const facts = await seriesManagementFacts(id);
+  return facts ? seriesManageVerdict(facts, caller) : null;
 }
 
 export async function deleteSeries(id: number): Promise<void> {
