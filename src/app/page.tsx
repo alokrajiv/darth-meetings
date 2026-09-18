@@ -181,20 +181,45 @@ export default function Home() {
   // Labels (docs/labels-design.md §4): the page owns the `?label=&exact=`
   // filter (URL = source of truth, shareable) and the rail's collapsed state
   // (localStorage `mw-label-rail`); the rail and the table both receive it.
+  //
+  // The rail starts COLLAPSED for everyone — only an explicit stored 'open'
+  // reopens it (phones/PWA used to boot with a 240px column eating the
+  // listing). Below Tailwind's `md` (768px) the rail is an overlay drawer
+  // instead of a side column, and its open state is never persisted there:
+  // a phone always starts closed, the toolbar "Labels" button opens it.
   const [labelFilter, setLabelFilterState] = useState<LabelFilter | null>(null);
   const [labelReady, setLabelReady] = useState(false);
-  const [railCollapsed, setRailCollapsed] = useState(false);
+  const [railCollapsed, setRailCollapsed] = useState(true);
+  const [railNarrow, setRailNarrow] = useState(false);
   useEffect(() => {
     setLabelFilterState(readLabelFilterFromUrl());
     setLabelReady(true);
-    try {
-      setRailCollapsed(localStorage.getItem(LABEL_RAIL_STORAGE_KEY) === 'collapsed');
-    } catch {
-      // storage blocked — rail just shows
-    }
+    const readStoredOpen = () => {
+      try {
+        return localStorage.getItem(LABEL_RAIL_STORAGE_KEY) === 'open';
+      } catch {
+        return false; // storage blocked — stays collapsed
+      }
+    };
+    const mq = window.matchMedia('(min-width: 768px)');
+    const narrow = !mq.matches;
+    setRailNarrow(narrow);
+    if (!narrow && readStoredOpen()) setRailCollapsed(false);
+    // Rotation / window resize across the breakpoint: going narrow closes an
+    // open side column (it would otherwise pop up as a drawer over the
+    // table); going wide restores whatever the desktop preference is.
+    const onChange = (e: MediaQueryListEvent) => {
+      const nowNarrow = !e.matches;
+      setRailNarrow(nowNarrow);
+      setRailCollapsed(nowNarrow ? true : !readStoredOpen());
+    };
+    mq.addEventListener('change', onChange);
     const onPop = () => setLabelFilterState(readLabelFilterFromUrl());
     window.addEventListener('popstate', onPop);
-    return () => window.removeEventListener('popstate', onPop);
+    return () => {
+      mq.removeEventListener('change', onChange);
+      window.removeEventListener('popstate', onPop);
+    };
   }, []);
   const setLabelFilter = (next: LabelFilter | null) => {
     setLabelFilterState((prev) => {
@@ -208,6 +233,7 @@ export default function Home() {
   };
   const toggleRail = (collapsed: boolean) => {
     setRailCollapsed(collapsed);
+    if (railNarrow) return; // drawer: never persisted, a phone always starts closed
     try {
       localStorage.setItem(LABEL_RAIL_STORAGE_KEY, collapsed ? 'collapsed' : 'open');
     } catch {
@@ -375,7 +401,8 @@ export default function Home() {
               onFilter={setLabelFilter}
               onChanged={handleTranscriptCreated}
               onCollapse={() => toggleRail(true)}
-              className="sticky top-4 max-h-[calc(100vh-2rem)]"
+              variant={railNarrow ? 'drawer' : 'inline'}
+              className={railNarrow ? '' : 'sticky top-4 max-h-[calc(100vh-2rem)]'}
             />
           )}
           <div className="min-w-0 flex-1">
