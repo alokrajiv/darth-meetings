@@ -187,6 +187,9 @@ final class RecordingController {
     private(set) var call: DetectedCall?
     private(set) var segments: [[String: Any]] = []
     private(set) var currentSource: Source?
+    /// 0.3.6: "auto" (the picker chose the window and keeps following the call) or "manual"
+    /// (the person picked a window / display from the preview's gear or the PWA).
+    private(set) var sourceMode = "auto"
     private(set) var micActive = false
     var fps = 5
 
@@ -418,7 +421,7 @@ final class RecordingController {
         loggedGoneAfterEnd = false
         holdTimer?.invalidate(); holdTimer = nil
         systemStreamFailed = nil; streamFailure = false; flags = [:]; healthTicks = 0; micDenied = false
-        shareNoticeShown = false; pendingVideoFailure = false; currentSource = nil
+        shareNoticeShown = false; pendingVideoFailure = false; currentSource = nil; sourceMode = "auto"
         videoFramesTotal = 0; videoDupTotal = 0; lastVideoCount = -1; lastVideoWriter = nil
         audioForwarder.reset()
         let f = DateFormatter(); f.dateFormat = "yyyy-MM-dd HH.mm.ss"
@@ -646,6 +649,8 @@ final class RecordingController {
         mic?.onBuffer = { [weak self] sb in self?.currentWriter()?.appendAudio(sb, track: micIndex) }
 
         state = .recording
+
+        ResourceSampler.shared.beginRecording(id: recordingId ?? "")
         errorRolls = 0
         lastVideoAt = Date()
         healthTimer?.invalidate()
@@ -968,6 +973,46 @@ final class RecordingController {
         }
     }
 
+    // MARK: source control (0.3.6)
+
+    /// Run the window picker again for the call being recorded; roll a new segment when it
+    /// picks a different window. Returns a one-line outcome for the log / the caller's banner.
+    @discardableResult
+    func redetectSource(how: String = "redetect") -> String {
+        guard state == .recording, currentSource?.isAudioOnly != true else { return "not recording video" }
+        guard let call, call.pid > 0 else { return "no call window to look for — this recording is a display / manual pick" }
+        let pick = WindowPicker.pick(kind: call.kind, pid: call.pid)
+        WindowPicker.logCandidates(phase: how, call: call, pick: pick)
+        guard let w = pick.window else {
+            EventLog.shared.log("source_redetect", ["recording_id": recordingId ?? "", "how": how, "outcome": "no_window", "from": currentSource?.json ?? NSNull()],
+                                summary: "record: re-detect found no window for \(call.appName) — keeping \(currentSource?.label ?? "?")")
+            return "no window found for \(call.appName) — keeping the current source"
+        }
+        if case .window(let id, _)? = currentSource, id == w.id {
+            EventLog.shared.log("source_redetect", ["recording_id": recordingId ?? "", "how": how, "outcome": "same", "window_id": Int(w.id), "title": w.title])
+            return "already recording \"\(w.title)\""
+        }
+        let from: Any = currentSource?.json ?? NSNull()
+        sourceMode = "auto"
+        rollSegment(to: .window(w.id, w.title), reason: "\(how): picker now says \"\(w.title)\"")
+        EventLog.shared.log("source_switch", ["recording_id": recordingId ?? "", "how": how, "from": from, "to": ["kind": "window", "window_id": Int(w.id), "title": w.title], "rule": pick.reason],
+                            summary: "record: source switched by \(how) → window #\(w.id) \"\(w.title)\"")
+        return "now recording \"\(w.title)\""
+    }
+
+    /// The person picked a source (preview gear / PWA): roll onto it and stop following the
+    /// call window (the picker's re-resolve keeps checking the window still exists).
+    func switchSource(to source: Source, title: String, how: String = "manual") -> String {
+        guard state == .recording, currentSource?.isAudioOnly != true else { return "not recording video" }
+        if let cur = currentSource, cur.json.description == source.json.description { return "already recording \(title)" }
+        let from: Any = currentSource?.json ?? NSNull()
+        sourceMode = "manual"
+        rollSegment(to: source, reason: "\(how): \(title)")
+        EventLog.shared.log("source_switch", ["recording_id": recordingId ?? "", "how": how, "from": from, "to": source.json, "title": title],
+                            summary: "record: source switched by \(how) → \(source.label)")
+        return "now recording \(title)"
+    }
+
     // MARK: window-gone hold
 
     private func beginWindowGoneHold(reason: String) {
@@ -1120,6 +1165,7 @@ final class RecordingController {
                 "system_error": self.systemStreamFailed ?? NSNull(),
                 "video_frames": self.videoFramesTotal, "video_dup": self.videoDupTotal,
                 "health": endHealth, "health_line": endLine, "stream_failure": self.streamFailure,
+                "source_mode": self.sourceMode, "resources": ResourceSampler.shared.endRecording(),
             ], summary: "record: stopped \(id) (\(reason)) — \(self.segments.count) segment(s), \(secs)s, \(bytes) bytes, mic buffers \(micBuffers), \(endLine), video frames \(self.videoFramesTotal)")
             if unwell {
                 let lines = LogTail.excerpt()

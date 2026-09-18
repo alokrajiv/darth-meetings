@@ -169,6 +169,7 @@ final class RecordDialog: NSObject, NSWindowDelegate {
 
         let panel = NSPanel(contentRect: NSRect(x: 0, y: 0, width: 480, height: 320),
                             styleMask: [.titled, .closable, .utilityWindow], backing: .buffered, defer: false)
+        panel.sharingType = .none   // 0.3.6: never part of another app's screen share / capture
         panel.title = "Darth Recorder"
         panel.isFloatingPanel = true
         panel.level = .floating

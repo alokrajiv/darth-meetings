@@ -1,9 +1,10 @@
 import AppKit
 import CoreGraphics
+import ScreenCaptureKit
 import ServiceManagement
 import RecorderCore
 
-let VERSION = "0.3.4"
+let VERSION = "0.3.6"
 let WS_PORT: UInt16 = 47800
 let PWA_URL = URL(string: "https://meetings.darth-internal.trames.io/")!
 /// Seconds between "the call ended" and an automatic stop.
@@ -46,6 +47,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     var graceDeadline: Date?
     var lastSaved: [String: Any]?
 
+    /// 0.3.6: plain template menu bar glyph whatever the state (no red while recording).
+    var discreet: Bool {
+        get { UserDefaults.standard.bool(forKey: "discreetIcon") }
+        set { UserDefaults.standard.set(newValue, forKey: "discreetIcon"); refreshMenu(); broadcast("status") }
+    }
+    /// 0.3.6: the recording pill fades 10 s after a recording starts (on by default); × hides
+    /// it at once; "Show banner" / ⌘B brings it back. Warnings still come back on their own.
+    var bannerAutoHide: Bool {
+        get { UserDefaults.standard.object(forKey: "bannerAutoHide") as? Bool ?? true }
+        set { UserDefaults.standard.set(newValue, forKey: "bannerAutoHide"); refreshMenu(); broadcast("status") }
+    }
+    static let BANNER_AUTO_HIDE: TimeInterval = 10
+
     /// "Upload recordings automatically" — on by default.
     var autoUpload: Bool {
         get { UserDefaults.standard.object(forKey: "autoUpload") as? Bool ?? true }
@@ -66,6 +80,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     var retryTimer: Timer?
     let stopItem = NSMenuItem(title: "Stop recording", action: #selector(stopFromMenu), keyEquivalent: "s")
     let previewItem = NSMenuItem(title: "Show preview", action: #selector(togglePreview), keyEquivalent: "p")
+    let bannerItem = NSMenuItem(title: "Show banner", action: #selector(toggleBanner), keyEquivalent: "b")
+    let discreetItem = NSMenuItem(title: "Discreet menu bar icon (no red while recording)", action: #selector(toggleDiscreet), keyEquivalent: "")
+    let autoHideItem = NSMenuItem(title: "Hide the recording banner after 10 s", action: #selector(toggleBannerAutoHide), keyEquivalent: "")
     let authItem = NSMenuItem(title: "Sign in to Darth Meetings…", action: #selector(toggleAuth), keyEquivalent: "")
     let uploadItem = NSMenuItem(title: "Upload recordings automatically", action: #selector(toggleAutoUpload), keyEquivalent: "")
     let pendingLine = NSMenuItem(title: "", action: nil, keyEquivalent: "")
@@ -173,6 +190,39 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             self.banner.showMessage(title: "Darth Recorder needs a restart", sub: "Something inside stalled \(Int(seconds)) s ago. It restarts itself when this recording ends.", accent: .warning, stoppable: true)
         }
         watchdog.start()
+
+        // 0.3.6: never part of another app's screen share or capture — the status item's own
+        // window opts out like the banner, preview and Record… dialog do.
+        statusItem.button?.window?.sharingType = .none
+        ResourceSampler.shared.isRecording = { [weak self] in self?.recorder.isRecording ?? false }
+        ResourceSampler.shared.start()
+        banner.onHidden = { [weak self] in self?.refreshMenu() }
+        preview.sourceInfo = { [weak self] in
+            guard let self else { return ("", "auto", [], true) }
+            let cur = self.recorder.currentSource
+            let title: String
+            switch cur {
+            case .window(_, let t)?: title = t
+            case .display(let d)?: title = "Display \(d)"
+            default: title = "audio only"
+            }
+            return (title, self.recorder.sourceMode, self.recorder.call.map { [$0.pid] } ?? [], cur?.isAudioOnly ?? true)
+        }
+        preview.onSetAuto = { [weak self] in
+            guard let self else { return }
+            let out = self.recorder.redetectSource(how: "auto")
+            self.banner.showMessage(title: "Following the call window", sub: out, accent: .info, stoppable: true, near: self.recordingFrame, autoHide: 6)
+        }
+        preview.onRedetect = { [weak self] in
+            guard let self else { return }
+            let out = self.recorder.redetectSource(how: "redetect")
+            self.banner.showMessage(title: "Window re-detected", sub: out, accent: .info, stoppable: true, near: self.recordingFrame, autoHide: 6)
+        }
+        preview.onPickSource = { [weak self] source, title in
+            guard let self else { return }
+            let out = self.recorder.switchSource(to: source, title: title)
+            self.banner.showMessage(title: "Recording source changed", sub: out, accent: .info, stoppable: true, near: self.recordingFrame, autoHide: 6)
+        }
 
         uploader.onProgress = { [weak self] id, seg, pct in
             self?.broadcast("upload_progress", ["recording_id": id, "segment": seg, "pct": pct])
@@ -372,10 +422,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         displayItem.target = self; m.addItem(displayItem)
         stopItem.target = self; m.addItem(stopItem)
         previewItem.target = self; m.addItem(previewItem)
+        bannerItem.target = self; m.addItem(bannerItem)
         m.addItem(.separator())
         authItem.target = self; m.addItem(authItem)
         uploadItem.target = self; m.addItem(uploadItem)
         pendingLine.target = self; pendingLine.action = #selector(uploadPendingFromMenu); m.addItem(pendingLine)
+        m.addItem(.separator())
+        discreetItem.target = self; m.addItem(discreetItem)
+        autoHideItem.target = self; m.addItem(autoHideItem)
         m.addItem(.separator())
         let open = NSMenuItem(title: "Open Darth Meetings", action: #selector(openPWA), keyEquivalent: "o"); open.target = self; m.addItem(open)
         let reveal = NSMenuItem(title: "Show recordings folder", action: #selector(revealFolder), keyEquivalent: ""); reveal.target = self; m.addItem(reveal)
@@ -416,6 +470,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         stopItem.isHidden = !recording
         previewItem.isHidden = !recording
         previewItem.title = preview.isOpen ? "Hide preview" : "Show preview"
+        bannerItem.isHidden = !recording
+        bannerItem.title = banner.isVisible ? "Hide banner" : "Show banner"
+        discreetItem.state = discreet ? .on : .off
+        autoHideItem.state = bannerAutoHide ? .on : .off
         authItem.title = auth.signingIn ? "Signing in…" : (auth.signedIn ? "Signed in as \(auth.email ?? "?") — sign out" : "Sign in to Darth Meetings…")
         authItem.isEnabled = !auth.signingIn
         uploadItem.state = autoUpload ? .on : .off
@@ -428,7 +486,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         else if updater.checking { updateItem.title = "Checking for updates…"; updateItem.isEnabled = false }
         else { updateItem.title = "Check for Updates…"; updateItem.isEnabled = true }
         if let b = statusItem.button {
-            b.image = StatusIcon.image(recording ? .recording : (detector.active.isEmpty ? .idle : .callDetected))
+            b.image = StatusIcon.image(recording ? .recording : (detector.active.isEmpty ? .idle : .callDetected), discreet: discreet)
+            // The status item's window exists only once the item is drawn — re-apply here.
+            b.window?.sharingType = .none
         }
     }
 
@@ -631,6 +691,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     var recordingFrame: CGRect? { recorder.lastWindowFrame ?? recorder.call?.windowFrame }
 
     func recordingStarted() {
+        ResourceSampler.shared.recordingStateChanged()
         updateShareWatcher()
         refreshMenu()
         systemWarned = false
@@ -657,12 +718,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         return audio ? "\(kindName(c.kind)) (audio)" : kindName(c.kind)
     }
 
-    func showRecordingBanner() {
+    func showRecordingBanner(autoHide: Bool? = nil) {
+        let hide = (autoHide ?? bannerAutoHide) ? Self.BANNER_AUTO_HIDE : nil
         banner.showRecording(label: recordingLabel(),
-                             since: recorder.startedAt ?? Date(), near: recordingFrame) { [weak self] in
+                             since: recorder.startedAt ?? Date(), near: recordingFrame, autoHide: hide) { [weak self] in
             self?.recorder.healthLine() ?? "Darth Recorder"
         }
     }
+
+    /// Menu "Show banner" / "Hide banner" (⌘B) while recording — shown again, it stays.
+    @objc func toggleBanner() {
+        guard recorder.isRecording else { return }
+        if banner.isVisible { banner.hide() } else { showRecordingBanner(autoHide: false) }
+        refreshMenu()
+    }
+    @objc func toggleDiscreet() { discreet = !discreet }
+    @objc func toggleBannerAutoHide() { bannerAutoHide = !bannerAutoHide }
 
     /// Once per recording: system audio silent past the threshold → a warning that stays until
     /// dismissed (the recording itself continues). Mic and video only change the tick + event.
@@ -689,6 +760,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func recordingStopped(_ saved: [String: Any]) {
         lastSaved = saved
+        ResourceSampler.shared.recordingStateChanged()
         preview.close(remember: false)   // closes with the recording; the preference is untouched
         updateShareWatcher()
         refreshMenu()
@@ -763,6 +835,31 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     // MARK: PWA protocol
 
+    /// SCK display screenshot — the same content filter a sharing app uses for "share this
+    /// display" (every window, nothing excluded on our side), so it shows exactly what a
+    /// Teams / Meet / Zoom viewer would get. Needs the Screen Recording grant.
+    static func snapshotDisplay(_ displayId: CGDirectDisplayID, to path: String) async -> Bool {
+        do {
+            let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true)
+            guard let display = content.displays.first(where: { $0.displayID == displayId }) ?? content.displays.first else { return false }
+            let filter = SCContentFilter(display: display, excludingWindows: [])
+            let cfg = SCStreamConfiguration()
+            cfg.width = display.width * 2
+            cfg.height = display.height * 2
+            cfg.showsCursor = false
+            let img = try await SCScreenshotManager.captureImage(contentFilter: filter, configuration: cfg)
+            let rep = NSBitmapImageRep(cgImage: img)
+            guard let png = rep.representation(using: .png, properties: [:]) else { return false }
+            let url = URL(fileURLWithPath: (path as NSString).expandingTildeInPath)
+            try png.write(to: url)
+            rlog("display snapshot \(img.width)x\(img.height) → \(url.path)")
+            return true
+        } catch {
+            rlog("display snapshot failed: \(error)")
+            return false
+        }
+    }
+
     func statusPayload() -> [String: Any] {
         let pending = Registry.shared.pendingUpload().count
         var d: [String: Any] = [
@@ -778,6 +875,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             "auto_upload": autoUpload,
             "update_available": updater.available ?? api.serverLatest ?? NSNull(),
             "update_staged": updater.staged?.version ?? NSNull(),
+            "discreet": discreet,
+            "banner_auto_hide": bannerAutoHide,
+            "banner_visible": banner.isVisible,
+            "resources": ResourceSampler.shared.latest ?? NSNull(),
             "ts": isoNow(),
         ]
         if recorder.isRecording {
@@ -789,6 +890,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             d["mic"] = recorder.micActive
             d["options"] = recorder.options.json
             d["audio"] = recorder.healthJSON()
+            d["source"] = recorder.currentSource?.json ?? NSNull()
+            d["source_mode"] = recorder.sourceMode
         }
         if let deadline = graceDeadline {
             d["stopping_in"] = max(0, Int(deadline.timeIntervalSinceNow.rounded()))
@@ -863,6 +966,31 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             broadcast("banner_snapshot", ["ok": ok, "path": path, "onscreen": onscreen ?? NSNull()])
         case "stop": stopRecording(reason: "pwa")
         case "status": broadcast("status")
+        case "redetect_source":                              // 0.3.6: run the window picker again
+            broadcast("source_changed", ["outcome": recorder.redetectSource(how: "pwa")])
+        case "set_auto_source":
+            broadcast("source_changed", ["outcome": recorder.redetectSource(how: "auto")])
+        case "set_source":                                   // {window_id} | {display_id}
+            if let wid = obj["window_id"] as? Int {
+                let title = ShareDetector.windowInfo(CGWindowID(wid))?.title ?? "window #\(wid)"
+                broadcast("source_changed", ["outcome": recorder.switchSource(to: .window(CGWindowID(wid), title), title: title, how: "pwa")])
+            } else if let did = obj["display_id"] as? Int {
+                broadcast("source_changed", ["outcome": recorder.switchSource(to: .display(CGDirectDisplayID(did)), title: "display \(did)", how: "pwa")])
+            }
+        case "set_discreet": if let v = obj["enabled"] as? Bool { discreet = v }
+        case "set_banner_auto_hide": if let v = obj["enabled"] as? Bool { bannerAutoHide = v }
+        case "show_banner": if recorder.isRecording { showRecordingBanner(autoHide: false) } else { banner.showMessage(title: "Darth Recorder", sub: "Not recording", accent: .info, autoHide: 5) }
+        case "hide_banner": banner.hide()
+        case "resources": broadcast("resources", ["sample": ResourceSampler.shared.sample()])
+        case "snapshot_display":                             // test hook: what a Teams/Meet/Zoom share SEES (SCK display capture) → PNG
+            let path = (obj["path"] as? String) ?? "~/Library/Logs/DarthRecorder/display-snapshot.png"
+            let displayId = (obj["display_id"] as? Int).map { CGDirectDisplayID($0) } ?? CGMainDisplayID()
+            Task { @MainActor in
+                let ok = await Self.snapshotDisplay(displayId, to: path)
+                self.broadcast("display_snapshot", ["ok": ok, "path": path])
+            }
+        case "show_test_banner":                             // test hook: a capture-opt-out check target
+            banner.showMessage(title: (obj["title"] as? String) ?? "Test banner", sub: (obj["sub"] as? String) ?? "sharingType = none", accent: .info, autoHide: (obj["seconds"] as? Double) ?? 20)
         case "simulate_call":
             simulate(kind: (obj["kind"] as? String) ?? "teams", pid: pid_t((obj["pid"] as? Int) ?? 0),
                      bundleOverride: obj["bundle_id"] as? String, titleOverride: obj["title"] as? String)

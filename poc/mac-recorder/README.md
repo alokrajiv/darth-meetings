@@ -14,6 +14,70 @@ Native macOS side of Darth Meetings recording (the "Swift tray" angle from Darth
 the user switched it off in the menu (`loginItemUserChoice` in UserDefaults records an explicit choice;
 the default never overrides it). macOS may show "Darth Recorder was added as a login item" once.
 
+**0.3.6 (2026-09-18) — hide-able while sharing, resource telemetry, preview source control:**
+- **Nothing of ours in a screen share.** The banner, the preview panel, the Record… dialog and the
+  menu bar item's own window set `sharingType = .none`: Teams / Meet / Zoom sharing this display (and
+  `screencapture`, and any other app's capture) do not include them; the person still sees them.
+  Verified with `screencapture` of the banner's region while a test banner was up (pixel-identical to
+  the region without it).
+- **Banner:** a × on the recording pill hides it (the recording goes on); it fades on its own 10 s
+  after a recording starts (menu "Hide the recording banner after 10 s", on by default, `bannerAutoHide`);
+  menu "Show banner" / ⌘B brings it back and it then stays. Warnings (a track ✗), the call-ended grace
+  card and the saved card still come back on their own.
+- **Discreet menu bar icon:** menu toggle (`discreetIcon`) — the plain template glyph whatever the state,
+  no red bars, no dot; the menu still shows the recording state and timer.
+- **Resource telemetry** (`ResourceSampler.swift`): every 10 s while recording (60 s idle) — own CPU %
+  (getrusage delta), memory footprint (task_vm_info phys_footprint), threads, system CPU user/sys/idle,
+  system GPU utilisation (IOAccelerator "Device Utilization %"), battery % + state, thermal state, and
+  CPU / GPU die temperatures via the SMC (smctemp's per-chip key sets, M1–M5). While recording each sample
+  is a `resource_sample` event; `recording_stopped` carries `resources` = avg / max per metric, the
+  battery from→to and the worst thermal state. `status` carries the latest sample (`resources`).
+- **Preview gear** (`⚙` next to ✕): "Recording: <window>", **Auto — follow the call window**,
+  **Re-detect the window now**, and **Record this instead:** every display and window the Record… dialog
+  offers (call windows first). A pick rolls a new segment onto it (`source_switch` event with from / to /
+  how; `source_mode` auto | manual in `status` and `recording_stopped`). ws: `redetect_source`,
+  `set_auto_source`, `set_source {window_id|display_id}`, `set_discreet {enabled}`,
+  `set_banner_auto_hide {enabled}`, `show_banner`, `hide_banner`, `resources`, `show_test_banner`.
+
+**Resource profile, measured 2026-09-18 15:54–22:50 SGT (sampler: `top` per 5 s on the tray pid, IOKit GPU
+utilisation, `pmset`, SMC die temperatures via `smctemp` from 16:23; CSV in
+`~/Library/Logs/DarthRecorder/perf-2026-09-18.csv`, M-series MacBook Pro, Meet window recording then a Teams
+window recording with camera off):**
+
+| phase | tray CPU avg / max | tray RSS avg / max | threads | system GPU util | CPU die °C avg / max |
+|---|---|---|---|---|---|
+| Meet recording, preview OPEN, on battery (3 min) | 8.9 % / 10.1 % | 240 / 241 MB | 26 | 65 % | – |
+| Meet recording, preview closed, on battery (15 min) | 5.5 % / 6.5 % | 71 / 77 MB | 12 | 45 % | – |
+| Meet recording, preview closed, charging (18 min) | 5.5 % / 6.4 % | 57 / 63 MB | 13 | 58 % | 68 / 75 |
+| Teams recording, camera off, charging (58 min) | 9.9 % / 19.1 % | 221 / 249 MB | 25 | 40 % | 67 / 83 |
+| idle tray afterwards (5 h) | 1.2 % / 9.8 % | 55 / 65 MB | 7 | 44 % | 64–72 / 101 |
+
+- The **preview panel costs ~4 CPU points, ~165 MB and 13 threads** (the CoreImage thumbnail pipeline + its
+  retained buffers, not the level strips). Closing it is the single biggest saving while recording.
+- The Teams recording phase shows the preview-open signature (25 threads, 220–250 MB) — either the preview was
+  reopened for it, or a Teams window capture retains more than a Meet one; the per-recording resource events
+  of 0.3.6 will tell.
+- **The tray is not the thermal driver.** The CPU die was *hotter* idle after the recordings (mediaanalysisd,
+  Chrome helpers, WindowServer at 26–56 %) than during them; during the Teams recording it sat at 65–68 °C
+  and only spiked to 78 °C in the last minute. GPU utilisation is WindowServer + Chrome, the tray's share is
+  negligible. Battery on the Meet recording with the preview closed: 70 % → 62 % in 15 min (~32 %/h, most of
+  it Chrome + WindowServer + coreaudiod per the top-process column).
+
+**0.3.5 (2026-09-18) — uploads through the resumable session + darth uploads (Azure Blob):**
+`Uploader.swift` no longer streams a whole file through `POST /api/transcripts` (nginx + one TCP
+stream over the Tailscale relay: the 1.3 GB Meet and 638 MB Teams recordings of 2026-09-18 died with
+HTTP 408 on every 30-minute retry). It now uses the same session the web app uses — `POST /api/uploads`
+(whole-file sha256 as the fingerprint, `via: "blob"`, `recorderRecordingId`, `multi` for segments) →
+bytes → `POST …/complete`. The SERVER picks the byte path: **blob** (the open reply carries a per-blob
+SAS on `darthuploads/meetings`; 4 MiB `Put Block`s straight to Azure, `parallel` at a time, `Put Block
+List`, then the VM pulls the committed blob once — `docs/darth-uploads.md`) or **chunks** (a host
+without the account: `PUT /api/uploads/:id/chunks/:idx`, 4 at a time, sha256 per chunk). Every retry
+(a drop, a quit, an update, the 30-min timer) re-opens the SAME session and sends only what Azure / the
+server does not hold yet. Backoff 1/2/4/8/15/30 s inside a 30-min window per `upload` call; a 401/403
+from Blob re-mints the SAS; `complete` handles 409 not-committed / missing (re-sync), 409 completing
+(poll), 503 (the VM's pull hiccuped — again), 404/410 (start over once). Progress is per acknowledged
+block (4 MiB) rather than per byte in flight.
+
 **0.3.4 (2026-09-18):** AGC gain now only RISES after 3 consecutive signal buffers (300 ms). 0.3.3 in a
 quiet room still reached +24 dB on isolated key clicks before anyone spoke (11 signal buffers, none
 sustained). Attack is unchanged (instant, every buffer).

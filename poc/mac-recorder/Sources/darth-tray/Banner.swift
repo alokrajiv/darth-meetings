@@ -21,6 +21,9 @@ final class BannerController {
     var onDismiss: (() -> Void)?
     /// 0.3.0: the "Preview" capsule on the recording pill.
     var onPreview: (() -> Void)?
+    /// 0.3.6: the pill was closed (× / auto-hide) — the menu's "Show banner" brings it back.
+    var onHidden: (() -> Void)?
+    var isVisible: Bool { panel?.isVisible == true }
     var frame: NSRect? { panel?.isVisible == true ? panel?.frame : nil }
     var screen: NSScreen? { panel?.screen }
 
@@ -53,6 +56,8 @@ final class BannerController {
     private let dot = NSView()
     private let primary = CapsuleButton(title: "Record", filled: true)
     private let secondary = CapsuleButton(title: "Not now", filled: false)
+    /// 0.3.6: × on the recording pill — hides it (the recording goes on; the menu shows it again).
+    private let closeButton = NSButton(title: "✕", target: nil, action: nil)
     private var currentAccent: Accent = .call
 
     private let fullWidth: CGFloat = 480
@@ -78,10 +83,14 @@ final class BannerController {
         EventLog.shared.log("banner_shown", ["kind": "call", "call": call.json])
     }
 
-    /// Recording: compact pill with the clock and Stop, stays for the whole recording.
-    /// `detail` (0.2.6) is asked every second for the health ticks ("video ✓ · mic ✓ · system ✗").
-    func showRecording(label: String, since: Date, near frame: CGRect?, detail: (() -> String)? = nil) {
+    /// Recording: compact pill with the clock and Stop. `detail` (0.2.6) is asked every second
+    /// for the health ticks ("video ✓ · mic ✓ · system ✗"). 0.3.6: `autoHide` seconds after
+    /// which the pill fades on its own (the recording goes on — the menu's "Show banner" or
+    /// ⌘B brings it back), and a × to hide it at once. Warnings, the call-ended grace and
+    /// the saved card still come back on their own.
+    func showRecording(label: String, since: Date, near frame: CGRect?, autoHide: TimeInterval? = nil, detail: (() -> String)? = nil) {
         set(symbol: "record.circle.fill", accent: .recording, title: "Recording \(label)", sub: "00:00 · Darth Recorder")
+        closeButton.isHidden = false
         dot.isHidden = false
         startPulse()
         primary.isHidden = false
@@ -98,8 +107,8 @@ final class BannerController {
         }
         update()
         tickTimer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { _ in update() }
-        present(compact: true, autoHideAfter: nil, near: frame)
-        EventLog.shared.log("banner_shown", ["kind": "recording", "label": label])
+        present(compact: true, autoHideAfter: autoHide, near: frame)
+        EventLog.shared.log("banner_shown", ["kind": "recording", "label": label, "auto_hide_s": autoHide ?? NSNull()])
     }
 
     /// The call ended while we were recording: 60 s to decide.
@@ -188,8 +197,10 @@ final class BannerController {
     func hide() {
         hideTimer?.invalidate(); hideTimer = nil
         tickTimer?.invalidate(); tickTimer = nil
+        let was = panel?.isVisible == true
         panel?.orderOut(nil)
         EventLog.shared.log("banner_hidden", [:])
+        if was { onHidden?() }
     }
 
     // MARK: internals
@@ -206,6 +217,7 @@ final class BannerController {
         iconCircle.layer?.borderColor = accent.color.withAlphaComponent(0.55).cgColor
         (panel?.contentView as? NSVisualEffectView)?.layer?.borderColor = accent.color.withAlphaComponent(0.35).cgColor
         primary.fill = accent.color
+        closeButton.isHidden = true
         dot.isHidden = true
         dot.layer?.removeAllAnimations()
         titleLabel.stringValue = title
@@ -267,6 +279,9 @@ final class BannerController {
         p.hidesOnDeactivate = false
         p.isMovableByWindowBackground = true
         p.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary]
+        // 0.3.6: never part of another app's screen share or capture (Teams / Meet / Zoom
+        // sharing this display do not include the pill; the person still sees it).
+        p.sharingType = .none
         // Explicit dark appearance: the HUD material is dark in both system appearances, so
         // without this the labels come out black-on-dark in Light Mode.
         p.appearance = NSAppearance(named: .darkAqua)
@@ -317,7 +332,14 @@ final class BannerController {
         text.translatesAutoresizingMaskIntoConstraints = false
         for b in [primary, secondary] { b.translatesAutoresizingMaskIntoConstraints = false }
         primary.keyEquivalent = "\r"
-        let buttons = NSStackView(views: [primary, secondary])
+        closeButton.isBordered = false
+        closeButton.font = .systemFont(ofSize: 11, weight: .bold)
+        closeButton.contentTintColor = .secondaryLabelColor
+        closeButton.target = self; closeButton.action = #selector(closeTapped)
+        closeButton.toolTip = "Hide this banner (the recording continues; the menu shows it again)"
+        closeButton.isHidden = true
+        closeButton.translatesAutoresizingMaskIntoConstraints = false
+        let buttons = NSStackView(views: [primary, secondary, closeButton])
         buttons.orientation = .horizontal
         buttons.spacing = 8
         buttons.translatesAutoresizingMaskIntoConstraints = false
@@ -444,7 +466,16 @@ final class BannerController {
         NSAnimationContext.runAnimationGroup({ ctx in
             ctx.duration = 0.35
             p.animator().alphaValue = 0
-        }, completionHandler: { [weak self] in self?.panel?.orderOut(nil); self?.panel?.alphaValue = 1 })
+        }, completionHandler: { [weak self] in
+            self?.panel?.orderOut(nil); self?.panel?.alphaValue = 1
+            EventLog.shared.log("banner_hidden", ["auto": true])
+            self?.onHidden?()
+        })
+    }
+
+    @objc private func closeTapped() {
+        EventLog.shared.log("banner_click", ["button": "close"], summary: "banner: hidden by the user (×)")
+        hide()
     }
 
     @objc private func recordTapped() {

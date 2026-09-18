@@ -25,6 +25,16 @@ final class PreviewPanel: NSObject, NSWindowDelegate {
     private var converting = false
     private(set) var framesShown = 0
     var onClosed: (() -> Void)?
+    /// 0.3.6 source control (the gear): "Auto" re-detects the call window and keeps following
+    /// it, "Re-detect" runs the picker once, "Switch to…" rolls a new segment onto the chosen
+    /// window / display. Wired by main.swift onto RecordingController.
+    var onSetAuto: (() -> Void)?
+    var onRedetect: (() -> Void)?
+    var onPickSource: ((RecordingController.Source, String) -> Void)?
+    /// What the gear menu shows: the current source label, the mode ("auto" | "manual"), the
+    /// call's pids (its windows listed first) and whether this recording has video at all.
+    var sourceInfo: (() -> (current: String, mode: String, callPids: [pid_t], audioOnly: Bool))?
+    private let gear = NSButton(title: "", target: nil, action: nil)
     /// Asked at 10 Hz: (systemMeter, micMeter, health, mic AGC gain in dB) — nil meter = track not requested.
     var levelsProvider: (() -> (system: LevelMeter?, mic: LevelMeter?, systemOK: Bool?, micOK: Bool?, audioOnly: Bool, micGainDb: Float))?
 
@@ -116,6 +126,7 @@ final class PreviewPanel: NSObject, NSWindowDelegate {
         p.hidesOnDeactivate = false
         p.isMovableByWindowBackground = true
         p.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary]
+        p.sharingType = .none   // 0.3.6: never part of another app's screen share / capture
         p.appearance = NSAppearance(named: .darkAqua)
         p.delegate = self
 
@@ -160,6 +171,13 @@ final class PreviewPanel: NSObject, NSWindowDelegate {
         close.font = .systemFont(ofSize: 11, weight: .bold)
         close.contentTintColor = .secondaryLabelColor
         close.translatesAutoresizingMaskIntoConstraints = false
+        gear.image = NSImage(systemSymbolName: "gearshape.fill", accessibilityDescription: "Recording source")
+        gear.symbolConfiguration = .init(pointSize: 11, weight: .bold)
+        gear.isBordered = false
+        gear.contentTintColor = .secondaryLabelColor
+        gear.target = self; gear.action = #selector(gearTapped)
+        gear.toolTip = "Which window is being recorded — auto, re-detect, or pick one"
+        gear.translatesAutoresizingMaskIntoConstraints = false
 
         let stack = NSStackView(views: [thumb, systemBar, systemStrip, micBar, micStrip])
         stack.orientation = .vertical
@@ -169,7 +187,10 @@ final class PreviewPanel: NSObject, NSWindowDelegate {
         stack.translatesAutoresizingMaskIntoConstraints = false
         fx.addSubview(stack)
         fx.addSubview(close)
+        fx.addSubview(gear)
         NSLayoutConstraint.activate([
+            gear.trailingAnchor.constraint(equalTo: close.leadingAnchor, constant: -10),
+            gear.centerYAnchor.constraint(equalTo: close.centerYAnchor),
             stack.leadingAnchor.constraint(equalTo: fx.leadingAnchor),
             stack.trailingAnchor.constraint(equalTo: fx.trailingAnchor),
             stack.topAnchor.constraint(equalTo: fx.topAnchor),
@@ -192,6 +213,52 @@ final class PreviewPanel: NSObject, NSWindowDelegate {
     }
 
     @objc private func closeTapped() { close(remember: true); onClosed?() }
+
+    /// The gear menu (0.3.6): current source, Auto / Re-detect, then every display and window
+    /// the Record… dialog would offer (call windows first).
+    @objc private func gearTapped() {
+        guard let info = sourceInfo?() else { return }
+        let m = NSMenu()
+        let head = NSMenuItem(title: info.audioOnly ? "Audio-only recording (no video source)" : "Recording: \(info.current)", action: nil, keyEquivalent: "")
+        head.isEnabled = false
+        m.addItem(head)
+        if info.audioOnly {
+            gear.menu = m
+            m.popUp(positioning: nil, at: NSPoint(x: 0, y: gear.bounds.height + 4), in: gear)
+            return
+        }
+        let auto = NSMenuItem(title: "Auto — follow the call window", action: #selector(autoTapped), keyEquivalent: "")
+        auto.target = self; auto.state = info.mode == "auto" ? .on : .off
+        m.addItem(auto)
+        let re = NSMenuItem(title: "Re-detect the window now", action: #selector(redetectTapped), keyEquivalent: "")
+        re.target = self
+        m.addItem(re)
+        m.addItem(.separator())
+        let pick = NSMenuItem(title: "Record this instead:", action: nil, keyEquivalent: "")
+        pick.isEnabled = false
+        m.addItem(pick)
+        let src = RecordDialog.sources(callPids: info.callPids)
+        pickable = []
+        for e in src.displays + Array(src.windows.prefix(18)) {
+            let item = NSMenuItem(title: e.title, action: #selector(pickTapped(_:)), keyEquivalent: "")
+            item.target = self
+            item.tag = pickable.count
+            item.state = e.title == info.current ? .on : .off
+            pickable.append(e)
+            m.addItem(item)
+        }
+        gear.menu = m
+        m.popUp(positioning: nil, at: NSPoint(x: 0, y: gear.bounds.height + 4), in: gear)
+    }
+    private var pickable: [RecordDialog.SourceEntry] = []
+    @objc private func autoTapped() { EventLog.shared.log("preview_click", ["button": "auto"]); onSetAuto?() }
+    @objc private func redetectTapped() { EventLog.shared.log("preview_click", ["button": "redetect"]); onRedetect?() }
+    @objc private func pickTapped(_ sender: NSMenuItem) {
+        guard sender.tag < pickable.count else { return }
+        let e = pickable[sender.tag]
+        EventLog.shared.log("preview_click", ["button": "pick", "source": e.source.json, "title": e.title])
+        onPickSource?(e.source, e.title)
+    }
 }
 
 /// One level bar: −60…0 dBFS, fill green when audible / grey when quiet / red when the track is

@@ -9,7 +9,10 @@ enum StatusIcon {
     /// Bar heights relative to the tallest, measured off the app icon.
     private static let bars: [CGFloat] = [0.38, 0.72, 1.0, 0.72, 0.38]
 
-    static func image(_ state: State) -> NSImage {
+    /// `discreet` (0.3.6): the plain template glyph whatever the state — no red, no dot — for
+    /// people who share their screen and do not want the menu bar to say they are recording.
+    static func image(_ state: State, discreet: Bool = false) -> NSImage {
+        let state = discreet ? State.idle : state
         let size = NSSize(width: 20, height: 18)
         let img = NSImage(size: size, flipped: false) { rect in
             let barW: CGFloat = 2.6
