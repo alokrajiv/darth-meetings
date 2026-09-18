@@ -131,6 +131,8 @@ export type CompanionState = {
   recording: boolean;
   recordingSince: string | null;
   recordingPath: string | null;
+  /** The registry id of the recording in progress (0.2.0+ snapshots carry `recording_id`). */
+  recordingId: string | null;
   recordingLabel: string | null;
   /** null = the tray does not report it (legacy). */
   signedIn: boolean | null;
@@ -195,6 +197,7 @@ const initial: CompanionState = {
   recording: false,
   recordingSince: null,
   recordingPath: null,
+  recordingId: null,
   recordingLabel: null,
   signedIn: null,
   authPrompt: null,
@@ -524,6 +527,7 @@ class CompanionClient {
       recording,
       recordingSince: recording ? str(m.recording_since) : null,
       recordingPath: recording ? str(m.recording_path) : null,
+      recordingId: recording ? str(m.recording_id) : null,
       recordingLabel: recording ? str(m.recording_label) : null,
       signedIn: typeof m.signed_in === 'boolean' ? m.signed_in : null,
       // A signed-in snapshot ends any pending approval prompt.
@@ -633,19 +637,44 @@ export function useCompanionRecordings(enabled = true): CompanionRecordingsState
 
   // Fold live upload_* events over the last snapshot so a row moves without
   // waiting for the refetch to land.
+  const live = { recording: c.recording, recordingId: c.recordingId };
   const merged = useMemo(
     () =>
-      recordings.map((r) => {
+      recordings.map((raw) => {
+        const r = foldStaleRecording(raw, live);
         const u = c.uploads[r.id];
         if (!u) return r;
         if (u.status === 'uploading') return { ...r, status: 'uploading' as const };
         if (u.status === 'done') return { ...r, status: 'uploaded' as const, transcript_id: r.transcript_id ?? u.transcriptId };
         return { ...r, status: 'upload_failed' as const, error: r.error ?? u.error };
       }),
-    [recordings, c.uploads]
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- `live` is rebuilt every render; its two scalars are the real inputs
+    [recordings, c.uploads, live.recording, live.recordingId]
   );
 
   return { recordings: merged, loading, error, refresh };
+}
+
+/**
+ * A registry row still at `recording` while the tray says nothing is being
+ * recorded (or a different id is) belongs to a process that died mid-recording.
+ * Trays from 0.3.7 repair such rows at launch; for older trays — and for the
+ * window before that launch — the page repairs the VIEW the same way, so the
+ * upload picker never shows a disabled spinner that nothing can resolve
+ * (3936556e, "Recording now" since 2026-09-16, seen 2026-09-19). Files with
+ * bytes → `local` (Upload works: the tray's upload only needs the files);
+ * nothing on disk → `upload_failed`.
+ */
+export function foldStaleRecording(
+  r: CompanionRecording,
+  live: Pick<CompanionState, 'recording' | 'recordingId'>
+): CompanionRecording {
+  if (r.status !== 'recording') return r;
+  if (live.recording && (live.recordingId == null || live.recordingId === r.id)) return r;
+  const hasBytes = r.files.length > 0 && r.bytes > 0;
+  return hasBytes
+    ? { ...r, status: 'local' }
+    : { ...r, status: 'upload_failed', error: r.error ?? 'capture never finished — the recorder was not running when the call ended' };
 }
 
 // NOT upload_progress: the tray broadcasts it for every debounced byte-count

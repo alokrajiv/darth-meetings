@@ -64,6 +64,9 @@ export function recorderMacLabel(rec: RecorderRecordingRef): string {
 
 export type RecorderRowAction = 'upload' | 'nudge' | 'open' | null;
 
+/** A `recording` row older than this is treated as one the tray lost, not a live call. */
+export const RECORDING_STALE_MS = 12 * 3600_000;
+
 /**
  * The line a calendar row shows when a Darth Recorder recording matched the
  * occurrence — it REPLACES the "recorded elsewhere — not importable here"
@@ -72,7 +75,7 @@ export type RecorderRowAction = 'upload' | 'nudge' | 'open' | null;
  */
 export function recorderRowCopy(
   rec: RecorderRecordingRef,
-  opts: { durationText?: string | null; originalNote?: string | null } = {}
+  opts: { durationText?: string | null; originalNote?: string | null; now?: number } = {}
 ): { text: string; action: RecorderRowAction; actionLabel: string | null; title: string } {
   const where = recorderMacLabel(rec);
   const dur = opts.durationText ? ` (${opts.durationText})` : '';
@@ -97,6 +100,19 @@ export function recorderRowCopy(
     };
   }
   if (rec.status === 'recording') {
+    // A row the tray never moved on (a process that died mid-recording; trays
+    // before 0.3.7 also never told the server about a failed capture) is not
+    // "now…" a day later — 80eddbe9 sat like that on its calendar row.
+    const startedMs = rec.startedAt ? Date.parse(rec.startedAt) : NaN;
+    const stale = Number.isFinite(startedMs) && (opts.now ?? Date.now()) - startedMs > RECORDING_STALE_MS;
+    if (stale) {
+      return {
+        text: `Recording on ${where} never finished${dur}`,
+        action: null,
+        actionLabel: null,
+        title: `${base} · the recorder stopped reporting on it; if the file exists it shows under Settings › Darth Recorder`,
+      };
+    }
     return {
       text: `Recording on ${where} now…`,
       action: null,
