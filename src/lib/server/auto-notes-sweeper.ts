@@ -9,6 +9,7 @@ import {
   softDeleteForUser,
 } from '@/db-ops/transcripts';
 import { deleteUploadSession, listExpiredUploadSessions } from '@/db-ops/upload-sessions';
+import { uploadsStore } from '@/lib/server/darth-uploads-store';
 import { deleteAudioFile, deleteAudioFilesByPrefix } from '@/lib/server/audio-storage';
 import { generateAutoNotes, identifySpeakers } from '@/lib/server/auto-notes';
 import { SCRATCH_TTL_DAYS } from '@/lib/format';
@@ -93,8 +94,13 @@ async function sweep(): Promise<void> {
     const expired = await listExpiredUploadSessions(SESSION_IDLE_HOURS, 20);
     for (const s of expired) {
       if (s.status === 'open' || s.status === 'completing') {
-        console.log(`[notes-sweeper] reaping expired upload session ${s.id} (${s.status})`);
+        console.log(`[notes-sweeper] reaping expired upload session ${s.id} (${s.status}, ${s.via})`);
         await deleteAudioFile(s.temp_filename).catch(() => {});
+        if (s.via === 'blob' && s.blob_name) {
+          await uploadsStore()
+            ?.delete(s.blob_name)
+            .catch((err) => console.warn(`[notes-sweeper] blob delete failed ${s.id}:`, err));
+        }
         const firstPart = !(s.spec?.multi && s.spec.multi.index > 1);
         if (firstPart) {
           // Only the still-uploading placeholder — never a promoted row

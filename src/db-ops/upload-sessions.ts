@@ -6,6 +6,9 @@ import type { UploadSpec } from '@/lib/server/upload-pipeline';
 const SCHEMA = SCHEMAS.MEETING_WHISPERER;
 
 export type UploadSessionStatus = 'open' | 'completing' | 'done' | 'failed';
+/** How the bytes reach the VM: chunk PUTs through nginx, or the Azure Blob
+ * transit (darth uploads, migration 043 — see src/lib/darth-uploads-shared.ts). */
+export type UploadSessionVia = 'chunks' | 'blob';
 
 export interface UploadSessionRow {
   id: string;
@@ -21,6 +24,11 @@ export interface UploadSessionRow {
   error: string | null;
   /** assemblyai_id of the finished transcript once status is 'done'. */
   result_id: string | null;
+  via: UploadSessionVia;
+  /** Blob sessions only (migration 043). */
+  blob_name: string | null;
+  sha256: string | null;
+  sas_expires_at: Date | null;
   created_at: Date;
   updated_at: Date;
   completed_at: Date | null;
@@ -66,19 +74,33 @@ export async function createUploadSession(data: {
   tempFilename: string;
   placeholderId: string;
   spec: UploadSpec;
+  /** Blob transit session (migration 043): the blob name, the client's
+   * whole-file sha256 and the minted SAS expiry. Absent = chunk session. */
+  blob?: { blobName: string; sha256: string; sasExpiresAt: Date } | null;
 }): Promise<UploadSessionRow> {
   const rows = await sql<UploadSessionRow[]>`
     INSERT INTO ${sql(SCHEMA)}.upload_sessions (
       id, user_id, fingerprint, size, chunk_size, chunk_count,
-      temp_filename, placeholder_id, spec
+      temp_filename, placeholder_id, spec, via, blob_name, sha256, sas_expires_at
     ) VALUES (
       ${data.id}, ${data.userId}, ${data.fingerprint}, ${data.size},
       ${data.chunkSize}, ${data.chunkCount}, ${data.tempFilename},
-      ${data.placeholderId}, ${sql.json(data.spec as unknown as never)}
+      ${data.placeholderId}, ${sql.json(data.spec as unknown as never)},
+      ${data.blob ? 'blob' : 'chunks'}, ${data.blob?.blobName ?? null},
+      ${data.blob?.sha256 ?? null}, ${data.blob?.sasExpiresAt ?? null}
     )
     RETURNING *
   `;
   return coerce(rows[0]!);
+}
+
+/** A blob session's SAS was re-minted (resume after expiry): record the new expiry. */
+export async function touchUploadSessionSas(id: string, sasExpiresAt: Date): Promise<void> {
+  await sql`
+    UPDATE ${sql(SCHEMA)}.upload_sessions
+    SET sas_expires_at = ${sasExpiresAt}, updated_at = now()
+    WHERE id = ${id}
+  `;
 }
 
 /** Indices of the chunks the server has fully received and acknowledged. */

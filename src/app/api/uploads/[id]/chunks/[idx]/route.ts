@@ -47,6 +47,12 @@ export const PUT = withAuth(async ({ user, request }, { params }) => {
       { status: 410 }
     );
   }
+  if (session.via === 'blob') {
+    return NextResponse.json(
+      { error: 'This upload session takes blocks via Azure Blob, not chunks', via: 'blob' },
+      { status: 409 }
+    );
+  }
   if (!Number.isInteger(idx) || idx < 0 || idx >= session.chunk_count) {
     return NextResponse.json({ error: 'Chunk index out of range' }, { status: 409 });
   }

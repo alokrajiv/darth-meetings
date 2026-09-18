@@ -6,6 +6,7 @@ import {
   listReceivedChunks,
 } from '@/db-ops/upload-sessions';
 import { abandonUpload } from '@/lib/server/upload-pipeline';
+import { uploadsStore } from '@/lib/server/darth-uploads-store';
 
 export const runtime = 'nodejs';
 
@@ -23,6 +24,7 @@ export const GET = withAuth(async ({ user }, { params }) => {
   const received = session.status === 'open' ? await listReceivedChunks(session.id) : [];
   return NextResponse.json({
     id: session.id,
+    via: session.via,
     status: session.status,
     error: session.error,
     chunkSize: session.chunk_size,
@@ -43,6 +45,13 @@ export const DELETE = withAuth(async ({ user }, { params }) => {
   const session = await getUploadSessionForUser(user.userId, id);
   if (!session) return NextResponse.json({ error: 'Upload session not found' }, { status: 404 });
   if (session.status === 'open') await abandonUpload(user, session.spec);
+  // A blob session: whatever Azure holds for it (staged blocks or the
+  // committed blob) goes too — the lifecycle rule is only the safety net.
+  if (session.via === 'blob' && session.blob_name) {
+    await uploadsStore()
+      ?.delete(session.blob_name)
+      .catch((err) => console.warn(`[uploads] blob delete on abort failed ${id}:`, err));
+  }
   await deleteUploadSession(session.id);
   return NextResponse.json({ ok: true });
 });

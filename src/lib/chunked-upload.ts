@@ -2,6 +2,9 @@
 
 import type { StoredTranscript } from '@/lib/format';
 import { chunkByteRange } from '@/lib/upload-chunking';
+import { UPLOAD_BLOB_MIN_BYTES, type BlobUploadTicket } from '@/lib/darth-uploads-shared';
+import { BlobUploadError, isAbortError, uploadBlobBlocks } from '@/lib/blob-blocks';
+import { hashFile, hashingAvailable } from '@/lib/sha256';
 
 /**
  * Chunked, parallel, resumable browser upload against /api/uploads.
@@ -18,6 +21,15 @@ import { chunkByteRange } from '@/lib/upload-chunking';
  * SG) crawls no matter the bandwidth; 4 streams fill the pipe. Why chunks:
  * a drop costs one chunk, not the file — and a re-dropped file continues
  * where it stopped, even after a reload.
+ *
+ * darth uploads (2026-09-18, src/lib/darth-uploads-shared.ts): a file ≥
+ * UPLOAD_BLOB_MIN_BYTES is first hashed in a Web Worker, and the open call
+ * asks for `via: 'blob'`. When the host grants it (DARTH_UPLOADS_ACCOUNT
+ * configured), step 3 becomes parallel 4 MiB block PUTs straight to Azure
+ * Blob (src/lib/blob-blocks.ts — Tailscale and nginx out of the byte path,
+ * resume from the uncommitted block list Azure keeps) and step 4's complete
+ * makes the VM pull the committed blob once. When the host says `via:
+ * 'chunks'` nothing changes. Same session, same resume key, same complete.
  */
 
 export const PARALLELISM = 4;
@@ -35,6 +47,10 @@ export interface ChunkedUploadParams {
    * Temporary tab, auto-trashed after 30 days. Server ignores it when
    * `linkedEvent` is set. */
   scratch?: boolean;
+  /** Darth Recorder registry row these bytes came from (the caller's own). */
+  recorderRecordingId?: string | null;
+  /** Force the chunk path even for a big file (tests / a browser without workers). */
+  noBlob?: boolean;
 }
 
 export interface ChunkedUploadHooks {
@@ -59,11 +75,30 @@ export class UploadError extends Error {
 
 interface SessionReply {
   id: string;
+  /** Absent on an older server = chunks. */
+  via?: 'chunks' | 'blob';
   chunkSize: number;
   chunkCount: number;
   received: number[];
   resumed: boolean;
   transcript: StoredTranscript;
+  /** Present when via === 'blob'. */
+  blob?: BlobUploadTicket;
+}
+
+/** What the open call sends for the blob path (null = chunks). */
+interface BlobAsk {
+  sha256: string;
+  coarse: boolean;
+}
+
+/** A phone / tablet pointer → the server halves the block parallelism. */
+function coarsePointer(): boolean {
+  try {
+    return typeof window !== 'undefined' && !!window.matchMedia?.('(pointer: coarse)').matches;
+  } catch {
+    return false;
+  }
 }
 
 const hex = (buf: ArrayBuffer) =>
@@ -141,7 +176,8 @@ async function openSession(
   file: File,
   fingerprint: string,
   params: ChunkedUploadParams,
-  signal?: AbortSignal
+  signal?: AbortSignal,
+  blob: BlobAsk | null = null
 ): Promise<SessionReply> {
   let attempt = 0;
   for (;;) {
@@ -164,6 +200,8 @@ async function openSession(
             sourceId: params.sourceId ?? undefined,
             multi: params.multi ?? undefined,
             scratch: params.scratch ? true : undefined,
+            recorderRecordingId: params.recorderRecordingId ?? undefined,
+            ...(blob ? { via: 'blob', sha256: blob.sha256, coarse: blob.coarse || undefined } : {}),
           }),
         },
         signal
@@ -184,6 +222,8 @@ async function openSession(
 }
 
 class SessionGone extends Error {}
+/** …/complete said the blob is not committed yet: re-sync the blocks and commit again. */
+class NotCommitted extends Error {}
 
 /** PUT one chunk via XHR (gives in-flight progress). Resolves when the
  * server acknowledges it; rejects with SessionGone on 404/410. */
@@ -306,7 +346,14 @@ async function completeSession(
 ): Promise<StoredTranscript> {
   const { signal } = hooks;
   hooks.onNote?.('Finalizing…');
-  type Done = { transcript?: StoredTranscript; status?: string; transcriptId?: string | null; error?: string; missing?: number[] };
+  type Done = {
+    transcript?: StoredTranscript;
+    status?: string;
+    transcriptId?: string | null;
+    error?: string;
+    missing?: number[];
+    notCommitted?: boolean;
+  };
   let attempt = 0;
   for (;;) {
     attempt++;
@@ -327,6 +374,13 @@ async function completeSession(
         lost = true; // someone (an earlier attempt of ours) is finalizing — poll
       } else if (status === 409 && body.missing) {
         throw new SessionGone(JSON.stringify(body)); // caller re-syncs chunks
+      } else if (status === 409 && body.notCommitted) {
+        throw new NotCommitted(); // blob path: caller re-syncs the blocks
+      } else if (status === 503) {
+        // Blob path: the VM's pull from Azure hiccuped and the session was
+        // reopened — the same complete again after a pause.
+        hooks.onNote?.('Transfer from blob storage hiccuped — retrying…');
+        if (attempt >= 20) throw new UploadError(body.error ?? 'Upload failed: transfer kept failing', status);
       } else if (status === 404 || status === 410) {
         throw new SessionGone(body.error ?? 'session gone');
       } else if (status >= 400 && status < 500) {
@@ -400,9 +454,44 @@ export async function uploadFileChunked(
   hooks: ChunkedUploadHooks = {}
 ): Promise<StoredTranscript> {
   const fingerprint = await fingerprintFile(file, params.multi);
+  // Big file + a browser that can hash in a worker → ask for the blob path.
+  // The hash is what the VM verifies the pulled bytes against.
+  let blobAsk: BlobAsk | null = null;
+  if (!params.noBlob && file.size >= UPLOAD_BLOB_MIN_BYTES && hashingAvailable()) {
+    try {
+      hooks.onNote?.('Preparing — reading the file…');
+      const sha256 = await hashFile(
+        file,
+        (pct) => hooks.onNote?.(`Preparing — reading the file… ${pct}%`),
+        hooks.signal
+      );
+      blobAsk = { sha256, coarse: coarsePointer() };
+    } catch (err) {
+      if (hooks.signal?.aborted || isAbortError(err)) throw new UploadError('Upload cancelled');
+      // A worker that cannot run: the chunk path is always there.
+      blobAsk = null;
+    } finally {
+      hooks.onNote?.(null);
+    }
+  }
   let restarts = 0;
   for (;;) {
-    const session = await openSession(file, fingerprint, params, hooks.signal);
+    const session = await openSession(file, fingerprint, params, hooks.signal, blobAsk);
+    if (session.via === 'blob' && session.blob) {
+      try {
+        return await uploadViaBlob(file, session, fingerprint, params, blobAsk!, hooks);
+      } catch (err) {
+        if (err instanceof SessionGone && restarts < 1) {
+          restarts++;
+          hooks.onNote?.('Upload session expired — starting over');
+          continue;
+        }
+        if (err instanceof SessionGone) throw new UploadError('Upload session expired — please try again');
+        throw err;
+      } finally {
+        hooks.onNote?.(null);
+      }
+    }
     if (session.resumed) {
       let bytes = 0;
       for (const i of session.received) bytes += chunkByteRange(file.size, session.chunkSize, i).length;
@@ -437,4 +526,58 @@ export async function uploadFileChunked(
       hooks.onNote?.(null);
     }
   }
+}
+
+/**
+ * The blob path of one session: blocks straight to Azure (resuming from
+ * whatever Blob already holds), commit, then the same complete as the
+ * chunk path — which makes the VM pull the blob. A complete that finds the
+ * blob uncommitted (an ack raced) re-syncs the blocks once more.
+ */
+async function uploadViaBlob(
+  file: File,
+  session: SessionReply,
+  fingerprint: string,
+  params: ChunkedUploadParams,
+  ask: BlobAsk,
+  hooks: ChunkedUploadHooks
+): Promise<StoredTranscript> {
+  let ticket = session.blob!;
+  // A fresh SAS for the same blob: re-open the session (same fingerprint →
+  // same session id → same blob name). A server that no longer grants the
+  // blob path answers via 'chunks' — then the session is gone for us.
+  const renewTicket = async (): Promise<BlobUploadTicket> => {
+    const again = await openSession(file, fingerprint, params, hooks.signal, ask);
+    if (again.id !== session.id || again.via !== 'blob' || !again.blob) throw new SessionGone('blob session replaced');
+    ticket = again.blob;
+    return ticket;
+  };
+  for (let sync = 0; sync < 3; sync++) {
+    try {
+      await uploadBlobBlocks({
+        file,
+        ticket,
+        renewTicket,
+        onProgress: (acked, total) => hooks.onProgress?.(acked, total),
+        onResumed: (acked, total) => hooks.onResumed?.(acked, total),
+        onNote: (note) => hooks.onNote?.(note),
+        signal: hooks.signal,
+      });
+    } catch (err) {
+      if (hooks.signal?.aborted || isAbortError(err)) throw new UploadError('Upload cancelled');
+      if (err instanceof SessionGone) throw err;
+      if (err instanceof BlobUploadError) {
+        throw new UploadError(`Upload failed: ${err.message} — the next attempt with this file resumes where it stopped`, err.status || undefined);
+      }
+      throw err;
+    }
+    try {
+      return await completeSession(session, hooks);
+    } catch (err) {
+      if (err instanceof NotCommitted && sync < 2) continue;
+      if (err instanceof NotCommitted) throw new UploadError('Upload failed: the blob never committed');
+      throw err;
+    }
+  }
+  throw new UploadError('Upload failed: blocks kept going missing');
 }

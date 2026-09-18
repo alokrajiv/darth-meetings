@@ -61,6 +61,13 @@ What **this** member owns / consumes:
 
 - Upload any recording (multi-GB streaming) or import Google Meet
   transcripts calendar-first; AssemblyAI transcription + diarization.
+- **darth uploads** (2026-09-18, `docs/darth-uploads.md`): a file ≥ 8 MiB
+  goes browser → Azure Blob (account `darthuploads`, container `meetings`,
+  per-blob user-delegation SAS) as parallel 4 MiB blocks — Tailscale and
+  nginx out of the byte path, resumable from the block list Azure keeps —
+  and the VM pulls the committed blob once (sha256 verified) into the same
+  chunked-upload session (`upload_sessions.via = 'blob'`, migration 043).
+  Hosts without `DARTH_UPLOADS_ACCOUNT` keep the chunk path for every size.
 - Voiceprint speaker auto-ID (ECAPA sidecar) with enrollment on naming.
 - AI notes, titles, topical segments and a detailed wiki-style report
   (Claude Agent SDK on the VM), with video-frame screenshots embedded.
