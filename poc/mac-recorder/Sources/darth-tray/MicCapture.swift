@@ -160,13 +160,18 @@ final class MicConditioner {
     private(set) var maxGainDb: Float = 0
     private(set) var signalBuffers = 0
     private(set) var noiseBuffers = 0
+    /// Consecutive signal buffers so far (0.3.4): gain only RISES after 3 (300 ms) — speech is
+    /// sustained, a click or a key press is one buffer, and 0.3.3 still boosted those by 24 dB
+    /// before anyone had spoken.
+    private var signalRun = 0
+    static let riseAfterBuffers = 3
 
     func reset(channels: Int) {
         hardwareChannels = max(1, channels)
         channelEma = Array(repeating: 0, count: hardwareChannels)
         channel = 0; channelSwitches = 0
         gain = 1; appliedGain = 1; peakTrack = 0; floor = -1
-        minGainDb = 0; maxGainDb = 0; signalBuffers = 0; noiseBuffers = 0
+        minGainDb = 0; maxGainDb = 0; signalBuffers = 0; noiseBuffers = 0; signalRun = 0
     }
 
     var gainDb: Float { 20 * log10f(max(appliedGain, 1e-6)) }
@@ -222,7 +227,7 @@ final class MicConditioner {
         // 3. Noise floor: follows the quietest buffers, creeps up slowly (~+0.2 dB per buffer).
         if floor < 0 { floor = max(rms, 1e-5) } else { floor = max(min(floor * 1.02, rms), 1e-5) }
         let isSignal = rms > floor * Self.signalOverFloor
-        if isSignal { signalBuffers += 1 } else { noiseBuffers += 1 }
+        if isSignal { signalBuffers += 1; signalRun += 1 } else { noiseBuffers += 1; signalRun = 0 }
 
         // 4. Gain: from a peak tracker that only signal buffers feed (silence must not pump the
         //    gain up); attack instant, release 24 dB/s, never below 1. The tracker decays only
@@ -233,7 +238,8 @@ final class MicConditioner {
         if isSignal {
             peakTrack = max(peak, peakTrack * 0.995)
             let wanted = min(Self.maxGain, max(1, Self.targetPeak / max(peakTrack, 1e-6)))
-            gain = wanted < gain ? wanted : min(wanted, gain * Self.releasePerBuffer)
+            if wanted < gain { gain = wanted }                                                   // attack: always, at once
+            else if signalRun >= Self.riseAfterBuffers { gain = min(wanted, gain * Self.releasePerBuffer) }  // rise: sustained signal only
         }
         let target = isSignal ? gain : gain * Self.expanderGain
 

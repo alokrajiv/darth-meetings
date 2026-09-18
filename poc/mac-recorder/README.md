@@ -14,6 +14,10 @@ Native macOS side of Darth Meetings recording (the "Swift tray" angle from Darth
 the user switched it off in the menu (`loginItemUserChoice` in UserDefaults records an explicit choice;
 the default never overrides it). macOS may show "Darth Recorder was added as a login item" once.
 
+**0.3.4 (2026-09-18):** AGC gain now only RISES after 3 consecutive signal buffers (300 ms). 0.3.3 in a
+quiet room still reached +24 dB on isolated key clicks before anyone spoke (11 signal buffers, none
+sustained). Attack is unchanged (instant, every buffer).
+
 **0.3.3 (2026-09-18, minutes after 0.3.2):** the AGC's speech-level tracker now decays 0.05 dB per
 signal buffer (was 0.45): on a normal 1-ch mic in a quiet room 0.3.2 reached +24 dB on keyboard
 clicks between sentences, which would have clipped the next word. Gain still converges fast on a
