@@ -16,14 +16,17 @@ final class PreviewPanel: NSObject, NSWindowDelegate {
     private let placeholder = NSTextField(labelWithString: "audio only")
     private let systemBar = LevelBar(name: "system")
     private let micBar = LevelBar(name: "mic")
+    /// 0.3.2: the last 10 s of each track as a scrolling envelope, 20 ms per point.
+    private let systemStrip = LevelHistoryView()
+    private let micStrip = LevelHistoryView()
     private var timer: Timer?
     private let ciContext = CIContext(options: [.cacheIntermediates: false])
     private let convertQueue = DispatchQueue(label: "darth.preview.convert", qos: .utility)
     private var converting = false
     private(set) var framesShown = 0
     var onClosed: (() -> Void)?
-    /// Asked at 10 Hz: (systemMeter, micMeter, health) — nil meter = track not requested.
-    var levelsProvider: (() -> (system: LevelMeter?, mic: LevelMeter?, systemOK: Bool?, micOK: Bool?, audioOnly: Bool))?
+    /// Asked at 10 Hz: (systemMeter, micMeter, health, mic AGC gain in dB) — nil meter = track not requested.
+    var levelsProvider: (() -> (system: LevelMeter?, mic: LevelMeter?, systemOK: Bool?, micOK: Bool?, audioOnly: Bool, micGainDb: Float))?
 
     var isOpen: Bool { panel?.isVisible == true }
     var frame: NSRect? { panel?.frame }
@@ -87,16 +90,24 @@ final class PreviewPanel: NSObject, NSWindowDelegate {
         guard let l = levelsProvider?() else { return }
         if l.audioOnly { image.image = nil; placeholder.isHidden = false }
         systemBar.isHidden = l.system == nil
+        systemStrip.isHidden = l.system == nil
         micBar.isHidden = l.mic == nil
-        if let m = l.system { systemBar.update(levelDb: m.levelDb, audible: m.audible, silentSeconds: m.secondsSinceAudible, bad: l.systemOK == false) }
-        if let m = l.mic { micBar.update(levelDb: m.levelDb, audible: m.audible, silentSeconds: m.secondsSinceAudible, bad: l.micOK == false) }
+        micStrip.isHidden = l.mic == nil
+        if let m = l.system {
+            systemBar.update(levelDb: m.levelDb, audible: m.audible, silentSeconds: m.secondsSinceAudible, bad: l.systemOK == false)
+            systemStrip.update(levels: m.recentLevelsDb(), bad: l.systemOK == false)
+        }
+        if let m = l.mic {
+            micBar.update(levelDb: m.levelDb, audible: m.audible, silentSeconds: m.secondsSinceAudible, bad: l.micOK == false, gainDb: l.micGainDb)
+            micStrip.update(levels: m.recentLevelsDb(), bad: l.micOK == false)
+        }
     }
 
     func windowShouldClose(_ sender: NSWindow) -> Bool { close(remember: true); onClosed?(); return false }
 
     private func makePanel() -> NSPanel {
         let thumbH = round((Self.width - 24) * 10 / 16)
-        let p = NSPanel(contentRect: NSRect(x: 0, y: 0, width: Self.width, height: thumbH + 24 + 2 * 26 + 8),
+        let p = NSPanel(contentRect: NSRect(x: 0, y: 0, width: Self.width, height: thumbH + 24 + 2 * 26 + 2 * (LevelHistoryView.height + 6) + 8),
                         styleMask: [.nonactivatingPanel, .borderless], backing: .buffered, defer: false)
         p.level = .statusBar
         p.isOpaque = false
@@ -150,7 +161,7 @@ final class PreviewPanel: NSObject, NSWindowDelegate {
         close.contentTintColor = .secondaryLabelColor
         close.translatesAutoresizingMaskIntoConstraints = false
 
-        let stack = NSStackView(views: [thumb, systemBar, micBar])
+        let stack = NSStackView(views: [thumb, systemBar, systemStrip, micBar, micStrip])
         stack.orientation = .vertical
         stack.alignment = .leading
         stack.spacing = 6
@@ -172,6 +183,8 @@ final class PreviewPanel: NSObject, NSWindowDelegate {
             placeholder.centerYAnchor.constraint(equalTo: thumb.centerYAnchor),
             systemBar.widthAnchor.constraint(equalToConstant: Self.width - 24),
             micBar.widthAnchor.constraint(equalToConstant: Self.width - 24),
+            systemStrip.widthAnchor.constraint(equalToConstant: Self.width - 24),
+            micStrip.widthAnchor.constraint(equalToConstant: Self.width - 24),
             close.trailingAnchor.constraint(equalTo: fx.trailingAnchor, constant: -16),
             close.topAnchor.constraint(equalTo: fx.topAnchor, constant: 14),
         ])
@@ -213,20 +226,22 @@ final class LevelBar: NSView {
             label.widthAnchor.constraint(equalToConstant: 46),
             value.trailingAnchor.constraint(equalTo: trailingAnchor),
             value.centerYAnchor.constraint(equalTo: centerYAnchor),
-            value.widthAnchor.constraint(equalToConstant: 64),
+            value.widthAnchor.constraint(equalToConstant: 76),
         ])
     }
     required init?(coder: NSCoder) { fatalError() }
 
-    func update(levelDb: Float, audible: Bool, silentSeconds: TimeInterval, bad: Bool) {
+    func update(levelDb: Float, audible: Bool, silentSeconds: TimeInterval, bad: Bool, gainDb: Float = 0) {
         level = levelDb
         self.audible = audible
         self.bad = bad
         self.silentSeconds = silentSeconds
         if levelDb >= peak || Date().timeIntervalSince(peakAt) > 1.5 { peak = levelDb; peakAt = Date() }
+        // "+34" after the level = the AGC gain currently applied to this track (0.3.2).
+        let gain = gainDb >= 1 ? String(format: " +%.0f", gainDb) : ""
         value.stringValue = bad || (!audible && silentSeconds >= 5)
             ? "silent \(Int(silentSeconds))s"
-            : (levelDb <= -119 ? "—" : String(format: "%.0f dB", levelDb))
+            : (levelDb <= -119 ? "—" : String(format: "%.0f dB", levelDb) + gain)
         value.textColor = bad ? .systemRed : .secondaryLabelColor
         needsDisplay = true
     }
@@ -239,7 +254,7 @@ final class LevelBar: NSView {
     static func fraction(_ db: Float) -> Float { max(0, min(1, (db + 60) / 60)) }
 
     override func draw(_ dirtyRect: NSRect) {
-        let track = NSRect(x: 50, y: bounds.midY - 4, width: bounds.width - 50 - 68, height: 8)
+        let track = NSRect(x: 50, y: bounds.midY - 4, width: bounds.width - 50 - 80, height: 8)
         NSColor.white.withAlphaComponent(0.10).setFill()
         NSBezierPath(roundedRect: track, xRadius: 4, yRadius: 4).fill()
         let f = CGFloat(Self.fraction(level))
@@ -254,5 +269,69 @@ final class LevelBar: NSView {
             (bad ? NSColor.systemRed : NSColor.white.withAlphaComponent(0.8)).setFill()
             NSRect(x: x - 1, y: track.minY - 1, width: 2, height: track.height + 2).fill()
         }
+    }
+}
+
+
+/// The last 10 s of one track as a scrolling envelope (0.3.2): one point per 20 ms bin from
+/// `LevelMeter.recentLevelsDb()`, newest at the right, drawn as a symmetric "waveform" whose
+/// half-height is the −60…0 dBFS fraction. Faint ticks every second. Alok, 2026-09-18: "a
+/// waveform for the last 10 seconds moving like a graph, so I can see if it's up compared to
+/// 3 seconds before".
+final class LevelHistoryView: NSView {
+    static let height: CGFloat = 40
+    private var levels: [Float] = []
+    private var bad = false
+
+    init() {
+        super.init(frame: .zero)
+        translatesAutoresizingMaskIntoConstraints = false
+        heightAnchor.constraint(equalToConstant: Self.height).isActive = true
+        wantsLayer = true
+        layer?.backgroundColor = NSColor.black.withAlphaComponent(0.35).cgColor
+        layer?.cornerRadius = 6
+        layer?.masksToBounds = true
+    }
+    required init?(coder: NSCoder) { fatalError() }
+
+    func update(levels: [Float], bad: Bool) {
+        self.levels = levels
+        self.bad = bad
+        needsDisplay = true
+    }
+
+    override func draw(_ dirtyRect: NSRect) {
+        let w = bounds.width, h = bounds.height, mid = h / 2
+        // 1 s grid (50 bins) + centre line.
+        NSColor.white.withAlphaComponent(0.08).setFill()
+        NSRect(x: 0, y: mid - 0.5, width: w, height: 1).fill()
+        let bins = max(1, levels.count)
+        for sec in stride(from: 0, to: bins, by: 50) {
+            let x = w * CGFloat(sec) / CGFloat(bins)
+            NSRect(x: x, y: 0, width: 1, height: h).fill()
+        }
+        guard !levels.isEmpty else { return }
+        // One column per pixel: the loudest bin in that pixel's span.
+        let px = Int(w)
+        guard px > 0 else { return }
+        let path = NSBezierPath()
+        var tops: [CGFloat] = []
+        tops.reserveCapacity(px)
+        for x in 0..<px {
+            let b0 = x * bins / px, b1 = max(b0 + 1, (x + 1) * bins / px)
+            var m: Float = -120
+            for b in b0..<min(b1, bins) { m = max(m, levels[b]) }
+            let f = CGFloat(LevelBar.fraction(m))
+            tops.append(max(0.5, (mid - 2) * f))
+        }
+        path.move(to: NSPoint(x: 0, y: mid + tops[0]))
+        for x in 1..<px { path.line(to: NSPoint(x: CGFloat(x), y: mid + tops[x])) }
+        for x in stride(from: px - 1, through: 0, by: -1) { path.line(to: NSPoint(x: CGFloat(x), y: mid - tops[x])) }
+        path.close()
+        (bad ? NSColor.systemRed : NSColor.systemGreen).withAlphaComponent(0.75).setFill()
+        path.fill()
+        // "now" edge.
+        NSColor.white.withAlphaComponent(0.5).setFill()
+        NSRect(x: w - 1, y: 0, width: 1, height: h).fill()
     }
 }

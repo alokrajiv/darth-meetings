@@ -20,6 +20,11 @@ final class LevelMeter {
     private var lastAudibleAt: Date?
     private var lastAudibleSec = -1
     private(set) var audibleSeconds = 0
+    /// 0.3.2: the last 10 s as 20 ms bins of RMS (linear), for the preview's scrolling strip.
+    static let historyBin: TimeInterval = 0.02
+    static let historyBins = 500
+    private var history = [Float](repeating: 0, count: LevelMeter.historyBins)
+    private var lastBin = -1
 
     /// Called from the capture thread.
     func note(peak p: Float, rms r: Float) {
@@ -28,6 +33,12 @@ final class LevelMeter {
         buffers += 1
         if firstBufferAt == nil { firstBufferAt = now }
         if p > peak { peak = p }
+        // History: this buffer covers every bin since the previous note (a 100 ms mic buffer
+        // is 5 bins) — fill them all, capped at one full ring.
+        let bin = Int(now.timeIntervalSince(startedAt) / LevelMeter.historyBin)
+        let from = max(lastBin + 1, bin - LevelMeter.historyBins + 1)
+        for b in from...max(from, bin) { history[b % LevelMeter.historyBins] = (b == bin && lastBin == bin) ? max(history[b % LevelMeter.historyBins], r) : r }
+        lastBin = max(lastBin, bin)
         let sec = Int(now.timeIntervalSince(startedAt))
         let i = ((sec % 5) + 5) % 5
         if buckets[i].sec != sec { buckets[i] = (sec, r) } else if r > buckets[i].rms { buckets[i].rms = r }
@@ -54,6 +65,18 @@ final class LevelMeter {
         return Date().timeIntervalSince(lastAudibleAt ?? startedAt)
     }
     var everAudible: Bool { lock.lock(); defer { lock.unlock() }; return lastAudibleAt != nil }
+
+    /// The last 10 s of RMS in dBFS, oldest first, one value per 20 ms bin; bins not yet
+    /// written (or older than the ring) read as −120.
+    func recentLevelsDb() -> [Float] {
+        lock.lock(); defer { lock.unlock() }
+        let nowBin = Int(Date().timeIntervalSince(startedAt) / LevelMeter.historyBin)
+        var out = [Float](repeating: -120, count: LevelMeter.historyBins)
+        for (i, b) in ((nowBin - LevelMeter.historyBins + 1)...nowBin).enumerated() where b >= 0 && b <= lastBin && nowBin - b < LevelMeter.historyBins && lastBin - b < LevelMeter.historyBins {
+            out[i] = LevelMeter.db(history[b % LevelMeter.historyBins])
+        }
+        return out
+    }
     var peakDb: Float { LevelMeter.db(peak) }
 
     func snapshot() -> [String: Any] {

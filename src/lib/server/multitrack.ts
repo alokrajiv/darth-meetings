@@ -134,10 +134,17 @@ export async function normalizeMultiTrack(tempFilename: string): Promise<MultiTr
     return { mixed: true, tracks: streams.length, aaiSource: mixName };
   }
 
-  // 1. Mix: every audio stream → mono 48 kHz → summed (normalize=0 keeps
-  //    each voice at its recorded level; the limiter catches the rare overlap
-  //    peak) → stereo (see module comment for why).
-  const inputs = streams.map((_, i) => `[0:a:${i}]aformat=sample_rates=48000:channel_layouts=mono[a${i}]`);
+  // 1. Mix: every audio stream → mono 48 kHz → level-normalised → summed
+  //    (normalize=0: the limiter catches the rare overlap peak) → stereo (see
+  //    module comment for why). dynaudnorm per track (2026-09-18): a WhatsApp
+  //    call leaves the recorder's mic track ~40 dB under the system track
+  //    (raw capsule feed, transcript 855 missed the uploader entirely); each
+  //    track is brought to a comparable level BEFORE summing so a quiet voice
+  //    is not buried by a loud one. f=300 ms frames, g=15 frame window, target
+  //    peak 0.9, at most 40× (+32 dB) gain, no compression.
+  const inputs = streams.map(
+    (_, i) => `[0:a:${i}]aformat=sample_rates=48000:channel_layouts=mono,dynaudnorm=f=300:g=15:p=0.9:m=40[a${i}]`
+  );
   const filter =
     inputs.join(';') +
     ';' +

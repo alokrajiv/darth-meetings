@@ -273,6 +273,8 @@ final class RecordingController {
 
     var systemMeter: LevelMeter { audioForwarder.meter }
     var micMeter: LevelMeter? { mic?.meter }
+    /// 0.3.2: AGC gain currently applied to the mic track, dB (0 when no mic / no gain).
+    var micGainDb: Float { mic?.conditioner.gainDb ?? 0 }
 
     private func videoAliveCount() -> Int {
         guard let w = currentWriter() else { return lastVideoCount }
@@ -356,7 +358,7 @@ final class RecordingController {
     private func healthDetail() -> String {
         var s = "video frames=\(videoFramesTotal + (currentWriter()?.videoFrames ?? 0)) stall=\(Int(Date().timeIntervalSince(lastVideoAt)))s"
         if options.systemAudio { s += " · system \(audioStream == nil ? "NO STREAM" : String(format: "%.0f dB", systemMeter.levelDb)) silent=\(Int(systemMeter.secondsSinceAudible))s bufs=\(systemMeter.buffers)" }
-        if options.mic { s += " · mic \(mic == nil ? "NONE" : String(format: "%.0f dB", micMeter!.levelDb)) silent=\(Int(micMeter?.secondsSinceAudible ?? 0))s bufs=\(micMeter?.buffers ?? 0)" }
+        if options.mic { s += " · mic \(mic == nil ? "NONE" : String(format: "%.0f dB", micMeter!.levelDb)) silent=\(Int(micMeter?.secondsSinceAudible ?? 0))s bufs=\(micMeter?.buffers ?? 0)\(mic.map { String(format: " gain=%+.0f dB ch=%d/%d", $0.conditioner.gainDb, $0.conditioner.channel + 1, $0.conditioner.hardwareChannels) } ?? "")" }
         return s
     }
 
@@ -1111,6 +1113,8 @@ final class RecordingController {
                 "segments": self.segments.count, "files": files,
                 "mic_buffers": micBuffers, "mic_peak": Double(micPeak),
                 "mic_peak_db": micSnap?["peak_db"] ?? NSNull(), "mic_audible_s": micSnap?["audible_s"] ?? NSNull(),
+                "mic_conditioner": self.mic?.conditioner.snapshot ?? NSNull(),
+                "mic_hw_format": self.mic?.hardwareFormat.map { "\(Int($0.sampleRate)) Hz × \($0.channelCount) ch" } ?? NSNull(),
                 "system_buffers": sysSnap?["buffers"] ?? NSNull(), "system_peak_db": sysSnap?["peak_db"] ?? NSNull(),
                 "system_audible_s": sysSnap?["audible_s"] ?? NSNull(), "system_stream": self.options.systemAudio ? sysStreamAlive : NSNull(),
                 "system_error": self.systemStreamFailed ?? NSNull(),

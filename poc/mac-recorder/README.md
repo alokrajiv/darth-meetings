@@ -14,6 +14,38 @@ Native macOS side of Darth Meetings recording (the "Swift tray" angle from Darth
 the user switched it off in the menu (`loginItemUserChoice` in UserDefaults records an explicit choice;
 the default never overrides it). macOS may show "Darth Recorder was added as a login item" once.
 
+**0.3.3 (2026-09-18, minutes after 0.3.2):** the AGC's speech-level tracker now decays 0.05 dB per
+signal buffer (was 0.45): on a normal 1-ch mic in a quiet room 0.3.2 reached +24 dB on keyboard
+clicks between sentences, which would have clipped the next word. Gain still converges fast on a
+source that is genuinely low (the tracker starts there). Preview snapshot of the 0.3.2 panel
+(waveform strips, "−22 dB +24" gain label) in `~/Library/Logs/DarthRecorder/preview-032-onscreen.png`.
+
+**0.3.2 (2026-09-18) — mic level during WhatsApp calls + scrolling level history:**
+- **Finding (12:37 SGT WhatsApp call with Kawen, recording 474033cd → transcript 855):** 0.3.1 recorded
+  fine (3 ch → mono, 36 s, uploaded) but Alok's mic track peaked at **−42 dBFS** (RMS −55 dB in speech,
+  −80 dB floor) against a system track at −29 dB RMS / −2 dB peak; AssemblyAI heard mostly the other
+  side and mis-detected Hindi. Cause: WhatsApp puts the built-in mic into its voice-processing (echo
+  cancel) mode; Core Audio then hands every other client the RAW 3-capsule feed, ~40 dB below the
+  normal processed mono path, and WhatsApp applies its own gain internally. Averaging the three
+  capsules (0.3.1) lost a further ~12 dB (peak 0.034 raw vs 0.008 averaged). Speaker vs earphones is
+  irrelevant to this — bleed would make the track louder, not quieter.
+- **`MicConditioner`** (MicCapture.swift): the mono track is the LOUDEST channel (per-buffer RMS EMA,
+  3 dB hysteresis, switches logged) with automatic gain: target peak −12 dBFS, ≤ +36 dB, instant
+  attack, 24 dB/s release, gain only rises on buffers ≥ 12 dB above a tracked noise floor, and
+  noise-only buffers get −20 dB (downward expander) so the health meter's silence detection still
+  works; gain ramps linearly across each buffer (no gate clicks). Runs on every mic buffer (a healthy
+  1-ch mic gets gain 1 — the AGC never attenuates). Synthetic test: −55 dB speech on capsule 2 of 3
+  → −13 dB out, silence stays < −60, channel 2 picked. Logged: "mic: hardware format … loudest
+  channel + AGC", channel switches, `gain=%+.0f dB ch=N/M` in the health line, `mic_conditioner`
+  + `mic_hw_format` in `recording_stopped`, summary at `mic: stopped`.
+- **Preview panel**: under each level bar a **10-second scrolling envelope** (`LevelHistoryView`):
+  `LevelMeter` keeps 500 × 20 ms bins of RMS; drawn as a symmetric waveform (half-height = −60…0 dBFS),
+  1 s grid, newest at the right, green / red when ✗. The mic bar's value shows the AGC gain
+  ("−18 dB +34"). Alok's ask: "a waveform for the last 10 seconds moving like a graph".
+- **Server** (`src/lib/server/multitrack.ts`): `dynaudnorm=f=300:g=15:p=0.9:m=40` per track before
+  `amix`, so a quiet mic is brought level with the system track before summing. Offline on the
+  12:37 file: mic −65 → −33 dB RMS (peak −10), mix peak −3 dB.
+
 **0.3.1 (2026-09-18) — the WhatsApp "hang" was never SCK:**
 - **Root cause of both WhatsApp start failures** (2026-09-16 21:23, 2026-09-17 22:53 SGT): during a
   WhatsApp voice call the built-in mic reports **48 kHz × 3 ch** (every working recording had 1 ch).

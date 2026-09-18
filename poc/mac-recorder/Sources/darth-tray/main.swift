@@ -3,7 +3,7 @@ import CoreGraphics
 import ServiceManagement
 import RecorderCore
 
-let VERSION = "0.3.1"
+let VERSION = "0.3.3"
 let WS_PORT: UInt16 = 47800
 let PWA_URL = URL(string: "https://meetings.darth-internal.trames.io/")!
 /// Seconds between "the call ended" and an automatic stop.
@@ -126,11 +126,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         recorder.onPreviewFrame = { [weak self] pb in self?.preview.showFrame(pb) }
         preview.levelsProvider = { [weak self] in
-            guard let self else { return (nil, nil, nil, nil, false) }
+            guard let self else { return (nil, nil, nil, nil, false, 0) }
             let h = self.recorder.health()
             let o = self.recorder.options
             return (o.systemAudio ? self.recorder.systemMeter : nil, o.mic ? self.recorder.micMeter : nil,
-                    h.systemOK, h.micOK, self.recorder.currentSource?.isAudioOnly == true)
+                    h.systemOK, h.micOK, self.recorder.currentSource?.isAudioOnly == true, self.recorder.micGainDb)
         }
         preview.onClosed = { [weak self] in self?.refreshMenu() }
         banner.onPreview = { [weak self] in self?.togglePreview() }
