@@ -1,7 +1,7 @@
 # Darth Meetings
 
 Meeting transcripts, AI notes and recordings for Tramés — part of the darth
-family of internal tools (darth tasks, darth-artifacts, darth meetings).
+family of internal tools (darth tasks, holocrons, darth meetings).
 Formerly known as *Meeting Whisperer*.
 
 - **Web**: https://meetings.darth-internal.trames.io (Tailscale-internal,
