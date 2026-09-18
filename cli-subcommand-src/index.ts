@@ -9,7 +9,9 @@
  */
 import type { Ctx, Subcommand } from "../../core/types";
 import { parseArgs, str } from "../../core/args";
-import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
+import { closeSync, createReadStream, existsSync, mkdirSync, openSync, readFileSync, readSync, statSync, writeFileSync } from "node:fs";
+import { createHash } from "node:crypto";
+import { homedir } from "node:os";
 import { basename, extname, join } from "node:path";
 
 const HELP = `darth-cli meetings — meeting transcripts, notes & recordings (darth-meetings)
@@ -91,6 +93,13 @@ READ
                                   probable duplicates
   notify                          Your Slack DM notification switches, one
                                   line per kind (opt-out: on unless turned off)
+  offline plan [<id,…>]           What the web app keeps offline for you under
+                                  the auto-pin counts (newest N: transcript
+                                  → audio → video ladder) with the stored
+                                  recording sizes; with ids: exactly those
+                                  meetings (absent = no longer available)
+  offline prefs                   Your offline auto-pin counts (transcripts /
+                                  audio / video) with defaults and caps
 
 LABELS (org-wide, hierarchical 'Customers/LP Global/QBR', many per transcript;
 <label> = a path, case-insensitive, or '#<id>' from 'labels')
@@ -117,7 +126,7 @@ LABELS (org-wide, hierarchical 'Customers/LP Global/QBR', many per transcript;
 
 WRITE (needs read+write for meetings)
   upload <file> [--event <meeting-code|event-key>] [--title <t>]
-         [--language <code>] [--scratch] [--wait] [--timeout <mins>]
+         [--language <code>] [--scratch] [--resume] [--wait] [--timeout <mins>]
                                   Upload a recording (audio/video; text docs
                                   like .vtt/.txt/.docx go through the text
                                   importer) and transcribe it. --event links
@@ -133,7 +142,18 @@ WRITE (needs read+write for meetings)
                                   until transcription AND the speaker-ID
                                   guess finish, then prints 'speakers'.
                                   Uploads get summary notes only — a detailed
-                                  report is requested by a human in the web UI
+                                  report is requested by a human in the web UI.
+                                  Media over 8 MB goes up RESUMABLE: the file
+                                  is hashed, then sent as parallel verified
+                                  pieces (through the VM, or straight to
+                                  Azure Blob when the server offers it — its
+                                  call). A drop costs one piece; Ctrl-C /
+                                  a crash leaves the session on the server
+                                  for 24 h and re-running the SAME command
+                                  on the same file continues where it
+                                  stopped (--resume just makes a fresh start
+                                  say so). Progress goes to stderr (not with
+                                  --json). ≤ 8 MB and text docs: one request
   link <id> <meeting-code|event-key>
                                   Attach an existing transcript (typically an
                                   unlinked upload) to a calendar event: sets
@@ -195,6 +215,11 @@ WRITE (needs read+write for meetings)
                                   Google connected
   notify <kind> on|off            Flip one Slack DM notification kind (see
                                   'notify' for the kinds)
+  offline prefs --set <k>=<n>[,<k>=<n>…]
+                                  Change the offline auto-pin counts
+                                  (transcripts / audio / video; capped
+                                  server-side). Applies to every device of
+                                  this account
   set-title <id> <title>          Update the title
   set-notes <id> --file <md|->    Replace the notes markdown ('-' = stdin)
   set-report <id> --file <md|->   Replace the report markdown ('-' = stdin)
@@ -209,7 +234,8 @@ WRITE (needs read+write for meetings)
                                   on that transcript; readers get 403)
   skill                           Print the agent workflow guide
 
-ACCOUNT-SETTINGS writes ('auto-sync off|mine|all', 'notify <kind> on|off')
+ACCOUNT-SETTINGS writes ('auto-sync off|mine|all', 'notify <kind> on|off',
+'offline prefs --set')
 additionally require --i-have-got-consent-from-human-user: pass it ONLY when
 the human user explicitly asked for that exact settings change — never on
 your own initiative (same contract as the slack-* verbs).
@@ -371,10 +397,14 @@ write (date, title, attendees, share suggestions) — nothing is re-run.
     #    'set-notes <id> --file notes.md'; 'label' it; share via the web UI.
 
 Notes: media goes to AssemblyAI; .vtt/.srt/.txt/.docx/.pdf transcripts go
-through the text importer (same verb, no transcription). Uploads over a few
-hundred MB are fine (streamed) but transcription time scales with length —
-raise --timeout. A 415 means the server thinks the file is a text document
-under a media extension (or vice versa) — rename it.
+through the text importer (same verb, no transcription). Media over 8 MB is
+sent resumable (hashed, parallel verified pieces, or straight to Azure Blob
+when the server offers it): if the run dies or you Ctrl-C it, re-run the SAME
+'upload' command on the SAME file within 24 h and it continues from what
+already arrived — never re-upload under a new name. Multi-GB files are fine
+but transcription time scales with length — raise --timeout. A 415 means the
+server thinks the file is a text document under a media extension (or vice
+versa) — rename it.
 
 Someone hands you a THROWAWAY recording (a voice memo, a test clip, "just
 tell me what they said") → 'upload --scratch'. It stays out of everyone's
@@ -894,6 +924,509 @@ const MIME_BY_EXT: Record<string, string> = {
 };
 function mimeFor(name: string): string { return MIME_BY_EXT[extname(name).slice(1).toLowerCase()] ?? "application/octet-stream"; }
 
+// ---------------------------------------------------------------------------
+// Resumable uploads — the /api/uploads session family. The browser twin is
+// src/lib/chunked-upload.ts (+ blob-blocks.ts for the Azure Blob mode); keep
+// the two in step. This folder is copied into darth-cli at build time, so
+// the constants and the Blob REST helpers are duplicated here on purpose.
+//
+//   1. sha256 the file (streamed) — the fingerprint the server resumes on
+//      AND what the VM verifies a blob pull against.
+//   2. POST /api/uploads {via:'blob', sha256, …} → a session. The same user +
+//      fingerprint + size while a session is open comes back with what the
+//      server already holds: THAT is resume. The server decides the byte
+//      path: 'chunks' (PUT /api/uploads/:id/chunks/:idx through the VM,
+//      sha256 per chunk) or 'blob' (4 MiB Put Block straight to a SAS URL,
+//      commit with Put Block List; resume from Azure's uncommitted list).
+//   3. POST …/complete — exactly-once; a lost reply is recovered by polling
+//      GET /api/uploads/:id, a 409 {missing} re-syncs the chunks, a 409
+//      {notCommitted} re-syncs the blocks, a 503 (VM pull hiccup) repeats.
+// ---------------------------------------------------------------------------
+
+/** At or below this the one-shot POST /api/transcripts is used (one request,
+ * nothing worth resuming). Same line as the server's UPLOAD_BLOB_MIN_BYTES. */
+const ONE_SHOT_MAX_BYTES = 8 * 1024 * 1024;
+const CHUNK_PARALLELISM = 4;
+const MAX_CHUNK_ATTEMPTS = 40;
+const BACKOFF_CAP_MS = 15_000;
+/** One chunk / block PUT may take this long before it is retried. */
+const PIECE_TIMEOUT_MS = 180_000;
+/** Blob mode: keep retrying this long after the first failure before giving
+ * up on THIS run (the next run resumes from Azure's block list anyway). */
+const BLOB_RESUME_WINDOW_MS = 30 * 60_000;
+const BLOB_BACKOFF_S = [1, 2, 4, 8, 15, 30];
+const READ_HIGH_WATER = 8 * 1024 * 1024;
+
+interface BlobTicket { sasUrl: string; blobName: string; blockBytes: number; parallel: number; expiresAt: string }
+interface UploadSessionReply {
+  id: string;
+  /** Absent on an older server = chunks. */
+  via?: "chunks" | "blob";
+  chunkSize: number;
+  chunkCount: number;
+  received: number[];
+  resumed: boolean;
+  transcript: any;
+  blob?: BlobTicket;
+}
+
+/** Terminal: the upload cannot proceed (the message is for the human). */
+class UploadFailed extends Error { constructor(message: string, public status?: number) { super(message); this.name = "UploadFailed"; } }
+/** The server no longer knows the session (404/410) or wants a chunk re-sync ('{…missing…}'). */
+class SessionGone extends Error {}
+/** …/complete on a blob session: Azure has no committed blob yet — re-sync the blocks. */
+class NotCommitted extends Error {}
+/** A Blob REST call failed (status 0 = network / timeout). */
+class BlobFailed extends Error { constructor(message: string, public status = 0) { super(message); this.name = "BlobFailed"; } }
+
+const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
+const fmtMB = (b: number) => (b / 1048576).toFixed(1);
+
+/** Progress on stderr: a live `\r` line on a TTY, one line per 10 % otherwise, nothing under --json. */
+class UploadProgress {
+  private lastLine = "";
+  private lastAt = 0;
+  private lastStep = -1;
+  private readonly tty = !!process.stderr.isTTY;
+  /** Highest byte count reported in the current phase (what a Ctrl-C message quotes). */
+  seen = 0;
+  constructor(private readonly enabled: boolean, private readonly total: number) {}
+  set(phase: string, bytes: number): void {
+    this.seen = phase === "Reading" ? 0 : Math.max(this.seen, bytes);
+    if (!this.enabled) return;
+    const pct = this.total ? Math.min(100, Math.floor((bytes / this.total) * 100)) : 100;
+    const line = `${phase} ${fmtMB(bytes)} / ${fmtMB(this.total)} MB (${pct}%)`;
+    if (this.tty) {
+      const now = Date.now();
+      if (line === this.lastLine || (now - this.lastAt < 200 && pct < 100)) return;
+      process.stderr.write(`\r\x1b[K${line}`);
+      this.lastLine = line; this.lastAt = now;
+    } else {
+      const step = Math.floor(pct / 10);
+      if (step === this.lastStep) return;
+      this.lastStep = step;
+      console.error(line);
+    }
+  }
+  /** A one-off line (retry notes, resume notice); keeps the live line tidy. */
+  note(text: string): void {
+    if (!this.enabled) return;
+    if (this.tty && this.lastLine) process.stderr.write("\r\x1b[K");
+    console.error(text);
+    this.lastLine = "";
+  }
+  end(): void {
+    if (this.enabled && this.tty && this.lastLine) { process.stderr.write("\n"); this.lastLine = ""; }
+  }
+}
+
+/** One piece of the file as a plain Uint8Array (a fetch body as-is; Buffer's typing is not a BodyInit under the DOM lib). */
+function readRange(fd: number, start: number, length: number): Uint8Array<ArrayBuffer> {
+  const buf = new Uint8Array(new ArrayBuffer(length));
+  let off = 0;
+  while (off < length) {
+    const n = readSync(fd, buf, off, length - off, start + off);
+    if (n <= 0) throw new UploadFailed(`Short read at byte ${start + off} — did the file change while uploading?`);
+    off += n;
+  }
+  return buf;
+}
+
+async function sha256File(file: string, onBytes: (done: number) => void): Promise<string> {
+  const h = createHash("sha256");
+  let done = 0;
+  for await (const chunk of createReadStream(file, { highWaterMark: READ_HIGH_WATER })) {
+    h.update(chunk as Buffer);
+    done += (chunk as Buffer).length;
+    onBytes(done);
+  }
+  return h.digest("hex");
+}
+
+function chunkRange(size: number, chunkSize: number, idx: number): { start: number; length: number } {
+  const start = idx * chunkSize;
+  return { start, length: Math.min(size, start + chunkSize) - start };
+}
+
+async function readJsonSafe(res: Response): Promise<any> {
+  const text = await res.text().catch(() => "");
+  try { return text ? JSON.parse(text) : null; } catch { return { error: text.slice(0, 300) || `HTTP ${res.status}` }; }
+}
+
+/** POST /api/uploads with retries on 5xx / network; 4xx is the caller's mistake and surfaces at once. */
+async function openUploadSession(ctx: Ctx, body: Record<string, unknown>): Promise<UploadSessionReply> {
+  for (let attempt = 1; ; attempt++) {
+    try {
+      const res = await ctx.api("meetings", "/api/uploads", { method: "POST", body: JSON.stringify(body), signal: AbortSignal.timeout(60_000) });
+      const data = await readJsonSafe(res);
+      if (res.ok && data?.id) return data as UploadSessionReply;
+      const msg = data?.error ?? `Upload failed (HTTP ${res.status})`;
+      if (res.status >= 400 && res.status < 500 && res.status !== 429) throw new UploadFailed(msg, res.status);
+      if (attempt >= 8) throw new UploadFailed(msg, res.status);
+    } catch (e) {
+      if (e instanceof UploadFailed) throw e;
+      if (attempt >= 8) throw new UploadFailed(`Upload failed: could not reach the server (${e instanceof Error ? e.message : String(e)})`);
+    }
+    await sleep(Math.min(BACKOFF_CAP_MS, 1000 * 2 ** (attempt - 1)));
+  }
+}
+
+/** Chunk mode: PUT every chunk the server has not acknowledged, CHUNK_PARALLELISM at a time, each retried with backoff. */
+async function sendMissingChunks(ctx: Ctx, fd: number, size: number, session: UploadSessionReply, progress: UploadProgress): Promise<void> {
+  const have = new Set(session.received);
+  const queue: number[] = [];
+  for (let i = 0; i < session.chunkCount; i++) if (!have.has(i)) queue.push(i);
+  let acked = 0;
+  for (const i of session.received) acked += chunkRange(size, session.chunkSize, i).length;
+  progress.set("Uploading", acked);
+  let failure: unknown = null;
+  const worker = async () => {
+    while (queue.length && !failure) {
+      const idx = queue.shift()!;
+      const range = chunkRange(size, session.chunkSize, idx);
+      const buf = readRange(fd, range.start, range.length);
+      const sha256 = createHash("sha256").update(buf).digest("hex");
+      for (let attempt = 1; ; attempt++) {
+        try {
+          const res = await ctx.api("meetings", `/api/uploads/${session.id}/chunks/${idx}`, {
+            method: "PUT", body: buf,
+            headers: { "content-type": "application/octet-stream", "content-length": String(range.length), "x-chunk-sha256": sha256 },
+            signal: AbortSignal.timeout(PIECE_TIMEOUT_MS),
+          });
+          if (res.ok) { await res.text().catch(() => ""); acked += range.length; progress.set("Uploading", acked); break; }
+          const data = await readJsonSafe(res);
+          if (res.status === 404 || res.status === 410) throw new SessionGone(data?.error ?? "session gone");
+          // Auth problems and malformed requests won't fix themselves.
+          if ([401, 403, 409, 413].includes(res.status)) throw new UploadFailed(data?.error ?? `chunk ${idx + 1} rejected (HTTP ${res.status})`, res.status);
+          throw new Error(data?.error ?? `HTTP ${res.status}`);
+        } catch (e) {
+          if (e instanceof SessionGone || e instanceof UploadFailed) throw e;
+          const msg = e instanceof Error ? e.message : String(e);
+          if (attempt >= MAX_CHUNK_ATTEMPTS) throw new UploadFailed(`Upload failed: chunk ${idx + 1}/${session.chunkCount} did not go through after ${attempt} attempts (${msg}) — re-run the same command to continue from what arrived`);
+          progress.note(`Connection hiccup — retrying chunk ${idx + 1}/${session.chunkCount} (attempt ${attempt + 1}): ${msg}`);
+          await sleep(Math.min(BACKOFF_CAP_MS, 500 * 2 ** Math.min(attempt, 6)));
+        }
+      }
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(CHUNK_PARALLELISM, queue.length || 1) }, () => worker().catch((e) => { failure = failure ?? e; })));
+  if (failure) throw failure;
+}
+
+// --- Azure Blob REST subset (mirrors src/lib/darth-uploads-shared.ts) ------
+const blockIdOf = (index: number) => Buffer.from(String(index).padStart(6, "0"), "binary").toString("base64");
+function withQuery(sasUrl: string, extra: Record<string, string>): string {
+  const u = new URL(sasUrl);
+  for (const [k, v] of Object.entries(extra)) u.searchParams.set(k, v);
+  return u.toString();
+}
+function parseUncommitted(xml: string): Map<string, number> {
+  const out = new Map<string, number>();
+  const section = /<UncommittedBlocks>([\s\S]*?)<\/UncommittedBlocks>/.exec(xml)?.[1] ?? "";
+  for (const m of section.matchAll(/<Block>\s*<Name>([^<]*)<\/Name>\s*<Size>(\d+)<\/Size>\s*<\/Block>/g)) out.set(m[1]!, Number(m[2]));
+  return out;
+}
+const blockListXml = (ids: string[]) => `<?xml version="1.0" encoding="utf-8"?><BlockList>${ids.map((id) => `<Latest>${id}</Latest>`).join("")}</BlockList>`;
+
+/**
+ * Blob mode: every attempt first asks Azure which blocks it already holds
+ * (resume), PUTs the rest `ticket.parallel` at a time, then commits the
+ * block list. An expired / refused SAS is replaced through `renewTicket`
+ * (same blob, fresh signature). Retries inside BLOB_RESUME_WINDOW_MS.
+ */
+async function uploadBlobBlocks(fd: number, size: number, contentType: string, ticket0: BlobTicket, renewTicket: () => Promise<BlobTicket>, progress: UploadProgress): Promise<void> {
+  let ticket = ticket0;
+  const blocks: Array<{ index: number; start: number; end: number }> = [];
+  for (let i = 0, start = 0; start < size; i++, start += ticket.blockBytes) blocks.push({ index: i, start, end: Math.min(size, start + ticket.blockBytes) });
+  const ids = blocks.map((b) => blockIdOf(b.index));
+  let attempt = 0;
+  let firstFailureAt: number | null = null;
+  for (;;) {
+    try {
+      if (new Date(ticket.expiresAt).getTime() <= Date.now()) ticket = await renewTicket();
+      // Already committed (a previous run got past the block list)? Straight to complete.
+      const head = await fetch(ticket.sasUrl, { method: "HEAD", signal: AbortSignal.timeout(30_000) });
+      if (head.status === 200 && Number(head.headers.get("content-length")) === size) { progress.set("Uploading", size); return; }
+      if (head.status === 401 || head.status === 403) throw new BlobFailed("the upload link expired", head.status);
+      const listed = await fetch(withQuery(ticket.sasUrl, { comp: "blocklist", blocklisttype: "uncommitted" }), { signal: AbortSignal.timeout(30_000) });
+      let have = new Map<string, number>();
+      if (listed.status === 200) have = parseUncommitted(await listed.text());
+      else if (listed.status === 401 || listed.status === 403) throw new BlobFailed("the upload link expired", listed.status);
+      else if (listed.status !== 404) throw new BlobFailed(`block list failed (${listed.status})`, listed.status);
+      const done = new Set<number>();
+      let acked = 0;
+      for (const b of blocks) if (have.get(ids[b.index]!) === b.end - b.start) { done.add(b.index); acked += b.end - b.start; }
+      if (acked > 0 && attempt === 0) progress.note(`Resuming — Azure already holds ${fmtMB(acked)} of ${fmtMB(size)} MB (${Math.round((acked / size) * 100)}%)`);
+      progress.set("Uploading", acked);
+      const pending = blocks.filter((b) => !done.has(b.index));
+      let next = 0;
+      let failed: unknown = null;
+      const worker = async () => {
+        while (next < pending.length && !failed) {
+          const b = pending[next++]!;
+          const body = readRange(fd, b.start, b.end - b.start);
+          let res: Response;
+          try {
+            res = await fetch(withQuery(ticket.sasUrl, { comp: "block", blockid: ids[b.index]! }), {
+              method: "PUT", headers: { "content-type": "application/octet-stream", "content-length": String(body.length) }, body, signal: AbortSignal.timeout(PIECE_TIMEOUT_MS),
+            });
+          } catch (e) {
+            throw new BlobFailed(`block ${b.index + 1}/${blocks.length}: ${e instanceof Error ? e.message : String(e)}`, 0);
+          }
+          if (!(res.status >= 200 && res.status < 300)) throw new BlobFailed(`block ${b.index + 1}/${blocks.length} failed (${res.status})`, res.status);
+          await res.text().catch(() => "");
+          acked += b.end - b.start;
+          progress.set("Uploading", acked);
+        }
+      };
+      await Promise.all(Array.from({ length: Math.max(1, ticket.parallel) }, () => worker().catch((e) => { failed = failed ?? e; })));
+      if (failed) throw failed;
+      const commit = await fetch(withQuery(ticket.sasUrl, { comp: "blocklist" }), {
+        method: "PUT", headers: { "content-type": "application/xml", "x-ms-blob-content-type": contentType || "application/octet-stream" }, body: blockListXml(ids), signal: AbortSignal.timeout(60_000),
+      });
+      if (!(commit.status >= 200 && commit.status < 300)) throw new BlobFailed(`commit failed (${commit.status})`, commit.status);
+      await commit.text().catch(() => "");
+      return;
+    } catch (e) {
+      if (e instanceof SessionGone || e instanceof UploadFailed) throw e;
+      attempt += 1;
+      firstFailureAt = firstFailureAt ?? Date.now();
+      const message = e instanceof Error ? e.message : String(e);
+      if (Date.now() - firstFailureAt > BLOB_RESUME_WINDOW_MS) throw new UploadFailed(`Upload failed: ${message} — re-run the same command to continue from what arrived`, e instanceof BlobFailed ? e.status || undefined : undefined);
+      progress.note(`Connection hiccup — reconnecting (attempt ${attempt + 1}): ${message}`);
+      if (e instanceof BlobFailed && (e.status === 401 || e.status === 403)) ticket = await renewTicket();
+      await sleep(BLOB_BACKOFF_S[Math.min(BLOB_BACKOFF_S.length - 1, attempt - 1)]! * 1000);
+    }
+  }
+}
+
+type SessionOutcome = { kind: "done"; transcriptId: string } | { kind: "failed"; error: string } | { kind: "open" };
+
+/** GET /api/uploads/:id until a terminal state — finalize can legitimately run for minutes (AAI re-upload of a multi-GB file). */
+async function pollUploadSession(ctx: Ctx, id: string): Promise<SessionOutcome> {
+  for (let i = 0; i < 400; i++) {
+    await sleep(3000);
+    try {
+      const res = await ctx.api("meetings", `/api/uploads/${id}`, { signal: AbortSignal.timeout(30_000) });
+      if (res.status === 404) return { kind: "failed", error: "Upload session vanished" };
+      const s = await readJsonSafe(res);
+      if (!res.ok || !s) continue;
+      if (s.status === "done" && s.transcriptId) return { kind: "done", transcriptId: s.transcriptId };
+      if (s.status === "failed") return { kind: "failed", error: s.error ?? "Upload failed" };
+      if (s.status === "open") return { kind: "open" };
+    } catch { /* network — keep polling */ }
+  }
+  return { kind: "failed", error: "Upload failed: finalize did not finish" };
+}
+
+/** POST …/complete, exactly-once on the server; a lost reply is recovered by polling. */
+async function completeUploadSession(ctx: Ctx, id: string, progress: UploadProgress): Promise<{ transcript?: any; transcriptId?: string }> {
+  progress.note("Finalizing…");
+  for (let attempt = 1; ; attempt++) {
+    let lost = false;
+    try {
+      // No client timeout here: the server answers only once finalize is
+      // through (blob pull + AAI ingest), which is minutes for a big file.
+      const res = await ctx.api("meetings", `/api/uploads/${id}/complete`, { method: "POST" });
+      const body = await readJsonSafe(res);
+      if (res.ok) {
+        if (body?.transcript) return { transcript: body.transcript };
+        if (body?.transcriptId) return { transcriptId: body.transcriptId };
+        throw new UploadFailed("Upload finished but the server returned no transcript");
+      }
+      if (res.status === 409 && body?.status === "completing") lost = true; // an earlier attempt of ours is finalizing — poll
+      else if (res.status === 409 && body?.missing) throw new SessionGone(JSON.stringify(body)); // caller re-syncs chunks
+      else if (res.status === 409 && body?.notCommitted) throw new NotCommitted(); // caller re-syncs blocks
+      else if (res.status === 503) {
+        progress.note("Transfer from blob storage hiccuped on the server — retrying…");
+        if (attempt >= 20) throw new UploadFailed(body?.error ?? "Upload failed: the server's transfer kept failing", res.status);
+      } else if (res.status === 404 || res.status === 410) throw new SessionGone(body?.error ?? "session gone");
+      else throw new UploadFailed(body?.error ?? `Upload failed (HTTP ${res.status})`, res.status);
+    } catch (e) {
+      if (e instanceof UploadFailed || e instanceof SessionGone || e instanceof NotCommitted) throw e;
+      lost = true; // network dropped while the server may still be finalizing
+    }
+    if (lost) {
+      const outcome = await pollUploadSession(ctx, id);
+      if (outcome.kind === "done") return { transcriptId: outcome.transcriptId };
+      if (outcome.kind === "failed") throw new UploadFailed(outcome.error);
+      // still 'open' (our complete never reached the server) → retry
+    }
+    if (attempt >= 20) throw new UploadFailed("Upload failed: could not finalize");
+    await sleep(Math.min(BACKOFF_CAP_MS, 1000 * 2 ** Math.min(attempt, 4)));
+  }
+}
+
+interface ResumableUploadOpts {
+  eventRef?: string;
+  languageCode?: string;
+  scratch: boolean;
+  /** --resume was passed: say so when there is nothing to resume. */
+  resumeExpected: boolean;
+}
+
+// --- Local session ledger ----------------------------------------------------
+// The server resumes by (user, fingerprint) — but only while the session is
+// OPEN. A Ctrl-C during "Finalizing…" leaves the server finishing the upload
+// on its own (status completing → done): re-running the command then finds
+// no open session, opens a fresh one and creates a DUPLICATE transcript. So
+// the CLI remembers {fingerprint → session id} in the darth config dir and,
+// before opening, asks the server what became of the last session for this
+// file: done → that transcript is the answer; completing → poll it; open →
+// the normal resume; anything else → start over. Entries expire with the
+// server's 24 h session lifetime. Same location convention as
+// holocron-leases.json (DARTH_CONFIG_DIR honoured).
+const LEDGER_FILE = join(process.env.DARTH_CONFIG_DIR || join(homedir(), ".darth"), "meetings-uploads.json");
+const LEDGER_TTL_MS = 24 * 60 * 60_000;
+type Ledger = Record<string, { id: string; file: string; size: number; at: string }>;
+
+function readLedger(): Ledger {
+  try {
+    const raw = JSON.parse(readFileSync(LEDGER_FILE, "utf8"));
+    if (!raw || typeof raw !== "object") return {};
+    const now = Date.now();
+    const out: Ledger = {};
+    for (const [k, v] of Object.entries(raw as Ledger)) if (v?.id && v.at && now - Date.parse(v.at) < LEDGER_TTL_MS) out[k] = v;
+    return out;
+  } catch { return {}; }
+}
+function writeLedger(mut: (l: Ledger) => void): void {
+  try {
+    const l = readLedger();
+    mut(l);
+    mkdirSync(join(LEDGER_FILE, ".."), { recursive: true });
+    writeFileSync(LEDGER_FILE, JSON.stringify(l, null, 2) + "\n");
+  } catch { /* best effort — the server-side resume still works without it */ }
+}
+
+/** What the server says about the last session this CLI opened for `fingerprint`, if any. */
+async function priorSessionOutcome(ctx: Ctx, fingerprint: string, progress: UploadProgress): Promise<{ transcriptId: string } | null> {
+  const prior = readLedger()[fingerprint];
+  if (!prior) return null;
+  let s: any = null;
+  try {
+    const res = await ctx.api("meetings", `/api/uploads/${prior.id}`, { signal: AbortSignal.timeout(30_000) });
+    s = res.ok ? await readJsonSafe(res) : null;
+  } catch { s = null; }
+  if (s?.status === "done" && s.transcriptId) {
+    progress.note(`The interrupted run already completed on the server (session ${prior.id}) — using its transcript instead of uploading again`);
+    return { transcriptId: s.transcriptId };
+  }
+  if (s?.status === "completing") {
+    progress.note(`The interrupted run is still being finalized on the server (session ${prior.id}) — waiting for it instead of uploading again`);
+    const outcome = await pollUploadSession(ctx, prior.id);
+    if (outcome.kind === "done") return { transcriptId: outcome.transcriptId };
+    if (outcome.kind === "failed") throw new UploadFailed(outcome.error);
+    return null; // reopened (transient pull failure) → the normal resume path takes it
+  }
+  if (s?.status !== "open") writeLedger((l) => { delete l[fingerprint]; });
+  return null;
+}
+
+/**
+ * Upload one media file through a resumable session. Resolves with the
+ * transcript row (fetched by id when the complete reply only carried the
+ * id). Restarts the session once if the server says it is gone.
+ */
+async function uploadResumable(ctx: Ctx, file: string, name: string, size: number, opts: ResumableUploadOpts, progress: UploadProgress): Promise<{ transcript: any; sessionId: string; via: "chunks" | "blob" | "prior" }> {
+  const contentType = mimeFor(name);
+  progress.set("Reading", 0);
+  const sha256 = await sha256File(file, (n) => progress.set("Reading", n));
+  const body: Record<string, unknown> = {
+    fingerprint: `cli:v1:${sha256}`, size, filename: name, contentType,
+    languageCode: opts.languageCode || undefined, eventRef: opts.eventRef || undefined, scratch: opts.scratch || undefined,
+    via: "blob", sha256,
+  };
+  const fingerprint = body.fingerprint as string;
+  const prior = await priorSessionOutcome(ctx, fingerprint, progress);
+  if (prior) {
+    const priorId = readLedger()[fingerprint]?.id ?? "?";
+    writeLedger((l) => { delete l[fingerprint]; });
+    return { ...(await resolveDone(ctx, prior)), sessionId: priorId, via: "prior" };
+  }
+  const fd = openSync(file, "r");
+  let sessionId: string | null = null;
+  let where = "on the server";
+  const onSigint = () => {
+    progress.end();
+    console.error(sessionId
+      ? `\nInterrupted — session ${sessionId} stays resumable for 24 h (${fmtMB(progress.seen)} of ${fmtMB(size)} MB ${where}). Re-run the same command on the same file to continue.`
+      : "\nInterrupted before the upload session opened — nothing is on the server yet. Re-run the same command to upload.");
+    process.exit(130);
+  };
+  process.on("SIGINT", onSigint);
+  try {
+    let restarts = 0;
+    for (;;) {
+      const session = await openUploadSession(ctx, body);
+      sessionId = session.id;
+      writeLedger((l) => { l[fingerprint] = { id: session.id, file: name, size, at: new Date().toISOString() }; });
+      const via: "chunks" | "blob" = session.via === "blob" && session.blob ? "blob" : "chunks";
+      where = via === "blob" ? "in Azure Blob storage" : "on the server";
+      if (session.resumed) progress.note(`Found an open upload session for this file (${session.id}) — resuming`);
+      else if (opts.resumeExpected && restarts === 0) progress.note("Nothing to resume for this file (no open upload session on the server) — uploading from the start");
+      try {
+        if (via === "blob") {
+          const renewTicket = async (): Promise<BlobTicket> => {
+            const again = await openUploadSession(ctx, body);
+            if (again.id !== session.id || again.via !== "blob" || !again.blob) throw new SessionGone("blob session replaced");
+            return again.blob;
+          };
+          for (let sync = 0; sync < 3; sync++) {
+            await uploadBlobBlocks(fd, size, contentType, session.blob!, renewTicket, progress);
+            try {
+              const done = await completeUploadSession(ctx, session.id, progress);
+              writeLedger((l) => { delete l[fingerprint]; });
+              return { ...(await resolveDone(ctx, done)), sessionId: session.id, via };
+            } catch (e) {
+              if (e instanceof NotCommitted && sync < 2) continue;
+              if (e instanceof NotCommitted) throw new UploadFailed("Upload failed: the blob never committed — re-run the same command");
+              throw e;
+            }
+          }
+          throw new UploadFailed("Upload failed: blocks kept going missing");
+        }
+        if (session.resumed) {
+          let bytes = 0;
+          for (const i of session.received) bytes += chunkRange(size, session.chunkSize, i).length;
+          progress.note(`Resuming — ${fmtMB(bytes)} of ${fmtMB(size)} MB already on the server (${Math.round((bytes / size) * 100)}%)`);
+        }
+        for (let sync = 0; sync < 3; sync++) {
+          await sendMissingChunks(ctx, fd, size, session, progress);
+          try {
+            const done = await completeUploadSession(ctx, session.id, progress);
+            writeLedger((l) => { delete l[fingerprint]; });
+            return { ...(await resolveDone(ctx, done)), sessionId: session.id, via };
+          } catch (e) {
+            if (e instanceof SessionGone && e.message.startsWith("{") && sync < 2) {
+              const fresh = await openUploadSession(ctx, body);
+              if (fresh.id !== session.id) throw new SessionGone("session replaced");
+              session.received = fresh.received;
+              continue;
+            }
+            throw e;
+          }
+        }
+        throw new UploadFailed("Upload failed: chunks kept going missing");
+      } catch (e) {
+        if (e instanceof SessionGone && restarts < 1) { restarts++; progress.note("Upload session expired on the server — starting over"); continue; }
+        if (e instanceof SessionGone) throw new UploadFailed("Upload session expired — please run the upload again");
+        throw e;
+      }
+    }
+  } finally {
+    process.off("SIGINT", onSigint);
+    closeSync(fd);
+    progress.end();
+  }
+}
+
+async function resolveDone(ctx: Ctx, done: { transcript?: any; transcriptId?: string }): Promise<{ transcript: any }> {
+  if (done.transcript) return { transcript: done.transcript };
+  const g = await ctx.expectJson<{ transcript: any }>(ctx.api("meetings", `/api/transcripts/${done.transcriptId}`));
+  return { transcript: g.transcript };
+}
+
 /** '<eventId>|<startIso>' = event key; anything else = meeting code. */
 function eventRefBody(ref: string): { eventKey: string } | { meetingCode: string } {
   return ref.includes("|") ? { eventKey: ref } : { meetingCode: ref };
@@ -1066,7 +1599,7 @@ const meetings: Subcommand = {
   help: HELP,
   async run(ctx, argv) {
     const { pos, flags } = parseArgs(argv);
-    liftBoolFlags(pos, flags, ["cascade", "exact", "cached", "details", "wait", "clear", "scratch", CONSENT_FLAG]);
+    liftBoolFlags(pos, flags, ["cascade", "exact", "cached", "details", "wait", "clear", "scratch", "resume", CONSENT_FLAG]);
     const [, cmd, ...args] = pos.length && pos[0] === "meetings" ? pos : ["", ...pos];
     if (!cmd || flags.help === true) { console.log(HELP); return 0; }
 
@@ -1172,6 +1705,85 @@ const meetings: Subcommand = {
         );
         ctx.print(data, () => console.log(`${sub}: ${data.prefs?.[sub] === false ? "off" : "on"}`));
         return 0;
+      }
+
+      case "offline": {
+        const sub = args[0];
+        const OFFLINE_KEYS = ["transcripts", "audio", "video"] as const;
+        const fmtPrefs = (p: any) => OFFLINE_KEYS.map(k => `${k} ${p?.[k] ?? "?"}`).join(" · ");
+        if (sub === "plan") {
+          const ids = args.slice(1).flatMap(a => a.split(",")).map(s => s.trim()).filter(Boolean);
+          const data = await ctx.expectJson<any>(ctx.api("meetings", `/api/offline/plan${ids.length ? `?ids=${encodeURIComponent(ids.join(","))}` : ""}`));
+          ctx.print(data, () => {
+            const prefs = data.prefs ?? {};
+            const meetings: any[] = data.meetings ?? [];
+            // The web app's ladder (src/lib/offline/offline-sync.ts desiredAutoLevels):
+            // newest N at transcript; of those with a stored recording the first
+            // N at audio; of those with video the first N at video. Max wins.
+            const level = new Map<string, string>();
+            const rank: Record<string, number> = { transcript: 1, audio: 2, video: 3 };
+            const set = (m: any, l: string) => { const cur = level.get(m.id); if (!cur || rank[l]! > rank[cur]!) level.set(m.id, l); };
+            const hasVideo = (m: any) => !!(m.media?.isVideo || (m.media?.parts ?? []).some((p: any) => p.isVideo));
+            if (!ids.length) {
+              for (const m of meetings.slice(0, Math.max(0, prefs.transcripts ?? 0))) set(m, "transcript");
+              const withMedia = meetings.filter(m => m.media?.hasLocal);
+              for (const m of withMedia.slice(0, Math.max(0, prefs.audio ?? 0))) set(m, "audio");
+              for (const m of withMedia.filter(hasVideo).slice(0, Math.max(0, prefs.video ?? 0))) set(m, "video");
+            }
+            console.log(`offline plan — auto-pin counts: ${fmtPrefs(prefs)}${data.buildId ? `  (build ${data.buildId})` : ""}`);
+            if (!meetings.length) { console.log(ids.length ? "None of those meetings is available to you (deleted, unshared, or never yours) — a device unpins them." : "Nothing to keep offline yet (no completed meetings visible to you)."); return; }
+            let storedTotal = 0;
+            const byLevel: Record<string, number> = {};
+            for (const m of meetings) {
+              const parts: any[] = m.media?.parts ?? [];
+              const stored = parts.reduce((n: number, p: any) => n + (p.bytes ?? 0), 0);
+              storedTotal += stored;
+              const media = !m.media?.hasLocal ? "no recording" : `${hasVideo(m) ? "video" : "audio"} ${fmtMB(stored)} MB${parts.length > 1 ? ` (${parts.length} parts)` : ""}${parts.some((p: any) => p.bytes == null) ? " (a part is missing on disk)" : ""}`;
+              const date = (m.recordedAt || m.createdAt || "").slice(0, 10);
+              const lvl = ids.length ? "available" : (level.get(m.id) ?? "-");
+              byLevel[lvl] = (byLevel[lvl] ?? 0) + 1;
+              console.log(`${m.id}  ${date}  ${fmtDuration(m.durationSec).padStart(7)}  ${lvl.padEnd(10)}  ${media.padEnd(28)}  ${m.title || "(untitled)"}`);
+            }
+            if (ids.length) {
+              const missing = ids.filter(id => !meetings.some(m => m.id === id));
+              if (missing.length) console.log(`\nnot available (a device unpins these): ${missing.join(", ")}`);
+              console.log(`\n${meetings.length} of ${ids.length} meeting(s) available · stored recordings ${fmtMB(storedTotal)} MB`);
+            } else {
+              console.log(`\n${meetings.length} meeting(s) in the plan: ${["video", "audio", "transcript"].map(l => `${byLevel[l] ?? 0} at ${l}`).join(", ")} · stored recordings ${fmtMB(storedTotal)} MB (the video tier fetches the stored file; the audio tier a smaller audio-only variant; transcript = page + text only)`);
+            }
+          });
+          return 0;
+        }
+        if (sub === "prefs") {
+          if (flags.set === undefined) {
+            const data = await ctx.expectJson<any>(ctx.api("meetings", "/api/offline/prefs"));
+            ctx.print(data, () => {
+              console.log(`offline auto-pin counts (newest N meetings every device of this account keeps offline):`);
+              for (const k of OFFLINE_KEYS) console.log(`  ${k.padEnd(12)} ${String(data.prefs?.[k] ?? "?").padStart(4)}   (default ${data.defaults?.[k] ?? "?"}, max ${data.max?.[k] ?? "?"})`);
+              console.log(`change: darth-cli meetings offline prefs --set transcripts=200,audio=20 --${CONSENT_FLAG}`);
+            });
+            return 0;
+          }
+          const raw = str(flags.set);
+          const patch: Record<string, number> = {};
+          for (const pair of (raw ?? "").split(",").map(s => s.trim()).filter(Boolean)) {
+            const eq = pair.indexOf("=");
+            const k = pair.slice(0, eq).trim(); const v = pair.slice(eq + 1).trim();
+            if (eq <= 0 || !(OFFLINE_KEYS as readonly string[]).includes(k) || !/^\d+$/.test(v)) {
+              console.error(`--set takes <key>=<count> pairs, comma-separated; keys: ${OFFLINE_KEYS.join(", ")} (got '${pair}')`);
+              return 1;
+            }
+            patch[k] = Number(v);
+          }
+          if (!Object.keys(patch).length) { console.error(`usage: darth-cli meetings offline prefs --set <key>=<count>[,…]   keys: ${OFFLINE_KEYS.join(", ")}`); return 1; }
+          ctx.requireWrite();
+          if (!requireConsent(flags, "the offline auto-pin counts")) return 1;
+          const data = await ctx.expectJson<any>(ctx.api("meetings", "/api/offline/prefs", { method: "PUT", body: JSON.stringify(patch) }));
+          ctx.print(data, () => console.log(`offline auto-pin counts: ${fmtPrefs(data.prefs)}  (values above the cap are clamped: max ${fmtPrefs(data.max)})`));
+          return 0;
+        }
+        console.error("usage: darth-cli meetings offline plan [<id,…>] | offline prefs [--set <key>=<count>[,…]]");
+        return 1;
       }
 
       case "whoami": {
@@ -1747,20 +2359,42 @@ const meetings: Subcommand = {
         const scratch = flags.scratch === true;
         if (scratch) q.set("scratch", "1");
         const say = (line: string) => { if (!ctx.json) console.log(line); };
-        // Bun streams a Bun.file body (multi-GB safe); node fallback reads it whole.
-        const B: any = (globalThis as any).Bun;
-        const body: any = B?.file ? B.file(file) : new Blob([readFileSync(file)]);
-        say(`Uploading ${name} (${(size / 1048576).toFixed(1)} MB)${ev ? ` → event ${ev}` : " unlinked"}${scratch ? " as a temporary (scratch) transcript" : ""}…`);
-        const path = isText ? `/api/transcripts/import-text?${q}` : `/api/transcripts?${q}`;
-        const res = await ctx.api("meetings", path, {
-          method: "POST", body,
-          headers: { "content-type": mimeFor(name), "x-filename": encodeURIComponent(name), "content-length": String(size) },
-        });
-        const data: any = await res.json().catch(() => null);
-        if (!res.ok) {
-          console.error(`Upload failed (HTTP ${res.status}): ${data?.error ?? "unknown error"}${data?.detail ? ` — ${data.detail}` : ""}`);
-          if (res.status === 404 && ev) console.error("Tip: 'darth-cli meetings calendar --view all --json' lists your events with their [meeting-code] and exact 'key'.");
-          return 1;
+        const eventTip = () => console.error("Tip: 'darth-cli meetings calendar --view all --json' lists your events with their [meeting-code] and exact 'key'.");
+        const resumable = !isText && size > ONE_SHOT_MAX_BYTES;
+        if (flags.resume === true && !resumable) console.error(`--resume: ${isText ? "text documents" : "files of 8 MB or less"} go up in one request — nothing to resume, uploading normally.`);
+        let data: any;
+        if (resumable) {
+          // Session path (POST /api/uploads): hashed, parallel verified
+          // pieces, resumable for 24 h by re-running the same command.
+          say(`Uploading ${name} (${fmtMB(size)} MB, resumable)${ev ? ` → event ${ev}` : " unlinked"}${scratch ? " as a temporary (scratch) transcript" : ""}…`);
+          try {
+            const r = await uploadResumable(ctx, file, name, size, { eventRef: ev, languageCode: lang, scratch, resumeExpected: flags.resume === true }, new UploadProgress(!ctx.json, size));
+            data = { transcript: r.transcript };
+            say(r.via === "prior"
+              ? `Already received by the server in the interrupted run — session ${r.sessionId} (nothing re-uploaded)`
+              : `Received via ${r.via === "blob" ? "Azure Blob (pulled by the server)" : "chunks"} — session ${r.sessionId}`);
+          } catch (e) {
+            if (!(e instanceof UploadFailed)) throw e;
+            console.error(`Upload failed${e.status ? ` (HTTP ${e.status})` : ""}: ${e.message}`);
+            if (e.status === 404 && ev) eventTip();
+            return 1;
+          }
+        } else {
+          // Bun streams a Bun.file body (multi-GB safe); node fallback reads it whole.
+          const B: any = (globalThis as any).Bun;
+          const body: any = B?.file ? B.file(file) : new Blob([readFileSync(file)]);
+          say(`Uploading ${name} (${fmtMB(size)} MB)${ev ? ` → event ${ev}` : " unlinked"}${scratch ? " as a temporary (scratch) transcript" : ""}…`);
+          const path = isText ? `/api/transcripts/import-text?${q}` : `/api/transcripts?${q}`;
+          const res = await ctx.api("meetings", path, {
+            method: "POST", body,
+            headers: { "content-type": mimeFor(name), "x-filename": encodeURIComponent(name), "content-length": String(size) },
+          });
+          data = await res.json().catch(() => null);
+          if (!res.ok) {
+            console.error(`Upload failed (HTTP ${res.status}): ${data?.error ?? "unknown error"}${data?.detail ? ` — ${data.detail}` : ""}`);
+            if (res.status === 404 && ev) eventTip();
+            return 1;
+          }
         }
         // Text importer, unknown format → 202 {queued, id, assemblyaiId}: an
         // LLM normalizes it behind a placeholder row (minutes). Read the
