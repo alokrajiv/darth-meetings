@@ -308,7 +308,10 @@ export async function recordAutoImportFire(input: {
   occKey: string;
   occStart: string | null;
   title: string | null;
-  outcome: 'imported' | 'deferred' | 'already' | 'failed';
+  /** 'no-artifact' (2026-09-18): the mode's artifact never appeared within
+   * its dependency window — terminal for the UI/CLI ("pending" forever was
+   * the alternative); the sweep still fires it if an artifact turns up. */
+  outcome: 'imported' | 'deferred' | 'already' | 'failed' | 'no-artifact';
   assemblyaiId?: string | null;
   detail?: string | null;
 }): Promise<void> {

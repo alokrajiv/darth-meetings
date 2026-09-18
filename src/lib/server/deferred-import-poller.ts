@@ -4,6 +4,8 @@ import {
   markDeferredImportFailed,
   mergeGmeetContextForUser,
 } from '@/db-ops/transcripts';
+import { getMeetingCacheByMeetings } from '@/db-ops/gmeet-meeting-cache';
+import { getCalendarAttachmentsFor } from '@/db-ops/calendar-event-cache';
 import { listRecordArtifacts } from '@/lib/server/gmeet';
 import { getServerAccessToken } from '@/lib/server/google-oauth';
 import { executeGmeetImport } from '@/lib/server/gmeet-import-core';
@@ -28,6 +30,15 @@ import type { GmeetContext } from '@/lib/format';
  *    transcript (Doc failures are swallowed in that mode). If the video is
  *    ready but the Doc still hasn't appeared after BOTH_TRANSCRIPT_WAIT_MS
  *    (or Google stopped listing any transcript), it proceeds video-only.
+ *
+ * Meet rows queued WITHOUT a conference record (account auto-sync's early
+ * fire while the recording is still generating — lib/server/account-auto-
+ * sync queueAwaitingRecording): the Meet API lists nothing for a
+ * non-organiser's token, so instead of that listing the tick reads the
+ * artifact cache (recording poller / organiser sweeps write video_file_id)
+ * and the owner's calendar attachments — the same sources the sweep picks
+ * video ids from — and runs once a file id shows up there. The 24h give-up
+ * applies unchanged.
  *
  * Teams rows (gmeet_context.provider === 'teams'): Graph is app-only — no
  * owner token needed. There is no separate "listed but file pending" state
@@ -192,6 +203,26 @@ async function settleExecOutcome(
   });
 }
 
+/** A ready recording file id for the occurrence from what the sweeps already
+ * persisted: the artifact cache row (code + instant, ±12h) or the owner's
+ * calendar attachments. Null = nothing landed yet. Never a terminal verdict
+ * — the 24h give-up is the only clock. */
+async function readyVideoFromCaches(
+  userId: string,
+  meetingCode: string,
+  startIso: string,
+  eventId: string | null
+): Promise<string | null> {
+  const [cacheRow] = await getMeetingCacheByMeetings([{ code: meetingCode, startTime: startIso }]).catch(
+    () => [null]
+  );
+  if (cacheRow?.video_file_id && (cacheRow.ready_recording_count ?? 0) > 0) return cacheRow.video_file_id;
+  const att = await getCalendarAttachmentsFor(userId, { eventId, meetingCode, startTime: startIso }).catch(
+    () => null
+  );
+  return att?.videoFileId ?? cacheRow?.video_file_id ?? null;
+}
+
 async function checkRow(row: {
   user_id: string;
   assemblyai_id: string;
@@ -302,7 +333,12 @@ async function checkRow(row: {
     (!!marker.request.videoFileId || (mode === 'transcript' && !!marker.request.transcriptDocId));
 
   const recordName = marker.request.conferenceRecordName;
-  if (!recordName && !readyAtQueue) {
+  const ev = marker.request.event;
+  // Account auto-sync early fire (see module doc): no record to watch, but
+  // a meeting code + start to look the file up by once it exists.
+  const awaitingRecordingViaCache =
+    !recordName && !readyAtQueue && mode !== 'transcript' && !!ev?.meetingCode && !!ev?.startTime;
+  if (!recordName && !readyAtQueue && !awaitingRecordingViaCache) {
     // Can't happen (deferral requires a record) — but never loop on it.
     await markDeferredImportFailed(row.user_id, row.assemblyai_id, {
       ...marker,
@@ -321,7 +357,16 @@ async function checkRow(row: {
   // would kill a perfectly good import (the Drive download itself works —
   // Drive sharing, not Meet API access, is what gates the file).
   let readyVideo: string | null = null;
-  if (!readyAtQueue) {
+  if (awaitingRecordingViaCache) {
+    readyVideo = await readyVideoFromCaches(row.user_id, ev!.meetingCode!, ev!.startTime!, ev!.id ?? null);
+    if (!readyVideo) {
+      await heartbeat(row.user_id, row.assemblyai_id, marker, {
+        lastCheckedAt: nowIso,
+        attempts: (marker.attempts ?? 0) + 1,
+      });
+      return;
+    }
+  } else if (!readyAtQueue) {
     const artifacts = await listRecordArtifacts(minted.token, recordName!);
     readyVideo = artifacts.recordings.find((r) => r.fileId)?.fileId ?? null;
     // "gone" verdicts are TERMINAL — never issue one off a failed listing
