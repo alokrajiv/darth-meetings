@@ -23,6 +23,7 @@ rsync "${RSYNC_FLAGS[@]}" \
   --exclude .next \
   --exclude .env.local \
   --exclude .git \
+  --exclude .claude \
   --exclude storage \
   --exclude tmp \
   --exclude .playwright-mcp \
