@@ -26,6 +26,7 @@ import {
   unpinMeeting,
 } from './offline-pins';
 import { levelRank, maxLevel } from './offline-urls';
+import { flushOutbox } from './offline-outbox';
 
 /**
  * The auto-pin policy. One pass = read the account's plan
@@ -322,6 +323,17 @@ async function syncOnce(reason: string): Promise<void> {
   // just because the sync never got past this line.
   const probe = await probeAndBindOwner();
   if (probe.result !== 'online') return;
+  // Reachable and bound to the right owner: replay what this device read
+  // while it was cut off — BEFORE the mode check, because a user who is
+  // still in offline mode (the "Connection is back" bar not yet clicked)
+  // has a working network now and the outbox is the one write that is
+  // safe in that state (idempotent, caller-scoped, no content).
+  try {
+    const r = await flushOutbox(reason);
+    if (r.drained > 0 || r.stopped) console.debug(`[offline-outbox] ${reason}: drained ${r.drained}, remaining ${r.remaining}${r.stopped ? ` (${r.stopped})` : ''}`);
+  } catch (err) {
+    console.warn('[offline-outbox] flush failed', err);
+  }
   if (getOfflineMode() === 'offline') return;
   await loadLastSync();
 

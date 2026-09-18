@@ -3,6 +3,7 @@
 import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import {
   OFFLINE_CHANGE_EVENT,
+  OFFLINE_DEEPLINK_PARAM,
   type OfflineMode,
   type OfflineState,
   type PinRecord,
@@ -191,8 +192,15 @@ export function OfflineProvider({ children }: { children: ReactNode }) {
         promptArmedRef.current = true;
         setPromptVisible(false);
         // Back after an outage: re-check who we are (and whether the
-        // session survived) right away rather than at the next period.
-        if (!was) void checkSession();
+        // session survived) right away rather than at the next period, and
+        // run a sync pass — it replays the offline activity outbox first
+        // (in every mode) and refreshes pins in online mode. The browser's
+        // 'online' event never fires on a stalled VPN tunnel, so this probe
+        // flip is the reconnect trigger that always exists.
+        if (!was) {
+          void checkSession();
+          void runOfflineSync('reconnect');
+        }
         return;
       }
 
@@ -246,6 +254,22 @@ export function OfflineProvider({ children }: { children: ReactNode }) {
     unmountedRef.current = false;
     supported.current = offlineSupported();
     modeRef.current = getOfflineMode();
+    // Manifest shortcut "Offline archive" (/?offline=1): the user asked for
+    // the on-device archive, which is the one time entering offline mode
+    // is not a banner decision. The param is stripped so a reload or a
+    // "Back online" click does not re-enter it.
+    try {
+      const sp = new URLSearchParams(window.location.search);
+      if (sp.get(OFFLINE_DEEPLINK_PARAM) === '1') {
+        modeRef.current = 'offline';
+        setOfflineMode('offline');
+        sp.delete(OFFLINE_DEEPLINK_PARAM);
+        const qs = sp.toString();
+        window.history.replaceState(window.history.state, '', `${window.location.pathname}${qs ? `?${qs}` : ''}${window.location.hash}`);
+      }
+    } catch {
+      /* no URL API — ignore */
+    }
     setMode(modeRef.current);
     setReady(true);
 

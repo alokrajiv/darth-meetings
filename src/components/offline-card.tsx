@@ -13,6 +13,8 @@ import { OFFLINE_TITLE, useOffline } from '@/lib/offline/offline-context';
 import { isNetworkFailure, offlineAwareError } from '@/lib/offline/offline-fetch';
 import { clearAllOffline, pinMeeting, unpinMeeting } from '@/lib/offline/offline-pins';
 import { OFFLINE_CHANGE_EVENT, type OfflinePrefs, type PinLevel, type PinRecord } from '@/lib/offline/offline-types';
+import { isStandalone, storagePersisted } from '@/lib/offline/installed-app';
+import { outboxCount } from '@/lib/offline/offline-outbox';
 import { formatBytes } from '@/lib/format';
 
 /**
@@ -174,6 +176,26 @@ export function OfflineCard() {
 
   const supported = sw !== 'unsupported';
   const visiblePins = pins.filter((p) => p.level !== 'none' || p.manual);
+
+  // Installed app (Dock / Home Screen) + persistent-storage grant: the
+  // eviction note only applies to a plain browser tab. Re-read after every
+  // sync so a "persist" grant that landed meanwhile shows up.
+  const [installed, setInstalled] = useState(false);
+  const [persisted, setPersisted] = useState<boolean | null>(null);
+  const [queued, setQueued] = useState(0);
+  useEffect(() => {
+    let cancelled = false;
+    setInstalled(isStandalone());
+    void storagePersisted().then((v) => {
+      if (!cancelled) setPersisted(v);
+    });
+    void outboxCount().then((n) => {
+      if (!cancelled) setQueued(n);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [syncing, mode, online]);
   const pinnedTotal = storage ? storage.pinned.transcript + storage.pinned.audio + storage.pinned.video : 0;
 
   // The row is "busy" only until the ledger holds the new level (the
@@ -491,9 +513,32 @@ export function OfflineCard() {
             </div>
           )}
 
-          <p className="mt-3 text-[11px] text-muted-foreground">
-            Safari deletes saved data after 7 days without a visit; add Darth Meetings to the Dock
-            (File › Add to Dock) to keep it. Signing out clears everything saved here.
+          {queued > 0 && (
+            <p className="mt-3 text-[11px] text-muted-foreground" data-offline-outbox-count>
+              {queued} offline {queued === 1 ? 'activity event' : 'activity events'} (views, plays) waiting to sync — sent
+              automatically when the server is reachable.
+            </p>
+          )}
+          <p className="mt-3 text-[11px] text-muted-foreground" data-offline-install-note>
+            {installed ? (
+              persisted === false ? (
+                <>
+                  Installed ✓ · storage not yet persistent — the browser may still evict saved data after a
+                  long idle; it usually grants persistence after a few visits. Signing out clears everything
+                  saved here.
+                </>
+              ) : (
+                <>
+                  Installed ✓ · storage persistent — saved data is never evicted automatically. Signing out
+                  clears everything saved here.
+                </>
+              )
+            ) : (
+              <>
+                Safari deletes saved data after 7 days without a visit; add Darth Meetings to the Dock
+                (File › Add to Dock) to keep it. Signing out clears everything saved here.
+              </>
+            )}
           </p>
         </section>
       </CardContent>

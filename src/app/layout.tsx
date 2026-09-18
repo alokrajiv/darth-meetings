@@ -3,6 +3,7 @@ import { Geist, Geist_Mono } from "next/font/google";
 import "./globals.css";
 import { SessionKeeper } from "@/components/session-keeper";
 import { OfflineProvider } from "@/lib/offline/offline-context";
+import { AppBadge } from "@/lib/offline/app-badge";
 import { OfflineBanner } from "@/components/offline-banner";
 import { CompanionBanner } from "@/components/companion-banner";
 
@@ -58,6 +59,8 @@ export default function RootLayout({
         {/* Client-only: registers /sw.js, tracks connectivity and the offline
             pins; the banner renders nothing unless there is something to say. */}
         <OfflineProvider>
+          {/* Installed app only: icon badge = meetings waiting for speaker review. */}
+          <AppBadge />
           <OfflineBanner />
           {/* Client-only: talks to the local Darth Recorder tray (ws://127.0.0.1:47800)
               when one is installed; renders nothing otherwise. */}

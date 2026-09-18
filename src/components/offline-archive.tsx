@@ -80,6 +80,20 @@ export function OfflineArchive({ className = '' }: { className?: string }) {
   // Tombstones (level 'none') are exclusions, not content. Ledger order is
   // already newest-first (listPins), which is what the day buckets need.
   const saved = useMemo(() => pins.filter((p) => p.level !== 'none'), [pins]);
+  // The headline counts what is actually READABLE now; rows still
+  // downloading (or that failed) are called out separately instead of
+  // being folded into "N meetings saved".
+  const tally = useMemo(() => {
+    let ready = 0;
+    let saving = 0;
+    let failed = 0;
+    for (const p of saved) {
+      if (p.status === 'ready') ready += 1;
+      else if (p.status === 'pending') saving += 1;
+      else failed += 1;
+    }
+    return { ready, saving, failed };
+  }, [saved]);
   const filtered = useMemo(() => {
     const needle = q.trim().toLowerCase();
     if (!needle) return saved;
@@ -100,8 +114,18 @@ export function OfflineArchive({ className = '' }: { className?: string }) {
             aria-label="Search saved meetings"
           />
         </div>
-        <span className="text-xs text-muted-foreground">
-          {saved.length} meeting{saved.length === 1 ? '' : 's'} saved on this device
+        <span className="text-xs text-muted-foreground" data-offline-archive-count>
+          {tally.ready} meeting{tally.ready === 1 ? '' : 's'} saved on this device
+          {tally.saving > 0 && (
+            <span className="ml-1.5 inline-flex items-center gap-1" title="Still downloading — readable once the row shows no spinner">
+              <Loader2 className="h-3 w-3 animate-spin" />+ {tally.saving} saving
+            </span>
+          )}
+          {tally.failed > 0 && (
+            <span className="ml-1.5 text-destructive" title="Download failed — retried on the next sync">
+              · {tally.failed} failed
+            </span>
+          )}
         </span>
       </div>
 

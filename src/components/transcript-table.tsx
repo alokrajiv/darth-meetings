@@ -2605,6 +2605,17 @@ archiveErrorPanel
           void fetchArchiveRef.current('silent');
           void refreshLabelCatalog();
         }}
+        // Temporary (migration 042): the Temporary tab offers Keep, the
+        // main tabs Move to temporary; the trash has its own restore flow.
+        scratchAction={tab === 'trash' ? null : tab === 'scratch' ? 'keep' : 'temporary'}
+        onScratchApplied={(result) => {
+          // Changed rows leave the tab they were on; the selection would
+          // point at rows that are gone, so drop it and reconcile.
+          const skipped = new Set(result.skipped.map((s) => s.id));
+          for (const id of selectedIds) if (!skipped.has(id)) removeRowLocally(id);
+          clearSelection();
+          void fetchArchiveRef.current('silent');
+        }}
       />
     </div>
   );

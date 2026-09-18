@@ -1,5 +1,5 @@
 import 'server-only';
-import { formatDuration } from '@/lib/format';
+import { SCRATCH_TTL_DAYS, formatDuration } from '@/lib/format';
 import { resolveMeetingByAnyTranscriptId } from '@/db-ops/meetings';
 import { APP_URL } from '@/lib/server/darth-notify';
 
@@ -98,6 +98,22 @@ export async function openLink(assemblyaiId: string | null | undefined, label = 
 }
 
 export const SETTINGS_LINK = `<${APP_URL}/settings#auto-sync|Settings>`;
+
+/** The listing, where the Trash tab lives (there is no per-tab deep link). */
+export const TRASH_LINK = `<${APP_URL}/|Open the Trash tab>`;
+
+/**
+ * "Your temporary transcript was moved to the trash" (notes sweeper, after
+ * the SCRATCH_TTL_DAYS auto-trash). Nothing is lost: trash is never purged
+ * automatically, so the ask is simply "restore it if you still want it".
+ */
+export function scratchTrashedDm(m: MeetingFacts): string {
+  return dm(
+    `🗑 *Temporary transcript moved to the trash*`,
+    meetingLine(m),
+    `It was marked temporary and its ${SCRATCH_TTL_DAYS} days ran out. Nothing is deleted for good — restore it from the Trash tab whenever you need it (it stays there until you empty it) → ${TRASH_LINK}`
+  );
+}
 
 /** Join the non-empty lines of a DM. */
 export function dm(...lines: Array<string | null | undefined | false>): string {

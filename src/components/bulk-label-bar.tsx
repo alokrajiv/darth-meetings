@@ -1,7 +1,7 @@
 'use client';
 
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { Loader2, Minus, Plus, X } from 'lucide-react';
+import { Archive, Hourglass, Loader2, Minus, Plus, X } from 'lucide-react';
 import type { LabelRef } from '@/lib/format';
 import { LabelPicker, anchorFromElement, parseError, type PickerAnchor } from '@/components/label-picker';
 import { OFFLINE_TITLE } from '@/lib/offline/offline-types';
@@ -14,11 +14,33 @@ import { isNetworkFailure } from '@/lib/offline/offline-fetch';
  * labels the selection actually carries) and call POST /api/labels/bulk;
  * the server answers `{applied, skipped:[{id,reason}]}` and the bar
  * reports partial success ("2 read-only skipped") instead of hiding it.
+ *
+ * Temporary transcripts (migration 042): one more action, "Move to
+ * temporary" on the main tabs or "Keep" on the Temporary tab. There is no
+ * batch route for `scratch` — it is PATCH /api/transcripts/:id per row,
+ * run client-side SCRATCH_CONCURRENCY at a time, with the same
+ * applied/skipped summary (403 = read-only share, skipped).
  */
 
 export interface BulkResult {
   applied: number;
   skipped: { id: string; reason: string }[];
+}
+
+export type BulkScratchAction = 'keep' | 'temporary';
+
+const SCRATCH_CONCURRENCY = 4;
+
+/** Runs `fn` over `items` with at most `n` in flight (order of completion irrelevant). */
+async function pool<T>(items: readonly T[], n: number, fn: (item: T) => Promise<void>): Promise<void> {
+  let i = 0;
+  const workers = Array.from({ length: Math.min(n, items.length) }, async () => {
+    while (i < items.length) {
+      const item = items[i++]!;
+      await fn(item);
+    }
+  });
+  await Promise.all(workers);
 }
 
 export interface BulkLabelBarProps {
@@ -35,6 +57,10 @@ export interface BulkLabelBarProps {
   openAddSignal?: number;
   /** Offline mode / network down: Add/Remove are inert (Clear stays live). */
   disabled?: boolean;
+  /** Which temporary-transcript action fits the current tab; null/undefined hides it. */
+  scratchAction?: BulkScratchAction | null;
+  /** Fired after the per-row PATCH loop finishes (success or partial). */
+  onScratchApplied?: (result: BulkResult, action: BulkScratchAction) => void;
 }
 
 export function BulkLabelBar({
@@ -45,6 +71,8 @@ export function BulkLabelBar({
   onApplied,
   openAddSignal,
   disabled = false,
+  scratchAction = null,
+  onScratchApplied,
 }: BulkLabelBarProps) {
   const [picker, setPicker] = useState<{ kind: 'add' | 'remove'; anchor: PickerAnchor } | null>(null);
   const [busy, setBusy] = useState(false);
@@ -116,6 +144,53 @@ export function BulkLabelBar({
     [count, selectedIds, onApplied]
   );
 
+  const runScratch = useCallback(
+    async (action: BulkScratchAction) => {
+      if (count === 0) return;
+      setBusy(true);
+      setMessage(null);
+      const scratch = action === 'temporary';
+      const result: BulkResult = { applied: 0, skipped: [] };
+      try {
+        await pool([...selectedIds], SCRATCH_CONCURRENCY, async (id) => {
+          try {
+            const res = await fetch(`/api/transcripts/${encodeURIComponent(id)}`, {
+              method: 'PATCH',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ scratch }),
+            });
+            if (res.ok) {
+              result.applied += 1;
+              return;
+            }
+            const txt = await res.text().catch(() => '');
+            result.skipped.push({
+              id,
+              reason: res.status === 403 ? 'read-only' : parseError(txt) || `${res.status}`,
+            });
+          } catch (err) {
+            if (isNetworkFailure(err)) throw err; // stop the loop — nothing will succeed offline
+            result.skipped.push({ id, reason: err instanceof Error ? err.message : 'failed' });
+          }
+        });
+        const verb = scratch ? 'Moved' : 'Kept';
+        const ro = result.skipped.filter((s) => s.reason === 'read-only').length;
+        const other = result.skipped.length - ro;
+        let msg = `${verb} ${result.applied} meeting${result.applied === 1 ? '' : 's'}${scratch ? ' to temporary' : ''}`;
+        if (ro) msg += ` · ${ro} read-only skipped`;
+        if (other) msg += ` · ${other} skipped`;
+        setMessage(msg);
+        onScratchApplied?.(result, action);
+      } catch (err) {
+        setMessage(isNetworkFailure(err) ? OFFLINE_TITLE : err instanceof Error ? err.message : 'Bulk update failed');
+        if (result.applied > 0) onScratchApplied?.(result, action);
+      } finally {
+        setBusy(false);
+      }
+    },
+    [count, selectedIds, onScratchApplied]
+  );
+
   if (count === 0) return null;
 
   return (
@@ -166,6 +241,25 @@ export function BulkLabelBar({
             <Minus className="h-3.5 w-3.5" />
             Remove label
           </button>
+          {scratchAction && (
+            <button
+              type="button"
+              disabled={busy || disabled}
+              onClick={() => void runScratch(scratchAction)}
+              className="inline-flex items-center gap-1 rounded-full px-2 py-1 text-sm hover:bg-muted disabled:opacity-50"
+              data-bulk-scratch={scratchAction}
+              title={
+                disabled
+                  ? OFFLINE_TITLE
+                  : scratchAction === 'keep'
+                    ? 'Keep — make every selected transcript permanent (moves them to the main list)'
+                    : 'Move to temporary — out of the main list, trashed automatically after 30 days'
+              }
+            >
+              {scratchAction === 'keep' ? <Archive className="h-3.5 w-3.5" /> : <Hourglass className="h-3.5 w-3.5" />}
+              {scratchAction === 'keep' ? 'Keep' : 'Move to temporary'}
+            </button>
+          )}
           <span className="mx-0.5 h-4 w-px bg-border" />
           <button
             type="button"
