@@ -490,24 +490,27 @@ function unimportedMuteExclusion(userId: string): ReturnType<typeof sql> {
  * Teams rows ride the same arms: calendar sweeps stamp the identical
  * canonical `teams-…` code on calendar_event_cache rows.
  */
-function unimportedVisibleTo(caller: Caller): ReturnType<typeof sql> {
+function unimportedVisibleTo(caller: Caller, alias: 'c' | 'g2' = 'c'): ReturnType<typeof sql> {
   const email = caller.email.toLowerCase();
+  // `alias` = the gmeet_meeting_cache row under test: the listing's `c`, or
+  // `g2` inside the per-row series_count subquery (same arms, same row).
+  const c = sql(alias);
   return sql`(
     EXISTS (
       SELECT 1 FROM ${sql(SCHEMA)}.calendar_event_cache ce
       WHERE ce.user_id = ${caller.userId}
-        AND ce.meeting_code = c.meeting_code
+        AND ce.meeting_code = ${c}.meeting_code
         AND ce.event_start
-              BETWEEN COALESCE(c.event_start, c.conf_start) - ${OCCURRENCE_WINDOW_S} * interval '1 second'
-                  AND COALESCE(c.event_start, c.conf_start) + ${OCCURRENCE_WINDOW_S} * interval '1 second'
+              BETWEEN COALESCE(${c}.event_start, ${c}.conf_start) - ${OCCURRENCE_WINDOW_S} * interval '1 second'
+                  AND COALESCE(${c}.event_start, ${c}.conf_start) + ${OCCURRENCE_WINDOW_S} * interval '1 second'
     )
-    OR lower(c.organizer_email) = ${email}
+    OR lower(${c}.organizer_email) = ${email}
     OR EXISTS (
       SELECT 1 FROM ${sql(SCHEMA)}.calendar_event_cache ce2
-      WHERE ce2.meeting_code = c.meeting_code
+      WHERE ce2.meeting_code = ${c}.meeting_code
         AND ce2.event_start
-              BETWEEN COALESCE(c.event_start, c.conf_start) - ${OCCURRENCE_WINDOW_S} * interval '1 second'
-                  AND COALESCE(c.event_start, c.conf_start) + ${OCCURRENCE_WINDOW_S} * interval '1 second'
+              BETWEEN COALESCE(${c}.event_start, ${c}.conf_start) - ${OCCURRENCE_WINDOW_S} * interval '1 second'
+                  AND COALESCE(${c}.event_start, ${c}.conf_start) + ${OCCURRENCE_WINDOW_S} * interval '1 second'
         AND (
           lower(ce2.organizer_email) = ${email}
           OR EXISTS (
@@ -677,11 +680,16 @@ async function unimportedRows(
       -- artifact cache is global, so count deduped (code, instant) pairs;
       -- when only the caller's calendar row knows the recurring id, count
       -- their own calendar rows instead.
+      -- PRIVACY GATE (tech-debt D4, 2026-09-18): the global count leaked how
+      -- many occurrences OTHER people's sweeps hold for the series — each
+      -- counted row must pass the caller-involvement predicate this listing
+      -- applies to the outer row c (unimportedVisibleTo, same arms on g2).
       CASE
         WHEN c.recurring_event_id IS NOT NULL THEN (
           SELECT count(DISTINCT (g2.meeting_code, COALESCE(g2.event_start, g2.conf_start)))::int
           FROM ${sql(SCHEMA)}.gmeet_meeting_cache g2
           WHERE g2.recurring_event_id = c.recurring_event_id
+            AND ${unimportedVisibleTo(caller, 'g2')}
         )
         WHEN cal.recurring_event_id IS NOT NULL THEN (
           SELECT count(*)::int

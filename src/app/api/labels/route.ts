@@ -20,7 +20,9 @@ export const runtime = 'nodejs';
  */
 export const GET = withAuth(async ({ user, request }) => {
   const counts = new URL(request.url).searchParams.get('counts') === '1';
-  if (!counts) return NextResponse.json({ labels: await listLabels() });
+  if (!counts) {
+    return NextResponse.json({ labels: await listLabels({ userId: user.userId, email: user.email }) });
+  }
   const res = await listLabelsWithCounts(user.userId, user.email);
   return NextResponse.json(res);
 });

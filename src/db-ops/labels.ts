@@ -3,6 +3,8 @@ import type postgres from 'postgres';
 import { sql } from '@/lib/db';
 import { SCHEMAS } from '@/lib/constants/database';
 import { resolveDisplayName } from '@/db-ops/transcript-activity';
+import { hideUnseenSeriesLabels } from '@/lib/label-visibility';
+import { SERIES_LABEL_ROOT } from '@/lib/series-label-name';
 import {
   LabelPathError,
   assertPath,
@@ -167,10 +169,44 @@ export async function getLabelByPath(path: string): Promise<LabelDbRow | null> {
   return rows[0] ?? null;
 }
 
-/** Flat catalog sorted by path_key (no counts). */
-export async function listLabels(): Promise<LabelDbRow[]> {
+/**
+ * Flat catalog sorted by path_key (no counts), scoped to the caller.
+ *
+ * PRIVACY GATE (tech-debt D4, 2026-09-18): `Series/*` auto-labels mirror
+ * series titles (= meeting titles), so a series node is served only when
+ * the caller holds a visible transcript (own + shared, not trashed) carrying
+ * it or a descendant — lib/label-visibility is THE predicate; this query is
+ * its SQL twin (subtree-inclusive prefix compare on path_key). Hand-made
+ * labels remain the org taxonomy everyone sees.
+ */
+export async function listLabels(caller: { userId: string; email: string }): Promise<LabelDbRow[]> {
+  const normEmail = caller.email.trim().toLowerCase();
+  const seriesRoot = SERIES_LABEL_ROOT.toLowerCase();
   return sql<LabelDbRow[]>`
-    SELECT ${LABEL_COLS()} FROM ${sql(SCHEMA)}.labels l ORDER BY l.path_key
+    WITH vis AS MATERIALIZED (
+      SELECT t.id
+      FROM ${sql(SCHEMA)}.transcripts t
+      LEFT JOIN ${sql(SCHEMA)}.transcript_shares s
+        ON s.transcript_id = t.id AND s.shared_with_email = ${normEmail}
+      WHERE (t.user_id = ${caller.userId} OR s.id IS NOT NULL)
+        AND t.deleted_at IS NULL
+        AND NOT t.scratch
+    ),
+    vis_keys AS MATERIALIZED (
+      SELECT DISTINCT l2.path_key
+      FROM ${sql(SCHEMA)}.transcript_labels tl
+      JOIN vis ON vis.id = tl.transcript_id
+      JOIN ${sql(SCHEMA)}.labels l2 ON l2.id = tl.label_id
+      WHERE l2.path_key = ${seriesRoot} OR left(l2.path_key, ${seriesRoot.length + 1}) = ${`${seriesRoot}/`}
+    )
+    SELECT ${LABEL_COLS()} FROM ${sql(SCHEMA)}.labels l
+    WHERE NOT (l.path_key = ${seriesRoot} OR left(l.path_key, ${seriesRoot.length + 1}) = ${`${seriesRoot}/`})
+       OR EXISTS (
+         SELECT 1 FROM vis_keys vk
+         WHERE vk.path_key = l.path_key
+            OR left(vk.path_key, length(l.path_key) + 1) = l.path_key || '/'
+       )
+    ORDER BY l.path_key
   `;
 }
 
@@ -247,7 +283,10 @@ export async function listLabelsWithCounts(
     return { labels: [], unlabelled: t[0]?.unlabelled ?? 0, total: t[0]?.total ?? 0 };
   }
   const { __unlabelled, __total } = rows[0];
-  const labels = rows.map((r) => {
+  // PRIVACY GATE (tech-debt D4, 2026-09-18): Series/* nodes with no
+  // caller-visible tagged transcript do not exist for this caller —
+  // lib/label-visibility over the subtree-inclusive count_visible.
+  const labels = hideUnseenSeriesLabels(rows).map((r) => {
     // eslint-disable-next-line @typescript-eslint/no-unused-vars
     const { __unlabelled: _u, __total: _t, ...rest } = r;
     return rest;

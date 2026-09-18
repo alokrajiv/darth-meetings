@@ -7,6 +7,7 @@ import {
   listKeys,
   listMembers,
   listSuggestedMembers,
+  seriesManageVerdictFor,
   setSeriesAutoImport,
   updateSeries,
   visibleSeriesIds,
@@ -119,13 +120,19 @@ export const PATCH = withAuth(async ({ user, request }, { params }) => {
 });
 
 /** DELETE /api/series/:id — remove the series (members detach, transcripts
- * are untouched). */
+ * are untouched). OWNERSHIP GATE (tech-debt D4, 2026-09-18): after the
+ * visibility 404, only the organiser of an attached occurrence or the
+ * series' creator may delete (lib/series-owner) — 403 otherwise. */
 export const DELETE = withAuth(async ({ user }, { params }) => {
   const id = parseId((await params).id);
   if (!id) return NextResponse.json({ error: 'Bad id' }, { status: 400 });
-  if (!(await seriesVisibleToCaller(id, { userId: user.userId, email: user.email }))) {
+  const caller = { userId: user.userId, email: user.email };
+  if (!(await seriesVisibleToCaller(id, caller))) {
     return NextResponse.json({ error: 'Not found' }, { status: 404 });
   }
+  const verdict = await seriesManageVerdictFor(id, caller);
+  if (!verdict) return NextResponse.json({ error: 'Not found' }, { status: 404 });
+  if (!verdict.ok) return NextResponse.json({ error: verdict.reason }, { status: 403 });
   await deleteSeries(id);
   return NextResponse.json({ ok: true });
 });
