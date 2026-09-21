@@ -11,38 +11,12 @@
 
 import type { GmeetContext } from '@/lib/format';
 
-export type ReportPref = 'summary' | 'detailed-video' | 'detailed-text' | 'later';
-
-/** Strength order — the resolver never lowers what someone asked for. */
-const REPORT_RANK: Record<ReportPref, number> = {
-  later: 0,
-  summary: 1,
-  'detailed-text': 2,
-  'detailed-video': 3,
-};
-
-/** The strongest of several report preferences (undefined/null ignored). */
-export function strongestReport(prefs: Array<ReportPref | null | undefined>): ReportPref {
-  let best: ReportPref = 'later';
-  for (const p of prefs) {
-    if (p && REPORT_RANK[p] > REPORT_RANK[best]) best = p;
-  }
-  return best;
-}
-
-export function reportLabel(pref: ReportPref | null | undefined): string {
-  switch (pref) {
-    case 'detailed-video':
-      return 'detailed report with video frames';
-    case 'detailed-text':
-      return 'detailed report';
-    case 'later':
-      return 'nothing (decide on the page)';
-    case 'summary':
-    default:
-      return 'quick summary';
-  }
-}
+/**
+ * Report prefs live in lib/report-pref (client + server, one definition).
+ * Re-exported here because every automation reader already imports them
+ * from the marker module.
+ */
+export { strongestReport, reportLabel, type ReportPref } from '@/lib/report-pref';
 
 export interface AutoMarker {
   source: 'series' | 'account';

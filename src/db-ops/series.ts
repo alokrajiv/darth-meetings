@@ -1,4 +1,5 @@
 import 'server-only';
+import type { ReportPref } from '@/lib/report-pref';
 import { sql } from '@/lib/db';
 import { SCHEMAS } from '@/lib/constants/database';
 import { keysFromContext, normalizeTitle, strongKeys, type SeriesKeyInput } from '@/lib/series-keys';
@@ -93,7 +94,10 @@ export interface SeriesAutoImportCfg {
   byUserId: string;
   byEmail: string;
   mode: 'transcript' | 'video' | 'both';
-  report: 'summary' | 'detailed-video' | 'detailed-text' | 'later';
+  /** Since 2026-09-21 a run writes BOTH tiers; this only picks the report's
+   * flavour, or 'later'. Series configured before that carry the retired
+   * 'summary' — read it with lib/report-pref storedReportPref(). */
+  report: ReportPref | 'summary';
   since: string;
   lastSweepAt?: string;
   lastError?: string | null;

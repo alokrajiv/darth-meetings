@@ -153,7 +153,7 @@ export function provenanceTitle(row: ArchiveStripRow): string {
             : 'Imported transcript text';
   const auto =
     row.auto_state === 'passed'
-      ? ' · auto-imported, speakers identified and summary generated without review'
+      ? ' · auto-imported, speakers identified and notes generated without review'
       : row.auto_state === 'gated'
         ? ' · auto-imported, waiting on speaker review'
         : row.auto_state === 'auto'

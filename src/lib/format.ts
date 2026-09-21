@@ -5,6 +5,8 @@
  * state — this file is imported from client components.
  */
 
+import type { ReportPref } from '@/lib/report-pref';
+
 /** Temporary (scratch) transcripts are moved to the trash this many days
  * after creation (migration 042). The sweeper, the listing hint and the
  * detail-page banner all read this one number. */
@@ -436,10 +438,13 @@ export interface GmeetContext {
   } | null;
   actuals?: MeetActuals | null;
   /** Upload-time processing choices (upload-media stepper). `report` is what
-   * the speaker-review confirm generates: quick summary (default when
-   * absent), a detailed report, or nothing ('later' = pick on the page). */
+   * the speaker-review confirm generates. Since 2026-09-21 every run writes
+   * BOTH tiers (quick summary + detailed report); the pref only picks the
+   * report's flavour, or 'later' = nothing yet, pick on the page. Rows saved
+   * before that carry the retired 'summary' value — read every one of them
+   * through lib/report-pref storedReportPref(). */
   uploadPrefs?: {
-    report?: 'summary' | 'detailed-video' | 'detailed-text' | 'later';
+    report?: ReportPref | 'summary';
   } | null;
   /** Stamped by the series auto-import sweep on rows it fires: which series
    * occurrence this import came from and whose connection ran it. Presence
@@ -477,8 +482,9 @@ export interface GmeetContext {
     evaluatedAt: string;
     passed: boolean;
     reason?: string;
-    /** What was generated unattended (mirrors uploadPrefs.report). */
-    generated?: 'summary' | 'detailed-video' | 'detailed-text' | null;
+    /** What was generated unattended (mirrors uploadPrefs.report). Rows
+     * from before 2026-09-21 may carry the retired 'summary'. */
+    generated?: ReportPref | 'summary' | null;
   } | null;
   /** Stamped by the notes sweeper when a temporary (scratch) row's 30 days
    * ran out and the owner was DM'd about the auto-trash — one DM per row,

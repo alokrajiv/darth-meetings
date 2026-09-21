@@ -5,11 +5,12 @@ import {
   upsertForUser as upsertMappingsForUser,
   type SpeakerLabel,
 } from '@/db-ops/speaker-mappings';
-import { getContentCached, generateAutoNotes, generateAutoReport } from '@/lib/server/auto-notes';
+import { getContentCached, generateAutoReport } from '@/lib/server/auto-notes';
 import { enrollFromTranscript } from '@/lib/server/voiceprint';
 import { notifyUser, APP_URL } from '@/lib/server/darth-notify';
 import { dm, headlines, meetingLine } from '@/lib/server/dm-copy';
 import { autoMarkerOf, autoRecipients, autoSourceLabel } from '@/lib/auto-marker';
+import { storedReportPref } from '@/lib/report-pref';
 
 /**
  * Automatic speaker-review for series-auto-imported rows: the human review
@@ -59,7 +60,11 @@ export async function maybeAutoReview(ownerUserId: string, assemblyaiId: string)
   };
   if (row.gmeet_context?.autoReview) return; // evaluated once, ever
 
-  const pref = row.gmeet_context?.uploadPrefs?.report ?? 'summary';
+  // Every generation writes BOTH tiers since 2026-09-21: firing the report
+  // is what produces them (generateAutoReport distils the summary from its
+  // own session). The pref only picks the report's flavour, or 'later'.
+  // A row saved with the retired 'summary' reads as the detailed default.
+  const pref = storedReportPref(row.gmeet_context?.uploadPrefs?.report);
   const url = `${APP_URL}/transcript/${assemblyaiId}`;
   const title = row.title?.trim() || 'Untitled meeting';
   const nowIso = new Date().toISOString();
@@ -110,7 +115,7 @@ export async function maybeAutoReview(ownerUserId: string, assemblyaiId: string)
           `👀 *Speakers need a quick look before the notes can be written*`,
           meetingLine({ title, when: row.recorded_at ?? row.created_at, duration: row.duration, speakerCount: row.speaker_count }),
           `Auto-imported via ${auto.source}. What blocked the automatic pass: ${blocker}.`,
-          `Confirm the names (usually 30 seconds) and the ${pref === 'summary' ? 'summary' : pref === 'later' ? 'notes' : 'detailed report'} generates itself → <${url}|Review speakers>`
+          `Confirm the names (usually 30 seconds) and the ${pref === 'later' ? 'notes' : 'summary + detailed report'} generates itself → <${url}|Review speakers>`
         ),
         dedupeKey: `mw-needs-review:${assemblyaiId}:${to}`,
       });
@@ -141,25 +146,22 @@ export async function maybeAutoReview(ownerUserId: string, assemblyaiId: string)
     },
   });
   console.log(
-    `[auto-review] ${assemblyaiId}: passed (${applied.length} auto-named) — generating ${pref}`
+    `[auto-review] ${assemblyaiId}: passed (${applied.length} auto-named) — generating summary + ${pref}`
   );
   if (pref === 'later') return;
 
   const triggeredBy = { userId: auto.byUserId, email: auto.byEmail };
-  if (pref === 'detailed-video' || pref === 'detailed-text') {
-    await generateAutoReport(ownerUserId, assemblyaiId, {
-      triggeredBy,
-      useVideo: pref === 'detailed-video',
-    });
-  } else {
-    await generateAutoNotes(ownerUserId, assemblyaiId, { triggeredBy });
-  }
+  // One run, both tiers: the report pass verifies the most (frames,
+  // attachments, cross-references) and the quick summary is distilled from
+  // that same session when it lands. 'detailed-video' on a row that turns
+  // out to have no video stream degrades to text-only inside the run.
+  await generateAutoReport(ownerUserId, assemblyaiId, {
+    triggeredBy,
+    useVideo: pref === 'detailed-video',
+  });
 
   const after = await getForUser(ownerUserId, assemblyaiId);
-  const ok =
-    pref === 'summary'
-      ? after?.auto_notes_status === 'completed'
-      : after?.auto_report_status === 'completed';
+  const ok = after?.auto_report_status === 'completed';
   if (ok) {
     const gist = headlines(after?.auto_notes, 3);
     for (const to of auto.recipients) {
@@ -167,7 +169,7 @@ export async function maybeAutoReview(ownerUserId: string, assemblyaiId: string)
         kind: 'report_ready',
         toEmail: to,
         text: dm(
-          `📝 *${pref === 'summary' ? 'Summary' : 'Detailed report'} ready*`,
+          `📝 *Summary + detailed report ready*`,
           meetingLine({ title, when: row.recorded_at ?? row.created_at, duration: row.duration, speakerCount: row.speaker_count }),
           ...gist,
           `Auto-imported via ${auto.source}, ${applied.length > 0 ? `${applied.length} speaker${applied.length === 1 ? '' : 's'} identified by voice` : 'speakers already named'} → <${url}|Read the full notes>`

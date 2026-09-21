@@ -182,6 +182,19 @@ In `sweepUser`'s event walk (already per-user, already has the user's Google tok
 
 ### 9.1 `POST /api/teams/import`
 Body mirrors `ImportBody` of gmeet/import: `{ event | linkedEvent-ish payload, mode: 'video'|'transcript'|'both', reportPref, language }`.
+
+> **As built 2026-09-21 — `reportPref` no longer has a summary-only value.**
+> Every generation writes BOTH tiers: the quick summary *and* the detailed
+> report (the report run distils the summary from its own session, so one run
+> produces both). `reportPref` is now `detailed-video | detailed-text | later`
+> only — it picks the report's flavour, or defers the whole thing. The retired
+> `summary` value is still accepted on every entry point (old darth-cli, old
+> tabs) and on every stored pref written before that date
+> (`gmeet_context.uploadPrefs.report`, `series.auto_import.report`,
+> `user_prefs.auto_sync_report`); it is read as the detailed default. One
+> definition for all of it: `src/lib/report-pref.ts`
+> (`REPORT_PREFS` / `defaultReportPref(hasVideo)` / `parseReportPref` /
+> `storedReportPref` / `strongestReport` / `reportLabel`). No migration.
 Server flow:
 1. `parseTeamsJoinLink` from the event payload; reject external tenant with a typed error the dialog renders as the manual-upload nudge.
 2. Resolve meeting → `pickOccurrenceArtifacts` for the event's window.

@@ -25,7 +25,7 @@ interface SpeakerReviewDialogProps {
   suggestions: SpeakerSuggestionMap;
   /** The speaker-ID AI pass is still running — more suggestions may land. */
   identifying: boolean;
-  /** Save the entered names (batch) and start summary generation. */
+  /** Save the entered names (batch) and start generation (summary + report). */
   onConfirm: (names: Record<string, string>) => Promise<void>;
   /** Generate without touching the labels. */
   onSkip: () => void;
@@ -34,7 +34,7 @@ interface SpeakerReviewDialogProps {
 }
 
 /**
- * The review interrupt between "transcript is ready" and "summary is
+ * The review interrupt between "transcript is ready" and "the notes are
  * generated": AI-suggested names for each diarized speaker, editable, with
  * the evidence shown — the human finalizes labels once, then the summary is
  * written with real names from the start (instead of regenerating later).
@@ -97,8 +97,8 @@ export function SpeakerReviewDialog({
           </DialogTitle>
           <DialogDescription className="text-xs">
             {allConfirmed
-              ? 'All names were confirmed earlier — a quick glance is enough. The summary is written with these names, so fix anything that looks off before generating.'
-              : `The AI guessed names from the transcript${identifying ? '' : ', voiceprints, and video'} — fix anything wrong, then generate. The summary is written with these names, so a minute here beats regenerating later.`}
+              ? 'All names were confirmed earlier — a quick glance is enough. The summary and the detailed report are written with these names, so fix anything that looks off before generating.'
+              : `The AI guessed names from the transcript${identifying ? '' : ', voiceprints, and video'} — fix anything wrong, then generate. The summary and the detailed report are written with these names, so a minute here beats regenerating later.`}
           </DialogDescription>
         </DialogHeader>
 
@@ -195,8 +195,8 @@ export function SpeakerReviewDialog({
             {submitting
               ? 'Saving…'
               : allConfirmed
-                ? 'Looks right — generate summary'
-                : `Confirm ${filledCount}/${speakers.length} & generate summary`}
+                ? 'Looks right — generate'
+                : `Confirm ${filledCount}/${speakers.length} & generate`}
           </Button>
         </DialogFooter>
       </DialogContent>

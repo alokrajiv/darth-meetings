@@ -19,6 +19,7 @@ import type { GmeetAttendee, GmeetContext, StoredTranscript } from '@/lib/format
 import type { RecorderMatch } from '@/lib/recorder';
 import type { DarthUser } from '@/lib/auth/session';
 import type { SpeechModel } from '@/lib/aai-language';
+import type { ReportPref } from '@/lib/report-pref';
 
 /**
  * The media-upload pipeline shared by the two byte-delivery routes:
@@ -47,12 +48,12 @@ export interface LinkedEventInput {
   attendees?: Array<{ email?: string; name?: string; responseStatus?: string }>;
 }
 
-export type ReportPref = NonNullable<NonNullable<GmeetContext['uploadPrefs']>['report']>;
-const REPORT_PREFS = new Set<string>(['summary', 'detailed-video', 'detailed-text', 'later']);
-
-export function parseReportPref(raw: string | null | undefined): ReportPref | null {
-  return raw && REPORT_PREFS.has(raw) ? (raw as ReportPref) : null;
-}
+/** The generation preference a row carries — one definition in
+ * lib/report-pref, re-exported here because both byte-delivery routes
+ * already import the parser from the pipeline. `parseReportPref` reads a
+ * legacy 'summary' (old darth-cli, old tabs) as the detailed default. */
+export { parseReportPref, defaultReportPref } from '@/lib/report-pref';
+export type { ReportPref };
 
 export function sanitizeLinkedEvent(parsed: unknown): LinkedEventInput | null {
   if (!parsed || typeof parsed !== 'object') return null;

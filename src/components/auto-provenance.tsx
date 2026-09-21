@@ -2,7 +2,8 @@
 
 import { Zap } from 'lucide-react';
 import type { GmeetContext } from '@/lib/format';
-import { autoMarkerOf, reportLabel } from '@/lib/auto-marker';
+import { autoMarkerOf } from '@/lib/auto-marker';
+import { reportLabel, storedReportPref } from '@/lib/report-pref';
 import { OFFLINE_TITLE } from '@/lib/offline/offline-types';
 
 /**
@@ -10,7 +11,9 @@ import { OFFLINE_TITLE } from '@/lib/offline/offline-types';
  * automation doing with it": which sweep imported it (series / account),
  * under whose connection, which report kind was resolved, whether the
  * speaker gate passed, and who was told. Rendered from the row's automation
- * marker (lib/auto-marker) — nothing for hand imports / uploads.
+ * marker (lib/auto-marker) — nothing for hand imports / uploads. Every
+ * generation writes BOTH tiers (summary + detailed report) since
+ * 2026-09-21; reportLabel() names them both.
  */
 export function AutoProvenance({
   ctx,
@@ -29,7 +32,9 @@ export function AutoProvenance({
   if (!m) return null;
   const review = ctx?.autoReview ?? null;
   const held = !!review && !review.passed && !generated;
-  const report = ctx?.uploadPrefs?.report ?? 'summary';
+  // Rows saved before 2026-09-21 carry the retired 'summary' — read as the
+  // detailed default, since every run now writes both tiers.
+  const report = storedReportPref(ctx?.uploadPrefs?.report);
   const audience = [m.byEmail, ...m.watchers].map((e) => e.split('@')[0]).join(', ');
 
   const via =
@@ -67,7 +72,7 @@ export function AutoProvenance({
   return (
     <span
       className="inline-flex max-w-full flex-wrap items-center gap-x-1 rounded-md border border-primary/20 bg-primary/5 px-1.5 py-0.5 text-[11px] text-muted-foreground"
-      title={`Auto-imported via ${m.source === 'series' ? `series "${m.seriesTitle ?? m.seriesId}"` : 'account auto-sync'} under ${m.byEmail}'s connection at ${new Date(m.at).toLocaleString()}. Report kind resolved for everyone served: ${reportLabel(report)}. ${review ? (review.passed ? 'Speaker gate passed unattended.' : `Speaker gate held: ${review.reason ?? 'low confidence'} — the review DM went to ${audience}.`) : 'Speaker gate not evaluated yet.'}`}
+      title={`Auto-imported via ${m.source === 'series' ? `series "${m.seriesTitle ?? m.seriesId}"` : 'account auto-sync'} under ${m.byEmail}'s connection at ${new Date(m.at).toLocaleString()}. Generated for everyone served: ${reportLabel(report)}. ${review ? (review.passed ? 'Speaker gate passed unattended.' : `Speaker gate held: ${review.reason ?? 'low confidence'} — the review DM went to ${audience}.`) : 'Speaker gate not evaluated yet.'}`}
     >
       <Zap className="h-3 w-3 shrink-0 text-primary" />
       <span>

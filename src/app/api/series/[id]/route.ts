@@ -1,4 +1,5 @@
 import { NextResponse } from 'next/server';
+import { normalizeReportPref, defaultReportPref } from '@/lib/report-pref';
 import { withAuth } from '@/lib/auth/with-auth';
 import {
   deleteSeries,
@@ -55,7 +56,6 @@ export const GET = withAuth(async ({ user }, { params }) => {
 });
 
 const AUTO_MODES = ['transcript', 'video', 'both'] as const;
-const AUTO_REPORTS = ['summary', 'detailed-video', 'detailed-text', 'later'] as const;
 
 /** PATCH /api/series/:id — rename / edit notes / configure auto-import. */
 export const PATCH = withAuth(async ({ user, request }, { params }) => {
@@ -95,8 +95,11 @@ export const PATCH = withAuth(async ({ user, request }, { params }) => {
       return NextResponse.json({ error: 'autoImport.enabled must be a boolean' }, { status: 400 });
     }
     const mode = ai.mode ?? series.auto_import?.mode ?? 'both';
-    const report = ai.report ?? series.auto_import?.report ?? 'summary';
-    if (!AUTO_MODES.includes(mode) || !AUTO_REPORTS.includes(report)) {
+    // Legacy 'summary' (old darth-cli, a series configured before
+    // 2026-09-21) reads as the detailed default — summary-only is gone.
+    const report =
+      normalizeReportPref(ai.report ?? series.auto_import?.report) ?? defaultReportPref(true);
+    if (!AUTO_MODES.includes(mode) || (ai.report !== undefined && !normalizeReportPref(ai.report))) {
       return NextResponse.json({ error: 'Invalid autoImport mode/report' }, { status: 400 });
     }
     // Enabling (re)binds the sweep to the CALLER — their Google connection

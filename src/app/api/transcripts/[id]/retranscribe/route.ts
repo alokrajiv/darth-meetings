@@ -1,4 +1,5 @@
 import { promises as fsp } from 'node:fs';
+import { parseReportPref } from '@/lib/report-pref';
 import { NextResponse } from 'next/server';
 import { withAuth } from '@/lib/auth/with-auth';
 import { resolveAccess } from '@/db-ops/transcript-access';
@@ -79,7 +80,9 @@ export const POST = withAuth(async ({ user }, { params }) => {
     contentType: 'application/octet-stream',
     languageCode: row.language_code ?? undefined,
     linkedEvent,
-    reportPref: ctx?.uploadPrefs?.report ?? null,
+    // Carries the original row's choice forward; a legacy 'summary' is
+    // read as the detailed default (lib/report-pref).
+    reportPref: parseReportPref(ctx?.uploadPrefs?.report),
     sourceId: row.assemblyai_id,
     multi: null,
     bytesTotal: bytes,

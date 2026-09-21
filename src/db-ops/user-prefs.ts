@@ -2,6 +2,7 @@ import 'server-only';
 import { sql } from '@/lib/db';
 import { SCHEMAS } from '@/lib/constants/database';
 import { strongestReport } from '@/lib/auto-marker';
+import { REPORT_PREFS, storedReportPref, type ReportPref } from '@/lib/report-pref';
 
 /**
  * Per-user app preferences (migration 033). Today: the account-level
@@ -16,8 +17,11 @@ export const AUTO_SYNC_SCOPES = ['off', 'mine', 'all'] as const;
 export type AutoSyncScope = (typeof AUTO_SYNC_SCOPES)[number];
 export const AUTO_SYNC_MODES = ['transcript', 'video', 'both'] as const;
 export type AutoSyncMode = (typeof AUTO_SYNC_MODES)[number];
-export const AUTO_SYNC_REPORTS = ['summary', 'detailed-video', 'detailed-text', 'later'] as const;
-export type AutoSyncReport = (typeof AUTO_SYNC_REPORTS)[number];
+/** Since 2026-09-21 a generation always writes BOTH tiers — the only choice
+ * is the detailed report's flavour, or 'later'. Accounts saved before that
+ * carry the retired 'summary'; autoSyncOf() reads it as the default. */
+export const AUTO_SYNC_REPORTS = REPORT_PREFS;
+export type AutoSyncReport = ReportPref;
 
 export interface AutoSyncPrefs {
   scope: AutoSyncScope;
@@ -33,7 +37,8 @@ export interface UserPrefsRow {
   email: string;
   auto_sync: AutoSyncScope;
   auto_sync_mode: AutoSyncMode;
-  auto_sync_report: AutoSyncReport;
+  /** Raw column — may still hold the retired 'summary' (normalised by autoSyncOf). */
+  auto_sync_report: string;
   auto_sync_since: string | null;
   auto_sync_providers: { gmeet?: boolean; teams?: boolean } | null;
   auto_sync_announce_dismissed_at: string | null;
@@ -56,7 +61,7 @@ export function autoSyncOf(row: UserPrefsRow | null | undefined): AutoSyncPrefs 
   return {
     scope: row.auto_sync,
     mode: row.auto_sync_mode,
-    report: row.auto_sync_report,
+    report: storedReportPref(row.auto_sync_report),
     since: row.auto_sync_since ? new Date(row.auto_sync_since).toISOString() : null,
     providers: {
       gmeet: row.auto_sync_providers?.gmeet !== false,
@@ -199,7 +204,7 @@ export async function predictedAutoSyncImporters(
     .filter((o) => o.code && !Number.isNaN(Date.parse(o.startIso)))
     .map((o) => ({ code: o.code, start: new Date(o.startIso).toISOString() }));
   if (batch.length === 0) return new Map();
-  const rows = await sql<Array<{ code: string; start: string; email: string; report: AutoSyncReport; organizer_self: boolean | null }>>`
+  const rows = await sql<Array<{ code: string; start: string; email: string; report: string; organizer_self: boolean | null }>>`
     SELECT o.code, o.start, p.email, p.auto_sync_report AS report, r.organizer_self
     FROM jsonb_to_recordset(${sql.json(batch as unknown as never)})
          AS o(code text, start timestamptz)
@@ -225,7 +230,7 @@ export async function predictedAutoSyncImporters(
     const key = `${r.code}|${new Date(r.start).toISOString()}`;
     const cur = out.get(key);
     if (!cur) {
-      out.set(key, { email: r.email, report: r.report, interested: [r.email] });
+      out.set(key, { email: r.email, report: storedReportPref(r.report), interested: [r.email] });
     } else {
       cur.interested.push(r.email);
       cur.report = strongestReport([cur.report, r.report]);

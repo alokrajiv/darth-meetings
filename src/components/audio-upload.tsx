@@ -37,6 +37,7 @@ import {
   GoogleNotConnectedError,
 } from '@/lib/google-token';
 import type { StoredTranscript } from '@/lib/format';
+import { defaultReportPref, type ReportPref } from '@/lib/report-pref';
 import { uploadFileChunked } from '@/lib/chunked-upload';
 import { OFFLINE_TITLE, useOfflineGate } from '@/lib/offline/offline-context';
 import { isNetworkFailure } from '@/lib/offline/offline-fetch';
@@ -118,7 +119,6 @@ interface CalendarEventLite {
   conferenceData?: { conferenceId?: string };
 }
 
-type ReportPref = 'summary' | 'detailed-video' | 'detailed-text' | 'later';
 type DialogStep = 'connect' | 'pick' | 'files' | 'link' | 'process';
 
 const POLL_INTERVAL_MS = 3000;
@@ -127,6 +127,13 @@ const POLL_INTERVAL_MS = 3000;
 const MAX_FILE_BYTES = 4 * 1024 * 1024 * 1024; // 4GB
 
 const VIDEO_FILE_RE = /\.(mp4|webm|mov|mkv|m4v)$/i;
+
+const isVideoFile = (f: File) => f.type.startsWith('video/') || VIDEO_FILE_RE.test(f.name);
+
+/** The pref actually sent: "with video frames" on a batch that turns out to
+ * have no video is just the text-only report. */
+const resolveReportPref = (pref: ReportPref, hasVideo: boolean): ReportPref =>
+  pref === 'later' ? 'later' : hasVideo ? pref : 'detailed-text';
 
 /** Text documents that must NEVER be streamed to AssemblyAI as audio (the
  * sibl_minutes.rtf incident: 8KB of meeting minutes died minutes later as an
@@ -263,7 +270,10 @@ export function AudioUpload({ onTranscriptCreated }: AudioUploadProps) {
   const [eventsBusy, setEventsBusy] = useState(false);
   const [eventsError, setEventsError] = useState<string | null>(null);
   const [selectedEventId, setSelectedEventId] = useState<string | null>(null);
-  const [reportPref, setReportPref] = useState<ReportPref>('summary');
+  // Both tiers always (2026-09-21) — this only picks the detailed report's
+  // flavour, or 'later'. Coerced to 'detailed-text' at submit when the batch
+  // has no video.
+  const [reportPref, setReportPref] = useState<ReportPref>(defaultReportPref(true));
   // Temporary transcript (migration 042): out of the main list, under the
   // Temporary tab, trashed automatically after 30 days. Default off; the
   // server ignores it when a calendar event is linked, and the dialog hides
@@ -360,7 +370,7 @@ export function AudioUpload({ onTranscriptCreated }: AudioUploadProps) {
       {
         languageCode: languageCode || undefined,
         linkedEvent: linked,
-        reportPref: pref !== 'summary' ? pref : null,
+        reportPref: pref,
         multi: multi
           ? {
               group: multi.group,
@@ -446,12 +456,13 @@ export function AudioUpload({ onTranscriptCreated }: AudioUploadProps) {
     let last: StoredTranscript | null = null;
     for (const [i, file] of files.entries()) {
       // Part 1 opens the group row (link, report pref, temporary flag all
-      // land there); parts 2..N inherit from it server-side.
+      // land there); parts 2..N inherit from it server-side (openUpload
+      // drops their reportPref outright).
       last = await uploadFile(
         file,
         languageCode,
         i === 0 ? linked : null,
-        i === 0 ? pref : 'summary',
+        pref,
         {
           group,
           index: i + 1,
@@ -566,7 +577,7 @@ export function AudioUpload({ onTranscriptCreated }: AudioUploadProps) {
       setStitchMode(list.length > 1 && isDialogOpen && !!prefill);
       setPartComments(list.map(() => ''));
       setSelectedLanguage('');
-      setReportPref('summary');
+      setReportPref(defaultReportPref(true));
       setEventsError(null);
       // Coming from the 'pick' step, the pre-link banner's selection carries
       // straight into the link step. Page-wide drag-drop (dialog closed)
@@ -669,7 +680,7 @@ export function AudioUpload({ onTranscriptCreated }: AudioUploadProps) {
       setStitchMode(false);
       setPartComments([]);
       setSelectedLanguage('');
-      setReportPref('summary');
+      setReportPref(defaultReportPref(true));
       setSelectedEventId(null);
       setDayEvents([]);
       setEventsError(null);
@@ -742,7 +753,7 @@ export function AudioUpload({ onTranscriptCreated }: AudioUploadProps) {
       pendingFiles,
       selectedLanguage,
       linked,
-      reportPref,
+      resolveReportPref(reportPref, pendingFiles.some(isVideoFile)),
       stitching ? { comments: partComments } : undefined,
       scratch && !linked
     );
@@ -971,18 +982,15 @@ export function AudioUpload({ onTranscriptCreated }: AudioUploadProps) {
     !!prefill &&
     !!selectedEventId &&
     dayEvents.some((e) => e.id === selectedEventId);
-  const hasVideoFile = pendingFiles.some(
-    (f) => f.type.startsWith('video/') || VIDEO_FILE_RE.test(f.name)
-  );
+  const hasVideoFile = pendingFiles.some(isVideoFile);
   const selectedEvent = selectedEventId
     ? dayEvents.find((e) => e.id === selectedEventId)
     : undefined;
 
-  // The unified generation shape — quick summary is always written, detailed
-  // is an opt-in on top, "later" defers the whole thing. All states map onto
-  // the legacy ReportPref wire values, so the server contract is unchanged.
+  // One outcome since 2026-09-21: the quick summary AND the detailed report,
+  // always. The pref only picks the report's flavour (video frames vs text),
+  // and "later" defers the whole thing.
   const prefLater = reportPref === 'later';
-  const prefDetailed = reportPref === 'detailed-video' || reportPref === 'detailed-text';
 
   return (
     <>
@@ -1657,82 +1665,53 @@ export function AudioUpload({ onTranscriptCreated }: AudioUploadProps) {
                 with real names from the start.
               </p>
               <div className="space-y-1.5">
-                <label
-                  className={`flex items-start gap-2 rounded-md border p-3 ${prefLater ? 'opacity-50' : ''}`}
+                <div
+                  className={`rounded-md border p-3 text-sm ${prefLater ? 'opacity-50' : ''}`}
                 >
-                  <input type="checkbox" className="mt-0.5" checked={!prefLater} disabled readOnly />
-                  <span className="text-sm">
-                    <span className="flex items-center gap-2 font-medium">
-                      <Sparkles className="h-4 w-4 text-primary" />
-                      Quick summary
-                    </span>
-                    <span className="mt-0.5 block text-xs text-muted-foreground">
-                      Always written — fast and clean.
-                    </span>
+                  <span className="flex items-center gap-2 font-medium">
+                    <Sparkles className="h-4 w-4 text-primary" />
+                    Summary + detailed report
                   </span>
-                </label>
-                <label
-                  className={`flex cursor-pointer items-start gap-2 rounded-md border p-3 has-[:checked]:border-primary ${prefLater ? 'pointer-events-none opacity-50' : ''}`}
-                >
-                  <input
-                    type="checkbox"
-                    className="mt-0.5"
-                    checked={prefDetailed}
-                    disabled={prefLater}
-                    onChange={(e) =>
-                      setReportPref(
-                        e.target.checked
-                          ? hasVideoFile
-                            ? 'detailed-video'
-                            : 'detailed-text'
-                          : 'summary'
-                      )
-                    }
-                  />
-                  <span className="min-w-0 flex-1 text-sm">
-                    <span className="flex items-center gap-2 font-medium">
-                      <FileText className="h-4 w-4 text-primary" />
-                      Also write a detailed report
-                    </span>
-                    <span className="mt-0.5 block text-xs text-muted-foreground">
-                      Wiki-style deep dive with tables and click-to-jump citations. Slower and
-                      pricier — worth it for dense meetings. The quick summary then distills
-                      from it.
-                    </span>
-                    {prefDetailed && hasVideoFile && (
-                      <span className="mt-2 block space-y-1">
-                        <label className="flex cursor-pointer items-center gap-2 text-xs">
-                          <input
-                            type="radio"
-                            name="upload-report-mode"
-                            checked={reportPref === 'detailed-video'}
-                            onChange={() => setReportPref('detailed-video')}
-                          />
-                          <Film className="h-3.5 w-3.5 text-primary" />
-                          With video frames — Claude reads the screen shares and embeds
-                          screenshots
-                        </label>
-                        <label className="flex cursor-pointer items-center gap-2 text-xs">
-                          <input
-                            type="radio"
-                            name="upload-report-mode"
-                            checked={reportPref === 'detailed-text'}
-                            onChange={() => setReportPref('detailed-text')}
-                          />
-                          <FileText className="h-3.5 w-3.5 text-muted-foreground" />
-                          Text only — cheaper, for meetings with no screen share worth seeing
-                        </label>
-                      </span>
-                    )}
+                  <span className="mt-0.5 block text-xs text-muted-foreground">
+                    Both are always written. The detailed report is the wiki-style deep dive
+                    with tables and click-to-jump citations; the quick summary distills from
+                    that same run.
                   </span>
-                </label>
+                  {!prefLater && hasVideoFile && (
+                    <span className="mt-2 block space-y-1">
+                      <label className="flex cursor-pointer items-center gap-2 text-xs">
+                        <input
+                          type="radio"
+                          name="upload-report-mode"
+                          checked={reportPref === 'detailed-video'}
+                          onChange={() => setReportPref('detailed-video')}
+                        />
+                        <Film className="h-3.5 w-3.5 text-primary" />
+                        With video frames — Claude reads the screen shares and embeds
+                        screenshots
+                      </label>
+                      <label className="flex cursor-pointer items-center gap-2 text-xs">
+                        <input
+                          type="radio"
+                          name="upload-report-mode"
+                          checked={reportPref === 'detailed-text'}
+                          onChange={() => setReportPref('detailed-text')}
+                        />
+                        <FileText className="h-3.5 w-3.5 text-muted-foreground" />
+                        Text only — cheaper, for meetings with no screen share worth seeing
+                      </label>
+                    </span>
+                  )}
+                </div>
                 <label className="flex cursor-pointer items-center gap-2 px-1 pt-1 text-xs text-muted-foreground">
                   <input
                     type="checkbox"
                     checked={prefLater}
-                    onChange={(e) => setReportPref(e.target.checked ? 'later' : 'summary')}
+                    onChange={(e) =>
+                      setReportPref(e.target.checked ? 'later' : defaultReportPref(hasVideoFile))
+                    }
                   />
-                  Don&apos;t generate anything yet — I&apos;ll decide on the meeting page
+                  Generate later — I&apos;ll decide on the meeting page
                 </label>
                 {/* Temporary (migration 042) — only when no calendar event is
                     linked: a linked upload is a real meeting and the server

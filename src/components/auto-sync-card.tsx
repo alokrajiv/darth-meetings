@@ -5,6 +5,7 @@ import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { RefreshCw, Loader2 } from 'lucide-react';
 import { OFFLINE_TITLE, useOfflineGate } from '@/lib/offline/offline-context';
 import { isNetworkFailure, offlineAwareError } from '@/lib/offline/offline-fetch';
+import { reportLabel, type ReportPref } from '@/lib/report-pref';
 
 /**
  * Settings card for account-level auto-sync (T2): one switch that imports
@@ -15,7 +16,7 @@ import { isNetworkFailure, offlineAwareError } from '@/lib/offline/offline-fetch
 
 type Scope = 'off' | 'mine' | 'all';
 type Mode = 'transcript' | 'video' | 'both';
-type Report = 'summary' | 'detailed-video' | 'detailed-text' | 'later';
+type Report = ReportPref;
 
 interface Payload {
   autoSync: {
@@ -59,17 +60,12 @@ const MODES: Array<{ value: Mode; label: string }> = [
   { value: 'both', label: 'Both' },
 ];
 const MODE_WORD: Record<Mode, string> = { video: 'recording', transcript: 'transcript only', both: 'both' };
-const REPORT_WORD: Record<Report, string> = {
-  summary: 'quick summary',
-  'detailed-video': 'detailed report + frames',
-  'detailed-text': 'detailed report',
-  later: 'no notes',
-};
+// Every run writes BOTH tiers since 2026-09-21 — the only choice is the
+// detailed report's flavour, or 'later'.
 const REPORTS: Array<{ value: Report; label: string }> = [
-  { value: 'detailed-video', label: 'Detailed report with video frames — recommended' },
-  { value: 'summary', label: 'Quick summary' },
-  { value: 'detailed-text', label: 'Detailed report' },
-  { value: 'later', label: 'Nothing — I’ll pick on the page' },
+  { value: 'detailed-video', label: 'Summary + detailed report (with video frames) — recommended' },
+  { value: 'detailed-text', label: 'Summary + detailed report (text only)' },
+  { value: 'later', label: 'Generate later — I’ll pick on the page' },
 ];
 
 const OUTCOME_LABEL: Record<string, string> = {
@@ -258,7 +254,7 @@ export function AutoSyncCard() {
                       </a>
                       <span className="shrink-0 text-muted-foreground">
                         {s.enabled
-                          ? `on · ${s.mine ? 'you' : s.byEmail} · ${MODE_WORD[s.mode]} · ${REPORT_WORD[s.report]}`
+                          ? `on · ${s.mine ? 'you' : s.byEmail} · ${MODE_WORD[s.mode]} · ${reportLabel(s.report)}`
                           : `off (opt-out by ${s.mine ? 'you' : s.byEmail})`}
                       </span>
                     </li>

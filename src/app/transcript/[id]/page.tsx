@@ -36,6 +36,7 @@ import { FindReplacePanel } from '@/components/find-replace-panel';
 import { SpeakerSummaryPanel } from '@/components/speaker-summary-panel';
 import { SpeakerReviewDialog } from '@/components/speaker-review-dialog';
 import { GenerateDialog } from '@/components/generate-dialog';
+import { storedReportPref } from '@/lib/report-pref';
 import { AttachmentPanel } from '@/components/attachment-panel';
 import { ShareDialog } from '@/components/share-dialog';
 import { LinkEventDialog } from '@/components/link-event-dialog';
@@ -297,13 +298,9 @@ function TranscriptDetailInner({ transcriptId }: { transcriptId: string }) {
   const [transcriptEdits, setTranscriptEdits] = useState<TranscriptEditMap>({});
   const [generatingNotes, setGeneratingNotes] = useState(false);
   const [notesPromptOpen, setNotesPromptOpen] = useState(false);
-  // Pre-tick "detailed report" in the generate dialog when it's opened from a
-  // report-tab context.
-  const [genDefaultDetailed, setGenDefaultDetailed] = useState(false);
-  const openGenerateDialog = (detailed: boolean) => {
-    setGenDefaultDetailed(detailed);
-    setNotesPromptOpen(true);
-  };
+  // One dialog, one outcome: summary + detailed report. Nothing to pre-tick
+  // since 2026-09-21 — summary-only generation no longer exists.
+  const openGenerateDialog = () => setNotesPromptOpen(true);
   const [reviewOpen, setReviewOpen] = useState(false);
   const [summaryTab, setSummaryTab] = useState<'summary' | 'report'>('summary');
   const [generatingReport, setGeneratingReport] = useState(false);
@@ -1053,18 +1050,19 @@ function TranscriptDetailInner({ transcriptId }: { transcriptId: string }) {
   }, [canFetchVideo, fetchVideo]);
 
   // What runs after the speaker-review gate (Confirm OR Skip): honor what the
-  // user picked at upload time (upload-media stepper) — a detailed report,
-  // nothing ('later'), or the default quick summary.
+  // user picked at upload time (upload-media stepper). Since 2026-09-21 that
+  // is only the report's flavour or 'later' — the run always writes both
+  // tiers, the summary distilling from the report session afterwards. A row
+  // saved with the retired 'summary' reads as the detailed default.
   const runPostReviewGeneration = useCallback(async () => {
-    const pref = row?.gmeet_context?.uploadPrefs?.report;
-    if (pref === 'detailed-video' || pref === 'detailed-text') {
-      selectSummaryTab('report');
-      await handleGenerateReport(undefined, pref === 'detailed-video');
-    } else if (pref !== 'later') {
-      selectSummaryTab('summary');
-      await handleGenerateNotes();
-    }
-  }, [row, selectSummaryTab, handleGenerateReport, handleGenerateNotes]);
+    const pref = storedReportPref(
+      row?.gmeet_context?.uploadPrefs?.report,
+      hasLocalVideo || canFetchVideo
+    );
+    if (pref === 'later') return;
+    selectSummaryTab('report');
+    await handleGenerateReport(undefined, pref === 'detailed-video');
+  }, [row, hasLocalVideo, canFetchVideo, selectSummaryTab, handleGenerateReport]);
 
   // Review-dialog confirm: batch-save the finalized names, then kick off the
   // first summary generation — the whole point of the interrupt is that the
@@ -2172,7 +2170,7 @@ function TranscriptDetailInner({ transcriptId }: { transcriptId: string }) {
             size="sm"
             className="ai-glimmer h-8 w-full justify-start gap-2 text-[13px] font-medium text-primary hover:text-primary"
             disabled={offline || notesGenerating || generatingReport}
-            onClick={() => openGenerateDialog(false)}
+            onClick={() => openGenerateDialog()}
             title={offline ? OFFLINE_TITLE : `Changed since the last AI run: ${staleLabels.join(', ')}. One click re-runs with the new context — the AI may well decide nothing needs updating.`}
           >
             <Sparkles className="h-4 w-4" />
@@ -2185,7 +2183,7 @@ function TranscriptDetailInner({ transcriptId }: { transcriptId: string }) {
             size="sm"
             className="h-8 w-full justify-start gap-2 text-[13px]"
             disabled={offline || notesGenerating || row.status !== 'completed'}
-            onClick={() => openGenerateDialog(false)}
+            onClick={() => openGenerateDialog()}
             title={offline ? OFFLINE_TITLE : undefined}
           >
             {notesGenerating ? (
@@ -3006,7 +3004,7 @@ function TranscriptDetailInner({ transcriptId }: { transcriptId: string }) {
                                 className="h-7 text-xs"
                                 disabled={offline || generatingReport}
                                 title={offline ? OFFLINE_TITLE : undefined}
-                                onClick={() => openGenerateDialog(true)}
+                                onClick={() => openGenerateDialog()}
                               >
                                 <RefreshCw className="h-3 w-3" />
                                 Regenerate
@@ -3051,7 +3049,7 @@ function TranscriptDetailInner({ transcriptId }: { transcriptId: string }) {
                       ) : canEdit ? (
                         <div className="flex flex-col items-center py-6 text-center">
                           <p className="text-sm text-muted-foreground">No detailed report yet.</p>
-                          <Button size="sm" className="mt-3" disabled={offline || generatingReport} title={offline ? OFFLINE_TITLE : undefined} onClick={() => openGenerateDialog(true)}>
+                          <Button size="sm" className="mt-3" disabled={offline || generatingReport} title={offline ? OFFLINE_TITLE : undefined} onClick={() => openGenerateDialog()}>
                             <Sparkles className="h-4 w-4" />
                             Generate detailed report
                           </Button>
@@ -3155,7 +3153,7 @@ function TranscriptDetailInner({ transcriptId }: { transcriptId: string }) {
                               className="h-7 text-xs"
                               disabled={offline || generatingNotes}
                               title={offline ? OFFLINE_TITLE : undefined}
-                              onClick={() => openGenerateDialog(false)}
+                              onClick={() => openGenerateDialog()}
                             >
                               <RefreshCw className="h-3 w-3" />
                               Regenerate
@@ -3263,7 +3261,7 @@ function TranscriptDetailInner({ transcriptId }: { transcriptId: string }) {
                               disabled={offline || generatingNotes}
                               title={offline ? OFFLINE_TITLE : undefined}
                               onClick={() =>
-                                reviewSpeakers.length > 0 ? setReviewOpen(true) : openGenerateDialog(false)
+                                reviewSpeakers.length > 0 ? setReviewOpen(true) : openGenerateDialog()
                               }
                             >
                               <Sparkles className="h-4 w-4" />
@@ -3677,18 +3675,12 @@ function TranscriptDetailInner({ transcriptId }: { transcriptId: string }) {
           videoPreparing={videoPreparing}
           videoFetching={videoFetching}
           generating={generatingNotes || generatingReport}
-          defaultDetailed={genDefaultDetailed}
-          onGenerate={({ detailed, video, instructions, runAt }) => {
+          onGenerate={({ video, instructions, runAt }) => {
             setNotesPromptOpen(false);
-            if (detailed) {
-              // Only the report fires — the quick summary auto-distills from
-              // the report session when it completes.
-              selectSummaryTab('report');
-              void handleGenerateReport(instructions, video, runAt);
-            } else {
-              selectSummaryTab('summary');
-              void handleGenerateNotes(instructions);
-            }
+            // Only the report fires — the quick summary auto-distills from
+            // the report session when it completes, so one run = both tiers.
+            selectSummaryTab('report');
+            void handleGenerateReport(instructions, video, runAt);
           }}
         />
 

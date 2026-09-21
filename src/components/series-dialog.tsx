@@ -12,6 +12,7 @@ import { Badge } from '@/components/ui/badge';
 import { getGoogleAccessToken, GoogleNotConnectedError } from '@/lib/google-token';
 import { OFFLINE_TITLE, useOfflineGate } from '@/lib/offline/offline-context';
 import { isNetworkFailure, offlineAwareError } from '@/lib/offline/offline-fetch';
+import { storedReportPref, type ReportPref } from '@/lib/report-pref';
 import {
   Repeat,
   Loader2,
@@ -47,7 +48,9 @@ interface AutoImportCfg {
   byUserId: string;
   byEmail: string;
   mode: 'transcript' | 'video' | 'both';
-  report: 'summary' | 'detailed-video' | 'detailed-text' | 'later';
+  /** Both tiers always since 2026-09-21; this only picks the report's
+   * flavour. Series configured before that may still hold 'summary'. */
+  report: ReportPref | 'summary';
   since: string;
   lastSweepAt?: string;
   lastError?: string | null;
@@ -136,8 +139,9 @@ interface Occurrence {
 interface OccurrencesResult {
   /** Whom a series setting speaks for (server: auto-import plan resolver). */
   autoSyncAudience?: {
-    interested: Array<{ email: string; report: AutoImportCfg['report']; organiser: boolean }>;
-    effectiveReport: AutoImportCfg['report'] | null;
+    // Server-resolved: always a live pref, never the retired 'summary'.
+    interested: Array<{ email: string; report: ReportPref; organiser: boolean }>;
+    effectiveReport: ReportPref | null;
     downgrades: string[];
   };
   googleConnected: boolean;
@@ -225,23 +229,23 @@ const MODE_INFO: Record<
   },
 };
 
-const REPORT_INFO: Record<AutoImportCfg['report'], { label: string; detail: string }> = {
-  summary: {
-    label: 'Quick summary',
-    detail: 'Short notes — key points, decisions, action items. Cheapest and fastest.',
-  },
+/** Every run writes BOTH tiers — the quick summary and the detailed report
+ * (the summary distills from the report's own session). The only choice is
+ * the report's flavour, or 'later'. */
+const REPORT_INFO: Record<ReportPref, { label: string; detail: string }> = {
   'detailed-text': {
-    label: 'Detailed report',
-    detail: 'Long wiki-style report with timestamped references, from the transcript text only.',
+    label: 'Summary + detailed report (text only)',
+    detail:
+      'The quick summary plus a long wiki-style report with timestamped references, from the transcript text only.',
   },
   'detailed-video': {
-    label: 'Detailed report + video frames',
+    label: 'Summary + detailed report (with video frames)',
     detail:
-      'Detailed report that also pulls frames from the recording (slides, screen shares). Needs the video — with "Native transcript only" it falls back to the text-only report.',
+      'The quick summary plus a detailed report that also pulls frames from the recording (slides, screen shares). Needs the video — with "Native transcript only" it falls back to the text-only report.',
   },
   later: {
-    label: 'Nothing (decide later)',
-    detail: 'Just import. You trigger notes yourself from the transcript page.',
+    label: 'Generate later',
+    detail: 'Just import. You trigger the summary + report yourself from the transcript page.',
   },
 };
 
@@ -373,7 +377,7 @@ function AudienceNote({
         </p>
         {audience.downgrades.length > 0 && audience.effectiveReport && (
           <p className="text-amber-700 dark:text-amber-400">
-            Your pick ({REPORT_INFO[cfg.report].label.toLowerCase()}) is weaker than what{' '}
+            Your pick ({REPORT_INFO[storedReportPref(cfg.report)].label.toLowerCase()}) is weaker than what{' '}
             {audience.downgrades.map(who).join(', ')} asked for — the import generates the{' '}
             <b>{REPORT_INFO[audience.effectiveReport].label.toLowerCase()}</b> for everyone (automation
             never lowers a colleague’s ask).
@@ -658,7 +662,7 @@ export function SeriesDialog({ seriesId, onClose, onChanged, onMerged }: SeriesD
     const next = {
       enabled: patch.enabled,
       mode: patch.mode ?? prev?.mode ?? 'both',
-      report: patch.report ?? prev?.report ?? 'summary',
+      report: storedReportPref(patch.report ?? prev?.report),
     };
     setDetail((d) =>
       d
@@ -1103,7 +1107,7 @@ export function SeriesDialog({ seriesId, onClose, onChanged, onMerged }: SeriesD
               const ai = detail.series.auto_import;
               const on = ai?.enabled ?? false;
               const mode = ai?.mode ?? 'both';
-              const report = ai?.report ?? 'summary';
+              const report = storedReportPref(ai?.report);
               return (
                 <div
                   className={`rounded-lg border p-2.5 ${on ? 'border-blue-500/30 bg-blue-500/[0.04]' : ''}`}
@@ -1205,11 +1209,11 @@ export function SeriesDialog({ seriesId, onClose, onChanged, onMerged }: SeriesD
                               void saveAutoImport({
                                 enabled: true,
                                 mode,
-                                report: e.target.value as AutoImportCfg['report'],
+                                report: e.target.value as ReportPref,
                               })
                             }
                           >
-                            {(Object.keys(REPORT_INFO) as AutoImportCfg['report'][]).map((r) => (
+                            {(Object.keys(REPORT_INFO) as ReportPref[]).map((r) => (
                               <option key={r} value={r}>
                                 {REPORT_INFO[r].label}
                               </option>
@@ -1218,7 +1222,7 @@ export function SeriesDialog({ seriesId, onClose, onChanged, onMerged }: SeriesD
                           <InfoHover align="left">
                             <p className="mb-1.5 font-medium">What gets generated after import</p>
                             <div className="space-y-1.5">
-                              {(Object.keys(REPORT_INFO) as AutoImportCfg['report'][]).map((r) => (
+                              {(Object.keys(REPORT_INFO) as ReportPref[]).map((r) => (
                                 <div key={r}>
                                   <span className={r === report ? 'font-medium text-primary' : 'font-medium'}>
                                     {REPORT_INFO[r].label}
@@ -1228,7 +1232,7 @@ export function SeriesDialog({ seriesId, onClose, onChanged, onMerged }: SeriesD
                               ))}
                             </div>
                             <p className="mt-1.5 border-t pt-1.5 text-muted-foreground">
-                              Anything but “Nothing” is gated on speakers: when every speaker is
+                              Anything but “Generate later” is gated on speakers: when every speaker is
                               identified with high confidence it runs unattended; otherwise you get a
                               Slack DM to review speakers first and it runs after you confirm.
                             </p>
@@ -1244,7 +1248,7 @@ export function SeriesDialog({ seriesId, onClose, onChanged, onMerged }: SeriesD
                             ? 'Each one has its recording downloaded and re-transcribed by AssemblyAI (speaker diarization + voiceprints).'
                             : 'Each one has its recording downloaded and re-transcribed by AssemblyAI, with the Meet/Teams transcript kept alongside.'}{' '}
                         {report === 'later'
-                          ? 'No notes are generated — you decide on the transcript page.'
+                          ? 'Nothing is generated — you decide on the transcript page.'
                           : `Then the ${REPORT_INFO[report].label.toLowerCase()} is generated${
                               mode === 'transcript' && report === 'detailed-video'
                                 ? ' (text-only, since no video is imported)'
@@ -1259,8 +1263,9 @@ export function SeriesDialog({ seriesId, onClose, onChanged, onMerged }: SeriesD
                   ) : (
                     <div className="mt-1 space-y-1 text-[11px] text-muted-foreground">
                       <p>
-                        Import every new occurrence of this series automatically, with your chosen
-                        report kind — you’ll be DMed as things land.
+                        Import every new occurrence of this series automatically — the quick
+                        summary and the detailed report are both written, in the flavour you
+                        pick, and you’ll be DMed as things land.
                       </p>
                       <AudienceNote audience={occ?.autoSyncAudience} cfg={ai} />
                     </div>

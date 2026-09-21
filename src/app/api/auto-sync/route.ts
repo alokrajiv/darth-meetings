@@ -12,8 +12,8 @@ import {
   AUTO_SYNC_REPORTS,
   type AutoSyncScope,
   type AutoSyncMode,
-  type AutoSyncReport,
 } from '@/db-ops/user-prefs';
+import { normalizeReportPref } from '@/lib/report-pref';
 import { getGoogleAccount } from '@/db-ops/google-accounts';
 import { listSeriesWithAutoImport, visibleSeriesIds } from '@/db-ops/series';
 
@@ -70,7 +70,9 @@ export const GET = withAuth(async ({ user }) => {
 /**
  * PUT /api/auto-sync — partial update:
  * { scope?: off|mine|all, mode?: transcript|video|both,
- *   report?: summary|detailed-video|detailed-text|later,
+ *   report?: detailed-video|detailed-text|later   (legacy 'summary' is
+ *     accepted and read as the detailed default — every run writes both
+ *     tiers since 2026-09-21),
  *   providers?: { gmeet?: bool, teams?: bool } }
  * Turning it on stamps `since = now()` — history is never backfilled.
  */
@@ -102,10 +104,13 @@ export const PUT = withAuth(async ({ user, request }) => {
     patch.mode = body.mode as AutoSyncMode;
   }
   if (body.report !== undefined) {
-    if (!AUTO_SYNC_REPORTS.includes(body.report as AutoSyncReport)) {
+    // Legacy 'summary' from an old darth-cli / old tab maps to the detailed
+    // default instead of 400-ing — summary-only generation no longer exists.
+    const report = normalizeReportPref(typeof body.report === 'string' ? body.report : null);
+    if (!report) {
       return NextResponse.json({ error: `report must be one of ${AUTO_SYNC_REPORTS.join('|')}` }, { status: 400 });
     }
-    patch.report = body.report as AutoSyncReport;
+    patch.report = report;
   }
   if (body.providers !== undefined) {
     const p = body.providers as { gmeet?: unknown; teams?: unknown } | null;

@@ -23,6 +23,7 @@ import { RowMenu, type RowMenuItem, type RowMenuSection } from '@/components/row
 import { RecorderRefStrip, RecordingStrip, SourceGlyph } from '@/components/recording-strip';
 import { OFFLINE_TITLE, useOfflineGate } from '@/lib/offline/offline-context';
 import { isNetworkFailure } from '@/lib/offline/offline-fetch';
+import { reportLabel } from '@/lib/report-pref';
 
 // Server-declared shapes (type-only import — erased at build, no server
 // code is pulled into the client bundle). Display-only data: importing
@@ -32,13 +33,6 @@ import type {
   CalendarMeetingRow,
   CalendarMeetingsResponse,
 } from '@/app/api/calendar-meetings/route';
-
-const REPORT_WORDS: Record<string, string> = {
-  summary: 'quick summary',
-  'detailed-text': 'detailed report',
-  'detailed-video': 'detailed report with video frames',
-  later: 'no notes until someone picks on the page',
-};
 
 export type { CalendarMeetingRow, CalendarMeetingsResponse };
 
@@ -549,7 +543,7 @@ export function CalendarEventRow({
         ? ` via ${r.autoSync.importerEmail}'s connection (account auto-sync)`
         : ''
     : '';
-  const autoReport = r.autoSync?.report ? ` Then: ${REPORT_WORDS[r.autoSync.report] ?? r.autoSync.report}.` : '';
+  const autoReport = r.autoSync?.report ? ` Then: ${reportLabel(r.autoSync.report)}.` : '';
   const autoSyncTitle =
     r.autoSync &&
     (r.autoSync.state === 'pending'

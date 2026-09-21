@@ -141,8 +141,9 @@ WRITE (needs read+write for meetings)
                                   kept in the web UI or linked. --wait polls
                                   until transcription AND the speaker-ID
                                   guess finish, then prints 'speakers'.
-                                  Uploads get summary notes only — a detailed
-                                  report is requested by a human in the web UI.
+                                  Uploads generate nothing by themselves — a
+                                  run (summary + detailed report, always both)
+                                  is requested by a human in the web UI.
                                   Media over 8 MB goes up RESUMABLE: the file
                                   is hashed, then sent as parallel verified
                                   pieces (through the VM, or straight to
@@ -182,7 +183,7 @@ WRITE (needs read+write for meetings)
                                   /m/<uuid> link. --wait polls until the
                                   import completes (default cap 30 min)
   series set <id> [--title <t>] [--notes <md>] [--auto-import on|off]
-             [--mode transcript|video|both] [--report summary|detailed-video|detailed-text|later]
+             [--mode transcript|video|both] [--report detailed-video|detailed-text|later]
                                   Rename / edit notes / configure auto-import
                                   (on = future occurrences import on their own
                                   under YOUR Google link)
@@ -202,11 +203,11 @@ WRITE (needs read+write for meetings)
                                   account auto-sync vs nobody + why), importer,
                                   mode, effective report (strongest ask across
                                   everyone in it), watchers, ledger row. The
-                                  answer to "why wasn't this auto-imported /
-                                  why only a summary". Start defaults to the
+                                  answer to "why wasn't this auto-imported".
+                                  Start defaults to the
                                   latest past occurrence of that code
   auto-sync off|mine|all [--mode transcript|video|both]
-             [--report summary|detailed-video|detailed-text|later]
+             [--report detailed-video|detailed-text|later]
              [--gmeet on|off] [--teams on|off]
                                   mine = meetings you organise, all = every
                                   meeting you attend (recommended: all, video,
@@ -289,10 +290,12 @@ set-notes/set-report replace the markdown shown in the web UI's Summary /
 Report tabs and are logged as "updated notes via darth-cli" in the activity
 feed. Notes = quick summary tier; report = detailed wiki-style tier.
 
-The CLI never starts the service's own AI runs: an upload gets the default
-summary notes, and a DETAILED report is something a human requests in the
-web UI (Generate…). You READ whatever exists with 'report <id>' and WRITE
-your own with 'set-report <id> --file report.md' — that is the whole point.
+The CLI never starts the service's own AI runs: an upload gets whatever the
+web UI's default generation produces (since 2026-09-21 that is always BOTH
+tiers — the quick summary AND the detailed report), and starting a run is a
+human's web-UI ask (Generate…). You READ whatever exists with 'notes <id>' /
+'report <id>' and WRITE your own with 'set-notes' / 'set-report <id> --file
+report.md' — that is the whole point.
 
 ## Grounding in what was on screen
 
@@ -1656,7 +1659,7 @@ const meetings: Subcommand = {
           return 0;
         }
         ctx.requireWrite();
-        if (!["off", "mine", "all"].includes(sub)) { console.error("usage: darth-cli meetings auto-sync [explain <ref>] [off|mine|all] [--mode ...] [--report ...] [--gmeet on|off] [--teams on|off]"); return 1; }
+        if (!["off", "mine", "all"].includes(sub)) { console.error("usage: darth-cli meetings auto-sync [explain <ref>] [off|mine|all] [--mode ...] [--report detailed-video|detailed-text|later] [--gmeet on|off] [--teams on|off]"); return 1; }
         if (!requireConsent(flags, "account auto-sync")) return 1;
         const body: any = { scope: sub };
         const mode = str(flags.mode); const report = str(flags.report);
@@ -2046,7 +2049,7 @@ const meetings: Subcommand = {
         ctx.requireWrite();
         if (sub === "set") {
           const id = asId(args[1]);
-          if (!id) { console.error("usage: darth-cli meetings series set <id> [--title <t>] [--notes <md>] [--auto-import on|off] [--mode ...] [--report ...]"); return 1; }
+          if (!id) { console.error("usage: darth-cli meetings series set <id> [--title <t>] [--notes <md>] [--auto-import on|off] [--mode ...] [--report detailed-video|detailed-text|later]"); return 1; }
           const body: any = {};
           if (str(flags.title) !== undefined) body.title = str(flags.title);
           if (str(flags.notes) !== undefined) body.notes = str(flags.notes);
@@ -2340,9 +2343,9 @@ const meetings: Subcommand = {
         if (!file) { console.error("usage: darth-cli meetings upload <file> [--event <meeting-code|event-key>] [--title <t>] [--language <code>] [--scratch] [--wait] [--timeout <mins>]"); return 1; }
         if (!existsSync(file) || !statSync(file).isFile()) { console.error(`No such file: ${file}`); return 1; }
         // No --report here on purpose: the CLI never starts the service's AI
-        // runs (a detailed report is a human's web-UI ask); the caller's own
-        // agent writes reports via set-report.
-        if (flags.report !== undefined) { console.error("--report is not a CLI option: uploads get the default summary notes; a detailed report is requested by a human in the web UI, or written by you with 'set-report'."); return 1; }
+        // runs (generation is a human's web-UI ask); the caller's own agent
+        // writes notes/reports via set-notes/set-report.
+        if (flags.report !== undefined) { console.error("--report is not a CLI option: an upload gets the web UI's default generation (summary + detailed report, since 2026-09-21); a run is started by a human in the web UI, or you write the markdown yourself with 'set-notes'/'set-report'."); return 1; }
         ctx.requireWrite();
         const capMin = Number(str(flags.timeout) ?? "60");
         if (!Number.isFinite(capMin) || capMin <= 0) { console.error(`--timeout must be a number of minutes (got '${str(flags.timeout)}')`); return 1; }

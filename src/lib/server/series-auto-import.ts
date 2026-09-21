@@ -16,6 +16,7 @@ import { listAutoSyncUsers, type AutoSyncUser } from '@/db-ops/user-prefs';
 import { ensureSharedWith } from '@/lib/server/account-auto-sync';
 import { planForOccurrence } from '@/lib/server/auto-import-plan';
 import { reportLabel, type ReportPref } from '@/lib/auto-marker';
+import { storedReportPref } from '@/lib/report-pref';
 
 /**
  * Series auto-import: for every series with auto_import enabled, re-run the
@@ -227,7 +228,9 @@ async function fireOne(
     },
     { users, series }
   );
-  const report: ReportPref = plan.report ?? cfg.report;
+  // storedReportPref reads a series configured before 2026-09-21 (the
+  // retired 'summary') as the detailed default — both tiers, always.
+  const report: ReportPref = plan.report ?? storedReportPref(cfg.report);
   const watchers = plan.watchers;
 
   const contextExtra = {
@@ -321,7 +324,7 @@ async function fireOne(
           kind === 'imported'
             ? `Imported under your Google connection — speakers are being identified; the ${reportLabel(report)} follows once they're confirmed.`
             : `Queued — Google is still generating the artifacts. It lands on its own; nothing to do.`,
-          ...(report !== cfg.report
+          ...(report !== storedReportPref(cfg.report)
             ? [`Report raised from the series' ${reportLabel(cfg.report)} to ${reportLabel(report)} — an auto-sync attendee asked for more.`]
             : []),
           ...(watchers.length > 0 ? [`Also shared with (auto-sync): ${watchers.join(', ')}.`] : []),
