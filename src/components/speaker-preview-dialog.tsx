@@ -10,7 +10,6 @@ import {
 } from '@/components/ui/dialog';
 import { Button } from '@/components/ui/button';
 import { Badge } from '@/components/ui/badge';
-import { Input } from '@/components/ui/input';
 import { Textarea } from '@/components/ui/textarea';
 import {
   ChevronLeft,
@@ -19,11 +18,16 @@ import {
   Play,
   Pause,
   Headphones,
+  Check,
+  Fingerprint,
+  MicOff,
   Pencil,
+  Sparkles,
   X,
 } from 'lucide-react';
-import { formatTime, type SpeakerLabel } from '@/lib/format';
+import { formatTime, type SpeakerLabel, type SpeakerSuggestionMap } from '@/lib/format';
 import { defaultSpeakerLabel } from '@/lib/speaker-display';
+import { speakerNameState } from '@/lib/speaker-name-state';
 import { UserPicker, type PickerPerson } from '@/components/user-picker';
 
 interface Utterance {
@@ -47,6 +51,11 @@ interface SpeakerPreviewDialogProps {
   speakers: string[];
   utterances: Utterance[];
   speakerLabels: SpeakerLabel[];
+  /** Voiceprint / Meet-align / speaker-ID guesses. The form opens PRE-FILLED
+   * with the guess for an unconfirmed speaker (docs/transcript-page-redesign.md
+   * §4) — before 2026-09-21 this dialog only saw `speakerLabels` and a guessed
+   * name vanished the moment the pencil was clicked. */
+  suggestions?: SpeakerSuggestionMap | null;
   /** /api/transcripts/[id]/audio — null when the transcript has no playable
    *  audio; the dialog still works for editing names + context. */
   audioSrc: string | null;
@@ -108,6 +117,7 @@ export function SpeakerPreviewDialog({
   speakers,
   utterances,
   speakerLabels,
+  suggestions,
   audioSrc,
   hasVideo,
   canEdit,
@@ -170,16 +180,23 @@ export function SpeakerPreviewDialog({
   );
 
   const mapping = speakerLabels.find((m) => m.originalSpeaker === speaker);
-  const displayName = mapping?.customName?.trim() || defaultSpeakerLabel(speaker);
+  // The ONE merge of labels + guesses (lib/speaker-name-state): confirmed
+  // name, else the guess, else nothing — with a caption saying which.
+  const state = useMemo(
+    () => speakerNameState(speaker, speakerLabels, suggestions),
+    [speaker, speakerLabels, suggestions]
+  );
+  const displayName = state.status === 'unknown' ? defaultSpeakerLabel(speaker) : state.display;
 
-  // Local drafts for the editable name / description, synced from props.
-  const [nameDraft, setNameDraft] = useState(mapping?.customName ?? '');
-  const [descDraft, setDescDraft] = useState(mapping?.description ?? '');
+  // Local drafts for the editable name / description, seeded from the state
+  // (so a guess is the starting point, never a blank field).
+  const [nameDraft, setNameDraft] = useState(state.name);
+  const [descDraft, setDescDraft] = useState(state.description);
   useEffect(() => {
-    setNameDraft(mapping?.customName ?? '');
-    setDescDraft(mapping?.description ?? '');
+    setNameDraft(state.name);
+    setDescDraft(state.description);
     setEditingName(false);
-  }, [speaker, mapping?.customName, mapping?.description]);
+  }, [speaker, state.name, state.description]);
 
   const speakerIdx = Math.max(0, speakers.indexOf(speaker));
   const nextSpeaker = () => {
@@ -254,10 +271,14 @@ export function SpeakerPreviewDialog({
     setEditingName(false);
     const trimmed = value.trim();
     setNameDraft(trimmed);
-    if (trimmed !== (mapping?.customName ?? '')) {
+    // Compare against what is STORED, not against the draft: confirming an
+    // unchanged guess must still write the label.
+    if (trimmed !== (mapping?.customName ?? '').trim()) {
       onSave(speaker, { customName: trimmed });
     }
   };
+  /** One click: the guess becomes the confirmed name. */
+  const confirmGuess = () => commitName(state.name);
 
   const commitDesc = () => {
     const trimmed = descDraft.trim();
@@ -342,10 +363,20 @@ export function SpeakerPreviewDialog({
               ) : (
                 <div
                   onDoubleClick={() => setEditingName(true)}
-                  className="flex items-center gap-1.5 rounded-md border px-2 py-1.5 text-sm hover:bg-muted/40 cursor-default"
+                  className={`flex cursor-default items-center gap-1.5 rounded-md border px-2 py-1.5 text-sm hover:bg-muted/40 ${
+                    state.status === 'guess' ? 'border-primary/50 ring-2 ring-primary/10' : ''
+                  }`}
                   title="Double-click to edit"
+                  data-speaker-name-field
+                  data-speaker-state={state.status}
                 >
-                  <span className={`truncate flex-1 ${nameDraft.trim() ? '' : 'text-muted-foreground italic'}`}>
+                  {state.status === 'guess' && (
+                    <span className="shrink-0 rounded bg-primary/15 px-1 text-[10px] font-semibold uppercase tracking-wide text-primary">
+                      guess
+                    </span>
+                  )}
+                  {state.status === 'group' && <MicOff className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />}
+                  <span className={`flex-1 truncate ${nameDraft.trim() ? '' : 'italic text-muted-foreground'}`}>
                     {nameDraft.trim() || 'Set a name'}
                   </span>
                   <button
@@ -358,6 +389,29 @@ export function SpeakerPreviewDialog({
                   </button>
                 </div>
               )}
+              <div className="mt-1.5 flex items-center gap-1.5 text-[11px] text-muted-foreground">
+                {state.status === 'guess' ? (
+                  guessIcon(state.suggestion?.source)
+                ) : state.status === 'confirmed' ? (
+                  <Check className="h-3 w-3 shrink-0 text-primary" />
+                ) : state.status === 'group' ? (
+                  <MicOff className="h-3 w-3 shrink-0" />
+                ) : null}
+                <span className="min-w-0 truncate" title={state.suggestion?.evidence}>
+                  {state.caption}
+                </span>
+                {state.status === 'guess' && !editingName && (
+                  <Button
+                    size="sm"
+                    className="ml-auto h-6 shrink-0 px-2 text-[11px]"
+                    onClick={confirmGuess}
+                    data-speaker-confirm-guess
+                  >
+                    <Check className="h-3 w-3" />
+                    Confirm guess
+                  </Button>
+                )}
+              </div>
             </div>
             <Textarea
               value={descDraft}
@@ -504,5 +558,13 @@ export function SpeakerPreviewDialog({
         )}
       </DialogContent>
     </Dialog>
+  );
+}
+
+function guessIcon(source: 'voice' | 'context' | undefined) {
+  return source === 'voice' ? (
+    <Fingerprint className="h-3 w-3 shrink-0 text-primary" />
+  ) : (
+    <Sparkles className="h-3 w-3 shrink-0 text-primary" />
   );
 }

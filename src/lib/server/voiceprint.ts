@@ -24,6 +24,8 @@ import type {
  * speaker ID.
  */
 
+import { isGroupLabel } from '@/lib/speaker-name-kind';
+
 const SIDECAR_URL = process.env.MW_VOICEPRINT_URL || 'http://127.0.0.1:3004';
 
 /**
@@ -133,6 +135,13 @@ export async function enrollFromTranscript(
   for (const label of labels) {
     const name = label.customName.trim();
     if (!name) continue;
+    // "mixed" / "room mic" is a shared-mic label, not a person: enrolling it
+    // (as happened 2026-09-14, voiceprints id 206) makes the matcher SUGGEST
+    // it on other meetings. docs/transcript-page-redesign.md §5.
+    if (isGroupLabel(name)) {
+      console.log(`[voiceprint] not enrolling group label "${name}" (speaker ${label.originalSpeaker})`);
+      continue;
+    }
     try {
       const segments = pickSegments(content, label.originalSpeaker);
       const embedding = await embedViaSidecar(audioPath, segments);
@@ -161,7 +170,9 @@ export async function suggestSpeakersForTranscript(
   const audioPath = audioPathFor(localAudioFilename);
   if (!audioPath || !content?.utterances?.length) return {};
 
-  const voiceprints = await listAll();
+  // Enrolments made under a group label before the rule existed stay in the
+  // table (deleting is a human's call) but never become a suggestion.
+  const voiceprints = (await listAll()).filter((vp) => !isGroupLabel(vp.name));
   if (voiceprints.length === 0) return {};
 
   const speakers = [...new Set(content.utterances.map((u) => u.speaker))];

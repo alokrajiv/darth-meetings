@@ -29,11 +29,10 @@ import {
   type TranscriptShare,
 } from '@/lib/format';
 import { AudioPlayer, type AudioPlayerHandle } from '@/components/audio-player';
-import { MeetLogo, TeamsLogo } from '@/components/provider-icon';
 import { NotesMarkdown } from '@/components/notes-markdown';
 import { EditableUtterance, type UtteranceHighlight } from '@/components/editable-utterance';
 import { FindReplacePanel } from '@/components/find-replace-panel';
-import { SpeakerSummaryPanel } from '@/components/speaker-summary-panel';
+import { PeopleCard } from '@/components/people-card';
 import { SpeakerReviewDialog } from '@/components/speaker-review-dialog';
 import { GenerateDialog } from '@/components/generate-dialog';
 import { storedReportPref } from '@/lib/report-pref';
@@ -47,7 +46,10 @@ import { AppHeader } from '@/components/app-header';
 import { RerunDiarizationButton } from '@/components/rerun-diarization-button';
 import { IngestFailureNote } from '@/components/ingest-failure-note';
 import { TranscriptSourcesCard } from '@/components/transcript-sources-card';
-import { MeetingInfoCard } from '@/components/meeting-info-card';
+import { RecordingCard } from '@/components/recording-card';
+import { PersonChip } from '@/components/person-chip';
+import { safeDate, usesEventRange, whenLine } from '@/lib/when';
+import { countVoices, speakerNameStates } from '@/lib/speaker-name-state';
 import { OfflinePinDialog, OfflinePinStatus } from '@/components/offline-pin-dialog';
 import { OFFLINE_TITLE, getOfflineMode, useOffline, useOfflineGate } from '@/lib/offline/offline-context';
 import { isNetworkFailure } from '@/lib/offline/offline-fetch';
@@ -88,6 +90,7 @@ import {
   FileText,
   Headphones,
   CalendarSearch,
+  CalendarX2,
   ExternalLink,
   Trash2,
   Hourglass,
@@ -95,6 +98,9 @@ import {
 } from 'lucide-react';
 
 const VIDEO_EXT_RE = /\.(mp4|webm|mov|mkv|m4v)$/i;
+/** The detail row: a StoredTranscript plus the owner's identity on shared
+ * rows (GET /api/transcripts/:id fills it) — "Recorded on Atira's Mac". */
+type DetailRow = StoredTranscript & { owner_email?: string | null; owner_name?: string | null };
 /** Offline mode, row still 'running'/'processing' in the cached copy. */
 const OFFLINE_IN_PROGRESS_COPY =
   'This was still in progress when the offline copy was saved — reconnect to see the result.';
@@ -152,7 +158,7 @@ function TranscriptDetailInner({ transcriptId }: { transcriptId: string }) {
     };
   }, []);
 
-  const [row, setRow] = useState<StoredTranscript | null>(null);
+  const [row, setRow] = useState<DetailRow | null>(null);
   const [access, setAccess] = useState<TranscriptAccess>('owner');
   const [shareOpen, setShareOpen] = useState(false);
   const [linkEventOpen, setLinkEventOpen] = useState(false);
@@ -570,7 +576,7 @@ function TranscriptDetailInner({ transcriptId }: { transcriptId: string }) {
         throw new Error(`Failed to load transcript (${rowRes.status})`);
       }
       const { transcript } = (await rowRes.json()) as {
-        transcript: StoredTranscript & { access?: TranscriptAccess };
+        transcript: DetailRow & { access?: TranscriptAccess };
       };
       if (liveIdRef.current !== transcriptId) return;
       setRow(transcript);
@@ -1841,25 +1847,6 @@ function TranscriptDetailInner({ transcriptId }: { transcriptId: string }) {
     }
   };
 
-  /** Header meta date: "Jul 30, 2026 · 9:41 AM". */
-  const formatHeaderDate = (value: string | null): string => {
-    if (!value) return 'Unknown date';
-    try {
-      const date = new Date(value);
-      if (isNaN(date.getTime())) return 'Unknown date';
-      return `${date.toLocaleDateString('en-US', {
-        month: 'short',
-        day: 'numeric',
-        year: 'numeric',
-      })} · ${date.toLocaleTimeString('en-US', {
-        hour: 'numeric',
-        minute: '2-digit',
-      })}`;
-    } catch {
-      return 'Unknown date';
-    }
-  };
-
   /**
    * Generate markdown from the transcript. `mode` controls whether we use raw
    * AAI content as-is or the composed edited view (text edits + speaker
@@ -2090,6 +2077,38 @@ function TranscriptDetailInner({ transcriptId }: { transcriptId: string }) {
   }
 
   const headerTitle = title.trim() || row.original_filename || 'Untitled transcript';
+
+  // --- Identity block (docs/transcript-page-redesign.md §3.2) -------------
+  // "when": the calendar range when linked and on the same day as the
+  // curated date, else the curated moment — always 24-hour.
+  const heldAt =
+    safeDate(row.recorded_at) ?? safeDate(row.gmeet_context?.startTime) ?? safeDate(row.created_at);
+  const whenInput = heldAt
+    ? {
+        held: heldAt,
+        eventStart: safeDate(row.gmeet_context?.startTime),
+        eventEnd: safeDate(row.gmeet_context?.endTime),
+      }
+    : null;
+  const headerWhen = whenInput ? whenLine(whenInput) : 'Unknown date';
+  const headerWhenFromCalendar = !!whenInput && usesEventRange(whenInput);
+  const hasCalendarEvent = !!row.gmeet_context?.eventId;
+  const organizerEmail = row.gmeet_context?.organizerEmail ?? null;
+  const organizerAttendee = organizerEmail
+    ? row.gmeet_context?.attendees?.find((a) => a.email.toLowerCase() === organizerEmail.toLowerCase())
+    : undefined;
+  const invitedCount = new Set(
+    (row.gmeet_context?.attendees ?? []).map((a) => (a.email || a.name || '').toLowerCase()).filter(Boolean)
+  ).size;
+  const voicesCount = content?.utterances?.length
+    ? countVoices(
+        speakerNameStates(
+          Array.from(new Set(content.utterances.map((u) => u.speaker))),
+          speakerLabels,
+          speakerSuggestions
+        )
+      )
+    : row.speaker_count;
   const notesGenerating = generatingNotes || row.auto_notes_status === 'running';
 
   /** Soft delete: the row moves to the Trash tab (restorable) — nothing is
@@ -2644,75 +2663,6 @@ function TranscriptDetailInner({ transcriptId }: { transcriptId: string }) {
                   {offline ? 'In progress when saved' : 'Processing'}
                 </Badge>
               ))}
-            <span className="inline-flex items-center gap-1 rounded-md bg-muted px-1.5 py-0.5 text-[11px]">
-              {row.gmeet_context?.provider === 'teams' ? (
-                <>
-                  <TeamsLogo className="h-3 w-3" />
-                  Microsoft Teams
-                </>
-              ) : row.assemblyai_id.startsWith('gmeet-') ? (
-                <>
-                  <MeetLogo className="h-3 w-3" />
-                  Google Meet
-                </>
-              ) : row.source === 'uploaded' ? (
-                <>
-                  <FileAudio className="h-3 w-3" />
-                  Upload
-                </>
-              ) : (
-                <>
-                  <FileText className="h-3 w-3" />
-                  Import
-                </>
-              )}
-            </span>
-            <AutoProvenance
-              ctx={row.gmeet_context}
-              generated={row.auto_notes_status === 'completed' || row.auto_report_status === 'completed'}
-              onOpenSeries={setOpenSeriesId}
-              disabled={blocked}
-            />
-            {seriesMembership !== 'loading' && (
-              <SeriesBadge
-                assemblyaiId={transcriptId}
-                membership={seriesMembership}
-                defaultTitle={title.trim() || row.original_filename}
-                disabled={blocked}
-                onOpenSeries={setOpenSeriesId}
-                onChanged={loadSeriesInfo}
-                variant="full"
-              />
-            )}
-            {labelInfo && (
-              <span ref={labelAddRef} className="inline-flex items-center">
-                <LabelChips
-                  labels={labelInfo.labels}
-                  variant="full"
-                  disabled={offline}
-                  onRemove={
-                    labelInfo.canEdit && !offline
-                      ? (l) =>
-                          void toggleLabel(l, false).catch((err: unknown) => {
-                            setLabelError(err instanceof Error ? err.message : 'Could not remove label');
-                            loadLabels();
-                            window.setTimeout(() => setLabelError(null), 5000);
-                          })
-                      : undefined
-                  }
-                  onAdd={
-                    labelInfo.canEdit
-                      ? (e) => setLabelPickerAnchor(anchorFromElement(e.currentTarget))
-                      : undefined
-                  }
-                />
-                {labelError && (
-                  <span className="ml-1.5 text-[11px] text-destructive" role="alert">
-                    {labelError}
-                  </span>
-                )}
-              </span>
-            )}
             {dateEditOpen && canEdit ? (
               <span
                 className="inline-flex items-center gap-1.5"
@@ -2763,13 +2713,12 @@ function TranscriptDetailInner({ transcriptId }: { transcriptId: string }) {
             ) : (
               <button
                 type="button"
-                className={`${canEdit && !offline ? 'hover:text-foreground hover:underline decoration-dotted underline-offset-2' : 'cursor-default'}`}
+                className={`font-medium text-foreground ${canEdit && !offline ? 'hover:underline decoration-dotted underline-offset-2' : 'cursor-default'}`}
+                data-header-when
                 title={
                   offline
                     ? OFFLINE_TITLE
-                    : canEdit
-                      ? `Meeting date — click to edit (${safeFormatDate(row.recorded_at ?? row.created_at)})`
-                      : safeFormatDate(row.recorded_at ?? row.created_at)
+                    : `${safeFormatDate(row.recorded_at ?? row.created_at)}${headerWhenFromCalendar ? ' · from the calendar invite' : ''}${canEdit ? ' — click to edit' : ''}`
                 }
                 onClick={() => {
                   if (!canEdit || offline) return;
@@ -2781,23 +2730,107 @@ function TranscriptDetailInner({ transcriptId }: { transcriptId: string }) {
                   setDateEditOpen(true);
                 }}
               >
-                {formatHeaderDate(row.recorded_at ?? row.created_at)}
+                {headerWhen}
               </button>
             )}
             {row.duration != null && (
-              <span className="font-mono text-[11px] tabular-nums">
-                {formatDuration(row.duration)}
+              <span className="tabular-nums">· {formatDuration(row.duration)}</span>
+            )}
+            <AutoProvenance
+              ctx={row.gmeet_context}
+              generated={row.auto_notes_status === 'completed' || row.auto_report_status === 'completed'}
+              onOpenSeries={setOpenSeriesId}
+              disabled={blocked}
+            />
+            {seriesMembership !== 'loading' && (
+              <SeriesBadge
+                assemblyaiId={transcriptId}
+                membership={seriesMembership}
+                defaultTitle={title.trim() || row.original_filename}
+                disabled={blocked}
+                onOpenSeries={setOpenSeriesId}
+                onChanged={loadSeriesInfo}
+                variant="full"
+              />
+            )}
+            {labelInfo && (
+              <span ref={labelAddRef} className="inline-flex items-center">
+                <LabelChips
+                  labels={labelInfo.labels}
+                  variant="full"
+                  disabled={offline}
+                  onRemove={
+                    labelInfo.canEdit && !offline
+                      ? (l) =>
+                          void toggleLabel(l, false).catch((err: unknown) => {
+                            setLabelError(err instanceof Error ? err.message : 'Could not remove label');
+                            loadLabels();
+                            window.setTimeout(() => setLabelError(null), 5000);
+                          })
+                      : undefined
+                  }
+                  onAdd={
+                    labelInfo.canEdit
+                      ? (e) => setLabelPickerAnchor(anchorFromElement(e.currentTarget))
+                      : undefined
+                  }
+                />
+                {labelError && (
+                  <span className="ml-1.5 text-[11px] text-destructive" role="alert">
+                    {labelError}
+                  </span>
+                )}
               </span>
             )}
-            {row.speaker_count != null && (
-              <span>
-                {row.speaker_count} speaker{row.speaker_count === 1 ? '' : 's'}
-              </span>
-            )}
-            {row.language_code && <span className="uppercase">{row.language_code}</span>}
             <div className="ml-auto">
               <ActivityBar transcriptId={transcriptId} refreshSignal={activityTick} />
             </div>
+          </div>
+
+          {/* "who": organizer · invited · voices — people are people. */}
+          <div
+            className="mt-1.5 flex flex-wrap items-center gap-x-2 gap-y-1 text-xs text-muted-foreground"
+            data-header-who
+          >
+            {organizerEmail && (
+              <>
+                <PersonChip
+                  email={organizerEmail}
+                  name={organizerAttendee?.name}
+                  trailing={<span className="rounded border px-1 text-[10px] text-muted-foreground">organizer</span>}
+                />
+                <span aria-hidden>·</span>
+              </>
+            )}
+            {invitedCount > 0 && (
+              <>
+                <a href="#speakers" className="font-medium text-foreground/80 hover:underline">
+                  {invitedCount} invited
+                </a>
+                <span aria-hidden>·</span>
+              </>
+            )}
+            {voicesCount != null && voicesCount > 0 && (
+              <a href="#speakers" className="font-medium text-foreground/80 hover:underline" data-header-voices>
+                {voicesCount} {voicesCount === 1 ? 'voice' : 'voices'}
+              </a>
+            )}
+            {!hasCalendarEvent && (
+              <span className="inline-flex items-center gap-1">
+                <CalendarX2 className="h-3 w-3" />
+                Not linked to a calendar event
+                {canEdit && !offline && (
+                  <button
+                    type="button"
+                    className="font-medium text-primary hover:underline"
+                    onClick={() => setLinkEventOpen(true)}
+                    title="Attach the calendar invite this meeting came from — fills the date, title, and attendees"
+                  >
+                    Link…
+                  </button>
+                )}
+              </span>
+            )}
           </div>
         </div>
 
@@ -3396,10 +3429,10 @@ function TranscriptDetailInner({ transcriptId }: { transcriptId: string }) {
               </Card>
             )}
 
-            {/* Speakers — friendly name + description per speaker */}
+            {/* People — who spoke (state-aware) + who was invited */}
             {viewMode === 'edited' && content?.utterances && content.utterances.length > 0 && (
               <div id="speakers" className="scroll-mt-36">
-                <SpeakerSummaryPanel
+                <PeopleCard
                   utterances={content.utterances}
                   speakerLabels={speakerLabels}
                   onSave={handleSaveSpeaker}
@@ -3417,6 +3450,9 @@ function TranscriptDetailInner({ transcriptId }: { transcriptId: string }) {
                   suggestions={speakerSuggestions}
                   onGuessNames={handleGuessSpeakers}
                   guessingNames={guessingSpeakers}
+                  identifying={row.speaker_id_status === 'running'}
+                  attendees={row.gmeet_context?.attendees}
+                  organizerEmail={organizerEmail}
                 />
               </div>
             )}
@@ -3474,6 +3510,7 @@ function TranscriptDetailInner({ transcriptId }: { transcriptId: string }) {
                               isTextEdited={viewMode === 'edited' && isTextEdited(index)}
                               isActive={index === currentUtteranceIndex}
                               speakerLabels={speakerLabels}
+                              suggestions={speakerSuggestions}
                               highlights={highlightsByUtterance.get(index)}
                               onSeek={handleSeekToUtterance}
                               canEdit={viewMode === 'edited' && canEdit && !offline}
@@ -3519,16 +3556,6 @@ function TranscriptDetailInner({ transcriptId }: { transcriptId: string }) {
                 interactive analysis details after, actions LAST — most
                 people read; only a few edit. */}
             <div className="sticky top-[72px] max-h-[calc(100vh-88px)] space-y-4 overflow-y-auto pr-1">
-              <MeetingInfoCard
-                row={row}
-                speakerLabels={speakerLabels}
-                canEdit={canEdit && !offline}
-                audioAvailable={audioAvailable}
-                videoFetching={videoFetching}
-                videoFetchError={videoFetchError}
-                onFetchVideo={() => void fetchVideo()}
-                onLinkEvent={() => setLinkEventOpen(true)}
-              />
               <TranscriptOutline
                 durationSec={row.duration ?? null}
                 hasNotes={!!description || canEdit}
@@ -3542,6 +3569,17 @@ function TranscriptDetailInner({ transcriptId }: { transcriptId: string }) {
                 onJumpToSeconds={handleOutlineJump}
                 activeAnchor={activeAnchor}
                 segments={row.auto_segments}
+              />
+              <RecordingCard
+                row={row}
+                access={access}
+                ownerEmail={row.owner_email}
+                ownerName={row.owner_name}
+                canEdit={canEdit && !offline}
+                audioAvailable={audioAvailable}
+                videoFetching={videoFetching}
+                videoFetchError={videoFetchError}
+                onFetchVideo={() => void fetchVideo()}
               />
               <TranscriptSourcesCard
                 row={row}
@@ -3692,19 +3730,6 @@ function TranscriptDetailInner({ transcriptId }: { transcriptId: string }) {
             {/* Same reader-first order as the desktop rail: info → outline →
                 sources → attachments → actions last. */}
             <div className="max-h-[70vh] space-y-4 overflow-y-auto pr-1">
-              <MeetingInfoCard
-                row={row}
-                speakerLabels={speakerLabels}
-                canEdit={canEdit && !offline}
-                audioAvailable={audioAvailable}
-                videoFetching={videoFetching}
-                videoFetchError={videoFetchError}
-                onFetchVideo={() => void fetchVideo()}
-                onLinkEvent={() => {
-                  setOutlineOpenMobile(false);
-                  setLinkEventOpen(true);
-                }}
-              />
               <div onClick={() => setOutlineOpenMobile(false)}>
                 <TranscriptOutline
                   durationSec={row.duration ?? null}
@@ -3724,6 +3749,17 @@ function TranscriptDetailInner({ transcriptId }: { transcriptId: string }) {
                   segments={row.auto_segments}
                 />
               </div>
+              <RecordingCard
+                row={row}
+                access={access}
+                ownerEmail={row.owner_email}
+                ownerName={row.owner_name}
+                canEdit={canEdit && !offline}
+                audioAvailable={audioAvailable}
+                videoFetching={videoFetching}
+                videoFetchError={videoFetchError}
+                onFetchVideo={() => void fetchVideo()}
+              />
               <TranscriptSourcesCard
                 row={row}
                 suggestions={speakerSuggestions}

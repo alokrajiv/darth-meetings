@@ -10,7 +10,7 @@ import {
 } from '@/db-ops/transcripts';
 import { deleteForUser as deleteSpeakerMappingsForUser } from '@/db-ops/speaker-mappings';
 import { resolveAccess } from '@/db-ops/transcript-access';
-import { logActivity } from '@/db-ops/transcript-activity';
+import { identityForUser, logActivity } from '@/db-ops/transcript-activity';
 import { deleteTranscript as aaiDelete } from '@/lib/server/assemblyai';
 import { deleteAudioFile } from '@/lib/server/audio-storage';
 import { dropAudioOnly } from '@/lib/server/audio-only';
@@ -40,8 +40,17 @@ export const GET = withAuth(async ({ user }, { params }) => {
     action: 'view',
   });
 
+  // Shared rows say who owns them ("Recorded on Atira's Mac" in the
+  // Recording card) — same identity source as the listing.
+  const owner = access.access === 'owner' ? null : await identityForUser(access.ownerUserId);
+
   return NextResponse.json({
-    transcript: { ...refreshed, access: access.access, owner_email: null, owner_name: null },
+    transcript: {
+      ...refreshed,
+      access: access.access,
+      owner_email: owner?.email ?? null,
+      owner_name: owner?.name ?? null,
+    },
   });
 });
 

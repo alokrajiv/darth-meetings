@@ -14,6 +14,7 @@ import { Input } from '@/components/ui/input';
 import { Check, Mic, RefreshCw, Sparkles } from 'lucide-react';
 import type { SpeakerLabel, SpeakerSuggestionMap } from '@/lib/format';
 import { defaultSpeakerLabel, speakerColorVar } from '@/lib/speaker-display';
+import { speakerNameState } from '@/lib/speaker-name-state';
 
 interface SpeakerReviewDialogProps {
   open: boolean;
@@ -54,10 +55,9 @@ export function SpeakerReviewDialog({
   const initialNames = useMemo(() => {
     const names: Record<string, string> = {};
     for (const sp of speakers) {
-      const confirmed = speakerLabels
-        .find((l) => l.originalSpeaker === sp)
-        ?.customName.trim();
-      names[sp] = confirmed || suggestions[sp]?.name?.trim() || '';
+      // Confirmed name, else a PERSON guess — a "mixed 85 %" voice match is
+      // not a name and must not be pre-filled (lib/speaker-name-kind).
+      names[sp] = speakerNameState(sp, speakerLabels, suggestions).name;
     }
     return names;
   }, [speakers, speakerLabels, suggestions]);
@@ -112,7 +112,7 @@ export function SpeakerReviewDialog({
 
         <div className="max-h-[50vh] space-y-2 overflow-y-auto pr-1">
           {speakers.map((sp) => {
-            const suggestion = suggestions[sp];
+            const suggestion = speakerNameState(sp, speakerLabels, suggestions).suggestion;
             const confirmed = !!speakerLabels
               .find((l) => l.originalSpeaker === sp)
               ?.customName.trim();

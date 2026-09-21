@@ -1,7 +1,7 @@
 'use client';
 
 import { useEffect, useRef, useState } from 'react';
-import { formatTime, type SpeakerLabel } from '@/lib/format';
+import { formatTime, type SpeakerLabel, type SpeakerSuggestionMap } from '@/lib/format';
 import { SpeakerBadgeEditor } from '@/components/speaker-badge-editor';
 import type { PickerPerson } from '@/components/user-picker';
 import { Pencil } from 'lucide-react';
@@ -32,6 +32,8 @@ interface EditableUtteranceProps {
   isActive: boolean;
   /** All speaker labels for this transcript (used to display the right name). */
   speakerLabels: SpeakerLabel[];
+  /** Guesses for unconfirmed speakers — shown with a "?" and pre-filled on edit. */
+  suggestions?: SpeakerSuggestionMap | null;
   /** Optional highlights to overlay on the text in display mode (find-and-replace). */
   highlights?: UtteranceHighlight[];
   /** Click an utterance → seek the player to its start. */
@@ -68,6 +70,7 @@ export function EditableUtterance({
   isTextEdited,
   isActive,
   speakerLabels,
+  suggestions,
   highlights,
   onSeek,
   onSaveText,
@@ -212,6 +215,7 @@ export function EditableUtterance({
             <SpeakerBadgeEditor
               originalSpeaker={utterance.speaker}
               speakerLabels={speakerLabels}
+              suggestions={suggestions}
               onSave={onSaveSpeaker}
               canEdit={canEdit}
               onPickPerson={onPickPerson}

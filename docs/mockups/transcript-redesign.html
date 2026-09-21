@@ -1,0 +1,545 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Transcript page — redesign mockup</title>
+<style>
+  /* Tokens — copied from src/app/globals.css so the mockup is honest to the app. */
+  :root {
+    color-scheme: light;
+    --radius: 0.5rem;
+    --background: oklch(0.988 0.002 264);
+    --foreground: oklch(0.21 0.012 264);
+    --card: oklch(1 0 0);
+    --popover: oklch(1 0 0);
+    --primary: oklch(0.51 0.19 264);
+    --primary-foreground: oklch(0.99 0 0);
+    --muted: oklch(0.962 0.004 264);
+    --muted-foreground: oklch(0.51 0.015 264);
+    --accent: oklch(0.955 0.012 264);
+    --destructive: oklch(0.577 0.245 27.325);
+    --border: oklch(0.925 0.005 264);
+    --input: oklch(0.905 0.006 264);
+    --status-ok: oklch(0.63 0.17 150);
+    --status-busy: oklch(0.75 0.15 80);
+    --status-err: oklch(0.577 0.245 27.3);
+    --speaker-1: oklch(0.55 0.16 264);
+    --speaker-2: oklch(0.55 0.14 160);
+    --speaker-3: oklch(0.6 0.14 70);
+    --speaker-4: oklch(0.55 0.16 15);
+    --speaker-5: oklch(0.52 0.13 300);
+    --speaker-6: oklch(0.55 0.12 220);
+    --amber-text: oklch(0.55 0.13 70);
+    --amber-bg: oklch(0.97 0.03 80);
+    --amber-border: oklch(0.85 0.1 80);
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      color-scheme: dark;
+      --background: oklch(0.145 0 0);
+      --foreground: oklch(0.985 0 0);
+      --card: oklch(0.205 0 0);
+      --popover: oklch(0.205 0 0);
+      --primary: oklch(0.66 0.16 264);
+      --primary-foreground: oklch(0.15 0.02 264);
+      --muted: oklch(0.269 0 0);
+      --muted-foreground: oklch(0.708 0 0);
+      --accent: oklch(0.28 0.05 264);
+      --destructive: oklch(0.704 0.191 22.216);
+      --border: oklch(1 0 0 / 10%);
+      --input: oklch(1 0 0 / 15%);
+      --status-ok: oklch(0.72 0.16 150);
+      --status-busy: oklch(0.8 0.14 80);
+      --status-err: oklch(0.68 0.2 27.3);
+      --speaker-1: oklch(0.72 0.14 264);
+      --speaker-2: oklch(0.72 0.13 160);
+      --speaker-3: oklch(0.75 0.13 70);
+      --speaker-4: oklch(0.72 0.14 15);
+      --speaker-5: oklch(0.7 0.12 300);
+      --speaker-6: oklch(0.72 0.11 220);
+      --amber-text: oklch(0.8 0.13 80);
+      --amber-bg: oklch(0.3 0.05 70 / 40%);
+      --amber-border: oklch(0.6 0.12 80 / 50%);
+    }
+  }
+  :root[data-theme="dark"] {
+    color-scheme: dark;
+    --background: oklch(0.145 0 0);
+    --foreground: oklch(0.985 0 0);
+    --card: oklch(0.205 0 0);
+    --popover: oklch(0.205 0 0);
+    --primary: oklch(0.66 0.16 264);
+    --primary-foreground: oklch(0.15 0.02 264);
+    --muted: oklch(0.269 0 0);
+    --muted-foreground: oklch(0.708 0 0);
+    --accent: oklch(0.28 0.05 264);
+    --destructive: oklch(0.704 0.191 22.216);
+    --border: oklch(1 0 0 / 10%);
+    --input: oklch(1 0 0 / 15%);
+    --status-ok: oklch(0.72 0.16 150);
+    --status-busy: oklch(0.8 0.14 80);
+    --status-err: oklch(0.68 0.2 27.3);
+    --speaker-1: oklch(0.72 0.14 264);
+    --speaker-2: oklch(0.72 0.13 160);
+    --speaker-3: oklch(0.75 0.13 70);
+    --speaker-4: oklch(0.72 0.14 15);
+    --speaker-5: oklch(0.7 0.12 300);
+    --speaker-6: oklch(0.72 0.11 220);
+    --amber-text: oklch(0.8 0.13 80);
+    --amber-bg: oklch(0.3 0.05 70 / 40%);
+    --amber-border: oklch(0.6 0.12 80 / 50%);
+  }
+
+  * { box-sizing: border-box; border-color: var(--border); }
+  html, body { margin: 0; }
+  body { background: var(--background); color: var(--foreground); font: 14px/1.45 ui-sans-serif, -apple-system, "Segoe UI", Inter, Roboto, sans-serif; -webkit-font-smoothing: antialiased; }
+  .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-variant-numeric: tabular-nums; }
+  .tnum { font-variant-numeric: tabular-nums; }
+  .muted { color: var(--muted-foreground); }
+  .truncate { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
+  a { color: var(--primary); text-decoration: none; }
+  svg { width: 14px; height: 14px; flex: none; }
+  button { font: inherit; color: inherit; }
+
+  /* ---- header bar ---- */
+  .header { position: sticky; top: 0; z-index: 10; display: flex; align-items: center; gap: 10px; padding: 8px 24px; border-bottom: 1px solid var(--border); background: var(--card); }
+  .logo { display: inline-grid; place-items: center; width: 26px; height: 26px; border-radius: 7px; background: var(--primary); color: var(--primary-foreground); font-weight: 700; font-size: 12px; }
+  .crumb { display: flex; align-items: center; gap: 6px; min-width: 0; font-size: 13px; color: var(--muted-foreground); }
+  .crumb b { color: var(--foreground); font-weight: 600; }
+  .crumb .cur { color: var(--foreground); }
+  .spacer { flex: 1; }
+  .btn { display: inline-flex; align-items: center; gap: 6px; height: 32px; padding: 0 12px; border-radius: 6px; border: 1px solid var(--input); background: var(--card); font-size: 13px; font-weight: 500; cursor: pointer; white-space: nowrap; }
+  .btn.primary { background: var(--primary); color: var(--primary-foreground); border-color: transparent; }
+  .btn.ghost { border-color: transparent; background: transparent; color: var(--muted-foreground); }
+  .btn.sm { height: 28px; padding: 0 10px; font-size: 12px; }
+  .btn.xs { height: 24px; padding: 0 8px; font-size: 11px; }
+  .badge { display: inline-flex; align-items: center; gap: 4px; padding: 1px 6px; border: 1px solid var(--border); border-radius: 6px; font-size: 10px; white-space: nowrap; }
+  .badge.ok { border-color: color-mix(in oklch, var(--status-ok) 40%, transparent); background: color-mix(in oklch, var(--status-ok) 10%, transparent); color: var(--status-ok); }
+  .seg { display: inline-flex; padding: 2px; border-radius: 6px; background: var(--muted); }
+  .seg span { padding: 3px 8px; border-radius: 4px; font-size: 12px; color: var(--muted-foreground); }
+  .seg span.on { background: var(--card); color: var(--foreground); font-weight: 500; box-shadow: 0 1px 2px rgb(0 0 0 / 6%); }
+
+  main { max-width: 1240px; margin: 0 auto; padding: 16px 24px 64px; }
+  .intro { margin: 0 0 20px; padding: 12px 14px; border: 1px dashed var(--border); border-radius: 10px; font-size: 12.5px; color: var(--muted-foreground); }
+  .intro b { color: var(--foreground); font-weight: 600; }
+  .intro ol { margin: 6px 0 0; padding-left: 18px; }
+  .intro li { margin: 2px 0; }
+
+  /* ---- identity block ---- */
+  .identity { margin-bottom: 20px; }
+  .identity h1 { margin: 0 0 6px; font-size: 24px; font-weight: 600; letter-spacing: -.01em; line-height: 1.2; }
+  .line { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 10px; font-size: 12.5px; color: var(--muted-foreground); }
+  .line + .line { margin-top: 6px; }
+  .line .when { color: var(--foreground); font-weight: 500; }
+  .line .dur { font-variant-numeric: tabular-nums; }
+  .chip { display: inline-flex; align-items: center; gap: 4px; max-width: 220px; padding: 1px 8px; border-radius: 999px; border: 1px solid var(--border); font-size: 11px; white-space: nowrap; }
+  .chip.series { border-color: color-mix(in oklch, var(--primary) 25%, transparent); background: color-mix(in oklch, var(--primary) 5%, transparent); color: var(--primary); }
+  .chip.label i { width: 6px; height: 6px; border-radius: 999px; background: oklch(0.6 0.14 220); }
+  .chip.dashed { border-style: dashed; color: var(--muted-foreground); }
+  .person { display: inline-flex; align-items: center; gap: 6px; min-width: 0; font-size: 12px; color: var(--muted-foreground); }
+  .avatar { width: 18px; height: 18px; border-radius: 999px; display: inline-grid; place-items: center; font-size: 9px; font-weight: 600; color: color-mix(in oklch, var(--foreground) 80%, transparent); flex: none; }
+  .tag { padding: 0 4px; border: 1px solid var(--border); border-radius: 6px; font-size: 10px; color: var(--muted-foreground); }
+  .link { color: var(--primary); font-weight: 500; cursor: pointer; }
+  .right { margin-left: auto; }
+  .edited { display: inline-flex; align-items: center; gap: 6px; padding: 3px 8px; border: 1px solid var(--border); border-radius: 999px; font-size: 11px; color: var(--muted-foreground); }
+  .edited .avatar { width: 16px; height: 16px; font-size: 8px; }
+  .edited b { color: var(--foreground); font-weight: 500; }
+
+  /* ---- layout ---- */
+  .cols { display: grid; grid-template-columns: minmax(0, 1fr) 300px; gap: 32px; align-items: start; }
+  .main { min-width: 0; display: grid; gap: 20px; }
+  .rail { position: sticky; top: 64px; display: grid; gap: 16px; }
+  .card { border: 1px solid var(--border); border-radius: 10px; background: var(--card); box-shadow: 0 1px 2px rgb(0 0 0 / 4%); }
+  .card .hd { display: flex; align-items: center; gap: 8px; padding: 10px 16px 6px; font-size: 13px; font-weight: 600; }
+  .card .hd svg { color: var(--muted-foreground); }
+  .card .hd .n { padding: 1px 6px; border-radius: 999px; background: var(--muted); font-size: 11px; font-weight: 400; color: var(--muted-foreground); }
+  .card .bd { padding: 0 16px 16px; }
+  .rc { padding: 12px; }
+  .rc h4 { margin: 0 0 8px; font-size: 11px; font-weight: 600; letter-spacing: .06em; text-transform: uppercase; color: var(--muted-foreground); }
+
+  /* ---- player ---- */
+  .player { position: sticky; top: 56px; z-index: 5; display: grid; gap: 6px; padding: 8px 12px; border: 1px solid var(--border); border-radius: 10px; background: color-mix(in oklch, var(--card) 95%, transparent); backdrop-filter: blur(6px); box-shadow: 0 1px 2px rgb(0 0 0 / 4%); }
+  .player .now { font-size: 11px; color: var(--muted-foreground); }
+  .player .row { display: flex; align-items: center; gap: 10px; height: 40px; padding: 0 12px; border-radius: 999px; background: var(--muted); font-size: 13px; }
+  .player .track { flex: 1; height: 4px; border-radius: 999px; background: color-mix(in oklch, var(--foreground) 20%, transparent); }
+  .player .track i { display: block; width: 3%; height: 100%; border-radius: 999px; background: var(--foreground); }
+
+  /* ---- summary ---- */
+  .tabs { display: inline-flex; gap: 2px; padding: 2px; border-radius: 8px; background: color-mix(in oklch, var(--muted) 60%, transparent); font-size: 12px; margin-bottom: 12px; }
+  .tabs span { padding: 4px 10px; border-radius: 6px; color: var(--muted-foreground); font-weight: 500; }
+  .tabs span.on { background: var(--card); color: var(--foreground); box-shadow: 0 1px 2px rgb(0 0 0 / 6%); }
+  .prose { max-width: 75ch; font-size: 14px; }
+  .prose h3 { margin: 14px 0 6px; font-size: 15px; }
+  .prose h4 { margin: 12px 0 4px; font-size: 14px; }
+  .prose p, .prose li { margin: 0 0 6px; }
+  .prose ul { padding-left: 20px; margin: 0; }
+  .t { display: inline-flex; align-items: center; gap: 3px; padding: 0 6px; border-radius: 5px; background: color-mix(in oklch, var(--primary) 8%, transparent); color: var(--primary); font-size: 12px; font-variant-numeric: tabular-nums; }
+  .t svg { width: 10px; height: 10px; }
+  .foot { display: flex; align-items: center; gap: 8px; margin-top: 14px; padding-top: 10px; border-top: 1px solid var(--border); font-size: 11px; color: var(--muted-foreground); }
+
+  /* ---- people ---- */
+  .voices { display: grid; grid-template-columns: 1fr 1fr; gap: 2px 24px; }
+  .voice { display: flex; align-items: center; gap: 8px; min-height: 28px; padding: 2px 8px; border-radius: 6px; }
+  .voice:hover { background: color-mix(in oklch, var(--muted) 60%, transparent); }
+  .voice:hover .pen { opacity: 1; }
+  .dot { width: 10px; height: 10px; border-radius: 999px; flex: none; }
+  .voice .nm { font-size: 14px; font-weight: 500; min-width: 0; }
+  .voice .nm.guess { color: var(--primary); }
+  .voice .nm.unknown { font-style: italic; color: var(--muted-foreground); font-weight: 400; }
+  .voice .nm.group { color: var(--muted-foreground); font-weight: 400; display: inline-flex; align-items: center; gap: 5px; }
+  .voice .lines { font-family: ui-monospace, Menlo, monospace; font-size: 11px; color: var(--muted-foreground); white-space: nowrap; }
+  .voice .why { display: inline-flex; align-items: center; gap: 4px; font-size: 11px; color: var(--muted-foreground); min-width: 0; }
+  .voice .why svg { width: 11px; height: 11px; color: var(--primary); }
+  .confirm { display: inline-flex; align-items: center; height: 22px; padding: 0 7px; border-radius: 5px; border: 1px solid color-mix(in oklch, var(--primary) 35%, transparent); background: transparent; color: var(--primary); font-size: 11px; cursor: pointer; white-space: nowrap; }
+  .confirm:hover { background: color-mix(in oklch, var(--primary) 8%, transparent); }
+  .name { display: inline-flex; align-items: center; height: 22px; padding: 0 7px; border-radius: 5px; border: 1px dashed var(--border); background: transparent; color: var(--muted-foreground); font-size: 11px; cursor: pointer; }
+  .pen { margin-left: auto; opacity: 0; display: inline-grid; place-items: center; width: 22px; height: 22px; border-radius: 5px; border: 0; background: transparent; color: var(--muted-foreground); cursor: pointer; }
+  .pen svg { width: 12px; height: 12px; }
+  .sub { display: flex; align-items: baseline; gap: 8px; margin: 14px 0 6px; font-size: 11px; font-weight: 600; letter-spacing: .06em; text-transform: uppercase; color: var(--muted-foreground); }
+  .sub small { text-transform: none; letter-spacing: 0; font-weight: 400; }
+  .invited { display: flex; flex-wrap: wrap; gap: 6px 14px; }
+  .invited .person { font-size: 12.5px; color: var(--foreground); }
+  .invited .person .spoke { width: 6px; height: 6px; border-radius: 999px; background: var(--status-ok); }
+
+  /* ---- transcript ---- */
+  .utt { display: grid; grid-template-columns: 56px 1fr; gap: 10px; padding: 4px 0; }
+  .utt .ts { font-family: ui-monospace, Menlo, monospace; font-size: 11px; color: var(--muted-foreground); padding-top: 3px; }
+  .utt .sp { font-size: 12px; font-weight: 600; margin-bottom: 1px; }
+  .utt .sp small { font-weight: 400; color: var(--muted-foreground); font-size: 10px; margin-left: 4px; }
+  .utt .tx { font-size: 14px; }
+  .utt.now .tx { background: color-mix(in oklch, var(--primary) 6%, transparent); border-radius: 4px; }
+  .heading { display: flex; align-items: center; gap: 8px; padding: 18px 0 6px; font-size: 13px; font-weight: 600; }
+  .heading .ts { font-family: ui-monospace, Menlo, monospace; font-size: 11px; font-weight: 400; color: var(--muted-foreground); }
+  .heading .rule { flex: 1; height: 1px; background: var(--border); }
+
+  /* ---- rail cards ---- */
+  .fact { display: flex; align-items: flex-start; gap: 8px; font-size: 12px; }
+  .fact svg { margin-top: 2px; color: var(--muted-foreground); }
+  .fact b { font-weight: 500; }
+  .facts { margin: 4px 0 0 22px; font-size: 11px; color: var(--muted-foreground); }
+  .disc { display: inline-flex; align-items: center; gap: 3px; margin: 8px 0 0 22px; background: none; border: 0; padding: 0; font-size: 11px; color: var(--muted-foreground); cursor: pointer; }
+  .disc svg { width: 11px; height: 11px; }
+  .segs { margin: 6px 0 0 22px; padding: 6px 8px; border: 1px solid var(--border); border-radius: 6px; background: color-mix(in oklch, var(--muted) 30%, transparent); font-size: 11px; }
+  .segs .s { display: grid; grid-template-columns: 14px 44px 1fr; gap: 6px; line-height: 1.6; font-variant-numeric: tabular-nums; }
+  .segs .s span:first-child { color: var(--muted-foreground); }
+  .segs p { margin: 6px 0 0; color: var(--muted-foreground); line-height: 1.35; }
+  .outline { display: grid; gap: 2px; font-size: 12px; }
+  .outline a { display: flex; gap: 8px; padding: 3px 6px; border-radius: 5px; color: var(--foreground); }
+  .outline a.on { background: color-mix(in oklch, var(--primary) 8%, transparent); color: var(--primary); }
+  .outline a .ts { font-family: ui-monospace, Menlo, monospace; font-size: 11px; color: var(--muted-foreground); width: 40px; }
+  .src { display: grid; gap: 6px; font-size: 12px; }
+  .src .fact span { min-width: 0; }
+  .note { margin-top: 8px; padding: 6px 8px; border: 1px solid var(--amber-border); border-radius: 6px; background: var(--amber-bg); color: var(--amber-text); font-size: 11px; line-height: 1.35; }
+  .plain { margin-top: 8px; font-size: 11px; line-height: 1.35; color: var(--muted-foreground); }
+  .qa { display: grid; gap: 4px; }
+  .qa .btn { justify-content: flex-start; width: 100%; }
+
+  /* ---- the edit dialog (static) ---- */
+  .dialog { width: 100%; max-width: 760px; margin: 12px 0 0; padding: 16px; border: 1px solid var(--border); border-radius: 12px; background: var(--popover); box-shadow: 0 8px 30px -6px rgb(0 0 0 / 18%), 0 1px 2px rgb(0 0 0 / 4%); }
+  .dialog h3 { display: flex; align-items: center; gap: 8px; margin: 0 0 2px; font-size: 15px; }
+  .dialog .desc { margin: 0 0 12px; font-size: 12px; color: var(--muted-foreground); }
+  .pager { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 8px; border: 1px solid var(--border); border-radius: 8px; background: color-mix(in oklch, var(--muted) 30%, transparent); font-size: 13px; }
+  .pager .pill { padding: 1px 8px; border-radius: 6px; background: var(--primary); color: var(--primary-foreground); font-size: 11px; font-weight: 600; }
+  .form { display: grid; grid-template-columns: 1fr 2fr; gap: 10px; margin-top: 10px; }
+  .field { display: flex; align-items: center; gap: 8px; height: 36px; padding: 0 10px; border: 1px solid var(--input); border-radius: 6px; background: var(--card); font-size: 14px; }
+  .field.guess { border-color: color-mix(in oklch, var(--primary) 45%, transparent); box-shadow: 0 0 0 3px color-mix(in oklch, var(--primary) 10%, transparent); }
+  .field .gtag { padding: 0 5px; border-radius: 4px; background: color-mix(in oklch, var(--primary) 12%, transparent); color: var(--primary); font-size: 10px; font-weight: 600; letter-spacing: .04em; text-transform: uppercase; }
+  .field .caret { width: 1px; height: 18px; background: var(--foreground); animation: blink 1s steps(2) infinite; }
+  @keyframes blink { 50% { opacity: 0 } }
+  .textarea { min-height: 56px; padding: 8px 10px; border: 1px solid var(--input); border-radius: 6px; background: var(--card); font-size: 13px; color: var(--muted-foreground); }
+  .caption { display: flex; align-items: center; gap: 6px; margin-top: 6px; font-size: 11px; color: var(--muted-foreground); }
+  .caption svg { width: 11px; height: 11px; color: var(--primary); }
+  .caption .btn { margin-left: auto; }
+  .snip { margin-top: 12px; padding: 10px; border: 1px solid var(--border); border-radius: 8px; }
+  .snip .u { padding: 6px 8px; border-radius: 6px; font-size: 13px; }
+  .snip .u.focus { background: var(--amber-bg); box-shadow: inset 0 0 0 1px var(--amber-border); font-weight: 500; }
+  .snip .u .m { display: flex; gap: 8px; align-items: baseline; margin-bottom: 2px; font-size: 11px; color: var(--muted-foreground); }
+  .snip .u .m b { font-weight: 600; color: var(--foreground); }
+
+  .caption-h { margin: 28px 0 8px; font-size: 12px; color: var(--muted-foreground); }
+  .caption-h b { color: var(--foreground); }
+
+  .phone-only { display: none; }
+  @media (max-width: 960px) {
+    .cols { grid-template-columns: minmax(0, 1fr); }
+    .rail { position: static; }
+    .voices { grid-template-columns: 1fr; }
+    .form { grid-template-columns: 1fr; }
+  }
+  @media (max-width: 640px) {
+    body { overflow-x: hidden; }
+    main { padding: 12px 16px 48px; }
+    .header { padding: 8px 16px; gap: 6px; }
+    .header .hide-sm { display: none; }
+    .identity h1 { font-size: 20px; }
+    .right { margin-left: 0; }
+    .player { top: 52px; }
+    .utt { grid-template-columns: 44px 1fr; gap: 6px; }
+    .phone-only { display: inline-flex; }
+  }
+</style>
+</head>
+<body>
+
+<svg width="0" height="0" style="position:absolute" aria-hidden="true">
+  <defs>
+    <symbol id="i-laptop" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 16V7a2 2 0 0 0-2-2H6a2 2 0 0 0-2 2v9m16 0H4m16 0 1.28 2.55a1 1 0 0 1-.9 1.45H3.62a1 1 0 0 1-.9-1.45L4 16"/></symbol>
+    <symbol id="i-sparkles" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9.9 2.6 11.5 7a1 1 0 0 0 .6.6l4.4 1.6a1 1 0 0 1 0 1.9L12.1 12.7a1 1 0 0 0-.6.6l-1.6 4.4a1 1 0 0 1-1.9 0L6.4 13.3a1 1 0 0 0-.6-.6L1.4 11.1a1 1 0 0 1 0-1.9L5.8 7.6a1 1 0 0 0 .6-.6l1.6-4.4a1 1 0 0 1 1.9 0Z"/><path d="M20 3v4"/><path d="M22 5h-4"/></symbol>
+    <symbol id="i-pencil" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21.2 6.4a2 2 0 0 0 0-2.8l-.8-.8a2 2 0 0 0-2.8 0L4 16.4V20h3.6z"/><path d="m15 5 4 4"/></symbol>
+    <symbol id="i-check" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></symbol>
+    <symbol id="i-chevd" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m6 9 6 6 6-6"/></symbol>
+    <symbol id="i-chevu" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m18 15-6-6-6 6"/></symbol>
+    <symbol id="i-chevl" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m15 18-6-6 6-6"/></symbol>
+    <symbol id="i-chevr" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m9 18 6-6-6-6"/></symbol>
+    <symbol id="i-play" viewBox="0 0 24 24" fill="currentColor"><path d="M6 4l14 8-14 8z"/></symbol>
+    <symbol id="i-film" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="18" height="18" x="3" y="3" rx="2"/><path d="M7 3v18"/><path d="M3 7.5h4"/><path d="M3 12h18"/><path d="M3 16.5h4"/><path d="M17 3v18"/><path d="M17 7.5h4"/><path d="M17 16.5h4"/></symbol>
+    <symbol id="i-users" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M22 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></symbol>
+    <symbol id="i-user" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M19 21v-2a4 4 0 0 0-4-4H9a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></symbol>
+    <symbol id="i-headphones" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 14h3a2 2 0 0 1 2 2v3a2 2 0 0 1-2 2H3z"/><path d="M21 14h-3a2 2 0 0 0-2 2v3a2 2 0 0 0 2 2h3z"/><path d="M3 14v-3a9 9 0 0 1 18 0v3"/></symbol>
+    <symbol id="i-list" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12h-8"/><path d="M21 6H8"/><path d="M21 18h-8"/><path d="M3 6v4c0 1.1.9 2 2 2h3"/><path d="M3 10v6c0 1.1.9 2 2 2h3"/></symbol>
+    <symbol id="i-clip" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m21.44 11.05-9.19 9.19a6 6 0 0 1-8.49-8.49l8.57-8.57A4 4 0 1 1 18 8.84l-8.59 8.57a2 2 0 0 1-2.83-2.83l8.49-8.48"/></symbol>
+    <symbol id="i-sun" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="12" cy="12" r="4"/><path d="M12 2v2m0 16v2M4.9 4.9l1.4 1.4m11.4 11.4 1.4 1.4M2 12h2m16 0h2M4.9 19.1l1.4-1.4m11.4-11.4 1.4-1.4"/></symbol>
+    <symbol id="i-dots" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="12" cy="12" r="1"/><circle cx="19" cy="12" r="1"/><circle cx="5" cy="12" r="1"/></symbol>
+    <symbol id="i-eye" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M2 12s3-7 10-7 10 7 10 7-3 7-10 7-10-7-10-7Z"/><circle cx="12" cy="12" r="3"/></symbol>
+    <symbol id="i-mic-off" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="2" x2="22" y1="2" y2="22"/><path d="M18.89 13.23A7.12 7.12 0 0 0 19 12v-2"/><path d="M5 10v2a7 7 0 0 0 12 5"/><path d="M15 9.34V5a3 3 0 0 0-5.68-1.33"/><path d="M9 9v3a3 3 0 0 0 5.12 2.12"/><line x1="12" x2="12" y1="19" y2="22"/></symbol>
+    <symbol id="i-mic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3Z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/><line x1="12" x2="12" y1="19" y2="22"/></symbol>
+    <symbol id="i-finger" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 10a2 2 0 0 0-2 2c0 1.02-.1 2.51-.26 4"/><path d="M14 13.12c0 2.38 0 6.38-1 8.88"/><path d="M17.29 21.02c.12-.6.43-2.3.5-3.02"/><path d="M2 12a10 10 0 0 1 18-6"/><path d="M2 16h.01"/><path d="M21.8 16c.2-2 .131-5.354 0-6"/><path d="M5 19.5C5.5 18 6 15 6 12a6 6 0 0 1 .34-2"/><path d="M8.65 22c.21-.66.45-1.32.57-2"/><path d="M9 6.8a6 6 0 0 1 9 5.2v2"/></symbol>
+    <symbol id="i-wave" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M2 13a2 2 0 0 0 2-2V7a2 2 0 0 1 4 0v13a2 2 0 0 0 4 0V4a2 2 0 0 1 4 0v13a2 2 0 0 0 4 0v-4a2 2 0 0 1 2-2"/></symbol>
+    <symbol id="i-file-text" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M15 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V7Z"/><path d="M14 2v4a2 2 0 0 0 2 2h4"/><path d="M10 9H8"/><path d="M16 13H8"/><path d="M16 17H8"/></symbol>
+    <symbol id="i-calendar" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M8 2v4"/><path d="M16 2v4"/><rect width="18" height="18" x="3" y="4" rx="2"/><path d="M3 10h18"/></symbol>
+    <symbol id="i-repeat" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m17 2 4 4-4 4"/><path d="M3 11v-1a4 4 0 0 1 4-4h14"/><path d="m7 22-4-4 4-4"/><path d="M21 13v1a4 4 0 0 1-4 4H3"/></symbol>
+    <symbol id="i-plus" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M5 12h14"/><path d="M12 5v14"/></symbol>
+    <symbol id="i-share" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M22 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></symbol>
+    <symbol id="i-pin" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 13v8"/><path d="M4 16.5A5.5 5.5 0 0 1 8 6h1.4A6.5 6.5 0 0 1 22 8.5a5 5 0 0 1-2 9.5"/><path d="m8 17 4-4 4 4"/></symbol>
+  </defs>
+</svg>
+
+<div class="header">
+  <span class="logo">D</span>
+  <span class="crumb"><b>Darth Meetings</b> <span class="hide-sm">› Archive ›</span> <span class="cur truncate" style="max-width:260px">Hypercare - PGLS Trames Go Live Su…</span></span>
+  <span class="spacer"></span>
+  <span class="badge hide-sm">Shared — Editor</span>
+  <span class="badge ok hide-sm"><svg width="10" height="10"><use href="#i-check"/></svg> Offline: audio</span>
+  <span class="seg"><span><svg style="width:11px;height:11px;vertical-align:-1px"><use href="#i-eye"/></svg> Raw</span><span class="on"><svg style="width:11px;height:11px;vertical-align:-1px"><use href="#i-pencil"/></svg> Edited</span></span>
+  <button class="btn primary sm"><svg><use href="#i-share"/></svg> <span class="hide-sm">Share</span></button>
+  <button class="btn ghost sm"><svg><use href="#i-dots"/></svg></button>
+  <button class="btn ghost sm" id="theme" title="Toggle theme"><svg><use href="#i-sun"/></svg></button>
+</div>
+
+<main>
+  <div class="intro">
+    <b>Transcript page redesign — mockup, 21 Sept 2026.</b> The Hypercare row as it is in prod, with the People card caught mid-review so every speaker state shows. In the order you will notice:
+    <ol>
+      <li><b>Identity block answers "what meeting is this".</b> Title; <i>when</i> in 24-hour time from the calendar invite; <i>who</i> as people — organizer, 37 invited, 6 voices. No source chip, no filename, no bare <code>ID</code>.</li>
+      <li><b>People replaces Speakers + About's invitee list.</b> Each voice shows its state: confirmed, <span style="color:var(--primary)">guessed?</span> with one-click Confirm, unknown with <i>Name…</i>, and <i>Several voices · shared mic</i> for the label typed as <code>mixed</code> — never listed as a person, never counted.</li>
+      <li><b>The pencil keeps the guess.</b> The Identify-speakers dialog (rendered below the page) opens pre-filled with <i>Yan-Simon Saragih</i>, tagged GUESS, with the evidence and a <b>Confirm guess</b> button. Today it opens on "Set a name".</li>
+      <li><b>One Recording block in the rail</b> replaces SOURCE / AUDIO / VIDEO / "Recorded in 8 segments": <i>Recorded on Atira's Mac with Darth Recorder · 8 segments · 56m 45s · 618 MB · video</i>, segments behind a disclosure. Filenames only in tooltips.</li>
+      <li><b>Language lives with the transcription</b> (Sources), with the nuance sentence — not as a row of its own.</li>
+    </ol>
+  </div>
+
+  <!-- ============ identity block ============ -->
+  <section class="identity">
+    <h1>Hypercare - PGLS Trames Go Live Support OKI - Perawang</h1>
+    <div class="line">
+      <span class="when" title="From the calendar invite · about 2 hours ago">Mon 21 Sep 2026 · 16:30–17:30</span>
+      <span class="dur">· 56m 45s</span>
+      <span class="chip series"><svg><use href="#i-repeat"/></svg> Hypercare - PGLS Trames Go Live…</span>
+      <span class="chip label"><i></i> Hypercare</span>
+      <span class="chip dashed"><svg style="width:11px;height:11px"><use href="#i-plus"/></svg> Label</span>
+      <span class="right edited"><span class="avatar" style="background:oklch(from var(--muted) l 0.06 120)">AT</span> Edited by <b>Atira</b> · 2 h ago</span>
+    </div>
+    <div class="line">
+      <span class="person" title="Antonius Hariyanto · antonius_hariyanto@app.co.id"><span class="avatar" style="background:oklch(from var(--muted) l 0.06 30)">AH</span> Antonius <span class="tag">organizer</span></span>
+      <span>·</span>
+      <a href="#people"><b style="font-weight:500">37 invited</b></a>
+      <span>·</span>
+      <a href="#people"><b style="font-weight:500">6 voices</b></a>
+    </div>
+  </section>
+
+  <div class="cols">
+    <!-- ============ main column ============ -->
+    <div class="main">
+      <div class="player">
+        <div class="now">Now: ONE Ship-To address rejections</div>
+        <div class="row"><svg><use href="#i-play"/></svg><span class="tnum">0:00 / 56:44</span><span class="track"><i></i></span><span class="muted">🔊</span></div>
+        <div><button class="btn xs"><svg><use href="#i-film"/></svg> Show video</button></div>
+      </div>
+
+      <div class="card">
+        <div class="hd"><svg style="color:var(--primary)"><use href="#i-sparkles"/></svg> Summary <span class="right"><svg><use href="#i-chevu"/></svg></span></div>
+        <div class="bd">
+          <div class="tabs"><span class="on">Detailed report</span><span>Summary</span></div>
+          <div class="prose">
+            <h3>Summary</h3>
+            <p>Daily operations sync between Trames and APP on booking status. Eight bookings were created today, mostly MSC. The main issue was ONE (ONEY) rejecting bookings because the Ship-To address pulled from SAP is incomplete (e.g. just "Peru", "Bogota", or a Miami/USA address for a Peru destination). The team agreed on a manual re-initiate workaround in Trames while pushing CS to fix the source data in SAP.</p>
+            <h3>Key Points</h3>
+            <h4>ONE Ship-To address rejections</h4>
+            <ul>
+              <li><b>Atira Sarat</b> explained ONE cannot approve bookings because the Ship-To address is missing street name, postcode and other details — the Ship-To entity name itself is correct.</li>
+              <li><b>Yan-Simon Saragih</b> noted that in ONE's own web booking the address auto-populates from master data and does <i>not</i> match what Trames sends from SAP.</li>
+              <li><b>Ping Ping</b> pressed the point that CS must input full addresses, not abbreviations, or bookings will keep failing.</li>
+              <li><b>Anton</b> confirmed at <span class="t"><svg><use href="#i-play"/></svg>43:39</span> that Ship-To is fine but the Ship-To <i>address value</i> from SAP is wrong.</li>
+            </ul>
+          </div>
+          <div class="foot">Copy · Regenerate <span class="right">generated 2 hours ago · $0.84 · 114s</span></div>
+        </div>
+      </div>
+
+      <!-- ============ People — READ state ============ -->
+      <div class="card" id="people">
+        <div class="hd"><svg><use href="#i-users"/></svg> People <span class="n">6 voices · 37 invited</span> <span class="right"><button class="confirm"><svg style="width:11px;height:11px;margin-right:4px"><use href="#i-sparkles"/></svg>Guess names</button></span></div>
+        <div class="bd">
+          <div class="sub">Voices <small>6 · who spoke, by voice</small></div>
+          <div class="voices">
+            <div class="voice"><span class="dot" style="background:var(--speaker-1)"></span><span class="nm truncate">Atira Sarat</span><span class="lines">· 78 lines</span><button class="pen" title="Edit name & context"><svg><use href="#i-pencil"/></svg></button></div>
+            <div class="voice"><span class="dot" style="background:var(--speaker-2)"></span><span class="nm truncate">Anton</span><span class="lines">· 41 lines</span><button class="pen"><svg><use href="#i-pencil"/></svg></button></div>
+            <div class="voice"><span class="dot" style="background:var(--speaker-3)"></span><span class="nm guess truncate">Yan-Simon Saragih?</span><span class="lines">· 64 lines</span><span class="why" title="Addressed constantly as 'Pak Simon' and replies each time; Teams tile reads 'Yan-Simon Saragih'"><svg><use href="#i-sparkles"/></svg>from the transcript</span><button class="confirm">Confirm</button><button class="pen"><svg><use href="#i-pencil"/></svg></button></div>
+            <div class="voice"><span class="dot" style="background:var(--speaker-4)"></span><span class="nm group truncate" title="Labelled “mixed” — a shared room mic, not a person"><svg style="width:12px;height:12px"><use href="#i-mic-off"/></svg>Several voices · shared mic</span><span class="lines">· 22 lines</span><button class="pen"><svg><use href="#i-pencil"/></svg></button></div>
+            <div class="voice"><span class="dot" style="background:var(--speaker-5)"></span><span class="nm guess truncate">Muhammad Adji Rizqi Ramadhan?</span><span class="lines">· 9 lines</span><span class="why" title="86% voice match — a hint, not proof"><svg><use href="#i-finger"/></svg>86% voice</span><button class="confirm">Confirm</button><button class="pen"><svg><use href="#i-pencil"/></svg></button></div>
+            <div class="voice"><span class="dot" style="background:var(--speaker-6)"></span><span class="nm unknown truncate">Speaker F</span><span class="lines">· 5 lines</span><button class="name">Name…</button><button class="pen"><svg><use href="#i-pencil"/></svg></button></div>
+          </div>
+
+          <div class="sub">Invited <small>37 · from the calendar invite</small></div>
+          <div class="invited">
+            <span class="person" title="Antonius Hariyanto · antonius_hariyanto@app.co.id"><span class="avatar" style="background:oklch(from var(--muted) l 0.06 30)">AH</span>Antonius <span class="tag">organizer</span></span>
+            <span class="person" title="Atira Sarat · atira.sarat@trames.sg · spoke"><span class="avatar" style="background:oklch(from var(--muted) l 0.06 120)">AS</span>Atira <i class="spoke" title="spoke"></i></span>
+            <span class="person" title="Ivan Seow · ivan@trames.sg"><span class="avatar" style="background:oklch(from var(--muted) l 0.06 200)">IS</span>Ivan</span>
+            <span class="person" title="Ka Wen Koh · kawen.koh@trames.sg"><span class="avatar" style="background:oklch(from var(--muted) l 0.06 260)">KK</span>Ka Wen</span>
+            <span class="person" title="Alok Rajiv · alok@trames.sg"><span class="avatar" style="background:oklch(from var(--muted) l 0.06 300)">AR</span>Alok</span>
+            <span class="person" title="Aniq Danial · aniq.danial@trames.sg"><span class="avatar" style="background:oklch(from var(--muted) l 0.06 20)">AD</span>Aniq</span>
+            <span class="person" title="Agustian Agustian · agustian_agustian@app.co.id"><span class="avatar" style="background:oklch(from var(--muted) l 0.06 80)">AA</span>Agustian</span>
+            <span class="person" title="Benny Hendrawan · benny_hendrawan@app.co.id"><span class="avatar" style="background:oklch(from var(--muted) l 0.06 340)">BH</span>Benny</span>
+            <span class="person" title="Cynthia Kumala Dewi · cynthia_dewi@app.co.id"><span class="avatar" style="background:oklch(from var(--muted) l 0.06 160)">CD</span>Cynthia</span>
+            <span class="person" title="Daniel Ivan Sastradiputra · daniel_i_sastradiputra@app.co.id"><span class="avatar" style="background:oklch(from var(--muted) l 0.06 220)">DS</span>Daniel</span>
+            <a class="link" style="font-size:12px">+27 more</a>
+          </div>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="hd"><svg><use href="#i-headphones"/></svg> Transcript <span class="right"><svg><use href="#i-chevu"/></svg></span></div>
+        <div class="bd">
+          <div class="heading"><span class="ts">0:15</span> Booking status &amp; ONE rejections <span class="rule"></span></div>
+          <div class="utt now"><span class="ts">0:15</span><div><div class="sp" style="color:var(--speaker-1)">Atira Sarat <small>(Speaker A)</small></div><div class="tx">Ok, jadi kita mulai dengan booking seperti biasa. Hari ini ada 8 booking yang dibuat, tidak terlalu banyak. Tapi kebanyakan adalah MSC. Jadi untuk MSC, saya akan mulai dengan booking hari ini dulu…</div></div></div>
+          <div class="utt"><span class="ts">1:02</span><div><div class="sp" style="color:var(--speaker-3)">Yan-Simon Saragih? <small>(Speaker C · guess)</small></div><div class="tx">Untuk ONEY, masalah saat ini adalah ONEY tidak dapat mengesahkan booking-nya kami karena dengan alamat shipped to.</div></div></div>
+          <div class="utt"><span class="ts">1:20</span><div><div class="sp" style="color:var(--speaker-1)">Atira Sarat</div><div class="tx">Jadi, tidak seperti nama jalan, kode poster, semua detail itu masih hilang.</div></div></div>
+          <div class="utt"><span class="ts">4:41</span><div><div class="sp" style="color:var(--speaker-4)">Several voices <small>(Speaker D · shared mic)</small></div><div class="tx">Kalo hari kanan-kiri, yang ini bener gak? Seat 2-nya namanya ini?</div></div></div>
+          <div class="utt"><span class="ts">4:52</span><div><div class="sp" style="color:var(--speaker-2)">Anton</div><div class="tx">Ini dia di sini keliatan ga nih, BIC siapa itu? You can show us the BIC one, who created this booking?</div></div></div>
+        </div>
+      </div>
+    </div>
+
+    <!-- ============ rail ============ -->
+    <aside class="rail">
+      <div class="card rc">
+        <h4>Outline</h4>
+        <div class="outline">
+          <a><span class="ts">0:00</span> Summary</a>
+          <a><span class="ts">0:00</span> People</a>
+          <a class="on"><span class="ts">0:15</span> Booking status &amp; ONE rejections</a>
+          <a><span class="ts">18:40</span> SAP address source data</a>
+          <a><span class="ts">31:05</span> Manual re-initiate workaround</a>
+          <a><span class="ts">43:39</span> Ship-To value confirmation</a>
+        </div>
+      </div>
+
+      <div class="card rc">
+        <h4>Recording</h4>
+        <div class="fact"><svg><use href="#i-laptop"/></svg><span><b>Recorded on Atira’s Mac</b> with Darth Recorder</span></div>
+        <div class="facts tnum">8 segments · 56m 45s · 618 MB · video</div>
+        <button class="disc">Segments <svg><use href="#i-chevu"/></svg></button>
+        <div class="segs">
+          <div class="s" title="2026-09-21 16.36.41 teams part1.mp4"><span>1</span><span>0:00</span><span>7m 12s</span></div>
+          <div class="s" title="2026-09-21 16.36.41 teams part2.mp4"><span>2</span><span>7:12</span><span>2m 03s</span></div>
+          <div class="s"><span>3</span><span>9:15</span><span>11m 40s</span></div>
+          <div class="s"><span>4</span><span>20:55</span><span>4m 21s</span></div>
+          <div class="s"><span>5</span><span>25:16</span><span>9m 08s</span></div>
+          <div class="s"><span>6</span><span>34:24</span><span>6m 50s</span></div>
+          <div class="s"><span>7</span><span>41:14</span><span>12m 02s</span></div>
+          <div class="s"><span>8</span><span>53:16</span><span>3m 29s</span></div>
+          <p>Darth Recorder starts a new segment on every screen-share change. They were joined in order into one recording before transcription, and the AI is told where the joins are.</p>
+        </div>
+      </div>
+
+      <div class="card rc">
+        <h4>Sources</h4>
+        <div class="src">
+          <div class="fact"><svg><use href="#i-file-text"/></svg><span><b>Voice-level diarization</b> <span class="muted">— speakers separated acoustically from the audio</span></span></div>
+          <div class="fact"><svg><use href="#i-finger"/></svg><span><b>Voiceprint: 4 speakers matched</b> <span class="muted">(Atira Sarat 67%, Anton 76%, Muhammad Adji Rizqi Ramadhan 86%, Luciana 65%)</span></span></div>
+          <div class="fact"><svg><use href="#i-wave"/></svg><span><b>Meet-timeline match: 1 speaker</b> <span class="muted">(Yan-Simon Saragih 85%)</span></span></div>
+        </div>
+        <p class="plain">Transcribed in Indonesian (auto-detected) by AssemblyAI Universal-2 — Universal-3.5 Pro was asked for but does not support Indonesian yet, so AssemblyAI fell back.</p>
+        <div class="note">Mixed-language calls come out in the detected language; English stretches may read as translations. Not fixable with a re-run today — see Advanced details.</div>
+        <button class="disc" style="margin-left:0">Advanced details <svg><use href="#i-chevd"/></svg></button>
+        <p class="plain" style="font-size:10px">Summaries and name guesses automatically use everything listed here.</p>
+      </div>
+
+      <div class="card rc">
+        <h4>Attachments</h4>
+        <p class="plain" style="margin:0">No attached context yet. <a class="link">Attach a deck or document…</a></p>
+      </div>
+
+      <div class="card rc">
+        <h4>Quick actions</h4>
+        <div class="qa">
+          <button class="btn sm"><svg><use href="#i-sparkles"/></svg> Regenerate summary &amp; report</button>
+          <button class="btn sm"><svg><use href="#i-pin"/></svg> Save for offline</button>
+          <button class="btn sm"><svg><use href="#i-calendar"/></svg> Link to a calendar event…</button>
+        </div>
+      </div>
+    </aside>
+  </div>
+
+  <!-- ============ People — EDIT state (the Identify-speakers dialog, opened from Speaker C's pencil) ============ -->
+  <p class="caption-h"><b>Edit state.</b> What opens when the pencil on <i>Yan-Simon Saragih?</i> is clicked. The guess is pre-filled and tagged; confirming is one click; typing replaces it. Today this opens on “Set a name”.</p>
+  <div class="dialog">
+    <h3><svg><use href="#i-headphones"/></svg> Identify speakers <span class="badge">3 / 6</span></h3>
+    <p class="desc">Cycle through each speaker, hear their distinctive moments, and set their name + context — all from here.</p>
+    <div class="pager">
+      <button class="btn sm"><svg><use href="#i-chevl"/></svg></button>
+      <span><span class="pill">Speaker C</span> &nbsp;<b>Yan-Simon Saragih</b> <span class="muted" style="font-size:12px">· 64 lines</span></span>
+      <button class="btn sm"><svg><use href="#i-chevr"/></svg></button>
+    </div>
+    <div class="form">
+      <div>
+        <div class="field guess"><span class="gtag">Guess</span><span>Yan-Simon Saragih</span><span class="caret"></span><svg style="margin-left:auto;color:var(--muted-foreground)"><use href="#i-pencil"/></svg></div>
+        <div class="caption"><svg><use href="#i-sparkles"/></svg><span class="truncate" title="Addressed constantly as 'Pak Simon' ('Pak Simon, boleh buka Tramesnya nggak?') and replies each time; Teams tile reads 'Yan-Simon Saragih'">guessed from the transcript — addressed as ‘Pak Simon’; Teams tile reads ‘Yan-Simon Saragih’</span><button class="btn primary xs"><svg style="width:11px;height:11px"><use href="#i-check"/></svg> Confirm guess</button></div>
+      </div>
+      <div class="textarea">Context (role, voice, who they are — optional)</div>
+    </div>
+    <div class="snip">
+      <div class="muted" style="font-size:11px;margin-bottom:6px">Snippet 1 of 5</div>
+      <div class="u"><div class="m"><b>Atira Sarat</b> 27:58</div>Pak Simon, boleh buka Tramesnya nggak?</div>
+      <div class="u focus"><div class="m"><b>Yan-Simon Saragih</b> 28:04</div>Ah Simon, semuanya sama seperti itu, alamatnya dari SAP. Di ONE web booking alamatnya auto-populate dari master data, jadi tidak match dengan yang dikirim Trames.</div>
+      <div class="u"><div class="m"><b>Anton</b> 28:41</div>Jadi datanya dari CS, bukan dari tim Simon.</div>
+    </div>
+    <div class="row" style="display:flex;align-items:center;gap:8px;margin-top:10px"><button class="btn primary sm"><svg><use href="#i-play"/></svg></button><span class="track" style="flex:1;height:4px;border-radius:999px;background:var(--muted)"></span><button class="btn xs"><svg><use href="#i-film"/></svg> Show video</button><span class="muted" style="font-size:11px">starts at <span class="mono">28:04</span></span></div>
+  </div>
+
+  <p class="caption-h"><b>The same edit surface for the shared-mic label.</b> Speaker D was saved as <code>mixed</code>: the form shows what was typed, says what it means, and the server will not enrol it as a voiceprint.</p>
+  <div class="dialog" style="max-width:520px">
+    <div class="pager"><button class="btn sm"><svg><use href="#i-chevl"/></svg></button><span><span class="pill">Speaker D</span> &nbsp;<b>Several voices · shared mic</b> <span class="muted" style="font-size:12px">· 22 lines</span></span><button class="btn sm"><svg><use href="#i-chevr"/></svg></button></div>
+    <div class="form" style="grid-template-columns:1fr">
+      <div>
+        <div class="field"><svg style="color:var(--muted-foreground)"><use href="#i-mic-off"/></svg><span>mixed</span><svg style="margin-left:auto;color:var(--muted-foreground)"><use href="#i-pencil"/></svg></div>
+        <div class="caption"><svg style="color:var(--muted-foreground)"><use href="#i-mic-off"/></svg>a shared mic, not a person — not enrolled as a voiceprint</div>
+      </div>
+    </div>
+  </div>
+</main>
+
+<script>
+  (function () {
+    const root = document.documentElement;
+    const btn = document.getElementById('theme');
+    btn.addEventListener('click', () => {
+      const dark = root.getAttribute('data-theme') === 'dark' || (!root.getAttribute('data-theme') && matchMedia('(prefers-color-scheme: dark)').matches);
+      root.setAttribute('data-theme', dark ? 'light' : 'dark');
+    });
+  })();
+</script>
+</body>
+</html>

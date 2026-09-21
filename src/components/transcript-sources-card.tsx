@@ -15,6 +15,7 @@ import {
   languageLabel,
   pctLabel,
 } from '@/lib/aai-outcome';
+import { isPersonName } from '@/lib/speaker-name-kind';
 import {
   AudioWaveform,
   CheckCircle2,
@@ -38,8 +39,8 @@ interface TranscriptSourcesCardProps {
 /**
  * "Sources" rail card: which transcript/diarization sources exist on this
  * row (summaries and name-guessing automatically use everything present),
- * plus multi-video coverage. Plain media availability (audio/video present
- * or not, fetch/add recovery) lives in MeetingInfoCard — this card keeps
+ * plus multi-video coverage. The recording itself (source, segments, media
+ * availability, fetch/add recovery) lives in RecordingCard — this card keeps
  * only the analysis-side facts.
  */
 export function TranscriptSourcesCard({
@@ -60,9 +61,13 @@ export function TranscriptSourcesCard({
   const hasSidecar =
     !isMeetPrimary && !isTeamsPrimary && (ctx?.meetTranscript?.utterances?.length ?? 0) > 0;
 
-  const voiceMatches = Object.values(suggestions).filter((s) => s.source === 'voice');
+  // A voiceprint enrolled under a group label ("mixed") is not a person heard
+  // — it never reaches this list (docs/transcript-page-redesign.md §5).
+  const voiceMatches = Object.values(suggestions).filter(
+    (s) => s.source === 'voice' && isPersonName(s.name)
+  );
   const alignMatches = Object.values(suggestions).filter(
-    (s) => s.source === 'context' && s.confidence > 0
+    (s) => s.source === 'context' && s.confidence > 0 && isPersonName(s.name)
   );
 
   const recordingFileId = ctx?.videoFileId ?? ctx?.actuals?.recordings?.[0]?.fileId;
@@ -358,46 +363,7 @@ export function TranscriptSourcesCard({
             </span>
           </li>
         )}
-        {(ctx?.uploadedParts?.length ?? 0) > 1 && (
-          <li className="flex items-start gap-2">
-            <Video className="mt-0.5 h-3.5 w-3.5 shrink-0 text-muted-foreground" />
-            {ctx?.recorder ? (
-              // Darth Recorder segments: one recording, N files — the file
-              // names are the recorder's own ("… teams part3.mp4"), not the
-              // person's, so the list is noise on a phone (2026-09-21).
-              <span className="min-w-0 flex-1">
-                <span className="font-medium">
-                  Recorded in {ctx!.uploadedParts!.length} segments by Darth Recorder
-                </span>
-                <span className="text-muted-foreground">
-                  {' '}
-                  — the recorder starts a new segment on every screen-share change; they were
-                  joined in order into one recording before transcription, and the AI is told
-                  where the joins are.
-                </span>
-              </span>
-            ) : (
-              <span className="min-w-0 flex-1">
-                <span className="font-medium">
-                  Stitched from {ctx!.uploadedParts!.length} uploaded files
-                </span>
-                <span className="text-muted-foreground">
-                  {' '}
-                  — joined in order into one recording before transcription. The AI is told
-                  where the joins are{ctx!.uploadedParts!.some((p) => p.comment) ? ' and gets your per-file notes' : ''}.
-                </span>
-                <span className="mt-1 block space-y-0.5">
-                  {ctx!.uploadedParts!.map((p) => (
-                    <span key={p.index} className="block break-words text-muted-foreground">
-                      {p.index}. {p.originalFilename ?? `file ${p.index}`}
-                      {p.comment ? ` — ${p.comment}` : ''}
-                    </span>
-                  ))}
-                </span>
-              </span>
-            )}
-          </li>
-        )}
+        {/* Segments (Darth Recorder / stitched uploads) moved to the Recording card — components/recording-card.tsx */}
         {multiVideo && (
           <li className="flex items-start gap-2">
             <Video className="mt-0.5 h-3.5 w-3.5 shrink-0 text-muted-foreground" />
@@ -606,7 +572,7 @@ export function TranscriptSourcesCard({
           &ldquo;Diarize with AssemblyAI&rdquo; separates them by voice
           {row.local_audio_path
             ? '.'
-            : ' (fetch the video first — see About this meeting above).'}
+            : ' (fetch the video first — see Recording above).'}
         </p>
       )}
       {error && <p className="mt-1.5 text-xs text-destructive">{error}</p>}

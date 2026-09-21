@@ -3,12 +3,16 @@
 import { useState } from 'react';
 import { Pencil } from 'lucide-react';
 import { UserPicker, type PickerPerson } from '@/components/user-picker';
-import type { SpeakerLabel } from '@/lib/format';
+import type { SpeakerLabel, SpeakerSuggestionMap } from '@/lib/format';
 import { defaultSpeakerLabel, speakerColorVar } from '@/lib/speaker-display';
+import { speakerNameState } from '@/lib/speaker-name-state';
 
 interface SpeakerBadgeEditorProps {
   originalSpeaker: string;
   speakerLabels: SpeakerLabel[];
+  /** Guesses — the picker opens pre-filled with the guess for an unconfirmed
+   * speaker, and the label shows it with a "?" (transcript-page-redesign §4). */
+  suggestions?: SpeakerSuggestionMap | null;
   /**
    * Save a partial update to the speaker. Description is left untouched
    * by this inline editor — for that, use the SpeakerSummaryPanel at the
@@ -38,13 +42,16 @@ interface SpeakerBadgeEditorProps {
 export function SpeakerBadgeEditor({
   originalSpeaker,
   speakerLabels,
+  suggestions,
   onSave,
   canEdit,
   onPickPerson,
   onRequestCreatePerson,
 }: SpeakerBadgeEditorProps) {
   const mapping = speakerLabels.find((m) => m.originalSpeaker === originalSpeaker);
-  const currentDisplay = mapping?.customName || defaultSpeakerLabel(originalSpeaker);
+  const state = speakerNameState(originalSpeaker, speakerLabels, suggestions);
+  const currentDisplay =
+    state.status === 'unknown' ? defaultSpeakerLabel(originalSpeaker) : state.display;
 
   const [isEditing, setIsEditing] = useState(false);
 
@@ -61,7 +68,7 @@ export function SpeakerBadgeEditor({
           <UserPicker
             mode="freeform"
             compact
-            initialValue={mapping?.customName ?? ''}
+            initialValue={state.name}
             placeholder="Name or email"
             onSelect={(sel) => {
               setIsEditing(false);
@@ -98,9 +105,15 @@ export function SpeakerBadgeEditor({
       <span
         className="truncate text-xs font-semibold"
         style={{ color: speakerColorVar(originalSpeaker) }}
+        title={state.status === 'guess' ? `Guessed — ${state.caption}` : state.status === 'group' ? `Labelled “${state.name}”` : undefined}
+        data-speaker-state={state.status}
       >
         {currentDisplay}
+        {state.status === 'guess' ? '?' : ''}
       </span>
+      {state.status === 'guess' && (
+        <span className="shrink-0 text-[10px] text-muted-foreground">(guess)</span>
+      )}
       {mapping?.customName && mapping.customName !== defaultSpeakerLabel(originalSpeaker) && (
         // Raw diarization label as a qualifier — but Meet/text imports arrive
         // with real names as the raw label, where "Jane (Jane)" is noise.
