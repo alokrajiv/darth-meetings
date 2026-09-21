@@ -1,6 +1,7 @@
 import 'server-only';
 import { getForUser } from '@/db-ops/transcripts';
 import { getContentCached, identifySpeakers } from '@/lib/server/auto-notes';
+import { deleteAtAaiIfSafe } from '@/lib/server/aai-retention';
 import { maybeAutoReview } from '@/lib/server/auto-review';
 import { suggestSpeakersFromMeet } from '@/lib/server/meet-align';
 import { suggestSpeakersForTranscript } from '@/lib/server/voiceprint';
@@ -12,11 +13,15 @@ import { dm, meetingLine, openLink } from '@/lib/server/dm-copy';
 /**
  * Fire-and-forget work that should happen once, when a transcript first
  * transitions to `completed`:
+ *   0. delete the job at AssemblyAI once our copy is proven safe (DEC-4)
  *   1. voiceprint-match the diarized speakers and store name suggestions
  *   2. Meet↔AAI timeline alignment votes ('both'-mode imports)
  *   3. the speaker-identification AI pass (text + hints + video frames)
  * Notes are NOT generated here: they wait for a human to review the
  * suggested speaker labels ("confirm & generate" on the detail page).
+ *
+ * Everything from step 1 on reads the DB payload and the local recording —
+ * nothing here goes back to AssemblyAI, which is why step 0 can run first.
  *
  * There is no job queue in this app — completion is only ever observed
  * inside a request (detail GET / listing GET polling AAI), so this is called
@@ -26,17 +31,30 @@ import { dm, meetingLine, openLink } from '@/lib/server/dm-copy';
  * set; suggestions are cheap and just overwrite. All no-op harmlessly if
  * re-triggered.
  */
-export function onTranscriptCompleted(ownerUserId: string, assemblyaiId: string): void {
+export function onTranscriptCompleted(
+  ownerUserId: string,
+  assemblyaiId: string,
+  /** What the completing AAI poll returned, when the caller saw it — the
+   * DEC-4 delete refuses to run unless the stored payload matches it. Absent
+   * for paths that never touched AAI (text imports). */
+  observed?: { utterances: number | null }
+): void {
   setTimeout(() => {
     void (async () => {
       try {
-        // Re-read so we have local_audio_path + any cached content even when
-        // the caller only had a skinny listing row.
+        // Re-read so we have local_audio_path + the payload the completion
+        // write stored, even when the caller only had a skinny listing row.
         const full = await getForUser(ownerUserId, assemblyaiId);
         if (!full || full.status !== 'completed') return;
 
-        // Content is usually not cached yet at the moment of completion —
-        // fetch (and cache) it once here so both steps below have it.
+        // DEC-4 step 0: our copy is on disk and in Postgres — take the job
+        // off AssemblyAI. Off unless MW_AAI_DELETE_ON_COMPLETE is set, and a
+        // failure here is logged and retried by the sweeper, never fatal.
+        await deleteAtAaiIfSafe(ownerUserId, assemblyaiId, observed?.utterances ?? null).catch(
+          (err) => console.warn('[post-completion] AAI delete failed:', err)
+        );
+
+        // The payload, from the DB — completion is its only writer now.
         const content = await getContentCached(ownerUserId, full);
 
         // Voiceprint speaker suggestions (fast, seconds). AI notes are NOT

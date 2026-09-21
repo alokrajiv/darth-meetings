@@ -121,12 +121,27 @@ export async function getTranscript(id: string): Promise<TranscriptResponse> {
   return response as unknown as TranscriptResponse;
 }
 
-export async function deleteTranscript(id: string): Promise<void> {
+/**
+ * DELETE /v2/transcript/:id — AAI wipes the transcript's data (text,
+ * utterances, words, audio_url) and, per their docs, immediately deletes the
+ * file that was uploaded for it too; the id itself survives as a tombstone.
+ *
+ * Returns `true` when AAI no longer holds the job — which includes a 404,
+ * since "already gone" is the outcome we wanted. `false` means the call
+ * failed for some other reason (5xx, network, auth) and the caller may retry;
+ * it never throws, so a permanent DB delete is not blocked by AAI being down.
+ */
+export async function deleteTranscript(id: string): Promise<boolean> {
   try {
     await getClient().transcripts.delete(id);
+    return true;
   } catch (error) {
-    // Idempotent delete: if the transcript is already gone on AAI, swallow
-    // the 404 so our DB delete can still proceed.
-    console.warn('[assemblyai] delete failed (treating as already-gone):', error);
+    const message = error instanceof Error ? error.message : String(error);
+    if (/\b404\b|not found/i.test(message)) {
+      console.warn('[assemblyai] delete: already gone at AAI:', id);
+      return true;
+    }
+    console.warn('[assemblyai] delete failed for', id, '-', message);
+    return false;
   }
 }

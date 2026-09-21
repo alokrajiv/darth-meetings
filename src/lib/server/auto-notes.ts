@@ -2,7 +2,7 @@ import 'server-only';
 import { promises as fsp } from 'node:fs';
 import { z } from 'zod';
 import { tool, createSdkMcpServer } from '@anthropic-ai/claude-agent-sdk';
-import { getTranscript } from '@/lib/server/assemblyai';
+import { logPayloadMissing } from '@/lib/server/aai-retention';
 import { runClaudeWithMeta, parseJsonFromClaude } from '@/lib/server/claude-agent';
 import { extractFrame, hasVideoStream } from '@/lib/server/video-frames';
 import { recordAiRun, getLatestSessionId } from '@/db-ops/ai-runs';
@@ -14,7 +14,6 @@ import {
   setAutoNotesForUser,
   setAutoReportForUser,
   setAutoSegmentsForUser,
-  setCachedContentForUser,
   setSpeakerIdForUser,
   updateMetaForUser,
   type TranscriptRow,
@@ -356,22 +355,24 @@ function buildTranscriptText(
   return lines.join('\n');
 }
 
-/** Fetch content from cache or AAI (caching it for future reads). */
+/**
+ * The stored payload, or null. DB-only since DEC-4
+ * (docs/recordings-first-class-design.md §7): whoever observed completion
+ * wrote the payload in the same statement, and AssemblyAI's copy is deleted
+ * right after — so there is no fallback to fall back to. A finished row with
+ * nothing stored is logged loudly rather than silently re-fetched; callers
+ * already treat null as "can't run this pass".
+ *
+ * `ownerUserId` is kept in the signature: every caller has it and it is what
+ * a future re-read would need.
+ */
 export async function getContentCached(
   ownerUserId: string,
   row: TranscriptRow
 ): Promise<TranscriptResponse | null> {
   if (row.imported_content?.utterances?.length) return row.imported_content;
-  try {
-    const content = await getTranscript(row.assemblyai_id);
-    if (content.status === 'completed') {
-      void setCachedContentForUser(ownerUserId, row.assemblyai_id, content).catch(
-        () => {}
-      );
-      return content;
-    }
-  } catch (err) {
-    console.warn('[auto-notes] content fetch failed:', err);
+  if (row.status === 'completed' || row.status === 'error') {
+    logPayloadMissing(row.assemblyai_id, `auto-notes (owner ${ownerUserId})`);
   }
   return null;
 }

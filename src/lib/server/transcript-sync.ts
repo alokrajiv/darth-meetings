@@ -1,10 +1,6 @@
 import 'server-only';
 import { getTranscript } from '@/lib/server/assemblyai';
-import {
-  setCachedContentForUser,
-  updateStatusForUser,
-  type TranscriptRow,
-} from '@/db-ops/transcripts';
+import { updateStatusForUser, type TranscriptRow } from '@/db-ops/transcripts';
 import { onTranscriptCompleted } from '@/lib/server/post-completion';
 
 /**
@@ -33,27 +29,29 @@ export async function refreshIfPending(
       ? new Set(aai.utterances.map((u) => u.speaker)).size
       : null;
 
+    const completed = aai.status === 'completed';
     const updated = await updateStatusForUser(userId, row.assemblyai_id, {
       status: aai.status,
       completedAt: aai.completed ? new Date(aai.completed) : null,
       duration: aai.audio_duration ?? null,
       speakerCount,
       languageCode: aai.language_code ?? null,
+      // DEC-4: the payload is written in the SAME statement that flips the
+      // row to completed — never lazily on the first content fetch. It is
+      // also the only record of what AAI actually DID (which model ran,
+      // which language it chose, which warnings it raised —
+      // lib/aai-outcome.ts), and after this poll we never ask AAI again.
+      content: completed ? aai : null,
     });
 
-    // First observation of the completed state → kick off auto-notes and
-    // voiceprint speaker suggestions (fire-and-forget).
-    if (aai.status === 'completed') {
-      onTranscriptCompleted(userId, row.assemblyai_id);
-      // Freeze the payload now rather than on the first content fetch. AAI
-      // content is immutable once completed, and the payload is the only
-      // record of what AAI actually DID — which model ran, which language it
-      // chose, which warnings it raised (lib/aai-outcome.ts). Caching it here
-      // means the Sources card can tell the truth on the very first page
-      // load instead of one refresh later.
-      await setCachedContentForUser(userId, row.assemblyai_id, aai).catch((err) =>
-        console.warn('[transcript-sync] caching the AAI payload failed:', err)
-      );
+    // First observation of the completed state → the post-completion hook
+    // (speaker suggestions, ID pass) and the AAI-side delete, both
+    // fire-and-forget. The observed utterance count travels with it so the
+    // delete can prove our copy matches what AAI returned.
+    if (completed) {
+      onTranscriptCompleted(userId, row.assemblyai_id, {
+        utterances: aai.utterances?.length ?? null,
+      });
       if (updated) return { ...updated, imported_content: aai };
     }
 

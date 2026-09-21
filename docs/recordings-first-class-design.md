@@ -339,3 +339,20 @@ re-basing on split), #14 (backfill of shared AAI ids).
 
 Sequence suggestion: Phase 1 on a branch with the diff script green, deploy, sit a week (offline pins and the
 darth-cli are the canaries), then Phase 2 (cheapest win: it stops paying AAI twice), then 3.
+
+## 7. Decisions taken by Alok — 2026-09-21 (these override §2–§5 where they conflict)
+
+Vocabulary, fixed from here on (the word "segment" is retired because it meant three things):
+
+| Term | Meaning |
+|---|---|
+| **Meeting** | The document: title, calendar event, people, notes/report, shares, labels, /m link. Today's `transcripts` row. |
+| **Recording** | One continuous capture = its bytes + ONE transcription with ONE diarization space. First-class, owned, can exist with no meeting. |
+| **Part** | A file inside a recording. The tray rolls a new file on every screen-share flip; Meet stop/restart makes several videos. Parts are a storage artefact and never reach the user or AssemblyAI separately. |
+| **Clip** | A `[from_ms, to_ms]` window of a recording used by a meeting. A pointer only: no file is cut, nothing is re-transcribed; the meeting's text is the recording's result filtered to the window. (`transcript_segments` in §2.1 → `meeting_clips`.) |
+
+- **DEC-1 One recording = one AssemblyAI job, always.** Parts are concatenated first (NVMe scratch), then transcribed once with diarization. Why: the parts are the same room and the same people; separate jobs give separate speaker-label spaces ("A" in part 1 ≠ "A" in part 2) and aligning them needs voice masks/embeddings we do not want in the hot path. This **deletes** the "N jobs, no concat" option in Phase 4 and supersedes D-E's "cut the bytes when the language switches".
+- **DEC-2 Transcription is never split per clip either.** A clip is chosen AFTER the single transcription — by a person in the UI, or by an AI/darth-cli session ("from when Paola joined until she left") — and only selects a window. Clip proposals may use speaker entry/exit, long silences and calendar boundaries; they are always a proposal until accepted.
+- **DEC-3 Azure Blob is the permanent home of recording bytes; the VM is a cache.** Originals and derivatives live in the `darthuploads` account; manipulation (concat, faststart, audio extract, cuts, frames) happens in `/temphigh` (NVMe, 216 GB, 101 GB free on 2026-09-21; ephemeral — scratch only) and the result is uploaded back. Playback is served from blob through a short-lived user-delegation SAS minted after the app's access check; AssemblyAI is handed a SAS URL instead of bytes pushed from the VM. `recording_media` gains `blob_name`; `filename` on local disk becomes a cache hint.
+- **DEC-4 AssemblyAI keeps nothing of ours (reverses D-H).** Target retention at AssemblyAI is 24 h and we delete the job ourselves as soon as the payload is safely stored. Therefore the AssemblyAI id stops being an identity anywhere: recordings and new meetings carry ids we mint, the AssemblyAI id is a disposable `provider_job_id`, and every lazy `getTranscript()` fallback (content route, audio route, listing status refresh, `getContentCached`) plus the "import from AssemblyAI" dialog must go before retention is shortened. Step 0: prove every completed row has its payload stored.
+- **DEC-5 Meet/Teams transcript vs AssemblyAI is a per-recording choice, to be driven by a shared-mic check** — see the eval note in §8 (to be written) before any policy change; today's behaviour (AssemblyAI nearly always) stays until the eval says the check is reliable.

@@ -2,6 +2,7 @@ import 'server-only';
 import {
   deleteForUser,
   getForUser,
+  listAaiDeletePending,
   listExpiredScratch,
   listNotesBacklog,
   listSpeakerIdBacklog,
@@ -9,6 +10,11 @@ import {
   mergeGmeetContextForUser,
   softDeleteForUser,
 } from '@/db-ops/transcripts';
+import {
+  deleteAtAaiIfSafe,
+  deleteOnCompleteEnabled,
+  isAaiJobId,
+} from '@/lib/server/aai-retention';
 import { identityForUser } from '@/db-ops/transcript-activity';
 import { deleteUploadSession, listExpiredUploadSessions } from '@/db-ops/upload-sessions';
 import { uploadsStore } from '@/lib/server/darth-uploads-store';
@@ -27,6 +33,11 @@ import { SCRATCH_TTL_DAYS } from '@/lib/format';
  *     kill in-flight generations). Never-ran notes are NOT picked up:
  *     generation waits for a human to review speaker labels and click
  *     "confirm & generate" on the detail page, however long that takes.
+ *   - AssemblyAI retention (DEC-4): retry the delete-at-AAI for recently
+ *     completed rows whose job is still there — the delete at completion is
+ *     fire-and-forget and AAI can be down. Off unless
+ *     MW_AAI_DELETE_ON_COMPLETE is set; the historical backlog is the job of
+ *     scripts/aai-purge.ts, not of this tick.
  *   - temporary transcripts (migration 042): soft-delete scratch rows
  *     created more than SCRATCH_TTL_DAYS ago — the same soft delete the
  *     DELETE route performs, so they land in the trash like any other row
@@ -51,6 +62,11 @@ const SESSION_IDLE_HOURS = 24;
 // listing hint and the detail-page banner) from creation before they are
 // moved to the trash.
 const SCRATCH_PER_SWEEP = 50;
+// DEC-4 retry window: how far back a not-yet-deleted AAI job is still this
+// sweeper's business. Anything older predates the feature (or predates the
+// row being safe) and belongs to scripts/aai-purge.ts.
+const AAI_DELETE_SINCE_HOURS = 72;
+const AAI_DELETE_PER_SWEEP = 10;
 
 let started = false;
 
@@ -106,6 +122,22 @@ async function sweep(): Promise<void> {
     }
   } catch (err) {
     console.warn('[notes-sweeper] scratch expiry query failed:', err);
+  }
+
+  // DEC-4: jobs that should already be gone from AssemblyAI. deleteAtAaiIfSafe
+  // re-verifies each row itself, so this query only has to narrow the field.
+  if (deleteOnCompleteEnabled()) {
+    try {
+      const pending = await listAaiDeletePending(AAI_DELETE_SINCE_HOURS, AAI_DELETE_PER_SWEEP);
+      for (const p of pending) {
+        if (!isAaiJobId(p.assemblyai_id)) continue;
+        await deleteAtAaiIfSafe(p.user_id, p.assemblyai_id, p.utterances).catch((err) =>
+          console.warn(`[notes-sweeper] AAI delete retry ${p.assemblyai_id} failed:`, err)
+        );
+      }
+    } catch (err) {
+      console.warn('[notes-sweeper] AAI delete backlog query failed:', err);
+    }
   }
 
   try {

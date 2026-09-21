@@ -1,9 +1,7 @@
 import { NextResponse, type NextRequest } from 'next/server';
 import { Readable } from 'node:stream';
 import { withAuth } from '@/lib/auth/with-auth';
-import { updateStatusForUser } from '@/db-ops/transcripts';
 import { resolveAccess } from '@/db-ops/transcript-access';
-import { getTranscript } from '@/lib/server/assemblyai';
 import { resolveAudioPath } from '@/lib/server/audio-storage';
 import { ensureAudioOnly } from '@/lib/server/audio-only';
 
@@ -34,11 +32,9 @@ export const runtime = 'nodejs';
  * Returns the audio for a transcript. Resolution order:
  *   1. local_audio_path (imported transcripts whose bytes we downloaded) →
  *      stream from disk with HTTP Range support so the player can seek.
- *   2. audio_url cached on the row → 302 to AAI's CDN, which handles Range
- *      itself.
- *   3. uploaded transcript with no cached audio_url yet → fetch from AAI
- *      once, persist, then 302.
- *   4. nothing → 404.
+ *   2. an audio_url already stored on the row → 302 (legacy rows only).
+ *   3. nothing → 404.
+ * There is no step that asks AssemblyAI for a URL any more (DEC-4).
  *
  * Ownership is enforced before any of the above so a user can't probe
  * another user's audio by id.
@@ -88,21 +84,13 @@ export const GET = withAuth(async ({ user, request }, { params }) => {
     }
   }
 
-  // Path 2 — remote URL (legacy / pre-local-storage rows). Note: AAI deletes
-  // the upload after transcription so this path effectively doesn't work.
-  // Kept here as a graceful fallback so old rows don't blow up.
-  let audioUrl = row.audio_url;
-  if (!audioUrl && row.source === 'uploaded') {
-    try {
-      const aai = await getTranscript(id);
-      audioUrl = aai.audio_url ?? null;
-      if (audioUrl) {
-        await updateStatusForUser(access.ownerUserId, id, { audioUrl });
-      }
-    } catch (err) {
-      console.error('[GET /api/transcripts/:id/audio] AAI backfill failed:', err);
-    }
-  }
+  // Path 2 — an audio_url already ON the row (legacy / pre-local-storage).
+  // Almost certainly broken for AAI-backed rows (TLS SAN mismatch + the URL
+  // needs signing; see project memory `aai_audio_url_unusable`) but it costs
+  // nothing to try what we already hold. We no longer ASK AAI for one:
+  // under DEC-4 the job is deleted as soon as our copy is safe, and the
+  // answer was never playable anyway.
+  const audioUrl = row.audio_url;
 
   if (!audioUrl) {
     return NextResponse.json({ error: 'Audio not available' }, { status: 404 });

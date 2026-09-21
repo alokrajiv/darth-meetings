@@ -164,6 +164,13 @@ export interface GmeetContext {
    * the button turns into a pointer instead of firing twice. */
   retranscribedFrom?: string;
   retranscribed?: { at: string; newId: string; model: string };
+  /** DEC-4 (docs/recordings-first-class-design.md §7): the AssemblyAI job
+   * behind this row has been deleted AT AssemblyAI — our payload + the local
+   * media are the only copies left, and nothing may ask AAI about `jobId`
+   * again. Stamped on EVERY user's copy of the id (one job, N rows) once the
+   * single delete succeeds. Absent = the job may or may not still be there;
+   * we simply never rely on it. */
+  aai?: { deletedAt: string; jobId: string } | null;
   /** Microsoft Teams source facts (provider === 'teams'). Artifacts are
    * fetched app-only under the ORGANIZER's AAD id — no per-user Microsoft
    * auth exists. `callId` keys the specific occurrence of a recurring

@@ -38,8 +38,9 @@ export const maxDuration = 900;
  * heard of their ids) are skipped, so for an all-finished list this is a
  * no-op with zero network hops. Shared by the legacy full listing (which
  * passes every row) and the v2 path (which passes a dedicated pending-only
- * query's rows, decoupled from pagination). First observed completion fires
- * onTranscriptCompleted (auto-notes + speaker suggestions, fire-and-forget).
+ * query's rows, decoupled from pagination). First observed completion stores
+ * the payload in the same write and fires onTranscriptCompleted (speaker
+ * suggestions + the AAI-side delete, fire-and-forget).
  */
 async function refreshPendingAgainstAai<T extends PendingRefreshRow>(
   rows: T[]
@@ -70,12 +71,18 @@ async function refreshPendingAgainstAai<T extends PendingRefreshRow>(
         const speakerCount = aai.utterances
           ? new Set(aai.utterances.map((u) => u.speaker)).size
           : null;
+        const completed = aai.status === 'completed';
         await updateStatusForUser(row.user_id, row.assemblyai_id, {
           status: aai.status,
           completedAt: aai.completed ? new Date(aai.completed) : null,
           duration: aai.audio_duration ?? null,
           speakerCount,
           languageCode: aai.language_code ?? null,
+          // DEC-4: this poll is the last time we ever see the payload, so it
+          // is stored in the same write that says 'completed'. The listing
+          // used to leave that to the first content fetch, which under 24 h
+          // AAI retention would eventually find nothing.
+          content: completed ? aai : null,
         });
         rows[i] = {
           ...row,
@@ -85,9 +92,12 @@ async function refreshPendingAgainstAai<T extends PendingRefreshRow>(
           speaker_count: speakerCount ?? row.speaker_count,
         };
         // First observation of completion → auto-notes + speaker
-        // suggestions (fire-and-forget, owner-scoped).
-        if (aai.status === 'completed') {
-          onTranscriptCompleted(row.user_id, row.assemblyai_id);
+        // suggestions (fire-and-forget, owner-scoped) and the AAI-side
+        // delete, which verifies our copy against this utterance count.
+        if (completed) {
+          onTranscriptCompleted(row.user_id, row.assemblyai_id, {
+            utterances: aai.utterances?.length ?? null,
+          });
         }
       } catch (err) {
         console.warn('[GET /api/transcripts] refresh failed for', row.assemblyai_id, err);

@@ -61,6 +61,10 @@ export interface TranscriptStatusUpdate {
   speakerCount?: number | null;
   languageCode?: string | null;
   audioUrl?: string | null;
+  /** The AAI payload observed in the SAME poll that saw the new status.
+   * Written in the same UPDATE so a row can never be `completed` with no
+   * content (DEC-4: after completion we never ask AAI again). */
+  content?: TranscriptResponse | null;
 }
 
 export interface ImportedTranscriptInsert {
@@ -1214,12 +1218,11 @@ export async function setLocalAudioPathForUser(
 }
 
 /**
- * Cache the full AAI transcript payload on the row. The `imported_content`
- * column was originally added for the import flow (where the bytes are
- * frozen at import time), but it doubles as a content cache for uploaded
- * transcripts too — AAI content is immutable once `completed`, so once we
- * fetch it once we never need to hit AAI for that row again. This makes the
- * transcript detail page load almost entirely from Postgres.
+ * Write the full transcript payload onto the row after the fact. Since DEC-4
+ * this is no longer a lazy cache-fill — `updateStatusForUser({ content })`
+ * stores the payload in the same statement that flips a row to `completed`,
+ * and nothing re-fetches it from AAI later. What is left here is the import
+ * flow, which already holds the payload when it creates the row.
  */
 export async function setCachedContentForUser(
   userId: string,
@@ -1360,6 +1363,12 @@ export async function setAutoSegmentsForUser(
   `;
 }
 
+/**
+ * The AAI poll result, written in one statement. When `content` is present
+ * (completion) the payload lands atomically with the status — the whole
+ * point of DEC-4: there is no window in which a row reads `completed` but
+ * has nothing to serve, so no reader ever needs a lazy AAI fetch.
+ */
 export async function updateStatusForUser(
   userId: string,
   assemblyaiId: string,
@@ -1373,7 +1382,11 @@ export async function updateStatusForUser(
       duration = COALESCE(${update.duration ?? null}, duration),
       speaker_count = COALESCE(${update.speakerCount ?? null}, speaker_count),
       language_code = COALESCE(${update.languageCode ?? null}, language_code),
-      audio_url = COALESCE(${update.audioUrl ?? null}, audio_url)
+      audio_url = COALESCE(${update.audioUrl ?? null}, audio_url),
+      imported_content = COALESCE(
+        ${update.content ? sql.json(update.content as unknown as never) : null}::jsonb,
+        imported_content
+      )
     WHERE user_id = ${userId} AND assemblyai_id = ${assemblyaiId}
     RETURNING *
   `;
@@ -1467,6 +1480,66 @@ export async function setVideoPartStoredForUser(
       AND jsonb_array_length(gmeet_context->'videoParts') > 0
   `;
   publishEvent({ kind: 'meta', assemblyaiId });
+}
+
+/**
+ * DEC-4 bookkeeping: record that the AssemblyAI job is gone from AAI. Not
+ * user-scoped on purpose — `UNIQUE (user_id, assemblyai_id)` lets two owners
+ * hold copies of the SAME job, and one delete at AAI settles it for both, so
+ * every copy gets the stamp. Atomic jsonb merge in SQL (same reason as
+ * setVideoPartStoredForUser: concurrent writers to gmeet_context) and quiet —
+ * nothing on an open page changes because of it. Returns the rows stamped.
+ */
+export async function stampAaiDeleted(
+  assemblyaiId: string,
+  stamp: { deletedAt: string; jobId: string }
+): Promise<number> {
+  const rows = await sql<Array<{ user_id: string }>>`
+    UPDATE ${sql(SCHEMA)}.transcripts
+    SET gmeet_context = COALESCE(gmeet_context, '{}'::jsonb)
+      || jsonb_build_object('aai', ${sql.json(stamp as unknown as never)}::jsonb)
+    WHERE assemblyai_id = ${assemblyaiId}
+    RETURNING user_id
+  `;
+  return rows.length;
+}
+
+/**
+ * Rows whose AssemblyAI job should be deleted at AAI but isn't yet: finished,
+ * payload verifiably stored, media on our disk, no `gmeet_context.aai` stamp.
+ * Bounded to the recent past — this is the RETRY for a delete that failed at
+ * completion, not a backfill (that's scripts/aai-purge.ts). Synthetic ids
+ * (up-/defer-/ext-/gmeet-/teams-) are filtered by the caller's id shape test.
+ */
+export async function listAaiDeletePending(
+  sinceHours: number,
+  limit: number
+): Promise<Array<{ user_id: string; assemblyai_id: string; utterances: number }>> {
+  // The utterance count goes through a CASE, not a bare
+  // `jsonb_typeof(...) = 'array' AND jsonb_array_length(...)`: WHERE clauses
+  // are not evaluated left to right, and some rows store a JSON `null` there
+  // — the planner happily runs the length first and errors with "cannot get
+  // array length of a scalar".
+  return sql<Array<{ user_id: string; assemblyai_id: string; utterances: number }>>`
+    SELECT user_id, assemblyai_id,
+           jsonb_array_length(
+             CASE WHEN jsonb_typeof(imported_content->'utterances') = 'array'
+                  THEN imported_content->'utterances' END
+           ) AS utterances
+    FROM ${sql(SCHEMA)}.transcripts
+    WHERE status = 'completed'
+      AND NOT (COALESCE(gmeet_context, '{}'::jsonb) ? 'aai')
+      AND local_audio_path IS NOT NULL
+      AND COALESCE(
+            jsonb_array_length(
+              CASE WHEN jsonb_typeof(imported_content->'utterances') = 'array'
+                   THEN imported_content->'utterances' END
+            ), 0
+          ) > 0
+      AND COALESCE(completed_at, created_at) > now() - make_interval(hours => ${sinceHours})
+    ORDER BY COALESCE(completed_at, created_at) DESC
+    LIMIT ${limit}
+  `;
 }
 
 /**
