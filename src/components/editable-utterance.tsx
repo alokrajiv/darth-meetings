@@ -51,6 +51,19 @@ interface EditableUtteranceProps {
   onPickPerson?: (person: PickerPerson) => void;
   /** Forwarded to SpeakerBadgeEditor so the page can open AddPersonDialog. */
   onRequestCreatePerson?: (originalSpeaker: string, name: string) => void;
+  /**
+   * Which RECORDING this turn was heard on — "Teams", "corridor.m4a" (Phase
+   * 3b). Set only on a meeting that reads from more than one recording, where
+   * the speaker label is namespaced and "Speaker A" alone is ambiguous; null
+   * everywhere else, so nothing changes for a one-recording meeting.
+   */
+  sourceTag?: string | null;
+  /**
+   * This turn came in under `gap_fill` — a second microphone filling a
+   * silence the main recording did not catch. Real content, but quieter on
+   * the page than what the meeting's own recording heard (spec §UI).
+   */
+  quiet?: boolean;
 }
 
 /**
@@ -79,6 +92,8 @@ export function EditableUtterance({
   showSpeaker,
   onPickPerson,
   onRequestCreatePerson,
+  sourceTag,
+  quiet,
 }: EditableUtteranceProps) {
   const [isEditingText, setIsEditingText] = useState(false);
   const [draftText, setDraftText] = useState(displayText);
@@ -221,6 +236,15 @@ export function EditableUtterance({
               onPickPerson={onPickPerson}
               onRequestCreatePerson={onRequestCreatePerson}
             />
+            {sourceTag && (
+              <span
+                className="shrink-0 rounded border px-1 py-px text-[10px] leading-tight text-muted-foreground"
+                title={`Heard on ${sourceTag}${quiet ? ' — used only because the other recording was silent here' : ''}`}
+                data-utterance-source
+              >
+                {sourceTag}
+              </span>
+            )}
             {isTextEdited && editedDot}
           </div>
         )}
@@ -247,7 +271,10 @@ export function EditableUtterance({
             className="w-full resize-none rounded-md border bg-background p-2 text-sm focus:outline-none focus:ring-2 focus:ring-ring"
           />
         ) : (
-          <p className="max-w-[75ch] text-sm leading-6">
+          <p
+            className={`max-w-[75ch] text-sm leading-6 ${quiet ? 'text-muted-foreground' : ''}`}
+            data-utterance-quiet={quiet ? '1' : undefined}
+          >
             {highlights && highlights.length > 0
               ? renderHighlightedText(displayText, highlights)
               : displayText}

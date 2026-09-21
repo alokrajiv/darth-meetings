@@ -51,9 +51,17 @@ import { IngestFailureNote } from '@/components/ingest-failure-note';
 import { TranscriptSourcesCard } from '@/components/transcript-sources-card';
 import { RecordingCard } from '@/components/recording-card';
 import { SplitClipDialog } from '@/components/split-clip-dialog';
+import { RecordingsSheet } from '@/components/recordings-sheet';
 import { useClips } from '@/hooks/use-clips';
 import { holesBeforeUtterance, windowFromContext, holesFromContext } from '@/lib/clip-window';
-import { formatTimestamp } from '@/lib/clips';
+import { candidateClipForTime, formatTimestamp } from '@/lib/clips';
+import { splitSpeakerLabel, type ClipTextPolicy } from '@/lib/recording-clips';
+import {
+  localMsInPart,
+  playerParts,
+  sourceTagsByRecording,
+  type PlayerPart,
+} from '@/lib/combine-ui';
 import { PersonChip } from '@/components/person-chip';
 import { safeDate, usesEventRange, whenLine } from '@/lib/when';
 import { countVoices, speakerNameStates } from '@/lib/speaker-name-state';
@@ -92,6 +100,7 @@ import {
   Sparkles,
   MoreHorizontal,
   CloudDownload,
+  Layers,
   Scissors,
   Undo2,
   Video,
@@ -508,6 +517,48 @@ function TranscriptDetailInner({ transcriptId }: { transcriptId: string }) {
   const [splitOpen, setSplitOpen] = useState(false);
   const [unsplitConfirmOpen, setUnsplitConfirmOpen] = useState(false);
   const [unsplitError, setUnsplitError] = useState<string | null>(null);
+
+  // --- clips: several recordings, one meeting (Phase 3b) --------------------
+  // `entries` is the clip list with its sources named. It is served whenever
+  // clips are on, with or without MW_COMBINE — a one-recording meeting is a
+  // one-entry list, and every piece of 3b UI below is written to render
+  // NOTHING for that case (`combineSummary`, `playerParts`, the source tags).
+  const clipEntries = useMemo(() => clips.data?.entries ?? [], [clips.data?.entries]);
+  const combineEnabled = !!clips.data?.combineEnabled;
+  const [recordingsSheetOpen, setRecordingsSheetOpen] = useState(false);
+  /** The tag beside a voice and beside an utterance — "Teams", "corridor.m4a"
+   * — and empty for a one-recording meeting, which is how it stays invisible
+   * on every meeting that has only ever had one capture. */
+  const sourceTags = useMemo(
+    () =>
+      new Set(clipEntries.map((e) => e.recordingId)).size > 1
+        ? sourceTagsByRecording(clipEntries)
+        : null,
+    [clipEntries]
+  );
+  /** The policy each recording's text came in under — `gap_fill` is the one
+   * that reads quietly (it is there only because nothing else heard it). */
+  const policyByRecording = useMemo(() => {
+    const out = new Map<string, ClipTextPolicy>();
+    for (const e of clipEntries) out.set(e.recordingId, e.textPolicy);
+    return out;
+  }, [clipEntries]);
+  const sourceTagOf = useCallback(
+    (speaker: string): string | null => {
+      if (!sourceTags) return null;
+      const { recordingId } = splitSpeakerLabel(speaker);
+      return recordingId ? (sourceTags.get(recordingId) ?? null) : null;
+    },
+    [sourceTags]
+  );
+  const isQuietUtterance = useCallback(
+    (speaker: string): boolean => {
+      if (!sourceTags) return false;
+      const { recordingId } = splitSpeakerLabel(speaker);
+      return !!recordingId && policyByRecording.get(recordingId) === 'gap_fill';
+    },
+    [sourceTags, policyByRecording]
+  );
 
   // --- view mode + find/replace ---
   const [viewMode, setViewMode] = useState<ViewMode>('edited');
@@ -1049,6 +1100,31 @@ function TranscriptDetailInner({ transcriptId }: { transcriptId: string }) {
   const activePartInfo = activePart === 1 ? null : storedParts.find((p) => p.partNo === activePart);
   const activePartOffset = activePartInfo?.offsetSec ?? 0;
   const pendingPartSeekRef = useRef<{ t: number; play: boolean } | null>(null);
+
+  // --- Phase 3b: parts are CLIPS -------------------------------------------
+  // A meeting that reads from more than one recording plays each of them as a
+  // part, labelled by source. `playerParts` is empty for every other meeting,
+  // so the block below is inert on prod and the videoParts switcher above
+  // stays exactly what it is.
+  const clipParts = useMemo(
+    () => playerParts(clipEntries, { primaryExtraFiles: videoParts.length }),
+    [clipEntries, videoParts.length]
+  );
+  const [activeClipOrd, setActiveClipOrd] = useState<number | null>(null);
+  const activeClip: PlayerPart | null =
+    clipParts.find((p) => p.ord === activeClipOrd) ??
+    clipParts.find((p) => p.primary) ??
+    clipParts[0] ??
+    null;
+  // `seekMeetingTime` is memoised on the videoParts model (every caller of it
+  // is), so the clip model reaches it through refs rather than by widening
+  // those deps and re-creating half the page's callbacks on every clip load.
+  const clipPartsRef = useRef(clipParts);
+  clipPartsRef.current = clipParts;
+  const clipEntriesRef = useRef(clipEntries);
+  clipEntriesRef.current = clipEntries;
+  const activeClipRef = useRef(activeClip);
+  activeClipRef.current = activeClip;
   /**
    * Seek to a MEETING-time position: picks the video segment containing it
    * (switching parts when needed — the seek applies after the new media's
@@ -1056,6 +1132,28 @@ function TranscriptDetailInner({ transcriptId }: { transcriptId: string }) {
    */
   const seekMeetingTime = useCallback(
     (seconds: number, opts?: { play?: boolean }) => {
+      // Phase 3b: parts are CLIPS, each on its own recording. The part that
+      // plays a moment is the one that HAS audio there — `candidateClipForTime`
+      // (include, then gap_fill, then exclude), and the position inside it is
+      // the meeting time mapped through that clip's offset, so switching part
+      // keeps the meeting time (spec §UI).
+      if (clipPartsRef.current.length > 0) {
+        const parts = clipPartsRef.current;
+        const meetingMs = Math.max(0, seconds * 1000);
+        const wanted = candidateClipForTime(clipEntriesRef.current, meetingMs);
+        const current = activeClipRef.current;
+        const target = (wanted && parts.find((p) => p.ord === wanted.ord)) || current;
+        if (!target) return;
+        const local = localMsInPart(target, meetingMs) / 1000;
+        if (!current || target.ord !== current.ord) {
+          pendingPartSeekRef.current = { t: local, play: !!opts?.play };
+          setActiveClipOrd(target.ord);
+          return;
+        }
+        if (opts?.play) playerRef.current?.seekToSeconds(local);
+        else playerRef.current?.seekOnly(local);
+        return;
+      }
       const { partNo: target, localSec: local } = partForMeetingTime(storedParts, seconds);
       if (target !== activePart) {
         pendingPartSeekRef.current = { t: local, play: !!opts?.play };
@@ -2696,6 +2794,32 @@ function TranscriptDetailInner({ transcriptId }: { transcriptId: string }) {
                   )}
                 </button>
               )}
+              {/* Phase 3b — several recordings, one meeting. The RECORDING
+                  card carries this once there is more than one ("2 recordings
+                  — … · Edit…"); a meeting with one recording has to start
+                  somewhere, and the card for it must look exactly as it does
+                  today, so the way in is here. */}
+              {clipsOffered && combineEnabled && (
+                <button
+                  type="button"
+                  disabled={blocked || !clips.data?.canAddRecording}
+                  onClick={() => {
+                    setOverflowMenuOpen(false);
+                    setRecordingsSheetOpen(true);
+                  }}
+                  className="flex w-full items-center gap-2 rounded px-3 py-1.5 text-left text-sm hover:bg-muted disabled:opacity-50"
+                  title={
+                    blocked
+                      ? OFFLINE_TITLE
+                      : (clips.data?.addBlockedReason ??
+                        'Another capture of the same meeting — a phone, a second laptop — placed on this timeline. Nothing is cut and nothing is transcribed again.')
+                  }
+                  data-menu-recordings
+                >
+                  <Layers className="h-3.5 w-3.5 text-muted-foreground" />
+                  <span className="min-w-0 truncate">Recordings…</span>
+                </button>
+              )}
               <div className="my-1 h-px bg-border" />
               <button
                 type="button"
@@ -3016,7 +3140,48 @@ function TranscriptDetailInner({ transcriptId }: { transcriptId: string }) {
                   <span className="min-w-0 truncate">
                     {nowSegment ? `Now: ${nowSegment.title}` : ''}
                   </span>
-                  {(storedParts.length > 0 || partsGenerating > 0 || partsFetching > 0) && (
+                  {/* Phase 3b — one chip per CLIP, labelled by its source. The
+                      scrubber below spans the part that is playing; the chips
+                      say where each one sits on the meeting's timeline, and a
+                      `t:` chip anywhere on the page picks the part that has
+                      audio at that moment (`candidateClipForTime`). */}
+                  {clipParts.length > 0 && (
+                    <span className="flex shrink-0 flex-wrap items-center gap-1" data-clip-parts>
+                      {clipParts.map((p) => (
+                        <button
+                          key={p.ord}
+                          type="button"
+                          onClick={() => {
+                            if (p.ord === activeClip?.ord) return;
+                            // Keep the meeting time: the same instant, on the
+                            // other recording's own clock.
+                            pendingPartSeekRef.current = {
+                              t: localMsInPart(p, currentTime * 1000) / 1000,
+                              play: false,
+                            };
+                            setActiveClipOrd(p.ord);
+                          }}
+                          title={
+                            p.primary
+                              ? 'The meeting’s main recording'
+                              : `Starts ${formatTimestamp(p.offsetMs)} into the meeting`
+                          }
+                          className={`rounded-md border px-1.5 py-0.5 font-medium ${
+                            p.ord === activeClip?.ord
+                              ? 'border-primary/50 bg-primary/10 text-primary'
+                              : 'hover:bg-muted'
+                          }`}
+                          data-clip-part={p.ord}
+                          aria-pressed={p.ord === activeClip?.ord}
+                        >
+                          {p.label}
+                          {p.offsetMs > 0 ? ` · ${formatTimestamp(p.offsetMs)}` : ''}
+                        </button>
+                      ))}
+                    </span>
+                  )}
+                  {clipParts.length === 0 &&
+                    (storedParts.length > 0 || partsGenerating > 0 || partsFetching > 0) && (
                     <span className="flex shrink-0 items-center gap-1">
                       {[{ partNo: 1, durationSec: null as number | null }, ...storedParts].map(
                         (p) => (
@@ -3063,23 +3228,33 @@ function TranscriptDetailInner({ transcriptId }: { transcriptId: string }) {
                   )}
                 </div>
                 <AudioPlayer
-                  key={`${row.assemblyai_id}-${activePart}-${offlineAudioOnly ? 'a' : 'v'}`}
+                  key={`${row.assemblyai_id}-${activeClip ? `c${activeClip.ord}` : activePart}-${offlineAudioOnly ? 'a' : 'v'}`}
                   ref={playerRef}
                   className="h-10 w-full"
                   src={offlineVariant(
-                    activePart === 1
+                    (activeClip ? activeClip.part : activePart) === 1
                       ? `/api/transcripts/${row.assemblyai_id}/audio`
-                      : `/api/transcripts/${row.assemblyai_id}/audio?part=${activePart}`
+                      : `/api/transcripts/${row.assemblyai_id}/audio?part=${activeClip ? activeClip.part : activePart}`
                   )}
                   hasVideo={
                     !offlineAudioOnly &&
-                    (activePart === 1
-                      ? hasLocalVideo
-                      : VIDEO_EXT_RE.test(activePartInfo?.filename ?? ''))
+                    (activeClip
+                      ? activeClip.primary && hasLocalVideo
+                      : activePart === 1
+                        ? hasLocalVideo
+                        : VIDEO_EXT_RE.test(activePartInfo?.filename ?? ''))
                   }
-                  window={playerWindow}
-                  holes={clipHoles}
-                  onTimeUpdate={(t) => setCurrentTime(t + activePartOffset)}
+                  window={
+                    activeClip
+                      ? activeClip.fromMs > 0 || activeClip.toMs !== null
+                        ? { fromMs: activeClip.fromMs, toMs: activeClip.toMs }
+                        : null
+                      : playerWindow
+                  }
+                  holes={activeClip ? [] : clipHoles}
+                  onTimeUpdate={(t) =>
+                    setCurrentTime(t + (activeClip ? activeClip.offsetMs / 1000 : activePartOffset))
+                  }
                   onLoadedMetadata={() => {
                     const ps = pendingPartSeekRef.current;
                     if (!ps) return;
@@ -3089,8 +3264,17 @@ function TranscriptDetailInner({ transcriptId }: { transcriptId: string }) {
                   }}
                   onError={() => {
                     // A broken part falls back to the primary instead of
-                    // hiding the whole player.
-                    if (activePart !== 1) setActivePart(1);
+                    // hiding the whole player — for a clip part too, where
+                    // "primary" is the clip that provides the meeting's own
+                    // file.
+                    if (activeClip && !activeClip.primary) {
+                      const main = clipParts.find((p) => p.primary) ?? clipParts[0];
+                      if (main) {
+                        setActiveClipOrd(main.ord);
+                        return;
+                      }
+                    }
+                    if (!activeClip && activePart !== 1) setActivePart(1);
                     else setAudioAvailable(false);
                   }}
                 />
@@ -3628,6 +3812,7 @@ function TranscriptDetailInner({ transcriptId }: { transcriptId: string }) {
                   identifying={row.speaker_id_status === 'running'}
                   attendees={row.gmeet_context?.attendees}
                   organizerEmail={organizerEmail}
+                  sourceTagOf={sourceTags ? sourceTagOf : null}
                 />
               </div>
             )}
@@ -3715,6 +3900,8 @@ function TranscriptDetailInner({ transcriptId }: { transcriptId: string }) {
                               onSeek={handleSeekToUtterance}
                               canEdit={viewMode === 'edited' && canEdit && !offline}
                               showSpeaker={showSpeaker}
+                              sourceTag={sourceTagOf(utterance.speaker)}
+                              quiet={isQuietUtterance(utterance.speaker)}
                               onPickPerson={handlePickPerson}
                               onRequestCreatePerson={handleRequestCreatePerson}
                               onSaveText={
@@ -3781,6 +3968,11 @@ function TranscriptDetailInner({ transcriptId }: { transcriptId: string }) {
                 videoFetchError={videoFetchError}
                 onFetchVideo={() => void fetchVideo()}
                 clips={clipRelationInput}
+                entries={clipEntries}
+                pendingAttach={clips.data?.pendingAttach ?? null}
+                onEditRecordings={
+                  clips.data?.enabled ? () => setRecordingsSheetOpen(true) : undefined
+                }
               />
               <TranscriptSourcesCard
                 row={row}
@@ -3963,6 +4155,11 @@ function TranscriptDetailInner({ transcriptId }: { transcriptId: string }) {
                 videoFetchError={videoFetchError}
                 onFetchVideo={() => void fetchVideo()}
                 clips={clipRelationInput}
+                entries={clipEntries}
+                pendingAttach={clips.data?.pendingAttach ?? null}
+                onEditRecordings={
+                  clips.data?.enabled ? () => setRecordingsSheetOpen(true) : undefined
+                }
               />
               <TranscriptSourcesCard
                 row={row}
@@ -4038,6 +4235,30 @@ function TranscriptDetailInner({ transcriptId }: { transcriptId: string }) {
             onSplit={(url) => {
               setSplitOpen(false);
               router.push(url);
+            }}
+          />
+        )}
+
+        {/* Phase 3b — "several recordings, one meeting". Mounted whenever the
+            clip list exists (it is the meeting's own description); the ADD
+            half inside it is gated on `combineEnabled` + `canAddRecording`,
+            both of which are the server's answers. */}
+        {clips.data?.enabled && (
+          <RecordingsSheet
+            open={recordingsSheetOpen}
+            onClose={() => setRecordingsSheetOpen(false)}
+            transcriptId={row.assemblyai_id}
+            entries={clipEntries}
+            combineEnabled={combineEnabled}
+            canEdit={canEdit && !offline}
+            canAddRecording={!!clips.data?.canAddRecording && !offline}
+            addBlockedReason={clips.data?.addBlockedReason ?? null}
+            onChanged={() => {
+              // A clip change re-materialises the meeting's TEXT, so the row
+              // is reloaded, not just the clip list.
+              clips.refresh();
+              loadAll({ silent: true });
+              bumpActivity();
             }}
           />
         )}

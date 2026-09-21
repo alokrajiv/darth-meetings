@@ -43,6 +43,15 @@ interface PeopleCardProps {
   organizerEmail?: string | null;
   /** The signed-in user's e-mail — their own chip reads "You". */
   selfEmail?: string | null;
+  /**
+   * "Speaker A · phone" — which RECORDING each voice was heard on (Phase 3b,
+   * spec §"Reader and writer changes"). A meeting over several recordings
+   * diarizes each one separately, so "Speaker A" on the phone and "Speaker A"
+   * on the video are different people until somebody says otherwise; the tag
+   * is what makes that visible. Null (and invisible) for every meeting with
+   * one recording.
+   */
+  sourceTagOf?: ((speaker: string) => string | null) | null;
 }
 
 const INVITED_CAP = 10;
@@ -72,6 +81,7 @@ export function PeopleCard({
   attendees,
   organizerEmail,
   selfEmail,
+  sourceTagOf,
 }: PeopleCardProps) {
   const [editSpeaker, setEditSpeaker] = useState<string | null>(null);
   const [invitedExpanded, setInvitedExpanded] = useState(false);
@@ -231,6 +241,7 @@ export function PeopleCard({
                   key={s.speaker}
                   state={s}
                   count={utteranceCounts[s.speaker] ?? 0}
+                  sourceTag={sourceTagOf?.(s.speaker) ?? null}
                   canEdit={canEdit}
                   offerCreatePerson={
                     s.status === 'guess' &&
@@ -328,6 +339,7 @@ export function PeopleCard({
 function VoiceRow({
   state: s,
   count,
+  sourceTag,
   canEdit,
   offerCreatePerson,
   onEdit,
@@ -336,6 +348,8 @@ function VoiceRow({
 }: {
   state: SpeakerNameState;
   count: number;
+  /** Which recording this voice was heard on — Phase 3b, null otherwise. */
+  sourceTag?: string | null;
   canEdit: boolean;
   offerCreatePerson: boolean;
   onEdit: () => void;
@@ -379,6 +393,15 @@ function VoiceRow({
           >
             {s.display}
             {s.status === 'guess' ? '?' : ''}
+          </span>
+        )}
+        {sourceTag && (
+          <span
+            className="shrink-0 rounded border px-1 py-px text-[10px] leading-tight text-muted-foreground"
+            title={`Heard on ${sourceTag} — each recording is diarized on its own, so this voice is named separately`}
+            data-voice-source
+          >
+            {sourceTag}
           </span>
         )}
         <span className="shrink-0 font-mono text-[11px] tabular-nums text-muted-foreground">

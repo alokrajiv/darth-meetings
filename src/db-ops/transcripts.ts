@@ -500,6 +500,20 @@ export async function listPagedForUser(
                COALESCE((t.gmeet_context->>'combinedParts')::int, 0)
              )::int`
              } AS recording_count,
+             -- Phase 3b: DISTINCT RECORDINGS this meeting holds — several
+             -- captures of one meeting (a Teams video plus the phone that
+             -- caught the corridor), not several files of one capture.
+             -- recording_count above cannot tell the two apart (it is a
+             -- GREATEST over both), and the strip has to: "2 recordings" and
+             -- "2 parts" are different sentences. v2 only; the legacy listing
+             -- is untouched and stays byte-identical.
+             ${
+               recordingsEnabled()
+                 ? sql`(SELECT count(DISTINCT c.recording_id)
+                          FROM ${sql(SCHEMA)}.meeting_clips c
+                         WHERE c.transcript_id = t.id)::int`
+                 : sql`1::int`
+             } AS clip_recording_count,
              -- Series auto-import lifecycle: 'passed' = imported AND speaker
              -- review jumped through automatically (report generated
              -- unattended — the blue dot), 'gated' = auto-imported but held
@@ -587,7 +601,7 @@ export async function listPagedForUser(
            b.upload_parts_done, b.upload_parts_total, b.recorder_recording_id,
            b.split_off,
            b.provider, b.has_event, b.deferred_mode, b.deferred_error,
-           b.recording_count, b.auto_state,
+           b.recording_count, b.clip_recording_count, b.auto_state,
            -- Evaluated for the page's rows only (t is joined below for both
            -- branches) — base is materialized for day_counts, so anything
            -- computed there runs for every visible row in range.

@@ -109,6 +109,47 @@ describe('stripForArchiveRow — a part of a longer recording (Phase 3a)', () =>
   });
 });
 
+describe('stripForArchiveRow — several recordings, one meeting (Phase 3b)', () => {
+  test('says how many captures there are, with the meeting length', () => {
+    const m = stripForArchiveRow(arow({ clip_recording_count: 2, duration: 17_880 }), opts)!;
+    expect(m.text).toBe('2 recordings · 298m 0s');
+    expect(m.state).toBe('transcribed');
+    expect(m.tone).toBe('muted');
+    expect(m.action).toBeNull();
+  });
+
+  test('wins over the Mac sentence — the phone is half of what you will read', () => {
+    const m = stripForArchiveRow(
+      arow({ clip_recording_count: 2, recorder_recording_id: 'r', duration: 600 }),
+      opts
+    )!;
+    expect(m.text).toBe('2 recordings · 10m 0s');
+    expect(m.source).toBe('mac');
+  });
+
+  test('being a PART still wins over it — a part is what the row is', () => {
+    const m = stripForArchiveRow(
+      arow({ split_off: true, clip_recording_count: 2, duration: 600 }),
+      opts
+    )!;
+    expect(m.text).toBe('Part of a longer recording · 10m 0s');
+  });
+
+  test('one recording — or a row without the field — says nothing new', () => {
+    expect(stripForArchiveRow(arow({ clip_recording_count: 1 }), opts)).toBeNull();
+    expect(stripForArchiveRow(arow(), opts)).toBeNull();
+  });
+
+  test('is not confused with several FILES of one capture', () => {
+    // recording_count counts files; clip_recording_count counts captures.
+    const files = stripForArchiveRow(
+      arow({ recording_count: 3, provider: 'teams', source: 'imported', duration: 600 }),
+      opts
+    )!;
+    expect(files.text).toBe('Teams recording · 3 parts · 10m 0s');
+  });
+});
+
 describe('stripForArchiveRow — in flight', () => {
   test('multi-part Mac upload reads part N of M over the whole recording', () => {
     const m = stripForArchiveRow(

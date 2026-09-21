@@ -81,6 +81,10 @@ export interface ArchiveStripRow {
   provider?: 'gmeet' | 'teams' | null;
   recorder_recording_id?: string | null;
   recording_count?: number;
+  /** Phase 3b (v2 listing): DISTINCT recordings this meeting holds clips on.
+   * > 1 = several captures of one meeting — a different sentence from
+   * `recording_count`'s "several files of one capture". */
+  clip_recording_count?: number;
   duration?: number | null;
   upload_bytes_received?: number | null;
   upload_bytes_total?: number | null;
@@ -304,6 +308,23 @@ export function stripForArchiveRow(row: ArchiveStripRow, opts: ArchiveStripOptio
       text: join(['Part of a longer recording', dur]),
       title:
         'A stretch of one recording, split off as its own meeting — nothing was cut; open it to see which recording it is part of.',
+      progress: null,
+      action: null,
+      busy: false,
+    };
+  }
+  // Several recordings, ONE meeting (Phase 3b). Ahead of the source branches
+  // below, because what matters about such a row is not which app made the
+  // first file — "Recorded on your Mac · 4h 58m" would hide the phone that is
+  // half of what you are about to read.
+  if ((row.clip_recording_count ?? 1) > 1) {
+    return {
+      source,
+      state: 'transcribed',
+      tone: 'muted',
+      text: join([`${row.clip_recording_count} recordings`, dur]),
+      title:
+        'Several separate recordings of this meeting — a second microphone, a phone, a laptop — placed on one timeline. Nothing was cut: each keeps its own file.',
       progress: null,
       action: null,
       busy: false,

@@ -4,7 +4,8 @@ import { useRef, useState } from 'react';
 import { MeetLogo, TeamsLogo } from '@/components/provider-icon';
 import { formatDuration, formatTime, type StoredTranscript, type TranscriptAccess } from '@/lib/format';
 import { clipRelationLines, recordingFacts, type ClipRelationInput } from '@/lib/recording-facts';
-import { formatTimestamp } from '@/lib/clips';
+import { formatTimestamp, type ClipEntry, type PendingAttach } from '@/lib/clips';
+import { combineSummary, pendingAttachLine } from '@/lib/combine-ui';
 import {
   ChevronDown,
   ChevronUp,
@@ -36,6 +37,25 @@ interface RecordingCardProps {
    * and the card then says nothing about it (its existence is itself a leak).
    */
   clips?: ClipRelationInput | null;
+  /**
+   * Phase 3b: the clips this meeting holds, one row per clip
+   * (`GET …/clips` → `entries`). More than ONE distinct recording turns the
+   * card's source sentence into "2 recordings — … · Edit…"; a single
+   * recording — every meeting on prod — renders exactly as it did before,
+   * because `combineSummary` answers null for it.
+   */
+  entries?: ClipEntry[] | null;
+  /** Opens the Recordings sheet. Absent = no "Edit…" (a reader, or the flag
+   * is off). */
+  onEditRecordings?: () => void;
+  /**
+   * Uploads that named THIS meeting and have not landed yet
+   * (`ClipsResponse.pendingAttach`). Shown as one busy line each, so an upload
+   * somebody started is never invisible between "sent" and "it is in the
+   * list". The labels are filename-free by construction on the server — these
+   * bytes have not been given to this meeting's readers yet.
+   */
+  pendingAttach?: PendingAttach[] | null;
 }
 
 /**
@@ -56,9 +76,15 @@ export function RecordingCard({
   videoFetchError,
   onFetchVideo,
   clips,
+  entries,
+  onEditRecordings,
+  pendingAttach,
 }: RecordingCardProps) {
   const facts = recordingFacts({ ...row, access, owner_email: ownerEmail, owner_name: ownerName });
   const clipRelations = clips ? clipRelationLines(clips, formatTimestamp) : [];
+  // Several recordings, one meeting (Phase 3b). Null for one recording, which
+  // is what keeps today's card byte-for-byte today's card.
+  const combined = combineSummary(entries);
   const ctx = row.gmeet_context;
   const [segmentsOpen, setSegmentsOpen] = useState(false);
   const [uploadError, setUploadError] = useState<string | null>(null);
@@ -81,8 +107,17 @@ export function RecordingCard({
     !knownRecording &&
     (ctx?.recordingPending?.status === 'gone' || ctx?.recordingPending?.status === 'gave-up');
   const canFetchRecording = canEdit && !row.local_audio_path && !!knownRecording;
+  // "Got the recording? Add it here…" is the upload-and-RE-TRANSCRIBE path: it
+  // makes a whole new meeting. Offering it under "2 recordings" would read as
+  // the way to add a third, which it is not — that is the sheet's "Add a
+  // recording…", and it adds without transcribing anything again.
   const canAddRecording =
-    canEdit && !hasLocalVideo && !knownRecording && !recordingProcessing && row.status === 'completed';
+    canEdit &&
+    !combined &&
+    !hasLocalVideo &&
+    !knownRecording &&
+    !recordingProcessing &&
+    row.status === 'completed';
   const partsFetching = (ctx?.videoParts ?? []).filter((p) => !p.filename).length;
   const partsGenerating =
     ctx?.recordingPending?.status === 'waiting'
@@ -156,14 +191,53 @@ export function RecordingCard({
         Recording
       </div>
 
-      <div className="mt-2 flex items-start gap-2 text-xs" title={facts.filename ?? undefined}>
-        {Glyph}
-        <span className="min-w-0">
-          <span className="font-medium">{facts.lead}</span>
-          {facts.tail && <span className="text-muted-foreground"> {facts.tail}</span>}
-        </span>
-      </div>
-      {facts.facts.length > 0 && (
+      {/* Several recordings, one meeting (Phase 3b). The source sentence and
+          the facts line below describe ONE file, so when the meeting reads
+          from more than one they are replaced by the list of them — saying
+          "Uploaded file · teams-day.m4a" above "2 recordings" would be two
+          answers to the same question. `combineSummary` is null for one
+          recording, so every meeting on prod keeps today's card exactly. */}
+      {combined ? (
+        <div className="mt-2 flex items-start gap-2 text-xs" data-recording-combined>
+          {Glyph}
+          <div className="min-w-0">
+            <span className="font-medium">{combined.heading}</span>
+            <ul className="mt-0.5 space-y-0.5 text-[11px] leading-snug text-muted-foreground">
+              {combined.parts.map((part) => (
+                <li key={part.ord} className="break-words" data-combined-part={part.ord}>
+                  {part.text}
+                  {part.policy !== 'include' && (
+                    <span className="opacity-80">
+                      {' '}
+                      · {part.policy === 'gap_fill' ? 'fills gaps only' : 'audio only'}
+                    </span>
+                  )}
+                </li>
+              ))}
+            </ul>
+            {onEditRecordings && (
+              <button
+                type="button"
+                onClick={onEditRecordings}
+                className="mt-1 text-[11px] font-medium text-primary hover:underline"
+                title="Change where each recording sits, what its text does, or take one out"
+                data-edit-recordings
+              >
+                Edit…
+              </button>
+            )}
+          </div>
+        </div>
+      ) : (
+        <div className="mt-2 flex items-start gap-2 text-xs" title={facts.filename ?? undefined}>
+          {Glyph}
+          <span className="min-w-0">
+            <span className="font-medium">{facts.lead}</span>
+            {facts.tail && <span className="text-muted-foreground"> {facts.tail}</span>}
+          </span>
+        </div>
+      )}
+      {!combined && facts.facts.length > 0 && (
         <div className="ml-[22px] mt-0.5 text-[11px] tabular-nums text-muted-foreground" data-recording-facts>
           {facts.facts.join(' · ')}
         </div>
@@ -171,6 +245,23 @@ export function RecordingCard({
       {facts.heldVsAdded && (
         <div className="ml-[22px] mt-0.5 text-[11px] text-muted-foreground">{facts.heldVsAdded}</div>
       )}
+
+      {/* Several recordings, one meeting — one that is still on its way in. */}
+      {(pendingAttach ?? []).map((p, i) => {
+        const line = pendingAttachLine(p);
+        return (
+          <p
+            key={`${p.sourceLabel}-${p.since}-${i}`}
+            className={`ml-[22px] mt-1.5 inline-flex items-start gap-1 text-[11px] leading-snug ${
+              line.tone === 'err' ? 'text-destructive' : 'text-amber-600 dark:text-amber-500'
+            }`}
+            data-pending-attach={p.state}
+          >
+            {line.busy && <Loader2 className="mt-0.5 h-3 w-3 shrink-0 animate-spin" />}
+            <span>{line.text}</span>
+          </p>
+        );
+      })}
 
       {/* One recording, several meetings — the sentence that says so, and a
           link to the other one. Nothing is cut: both play the same file. */}
