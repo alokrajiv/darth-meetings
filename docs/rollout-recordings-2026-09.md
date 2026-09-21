@@ -18,6 +18,7 @@ Flags live in `~/apps/meeting-whisperer/.env.local` on the VM; every one is read
 | `MW_SAME_FILE_CHECK` | an upload whose bytes the same owner already has is answered before anything is spent |
 | `MW_CLIPS` | split a window of a recording off into its own meeting (no re-transcription, no file cut) |
 | `MW_MEDIA_FROM_BLOB` | /audio answers browsers with a 60-minute signed blob link instead of streaming through the VM |
+| `MW_COMBINE` | several recordings in one meeting (clips on different recordings, the align guesser) |
 | `DARTH_MEDIA_ACCOUNT` / `DARTH_MEDIA_CONTAINER` / `MW_MEDIA_ARCHIVE` | copy every media file to the permanent blob account |
 | `MW_AAI_FROM_BLOB` | AssemblyAI reads the recording from the blob; the VM stops pushing it there (Stage C) |
 | `MW_SCRATCH_DIR` | the stitch of a multi-file upload works on the NVMe (`/temphigh/mw-scratch`) instead of the root disk |
@@ -107,6 +108,21 @@ Flags live in `~/apps/meeting-whisperer/.env.local` on the VM; every one is read
   multi-file group. Nothing to switch off for them.
 - [ ] Optional, independent: **ALOK** `mkdir -p /temphigh/mw-scratch`, set `MW_SCRATCH_DIR=/temphigh/mw-scratch`,
       restart — the stitch of a multi-file upload then works on the NVMe. Unset = today's behaviour exactly.
+
+## J. Several recordings, one meeting (Phase 3b) — server b540e8a, UI in progress
+
+- [ ] **ALOK** deploy `voiceprint/server.py` to the VM's sidecar dir and `pm2 restart mw-voiceprint` (the /align
+      endpoint; numpy only, nothing to install). Check nginx/pm2 timeouts: aligning two multi-hour recordings takes
+      minutes (route `maxDuration` 800 s).
+- [ ] **ALOK** set `MW_COMBINE=1`, restart (needs G on). Acceptance: rebuild the SI-BL day (row 548's three
+      recordings) with Add a recording… + Guess instead of the hand merge, compare the text.
+
+## K. Tray 0.3.12 (mix as track 0) — d7842cd
+
+- [ ] **ALOK** `cd poc/mac-recorder && ./make-app.sh --release && ./dist-scripts/deploy-to-dot6.sh` (also carries
+      0.3.11's same-file check). After the first real recording on 0.3.12: `ffprobe` its file — audio stream 0 must be
+      the stereo `qmx` mix — and check the transcript word count is sane (the 2026-09-16 failure mode is 1/3 of the
+      words). Only then set `MW_AAI_FROM_BLOB=1` (section I).
 
 ## Order and dependencies
 
