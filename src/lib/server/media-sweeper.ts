@@ -8,6 +8,16 @@ import { audioFileExists, getAudioDir } from '@/lib/server/audio-storage';
 import { buildAudioOnly, getAudioOnlyDir } from '@/lib/server/audio-only';
 import { ensureFaststart } from '@/lib/server/media-faststart';
 import { queueDerivativeMediaDrop, queueRecordingGraphSync } from '@/lib/server/recording-sync';
+import {
+  archiveBudgetVerdict,
+  archiveMedia,
+  archiveShouldYield,
+  archiveStore,
+  drainPendingBlobDeletes,
+  fmtBytes,
+  localMediaPath,
+} from '@/lib/server/media-archive';
+import { listMediaToArchive } from '@/db-ops/recordings';
 import type { GmeetContext } from '@/lib/format';
 
 /**
@@ -31,6 +41,12 @@ import type { GmeetContext } from '@/lib/format';
  *     `.m4a` derivatives whose source file is gone (permanent delete, a
  *     re-transcribe that renamed the source) are removed, one line each.
  *
+ * The same tick also runs the MEDIA ARCHIVE backfill (DEC-3 Stage A.3,
+ * `media-archive.ts`): local files with no blob yet are copied to the
+ * permanent media container, oldest first, at most 2 GB / 5 files per tick and
+ * never while an ingest or an AI run is in flight. It is last in the tick and
+ * inert unless DARTH_MEDIA_ACCOUNT and MW_MEDIA_ARCHIVE are both set.
+ *
  * State lives in `gmeet_context.media` (see GmeetContext): a row qualifies
  * while `faststart`/`audioOnly` are not both true or `parts` is below the
  * number of stored videoParts (a part fetched later re-qualifies the row).
@@ -45,6 +61,18 @@ const MAX_ATTEMPTS = 3;
 const RETRY_AFTER = '6 hours';
 /** A `.tmp` in the derivative dir older than this is a crashed transcode. */
 const STALE_TMP_MS = 2 * 60 * 60 * 1000;
+/**
+ * The media-archive backfill's budget per tick (DEC-3 Stage A.3): 80 GB of
+ * existing media at 2 GB per 5-minute tick is roughly 3–4 h of ticks, and the
+ * file cap keeps a tick short when the files are small. A single file larger
+ * than the byte budget is still archived — as the first file of a tick, alone.
+ */
+const ARCHIVE_MAX_BYTES_PER_TICK = 2 * 1024 * 1024 * 1024;
+const ARCHIVE_MAX_FILES_PER_TICK = 5;
+/** Candidates read per tick; the extra ones absorb rows whose file is gone. */
+const ARCHIVE_SCAN_PER_TICK = 50;
+/** Blobs whose rows are already gone, retried per tick. */
+const ARCHIVE_DELETE_PER_TICK = 25;
 
 interface MediaRow {
   user_id: string;
@@ -252,6 +280,79 @@ async function sweepOrphanDerivatives(): Promise<void> {
   queueDerivativeMediaDrop(dropped, '[media-sweeper]');
 }
 
+/**
+ * DEC-3 Stage A.3 — the archive backfill. Media rows we hold locally and have
+ * no blob for, oldest capture first, paced so the copy never competes with
+ * something a person is waiting for: the whole pass is skipped while an ingest
+ * or an AI run is in flight, and it stops at ARCHIVE_MAX_BYTES_PER_TICK /
+ * ARCHIVE_MAX_FILES_PER_TICK.
+ *
+ * One line per tick in the pm2 log; `scripts/media-archive-status.ts` has the
+ * totals. Inert (not one query) unless DARTH_MEDIA_ACCOUNT and
+ * MW_MEDIA_ARCHIVE are both set.
+ */
+async function archiveBackfillPass(): Promise<void> {
+  if (!archiveStore()) return;
+  const yieldTo = await archiveShouldYield();
+  if (yieldTo) {
+    console.log(`[media-archive] backfill skipped — ${yieldTo}`);
+    return;
+  }
+
+  const candidates = await listMediaToArchive(ARCHIVE_SCAN_PER_TICK);
+  if (candidates.length === 0) {
+    await drainPendingBlobDeletes(ARCHIVE_DELETE_PER_TICK);
+    return;
+  }
+
+  let files = 0;
+  let bytes = 0;
+  let noFile = 0;
+  let failed = 0;
+  const report: string[] = [];
+  const caps = { maxFiles: ARCHIVE_MAX_FILES_PER_TICK, maxBytes: ARCHIVE_MAX_BYTES_PER_TICK };
+  for (const row of candidates) {
+    if (archiveBudgetVerdict({ files, bytes }, 0, caps) === 'stop') break;
+    const abs = localMediaPath(row);
+    const st = abs ? await fsp.stat(abs).catch(() => null) : null;
+    if (!st?.isFile() || st.size === 0) {
+      // Nothing to copy. The row keeps its NULL blob_name and shows up in the
+      // verifier's INFO section; this pass simply steps over it.
+      noFile += 1;
+      continue;
+    }
+    if (archiveBudgetVerdict({ files, bytes }, st.size, caps) === 'stop') break;
+
+    const outcome = await archiveMedia(row);
+    if (outcome.status === 'archived') {
+      files += 1;
+      bytes += outcome.bytes;
+      report.push(`${row.kind} ${fmtBytes(outcome.bytes)} ${(outcome.ms / 1000).toFixed(1)}s`);
+    } else if (outcome.status === 'adopted') {
+      files += 1;
+      bytes += outcome.bytes;
+      report.push(`${row.kind} ${fmtBytes(outcome.bytes)} adopted`);
+    } else if (outcome.status === 'failed') {
+      failed += 1;
+      console.warn(`[media-archive] ${outcome.blobName}: ${outcome.error}`);
+    } else if (outcome.status === 'skipped') {
+      report.push(`skipped (${outcome.reason})`);
+      // A canary failure stops the whole pass, not just this file.
+      if (outcome.reason.startsWith('CANARY GONE')) break;
+    }
+  }
+
+  if (files > 0 || failed > 0 || report.length > 0) {
+    console.log(
+      `[media-archive] tick: ${files} file(s), ${fmtBytes(bytes)}` +
+        (noFile > 0 ? `, ${noFile} row(s) with no local file` : '') +
+        (failed > 0 ? `, ${failed} failed` : '') +
+        (report.length > 0 ? ` | ${report.join(' | ')}` : '')
+    );
+  }
+  await drainPendingBlobDeletes(ARCHIVE_DELETE_PER_TICK);
+}
+
 async function tick(): Promise<void> {
   if (g.__mwMediaSweeperTicking) return; // a long extract can outlive the interval
   g.__mwMediaSweeperTicking = true;
@@ -269,6 +370,13 @@ async function tick(): Promise<void> {
     await sweepOrphanDerivatives();
   } catch (err) {
     console.warn('[media-sweeper] derivative sweep failed:', err);
+  }
+  try {
+    // Last: the derivatives this tick just built are candidates too, and the
+    // archive must never delay the playback preparation people wait for.
+    await archiveBackfillPass();
+  } catch (err) {
+    console.warn('[media-archive] backfill pass failed:', err);
   } finally {
     g.__mwMediaSweeperTicking = false;
   }

@@ -23,6 +23,7 @@
 
 import { createHash } from 'node:crypto';
 import type { GmeetContext } from '@/lib/format';
+import { aaiJobIdOf } from '@/lib/aai-job-state';
 import { videoPartOffsets } from '@/lib/part-offsets';
 
 // ---------------------------------------------------------------------------
@@ -71,6 +72,9 @@ export interface GraphMeetingRow {
   id: number;
   user_id: string;
   assemblyai_id: string;
+  /** The AssemblyAI job (migration 045). Read it through `aaiJobIdOf`, which
+   * falls back to a UUID-shaped `assemblyai_id` for rows that predate 1b. */
+  aai_job_id?: string | null;
   original_filename: string | null;
   status: string;
   created_at: string | Date;
@@ -120,8 +124,25 @@ export interface GraphFileFacts {
 const AAI_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const SYNTHETIC = /^(gmeet-|teams-|ext-|up-|defer-)/;
 
-/** A real AssemblyAI job id, not one of our synthetic ones. */
+/**
+ * UUID-shaped and not one of our synthetic prefixes. Before Phase 1b that
+ * meant "a real AssemblyAI job id"; it does NOT any more — a meeting id we
+ * mint looks exactly the same. It survives as the shape test only; the
+ * question "does this row have a job" is `aaiJobIdOf`, and "is this row's
+ * meeting id its job id" is `isJobIdMeeting`.
+ */
 export const isRealAaiId = (id: string) => AAI_ID.test(id) && !SYNTHETIC.test(id);
+
+/**
+ * A meeting whose own id IS its AssemblyAI job — i.e. every upload born
+ * before Phase 1b, including the two-owner copies of one job. These are the
+ * only rows that may key a recording on the job id (see `canonicalKeyOf`),
+ * and the only ones two meetings can ever share.
+ */
+export function isJobIdMeeting(row: GraphMeetingRow): boolean {
+  const job = aaiJobIdOf(row);
+  return job !== null && job === row.assemblyai_id;
+}
 
 export type GraphSourceKind = 'recorder' | 'upload' | 'meet' | 'teams' | 'text' | 'aai-import';
 export type GraphProvider = 'assemblyai' | 'meet-doc' | 'teams-vtt' | 'text';
@@ -146,9 +167,12 @@ export function sourceKindOf(row: GraphMeetingRow): GraphSourceKind {
   if (id.startsWith('ext-')) return 'text';
   if (g?.provider === 'teams' || g?.teams) return 'teams';
   if (g?.videoFileId || g?.meetingCode || g?.actuals) return 'meet';
-  // Imported from AssemblyAI by id: a real job, no bytes of ours, no
-  // conferencing context. (All 35 such rows on prod are source='imported'.)
-  if (isRealAaiId(id) && !row.local_audio_path && !g) return 'aai-import';
+  // Imported from AssemblyAI by id: a job someone typed in, no bytes of ours,
+  // no conferencing context. (All 35 such rows on prod are source='imported';
+  // the feature itself was deleted with DEC-4.) `isJobIdMeeting`, not the id
+  // shape — a minted upload id is UUID-shaped too, and an upload whose file
+  // rename failed would otherwise be filed as an AssemblyAI import.
+  if (isJobIdMeeting(row) && !row.local_audio_path && !g) return 'aai-import';
   return 'upload';
 }
 
@@ -169,16 +193,19 @@ export function transcriptionStatusOf(row: GraphMeetingRow): GraphTranscriptionS
 /**
  * The key two meetings must share to collapse onto one recording.
  *
- * A real AssemblyAI job is the key, so the two-owner copies of one Meet call
- * land on one recording. Everything else keys on `transcripts.id` — the
+ * The AssemblyAI job is the key ONLY for a row whose meeting id IS that job
+ * (`isJobIdMeeting`) — the pre-1b rows, where it is what makes the two-owner
+ * copies of one Meet call land on one recording, and what keeps every id the
+ * Phase 1 backfill minted. Everything else keys on `transcripts.id` — the
  * DOCUMENT's identity, which (unlike `assemblyai_id` + user id, the shape
  * spec §2 sketched) survives both a placeholder promotion and an ownership
- * transfer. A promotion still moves the key from the `t…` form to the job id;
- * `applyRecordingGraph` migrates the clip and drops the placeholder's
- * recording rather than leaving two.
+ * transfer. A meeting minted by 1b therefore keeps the `t…` key it had as a
+ * placeholder, so its promotion does not move the recording at all; a pre-1b
+ * promotion still moves the key from `t…` to the job id and
+ * `applyRecordingGraph` migrates the clip rather than leaving two recordings.
  */
 export function canonicalKeyOf(row: GraphMeetingRow): string {
-  return isRealAaiId(row.assemblyai_id) ? row.assemblyai_id : `t${row.id}`;
+  return isJobIdMeeting(row) ? row.assemblyai_id : `t${row.id}`;
 }
 
 /** Placeholders with nothing behind them: no payload, no bytes, no job. */
@@ -430,7 +457,9 @@ export function deriveRecordingGraph(
     transcription: {
       id: transcriptionIdFor(recordingId),
       provider: providerOf(ownerRow),
-      providerJobId: isRealAaiId(ownerRow.assemblyai_id) ? ownerRow.assemblyai_id : null,
+      // The job itself, wherever it is recorded — `aai_job_id` for a minted
+      // meeting, the meeting id for every row born before 1b.
+      providerJobId: aaiJobIdOf(ownerRow),
       speechModel: ownerRow.speech_model,
       languageCode: ownerRow.language_code,
       status: transcriptionStatusOf(ownerRow),

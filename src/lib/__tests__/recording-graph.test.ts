@@ -4,6 +4,7 @@ import {
   canonicalKeyOf,
   deriveRecordingGraph,
   desiredClipFor,
+  isJobIdMeeting,
   isRealAaiId,
   ownerRowOf,
   providerOf,
@@ -68,9 +69,11 @@ describe('ids', () => {
 });
 
 describe('canonical key', () => {
-  test('a real AssemblyAI job is the key, so two importers collapse', () => {
+  test('a pre-1b meeting IS its AssemblyAI job, so two importers collapse', () => {
+    // No `aai_job_id` column yet (or the backfilled value, which equals the
+    // meeting id) — both are the same row to this rule.
     expect(canonicalKeyOf(row({ id: 7, user_id: 'u1' }))).toBe(AAI);
-    expect(canonicalKeyOf(row({ id: 9, user_id: 'u2' }))).toBe(AAI);
+    expect(canonicalKeyOf(row({ id: 9, user_id: 'u2', aai_job_id: AAI }))).toBe(AAI);
   });
 
   test('everything else keys on the row id, which survives a promotion', () => {
@@ -79,7 +82,24 @@ describe('canonical key', () => {
     expect(canonicalKeyOf(row({ id: 42, assemblyai_id: 'up-abc', user_id: 'u2' }))).toBe('t42');
   });
 
-  test('synthetic ids are not real AssemblyAI ids', () => {
+  test('a MINTED meeting keeps the t… key its placeholder had (Phase 1b)', () => {
+    // The job id is a different string from the meeting id, so it can never
+    // key the recording — and the promotion therefore moves nothing at all.
+    const minted = row({ id: 42, assemblyai_id: 'abcdef12-1111-4111-8111-abcdef123456', aai_job_id: AAI });
+    expect(canonicalKeyOf(minted)).toBe('t42');
+    expect(canonicalKeyOf(row({ id: 42, assemblyai_id: 'up-abcdef12-1111-4111-8111-abcdef123456' }))).toBe('t42');
+    // A retry puts a second job on the SAME meeting — still not the key.
+    expect(canonicalKeyOf(row({ id: 42, aai_job_id: 'bbbbbbbb-2222-4222-8222-bbbbbbbbbbbb' }))).toBe('t42');
+  });
+
+  test('isJobIdMeeting is the test, not the id shape', () => {
+    expect(isJobIdMeeting(row())).toBe(true);
+    expect(isJobIdMeeting(row({ aai_job_id: AAI }))).toBe(true);
+    expect(isJobIdMeeting(row({ aai_job_id: 'bbbbbbbb-2222-4222-8222-bbbbbbbbbbbb' }))).toBe(false);
+    expect(isJobIdMeeting(row({ assemblyai_id: 'gmeet-x' }))).toBe(false);
+  });
+
+  test('synthetic ids are not UUID-shaped — a shape test only, since 1b', () => {
     expect(isRealAaiId(AAI)).toBe(true);
     for (const id of ['gmeet-x', 'teams-x', 'ext-x', `up-${AAI}`, `defer-${AAI}`]) {
       expect(isRealAaiId(id)).toBe(false);
@@ -109,6 +129,15 @@ describe('classification', () => {
   test('a bare AssemblyAI id with no bytes and no context is an import', () => {
     expect(sourceKindOf(row({ local_audio_path: null, gmeet_context: null }))).toBe('aai-import');
     expect(sourceKindOf(row({ gmeet_context: null }))).toBe('upload');
+  });
+
+  test('a MINTED upload whose file is missing is still an upload, not an import', () => {
+    expect(
+      sourceKindOf(
+        row({ assemblyai_id: 'abcdef12-1111-4111-8111-abcdef123456', aai_job_id: AAI,
+              local_audio_path: null, gmeet_context: null })
+      )
+    ).toBe('upload');
   });
 
   test('status collapses to the three the transcription knows', () => {

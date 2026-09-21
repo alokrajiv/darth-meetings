@@ -17,11 +17,32 @@ export function scratchTrashDate(createdAt: string): Date {
   return new Date(new Date(createdAt).getTime() + SCRATCH_TTL_DAYS * 86_400_000);
 }
 
-/** A row from our `transcripts` table, as returned by /api/transcripts. */
+/**
+ * A row from our `transcripts` table, as returned by /api/transcripts.
+ *
+ * The two id columns mean different things since Phase 1b
+ * (docs/recordings-phase1b-spec.md; migration 045). `assemblyai_id` is the
+ * MEETING's opaque public id — it is what the URLs, `transcript_edits`,
+ * `speaker_mappings`, `ai_runs`, the SSE events and darth-cli key on, and its
+ * only readable property is which of OUR prefixes it carries (`gmeet-`,
+ * `teams-`, `ext-`, `up-`, `defer-`, or none for an ordinary transcribed
+ * upload). It happened to be the AssemblyAI job id for uploads born before
+ * 1b, and for those rows it still is; new uploads get a bare uuid we mint,
+ * which AssemblyAI has never heard of. The column keeps its name on purpose
+ * (D-H): renaming it would touch ~27 files and re-release the CLI for no
+ * behaviour. `aai_job_id` is the AssemblyAI job — disposable under DEC-4, the
+ * ONLY value that may be handed to the AssemblyAI SDK, and null for every row
+ * that never went there. Read it through `aaiJobIdOf()` (@/lib/aai-job-state),
+ * never by testing the shape of `assemblyai_id`.
+ */
 export interface StoredTranscript {
   id: number;
   user_id: string;
   assemblyai_id: string;
+  /** The AssemblyAI job behind this row (migration 045), or null when it
+   * never went to AssemblyAI. Undefined only in projections that predate the
+   * column. See the note above; use `aaiJobIdOf()`. */
+  aai_job_id?: string | null;
   original_filename: string | null;
   status: string;
   created_at: string;

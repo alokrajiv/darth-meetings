@@ -17,7 +17,9 @@ import {
 import { EMPTY_MEETING_FILTERS, type MeetingFilters } from '@/lib/server/meeting-filters';
 import { recordingCountExpr } from '@/db-ops/recordings';
 import { recordingsEnabled } from '@/lib/server/recordings';
-import { AAI_JOB_ID_RE, AAI_STUCK_HOURS } from '@/lib/aai-job-state';
+import { AAI_STUCK_HOURS } from '@/lib/aai-job-state';
+import { aaiJobIdColumnExists, jobIdSql, mintedIdsEnabled } from '@/db-ops/aai-job-id';
+import { promotedMeetingId } from '@/lib/meeting-ids';
 import type { LabelFilter } from '@/lib/labels';
 import type {
   GmeetContext,
@@ -38,12 +40,32 @@ export type TranscriptRow = StoredTranscript;
  * clause enforces `user_id = ${userId}`. Do NOT add a function here that
  * reads or writes transcripts without this constraint — that would break
  * per-user ACL.
+ *
+ * THE TWO ID COLUMNS (Phase 1b, migration 045 —
+ * docs/recordings-phase1b-spec.md). `assemblyai_id` is the MEETING's opaque
+ * public id: the URLs, `transcript_edits` / `speaker_mappings`
+ * (`UNIQUE (user_id, assemblyai_id)`), `ai_runs`, `meetings.transcript_id`,
+ * the media file names and darth-cli all key on it, and the only thing that
+ * may be read out of it is which of OUR prefixes it carries (`gmeet-`,
+ * `teams-`, `ext-`, `up-`, `defer-`, or none = an ordinary transcribed
+ * upload). `aai_job_id` is the AssemblyAI job — disposable under DEC-4, the
+ * only value that may reach the AssemblyAI SDK, null for rows that never went
+ * there. They are EQUAL for every upload born before 1b (the meeting used to
+ * take the job's id) and DIFFERENT for every one minted after, so no query
+ * may go on deriving one from the shape of the other: read the job through
+ * `aaiJobIdOf()` in JS and through `jobIdSql().expr` in SQL (db-ops/aai-job-id).
+ * The column is NOT renamed (D-H): it is an opaque document id, and renaming
+ * it would touch ~27 files and the CLI for no behaviour.
  */
 
 const SCHEMA = SCHEMAS.MEETING_WHISPERER;
 
 export interface TranscriptInsert {
   assemblyaiId: string;
+  /** The AssemblyAI job this row was submitted as (migration 045). Every
+   * writer of a SUBMITTED row passes it, flag or no flag — the column is the
+   * only place the job id is recorded once minted ids are on. */
+  aaiJobId?: string | null;
   originalFilename: string | null;
   status: string;
   languageCode?: string | null;
@@ -214,7 +236,8 @@ export async function listVisibleToUser(
   });
 }
 
-/** Minimal row shape the AAI pending-refresh fan-out needs. */
+/** Minimal row shape the AAI pending-refresh fan-out needs. The job id is in
+ * it because the fan-out polls the JOB, not the meeting (Phase 1b). */
 export type PendingRefreshRow = Pick<
   TranscriptListRow,
   | 'user_id'
@@ -224,16 +247,24 @@ export type PendingRefreshRow = Pick<
   | 'completed_at'
   | 'duration'
   | 'speaker_count'
->;
+> & {
+  /** Optional because the LEGACY listing's projection deliberately has no
+   * such column — adding one would change its response bytes, which darth-cli
+   * reads. That path resolves the job ids separately
+   * (`jobIdsForVisibleMeetings`). Present ⇒ authoritative, null included. */
+  aai_job_id?: string | null;
+};
 
 /**
  * Every visible row still in flight at AssemblyAI (queued/processing),
  * regardless of which listing page it would land on. Powers the v2 refresh
  * fan-out, which is decoupled from pagination so pending rows outside the
- * requested page keep getting refreshed. Synthetic `up-…`/`defer-…`/`ext-…`
- * placeholder ids never reached AAI, so they are excluded by id as well as
- * by status ('ext-' rows can sit in 'processing' while a background text
- * import normalizes).
+ * requested page keep getting refreshed. A row is in flight only if it HAS an
+ * AssemblyAI job (the SQL twin of `aaiJobIdOf`): that drops the synthetic
+ * `up-…`/`defer-…`/`ext-…` placeholders, which never reached AAI ('ext-' rows
+ * can sit in 'processing' while a background text import normalizes), and it
+ * keeps working once a minted meeting id is UUID-shaped too. The job id is
+ * returned with the row because it, not the meeting id, is what gets polled.
  *
  * Bounded by age: past AAI_STUCK_HOURS the job is the sweeper's problem, not
  * the listing's (lib/aai-job-state). Without this bound the 19 rows that had
@@ -247,9 +278,10 @@ export async function listPendingVisibleToUser(
   email: string
 ): Promise<PendingRefreshRow[]> {
   const normEmail = email.trim().toLowerCase();
+  const job = await jobIdSql('t');
   return sql<PendingRefreshRow[]>`
     SELECT t.user_id, t.assemblyai_id, t.status, t.created_at, t.completed_at,
-           t.duration, t.speaker_count
+           t.duration, t.speaker_count, ${job.expr} AS aai_job_id
     FROM ${sql(SCHEMA)}.transcripts t
     LEFT JOIN ${sql(SCHEMA)}.transcript_shares s
       ON s.transcript_id = t.id
@@ -257,12 +289,42 @@ export async function listPendingVisibleToUser(
     WHERE (t.user_id = ${userId} OR s.id IS NOT NULL)
       AND t.deleted_at IS NULL
       AND t.status NOT IN ('completed', 'error', 'uploading', 'waiting')
-      AND t.assemblyai_id NOT LIKE 'up-%'
-      AND t.assemblyai_id NOT LIKE 'defer-%'
-      AND t.assemblyai_id NOT LIKE 'ext-%'
+      AND ${job.expr2} IS NOT NULL
       AND COALESCE(t.upload_progress_at, t.created_at)
             > now() - make_interval(hours => ${AAI_STUCK_HOURS})
   `;
+}
+
+/**
+ * The AssemblyAI job behind each of these meetings, for rows the caller can
+ * see. Caller-scoped with the SAME owner-or-share predicate as every other
+ * listing query — it is a lookup over ids the caller already has, but it must
+ * not become a way to ask about someone else's meeting.
+ *
+ * Exists for the LEGACY listing (`GET /api/transcripts`), whose rows go onto
+ * the wire verbatim: putting `aai_job_id` in that projection would change the
+ * response bytes darth-cli reads, and since Phase 1b the poller can no longer
+ * guess the job from the meeting id. Called only for rows that are actually
+ * in flight, so a finished listing still makes no extra query.
+ */
+export async function jobIdsForVisibleMeetings(
+  userId: string,
+  email: string,
+  assemblyaiIds: string[]
+): Promise<Map<string, string | null>> {
+  if (assemblyaiIds.length === 0) return new Map();
+  const normEmail = email.trim().toLowerCase();
+  const job = await jobIdSql('t');
+  const rows = await sql<Array<{ assemblyai_id: string; aai_job_id: string | null }>>`
+    SELECT t.assemblyai_id, ${job.expr} AS aai_job_id
+    FROM ${sql(SCHEMA)}.transcripts t
+    LEFT JOIN ${sql(SCHEMA)}.transcript_shares s
+      ON s.transcript_id = t.id
+      AND s.shared_with_email = ${normEmail}
+    WHERE t.assemblyai_id = ANY(${assemblyaiIds})
+      AND (t.user_id = ${userId} OR s.id IS NOT NULL)
+  `;
+  return new Map(rows.map((r) => [r.assemblyai_id, r.aai_job_id]));
 }
 
 export interface TranscriptListPageOpts {
@@ -764,10 +826,15 @@ export async function createForUser(
   userId: string,
   data: TranscriptInsert
 ): Promise<TranscriptRow> {
+  // The job id is written whenever we know it and the column is there —
+  // independently of MW_MINTED_IDS (spec §2). With minting off the two
+  // columns simply agree, which is what every legacy row looks like.
+  const withJobId = data.aaiJobId !== undefined && (await aaiJobIdColumnExists());
   const rows = await sql<TranscriptRow[]>`
     INSERT INTO ${sql(SCHEMA)}.transcripts (
       user_id, assemblyai_id, original_filename, status, language_code, title, audio_url, source,
       drive_file_id, gmeet_context, speech_model, scratch
+      ${withJobId ? sql`, aai_job_id` : sql``}
     ) VALUES (
       ${userId}, ${data.assemblyaiId}, ${data.originalFilename ?? null},
       ${data.status}, ${data.languageCode ?? null}, ${data.title ?? null},
@@ -776,10 +843,12 @@ export async function createForUser(
       ${data.gmeetContext ? sql.json(data.gmeetContext as unknown as never) : null},
       ${data.speechModel ?? null},
       ${data.scratch ?? false}
+      ${withJobId ? sql`, ${data.aaiJobId ?? null}` : sql``}
     )
     ON CONFLICT (user_id, assemblyai_id) DO UPDATE
       SET original_filename = EXCLUDED.original_filename,
           status = EXCLUDED.status,
+          ${withJobId ? sql`aai_job_id = COALESCE(EXCLUDED.aai_job_id, ${sql(SCHEMA)}.transcripts.aai_job_id),` : sql``}
           speech_model = COALESCE(EXCLUDED.speech_model, ${sql(SCHEMA)}.transcripts.speech_model),
           language_code = COALESCE(EXCLUDED.language_code, ${sql(SCHEMA)}.transcripts.language_code),
           title = COALESCE(EXCLUDED.title, ${sql(SCHEMA)}.transcripts.title),
@@ -971,14 +1040,16 @@ export async function clearIngestFailure(userId: string, assemblyaiId: string): 
  * NOT user-scoped either — this is the sweeper's global view; the writes it
  * makes go back through the user-scoped `markAaiGaveUp`.
  *
- * `assemblyai_id ~* <uuid>` is the same "did this ever reach AAI?" test as
- * `isAaiJobId`, applied in SQL so the LIMIT is spent on real candidates.
- * Rows still waiting in OUR pipeline ('uploading', 'waiting', `up-…`,
- * `defer-…`, `ext-…`) fail one of the two predicates and are never returned.
+ * "Did this ever reach AAI?" is `jobIdSql().expr` — the SQL twin of `aaiJobIdOf`
+ * — applied here so the LIMIT is spent on real candidates. Rows still waiting
+ * in OUR pipeline ('uploading', 'waiting', `up-…`, `defer-…`, `ext-…`) fail
+ * one of the two predicates and are never returned.
  */
 export interface StuckAaiRow {
   user_id: string;
   assemblyai_id: string;
+  /** The job that is stuck (migration 045; = `assemblyai_id` pre-1b). */
+  aai_job_id: string | null;
   status: string;
   created_at: string;
   deleted_at: string | null;
@@ -992,14 +1063,16 @@ export interface StuckAaiRow {
 }
 
 export async function listStuckAtAai(hours: number, limit: number): Promise<StuckAaiRow[]> {
+  const job = await jobIdSql();
   return sql<StuckAaiRow[]>`
     SELECT user_id, assemblyai_id, status, created_at, deleted_at,
+           ${job.expr} AS aai_job_id,
            COALESCE(upload_progress_at, created_at) AS waiting_since,
            original_filename, title, language_code, speech_model,
            local_audio_path, gmeet_context
     FROM ${sql(SCHEMA)}.transcripts
     WHERE status IN ('queued', 'processing')
-      AND assemblyai_id ~* ${AAI_JOB_ID_RE.source}
+      AND ${job.expr2} IS NOT NULL
       AND COALESCE(upload_progress_at, created_at) < now() - make_interval(hours => ${hours})
     ORDER BY COALESCE(upload_progress_at, created_at) ASC
     LIMIT ${limit}
@@ -1116,21 +1189,46 @@ export async function updateUploadProgress(
 }
 
 /**
- * Swap the placeholder's synthetic id for the real AAI id once the
- * transcription is accepted. Shares survive (they key on the numeric row id).
- * Covers both placeholder kinds: `up-…` uploads (status 'uploading') and
- * `defer-…` deferred imports (status 'waiting'). Returns null when the row
- * is gone — e.g. the sweeper reaped it, or the user deleted the queued
- * import — so the caller can fall back to a fresh insert.
+ * Promote a placeholder once AssemblyAI has accepted the job. Shares survive
+ * (they key on the numeric row id). Covers both placeholder kinds: `up-…`
+ * uploads (status 'uploading') and `defer-…` deferred imports (status
+ * 'waiting'). Returns null when the row is gone — e.g. the sweeper reaped it,
+ * or the user deleted the queued import — so the caller can fall back to a
+ * fresh insert.
+ *
+ * `data.assemblyaiId` is the AssemblyAI JOB id, and what the meeting is
+ * called afterwards is decided here, not by the caller (Phase 1b §3):
+ *   - minting on  → the placeholder's own uuid, bare (`up-1234…` → `1234…`);
+ *   - minting off → the job id, exactly as before 1b;
+ *   - a non-placeholder id (a minted row being re-sent by Retry, or a legacy
+ *     row the sweeper gave up on) keeps the id it has — a second job lands on
+ *     the SAME meeting.
+ * Either way `aai_job_id` records the job, so the pollers and the DEC-4
+ * delete have something to ask AssemblyAI about.
+ *
+ * `repointMeeting(placeholder → new id)` runs unchanged: the minted id is the
+ * placeholder's own uuid, so `/m/` links and the `former_ids` self-heal
+ * behave exactly as they do today. It is skipped only when the id did not
+ * move (the Retry case), where there is nothing to repoint.
  */
 export async function promoteUploadingRow(
   userId: string,
   placeholderId: string,
   data: { assemblyaiId: string; status: string; audioUrl?: string | null; speechModel?: string | null }
 ): Promise<TranscriptRow | null> {
+  const jobId = data.assemblyaiId;
+  const withJobId = await aaiJobIdColumnExists();
+  // Without the column (045 not applied yet) the job can only live in the
+  // meeting id, so EVERY promote renames to it, exactly as before 1b — keeping
+  // a re-sent legacy row's old id there would leave the pollers asking
+  // AssemblyAI about the dead first job.
+  const newId = withJobId
+    ? promotedMeetingId(placeholderId, jobId, await mintedIdsEnabled())
+    : jobId;
   const rows = await sql<TranscriptRow[]>`
     UPDATE ${sql(SCHEMA)}.transcripts
-    SET assemblyai_id = ${data.assemblyaiId},
+    SET assemblyai_id = ${newId},
+        ${withJobId ? sql`aai_job_id = ${jobId},` : sql``}
         status = ${data.status},
         audio_url = ${data.audioUrl ?? null},
         speech_model = COALESCE(${data.speechModel ?? null}, speech_model)
@@ -1139,13 +1237,15 @@ export async function promoteUploadingRow(
     RETURNING *
   `;
   if (rows[0]) {
-    publishEvent({ kind: 'status', assemblyaiId: data.assemblyaiId });
-    await repointMeeting(placeholderId, data.assemblyaiId).catch(async (err) => {
-      console.error('[meetings] repoint failed, retrying once', placeholderId, '->', data.assemblyaiId, err);
-      await repointMeeting(placeholderId, data.assemblyaiId).catch((err2) =>
-        console.error('[meetings] repoint retry failed — /m/ link stuck on the dead placeholder id', placeholderId, err2)
-      );
-    });
+    publishEvent({ kind: 'status', assemblyaiId: newId });
+    if (newId !== placeholderId) {
+      await repointMeeting(placeholderId, newId).catch(async (err) => {
+        console.error('[meetings] repoint failed, retrying once', placeholderId, '->', newId, err);
+        await repointMeeting(placeholderId, newId).catch((err2) =>
+          console.error('[meetings] repoint retry failed — /m/ link stuck on the dead placeholder id', placeholderId, err2)
+        );
+      });
+    }
   }
   return rows[0] ?? null;
 }
@@ -1590,22 +1690,24 @@ export async function setVideoPartStoredForUser(
 }
 
 /**
- * DEC-4 bookkeeping: record that the AssemblyAI job is gone from AAI. Not
- * user-scoped on purpose — `UNIQUE (user_id, assemblyai_id)` lets two owners
- * hold copies of the SAME job, and one delete at AAI settles it for both, so
- * every copy gets the stamp. Atomic jsonb merge in SQL (same reason as
- * setVideoPartStoredForUser: concurrent writers to gmeet_context) and quiet —
- * nothing on an open page changes because of it. Returns the rows stamped.
+ * DEC-4 bookkeeping: record that the AssemblyAI job is gone from AAI. Keyed
+ * on the JOB, not the meeting (Phase 1b), and not user-scoped on purpose —
+ * `UNIQUE (user_id, assemblyai_id)` lets two owners hold copies of the same
+ * job, and one delete at AAI settles it for both, so every copy gets the
+ * stamp. Atomic jsonb merge in SQL (same reason as setVideoPartStoredForUser:
+ * concurrent writers to gmeet_context) and quiet — nothing on an open page
+ * changes because of it. Returns the rows stamped.
  */
 export async function stampAaiDeleted(
-  assemblyaiId: string,
+  jobId: string,
   stamp: { deletedAt: string; jobId: string }
 ): Promise<number> {
+  const job = await jobIdSql();
   const rows = await sql<Array<{ user_id: string }>>`
     UPDATE ${sql(SCHEMA)}.transcripts
     SET gmeet_context = COALESCE(gmeet_context, '{}'::jsonb)
       || jsonb_build_object('aai', ${sql.json(stamp as unknown as never)}::jsonb)
-    WHERE assemblyai_id = ${assemblyaiId}
+    WHERE ${job.expr} = ${jobId}
     RETURNING user_id
   `;
   return rows.length;
@@ -1615,26 +1717,33 @@ export async function stampAaiDeleted(
  * Rows whose AssemblyAI job should be deleted at AAI but isn't yet: finished,
  * payload verifiably stored, media on our disk, no `gmeet_context.aai` stamp.
  * Bounded to the recent past — this is the RETRY for a delete that failed at
- * completion, not a backfill (that's scripts/aai-purge.ts). Synthetic ids
- * (up-/defer-/ext-/gmeet-/teams-) are filtered by the caller's id shape test.
+ * completion, not a backfill (that's scripts/aai-purge.ts). Rows that never
+ * went to AssemblyAI are dropped here rather than by the caller: `aai_job_id`
+ * is what says so since 1b, and it is what the delete needs anyway.
  */
 export async function listAaiDeletePending(
   sinceHours: number,
   limit: number
-): Promise<Array<{ user_id: string; assemblyai_id: string; utterances: number }>> {
+): Promise<
+  Array<{ user_id: string; assemblyai_id: string; aai_job_id: string; utterances: number }>
+> {
   // The utterance count goes through a CASE, not a bare
   // `jsonb_typeof(...) = 'array' AND jsonb_array_length(...)`: WHERE clauses
   // are not evaluated left to right, and some rows store a JSON `null` there
   // — the planner happily runs the length first and errors with "cannot get
   // array length of a scalar".
-  return sql<Array<{ user_id: string; assemblyai_id: string; utterances: number }>>`
-    SELECT user_id, assemblyai_id,
+  const job = await jobIdSql();
+  return sql<
+    Array<{ user_id: string; assemblyai_id: string; aai_job_id: string; utterances: number }>
+  >`
+    SELECT user_id, assemblyai_id, ${job.expr} AS aai_job_id,
            jsonb_array_length(
              CASE WHEN jsonb_typeof(imported_content->'utterances') = 'array'
                   THEN imported_content->'utterances' END
            ) AS utterances
     FROM ${sql(SCHEMA)}.transcripts
     WHERE status = 'completed'
+      AND ${job.expr2} IS NOT NULL
       AND NOT (COALESCE(gmeet_context, '{}'::jsonb) ? 'aai')
       AND local_audio_path IS NOT NULL
       AND COALESCE(

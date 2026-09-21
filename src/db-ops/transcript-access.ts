@@ -60,9 +60,15 @@ export async function resolveAccess(
   // the owner OR has a share, return the row + their access level. We look
   // up by assemblyai_id globally (not scoped to user_id) because collaborators
   // don't own the row — the UNIQUE(user_id, assemblyai_id) constraint means
-  // there could be multiple owner rows for the same AAI id across users, but
+  // there could be multiple owner rows for the same id across users, but
   // a caller can only have access to one of them (their own, or the one they
   // were shared on).
+  //
+  // LEGACY-ONLY, that last case: it happens when two people imported the same
+  // Meet call before Phase 1b, when the meeting id WAS the AssemblyAI job id
+  // and both copies therefore took the same one. One prod pair exists
+  // (f4a32ca1…). A meeting id minted since is unique to one row by
+  // construction, so no new row can ever be found twice here.
   const rows = await sql<
     Array<StoredTranscript & { __access: TranscriptAccess }>
   >`

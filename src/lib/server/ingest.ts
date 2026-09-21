@@ -23,13 +23,16 @@ import { normalizeMultiTrack } from '@/lib/server/multitrack';
 import { autoAttachSeries } from '@/lib/server/series-attach';
 import { prepareMediaForPlayback } from '@/lib/server/media-sweeper';
 import { queueRecordingGraphSync } from '@/lib/server/recording-sync';
+import { mintedIdsEnabled } from '@/db-ops/aai-job-id';
+import { newMeetingId } from '@/lib/meeting-ids';
 import type { GmeetContext } from '@/lib/format';
 
 /**
  * Shared ingestion tail for audio that has already landed as a temp file in
  * the audio dir: upload to AssemblyAI (disk-streamed), submit transcription
  * with merged vocab bias, create the DB row, and rename the temp file to its
- * permanent `<aai-id>.<ext>` name.
+ * permanent `<meeting id>.<ext>` name — the MEETING's id, which since Phase
+ * 1b is only the AssemblyAI job id for rows minting did not touch.
  *
  * Used by both the raw-body upload route (POST /api/transcripts) and the
  * Google Meet import route (which downloads the bytes from Drive first).
@@ -248,6 +251,9 @@ export async function ingestLocalAudio(
   try {
     let promoted: TranscriptRow | null = null;
     if (opts.placeholderAssemblyaiId) {
+      // What the meeting ends up called is decided inside promoteUploadingRow
+      // (Phase 1b): the placeholder's own uuid when minted ids are on, the
+      // job id when they are not. `submitted.id` is always the JOB.
       promoted = await promoteUploadingRow(userId, opts.placeholderAssemblyaiId, {
         assemblyaiId: submitted.id,
         status: submitted.status,
@@ -259,7 +265,8 @@ export async function ingestLocalAudio(
     row =
       promoted ??
       (await createForUser(userId, {
-        assemblyaiId: submitted.id,
+        assemblyaiId: newMeetingId(submitted.id, await mintedIdsEnabled()),
+        aaiJobId: submitted.id,
         originalFilename: opts.originalFilename,
         status: submitted.status,
         speechModel: submitted.model,
@@ -292,20 +299,26 @@ export async function ingestLocalAudio(
   // after transcription, so their audio_url is useless for playback. The
   // bytes are already on disk as the temp file — just rename it to its
   // permanent name. We serve it via /api/transcripts/[id]/audio.
+  //
+  // Named after the MEETING (Phase 1b), which is the job id only for a row
+  // minting did not touch. `row.assemblyai_id` is the one source of that —
+  // `submitted.id` is the disposable job and must not name a file, a frames
+  // directory or an SSE event.
+  const meetingId = row.assemblyai_id;
   try {
-    let filename = audioFilename(submitted.id, opts.originalFilename);
+    let filename = audioFilename(meetingId, opts.originalFilename);
     if (filename.endsWith('.bin')) {
       // Extension-less original name (Drive names Meet recordings that way):
       // sniff the container so video detection and playback Content-Type work.
       const sniffed = await sniffMediaExtension(tempFilename);
-      if (sniffed) filename = `${submitted.id}${sniffed}`;
+      if (sniffed) filename = `${meetingId}${sniffed}`;
     }
     await renameAudioFile(tempFilename, filename);
-    await setLocalAudioPathForUser(userId, submitted.id, filename);
+    await setLocalAudioPathForUser(userId, meetingId, filename);
     row.local_audio_path = filename;
     // Faststart remux + audio-only extract, in the background: AAI already
     // has the bytes, so nothing on the transcription path waits for ffmpeg.
-    prepareMediaForPlayback(userId, submitted.id);
+    prepareMediaForPlayback(userId, meetingId);
   } catch (error) {
     // Non-fatal: the transcription itself succeeded. Audio playback for this
     // row will fall back to (broken) remote URL until/unless we re-upload.

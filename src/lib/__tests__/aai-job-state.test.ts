@@ -2,6 +2,7 @@ import { describe, expect, test } from 'bun:test';
 import {
   AAI_STUCK_HOURS,
   AAI_STUCK_REASON,
+  aaiJobIdOf,
   awaitingAai,
   isAaiJobId,
   stuckAtAai,
@@ -36,6 +37,36 @@ describe('isAaiJobId — only a real AAI job is AAI’s problem', () => {
   });
 });
 
+describe('aaiJobIdOf — which job to ask AssemblyAI about (Phase 1b)', () => {
+  const MINTED = '1234abcd-5678-4901-8abc-def012345678'; // a meeting id we minted
+
+  test('the column wins whenever it is set', () => {
+    expect(aaiJobIdOf({ assemblyai_id: MINTED, aai_job_id: JOB })).toBe(JOB);
+    // Retry put a SECOND job on a meeting that is still called by the FIRST.
+    expect(aaiJobIdOf({ assemblyai_id: JOB, aai_job_id: MINTED })).toBe(MINTED);
+  });
+
+  test('a row that predates the column falls back to its own id — if it is one', () => {
+    expect(aaiJobIdOf({ assemblyai_id: JOB })).toBe(JOB);
+    expect(aaiJobIdOf({ assemblyai_id: JOB, aai_job_id: null })).toBe(JOB);
+    expect(aaiJobIdOf({ assemblyai_id: JOB.toUpperCase() })).toBe(JOB.toUpperCase());
+  });
+
+  test('a row that never went to AssemblyAI has no job', () => {
+    for (const id of [`up-${JOB}`, `defer-${JOB}`, `ext-${JOB}`, 'gmeet-abc', 'teams-19:x', '']) {
+      expect(aaiJobIdOf({ assemblyai_id: id })).toBeNull();
+      expect(aaiJobIdOf({ assemblyai_id: id, aai_job_id: null })).toBeNull();
+    }
+  });
+
+  test('a minted meeting id is NEVER mistaken for a job', () => {
+    // The whole point of 1b: UUID-shaped no longer means "AssemblyAI knows it".
+    // A minted row always carries its job in the column (minting is forced off
+    // while the column is missing), so the fallback cannot fire for one.
+    expect(aaiJobIdOf({ assemblyai_id: MINTED, aai_job_id: JOB })).not.toBe(MINTED);
+  });
+});
+
 describe('awaitingAai / waitingOnAai', () => {
   test('only queued and processing mean AssemblyAI owes us an answer', () => {
     expect(awaitingAai('queued')).toBe(true);
@@ -50,6 +81,15 @@ describe('awaitingAai / waitingOnAai', () => {
     expect(waitingOnAai({ assemblyaiId: `ext-${JOB}`, status: 'processing' })).toBe(false);
     expect(waitingOnAai({ assemblyaiId: `up-${JOB}`, status: 'processing' })).toBe(false);
     expect(waitingOnAai({ assemblyaiId: JOB, status: 'processing' })).toBe(true);
+  });
+
+  test('a minted meeting id waits on the JOB in its column, not on itself', () => {
+    const minted = '1234abcd-5678-4901-8abc-def012345678';
+    expect(waitingOnAai({ assemblyaiId: minted, aaiJobId: JOB, status: 'processing' })).toBe(true);
+    // A `gmeet-`/`teams-` row with no job never waits, whatever its status.
+    expect(waitingOnAai({ assemblyaiId: 'gmeet-abc', aaiJobId: null, status: 'processing' })).toBe(
+      false
+    );
   });
 });
 

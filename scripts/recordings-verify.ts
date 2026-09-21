@@ -26,7 +26,7 @@ import { existsSync, statSync } from 'node:fs';
 import {
   deriveRecordingGraph,
   desiredClipFor,
-  isRealAaiId,
+  isJobIdMeeting,
   ownerRowOf,
   recordingFilenames,
   skipReason,
@@ -134,6 +134,12 @@ interface ActualMedia {
   has_video: boolean | null;
   source_ref: Record<string, unknown> | null;
   of_media_id: string | null;
+  // NOT derived from the `transcripts` row and therefore NEVER compared below
+  // (DEC-3 Stage A.5): only `src/lib/server/media-archive.ts` writes these,
+  // after Azure has confirmed the bytes, and no sync clears them. They are
+  // read only for the INFO block at the end of the report.
+  blob_name: string | null;
+  sha256: string | null;
 }
 interface ActualTranscription {
   id: string;
@@ -194,8 +200,20 @@ const judgedKinds = (graph: DesiredGraph) =>
 async function main() {
   await sql.unsafe('SET default_transaction_read_only = on');
 
+  // Tolerate a schema where migration 045 (`aai_job_id`) has not been applied:
+  // the job is then the meeting id, which is what every pre-1b row looks like.
+  const hasJobIdColumn =
+    (
+      await sql`
+        SELECT 1 FROM information_schema.columns
+        WHERE table_schema = ${SCHEMA} AND table_name = 'transcripts'
+          AND column_name = 'aai_job_id'
+      `
+    ).length > 0;
+  const jobIdCol = hasJobIdColumn ? sql`t.aai_job_id` : sql`NULL::text AS aai_job_id`;
+
   const rows = await sql<GraphMeetingRow[]>`
-    SELECT t.id, t.user_id, t.assemblyai_id, t.original_filename, t.status,
+    SELECT t.id, t.user_id, t.assemblyai_id, ${jobIdCol}, t.original_filename, t.status,
            t.created_at, t.completed_at, t.duration, t.language_code,
            t.speech_model, t.local_audio_path, t.deleted_at, t.gmeet_context,
            (t.imported_content IS NOT NULL) AS has_content,
@@ -225,7 +243,8 @@ async function main() {
     `,
     sql<ActualMedia[]>`
       SELECT id, recording_id, kind, ord, offset_ms::float8 AS offset_ms,
-             duration_ms::float8 AS duration_ms, filename, has_video, source_ref, of_media_id
+             duration_ms::float8 AS duration_ms, filename, has_video, source_ref, of_media_id,
+             blob_name, sha256
       FROM ${sql(SCHEMA)}.recording_media
     `,
     sql<ActualTranscription[]>`
@@ -257,7 +276,7 @@ async function main() {
 
   const byAaiId = new Map<string, GraphMeetingRow[]>();
   for (const row of rows) {
-    if (!isRealAaiId(row.assemblyai_id) || skipReason(row)) continue;
+    if (!isJobIdMeeting(row) || skipReason(row)) continue;
     byAaiId.set(row.assemblyai_id, [...(byAaiId.get(row.assemblyai_id) ?? []), row]);
   }
 
@@ -432,6 +451,55 @@ async function main() {
     }
   }
 
+  // ---- INFO: the media archive (DEC-3 Stage A) --------------------------
+  // `blob_name` / `sha256` are NOT derivable from a `transcripts` row, so a
+  // disagreement between them and the row is not drift and must never be a
+  // finding — nothing above compares them. They are still worth SEEING, so
+  // the two states that matter are counted here and printed as INFO: the
+  // exit code is unaffected.
+  const infos: string[] = [];
+  {
+    const archived = media.filter((m) => m.blob_name);
+    const unarchived = media.filter((m) => m.filename && !m.blob_name);
+    infos.push(`media archived (blob_name set) : ${archived.length}`);
+    infos.push(`media with a file, no blob yet : ${unarchived.length}`);
+    infos.push(`media naming no file at all    : ${media.filter((m) => !m.filename).length}`);
+    if (CHECK_FILES) {
+      const storage = path.resolve(CHECK_FILES);
+      // `audio_only` extracts live in a dir of their own; everything else is
+      // directly under `audio/` (see lib/server/audio-only.ts).
+      const localOf = (m: ActualMedia) =>
+        m.filename
+          ? path.join(storage, m.kind === 'audio_only' ? 'audio-only' : 'audio', m.filename)
+          : null;
+      const lostLocal = archived.filter((m) => {
+        const p = localOf(m);
+        return p ? !existsSync(p) : false;
+      });
+      const waiting = unarchived.filter((m) => {
+        const p = localOf(m);
+        return p ? existsSync(p) : false;
+      });
+      infos.push(
+        `  archived, local file gone    : ${lostLocal.length}  (blob-only; expected once Stage D drains storage/)`
+      );
+      infos.push(
+        `  local file present, no blob  : ${waiting.length}  (what the backfill still has to copy)`
+      );
+    }
+    // Migration 047 may not be applied on this schema yet.
+    const pending = await sql<Array<{ n: number; oldest: Date | null }>>`
+      SELECT count(*)::int AS n, min(queued_at) AS oldest
+      FROM ${sql(SCHEMA)}.media_blob_deletes
+    `.catch(() => null);
+    if (pending) {
+      infos.push(
+        `blobs queued for delete        : ${pending[0]?.n ?? 0}` +
+          (pending[0]?.oldest ? ` (oldest ${norm(pending[0].oldest)})` : '')
+      );
+    }
+  }
+
   // ---- report -----------------------------------------------------------
   const byMeeting = new Map<string, string[]>();
   for (const p of problems) {
@@ -448,6 +516,9 @@ async function main() {
   console.log(`media rows             : ${media.length}`);
   console.log(`transcriptions         : ${transcriptions.length}`);
   console.log(`clips                  : ${clips.length}`);
+  console.log('');
+  console.log('media archive (INFO, never drift)');
+  for (const line of infos) console.log(`  ${line}`);
   console.log('');
   console.log(`rows with drift        : ${byMeeting.size}`);
   console.log(`findings               : ${problems.length}`);

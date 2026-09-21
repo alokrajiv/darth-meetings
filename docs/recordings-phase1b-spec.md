@@ -69,3 +69,47 @@ Not unique: the one legacy two-owner job (f4a32ca1…) has two rows.
   lands), give-up after 6 h, retry-ingest → a second job id on the SAME meeting id, permanent delete, recording graph.
 - Flag off must be behaviour-identical to today except that `aai_job_id` gets written.
 - `bun test`, `bunx tsc --noEmit`, `bunx eslint` on touched files, `bun run build` with no env.
+
+## As built (2026-09-22)
+
+Done as specified, with these rulings where the brief left a gap:
+
+- **The accessor and its SQL twin.** `aaiJobIdOf(row)` lives in
+  `src/lib/aai-job-state.ts` (pure); `src/db-ops/aai-job-id.ts` holds the cached
+  column probe, `mintedIdsEnabled()` (the flag AND-ed with the column) and
+  `jobIdSql(alias)` → `{ column, expr, expr2 }`, the SQL twin. The column check
+  gates READS as well as writes: a `SELECT` naming a missing column breaks just
+  as hard as an `UPDATE`, so every projection and predicate goes through the
+  fragments and falls back to the pre-1b expression when 045 is absent.
+- **`isRealAaiId` was the wrong question, not the wrong name.** It stays as a
+  shape test (documented as such) and every caller moved to the new
+  `isJobIdMeeting(row)` — "this meeting's own id IS its job" — which is what
+  `canonicalKeyOf`, `sourceKindOf`'s `aai-import` branch and the recording
+  sync's two-owner collapse actually meant.
+- **A non-placeholder id is never renamed by a promote** (`promotedMeetingId`).
+  That covers two cases the brief did not name: a minted row re-sent by Retry
+  (a second job on the SAME meeting, as the verification section asks for), and
+  a legacy row the sweeper gave up on. It also makes rolling `MW_MINTED_IDS`
+  back safe — a minted row can never be re-pointed at a job id.
+- **A fresh insert with no placeholder** (the sweeper reaped it mid-upload) gets
+  a NEW uuid rather than the reaped placeholder's, which may still be aliased by
+  a `former_ids` entry. Nothing links to that row yet.
+- **The legacy listing keeps its exact response bytes.** Its projection has no
+  `aai_job_id` — adding one would change what darth-cli reads — so the pending
+  fan-out resolves the job ids for the few in-flight rows through
+  `jobIdsForVisibleMeetings` (caller-scoped, and not called at all when the
+  listing is all-finished). `StoredTranscript` DOES gain the field, so
+  `GET /api/transcripts/<id>` grows one key; darth-cli parses with an unchecked
+  cast and ignores unknown keys (surveyed read-only).
+- **darth-cli needs no release.** It never talks to AssemblyAI, never tests a
+  transcript id's shape, and already re-resolves promoted ids through
+  `/api/meetings/resolve?any=`. One doc line is now wrong:
+  `src/subcommands/meetings/README.md:48` still calls the public id "a bare AAI
+  uuid".
+- Migration 044 has **not** been applied on prod yet, so 1b's rollout still sits
+  behind Phase 1 step 1. 045's UPDATE would stamp exactly 502 of 691 prod rows
+  (the other 189: 144 `gmeet-`, 21 `teams-`, 14 `ext-`, 1 `up-`, 9 `defer-`; no
+  row is neither UUID-shaped nor a known prefix).
+- Rollout order: apply 045 → deploy with `MW_MINTED_IDS` unset (rows start
+  recording their job id) → set `MW_MINTED_IDS=1` and restart. Rolling back is
+  unsetting the flag; rows minted while it was on keep their ids.

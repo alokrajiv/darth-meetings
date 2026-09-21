@@ -12,6 +12,7 @@ import { deleteForUser as deleteSpeakerMappingsForUser } from '@/db-ops/speaker-
 import { resolveAccess } from '@/db-ops/transcript-access';
 import { identityForUser, logActivity } from '@/db-ops/transcript-activity';
 import { deleteTranscript as aaiDelete } from '@/lib/server/assemblyai';
+import { aaiJobIdOf } from '@/lib/aai-job-state';
 import { deleteAudioFile } from '@/lib/server/audio-storage';
 import { dropAudioOnly } from '@/lib/server/audio-only';
 import { refreshIfPending } from '@/lib/server/transcript-sync';
@@ -168,7 +169,11 @@ export const DELETE = withAuth(async ({ user, request }, { params }) => {
     return NextResponse.json({ ok: true, trashed: true });
   }
 
-  await aaiDelete(id);
+  // The AssemblyAI JOB, not the meeting: since Phase 1b an upload's meeting
+  // id is one we minted and AAI has never heard of it. Nothing to delete for
+  // a row that never went there.
+  const jobId = aaiJobIdOf(access.row);
+  if (jobId) await aaiDelete(jobId);
   await deleteSpeakerMappingsForUser(access.ownerUserId, id);
   // Before the row goes: `meeting_clips.transcript_id` has no FK (it is the
   // int family), so an orphan clip would survive the row forever.

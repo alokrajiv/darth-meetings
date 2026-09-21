@@ -5,7 +5,7 @@ import { getAudioOnlyPath } from '@/lib/server/audio-only';
 import {
   deriveRecordingGraph,
   desiredClipFor,
-  isRealAaiId,
+  isJobIdMeeting,
   ownerRowOf,
   recordingFilenames,
   skipReason,
@@ -19,6 +19,11 @@ import {
   removeMeetingFromRecordingGraph,
   stampTranscriptionProviderDeleted,
 } from '@/db-ops/recordings';
+import {
+  blobsHeldByMeeting,
+  deleteBlobsForRemovedRecordings,
+  queueMediaArchiveForRecording,
+} from '@/lib/server/media-archive';
 
 /**
  * Dual-write: keep recordings / recording_media / recording_transcriptions /
@@ -120,11 +125,13 @@ export async function syncRecordingGraphForMeeting(
   const why = skipReason(me);
   if (why) return { status: 'skipped', reason: why };
 
-  // Only a REAL AssemblyAI job collapses two meetings onto one recording. A
-  // synthetic id (`gmeet-<record>`) is identical for every importer by
-  // design but each of them parsed their own copy, so those stay separate —
-  // `canonicalKeyOf` keys them on `transcripts.id`.
-  const owner = (isRealAaiId(assemblyaiId) ? ownerRowOf(rows) : me) ?? me;
+  // Only a meeting whose id IS an AssemblyAI job collapses two meetings onto
+  // one recording — the pre-1b rows two people imported. A synthetic id
+  // (`gmeet-<record>`) is identical for every importer by design but each of
+  // them parsed their own copy, and a minted id (Phase 1b) is unique to one
+  // meeting by construction, so both stay separate — `canonicalKeyOf` keys
+  // them on `transcripts.id`.
+  const owner = (isJobIdMeeting(me) ? ownerRowOf(rows) : me) ?? me;
   if (skipReason(owner)) return { status: 'skipped', reason: 'owner row is a placeholder' };
 
   const files = opts?.probeFiles === false ? undefined : await probeFiles(owner);
@@ -134,6 +141,11 @@ export async function syncRecordingGraphForMeeting(
   // a shared job converges from whichever side is touched first.
   const clips = [desiredClipFor(me.id), ...(owner.id === me.id ? [] : [desiredClipFor(owner.id)])];
   const applied = await applyRecordingGraph({ graph, clips, createdBy: 'recording-sync' });
+
+  // DEC-3 Stage A: the files this sync has just described get their permanent
+  // copy in Azure Blob. Fire-and-forget and inert unless both
+  // DARTH_MEDIA_ACCOUNT and MW_MEDIA_ARCHIVE are set — see media-archive.ts.
+  queueMediaArchiveForRecording(applied.recordingId, 'recording-sync');
 
   return {
     status: 'written',
@@ -194,10 +206,15 @@ export function queueRecordingGraphSync(
  * to destroy must not leave rows behind, and the call is already on a slow
  * path (AAI delete + unlinking files).
  *
- * The FILE deletion logic is untouched in Phase 1: the route still walks the
- * row's own `local_audio_path` / `videoParts`. A recording kept alive by
+ * The LOCAL file deletion logic is untouched in Phase 1: the route still walks
+ * the row's own `local_audio_path` / `videoParts`. A recording kept alive by
  * another meeting's clip is logged so the shared-job case is visible while
  * that stays true.
+ *
+ * The BLOBS of the recordings that were actually removed go too (DEC-3 Stage
+ * A.7). Their names are read before the rows are destroyed — afterwards
+ * nothing knows them — and a delete that fails is left in `media_blob_deletes`
+ * for the sweeper. Soft delete never reaches here, so it never touches a blob.
  */
 export async function removeRecordingGraphForMeeting(
   transcriptId: number,
@@ -205,7 +222,11 @@ export async function removeRecordingGraphForMeeting(
 ): Promise<void> {
   if (!recordingsWriteEnabled()) return;
   try {
+    const blobs = await blobsHeldByMeeting(transcriptId);
     const out = await removeMeetingFromRecordingGraph(transcriptId);
+    if (blobs.length > 0) {
+      await deleteBlobsForRemovedRecordings(blobs, out.recordingsRemoved, tag);
+    }
     if (out.recordingsKept.length > 0) {
       console.log(
         `[recording-sync] ${tag} meeting ${transcriptId}: kept ${out.recordingsKept.length} ` +

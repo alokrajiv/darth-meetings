@@ -39,12 +39,17 @@ const INCLUDE_NO_MEDIA = args.includes('--include-no-media');
 const limitArg = args.indexOf('--limit');
 const LIMIT = limitArg >= 0 ? Number.parseInt(args[limitArg + 1] ?? '', 10) : NaN;
 
-/** AAI job ids are bare UUIDs; every id we mint carries a prefix. */
+/** AAI job ids are bare UUIDs. Only used for the pre-1b fallback below — a
+ * MEETING id is UUID-shaped too since Phase 1b, so what makes a row an
+ * AssemblyAI job is `aai_job_id` (migration 045), not the shape of its id. */
 const AAI_JOB_ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 interface Candidate {
   user_id: string;
   assemblyai_id: string;
+  /** The AssemblyAI job — what is deleted, and what the copies are grouped
+   * by. Equal to `assemblyai_id` for every row born before Phase 1b. */
+  aai_job_id: string | null;
   status: string;
   title: string | null;
   completed_at: string | null;
@@ -60,14 +65,27 @@ const sql = postgres({ onnotice: () => {} });
 function fmt(c: Candidate): string {
   const when = c.completed_at ? String(c.completed_at).slice(0, 10) : '????-??-??';
   const name = (c.title ?? '(untitled)').slice(0, 44);
-  return `${c.assemblyai_id}  ${when}  u=${c.utterances ?? 0} w=${c.words ?? 0}  ${
+  return `${c.aai_job_id}  ${when}  u=${c.utterances ?? 0} w=${c.words ?? 0}  ${
     c.has_media ? 'media' : 'NO-MEDIA'
   }${c.trashed ? ' trashed' : ''}  ${name}`;
 }
 
 async function main(): Promise<void> {
+  // Tolerate a schema where migration 045 has not been applied: the job is
+  // then the meeting id, which is exactly what every pre-1b row looks like.
+  const hasJobIdColumn =
+    (
+      await sql`
+        SELECT 1 FROM information_schema.columns
+        WHERE table_schema = ${SCHEMA} AND table_name = 'transcripts'
+          AND column_name = 'aai_job_id'
+      `
+    ).length > 0;
+  const legacyJobId = sql`CASE WHEN assemblyai_id ~* ${AAI_JOB_ID_RE.source} THEN assemblyai_id END`;
+  const jobIdExpr = hasJobIdColumn ? sql`COALESCE(aai_job_id, ${legacyJobId})` : legacyJobId;
+
   const rows = await sql<Candidate[]>`
-    SELECT user_id, assemblyai_id, status, title,
+    SELECT user_id, assemblyai_id, ${jobIdExpr} AS aai_job_id, status, title,
            completed_at::text AS completed_at,
            jsonb_array_length(
              CASE WHEN jsonb_typeof(imported_content->'utterances') = 'array'
@@ -89,10 +107,10 @@ async function main(): Promise<void> {
   // per job, not per row.
   const jobs = new Map<string, Candidate[]>();
   for (const r of rows) {
-    if (!AAI_JOB_ID_RE.test(r.assemblyai_id)) continue;
-    const list = jobs.get(r.assemblyai_id);
+    if (!r.aai_job_id) continue;
+    const list = jobs.get(r.aai_job_id);
     if (list) list.push(r);
-    else jobs.set(r.assemblyai_id, [r]);
+    else jobs.set(r.aai_job_id, [r]);
   }
 
   const ready: Candidate[] = [];
@@ -163,9 +181,10 @@ async function main(): Promise<void> {
   let deleted = 0;
   let failed = 0;
   for (const c of capped) {
+    const jobId = c.aai_job_id!;
     let gone = false;
     try {
-      await client.transcripts.delete(c.assemblyai_id);
+      await client.transcripts.delete(jobId);
       gone = true;
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
@@ -173,20 +192,22 @@ async function main(): Promise<void> {
         gone = true;
       } else {
         failed += 1;
-        console.warn(`  FAILED ${c.assemblyai_id}: ${message}`);
+        console.warn(`  FAILED ${jobId}: ${message}`);
       }
     }
     if (!gone) continue;
-    const stamp = { deletedAt: new Date().toISOString(), jobId: c.assemblyai_id };
+    const stamp = { deletedAt: new Date().toISOString(), jobId };
+    // Keyed on the JOB: every meeting that ran on it gets the stamp, however
+    // it is called.
     const stamped = await sql`
       UPDATE ${sql(SCHEMA)}.transcripts
       SET gmeet_context = COALESCE(gmeet_context, '{}'::jsonb)
         || jsonb_build_object('aai', ${sql.json(stamp as never)}::jsonb)
-      WHERE assemblyai_id = ${c.assemblyai_id}
+      WHERE ${jobIdExpr} = ${jobId}
       RETURNING user_id
     `;
     deleted += 1;
-    console.log(`  deleted ${c.assemblyai_id} (${stamped.length} row(s) stamped)`);
+    console.log(`  deleted ${jobId} (${stamped.length} row(s) stamped)`);
   }
 
   console.log('');

@@ -1,6 +1,7 @@
 import 'server-only';
 import { sql } from '@/lib/db';
 import { SCHEMAS } from '@/lib/constants/database';
+import { jobIdSql } from '@/db-ops/aai-job-id';
 import type { TranscriptResponse } from '@/lib/format';
 import type { ClipTextPolicy } from '@/lib/recording-clips';
 import type { TransactionSql } from 'postgres';
@@ -680,8 +681,12 @@ export async function loadMeetingRecordingGraphs(
  * junk marker can never make the cast throw.
  */
 export async function loadGraphMeetingRows(assemblyaiId: string): Promise<GraphMeetingRow[]> {
+  // The job id comes through `jobIdSql` so this keeps working on a
+  // schema where migration 045 has not been applied (it selects a NULL, and
+  // `aaiJobIdOf` falls back to a UUID-shaped meeting id, as for any pre-1b row).
+  const job = await jobIdSql('t');
   return sql<GraphMeetingRow[]>`
-    SELECT t.id, t.user_id, t.assemblyai_id, t.original_filename, t.status,
+    SELECT t.id, t.user_id, t.assemblyai_id, ${job.column}, t.original_filename, t.status,
            t.created_at, t.completed_at, t.duration, t.language_code,
            t.speech_model, t.local_audio_path, t.deleted_at, t.gmeet_context,
            (t.imported_content IS NOT NULL) AS has_content,
@@ -767,6 +772,13 @@ export async function applyRecordingGraph(
         updated_at            = now()
     `;
 
+    // NOTE (DEC-3 Stage A.5): `blob_name` and `sha256` are deliberately absent
+    // from both the column list and the DO UPDATE below, and `recordings`'
+    // upsert above omits `sha256` for the same reason. Those three are NOT
+    // derived from the `transcripts` row — only `media-archive.ts` writes
+    // them, and only after Azure has confirmed the bytes. A sync must never
+    // null or overwrite an archive stamp, and `recordings-verify` never judges
+    // them as drift.
     for (const m of graph.media) {
       await tx`
         INSERT INTO ${tx(SCHEMA)}.recording_media
@@ -1003,4 +1015,191 @@ export async function moveRecordingOwnershipForMeeting(
     RETURNING id
   `;
   return { moved: moved.map((r) => r.id), shared };
+}
+
+// ---------------------------------------------------------------------------
+// The media archive (Stage A) — docs/recordings-blob-spec.md
+//
+// APPEND-ONLY section. `blob_name` / `sha256` / `bytes` on `recording_media`
+// are NOT derived from the `transcripts` row: only the archive writes them,
+// only after it has re-read the blob and agreed with it, and no sync ever
+// clears them (`applyRecordingGraph` does not name those columns — see the
+// comment on its media upsert). Migration 047 adds the two bookkeeping
+// tables used below.
+// ---------------------------------------------------------------------------
+
+/**
+ * INTERNAL-ONLY — the backfill queue: files we hold locally that have no blob
+ * yet, oldest capture first. A soft-deleted recording is skipped: its bytes
+ * are on their way out, and the pacing budget belongs to live media.
+ */
+export async function listMediaToArchive(limit: number): Promise<RecordingMediaRow[]> {
+  return sql<RecordingMediaRow[]>`
+    SELECT ${mediaCols} FROM ${sql(SCHEMA)}.recording_media m
+    WHERE m.filename IS NOT NULL
+      AND m.blob_name IS NULL
+      AND EXISTS (
+        SELECT 1 FROM ${sql(SCHEMA)}.recordings r
+        WHERE r.id = m.recording_id AND r.deleted_at IS NULL
+      )
+    ORDER BY m.created_at, m.id
+    LIMIT ${limit}
+  `;
+}
+
+/**
+ * INTERNAL-ONLY — the archive's ONE write, made only after the blob has been
+ * re-read and matched on size + stored hash (spec Stage A.1: verify, then
+ * stamp). `blob_name` is set unconditionally because a re-archive to the same
+ * deterministic name is the same bytes; `bytes` and `sha256` come from the
+ * verified upload. Returns false when the row vanished meanwhile.
+ */
+export async function stampMediaArchived(
+  id: string,
+  p: { blobName: string; sha256: string; bytes: number }
+): Promise<boolean> {
+  const rows = await sql<Array<{ id: string }>>`
+    UPDATE ${sql(SCHEMA)}.recording_media
+    SET blob_name = ${p.blobName}, sha256 = ${p.sha256}, bytes = ${p.bytes}
+    WHERE id = ${id}::uuid
+    RETURNING id
+  `;
+  return rows.length > 0;
+}
+
+/**
+ * INTERNAL-ONLY — spec Stage A.6: `recordings.sha256` IS the canonical media's
+ * sha256 (what Phase 2's "you have already transcribed this file" check
+ * reads). Written when the canonical is archived and its hash is therefore
+ * known; a no-op when it already says the same thing.
+ */
+export async function setRecordingSha256(recordingId: string, sha256: string): Promise<boolean> {
+  const rows = await sql<Array<{ id: string }>>`
+    UPDATE ${sql(SCHEMA)}.recordings
+    SET sha256 = ${sha256}, updated_at = now()
+    WHERE id = ${recordingId}::uuid AND sha256 IS DISTINCT FROM ${sha256}
+    RETURNING id
+  `;
+  return rows.length > 0;
+}
+
+export interface ArchivedBlobRef {
+  recording_id: string;
+  media_id: string;
+  blob_name: string;
+}
+
+/**
+ * INTERNAL-ONLY — every archived blob of the given recordings. Read BEFORE
+ * the rows are deleted (permanent delete): once they are gone nothing knows
+ * the blob names any more.
+ */
+export async function listMediaBlobsForRecordings(
+  recordingIds: string[]
+): Promise<ArchivedBlobRef[]> {
+  if (recordingIds.length === 0) return [];
+  return sql<ArchivedBlobRef[]>`
+    SELECT recording_id, id AS media_id, blob_name
+    FROM ${sql(SCHEMA)}.recording_media
+    WHERE recording_id = ANY(${recordingIds}::uuid[])
+      AND blob_name IS NOT NULL
+  `;
+}
+
+/**
+ * INTERNAL-ONLY — queue blobs whose media row has just been destroyed. The
+ * sweeper drains this; a delete that fails is retried rather than lost, which
+ * is the whole reason the queue exists (migration 047).
+ */
+export async function queueBlobDeletes(refs: ArchivedBlobRef[]): Promise<number> {
+  if (refs.length === 0) return 0;
+  const rows = await sql<Array<{ blob_name: string }>>`
+    INSERT INTO ${sql(SCHEMA)}.media_blob_deletes
+      ${sql(refs as unknown as readonly Record<string, unknown>[], 'blob_name', 'recording_id', 'media_id')}
+    ON CONFLICT (blob_name) DO NOTHING
+    RETURNING blob_name
+  `;
+  return rows.length;
+}
+
+export interface PendingBlobDeleteRow {
+  blob_name: string;
+  recording_id: string | null;
+  media_id: string | null;
+  queued_at: string;
+  attempts: number;
+  last_error: string | null;
+}
+
+/** INTERNAL-ONLY — the sweeper's drain list, oldest first, retries last. */
+export async function listPendingBlobDeletes(limit: number): Promise<PendingBlobDeleteRow[]> {
+  return sql<PendingBlobDeleteRow[]>`
+    SELECT blob_name, recording_id, media_id, queued_at, attempts, last_error
+    FROM ${sql(SCHEMA)}.media_blob_deletes
+    WHERE last_attempt_at IS NULL OR last_attempt_at < now() - interval '15 minutes'
+    ORDER BY attempts, queued_at
+    LIMIT ${limit}
+  `;
+}
+
+/** INTERNAL-ONLY — the blob is gone (or was never there); forget it. */
+export async function clearPendingBlobDelete(blobName: string): Promise<void> {
+  await sql`DELETE FROM ${sql(SCHEMA)}.media_blob_deletes WHERE blob_name = ${blobName}`;
+}
+
+/** INTERNAL-ONLY — the delete failed; leave it queued with the reason. */
+export async function markPendingBlobDeleteFailed(blobName: string, error: string): Promise<void> {
+  await sql`
+    UPDATE ${sql(SCHEMA)}.media_blob_deletes
+    SET attempts = attempts + 1, last_attempt_at = now(), last_error = ${error.slice(0, 300)}
+    WHERE blob_name = ${blobName}
+  `;
+}
+
+export interface MediaCanaryRow {
+  name: string;
+  written_at: string;
+  last_ok_at: string | null;
+  missing_at: string | null;
+}
+
+/** INTERNAL-ONLY — every canary, oldest first (spec Stage A.4). */
+export async function listMediaCanaries(): Promise<MediaCanaryRow[]> {
+  return sql<MediaCanaryRow[]>`
+    SELECT name, written_at, last_ok_at, missing_at
+    FROM ${sql(SCHEMA)}.media_archive_canaries
+    ORDER BY written_at
+  `;
+}
+
+/** INTERNAL-ONLY — record a canary we have just written to the container. */
+export async function insertMediaCanary(name: string): Promise<void> {
+  await sql`
+    INSERT INTO ${sql(SCHEMA)}.media_archive_canaries (name, last_ok_at)
+    VALUES (${name}, now())
+    ON CONFLICT (name) DO NOTHING
+  `;
+}
+
+/** INTERNAL-ONLY — the canary blob is still there. */
+export async function markMediaCanarySeen(name: string): Promise<void> {
+  await sql`
+    UPDATE ${sql(SCHEMA)}.media_archive_canaries
+    SET last_ok_at = now(), missing_at = NULL
+    WHERE name = ${name}
+  `;
+}
+
+/**
+ * INTERNAL-ONLY — the canary blob has been eaten. While any row carries
+ * `missing_at` the archive refuses to write anything (spec Stage A.4): a
+ * lifecycle rule that deletes a blob we never touched would delete the
+ * recordings too.
+ */
+export async function markMediaCanaryMissing(name: string): Promise<void> {
+  await sql`
+    UPDATE ${sql(SCHEMA)}.media_archive_canaries
+    SET missing_at = COALESCE(missing_at, now())
+    WHERE name = ${name}
+  `;
 }

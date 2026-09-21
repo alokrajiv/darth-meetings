@@ -1,6 +1,6 @@
 import 'server-only';
 import { deleteTranscript } from '@/lib/server/assemblyai';
-import { isAaiJobId } from '@/lib/aai-job-state';
+import { aaiJobIdOf } from '@/lib/aai-job-state';
 import { getForUser, stampAaiDeleted, type TranscriptRow } from '@/db-ops/transcripts';
 import { queueProviderDeletedStamp } from '@/lib/server/recording-sync';
 
@@ -22,14 +22,14 @@ import { queueProviderDeletedStamp } from '@/lib/server/recording-sync';
  */
 
 /**
- * AssemblyAI job ids are plain UUIDs. Every id we mint ourselves carries a
- * prefix instead (`up-`, `defer-`, `ext-`, `gmeet-`, `teams-`), so a UUID
- * test is the one check that stays correct when another prefix is added.
- * The test itself lives in `@/lib/aai-job-state` — the give-up rules need it
- * too and that module is pure (unit-testable); re-exported here so existing
- * importers of `isAaiJobId` are unaffected.
+ * Which AssemblyAI job a row belongs to — since Phase 1b that is a COLUMN
+ * (`aai_job_id`, migration 045), not something derivable from the meeting id:
+ * an id we mint is UUID-shaped too. The accessor lives in
+ * `@/lib/aai-job-state` — the give-up rules and the pollers need it too and
+ * that module is pure (unit-testable); re-exported here so callers reach it
+ * through the AAI wrapper they already import.
  */
-export { isAaiJobId } from '@/lib/aai-job-state';
+export { aaiJobIdOf } from '@/lib/aai-job-state';
 
 /** Lazy, per-call — see the module comment. */
 export function deleteOnCompleteEnabled(): boolean {
@@ -78,6 +78,11 @@ function unsafeReason(
  * One job can back several rows (`UNIQUE (user_id, assemblyai_id)` — two
  * people importing the same meeting). The delete happens once; the stamp goes
  * on every copy, which is also what makes this idempotent.
+ *
+ * `assemblyaiId` is the MEETING (the caller never has anything else). The job
+ * comes off the row that is read back here, and it — not the meeting id — is
+ * what AssemblyAI is asked to delete and what the stamp is keyed on
+ * (Phase 1b). A row with no job is nothing to delete.
  */
 export async function deleteAtAaiIfSafe(
   ownerUserId: string,
@@ -85,7 +90,6 @@ export async function deleteAtAaiIfSafe(
   expectedUtterances: number | null
 ): Promise<RetentionOutcome> {
   if (!deleteOnCompleteEnabled()) return 'skipped';
-  if (!isAaiJobId(assemblyaiId)) return 'skipped';
 
   let row: TranscriptRow | null;
   try {
@@ -96,32 +100,34 @@ export async function deleteAtAaiIfSafe(
   }
   if (!row) return 'skipped';
   if (row.gmeet_context?.aai?.deletedAt) return 'skipped';
+  const jobId = aaiJobIdOf(row);
+  if (!jobId) return 'skipped';
 
   const reason = unsafeReason(row, expectedUtterances);
   if (reason) {
-    console.warn(`[aai-retention] NOT deleting ${assemblyaiId} at AAI: ${reason}`);
+    console.warn(`[aai-retention] NOT deleting ${jobId} at AAI: ${reason}`);
     return 'unsafe';
   }
 
-  const gone = await deleteTranscript(assemblyaiId);
+  const gone = await deleteTranscript(jobId);
   if (!gone) {
-    console.warn(`[aai-retention] delete rejected by AAI ${assemblyaiId} — will retry`);
+    console.warn(`[aai-retention] delete rejected by AAI ${jobId} — will retry`);
     return 'failed';
   }
 
-  const stamp = { deletedAt: new Date().toISOString(), jobId: assemblyaiId };
+  const stamp = { deletedAt: new Date().toISOString(), jobId };
   try {
-    const copies = await stampAaiDeleted(assemblyaiId, stamp);
+    const copies = await stampAaiDeleted(jobId, stamp);
     // DEC-4's other half: one `recording_transcriptions` row holds this job
     // however many meetings point at it, so the stamp is keyed on the job id.
-    queueProviderDeletedStamp(assemblyaiId, stamp.deletedAt);
+    queueProviderDeletedStamp(jobId, stamp.deletedAt);
     console.log(
-      `[aai-retention] deleted ${assemblyaiId} at AAI (${row.imported_content?.utterances?.length ?? 0} utterances kept, ${copies} row(s) stamped)`
+      `[aai-retention] deleted ${jobId} at AAI (${row.imported_content?.utterances?.length ?? 0} utterances kept, ${copies} row(s) stamped)`
     );
   } catch (err) {
     // The delete already happened; losing the stamp only costs a no-op retry
     // (AAI answers 404, which deleteTranscript treats as success).
-    console.warn(`[aai-retention] stamp failed after delete ${assemblyaiId}:`, err);
+    console.warn(`[aai-retention] stamp failed after delete ${jobId}:`, err);
   }
   return 'deleted';
 }

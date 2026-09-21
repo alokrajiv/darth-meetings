@@ -11,11 +11,7 @@ import {
   mergeGmeetContextForUser,
   softDeleteForUser,
 } from '@/db-ops/transcripts';
-import {
-  deleteAtAaiIfSafe,
-  deleteOnCompleteEnabled,
-  isAaiJobId,
-} from '@/lib/server/aai-retention';
+import { deleteAtAaiIfSafe, deleteOnCompleteEnabled } from '@/lib/server/aai-retention';
 import { AAI_STUCK_HOURS, AAI_STUCK_REASON } from '@/lib/aai-job-state';
 import { giveUpOnAaiJob } from '@/lib/server/aai-giveup';
 import { identityForUser } from '@/db-ops/transcript-activity';
@@ -145,7 +141,7 @@ async function sweep(): Promise<void> {
       const flipped = await giveUpOnAaiJob(s.user_id, s.assemblyai_id, AAI_STUCK_REASON, s);
       if (flipped) {
         console.log(
-          `[notes-sweeper] gave up on AssemblyAI job ${s.assemblyai_id} ` +
+          `[notes-sweeper] gave up on AssemblyAI job ${s.aai_job_id} (meeting ${s.assemblyai_id}) ` +
             `(waiting since ${s.waiting_since}${s.deleted_at ? ', trashed' : ''}` +
             `${s.local_audio_path ? '' : ', no stored media'})`
         );
@@ -159,11 +155,13 @@ async function sweep(): Promise<void> {
   // re-verifies each row itself, so this query only has to narrow the field.
   if (deleteOnCompleteEnabled()) {
     try {
+      // The query already dropped rows with no job (Phase 1b: the meeting id
+      // no longer says whether there is one); `deleteAtAaiIfSafe` re-reads the
+      // row and takes the job id off it again.
       const pending = await listAaiDeletePending(AAI_DELETE_SINCE_HOURS, AAI_DELETE_PER_SWEEP);
       for (const p of pending) {
-        if (!isAaiJobId(p.assemblyai_id)) continue;
         await deleteAtAaiIfSafe(p.user_id, p.assemblyai_id, p.utterances).catch((err) =>
-          console.warn(`[notes-sweeper] AAI delete retry ${p.assemblyai_id} failed:`, err)
+          console.warn(`[notes-sweeper] AAI delete retry ${p.aai_job_id} failed:`, err)
         );
       }
     } catch (err) {

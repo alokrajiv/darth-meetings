@@ -1,7 +1,7 @@
 import 'server-only';
 import { getTranscript, isAaiNotFound } from '@/lib/server/assemblyai';
 import { updateStatusForUser, type TranscriptRow } from '@/db-ops/transcripts';
-import { AAI_GONE_REASON, isAaiJobId } from '@/lib/aai-job-state';
+import { AAI_GONE_REASON, aaiJobIdOf } from '@/lib/aai-job-state';
 import { giveUpOnAaiJob } from '@/lib/server/aai-giveup';
 import { onTranscriptCompleted } from '@/lib/server/post-completion';
 import { queueRecordingGraphSync } from '@/lib/server/recording-sync';
@@ -11,8 +11,8 @@ import { queueRecordingGraphSync } from '@/lib/server/recording-sync';
  * AssemblyAI and persist it. Returns the (possibly updated) row. Swallows
  * upstream errors so a transient AAI hiccup doesn't break the list endpoint.
  *
- * Three things stop the poll before it reaches AAI: a terminal status, an id
- * AssemblyAI never issued (`ext-…`, `gmeet-…`, `teams-…`), a
+ * Three things stop the poll before it reaches AAI: a terminal status, a row
+ * with no AssemblyAI job to poll (`ext-…`, `gmeet-…`, `teams-…`), a
  * TRASHED row (opening `/transcript/<id>` of a soft-deleted pending row used
  * to poll AssemblyAI on every load — `resolveAccess` does not filter
  * `deleted_at`, by design, so the guard lives here). Jobs pending past AAI_STUCK_HOURS are
@@ -36,8 +36,11 @@ export async function refreshIfPending(
 
   // …and neither has it heard of `ext-…` (text imports normalising in the
   // background sit in 'processing'), `gmeet-…` or `teams-…`. The listing
-  // fan-out already excluded those by id; this path never did.
-  if (!isAaiJobId(row.assemblyai_id)) return row;
+  // fan-out already excluded those by id; this path never did. Since Phase 1b
+  // the question is "does this row have a JOB", not "is its id UUID-shaped" —
+  // a minted meeting id is UUID-shaped and AAI has never heard of it either.
+  const jobId = aaiJobIdOf(row);
+  if (!jobId) return row;
 
   // In the trash: nobody is waiting for this status, and 19 prod rows sat
   // here burning an AAI call per page open.
@@ -50,7 +53,7 @@ export async function refreshIfPending(
   // polling through the status check above.
 
   try {
-    const aai = await getTranscript(row.assemblyai_id);
+    const aai = await getTranscript(jobId);
     const speakerCount = aai.utterances
       ? new Set(aai.utterances.map((u) => u.speaker)).size
       : null;

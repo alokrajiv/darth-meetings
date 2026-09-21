@@ -21,6 +21,13 @@ import type { SpeechModel } from '@/lib/aai-language';
  * (same /m link, same shares, recorder registry relinked), and on another
  * failure `keepFailedIngest` re-marks the row with the next backoff.
  *
+ * The row handed to `ingestLocalAudio` as the "placeholder" is whatever the
+ * meeting is called now, which is not always a `up-`/`defer-` id: a row the
+ * AAI sweeper gave up on carries a promoted id, and since Phase 1b a minted
+ * one. `promoteUploadingRow` keeps a non-placeholder id as it is, so a retry
+ * puts a SECOND job id on the SAME meeting instead of renaming it — the file
+ * on disk, the /m link and every share stay where they are.
+ *
  * Runs every TICK_MS from instrumentation.ts; `retryIngest` is also called on
  * demand by POST /api/transcripts/:id/retry-ingest. One row at a time — the
  * AAI upload leg of a multi-GB file is minutes long and the sweeper must not

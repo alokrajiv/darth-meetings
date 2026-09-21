@@ -61,6 +61,53 @@ not part of this spec.
 7. Permanent delete of a recording's rows also deletes its blobs (only when no clip of any meeting is left — the
    Phase 1 rule); soft delete never touches blobs.
 
+### Stage A as built — 2026-09-22
+
+Nothing here is on: `DARTH_MEDIA_ACCOUNT` does not exist yet, so every piece below is inert (no query, no
+network) until the account is provisioned AND `MW_MEDIA_ARCHIVE` is set.
+
+| Piece | File |
+|---|---|
+| The permanent store: `DARTH_MEDIA_*` config, `createAzureBlobStore` + the three archive methods (`putStream`, `setMetadata`, `properties`), blob name, content type | `src/lib/server/media-store.ts` |
+| `archiveMedia` / `archiveRecording` / the fire-and-forget queue, the canary, the pacing rule, the blob-delete paths, the "is the VM busy" probe | `src/lib/server/media-archive.ts` |
+| The hook (one call after a successful sync) + permanent delete takes the blobs | `src/lib/server/recording-sync.ts` |
+| The paced backfill (≤ 2 GB / 5 files per 5-minute tick) + the pending-delete drain | `src/lib/server/media-sweeper.ts` |
+| Archive db-ops (append-only section), and the note on `applyRecordingGraph`'s upsert that keeps A.5 true | `src/db-ops/recordings.ts` |
+| `media_blob_deletes` + `media_archive_canaries` | `migrations/047_media_archive.sql` |
+| Totals / canary / `--check-blobs` | `scripts/media-archive-status.ts` |
+| The archive as INFO, never drift | `scripts/recordings-verify.ts` |
+| Tests | `src/lib/server/__tests__/media-archive.test.ts` (+ `helpers/fake-media-blob.ts`), `tmp/media-archive/` (scratch PG integration check) |
+
+Decisions taken while building:
+
+- **A.5 needed no code change.** `applyRecordingGraph` never names `blob_name` / `sha256` in the media upsert and
+  never names `recordings.sha256` — the stamps already survive a re-derive. A comment now says so, and
+  `recordings-verify` reads the two columns only to COUNT them in an INFO block that cannot affect the exit code.
+- **Pending deletes are a table, not a jsonb stash.** Permanent delete destroys the meeting row AND the recording /
+  media rows in one transaction, so afterwards no surviving row owns those blob names; a jsonb queue would have to
+  squat on an unrelated row. The names are written to `media_blob_deletes` BEFORE the blob delete is attempted and
+  the row is cleared on success, so a crash mid-delete costs one retry, never a leaked blob.
+- **Verify is size + the stored hash, as the spec says.** Azure cannot hash a blob for us, so the sha256 we compare
+  against is the one we wrote as metadata: the check proves the blob exists, is exactly as long as the local file,
+  and carries the hash every later reader (Stage B/D, `--check-blobs`) will verify against. A full byte read-back is
+  `media-archive-status --check-blobs` and Stage D's `ensureLocal`, not the hot path.
+- **Busy = a DB probe + the in-process ffmpeg maps.** There is no shared busy flag in the app and `ai_runs` rows are
+  only written when a run FINISHES, so the backfill yields on `transcripts.status IN (uploading, queued, processing)`
+  within 12 h and on `auto_notes/auto_report/speaker_id_status = 'running'` within 30 min (time-bounded because those
+  statuses get stuck across a pm2 restart), plus `__mwAudioOnlyInflight` / `__mwMediaPrepInflight` in this process.
+
+Config (names only, never a key), once the account exists:
+
+```
+DARTH_MEDIA_ACCOUNT=darthmedia
+DARTH_MEDIA_CONTAINER=meetings-media
+MW_MEDIA_ARCHIVE=1
+```
+
+**CORS is not needed for Stage A** — the VM is the only client and it talks to Blob server-side. CORS becomes
+necessary in Stage B, when a browser follows a redirect to a SAS URL (and even then only for `Range`/preflight
+cases); it is listed in the provisioning note above so it is not forgotten, not because Stage A uses it.
+
 ## Stage B — serve from blob   flag `MW_MEDIA_FROM_BLOB`
 
 - `/api/transcripts/:id/audio` (and `?part=N`, `?variant=audio`): access check as today → when the resolved media

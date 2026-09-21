@@ -41,7 +41,7 @@ import {
   canonicalKeyOf,
   deriveRecordingGraph,
   desiredClipFor,
-  isRealAaiId,
+  isJobIdMeeting,
   ownerRowOf,
   skipReason,
   recordingFilenames,
@@ -147,8 +147,20 @@ async function main() {
   // The recorder join mirrors db-ops/recordings.ts `loadGraphMeetingRows`:
   // the reverse link first, the `gmeet_context.recorder` marker second, and
   // `started_at` comes along for §5a's fallback anchor.
+  // Tolerate a schema where migration 045 (`aai_job_id`) has not been applied:
+  // the job is then the meeting id, which is what every pre-1b row looks like.
+  const hasJobIdColumn =
+    (
+      await sql`
+        SELECT 1 FROM information_schema.columns
+        WHERE table_schema = ${SCHEMA} AND table_name = 'transcripts'
+          AND column_name = 'aai_job_id'
+      `
+    ).length > 0;
+  const jobIdCol = hasJobIdColumn ? sql`t.aai_job_id` : sql`NULL::text AS aai_job_id`;
+
   const rows = await sql<GraphMeetingRow[]>`
-    SELECT t.id, t.user_id, t.assemblyai_id, t.original_filename, t.status,
+    SELECT t.id, t.user_id, t.assemblyai_id, ${jobIdCol}, t.original_filename, t.status,
            t.created_at, t.completed_at, t.duration, t.language_code,
            t.speech_model, t.local_audio_path, t.deleted_at, t.gmeet_context,
            (t.imported_content IS NOT NULL) AS has_content,
@@ -176,13 +188,14 @@ async function main() {
     else kept.push(row);
   }
 
-  // Meetings that must collapse onto ONE recording: only a REAL AssemblyAI
-  // job is shared (a `gmeet-<record>` id is the same string for every
-  // importer but each parsed their own copy — `canonicalKeyOf` keys those on
-  // transcripts.id).
+  // Meetings that must collapse onto ONE recording: only a meeting whose own
+  // id IS an AssemblyAI job can be shared (a `gmeet-<record>` id is the same
+  // string for every importer but each parsed their own copy, and a meeting
+  // id minted by Phase 1b belongs to exactly one row — `canonicalKeyOf` keys
+  // both on transcripts.id).
   const byAaiId = new Map<string, GraphMeetingRow[]>();
   for (const row of kept) {
-    if (!isRealAaiId(row.assemblyai_id)) continue;
+    if (!isJobIdMeeting(row)) continue;
     byAaiId.set(row.assemblyai_id, [...(byAaiId.get(row.assemblyai_id) ?? []), row]);
   }
 

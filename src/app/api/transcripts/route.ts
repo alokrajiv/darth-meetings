@@ -1,6 +1,7 @@
 import { NextResponse } from 'next/server';
 import { withAuth } from '@/lib/auth/with-auth';
 import {
+  jobIdsForVisibleMeetings,
   listDeletedForUser,
   listPagedForUser,
   listPendingVisibleToUser,
@@ -50,33 +51,49 @@ export const maxDuration = 900;
  *   - a job AAI has been holding past AAI_STUCK_HOURS is skipped — the
  *     5-minute sweeper flips it to 'error';
  *   - a 404 flips it right here, because that answer cannot improve.
+ *
+ * WHICH id is polled: the AssemblyAI JOB, never the meeting (Phase 1b — a
+ * minted meeting id is UUID-shaped and AAI has never heard of it). The v2
+ * path's query returns the job with each row; the legacy listing's projection
+ * deliberately has no such column (its rows are the response body, byte for
+ * byte, and darth-cli reads them), so it passes `lookupJobIds` and the job ids
+ * are fetched — caller-scoped — only for the rows that are still in flight.
+ * An all-finished listing therefore still makes zero extra queries.
  */
 async function refreshPendingAgainstAai<T extends PendingRefreshRow>(
-  rows: T[]
+  rows: T[],
+  lookupJobIds?: (assemblyaiIds: string[]) => Promise<ReadonlyMap<string, string | null>>
 ): Promise<void> {
-  const pendingIdx = rows
-    .map((r, i) =>
-      r.status === 'completed' ||
-      r.status === 'error' ||
-      r.status === 'uploading' ||
-      r.status === 'waiting' ||
-      r.assemblyai_id.startsWith('up-') ||
-      r.assemblyai_id.startsWith('defer-') ||
-      // Text-import placeholders normalize via the LLM in the background —
-      // they sit in 'processing' but AAI has never heard of their ids.
-      r.assemblyai_id.startsWith('ext-')
-        ? -1
-        : i
-    )
-    .filter((i) => i >= 0);
+  const inFlight = (r: PendingRefreshRow) =>
+    r.status !== 'completed' &&
+    r.status !== 'error' &&
+    r.status !== 'uploading' &&
+    r.status !== 'waiting';
 
+  const candidates = rows.map((r, i) => (inFlight(r) ? i : -1)).filter((i) => i >= 0);
+  if (candidates.length === 0) return;
+
+  // Rows whose projection carries no job id at all — see above.
+  const unknown = candidates.filter((i) => rows[i]!.aai_job_id === undefined);
+  const fetched =
+    unknown.length > 0 && lookupJobIds
+      ? await lookupJobIds(unknown.map((i) => rows[i]!.assemblyai_id))
+      : null;
+  // No AssemblyAI job behind the row ⇒ nothing to poll: the `up-`/`defer-`
+  // placeholders whose bytes are still in our pipeline, the text-import
+  // placeholders that normalize via the LLM in the background (they sit in
+  // 'processing' but never reached AAI), and any meeting id we minted.
+  const jobOf = (r: T): string | null =>
+    r.aai_job_id !== undefined ? r.aai_job_id : (fetched?.get(r.assemblyai_id) ?? null);
+
+  const pendingIdx = candidates.filter((i) => jobOf(rows[i]!) !== null);
   if (pendingIdx.length === 0) return;
 
   await Promise.all(
     pendingIdx.map(async (i) => {
       const row = rows[i]!;
       try {
-        const aai = await getTranscript(row.assemblyai_id);
+        const aai = await getTranscript(jobOf(row)!);
         const speakerCount = aai.utterances
           ? new Set(aai.utterances.map((u) => u.speaker)).size
           : null;
@@ -250,7 +267,9 @@ export const GET = withAuth(async ({ user, request }) => {
   // real transcripts, so still-transcribing ones join the AAI refresh.
   if (params.get('scratch') === '1') {
     const scratchRows = await listVisibleToUser(user.userId, user.email, { scratch: true });
-    await refreshPendingAgainstAai(scratchRows);
+    await refreshPendingAgainstAai(scratchRows, (ids) =>
+      jobIdsForVisibleMeetings(user.userId, user.email, ids)
+    );
     return NextResponse.json({ transcripts: scratchRows });
   }
 
@@ -259,7 +278,9 @@ export const GET = withAuth(async ({ user, request }) => {
   // Refresh pending rows in parallel. Completed rows (the common case)
   // skip the network hop entirely, so for a list of 36 finished transcripts
   // this is still a pure-DB call.
-  await refreshPendingAgainstAai(rows);
+  await refreshPendingAgainstAai(rows, (ids) =>
+    jobIdsForVisibleMeetings(user.userId, user.email, ids)
+  );
 
   return NextResponse.json({ transcripts: rows });
 });
