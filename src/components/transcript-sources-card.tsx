@@ -342,24 +342,41 @@ export function TranscriptSourcesCard({
         {(ctx?.uploadedParts?.length ?? 0) > 1 && (
           <li className="flex items-start gap-2">
             <Video className="mt-0.5 h-3.5 w-3.5 shrink-0 text-muted-foreground" />
-            <span>
-              <span className="font-medium">
-                Stitched from {ctx!.uploadedParts!.length} uploaded files
+            {ctx?.recorder ? (
+              // Darth Recorder segments: one recording, N files — the file
+              // names are the recorder's own ("… teams part3.mp4"), not the
+              // person's, so the list is noise on a phone (2026-09-21).
+              <span className="min-w-0 flex-1">
+                <span className="font-medium">
+                  Recorded in {ctx!.uploadedParts!.length} segments by Darth Recorder
+                </span>
+                <span className="text-muted-foreground">
+                  {' '}
+                  — the recorder starts a new segment on every screen-share change; they were
+                  joined in order into one recording before transcription, and the AI is told
+                  where the joins are.
+                </span>
               </span>
-              <span className="text-muted-foreground">
-                {' '}
-                — joined in order into one recording before transcription. The AI is told
-                where the joins are{ctx!.uploadedParts!.some((p) => p.comment) ? ' and gets your per-file notes' : ''}.
+            ) : (
+              <span className="min-w-0 flex-1">
+                <span className="font-medium">
+                  Stitched from {ctx!.uploadedParts!.length} uploaded files
+                </span>
+                <span className="text-muted-foreground">
+                  {' '}
+                  — joined in order into one recording before transcription. The AI is told
+                  where the joins are{ctx!.uploadedParts!.some((p) => p.comment) ? ' and gets your per-file notes' : ''}.
+                </span>
+                <span className="mt-1 block space-y-0.5">
+                  {ctx!.uploadedParts!.map((p) => (
+                    <span key={p.index} className="block break-words text-muted-foreground">
+                      {p.index}. {p.originalFilename ?? `file ${p.index}`}
+                      {p.comment ? ` — ${p.comment}` : ''}
+                    </span>
+                  ))}
+                </span>
               </span>
-              <span className="mt-1 block space-y-0.5">
-                {ctx!.uploadedParts!.map((p) => (
-                  <span key={p.index} className="block truncate text-muted-foreground">
-                    {p.index}. {p.originalFilename ?? `file ${p.index}`}
-                    {p.comment ? ` — ${p.comment}` : ''}
-                  </span>
-                ))}
-              </span>
-            </span>
+            )}
           </li>
         )}
         {multiVideo && (

@@ -2,6 +2,7 @@ import 'server-only';
 import { sql } from '@/lib/db';
 import { SCHEMAS } from '@/lib/constants/database';
 import { publishEvent } from '@/lib/server/event-bus';
+import { identitiesForUsers } from '@/db-ops/transcript-activity';
 import { teamsCacheCode } from '@/lib/server/teams-ids';
 import {
   cleanupMeetingIfOrphan,
@@ -629,6 +630,22 @@ export async function listPagedForUser(
     }
     current.rows.push(row);
     current.totalSecs += Number(row.duration ?? 0) || 0;
+  }
+
+  // Shared rows name their owner (the "Owner" column, "Recorded on Atira's
+  // Mac"). One batched lookup per page; unknown owners stay null.
+  const sharedRows = dayGroups.flatMap((g) => g.rows).filter((r) => r.access !== 'owner');
+  if (sharedRows.length > 0) {
+    const ids = await identitiesForUsers(sharedRows.map((r) => r.user_id)).catch(
+      () => new Map<string, { email: string; name: string | null }>()
+    );
+    for (const r of sharedRows) {
+      const id = ids.get(r.user_id);
+      if (id) {
+        r.owner_email = id.email;
+        r.owner_name = id.name;
+      }
+    }
   }
 
   const totalDays = raw[0]?.__total_days ?? 0;

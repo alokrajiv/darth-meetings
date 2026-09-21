@@ -116,6 +116,37 @@ export async function identityForUser(userId: string): Promise<UserIdentity | nu
 }
 
 /**
+ * Batched form of identityForUser for listing pages: the latest activity row
+ * per user id, with the Darth Recorder device registry as a fallback for
+ * people who only ever upload from the tray (Atira, 2026-09-21 — her
+ * Hypercare rows showed Owner "—" although she had 89 activity rows; the
+ * v2 listing simply never looked). Missing ids are absent from the map.
+ */
+export async function identitiesForUsers(userIds: string[]): Promise<Map<string, UserIdentity>> {
+  const ids = [...new Set(userIds.filter(Boolean))];
+  const out = new Map<string, UserIdentity>();
+  if (ids.length === 0) return out;
+  const rows = await sql<Array<{ user_id: string; user_email: string; user_name: string | null }>>`
+    SELECT DISTINCT ON (user_id) user_id, user_email, user_name
+    FROM ${sql(SCHEMA)}.transcript_activity
+    WHERE user_id = ANY(${ids})
+    ORDER BY user_id, at DESC
+  `;
+  for (const r of rows) out.set(r.user_id, { userId: r.user_id, email: r.user_email, name: r.user_name });
+  const missing = ids.filter((id) => !out.has(id));
+  if (missing.length > 0) {
+    const devs = await sql<Array<{ user_id: string; email: string | null }>>`
+      SELECT DISTINCT ON (user_id) user_id, email
+      FROM ${sql(SCHEMA)}.recorder_devices
+      WHERE user_id = ANY(${missing}) AND email IS NOT NULL
+      ORDER BY user_id, last_seen DESC
+    `.catch(() => [] as Array<{ user_id: string; email: string | null }>);
+    for (const d of devs) if (d.email) out.set(d.user_id, { userId: d.user_id, email: d.email, name: null });
+  }
+  return out;
+}
+
+/**
  * Inverse lookup: SSO user id for an email, again via the activity log.
  * Returns null for people who have never opened the app — they have no
  * user id yet, so e.g. ownership can't be transferred to them.

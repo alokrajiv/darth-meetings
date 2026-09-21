@@ -56,6 +56,17 @@ describe('stripForArchiveRow — silence is the default', () => {
     expect(m.action).toBeNull();
     expect(m.busy).toBe(false);
   });
+
+  test('a shared Mac recording names the owner, not "your Mac"', () => {
+    const m = stripForArchiveRow(
+      arow({ recorder_recording_id: 'r', recording_count: 8, duration: 3405, access: 'edit', owner_email: 'atira.sarat@trames.sg' }),
+      opts
+    )!;
+    expect(m.text).toBe('Recorded on Atira’s Mac · 8 segments · 56m 45s');
+    expect(stripForArchiveRow(arow({ recorder_recording_id: 'r', access: 'owner' }), opts)!.text).toContain('your Mac');
+    const up = stripForArchiveRow(arow({ recorder_recording_id: 'r', status: 'uploading', access: 'read', owner_name: 'Atira Sarat' }), opts)!;
+    expect(up.text).toContain('Uploading from Atira’s Mac');
+  });
   test('a Meet meeting with two videos', () => {
     const m = stripForArchiveRow(arow({ provider: 'gmeet', source: 'imported', recording_count: 2, duration: 1293 }), opts)!;
     expect(m.text).toBe('Meet recording · 2 parts · 21m 33s');

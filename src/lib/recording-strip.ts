@@ -11,6 +11,7 @@
  */
 import type { RecorderRecordingRef } from '@/lib/recorder';
 import { recorderMacLabel, recorderOwnerFirstName, RECORDING_STALE_MS } from '@/lib/recorder';
+import { personDisplay } from '@/lib/person-display';
 
 export type RecordingSource = 'mac' | 'meet' | 'teams' | 'file' | 'text' | 'none';
 
@@ -90,6 +91,19 @@ export interface ArchiveStripRow {
   deferred_background?: string | null;
   original_filename?: string | null;
   auto_state?: 'passed' | 'gated' | 'auto' | null;
+  /** The caller's access + the owner: a Mac recording on a SHARED row was
+   * recorded on the owner's Mac, not the caller's ("Recorded on Atira's
+   * Mac" — Alok, 2026-09-21, an Editor on Atira's Hypercare upload). */
+  access?: 'owner' | 'edit' | 'read';
+  owner_email?: string | null;
+  owner_name?: string | null;
+}
+
+/** "your Mac" for the owner, "Atira's Mac" for everyone the row is shared with. */
+export function macOwnerLabel(row: Pick<ArchiveStripRow, 'access' | 'owner_email' | 'owner_name'>): string {
+  if (!row.access || row.access === 'owner') return 'your Mac';
+  const first = personDisplay(row.owner_email, row.owner_name).first;
+  return first && first !== '—' ? `${first}’s Mac` : 'a colleague’s Mac';
 }
 
 export interface ArchiveStripOptions {
@@ -129,7 +143,7 @@ export function provenanceTitle(row: ArchiveStripRow): string {
   const src = sourceOfArchiveRow(row);
   const base =
     src === 'mac'
-      ? 'Recorded with Darth Recorder on your Mac'
+      ? `Recorded with Darth Recorder on ${macOwnerLabel(row)}`
       : src === 'meet'
         ? 'Imported from Google Meet'
         : src === 'teams'
@@ -181,7 +195,7 @@ function uploadProgress(row: ArchiveStripRow, opts: ArchiveStripOptions): StripP
  */
 export function stripForArchiveRow(row: ArchiveStripRow, opts: ArchiveStripOptions): RecordingStripModel | null {
   const source = sourceOfArchiveRow(row);
-  const mine = true; // archive rows are the caller's or shared with them; the Mac is the owner's
+  const mac = macOwnerLabel(row);
   const segs = segmentsWord(row.recording_count, source === 'mac' ? 'segment' : 'part');
   const dur = row.duration ? opts.fmtDuration(row.duration) : null;
   const isDefer = row.assemblyai_id.startsWith('defer-');
@@ -203,7 +217,7 @@ export function stripForArchiveRow(row: ArchiveStripRow, opts: ArchiveStripOptio
         busy: true,
       };
     }
-    const lead = source === 'mac' ? 'Uploading from your Mac' : 'Uploading';
+    const lead = source === 'mac' ? `Uploading from ${mac}` : 'Uploading';
     return {
       source,
       state: 'uploading',
@@ -277,7 +291,7 @@ export function stripForArchiveRow(row: ArchiveStripRow, opts: ArchiveStripOptio
       source,
       state: 'transcribed',
       tone: 'muted',
-      text: join([`Recorded on ${mine ? 'your Mac' : 'a colleague’s Mac'}`, segs, dur]),
+      text: join([`Recorded on ${mac}`, segs, dur]),
       title: segs
         ? 'One recording — the recorder rolls a new segment on every screen-share change; they were stitched into one transcript.'
         : 'Recorded with Darth Recorder and transcribed as one file.',
