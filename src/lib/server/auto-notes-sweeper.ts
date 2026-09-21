@@ -20,7 +20,19 @@ import { pollTargetFromRow, pollTranscriptionRun } from '@/lib/server/transcript
 import { AAI_STUCK_HOURS, AAI_STUCK_REASON } from '@/lib/aai-job-state';
 import { giveUpOnAaiJob } from '@/lib/server/aai-giveup';
 import { identityForUser } from '@/db-ops/transcript-activity';
-import { deleteUploadSession, listExpiredUploadSessions } from '@/db-ops/upload-sessions';
+import {
+  deleteUploadSession,
+  listExpiredUploadSessions,
+  type UploadSessionRow,
+} from '@/db-ops/upload-sessions';
+import { abandonedBlobOf } from '@/lib/server/aai-from-blob';
+import {
+  claimedMediaBlobNames,
+  mediaArchiveTablesExist,
+  queueBlobDeletes,
+  type ArchivedBlobRef,
+} from '@/db-ops/recordings';
+import type { BlobCopyIntent } from '@/lib/server/upload-pipeline';
 import { uploadsStore } from '@/lib/server/darth-uploads-store';
 import { deleteAudioFile, deleteAudioFilesByPrefix } from '@/lib/server/audio-storage';
 import { generateAutoNotes, identifySpeakers } from '@/lib/server/auto-notes';
@@ -122,6 +134,97 @@ async function notifyScratchTrashed(ownerUserId: string, assemblyaiId: string): 
   });
 }
 
+/**
+ * DEC-3 Stage C's one leak, closed (`docs/recordings-blob-spec.md`).
+ *
+ * An upload session that took the fast path stamps a `blobIntent` on itself
+ * before Azure copies the transit blob into the PERMANENT media container, and
+ * clears it once the row that names the blob exists. A session that dies in
+ * between — a pm2 restart mid-ingest, which is what leaves one stuck at
+ * `completing` — used to strand those bytes: nothing knew the name any more,
+ * and finding them again meant listing the whole container.
+ *
+ * So, as these sessions are reaped: ask `recording_media` which of the
+ * intended blobs a live row actually claims (a session that completed normally
+ * has one, and those bytes are the recording — never touch them), and enqueue
+ * the rest into `media_blob_deletes`, which the media sweeper drains with
+ * retries. Intent-free sessions — every chunk session, every pull-path
+ * session — cost one nothing: no intents, no query.
+ */
+async function queueAbandonedStageCBlobs(expired: UploadSessionRow[]): Promise<void> {
+  const intents = expired
+    .map((s) => s.spec?.blobIntent)
+    .filter((i): i is BlobCopyIntent => !!i?.blobName);
+  if (intents.length === 0) return;
+  const claimed = await claimedMediaBlobNames(intents.map((i) => i.blobName));
+  const leaked: ArchivedBlobRef[] = [];
+  for (const s of expired) {
+    const abandoned = abandonedBlobOf({ intent: s.spec?.blobIntent, claimed });
+    if (!abandoned) continue;
+    console.warn(
+      `[notes-sweeper] upload session ${s.id} (${s.status}) died before anything named ` +
+        `${abandoned.blobName} (copy intended ${abandoned.at}) — queueing that blob for deletion`
+    );
+    leaked.push({
+      blob_name: abandoned.blobName,
+      recording_id: abandoned.recordingId,
+      media_id: abandoned.mediaId,
+    });
+  }
+  if (leaked.length === 0) return;
+  if (!(await mediaArchiveTablesExist().catch(() => false))) {
+    console.warn(
+      `[notes-sweeper] migrations/047 is not applied — ${leaked.length} abandoned Stage C blob(s) ` +
+        'cannot be queued for deletion'
+    );
+    return;
+  }
+  const queued = await queueBlobDeletes(leaked).catch((err) => {
+    console.warn('[notes-sweeper] queueing abandoned Stage C blobs failed:', err);
+    return 0;
+  });
+  if (queued > 0) console.log(`[notes-sweeper] ${queued} abandoned Stage C blob(s) queued for deletion`);
+}
+
+/**
+ * Chunked-upload sessions: an OPEN one stays resumable for
+ * SESSION_IDLE_HOURS after its last acknowledged chunk (re-drop the same
+ * file -> continues). Past that, or for a 'completing' one whose handler died
+ * mid-ingest, reap file + session + placeholder. Done/failed audit rows age
+ * out after a week (handled inside the query).
+ *
+ * Exported so the Stage C integration check can drive the real reaper rather
+ * than a copy of it; the sweep tick is still the only caller in the server.
+ */
+export async function sweepExpiredUploadSessions(): Promise<void> {
+  const expired = await listExpiredUploadSessions(SESSION_IDLE_HOURS, 20);
+  await queueAbandonedStageCBlobs(expired);
+  for (const s of expired) {
+    if (s.status === 'open' || s.status === 'completing') {
+      console.log(`[notes-sweeper] reaping expired upload session ${s.id} (${s.status}, ${s.via})`);
+      await deleteAudioFile(s.temp_filename).catch(() => {});
+      if (s.via === 'blob' && s.blob_name) {
+        await uploadsStore()
+          ?.delete(s.blob_name)
+          .catch((err) => console.warn(`[notes-sweeper] blob delete failed ${s.id}:`, err));
+      }
+      const firstPart = !(s.spec?.multi && s.spec.multi.index > 1);
+      if (firstPart) {
+        // Only the still-uploading placeholder — never a promoted row
+        // (a 'completing' session's ingest may have finished after all).
+        const row = await getForUser(s.user_id, s.placeholder_id).catch(() => null);
+        if (row && row.status === 'uploading') {
+          await deleteAudioFilesByPrefix(`upload-${s.placeholder_id.slice(3)}.part`);
+          await deleteForUser(s.user_id, s.placeholder_id).catch((err) =>
+            console.warn(`[notes-sweeper] session placeholder delete failed ${s.placeholder_id}:`, err)
+          );
+        }
+      }
+    }
+    await deleteUploadSession(s.id).catch(() => {});
+  }
+}
+
 async function sweep(): Promise<void> {
   // Temporary transcripts past their 30 days → trash. One line per row so a
   // "where did my transcript go?" question has an answer in the pm2 log.
@@ -212,37 +315,8 @@ async function sweep(): Promise<void> {
     console.warn('[notes-sweeper] stale-upload query failed:', err);
   }
 
-  // Chunked-upload sessions: an OPEN one stays resumable for
-  // SESSION_IDLE_HOURS after its last acknowledged chunk (re-drop the same
-  // file → continues). Past that, or for a 'completing' one whose handler
-  // died mid-ingest, reap file + session + placeholder. Done/failed audit
-  // rows age out after a week (handled inside the query).
   try {
-    const expired = await listExpiredUploadSessions(SESSION_IDLE_HOURS, 20);
-    for (const s of expired) {
-      if (s.status === 'open' || s.status === 'completing') {
-        console.log(`[notes-sweeper] reaping expired upload session ${s.id} (${s.status}, ${s.via})`);
-        await deleteAudioFile(s.temp_filename).catch(() => {});
-        if (s.via === 'blob' && s.blob_name) {
-          await uploadsStore()
-            ?.delete(s.blob_name)
-            .catch((err) => console.warn(`[notes-sweeper] blob delete failed ${s.id}:`, err));
-        }
-        const firstPart = !(s.spec?.multi && s.spec.multi.index > 1);
-        if (firstPart) {
-          // Only the still-uploading placeholder — never a promoted row
-          // (a 'completing' session's ingest may have finished after all).
-          const row = await getForUser(s.user_id, s.placeholder_id).catch(() => null);
-          if (row && row.status === 'uploading') {
-            await deleteAudioFilesByPrefix(`upload-${s.placeholder_id.slice(3)}.part`);
-            await deleteForUser(s.user_id, s.placeholder_id).catch((err) =>
-              console.warn(`[notes-sweeper] session placeholder delete failed ${s.placeholder_id}:`, err)
-            );
-          }
-        }
-      }
-      await deleteUploadSession(s.id).catch(() => {});
-    }
+    await sweepExpiredUploadSessions();
   } catch (err) {
     console.warn('[notes-sweeper] upload-session sweep failed:', err);
   }

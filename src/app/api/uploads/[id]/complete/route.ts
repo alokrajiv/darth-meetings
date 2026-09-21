@@ -2,9 +2,11 @@ import { NextResponse } from 'next/server';
 import { withAuth } from '@/lib/auth/with-auth';
 import {
   claimUploadSessionForComplete,
+  clearUploadSessionBlobIntent,
   getUploadSessionForUser,
   listReceivedChunks,
   setUploadSessionStatus,
+  stampUploadSessionBlobIntent,
 } from '@/db-ops/upload-sessions';
 import { audioFileSize } from '@/lib/server/audio-storage';
 import { abandonUpload, finalizeUpload, groupProgressAdder } from '@/lib/server/upload-pipeline';
@@ -13,6 +15,7 @@ import { pullBlobToTemp, uploadsStore } from '@/lib/server/darth-uploads-store';
 import {
   BlobIngestFailed,
   aaiFromBlobFlagOn,
+  blobIntentOf,
   copyTransitToMedia,
   planBlobIngest,
 } from '@/lib/server/aai-from-blob';
@@ -86,6 +89,12 @@ async function sameFileVerdict(
  *  - AssemblyAI refused the submit — nothing was created, and the pull path
  *    can do better (it keeps the bytes as a visible Failed row for the
  *    ingest-retry sweeper).
+ *
+ * And the fourth, which does NOT fall back because it cannot: this process
+ * dying between the copy and the row. That is what the `blobIntent` stamp
+ * below is for — it is written before the copy and cleared once the row
+ * exists, so the expired-session sweeper can delete a blob nothing ever came
+ * to name (`abandonedBlobOf`).
  */
 async function tryAaiFromBlob(
   user: DarthUser,
@@ -102,6 +111,21 @@ async function tryAaiFromBlob(
     }
     return null;
   }
+  // The INTENT, before a byte moves: from here until the media row names the
+  // blob, this stamp is the ONLY record of where those permanent bytes are.
+  // A crash in between leaves the session at `completing`, and the
+  // expired-session sweeper deletes the blob it was going to write unless a
+  // media row turns out to claim it (`abandonedBlobOf`).
+  const intent = blobIntentOf(planned.plan);
+  try {
+    await stampUploadSessionBlobIntent(session.id, intent);
+  } catch (err) {
+    // Without the stamp the copy is exactly the leak this guards against, so
+    // do not take the fast path at all — the pull path is not worse, only
+    // slower.
+    console.warn(`[aai-from-blob] ${session.id}: could not record the copy intent, pulling instead:`, err);
+    return null;
+  }
   const copied = await copyTransitToMedia(
     planned.store,
     planned.transit,
@@ -109,7 +133,9 @@ async function tryAaiFromBlob(
     planned.plan
   );
   if (!copied.ok) {
+    // `copyTransitToMedia` already took the half-written blob back out.
     console.warn(`[aai-from-blob] ${session.id}: copy failed, pulling instead — ${copied.error}`);
+    await clearUploadSessionBlobIntent(session.id).catch(() => {});
     return null;
   }
   console.log(
@@ -122,8 +148,15 @@ async function tryAaiFromBlob(
     });
     const ok = done.status >= 200 && done.status < 300 && 'transcript' in done.body;
     if (ok && 'transcript' in done.body) {
+      // The row exists and the graph sync will stamp the media row with this
+      // blob: Stage C is over, so the intent has nothing left to protect.
+      // (From here the deterministic name is what lets `archiveMedia` adopt
+      // the blob even if the stamp itself is lost — spec, Stage C as built.)
+      await clearUploadSessionBlobIntent(session.id).catch(() => {});
       await setUploadSessionStatus(session.id, 'done', null, done.body.transcript.assemblyai_id);
     } else {
+      // The intent STAYS: whether a row was created is exactly what this side
+      // cannot tell, and the sweeper decides it by asking `recording_media`.
       const msg = 'error' in done.body ? done.body.error : `finalize returned ${done.status}`;
       await setUploadSessionStatus(session.id, 'failed', msg);
     }
@@ -133,6 +166,7 @@ async function tryAaiFromBlob(
       // Nothing was created. Take the permanent copy back out — the pull path
       // will archive the file itself once it is on disk — and fall back.
       await planned.store.delete(planned.plan.blobName).catch(() => {});
+      await clearUploadSessionBlobIntent(session.id).catch(() => {});
       return null;
     }
     console.error(`[uploads] finalize crashed ${session.id}:`, error);

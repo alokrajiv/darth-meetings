@@ -282,6 +282,37 @@ export interface UploadSpec {
    * the open body any more (docs/recordings-same-file-spec.md).
    */
   dupAware?: boolean;
+  /**
+   * DEC-3 Stage C's INTENT (`docs/recordings-blob-spec.md`). The one part of
+   * the spec that is NOT frozen at open: it is written just before the
+   * server-side copy into the permanent media container and cleared the
+   * moment Stage C is over, either way. See `BlobCopyIntent`.
+   */
+  blobIntent?: BlobCopyIntent | null;
+}
+
+/**
+ * "This session is about to put bytes at `blobName`."
+ *
+ * Stamped on the session row BEFORE `copyTransitToMedia` runs, because the
+ * blob's name is otherwise known only to a promise in flight: a crash between
+ * the copy and the row that names it (`recording_media.blob_name`) would
+ * leave bytes in the permanent container that NOTHING refers to, findable
+ * afterwards only by listing the whole container. With the intent recorded,
+ * the expired-session sweeper can enqueue exactly that blob for deletion when
+ * the session dies without a media row claiming it (`abandonedBlobOf`).
+ *
+ * JSON-safe (it rides in `upload_sessions.spec`), and deliberately the same
+ * three fields `media_blob_deletes` takes plus the time, so the hand-off is a
+ * rename rather than a lookup.
+ */
+export interface BlobCopyIntent {
+  /** `<recording id>/<media id><.ext>` in the media container. */
+  blobName: string;
+  recordingId: string;
+  mediaId: string;
+  /** ISO, for the log line and for forensics. */
+  at: string;
 }
 
 export interface OpenUploadInput {

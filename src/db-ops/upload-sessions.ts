@@ -1,7 +1,7 @@
 import 'server-only';
 import { sql } from '@/lib/db';
 import { SCHEMAS } from '@/lib/constants/database';
-import type { UploadSpec } from '@/lib/server/upload-pipeline';
+import type { BlobCopyIntent, UploadSpec } from '@/lib/server/upload-pipeline';
 
 const SCHEMA = SCHEMAS.MEETING_WHISPERER;
 
@@ -92,6 +92,43 @@ export async function createUploadSession(data: {
     RETURNING *
   `;
   return coerce(rows[0]!);
+}
+
+/**
+ * DEC-3 Stage C — record what this session is ABOUT to write into the
+ * permanent media container, before a byte moves (`BlobCopyIntent`).
+ *
+ * An atomic jsonb merge rather than a read-modify-write of `spec`: the row is
+ * also being written by the progress/status updates around it, and losing an
+ * unrelated key here would lose the upload. The `::jsonb` cast is
+ * load-bearing — `jsonb_build_object` takes "any", so an uncast parameter has
+ * no inferable type and Postgres refuses the whole statement.
+ */
+export async function stampUploadSessionBlobIntent(
+  id: string,
+  intent: BlobCopyIntent
+): Promise<void> {
+  await sql`
+    UPDATE ${sql(SCHEMA)}.upload_sessions
+    SET spec = COALESCE(spec, '{}'::jsonb)
+               || jsonb_build_object('blobIntent', ${sql.json(intent as unknown as never)}::jsonb),
+        updated_at = now()
+    WHERE id = ${id}
+  `;
+}
+
+/**
+ * Stage C is over for this session (the row exists, or the attempt fell back
+ * and took its blob away): forget the intent, so the sweeper has nothing to
+ * clean up. Never fails the caller — a stamp left behind is picked up by
+ * `abandonedBlobOf`, which checks `recording_media` before deleting anything.
+ */
+export async function clearUploadSessionBlobIntent(id: string): Promise<void> {
+  await sql`
+    UPDATE ${sql(SCHEMA)}.upload_sessions
+    SET spec = COALESCE(spec, '{}'::jsonb) - 'blobIntent', updated_at = now()
+    WHERE id = ${id}
+  `;
 }
 
 /** A blob session's SAS was re-minted (resume after expiry): record the new expiry. */

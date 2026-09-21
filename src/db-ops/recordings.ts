@@ -1498,6 +1498,24 @@ export async function listMediaBlobsForRecordings(
 }
 
 /**
+ * INTERNAL-ONLY — which of these blob names a LIVE `recording_media` row
+ * claims. The question the abandoned-upload sweeper asks before deleting a
+ * blob a dead session meant to write (DEC-3 Stage C): a session that
+ * completed normally has a media row naming its blob, and those bytes are the
+ * recording. Reads `blob_name` directly — it is the authority on where a
+ * recording's bytes are, deterministic name or not.
+ */
+export async function claimedMediaBlobNames(blobNames: string[]): Promise<string[]> {
+  if (blobNames.length === 0) return [];
+  const rows = await sql<Array<{ blob_name: string }>>`
+    SELECT DISTINCT blob_name
+    FROM ${sql(SCHEMA)}.recording_media
+    WHERE blob_name = ANY(${blobNames}::text[])
+  `;
+  return rows.map((r) => r.blob_name);
+}
+
+/**
  * INTERNAL-ONLY — queue blobs whose media row has just been destroyed. The
  * sweeper drains this; a delete that fails is retried rather than lost, which
  * is the whole reason the queue exists (migration 047).

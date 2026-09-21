@@ -223,7 +223,10 @@ than after the copy as the sketch above said: the fallback needs those bytes.
 | `copyFromUrl` on the `MediaBlobLike` seam (`Put Block From URL` × N + `Put Block List`), `copyBlockPlan` / `copyBlockId` | `src/lib/server/media-store.ts` (+ the fake) |
 | `submitForIngest` / `createOrPromoteRow` / `attachSeriesForRow` — the two halves of the ingest made reusable without a local file; `ingestLocalAudio` keeps its exact shape and error ordering | `src/lib/server/ingest.ts` |
 | `FinalizeHashes.fromBlob`, the one-line branch, and `BlobIngestFailed` rethrown before any cleanup | `src/lib/server/upload-pipeline.ts` |
-| `tryAaiFromBlob` — the whole attempt, with the transit delete on success | `src/app/api/uploads/[id]/complete/route.ts` |
+| `tryAaiFromBlob` — the whole attempt, with the intent stamp before the copy, the transit delete on success and the clear on every exit | `src/app/api/uploads/[id]/complete/route.ts` |
+| The intent itself: `BlobCopyIntent` on `UploadSpec`, `blobIntentOf`, the pure `abandonedBlobOf` rule | `src/lib/server/upload-pipeline.ts`, `src/lib/server/aai-from-blob.ts` |
+| `stampUploadSessionBlobIntent` / `clearUploadSessionBlobIntent` (jsonb merge on `upload_sessions.spec` — no migration), `claimedMediaBlobNames` | `src/db-ops/upload-sessions.ts`, `src/db-ops/recordings.ts` |
+| `sweepExpiredUploadSessions` + `queueAbandonedStageCBlobs` — the reaper queues an abandoned blob into `media_blob_deletes` | `src/lib/server/auto-notes-sweeper.ts` |
 | DEC-4: "media we hold" = a local file that EXISTS or a blob-verified canonical | `src/lib/server/aai-retention.ts` |
 | The `blobFirst` marker | `src/lib/format.ts` (`GmeetContext`) |
 | The prep candidates skip a row whose bytes are still in flight; one retry fetch per tick | `src/lib/server/media-sweeper.ts` |
@@ -231,7 +234,7 @@ than after the copy as the sketch above said: the fallback needs those bytes.
 | `redactSasInText` | `src/lib/server/media-serve.ts` |
 | `MW_SCRATCH_DIR` — the stitch works on the NVMe (item 2, below) | `src/lib/server/scratch-dir.ts`, `media-concat.ts`, `upload-pipeline.ts` |
 | INFO, never drift: blob-before-local, and the Stage C counters | `scripts/recordings-verify.ts`, `scripts/media-archive-status.ts` |
-| Tests | `src/lib/server/__tests__/aai-from-blob.test.ts` (15), `tmp/media-ingest/` (56-check scratch-PG integration, real ffmpeg, AssemblyAI stubbed) |
+| Tests | `src/lib/server/__tests__/aai-from-blob.test.ts` (21), `tmp/media-ingest/` (71-check scratch-PG integration, real ffmpeg, AssemblyAI stubbed) |
 
 **The multitrack decision: recorder uploads take the PULL path, always.** `normalizeMultiTrack` re-muxes a Darth
 Recorder file so the MIX is track 0 *before* AssemblyAI hears it; handing a multi-track file over as-is is the
@@ -259,6 +262,26 @@ the delete paths, `--check-blobs`) goes through it, so if reality ever diverges 
 stale-upload sweeper reaped the placeholder mid-flight and the row was inserted fresh — the stamp still names the
 blob that exists and nothing is stranded. The deterministic name only buys `archiveMedia`'s adopt-by-name for the
 case where the stamp itself was lost (a restart between the copy and the UPDATE).
+
+**The one leak, and how it is closed (2026-09-22).** Stage C shipped with a window it could not fall back
+from: `copyTransitToMedia` puts the bytes in the PERMANENT container and the row that names them
+(`recording_media.blob_name`) is written afterwards, so a process death in between — a pm2 restart mid-ingest,
+which leaves the session stuck at `completing` — left a blob nothing referred to, findable again only by listing
+the whole container. The fix is an INTENT: before the copy the session records the name it is about to write
+(`BlobCopyIntent` in `upload_sessions.spec.blobIntent`, an atomic jsonb merge — the column already exists, so no
+migration), and Stage C clears it on every exit it survives (the row exists; the copy failed and took its blob
+back out; AssemblyAI refused and the route deleted the blob). What is left stamped is by definition a session
+that died mid-flight, so as the expired-session sweeper reaps it (`sweepExpiredUploadSessions`, 24 h for an
+open/completing session, 7 days for a done/failed audit row) the intended blob goes into `media_blob_deletes` and
+the media sweeper's drain deletes it with retries.
+
+The rule has exactly one guard, and it is the one that matters: **an intent whose blob a live `recording_media`
+row claims is never queued.** That is the crash-AFTER-the-row case — the row was created and only the clear never
+ran — where deleting would destroy a meeting's only copy of itself. The question is asked of the database at
+sweep time (`claimedMediaBlobNames`), never inferred from the session's status, because a promotion may have
+moved the row the session remembers. If a stamp cannot be written at all the fast path is not taken: the pull
+path is slower, not worse, and an un-recorded copy is the leak itself. Sessions that never went near Stage C —
+every chunk session, every pull-path session — carry no intent and cost the sweeper not one query.
 
 **Where the hash check moved.** The pull path verifies the client's sha256 by reading every byte. Stage C cannot:
 the size is verified against the committed transit blob, the hash is written as blob metadata and *believed* until

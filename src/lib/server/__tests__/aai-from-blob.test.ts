@@ -12,6 +12,9 @@ import { createHash } from 'node:crypto';
  * over, and that the URL AssemblyAI is handed is a read-only SAS on the MEDIA
  * blob with a life of at most six hours.
  *
+ * Also here: the INTENT rule — when a dying upload session's planned blob is
+ * a leak worth deleting and when it is the recording itself.
+ *
  * Everything that needs rows — the plan's ids, the row that comes out, the
  * background fetch, the sweeper's retry — is proven against a scratch
  * Postgres in `tmp/media-ingest/`. Nothing here touches Postgres or Azure, and
@@ -26,7 +29,9 @@ const { FakeMediaBlob } = await import('./helpers/fake-media-blob');
 const {
   AAI_SAS_TTL_MS,
   aaiFromBlobFlagOn,
+  abandonedBlobOf,
   blobFastPathRefusal,
+  blobIntentOf,
   copyTransitToMedia,
   planBlobIngest,
 } = await import('@/lib/server/aai-from-blob');
@@ -218,5 +223,54 @@ describe('transit → permanent, server-side', () => {
       expect(out.error).not.toContain('SECRET');
       expect(out.error).toContain('<sas redacted>');
     }
+  });
+});
+
+describe('what a dying upload session leaves in the media container', () => {
+  const INTENT = {
+    blobName: 'rec-9/media-9.mp4',
+    recordingId: '11111111-1111-4111-8111-111111111111',
+    mediaId: '22222222-2222-4222-8222-222222222222',
+    at: '2026-09-22T00:00:00.000Z',
+  };
+
+  test('the intent is the plan, plus when the copy was about to start', () => {
+    const before = Date.now();
+    const intent = blobIntentOf({ ...PLAN, sha256: 'a'.repeat(64), bytes: 10 });
+    expect(intent.blobName).toBe(PLAN.blobName);
+    expect(intent.recordingId).toBe(PLAN.recordingId);
+    expect(intent.mediaId).toBe(PLAN.mediaId);
+    expect(Date.parse(intent.at)).toBeGreaterThanOrEqual(before);
+    // No hash, no size, no filename: the queue only ever needs the name and
+    // the two ids for its log line.
+    expect(Object.keys(intent).sort()).toEqual(['at', 'blobName', 'mediaId', 'recordingId']);
+  });
+
+  test('a session that never took the fast path leaves nothing', () => {
+    expect(abandonedBlobOf({ intent: null, claimed: [] })).toBeNull();
+    expect(abandonedBlobOf({ intent: undefined, claimed: [] })).toBeNull();
+  });
+
+  test('a session that cleared its intent leaves nothing, claimed or not', () => {
+    expect(abandonedBlobOf({ intent: null, claimed: [INTENT.blobName] })).toBeNull();
+  });
+
+  test('an intent nothing claims IS the leak — the blob is queued', () => {
+    expect(abandonedBlobOf({ intent: INTENT, claimed: [] })).toEqual(INTENT);
+    // Another meeting's blob in the list changes nothing.
+    expect(abandonedBlobOf({ intent: INTENT, claimed: ['rec-8/media-8.mp4'] })).toEqual(INTENT);
+  });
+
+  test('an intent a LIVE media row claims is the recording — never queued', () => {
+    // The crash-after-the-row case: the row was created, the clear never ran.
+    // Deleting here would destroy the meeting's only copy of itself.
+    expect(abandonedBlobOf({ intent: INTENT, claimed: [INTENT.blobName] })).toBeNull();
+    expect(
+      abandonedBlobOf({ intent: INTENT, claimed: ['rec-8/media-8.mp4', INTENT.blobName] })
+    ).toBeNull();
+  });
+
+  test('a half-written intent is not something to delete by', () => {
+    expect(abandonedBlobOf({ intent: { ...INTENT, blobName: '' }, claimed: [] })).toBeNull();
   });
 });

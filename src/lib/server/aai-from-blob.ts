@@ -53,7 +53,7 @@ import {
   setLocalAudioPathForUser,
   type TranscriptRow,
 } from '@/db-ops/transcripts';
-import type { UploadSpec } from '@/lib/server/upload-pipeline';
+import type { BlobCopyIntent, UploadSpec } from '@/lib/server/upload-pipeline';
 import type { GmeetContext } from '@/lib/format';
 
 /**
@@ -97,6 +97,14 @@ import type { GmeetContext } from '@/lib/format';
  * one blob for six hours. It is never stored (`transcripts.audio_url` is left
  * NULL on this path), never logged, and every error that could quote it back
  * goes through `redactSasInText` first.
+ *
+ * THE INTENT: between the copy and the media row that names its blob there is
+ * a window in which the only record of those permanent bytes is a promise in
+ * this process. So the blob's name is written onto the upload session FIRST
+ * (`BlobCopyIntent`, `blobIntentOf`) and cleared once Stage C is over either
+ * way; the expired-session sweeper turns a leftover intent into a
+ * `media_blob_deletes` row unless a live media row claims that blob
+ * (`abandonedBlobOf`).
  */
 
 const SCHEMA = SCHEMAS.MEETING_WHISPERER;
@@ -262,6 +270,60 @@ export async function planBlobIngest(
       bytes: session.size,
     },
   };
+}
+
+// ---------------------------------------------------------------------------
+// The intent, and what a dead session leaves behind
+// ---------------------------------------------------------------------------
+
+/** The plan, reduced to the four things a cleanup needs to know. */
+export function blobIntentOf(plan: BlobIngestPlan): BlobCopyIntent {
+  return {
+    blobName: plan.blobName,
+    recordingId: plan.recordingId,
+    mediaId: plan.mediaId,
+    at: new Date().toISOString(),
+  };
+}
+
+/** Everything the decision below is allowed to look at. */
+export interface AbandonedBlobInput {
+  /** `upload_sessions.spec.blobIntent` — absent when Stage C never started. */
+  intent: BlobCopyIntent | null | undefined;
+  /** Blob names LIVE `recording_media` rows claim (`claimedMediaBlobNames`). */
+  claimed: readonly string[];
+}
+
+/**
+ * A session is being reaped: is there a blob in the permanent media container
+ * that nothing will ever name again?
+ *
+ * The one leak Stage C shipped with. `copyTransitToMedia` puts the bytes at a
+ * deterministic name and the row that refers to them
+ * (`recording_media.blob_name`) is written afterwards, so a crash in between —
+ * a pm2 restart mid-ingest is the ordinary way this happens, and it leaves the
+ * session stuck at `completing` — stranded the bytes: the blob's name existed
+ * only inside a promise that died with the process. The INTENT is that name,
+ * written down before the copy.
+ *
+ * Two rules, and the second is the one that matters:
+ *
+ *  - no intent, nothing to do. A chunk session, a pull-path session, or a
+ *    Stage C attempt that finished and cleared its stamp.
+ *  - an intent whose blob a live media row CLAIMS is not abandoned — it is the
+ *    recording. This is the crash-after-the-row case (the row was created, the
+ *    clear never ran), and deleting there would destroy a meeting's only copy
+ *    of itself. `claimed` is asked of the database at sweep time, never
+ *    inferred from the session's own status: the session says nothing
+ *    trustworthy about a row a later promotion may have moved.
+ *
+ * Pure, so the rule is testable without a store, a row or an account.
+ */
+export function abandonedBlobOf(i: AbandonedBlobInput): BlobCopyIntent | null {
+  const intent = i.intent;
+  if (!intent?.blobName) return null;
+  if (i.claimed.includes(intent.blobName)) return null;
+  return intent;
 }
 
 // ---------------------------------------------------------------------------
