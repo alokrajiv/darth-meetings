@@ -126,7 +126,15 @@ export function onTranscriptCompleted(
             ownerUserId,
             full.assemblyai_id,
             content,
-            meetT.utterances
+            meetT.utterances,
+            // The media, for the pooled-room release valve: when the rule is
+            // about to drop a name because it spans two diarized speakers,
+            // it can cut a few seconds of that name's own dense speech and
+            // ask the ECAPA sidecar whether it is one voice after all
+            // (lib/meet-align-valve.ts). Off unless
+            // MW_MEET_ALIGN_VOICE_VALVE is set; capped at 3 checks, ~2 s of
+            // CPU each, audio only, nothing enrolled.
+            { media: resolved.media, gmeetContext: full.gmeet_context ?? null }
           ).catch((err) => console.warn('[post-completion] meet-align failed:', err));
         }
 

@@ -15,6 +15,11 @@ Endpoints:
   POST /embed            -> {"embedding": [f32 x 192], "segments_used": n}
        body: {"audio_path": "/abs/path.m4a",
               "segments": [{"start_ms": int, "end_ms": int}, ...]}
+  POST /embed-batch      -> {"embeddings": [[f32 x 192], ...], "starts_ms": [...],
+                             "segments_used": n, "segments_asked": n}
+       body: same as /embed. One embedding PER SEGMENT instead of their
+       average, for callers that ask whether the segments are one voice at
+       all (the pooled-room release valve). Audio only (-vn).
   POST /align            -> {"offsetMs": int, "confidence": f, "driftPpm": f|null,
                              "method": str, "overlapMs": int|null}
        body: {"a": "/abs/a.m4a", "b": "/abs/b.m4a",
@@ -360,6 +365,90 @@ def align_recordings(a_path: str, b_path: str, nominal_ms: int, window_ms: int) 
     }
 
 
+# ---------------------------------------------------------------------------
+# /embed-batch — one embedding PER SEGMENT (the shared-mic "split" check)
+# ---------------------------------------------------------------------------
+#
+# /embed answers "who is this speaker?" and averages the segments into one
+# voiceprint. This answers a different question — "is this ONE voice at all?"
+# (docs/eval-shared-mic-2026-09-21.md) — and averaging would destroy exactly
+# the disagreement it looks for, so the caller gets every segment's own
+# embedding and clusters them itself (src/lib/meet-align-valve.ts).
+#
+# Nothing here enrolls anything: the embeddings are compared inside one
+# meeting and thrown away.
+#
+# AUDIO ONLY, always: `-vn` is passed explicitly so a video file can never
+# have a frame decoded in this process.
+
+MAX_BATCH_SEGMENTS = 12
+
+
+def slice_audio_only(audio_path: str, start_ms: int, end_ms: int) -> np.ndarray:
+    """Like slice_to_wav, with -vn — no video stream is ever decoded."""
+    duration_ms = min(end_ms - start_ms, MAX_SEGMENT_MS)
+    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
+        tmp_path = tmp.name
+    try:
+        subprocess.run(
+            [
+                "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+                "-ss", f"{start_ms / 1000:.3f}",
+                "-t", f"{duration_ms / 1000:.3f}",
+                "-i", audio_path,
+                "-vn", "-ac", "1", "-ar", "16000", "-c:a", "pcm_s16le",
+                tmp_path,
+            ],
+            check=True,
+            timeout=120,
+            capture_output=True,
+        )
+        with wave.open(tmp_path, "rb") as w:
+            frames = w.readframes(w.getnframes())
+        return np.frombuffer(frames, dtype=np.int16).astype(np.float32) / 32768.0
+    finally:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+
+
+def embed_segments(audio_path: str, segments: list) -> dict:
+    """One L2-normalised embedding per usable segment, in the order given.
+
+    A segment that is too short, or that decodes to less than a second of
+    audio, is simply left out — the caller decides whether what came back is
+    enough to have an opinion, and fewer than it asked for must never be read
+    as a verdict.
+    """
+    if not os.path.isfile(audio_path):
+        raise FileNotFoundError(f"audio file not found: {audio_path}")
+
+    usable = [
+        s for s in segments
+        if int(s["end_ms"]) - int(s["start_ms"]) >= MIN_SEGMENT_MS
+    ][:MAX_BATCH_SEGMENTS]
+    if not usable:
+        raise ValueError("no segments >= 1s provided")
+
+    model = get_model()
+    out, starts = [], []
+    for seg in usable:
+        start_ms = int(seg["start_ms"])
+        pcm = slice_audio_only(audio_path, start_ms, int(seg["end_ms"]))
+        if pcm.shape[0] < 16000:
+            continue
+        signal = torch.from_numpy(pcm).unsqueeze(0)
+        with torch.no_grad():
+            emb = model.encode_batch(signal).squeeze().cpu().numpy()
+        emb = emb / (np.linalg.norm(emb) + 1e-10)
+        out.append([float(x) for x in emb])
+        starts.append(start_ms)
+
+    return {"embeddings": out, "starts_ms": starts,
+            "segments_used": len(out), "segments_asked": len(usable)}
+
+
 class Handler(BaseHTTPRequestHandler):
     def _send(self, code: int, payload: dict):
         body = json.dumps(payload).encode()
@@ -376,13 +465,15 @@ class Handler(BaseHTTPRequestHandler):
             self._send(404, {"error": "not found"})
 
     def do_POST(self):
-        if self.path not in ("/embed", "/align"):
+        if self.path not in ("/embed", "/embed-batch", "/align"):
             self._send(404, {"error": "not found"})
             return
         try:
             length = int(self.headers.get("Content-Length", "0"))
             req = json.loads(self.rfile.read(length))
-            if self.path == "/align":
+            if self.path == "/embed-batch":
+                result = embed_segments(req["audio_path"], req["segments"])
+            elif self.path == "/align":
                 result = align_recordings(
                     req["a"],
                     req["b"],

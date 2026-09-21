@@ -68,18 +68,30 @@ export interface AlignmentVote {
  * below `MIN_DENSITY_CHARS_PER_S`.
  */
 export function windowWeight(spanMs: number, textLength: number): number {
-  if (spanMs <= 0) return 0;
-  const density = textLength / (spanMs / 1000);
+  const density = windowDensity(spanMs, textLength);
   if (density < MIN_DENSITY_CHARS_PER_S) return 0;
   return Math.min(1, density / DENSITY_REF_CHARS_PER_S);
+}
+
+/**
+ * Characters per second a window implies — how full of its own speaker's
+ * speech it is. 0 for a zero or negative span (nothing to divide by).
+ *
+ * The one place density is computed. `windowWeight` turns it into the vote's
+ * soft weight; `lib/meet-align-valve.ts` applies the shared-mic eval's HARD
+ * cut to it (>= 12 chars/s, span >= 3 s) to find windows worth cutting audio
+ * out of. Same number, two thresholds, one definition.
+ */
+export function windowDensity(spanMs: number, textLength: number): number {
+  if (spanMs <= 0) return 0;
+  return textLength / (spanMs / 1000);
 }
 
 /** True when at least one window carries enough text for density to mean
  * anything. False → weighting is skipped (every window counts flat). */
 export function hasDensitySignal(meetUtterances: MeetUtterance[]): boolean {
   for (const m of meetUtterances) {
-    const span = m.end - m.start;
-    if (span > 0 && m.text.length / (span / 1000) >= SIGNAL_PRESENT_CHARS_PER_S) return true;
+    if (windowDensity(m.end - m.start, m.text.length) >= SIGNAL_PRESENT_CHARS_PER_S) return true;
   }
   return false;
 }

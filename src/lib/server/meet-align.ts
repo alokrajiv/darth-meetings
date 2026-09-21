@@ -3,8 +3,22 @@ import {
   getForUser as getMappingsForUser,
   setSuggestionsForUser,
 } from '@/db-ops/speaker-mappings';
-import type { MeetUtterance, SpeakerSuggestionMap, TranscriptResponse } from '@/lib/format';
+import type {
+  GmeetContext,
+  MeetUtterance,
+  SpeakerSuggestionMap,
+  TranscriptResponse,
+} from '@/lib/format';
 import { computeMeetAlignment, type AlignmentVote } from '@/lib/meet-align-vote';
+import {
+  planValveChecks,
+  runVoiceValve,
+  type PooledGroup,
+  type ValveCheck,
+} from '@/lib/meet-align-valve';
+import { resolveAudioPath } from '@/lib/server/audio-storage';
+import { canonicalMedia, localMsIn, type ResolvedMedia } from '@/lib/server/recordings';
+import { embedSegmentsViaSidecar } from '@/lib/server/voiceprint';
 
 /**
  * Meet ↔ AAI speaker alignment.
@@ -40,6 +54,113 @@ export { computeMeetAlignment };
 export type { AlignmentVote };
 
 /**
+ * What the pooled-room valve needs to look at audio: the meeting's files and
+ * the context markers that say whether they sit on the sidecar's timeline.
+ * Absent → the valve never runs and the rule behaves exactly as it always has.
+ */
+export interface MeetAlignVoiceContext {
+  media: ResolvedMedia[];
+  gmeetContext: GmeetContext | null;
+}
+
+/**
+ * The release valve is OFF unless `MW_MEET_ALIGN_VOICE_VALVE` says otherwise.
+ *
+ * It is built and tested, and on the 2026-09-22 corpus it does not pay:
+ * 17 of 19 pooled groups were checkable and 15 scored `split < 0.45` — those
+ * rooms really do hold two voices — so at the eval's threshold the valve
+ * rescued one name the owner's own labels call WRONG and no right ones
+ * (docs/eval-meet-align-voice-valve-2026-09-22.md). Re-measure before
+ * flipping this on; the corpus behind it is 23 labels.
+ */
+export function voiceValveEnabled(): boolean {
+  const v = (process.env.MW_MEET_ALIGN_VOICE_VALVE ?? '').trim().toLowerCase();
+  return v === '1' || v === 'true' || v === 'on' || v === 'yes';
+}
+
+/**
+ * A meeting whose media and Meet sidecar are NOT on one timeline: several
+ * files, a concatenation, extra Meet videos, or a re-cut upload whose
+ * canonical is windowed. The vote is already known to be unreliable on these
+ * (dense-windows eval §6) and a snippet cut at a Meet window's ms would be
+ * the wrong audio, so the valve refuses to look.
+ */
+function timelineShifted(voice: MeetAlignVoiceContext, primary: ResolvedMedia | null): boolean {
+  const ctx = voice.gmeetContext;
+  return (
+    voice.media.length > 1 ||
+    (ctx?.combinedParts ?? 0) > 0 ||
+    (ctx?.videoParts?.length ?? 0) > 0 ||
+    primary?.windowFromMs != null
+  );
+}
+
+/**
+ * Ask the audio whether each pooled Meet name really is two voices, and
+ * return the labels whose suggestion survives (`split >= 0.45` = one voice =
+ * the rule was a false alarm).
+ *
+ * Best-effort throughout: no media, a shifted timeline, a sidecar that is
+ * down, too little dense speech — every one of those means "keep dropping",
+ * never "keep the name".
+ */
+async function runPooledRoomValve(
+  assemblyaiId: string,
+  pooled: PooledGroup[],
+  aaiUtterances: Array<{ speaker: string; start: number; end: number }>,
+  meetUtterances: MeetUtterance[],
+  voice: MeetAlignVoiceContext
+): Promise<Set<string>> {
+  const primary = canonicalMedia(voice.media) ?? voice.media[0] ?? null;
+  let audioPath: string | null = null;
+  try {
+    audioPath = primary ? resolveAudioPath(primary.filename) : null;
+  } catch {
+    audioPath = null;
+  }
+
+  const plan = planValveChecks(pooled, {
+    meetUtterances,
+    aaiUtterances,
+    hasLocalMedia: Boolean(audioPath && primary),
+    timelineShifted: timelineShifted(voice, primary),
+  });
+  for (const s of plan.skipped) {
+    console.log(
+      `[meet-align] ${assemblyaiId}: voice valve skipped "${s.name}" (${s.reason}, alignment ${plan.alignment.toFixed(2)})`
+    );
+  }
+  if (plan.candidates.length === 0 || !audioPath || !primary) return new Set();
+
+  const log = (check: ValveCheck) => {
+    const c = check.candidate;
+    console.log(
+      `[meet-align] ${assemblyaiId}: voice valve "${c.name}" split=${check.split === null ? 'n/a' : check.split.toFixed(3)} ` +
+        `(${check.embeddings} snippets, ${c.denseWindows} dense windows, ${Math.round(c.denseMs / 1000)}s) -> ${check.verdict}`
+    );
+  };
+
+  const checks = await runVoiceValve(
+    plan,
+    async (candidate) =>
+      embedSegmentsViaSidecar(
+        audioPath,
+        candidate.snippets.map((sn) => ({
+          start_ms: localMsIn(primary, sn.startMs),
+          end_ms: localMsIn(primary, sn.endMs),
+        }))
+      ),
+    log
+  );
+
+  const kept = new Set<string>();
+  for (const check of checks) {
+    if (check.verdict === 'single-voice') kept.add(check.candidate.winner);
+  }
+  return kept;
+}
+
+/**
  * Run the alignment and merge decisive results into the transcript's
  * speaker suggestions. Never overrides confirmed labels or voiceprint
  * matches. Returns the number of suggestions written.
@@ -48,7 +169,11 @@ export async function suggestSpeakersFromMeet(
   ownerUserId: string,
   assemblyaiId: string,
   content: TranscriptResponse,
-  meetUtterances: MeetUtterance[]
+  meetUtterances: MeetUtterance[],
+  /** The meeting's media, so the pooled-room rule can consult the audio
+   * before it throws a name away. Omit and the rule behaves as it always
+   * has; the valve is also off by default (`voiceValveEnabled`). */
+  voice?: MeetAlignVoiceContext
 ): Promise<number> {
   const aaiUtterances = (content.utterances ?? []).map((u) => ({
     speaker: u.speaker,
@@ -75,12 +200,43 @@ export async function suggestSpeakersFromMeet(
     list.push(speaker);
     byName.set(vote.name, list);
   }
+  const pooled: PooledGroup[] = [];
   for (const [name, speakers] of byName) {
     if (speakers.length > 1) {
       console.log(
         `[meet-align] ${assemblyaiId}: "${name}" spans ${speakers.length} diarized speakers (pooled room) — skipping`
       );
+      pooled.push({
+        name,
+        entries: speakers.map((s) => ({ speaker: s, vote: decisive.get(s)! })),
+      });
       for (const s of speakers) decisive.delete(s);
+    }
+  }
+
+  // The release valve: the rule above infers "two voices behind one device"
+  // from the alignment alone. When there is local audio on the sidecar's own
+  // timeline, ask the audio instead — one voice means the rule misfired and
+  // the strongest label keeps its name.
+  const rescued = new Set<string>();
+  if (pooled.length > 0 && voice && voiceValveEnabled()) {
+    try {
+      const kept = await runPooledRoomValve(
+        assemblyaiId,
+        pooled,
+        aaiUtterances,
+        meetUtterances,
+        voice
+      );
+      for (const group of pooled) {
+        for (const entry of group.entries) {
+          if (!kept.has(entry.speaker)) continue;
+          decisive.set(entry.speaker, entry.vote);
+          rescued.add(entry.speaker);
+        }
+      }
+    } catch (err) {
+      console.warn(`[meet-align] ${assemblyaiId}: voice valve failed:`, err);
     }
   }
   if (decisive.size === 0) return 0;
@@ -98,11 +254,17 @@ export async function suggestSpeakersFromMeet(
     if (confirmed.has(speaker)) continue;
     // Voiceprint matches outrank timeline overlap.
     if (merged[speaker]?.source === 'voice') continue;
+    // `source` stays 'context' — it is the People card's filter key and the
+    // rescue is still an overlap vote. What the voice check added goes in the
+    // evidence, which is the sentence the card shows.
+    const voiceNote = rescued.has(speaker)
+      ? `; ${vote.name}'s own speech in this meeting sounds like one voice, so the shared-device guard was released (meet-align+voice)`
+      : '';
     merged[speaker] = {
       name: vote.name,
       confidence: Math.round(vote.share * 100) / 100,
       source: 'context',
-      evidence: `${Math.round(vote.share * 100)}% of this speaker's time lines up with ${vote.name}'s speech in the meeting's own named transcript`,
+      evidence: `${Math.round(vote.share * 100)}% of this speaker's time lines up with ${vote.name}'s speech in the meeting's own named transcript${voiceNote}`,
     };
     written++;
   }

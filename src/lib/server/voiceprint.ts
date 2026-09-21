@@ -287,3 +287,37 @@ export async function suggestSpeakersForTranscript(
   }
   return merged;
 }
+
+/**
+ * One embedding PER SEGMENT, for callers that ask whether a stretch of audio
+ * is ONE voice rather than whose voice it is (`lib/meet-align-valve.ts`).
+ *
+ * `/embed` averages its segments into a voiceprint, which is exactly the
+ * wrong shape here: the disagreement between segments IS the signal. This
+ * hits the sidecar's `/embed-batch`, which cuts each segment audio-only
+ * (`-vn`) and returns the segments it managed to decode, in order.
+ *
+ * Nothing is enrolled and nothing is written: the vectors are compared to
+ * each other by the caller and dropped.
+ *
+ * Returns `[]` when the sidecar has nothing usable — never a partial verdict.
+ */
+export async function embedSegmentsViaSidecar(
+  audioPath: string,
+  segments: Segment[]
+): Promise<number[][]> {
+  if (segments.length === 0) return [];
+  const res = await fetch(`${SIDECAR_URL}/embed-batch`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ audio_path: audioPath, segments }),
+    // ~0.15 s per 5 s snippet on the VM; 8 snippets is a couple of seconds.
+    signal: AbortSignal.timeout(120_000),
+  });
+  if (!res.ok) {
+    const body = await res.text().catch(() => '');
+    throw new Error(`sidecar /embed-batch ${res.status}: ${body.slice(0, 300)}`);
+  }
+  const data = (await res.json()) as { embeddings?: number[][] };
+  return data.embeddings ?? [];
+}
