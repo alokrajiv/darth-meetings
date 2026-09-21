@@ -13,6 +13,8 @@ describe('personDisplay', () => {
   test('underscore and hyphen separators', () => {
     expect(personDisplay('antonius_hariyanto@trames.sg').first).toBe('Antonius');
     expect(personDisplay('antonius_hariyanto@trames.sg').initials).toBe('AH');
+    expect(personDisplay('atira.sarat@trames.sg', 'atira').first).toBe('Atira');
+    expect(personDisplay('x@trames.sg', 'Ronald McDonald').full).toBe('Ronald McDonald');
     expect(personDisplay('kawen-koh@trames.sg').full).toBe('Kawen Koh');
   });
   test('a display name wins over the e-mail', () => {

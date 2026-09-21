@@ -34,7 +34,12 @@ export function personDisplay(
   const nm = (name ?? '').trim();
   let words: string[] = [];
   if (nm && !nm.includes('@')) {
-    words = nm.split(/\s+/).filter(Boolean);
+    // A stored display name can be all lower-case ("atira" — the SSO profile
+    // as typed); capitalise those words, leave "McDonald" / "de Souza" alone.
+    words = nm
+      .split(/\s+/)
+      .filter(Boolean)
+      .map((w) => (w === w.toLowerCase() ? cap(w) : w));
   } else if (mail) {
     words = wordsFromLocalPart(mail.split('@')[0] ?? '');
   }
