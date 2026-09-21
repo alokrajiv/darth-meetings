@@ -4,7 +4,7 @@ import ScreenCaptureKit
 import ServiceManagement
 import RecorderCore
 
-let VERSION = "0.3.9"
+let VERSION = "0.3.10"
 let WS_PORT: UInt16 = 47800
 let PWA_URL = URL(string: "https://meetings.darth-internal.trames.io/")!
 /// Seconds between "the call ended" and an automatic stop.
@@ -62,6 +62,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
     static let BANNER_AUTO_HIDE: TimeInterval = 10
 
+    /// 0.3.10: Apple's voice processing (VPIO) on the mic input — acoustic echo cancellation
+    /// against the system's own output, noise suppression, Apple's AGC. ON by default: without
+    /// it a call on the speakers puts the far end in BOTH tracks and the server's mix carries
+    /// the other people twice. Read when a recording's mic starts, so a change takes effect on
+    /// the next recording.
+    var micVoiceProcessing: Bool {
+        get { UserDefaults.standard.object(forKey: "micVoiceProcessing") as? Bool ?? true }
+        set {
+            UserDefaults.standard.set(newValue, forKey: "micVoiceProcessing")
+            recorder.micVoiceProcessing = newValue
+            EventLog.shared.log("mic_processing_pref", ["enabled": newValue],
+                                summary: "mic: voice processing preference → \(newValue ? "ON" : "off") — takes effect on the next recording")
+            refreshMenu(); broadcast("status")
+        }
+    }
+
     /// "Upload recordings automatically" — on by default.
     var autoUpload: Bool {
         get { UserDefaults.standard.object(forKey: "autoUpload") as? Bool ?? true }
@@ -87,6 +103,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     let bannerItem = NSMenuItem(title: "Show banner", action: #selector(toggleBanner), keyEquivalent: "b")
     let discreetItem = NSMenuItem(title: "Discreet menu bar icon (no red while recording)", action: #selector(toggleDiscreet), keyEquivalent: "")
     let autoHideItem = NSMenuItem(title: "Hide the recording banner after 10 s", action: #selector(toggleBannerAutoHide), keyEquivalent: "")
+    let micProcessingItem: NSMenuItem = {
+        let i = NSMenuItem(title: "Cancel speaker echo in the mic (voice processing)", action: #selector(toggleMicProcessing), keyEquivalent: "")
+        i.toolTip = "Apple's echo cancellation keeps the other people's voices out of your microphone track, so a call on the speakers is not recorded twice. Takes effect on the next recording."
+        return i
+    }()
     let authItem = NSMenuItem(title: "Sign in to Darth Meetings…", action: #selector(toggleAuth), keyEquivalent: "")
     let uploadItem = NSMenuItem(title: "Upload recordings automatically", action: #selector(toggleAutoUpload), keyEquivalent: "")
     let pendingLine = NSMenuItem(title: "", action: nil, keyEquivalent: "")
@@ -134,6 +155,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         recorder.api = api
         recorder.deviceId = auth.deviceId
+        recorder.micVoiceProcessing = micVoiceProcessing
         recorder.willStopOwnStreams = { [weak self] n in for _ in 0..<n { self?.shares.expectOwnTeardown() } }
         recorder.onStarted = { [weak self] in self?.recordingStarted() }
         recorder.onSegment = { [weak self] index, reason in self?.broadcast("segment_started", ["segment": index, "reason": reason]) }
@@ -465,6 +487,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         m.addItem(.separator())
         discreetItem.target = self; m.addItem(discreetItem)
         autoHideItem.target = self; m.addItem(autoHideItem)
+        micProcessingItem.target = self; m.addItem(micProcessingItem)
         m.addItem(.separator())
         let open = NSMenuItem(title: "Open Darth Meetings", action: #selector(openPWA), keyEquivalent: "o"); open.target = self; m.addItem(open)
         let reveal = NSMenuItem(title: "Show recordings folder", action: #selector(revealFolder), keyEquivalent: ""); reveal.target = self; m.addItem(reveal)
@@ -509,6 +532,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         bannerItem.title = banner.isVisible ? "Hide banner" : "Show banner"
         discreetItem.state = discreet ? .on : .off
         autoHideItem.state = bannerAutoHide ? .on : .off
+        micProcessingItem.state = micVoiceProcessing ? .on : .off
         authItem.title = auth.signingIn ? "Signing in…" : (auth.signedIn ? "Signed in as \(auth.email ?? "?") — sign out" : "Sign in to Darth Meetings…")
         authItem.isEnabled = !auth.signingIn
         uploadItem.state = autoUpload ? .on : .off
@@ -861,6 +885,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
     @objc func toggleDiscreet() { discreet = !discreet }
     @objc func toggleBannerAutoHide() { bannerAutoHide = !bannerAutoHide }
+    @objc func toggleMicProcessing() { micVoiceProcessing = !micVoiceProcessing }
 
     /// Once per recording: system audio silent past the threshold → a warning that stays until
     /// dismissed (the recording itself continues). Mic and video only change the tick + event.
@@ -995,6 +1020,33 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
+    /// ws `mic_echo_probe {seconds?: 10, processing?: Bool}` → `mic_echo_probe_result`.
+    ///
+    /// Plays a deterministic noise burst out of the default output and measures how much of it
+    /// comes back in the microphone (see `EchoProbe`). Nothing is recorded: no registry row, no
+    /// file, no upload — the two tracks live in memory for the length of the probe.
+    ///
+    /// Refused while a call is detected or a recording is live: the burst would be heard by the
+    /// people on the call, and the probe would fight the recording for the microphone.
+    func runEchoProbe(_ obj: [String: Any]) {
+        let busy: String?
+        if recorder.isRecording || recorder.state == .starting { busy = "a recording is live" }
+        else if !detector.active.isEmpty { busy = "a call is in progress" }
+        else { busy = nil }
+        if let busy {
+            rlog("echo probe: refused — \(busy)")
+            server.broadcast(["type": "mic_echo_probe_result", "error": "busy", "reason": busy])
+            return
+        }
+        let seconds = (obj["seconds"] as? Double) ?? 10
+        let processing = obj["processing"] as? Bool
+        EchoProbe.shared.run(seconds: seconds, processing: processing) { [weak self] result in
+            var msg = result
+            msg["type"] = "mic_echo_probe_result"
+            self?.server.broadcast(msg)
+        }
+    }
+
     func statusPayload() -> [String: Any] {
         let pending = Registry.shared.pendingUpload().count
         var d: [String: Any] = [
@@ -1014,6 +1066,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             "update_staged": updater.staged?.version ?? NSNull(),
             "discreet": discreet,
             "banner_auto_hide": bannerAutoHide,
+            // 0.3.10: `enabled` = the preference, `active` = what the last recording's mic
+            // really ran with (null until a recording has had a microphone).
+            "mic_processing": ["enabled": micVoiceProcessing, "active": recorder.micProcessingActive ?? NSNull()] as [String: Any],
             "banner_visible": banner.isVisible,
             "resources": ResourceSampler.shared.latest ?? NSNull(),
             "ts": isoNow(),
@@ -1114,6 +1169,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             } else if let did = obj["display_id"] as? Int {
                 broadcast("source_changed", ["outcome": recorder.switchSource(to: .display(CGDirectDisplayID(did)), title: "display \(did)", how: "pwa")])
             }
+        case "set_mic_processing": if let v = obj["enabled"] as? Bool { micVoiceProcessing = v }
+        case "mic_echo_probe":                               // {seconds?, processing?} → mic_echo_probe_result
+            runEchoProbe(obj)
         case "set_discreet": if let v = obj["enabled"] as? Bool { discreet = v }
         case "set_banner_auto_hide": if let v = obj["enabled"] as? Bool { bannerAutoHide = v }
         case "show_banner": if recorder.isRecording { showRecordingBanner(autoHide: false) } else { banner.showMessage(title: "Darth Recorder", sub: "Not recording", accent: .info, autoHide: 5) }

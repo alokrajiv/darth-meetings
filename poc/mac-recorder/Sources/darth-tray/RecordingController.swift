@@ -191,6 +191,18 @@ final class RecordingController {
     /// (the person picked a window / display from the preview's gear or the PWA).
     private(set) var sourceMode = "auto"
     private(set) var micActive = false
+    /// 0.3.10: the `micVoiceProcessing` preference, copied in by the AppDelegate. Read ONCE,
+    /// when a recording's mic starts — changing it mid-recording would mean tearing the input
+    /// engine down and rolling a segment, so it takes effect on the next recording.
+    var micVoiceProcessing = true
+    /// 0.3.10: what the current (or most recent) recording's mic ACTUALLY ran with, and the
+    /// format its track was built from. Kept after `mic` is released so the stopped event and
+    /// the ws status can still say so.
+    private(set) var micProcessing: MicCapture.VoiceProcessing?
+    private(set) var micFormatLabel: String?
+    private(set) var micHardwareLabel: String?
+    /// `true` / `false` / nil (no mic yet) — the "active" half of `mic_processing` in `status`.
+    var micProcessingActive: Bool? { micProcessing.map { $0 == .on } }
     var fps = 5
 
     /// Main queue.
@@ -421,6 +433,7 @@ final class RecordingController {
         loggedGoneAfterEnd = false
         holdTimer?.invalidate(); holdTimer = nil
         systemStreamFailed = nil; streamFailure = false; flags = [:]; healthTicks = 0; micDenied = false
+        micProcessing = nil; micFormatLabel = nil; micHardwareLabel = nil
         shareNoticeShown = false; pendingVideoFailure = false; currentSource = nil; sourceMode = "auto"
         videoFramesTotal = 0; videoDupTotal = 0; lastVideoCount = -1; lastVideoWriter = nil
         audioForwarder.reset()
@@ -544,12 +557,17 @@ final class RecordingController {
             self.micDenied = !granted
             var micFormat: AVAudioFormat?
             if granted {
-                let m = MicCapture()
+                let m = MicCapture(voiceProcessing: self.micVoiceProcessing)
                 do {
                     try m.start()
                     micFormat = m.format
                     self.mic = m
                     self.micActive = true
+                    // 0.3.10: the format AFTER voice processing had its say — that is what the
+                    // writer's mic track is built from, and what the event log must report.
+                    self.micProcessing = m.voiceProcessing
+                    self.micFormatLabel = m.formatLabel
+                    self.micHardwareLabel = m.hardwareFormatLabel
                 } catch {
                     rlog("record: mic unavailable — \(error.localizedDescription)")
                     EventLog.shared.log("mic_failed", ["error": error.localizedDescription])
@@ -677,6 +695,12 @@ final class RecordingController {
             "system_error": systemStreamFailed ?? NSNull(),
             "mic_stream": options.mic ? (mic != nil) : NSNull(),
             "mic_denied": micDenied,
+            // 0.3.10: true | false | "unavailable" (asked for, refused by the system), and the
+            // input format the mic track was actually built from.
+            "mic_processing": mic?.voiceProcessingJSON ?? NSNull(),
+            "mic_processing_requested": options.mic ? micVoiceProcessing : NSNull(),
+            "mic_format": micFormatLabel ?? NSNull(),
+            "mic_hw_format": micHardwareLabel ?? NSNull(),
             "audio_display_id": Int(displayID),
             "path": url.path, "options": options.json,
         ], summary: "record: \(recordingId ?? "") \(w)x\(h) tracks=[\(tracks.map { $0.name }.joined(separator: ","))] started=[\(started.joined(separator: ","))] \(options.summary) → \(url.lastPathComponent)")
@@ -1131,6 +1155,12 @@ final class RecordingController {
         mic?.stop()
         let micBuffers = mic?.buffersSeen ?? 0
         let micPeak = mic?.peak ?? 0
+        // Read off the object while it still exists: `mic` is nil one line down, so the
+        // conditioner / format fields in `recording_stopped` had been null since 0.3.2.
+        let micConditioner = mic?.conditioner.snapshot
+        let micProcessingJSON = mic?.voiceProcessingJSON
+        let micFormat = micFormatLabel
+        let micHardware = micHardwareLabel ?? mic?.hardwareFormatLabel
         mic = nil
         micActive = false
 
@@ -1162,8 +1192,11 @@ final class RecordingController {
                 "segments": self.segments.count, "files": files,
                 "mic_buffers": micBuffers, "mic_peak": Double(micPeak),
                 "mic_peak_db": micSnap?["peak_db"] ?? NSNull(), "mic_audible_s": micSnap?["audible_s"] ?? NSNull(),
-                "mic_conditioner": self.mic?.conditioner.snapshot ?? NSNull(),
-                "mic_hw_format": self.mic?.hardwareFormat.map { "\(Int($0.sampleRate)) Hz × \($0.channelCount) ch" } ?? NSNull(),
+                "mic_conditioner": micConditioner ?? NSNull(),
+                "mic_processing": micProcessingJSON ?? NSNull(),
+                "mic_processing_requested": self.options.mic ? self.micVoiceProcessing : NSNull(),
+                "mic_format": micFormat ?? NSNull(),
+                "mic_hw_format": micHardware ?? NSNull(),
                 "system_buffers": sysSnap?["buffers"] ?? NSNull(), "system_peak_db": sysSnap?["peak_db"] ?? NSNull(),
                 "system_audible_s": sysSnap?["audible_s"] ?? NSNull(), "system_stream": self.options.systemAudio ? sysStreamAlive : NSNull(),
                 "system_error": self.systemStreamFailed ?? NSNull(),

@@ -14,6 +14,100 @@ Native macOS side of Darth Meetings recording (the "Swift tray" angle from Darth
 the user switched it off in the menu (`loginItemUserChoice` in UserDefaults records an explicit choice;
 the default never overrides it). macOS may show "Darth Recorder was added as a login item" once.
 
+**0.3.10 (2026-09-21) — the far end is not in the mic track any more.** On speakers the
+microphone also hears the other people, tens of milliseconds after the system-audio track does.
+The server's mix (`src/lib/server/multitrack.ts`: amix of the system track and the mic track,
+each through its own dynaudnorm) then carries them TWICE — a comb-filtered double of every
+sentence — and diarization smears across the two copies. `MicCapture` opened the mic as a raw
+`AVAudioEngine.inputNode` tap with no echo cancellation at all.
+
+- **Apple's voice processing on the input node.** `inputNode.setVoiceProcessingEnabled(true)`
+  (the VPIO unit): acoustic echo cancellation with the system's own output as the reference,
+  noise suppression, and Apple's AGC. On by default. Four things it forces, each with its own
+  log line:
+  - **Order.** It must be switched on BEFORE the tap is installed and before the engine starts —
+    enabling it rebuilds the IO unit — and the node's format changes with it (mono, usually a
+    different sample rate). So the tap format, `MicCapture.format` and the writer's mic track
+    spec all come from `inputNode.outputFormat(forBus: 0)` re-read AFTER enabling, never from
+    the hardware format we looked at first (`mic: voice-processing formats — input … output …`).
+    The raw path still reads `inputFormat(forBus: 0)` and still folds > 2 channels to mono the
+    0.3.1 way, so a WhatsApp 48 kHz × 3 ch feed is handled exactly as before when VPIO is off.
+  - **Ducking.** macOS 14 makes VPIO duck every OTHER app's audio — which would duck the call
+    we are recording. `voiceProcessingOtherAudioDuckingConfiguration` is set to
+    `(enableAdvancedDucking: false, duckingLevel: .min)`. (No `#available` guard: the package's
+    deployment target is macOS 14, so the API is unconditionally present.)
+  - **Two AGCs do not stack.** `isVoiceProcessingAGCEnabled` stays true — Apple's AGC owns the
+    level — and `MicConditioner`'s own gain is capped at **+12 dB** while VPIO runs (+36 dB on
+    the raw path, `MicConditioner.setMaxGainDb`, which `reset(channels:)` does not clobber). The
+    conditioner's loudest-channel pick and its expander stay as the fallback for when VPIO is
+    off. `isVoiceProcessingBypassed` is held false.
+  - **Fallback.** If enabling throws, or the engine refuses to start with it on, the engine is
+    thrown away and started once more raw — `mic: voice processing unavailable — raw input` —
+    and the capture records `unavailable` (not `false`), so the event log distinguishes "the
+    user turned it off" from "this Mac refused".
+- **Preference + menu.** `UserDefaults` key `micVoiceProcessing`, default ON. Menu item
+  **"Cancel speaker echo in the mic (voice processing)"** with a check mark, next to the
+  discreet-icon and banner-auto-hide toggles. It is read ONCE, when a recording's microphone
+  starts (changing it mid-recording would mean tearing the input engine down and rolling a
+  segment), so it takes effect on the next recording — the item's tooltip says so.
+- **Telemetry.** `recording_started` and `recording_stopped` gain `mic_processing`
+  (`true | false | "unavailable"`), `mic_processing_requested`, `mic_format` (the input format
+  the mic track was actually built from) and `mic_hw_format`. `audio_health` is unchanged. Also
+  fixed while in there: `recording_stopped`'s `mic_conditioner` and `mic_hw_format` had been
+  `null` since 0.3.2 — they were read off `self.mic` inside the detached finish task, one line
+  after `mic = nil`; the facts are now captured before the object is released.
+- **ws contract** (older trays simply do not answer the new commands):
+  - `set_mic_processing {enabled: Bool}` — sets the preference; a `status` broadcast follows.
+  - every status payload gains `mic_processing: {enabled: Bool, active: Bool|null}` —
+    `enabled` is the preference, `active` is what the last recording's microphone really ran
+    with (`null` until a recording has had one, `false` when VPIO was asked for and refused).
+  - `mic_echo_probe {seconds?: 10, processing?: Bool}` → `mic_echo_probe_result`. Refused with
+    `{error: "busy", reason}` while a call is detected or a recording is live (the burst would
+    be heard by the people on the call) and while another probe runs.
+
+**The echo probe** (`Sources/darth-tray/EchoProbe.swift`) — how much of the speakers is in the
+mic, as a number, without anyone having to listen to anything. One pass plays a deterministic
+wideband noise burst (fixed-seed LCG, 200 Hz – 7.5 kHz, peak ≈ −16 dBFS, 50 ms fades; noise and
+not a repeated chirp because its autocorrelation is a single spike, so no second peak can be
+mistaken for the echo) out of the default output, while capturing the system-audio track and the
+microphone. Both tracks are resampled to 16 kHz on a common host-clock time base (SCK audio and
+the mic tap both timestamp against `CMClockGetHostTimeClock`, which is what makes a lag in
+milliseconds mean anything), and the mic window is slid over the system track across **±300 ms**
+for the largest normalised cross-correlation (`vDSP_conv` + a running energy for the per-lag
+normalisation).
+
+With no `processing` argument it runs **twice — VPIO on, then off** — so the reply shows the AEC
+effect as two numbers from the same room a second apart; pass `processing: true|false` to run a
+single pass.
+
+```
+{ "type": "mic_echo_probe_result",
+  "seconds": 10, "processing": true,            // the headline fields are the FIRST pass
+  "peak": 0.071, "lag_ms": 38.4,                // 0…1 and ms
+  "mic_rms_db": -31.2, "system_rms_db": -17.9,
+  "peak_with_processing": 0.071, "peak_without_processing": 0.642,
+  "peak_drop": 0.571, "peak_drop_db": 19.1,
+  "output_device": "MacBook Pro Speakers", "input_device": "MacBook Pro Microphone",
+  "analysis_rate": 16000, "lag_search_ms": 300,
+  "passes": [ { "processing": true,  "peak": …, "lag_ms": …, "mic_processing": true,
+                "mic_format": "24000 Hz × 1 ch", "mic_agc_db": …, "window_s": 4.0, … },
+              { "processing": false, "peak": …, … } ] }
+```
+
+**How to read it.** `peak` is the fraction of the mic window explained by a delayed copy of the
+system track. Speakers with no echo cancellation is typically **0.3–0.9** with `lag_ms` a small
+positive number (air + the output device's buffering). With AEC the peak should fall a long way
+— same burst, same room, residual only — so a healthy `peak_drop_db` is the whole result.
+`lag_ms` is only meaningful when the peak is. A peak near **0 in BOTH passes** means there was no
+acoustic path at all (headphones, output muted, the burst never played) and the probe proves
+nothing: look at `output_device` first.
+
+**It never stores audio.** Deliberately not "a recording that is deleted afterwards": there is no
+file, no registry row, no upload and no temp directory — the two tracks live in memory as Float32
+for the length of the probe and die with the object. The one other difference from a real capture
+is that the probe's SCK stream sets `excludesCurrentProcessAudio = false` (a recording excludes
+our own audio; here our own burst IS the reference signal and has to be in the track).
+
 **0.3.9 (2026-09-21) — the tray says where the bytes are** (design: `docs/recorder-upload-ux.md`
 §0–3). Until now a 696 MB / 6-part upload showed a 12-second "Uploading to Darth Meetings…" card
 and then nothing at all, while the web read part 1's size as the whole recording's.
@@ -540,7 +634,11 @@ recordings`, with `calls[]`, `recording` (**always a boolean** — the saved fil
 Commands from the page: `{cmd:"start", pid?}`, `{cmd:"stop"}`, `{cmd:"status"}`,
 `{cmd:"login"}`, `{cmd:"logout"}`, `{cmd:"upload", recording_id, linked_event?}`,
 `{cmd:"list_recordings", req}` → `{type:"recordings", recordings:[…], req}`,
-`{cmd:"set_auto_upload", enabled}`.
+`{cmd:"set_auto_upload", enabled}`, `{cmd:"set_mic_processing", enabled}` (0.3.10 — voice
+processing / echo cancellation on the mic; `mic_processing:{enabled,active}` rides in every
+status snapshot), `{cmd:"mic_echo_probe", seconds?, processing?}` →
+`{type:"mic_echo_probe_result", …}` (0.3.10 — measures how much of the speakers is in the mic;
+refused with `error:"busy"` during a call or a recording; stores no audio).
 Test hooks: `{cmd:"simulate_call", kind, pid?, bundle_id?}` (with a **real pid** it treats that
 app as the call, so the window picker, the window filter and the banner run for real),
 `{cmd:"end_simulated", pid}`, `{cmd:"simulate_share", kind, window_id?, display_id?,

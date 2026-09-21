@@ -24,12 +24,42 @@ import RecorderCore
 /// expander (−20 dB) on buffers that sit within 12 dB of the tracked noise floor so silence
 /// stays silent for the health meter. Gain is applied to EVERY mic buffer (a normal 1-channel
 /// mic at a healthy level gets gain 1 — the AGC never attenuates).
+///
+/// **Echo (0.3.10).** On speakers the mic also hears the far end, tens of milliseconds late,
+/// and the server's mix (system track + mic track) then carries the other people TWICE —
+/// diarization smears and the transcript doubles. So the input node now runs Apple's voice
+/// processing IO unit (`setVoiceProcessingEnabled(true)`): acoustic echo cancellation with the
+/// system's own output as the reference, plus noise suppression and Apple's AGC. Four things
+/// that path forces, each logged:
+///
+/// 1. **Order.** Voice processing must be switched on BEFORE the tap is installed and before
+///    the engine runs — it rebuilds the IO unit. The node's format changes with it (mono,
+///    usually a different sample rate), so the tap, `format` and the writer's track spec all
+///    come from `outputFormat(forBus: 0)` re-read AFTER enabling, never from the hardware
+///    format we looked at first. The raw path still reads `inputFormat(forBus: 0)` and still
+///    folds > 2 channels to mono the 0.3.1 way.
+/// 2. **Ducking.** macOS 14 ducks every OTHER app's audio while voice processing runs — which
+///    would duck the call we are recording. `voiceProcessingOtherAudioDuckingConfiguration`
+///    is set to `(enableAdvancedDucking: false, duckingLevel: .min)`. (Deployment target is
+///    macOS 14, so the API is always present; there is nothing to `#available`-guard.)
+/// 3. **Two AGCs do not stack.** Apple's AGC stays ON and `MicConditioner`'s own gain is
+///    capped at +12 dB while voice processing is active (+36 dB on the raw path). The channel
+///    pick and the expander stay as the fallback for when it is off. `isVoiceProcessingBypassed`
+///    is held false.
+/// 4. **Fallback.** If enabling throws, or the engine refuses to start with it on, the whole
+///    engine is thrown away and started once more raw — "mic: voice processing unavailable —
+///    raw input" — and `voiceProcessing` records `.unavailable` so the event log says so.
 final class MicCapture {
-    private let engine = AVAudioEngine()
+    /// What this capture's microphone ACTUALLY ran with (not what was asked for).
+    /// `.unavailable` = asked for, refused by the system, running raw.
+    enum VoiceProcessing: String { case on, off, unavailable }
+
+    private var engine = AVAudioEngine()
     private var tapped = false
     /// The format of the buffers handed to `onBuffer` (mono when the hardware has > 1 ch).
     private(set) var format: AVAudioFormat?
-    /// What the device reported when the tap was installed.
+    /// What the node reported when the tap was installed (the hardware format on the raw path,
+    /// the voice-processing output format when that is on).
     private(set) var hardwareFormat: AVAudioFormat?
     private var reduce = false
     private(set) var reduceDropped = 0
@@ -43,6 +73,21 @@ final class MicCapture {
     /// Channel pick + AGC (0.3.2).
     let conditioner = MicConditioner()
     private var startedAt = Date()
+    /// 0.3.10: what the caller asked for.
+    let wantsVoiceProcessing: Bool
+    /// 0.3.10: what we got.
+    private(set) var voiceProcessing: VoiceProcessing = .off
+    /// 0.3.10: ceiling for `MicConditioner` when Apple's AGC is already running.
+    static let agcCapWithVoiceProcessingDb: Float = 12
+    static let agcCapRawDb: Float = 36
+
+    init(voiceProcessing: Bool = false) { wantsVoiceProcessing = voiceProcessing }
+
+    /// `true | false | "unavailable"` for the event log and the ws payloads.
+    var voiceProcessingJSON: Any { voiceProcessing == .unavailable ? "unavailable" : (voiceProcessing == .on) }
+    /// "24000 Hz × 1 ch" — the format the writer's mic track was built from.
+    var formatLabel: String? { format.map { "\(Int($0.sampleRate)) Hz × \($0.channelCount) ch" } }
+    var hardwareFormatLabel: String? { hardwareFormat.map { "\(Int($0.sampleRate)) Hz × \($0.channelCount) ch" } }
 
     static var authorization: AVAuthorizationStatus { AVCaptureDevice.authorizationStatus(for: .audio) }
 
@@ -57,11 +102,57 @@ final class MicCapture {
     }
 
     /// Start the engine and tap. Throws if the input node has no usable format (no input
-    /// device, or permission denied).
+    /// device, or permission denied). With voice processing asked for and refused, this
+    /// still succeeds — on the raw path.
     func start() throws {
         guard !tapped else { return }
+        do {
+            try startEngine(voiceProcessing: wantsVoiceProcessing)
+            voiceProcessing = wantsVoiceProcessing ? .on : .off
+        } catch {
+            guard wantsVoiceProcessing else { throw error }
+            rlog("mic: voice processing unavailable — raw input (\(error.localizedDescription))")
+            EventLog.shared.log("mic_voice_processing_unavailable", ["error": error.localizedDescription])
+            // A half-configured voice-processing IO unit is not reusable: start over on a
+            // brand-new engine so the retry is a genuine raw path.
+            resetEngine()
+            try startEngine(voiceProcessing: false)
+            voiceProcessing = .unavailable
+        }
+    }
+
+    private func resetEngine() {
+        if tapped { engine.inputNode.removeTap(onBus: 0); tapped = false }
+        engine.stop()
+        engine = AVAudioEngine()
+        buffersSeen = 0
+        reduceDropped = 0
+        peak = 0
+    }
+
+    private func startEngine(voiceProcessing: Bool) throws {
         let input = engine.inputNode
-        let hw = input.inputFormat(forBus: 0)
+        if voiceProcessing {
+            // BEFORE the tap and before the engine runs — enabling it rebuilds the IO unit.
+            try input.setVoiceProcessingEnabled(true)
+            input.isVoiceProcessingBypassed = false
+            input.isVoiceProcessingAGCEnabled = true          // Apple's AGC owns the level now
+            // macOS 14 would otherwise duck the call itself while we listen.
+            input.voiceProcessingOtherAudioDuckingConfiguration =
+                AVAudioVoiceProcessingOtherAudioDuckingConfiguration(enableAdvancedDucking: false, duckingLevel: .min)
+            rlog("mic: voice processing ON — AEC + noise suppression + Apple AGC; other-app ducking disabled (advanced=false, level=min); bypass=false")
+        }
+        // The format CHANGES when voice processing is on, so read it back now. `outputFormat`
+        // is what the node will actually hand the tap; the raw path keeps reading the hardware
+        // format the way 0.3.1 did.
+        var hw = voiceProcessing ? input.outputFormat(forBus: 0) : input.inputFormat(forBus: 0)
+        if voiceProcessing {
+            rlog("mic: voice-processing formats — input \(fmt(input.inputFormat(forBus: 0))), output \(fmt(hw))")
+            if hw.sampleRate <= 0 || hw.channelCount == 0 {
+                hw = input.inputFormat(forBus: 0)
+                rlog("mic: voice-processing output format was empty — falling back to the input format \(fmt(hw))")
+            }
+        }
         guard hw.sampleRate > 0, hw.channelCount > 0 else {
             throw NSError(domain: "mic", code: 1, userInfo: [NSLocalizedDescriptionKey: "no input format (no microphone or permission denied)"])
         }
@@ -71,9 +162,11 @@ final class MicCapture {
             throw NSError(domain: "mic", code: 2, userInfo: [NSLocalizedDescriptionKey: "could not build a mono format at \(Int(hw.sampleRate)) Hz"])
         }
         reduce = hw.channelCount > 1
-        if reduce { rlog("mic: hardware format \(Int(hw.sampleRate)) Hz × \(hw.channelCount) ch — mono track = loudest channel + AGC") }
+        if reduce { rlog("mic: hardware format \(fmt(hw)) — mono track = loudest channel + AGC") }
         format = mono
         conditioner.reset(channels: Int(hw.channelCount))
+        // Two AGCs chasing each other is worse than none: Apple's stays, ours is capped.
+        conditioner.setMaxGainDb(voiceProcessing ? Self.agcCapWithVoiceProcessingDb : Self.agcCapRawDb)
         // The tap must use the node's own format; the conversion happens in the callback.
         input.installTap(onBus: 0, bufferSize: 2048, format: hw) { [weak self] raw, when in
             guard let self else { return }
@@ -88,7 +181,7 @@ final class MicCapture {
                 self.meter.note(peak: m.peak, rms: m.rms)
             }
             if self.buffersSeen == 1 {
-                rlog("mic: first buffer \(Int(Date().timeIntervalSince(self.startedAt) * 1000)) ms after start — \(Int(raw.format.sampleRate)) Hz × \(raw.format.channelCount) ch, \(raw.frameLength) frames")
+                rlog("mic: first buffer \(Int(Date().timeIntervalSince(self.startedAt) * 1000)) ms after start — \(fmt(raw.format)), \(raw.frameLength) frames")
             }
             guard let sb = MicCapture.sampleBuffer(from: buf, when: when) else { return }
             self.onBuffer?(sb)
@@ -96,17 +189,27 @@ final class MicCapture {
         tapped = true
         startedAt = Date()
         engine.prepare()
-        try engine.start()
+        do {
+            try engine.start()
+        } catch {
+            // Leave nothing behind for the raw retry to trip over.
+            input.removeTap(onBus: 0)
+            tapped = false
+            throw error
+        }
         let dev = AVCaptureDevice.default(for: .audio)
-        rlog("mic: capturing \(Int(hw.sampleRate)) Hz × \(hw.channelCount) ch from \(dev?.localizedName ?? "default input")\(reduce ? " → mono track" : "")")
+        rlog("mic: capturing \(fmt(hw)) from \(dev?.localizedName ?? "default input")\(reduce ? " → mono track" : "")"
+             + " · voice processing \(voiceProcessing ? "ON" : "off") · AGC cap \(Int(voiceProcessing ? Self.agcCapWithVoiceProcessingDb : Self.agcCapRawDb)) dB")
     }
+
+    private func fmt(_ f: AVAudioFormat) -> String { "\(Int(f.sampleRate)) Hz × \(f.channelCount) ch" }
 
     func stop() {
         guard tapped else { return }
         engine.inputNode.removeTap(onBus: 0)
         engine.stop()
         tapped = false
-        rlog("mic: stopped after \(buffersSeen) buffers, peak \(String(format: "%.3f", peak)) — \(conditioner.summary)")
+        rlog("mic: stopped after \(buffersSeen) buffers, peak \(String(format: "%.3f", peak)) — vp=\(voiceProcessing.rawValue) — \(conditioner.summary)")
     }
 
     /// AVAudioPCMBuffer + AVAudioTime → CMSampleBuffer timestamped on the host clock, which
@@ -141,9 +244,13 @@ final class MicCapture {
 
 /// Mono channel pick + automatic gain for the mic track (0.3.2). Runs on the tap thread; the
 /// counters are read from the main thread for logs only (approximate is fine).
+///
+/// 0.3.10: the ceiling is no longer a constant. With Apple's voice processing running, its AGC
+/// already holds the level, so ours is capped at +12 dB — two AGCs stacked hunt each other and
+/// pump. `setMaxGainDb` survives `reset`.
 final class MicConditioner {
     static let targetPeak: Float = 0.25          // −12 dBFS
-    static let maxGain: Float = 63               // +36 dB
+    static let defaultMaxGain: Float = 63        // +36 dB
     static let releasePerBuffer: Float = 1.32    // ≈ +2.4 dB per 100 ms buffer = 24 dB/s (a 40 dB deficit closes in ~1.5 s)
     static let expanderGain: Float = 0.1         // −20 dB on noise-only buffers
     static let signalOverFloor: Float = 4        // 12 dB above the tracked floor = signal
@@ -160,11 +267,17 @@ final class MicConditioner {
     private(set) var maxGainDb: Float = 0
     private(set) var signalBuffers = 0
     private(set) var noiseBuffers = 0
+    /// Linear ceiling for the AGC — see `setMaxGainDb`.
+    private(set) var maxGain: Float = MicConditioner.defaultMaxGain
     /// Consecutive signal buffers so far (0.3.4): gain only RISES after 3 (300 ms) — speech is
     /// sustained, a click or a key press is one buffer, and 0.3.3 still boosted those by 24 dB
     /// before anyone had spoken.
     private var signalRun = 0
     static let riseAfterBuffers = 3
+
+    /// The AGC ceiling in dB. Not touched by `reset` — the caller sets it once per capture.
+    func setMaxGainDb(_ db: Float) { maxGain = max(1, powf(10, db / 20)) }
+    var maxGainCeilingDb: Float { 20 * log10f(max(maxGain, 1)) }
 
     func reset(channels: Int) {
         hardwareChannels = max(1, channels)
@@ -176,13 +289,14 @@ final class MicConditioner {
 
     var gainDb: Float { 20 * log10f(max(appliedGain, 1e-6)) }
     var summary: String {
-        String(format: "channel %d/%d (%d switches), gain now %+.0f dB (range %+.0f…%+.0f), signal %d / noise %d buffers",
-               channel + 1, hardwareChannels, channelSwitches, gainDb, minGainDb, maxGainDb, signalBuffers, noiseBuffers)
+        String(format: "channel %d/%d (%d switches), gain now %+.0f dB (range %+.0f…%+.0f, cap %+.0f), signal %d / noise %d buffers",
+               channel + 1, hardwareChannels, channelSwitches, gainDb, minGainDb, maxGainDb, maxGainCeilingDb, signalBuffers, noiseBuffers)
     }
     var snapshot: [String: Any] {
         ["hw_channels": hardwareChannels, "channel": channel + 1, "channel_switches": channelSwitches,
          "gain_db": Double((gainDb * 10).rounded() / 10), "gain_min_db": Double((minGainDb * 10).rounded() / 10),
-         "gain_max_db": Double((maxGainDb * 10).rounded() / 10), "signal_buffers": signalBuffers, "noise_buffers": noiseBuffers]
+         "gain_max_db": Double((maxGainDb * 10).rounded() / 10), "gain_cap_db": Double((maxGainCeilingDb * 10).rounded() / 10),
+         "signal_buffers": signalBuffers, "noise_buffers": noiseBuffers]
     }
 
     /// Float32 in → Float32 mono out (nil for other sample formats; the caller drops the buffer).
@@ -237,7 +351,7 @@ final class MicConditioner {
         //    still converges fast, because the tracker starts at that low level.
         if isSignal {
             peakTrack = max(peak, peakTrack * 0.995)
-            let wanted = min(Self.maxGain, max(1, Self.targetPeak / max(peakTrack, 1e-6)))
+            let wanted = min(maxGain, max(1, Self.targetPeak / max(peakTrack, 1e-6)))
             if wanted < gain { gain = wanted }                                                   // attack: always, at once
             else if signalRun >= Self.riseAfterBuffers { gain = min(wanted, gain * Self.releasePerBuffer) }  // rise: sustained signal only
         }
