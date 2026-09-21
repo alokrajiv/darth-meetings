@@ -276,10 +276,16 @@ async function submitInBackground(
         `(${submitted.model}, ${input.languageCode})`
     );
   } catch (err) {
-    const message = err instanceof Error ? err.message : String(err);
     console.error(`[transcription-run] ${row.assemblyai_id}: hand-off failed:`, err);
     // The MEETING is untouched — only the version says it failed.
-    await failRunTranscription(transcriptionId, `Could not send the recording to AssemblyAI: ${message}`).catch(
+    // The raw exception stays in the server log above. What is stored is
+    // shown to every reader of the meeting, read-only collaborators included,
+    // so it must not carry whatever the SDK or our config checks put in
+    // `message` (URLs, request ids, env-var names).
+    await failRunTranscription(
+      transcriptionId,
+      'The recording could not be sent to AssemblyAI. Nothing changed — try again in a few minutes.'
+    ).catch(
       () => {}
     );
     await clearRetranscribeMarker(ownerUserId, row.assemblyai_id, transcriptionId).catch(() => {});
@@ -474,6 +480,7 @@ export async function activateTranscription(input: {
     archived: facts.archived,
     hasNotes: facts.hasNotes,
     hasReport: facts.hasReport,
+    notesStale: row.gmeet_context?.notesStale ?? null,
     now: new Date().toISOString(),
   });
   if (!decision.ok) {

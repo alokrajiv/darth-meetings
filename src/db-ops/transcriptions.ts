@@ -625,7 +625,8 @@ export async function applyActivatePlan(
           speaker_id_status = CASE WHEN ${plan.brandNew} THEN NULL ELSE t.speaker_id_status END,
           speaker_id_error  = CASE WHEN ${plan.brandNew} THEN NULL ELSE t.speaker_id_error END,
           speaker_id_at     = CASE WHEN ${plan.brandNew} THEN NULL ELSE t.speaker_id_at END,
-          gmeet_context    = (COALESCE(t.gmeet_context, '{}'::jsonb) - 'retranscribing')
+          gmeet_context    = (COALESCE(t.gmeet_context, '{}'::jsonb) - 'retranscribing'
+                                - ${plan.clearNotesStale ? 'notesStale' : ''}::text)
                              || ${tx.json((plan.notesStale ? { notesStale: plan.notesStale } : {}) as never)}
       FROM ${tx(SCHEMA)}.recording_transcriptions src
       WHERE src.id = ${plan.row.payloadFromTranscriptionId}::uuid

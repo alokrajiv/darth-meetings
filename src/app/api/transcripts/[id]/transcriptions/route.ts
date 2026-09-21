@@ -48,9 +48,11 @@ export const GET = withAuth(async ({ user }, { params }) => {
   const off: TranscriptionsResponse = {
     versioned: false,
     canEdit,
-    running,
+    running: null,
     versions: [],
-    notesStale,
+    // With versions off there is no "previous transcription" to talk about —
+    // a marker left from before a rollback must not keep a banner up.
+    notesStale: null,
   };
   if (!(await transcriptionVersionsEnabled())) return NextResponse.json(off);
 

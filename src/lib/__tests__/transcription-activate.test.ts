@@ -157,6 +157,33 @@ describe('planActivate — the new run lands', () => {
     expect(withReport.notesStale?.fromTranscriptionId).toBe(txn().id);
   });
 
+  test('the notes remember the version they were written from across switches', () => {
+    const origin = txn();
+    const marker = { since: '2026-09-21T10:00:00.000Z', fromTranscriptionId: origin.id };
+
+    // Back to the origin: the notes describe exactly what is being read.
+    const back = planActivate(
+      input({ current: NEWER, target: origin, hasNotes: true, notesStale: marker })
+    );
+    if (!back.ok) throw new Error(back.error);
+    expect(back.notesStale).toBeNull();
+    expect(back.clearNotesStale).toBe(true);
+
+    // On to a third version: still stale, still FROM the origin, since unchanged.
+    const third = txn({ id: '33333333-3333-4333-8333-333333333333' });
+    const onward = planActivate(
+      input({ current: NEWER, target: third, hasReport: true, notesStale: marker })
+    );
+    if (!onward.ok) throw new Error(onward.error);
+    expect(onward.notesStale).toEqual(marker);
+    expect(onward.clearNotesStale).toBe(false);
+
+    // Notes deleted meanwhile: a leftover marker goes.
+    const gone = planActivate(input({ notesStale: marker }));
+    if (!gone.ok) throw new Error(gone.error);
+    expect(gone.clearNotesStale).toBe(true);
+  });
+
   test('an empty annotation set is not parked at all', () => {
     const d = planActivate(
       input({ live: [{ userId: 'u1', edits: {}, speakers: { labels: [], suggestions: null } }] })

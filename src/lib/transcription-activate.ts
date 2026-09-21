@@ -77,6 +77,11 @@ export interface ActivateInput {
   /** Does the meeting carry a summary / a detailed report right now? */
   hasNotes: boolean;
   hasReport: boolean;
+  /** The meeting's existing `notesStale` marker, if any. Its
+   * `fromTranscriptionId` is the version the summary/report were WRITTEN
+   * FROM — that origin must survive any number of switches, and coming back
+   * to it means the notes are not stale any more. */
+  notesStale?: { since: string; fromTranscriptionId: string } | null;
   /** ISO — the planner never reads the clock itself. */
   now: string;
 }
@@ -114,6 +119,9 @@ export interface ActivatePlan {
   supersede: { transcriptionId: string; by: string } | null;
   /** The marker for `gmeet_context`; null when there is nothing to go stale. */
   notesStale: { since: string; fromTranscriptionId: string } | null;
+  /** Remove an existing marker: the target IS the version the notes were
+   * written from, or there are no notes left to be stale. */
+  clearNotesStale: boolean;
   /** True = this version has never been read on this meeting. Gates the
    * speaker-ID re-run, the voiceprint suggestions and the "ready" DM. */
   brandNew: boolean;
@@ -171,6 +179,22 @@ function msOf(iso: string | null): number {
  * the meeting, and re-activating the live one would archive the user's
  * annotations and then restore nothing.
  */
+function notesStalePlan(
+  input: ActivateInput,
+  targetId: string,
+  currentId: string | null
+): Pick<ActivatePlan, 'notesStale' | 'clearNotesStale'> {
+  const existing = input.notesStale ?? null;
+  if (!input.hasNotes && !input.hasReport) return { notesStale: null, clearNotesStale: !!existing };
+  const origin = existing?.fromTranscriptionId ?? currentId;
+  if (!origin) return { notesStale: null, clearNotesStale: false };
+  if (origin === targetId) return { notesStale: null, clearNotesStale: !!existing };
+  return {
+    notesStale: { since: existing?.since ?? input.now, fromTranscriptionId: origin },
+    clearNotesStale: false,
+  };
+}
+
 export function planActivate(input: ActivateInput): ActivateDecision {
   const { target, current } = input;
 
@@ -235,13 +259,12 @@ export function planActivate(input: ActivateInput): ActivateDecision {
     },
     activeTranscriptionId: target.id,
     supersede: current && newer ? { transcriptionId: current.id, by: target.id } : null,
-    // The summary and the report were written from `current`. They are not
-    // regenerated automatically — that costs money and they are still mostly
-    // right — so the page says so instead (spec Flow 4).
-    notesStale:
-      current && (input.hasNotes || input.hasReport)
-        ? { since: input.now, fromTranscriptionId: current.id }
-        : null,
+    // The summary and the report were written from ONE version — `current`
+    // the first time the meeting leaves it, and still that same version after
+    // any number of later switches. They are not regenerated automatically
+    // (that costs money and they are still mostly right), so the page says so
+    // — but only while the version being read is not the one they came from.
+    ...notesStalePlan(input, target.id, current?.id ?? null),
     brandNew,
     setAside,
     restored,
