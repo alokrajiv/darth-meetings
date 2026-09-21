@@ -5,7 +5,10 @@ import { deleteAtAaiIfSafe } from '@/lib/server/aai-retention';
 import { maybeAutoReview } from '@/lib/server/auto-review';
 import { suggestSpeakersFromMeet } from '@/lib/server/meet-align';
 import { suggestSpeakersForTranscript } from '@/lib/server/voiceprint';
-import { canonicalMedia, resolveMeetingContent } from '@/lib/server/recordings';
+import { resolveMeetingContent } from '@/lib/server/recordings';
+import { combineFlagOn } from '@/db-ops/clips';
+import { meetingRecordingRef } from '@/db-ops/transcriptions';
+import { rematerialiseCombinedMeetings } from '@/lib/server/clip-combine';
 import { identityForUser } from '@/db-ops/transcript-activity';
 import { autoMarkerOf } from '@/lib/auto-marker';
 import { notifyUser } from '@/lib/server/darth-notify';
@@ -72,6 +75,20 @@ export function onTranscriptCompleted(
           resolveMeetingContent(full),
         ]);
 
+        // Phase 3b: a recording added to ANOTHER meeting as a clip while it
+        // was still transcribing (the "playable now, text later" case, only
+        // legal with `exclude`) — that meeting's text is rebuilt now the
+        // transcription has landed. A no-op for every meeting that is not
+        // part of a combined one, which is every row on prod.
+        if (combineFlagOn()) {
+          await (async () => {
+            const ref = await meetingRecordingRef(full.id);
+            if (ref) await rematerialiseCombinedMeetings(ref.recordingId, full.id);
+          })().catch((err) =>
+            console.warn('[post-completion] combined re-materialise failed:', err)
+          );
+        }
+
         // Voiceprint speaker suggestions (fast, seconds). AI notes are NOT
         // auto-generated any more — the user triggers them from the detail
         // page, so they can attach context (decks, pasted docs) first and
@@ -79,7 +96,7 @@ export function onTranscriptCompleted(
         await suggestSpeakersForTranscript(
           ownerUserId,
           full.assemblyai_id,
-          canonicalMedia(resolved.media),
+          resolved.media /* every file: a combined meeting embeds each recording's voices from ITS OWN file (mediaForSpeaker) */,
           content
         ).catch((err) => console.warn('[post-completion] suggest failed:', err));
 

@@ -3,7 +3,7 @@ import { withAuth } from '@/lib/auth/with-auth';
 import { resolveAccess } from '@/db-ops/transcript-access';
 import { getContentCached, identifySpeakers } from '@/lib/server/auto-notes';
 import { suggestSpeakersForTranscript } from '@/lib/server/voiceprint';
-import { canonicalMedia, resolveMeetingContent } from '@/lib/server/recordings';
+import { resolveMeetingContent } from '@/lib/server/recordings';
 
 export const runtime = 'nodejs';
 
@@ -47,7 +47,7 @@ export const POST = withAuth(async ({ user }, { params }) => {
     const suggestions = await suggestSpeakersForTranscript(
       access.ownerUserId,
       id,
-      canonicalMedia(resolved.media),
+      resolved.media /* every file: a combined meeting embeds each recording's voices from ITS OWN file (mediaForSpeaker) */,
       content
     );
     // AI pass retry: only when it isn't already running/completed — a manual

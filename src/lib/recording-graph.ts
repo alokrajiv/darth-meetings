@@ -24,6 +24,7 @@
 import { createHash } from 'node:crypto';
 import type { GmeetContext } from '@/lib/format';
 import { storedClipsInContext, type StoredClips } from '@/lib/clips';
+import type { ClipTextPolicy } from '@/lib/recording-clips';
 import { aaiJobIdOf } from '@/lib/aai-job-state';
 import { videoPartOffsets } from '@/lib/part-offsets';
 
@@ -284,7 +285,12 @@ export interface DesiredClip {
   fromMs: number;
   toMs: number | null;
   offsetMs: number;
-  textPolicy: 'include';
+  /**
+   * Phase 3b: the row's mirror carries the policy, so a `gap_fill` clip
+   * survives the next dual-write. Absent on the mirror = `include`, which is
+   * every clip a split ever made and every row on prod.
+   */
+  textPolicy: ClipTextPolicy;
 }
 
 export interface DesiredGraph {
@@ -397,7 +403,7 @@ export function desiredClipsFor(row: GraphMeetingRow): DesiredClip[] {
       fromMs: c.fromMs,
       toMs: c.toMs,
       offsetMs: c.offsetMs,
-      textPolicy: 'include' as const,
+      textPolicy: c.textPolicy ?? ('include' as const),
     }))
     .sort((a, b) => a.ord - b.ord);
 }

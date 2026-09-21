@@ -7,11 +7,12 @@ import {
 } from '@/db-ops/speaker-mappings';
 import { getContentCached, generateAutoReport } from '@/lib/server/auto-notes';
 import { enrollFromTranscript } from '@/lib/server/voiceprint';
-import { canonicalMedia, resolveMeetingContent } from '@/lib/server/recordings';
+import { resolveMeetingContent } from '@/lib/server/recordings';
 import { notifyUser, APP_URL } from '@/lib/server/darth-notify';
 import { dm, headlines, meetingLine, runKey } from '@/lib/server/dm-copy';
 import { autoMarkerOf, autoRecipients, autoSourceLabel } from '@/lib/auto-marker';
 import { storedReportPref } from '@/lib/report-pref';
+import { splitSpeakerLabel } from '@/lib/recording-clips';
 
 /**
  * Automatic speaker-review for series-auto-imported rows: the human review
@@ -38,10 +39,18 @@ const ID_MIN = 0.85;
  * blocking the jump-through (matches what human reviewers do). */
 const MIN_UTTERANCES = 2;
 
-/** AAI diarization labels look like "A" / "B" / "Speaker 1" — anything else
- * is already a real name (transcript-mode imports). */
+/**
+ * AAI diarization labels look like "A" / "B" / "Speaker 1" — anything else is
+ * already a real name (transcript-mode imports).
+ *
+ * A COMBINED meeting's labels carry the recording namespace
+ * (`<recordingId>:A`, Phase 3b), so the prefix comes off first: without that
+ * every speaker of a combined meeting reads as "already a real name" and the
+ * automatic review would jump the gate having named nobody.
+ */
 function isDiarizationLabel(speaker: string): boolean {
-  return /^[A-Z]{1,2}$/.test(speaker.trim()) || /^speaker\s*\d+$/i.test(speaker.trim());
+  const bare = splitSpeakerLabel(speaker.trim()).speaker.trim();
+  return /^[A-Z]{1,2}$/.test(bare) || /^speaker\s*\d+$/i.test(bare);
 }
 
 export async function maybeAutoReview(
@@ -144,7 +153,7 @@ export async function maybeAutoReview(
     // Same free-enrollment rule as a human confirm.
     void (async () => {
       const resolved = await resolveMeetingContent(row);
-      await enrollFromTranscript(canonicalMedia(resolved.media), content, merged);
+      await enrollFromTranscript(resolved.media /* every file: a combined meeting embeds each recording's voices from ITS OWN file (mediaForSpeaker) */, content, merged);
     })().catch((err) => console.warn('[auto-review] voiceprint enroll failed:', err));
   }
 

@@ -1,8 +1,14 @@
 import 'server-only';
 import { sql } from '@/lib/db';
 import { SCHEMAS } from '@/lib/constants/database';
-import { compareClipsOnTimeline, resolveClips, type ResolvableClip } from '@/lib/recording-clips';
-import { meetingSpanMs, type ClipWindow } from '@/lib/clips';
+import {
+  compareClipsOnTimeline,
+  isClipTextPolicy,
+  resolveClips,
+  type ClipTextPolicy,
+  type ResolvableClip,
+} from '@/lib/recording-clips';
+import { meetingSpanFromDurations, type ClipWindow } from '@/lib/clips';
 import {
   loadMeetingRecordingGraph,
   type MeetingRecordingGraph,
@@ -51,7 +57,14 @@ export interface MaterialiseResult {
 
 /** The clip rows as the pure layer wants them. */
 export function clipWindowsOf(
-  clips: Array<{ ord: number; recording_id: string; from_ms: number; to_ms: number | null; offset_ms: number }>
+  clips: Array<{
+    ord: number;
+    recording_id: string;
+    from_ms: number;
+    to_ms: number | null;
+    offset_ms: number;
+    text_policy?: string;
+  }>
 ): ClipWindow[] {
   return clips
     .map((c) => ({
@@ -60,8 +73,14 @@ export function clipWindowsOf(
       fromMs: c.from_ms,
       toMs: c.to_ms,
       offsetMs: c.offset_ms,
+      textPolicy: policyOf(c.text_policy),
     }))
     .sort((a, b) => compareClipsOnTimeline(a, b));
+}
+
+/** A clip row's policy, defaulting to `include` (what every 3a clip is). */
+export function policyOf(raw: string | null | undefined): ClipTextPolicy {
+  return isClipTextPolicy(raw) ? raw : 'include';
 }
 
 /** The transcription a clip reads: its own, else the recording's active one. */
@@ -105,13 +124,16 @@ export async function materialisedFacts(transcriptId: number): Promise<{
   const row = await rowFacts(transcriptId);
   if (!row) return null;
 
+  // Phase 3b: the clip's OWN policy, not a hardcoded `include`. A `gap_fill`
+  // clip that materialised as `include` would double up every word both mics
+  // caught — the exact failure the SI-BL merge was built to avoid.
   const resolvable: ResolvableClip[] = graph.clips.map((c) => ({
     ord: c.ord,
     recordingId: c.recording_id,
     fromMs: c.from_ms,
     toMs: c.to_ms,
     offsetMs: c.offset_ms,
-    textPolicy: 'include',
+    textPolicy: policyOf(c.text_policy),
     payload: transcriptionFor(graph, c.recording_id, c.transcription_id)?.payload ?? null,
   }));
 
@@ -122,17 +144,22 @@ export async function materialisedFacts(transcriptId: number): Promise<{
   });
 
   const windows = clipWindowsOf(graph.clips);
-  // A clip that runs "to the end" needs the recording's length to say how long
-  // the meeting is; the transcription's last word is the fallback when the
-  // recording never recorded one.
-  const recordingDurationMs = Math.max(
-    0,
-    ...graph.recordings.map((r) => r.duration_ms ?? 0),
-    ...resolvable.map((c) =>
-      Math.max(0, ...(c.payload?.utterances ?? []).map((u) => u.end))
-    )
-  );
-  const spanMs = meetingSpanMs(windows, recordingDurationMs || null);
+  // A clip that runs "to the end" needs the length of ITS OWN recording to say
+  // how long the meeting is — Phase 3b: a 5-minute phone clip beside a 5-hour
+  // Teams video must not inherit the video's length. The transcription's last
+  // word is the fallback when the recording never recorded one.
+  const durationOf = (recordingId: string): number | null => {
+    const stated = graph.recordings.find((r) => r.id === recordingId)?.duration_ms ?? null;
+    if (stated != null && stated > 0) return stated;
+    const heard = Math.max(
+      0,
+      ...resolvable
+        .filter((c) => c.recordingId === recordingId)
+        .map((c) => Math.max(0, ...(c.payload?.utterances ?? []).map((u) => u.end)))
+    );
+    return heard > 0 ? heard : null;
+  };
+  const spanMs = meetingSpanFromDurations(windows, durationOf);
 
   return {
     content: resolved.content,

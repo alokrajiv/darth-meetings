@@ -42,7 +42,12 @@ export type ActivityAction =
   // Phase 3a clips: `split_off` on the SOURCE ("a part of this became its own
   // meeting"), `split_from` on the new one. Both carry the window in ms.
   | 'split_off'
-  | 'split_from';
+  | 'split_from'
+  // Phase 3b combine: a recording joined this meeting, was re-placed, or left
+  // it again. `details` carries the recording id, the window and the policy.
+  | 'clip_add'
+  | 'clip_edit'
+  | 'clip_remove';
 
 export interface ActivityRow {
   id: number;

@@ -48,3 +48,6 @@ next-env.d.ts
 # committed reference — the ignore rule above is for real env files
 !.env.example
 old-session/
+
+# Python bytecode from the voiceprint sidecar (the align eval imports it).
+__pycache__/

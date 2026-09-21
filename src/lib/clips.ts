@@ -31,6 +31,7 @@
  */
 
 import type { TranscriptEditMap } from '@/lib/format';
+import { isClipTextPolicy, type ClipTextPolicy } from '@/lib/recording-clips';
 
 // ---------------------------------------------------------------------------
 // The model
@@ -52,6 +53,18 @@ export interface ClipWindow {
   toMs: number | null;
   /** Where `fromMs` lands on the MEETING timeline. */
   offsetMs: number;
+  /**
+   * What this clip contributes to the merged TEXT (Phase 3b,
+   * docs/recordings-phase3b-combine-spec.md; the policies themselves are
+   * `lib/recording-clips.ts`). Absent = `include`, which is what every clip
+   * of a single-recording meeting is and what every row on prod carries.
+   *
+   * It lives on the mirror as well as on the row because `desiredClipsFor`
+   * derives the desired graph FROM THE ROW: a mirror without the policy would
+   * let the next dual-write heal a `gap_fill` clip back to `include` and
+   * quietly double up the SI-BL text.
+   */
+  textPolicy?: ClipTextPolicy;
 }
 
 /**
@@ -108,8 +121,20 @@ export function storedClipsInContext(g: { clips?: unknown } | null | undefined):
       return null;
     }
     if (typeof offsetMs !== 'number' || !Number.isFinite(offsetMs) || offsetMs < 0) return null;
+    // An unreadable policy reads as the default rather than as a malformed
+    // mirror: `include` is what the clip would have been without Phase 3b,
+    // and a meeting must never go invisible to the resolver over one bad
+    // string (same rule as the rest of this function).
+    const textPolicy = isClipTextPolicy(c.textPolicy) ? c.textPolicy : 'include';
     ords.add(ord);
-    out.push({ ord, recordingId, fromMs, toMs: toMs as number | null, offsetMs });
+    out.push({
+      ord,
+      recordingId,
+      fromMs,
+      toMs: toMs as number | null,
+      offsetMs,
+      ...(textPolicy === 'include' ? {} : { textPolicy }),
+    });
   }
   return out;
 }
@@ -382,11 +407,26 @@ export function hostClipFor(
 
 /** How long the meeting runs on its own timeline, given its clips. */
 export function meetingSpanMs(clips: ClipWindow[], recordingDurationMs: number | null): number {
+  return meetingSpanFromDurations(clips, () => recordingDurationMs);
+}
+
+/**
+ * The same span when the clips sit on SEVERAL recordings (Phase 3b): each
+ * open-ended clip runs to the end of ITS OWN recording, not to the end of the
+ * longest one.
+ *
+ * `meetingSpanMs`'s single number is the one-recording case of this and is
+ * kept because every existing caller has exactly one duration to give.
+ */
+export function meetingSpanFromDurations(
+  clips: ClipWindow[],
+  durationOf: (recordingId: string) => number | null | undefined
+): number {
   let span = 0;
   for (const clip of clips) {
     const length =
       clip.toMs === null
-        ? Math.max(0, (recordingDurationMs ?? clip.fromMs) - clip.fromMs)
+        ? Math.max(0, (durationOf(clip.recordingId) ?? clip.fromMs) - clip.fromMs)
         : Math.max(0, clip.toMs - clip.fromMs);
     span = Math.max(span, clip.offsetMs + length);
   }
@@ -1034,6 +1074,24 @@ export interface ClipsResponse {
    * nothing about clips is shown).
    */
   splitBlockedReason: string | null;
+  /**
+   * Phase 3b — the clip list with its sources named, one row per clip
+   * (`ClipEntry`). Present whenever clips are enabled, with or without
+   * `MW_COMBINE`: a one-recording meeting is a one-entry list, which is what
+   * the recording card renders either way.
+   *
+   * `clips` above stays the bare windows so every 3a caller keeps its shape.
+   */
+  entries?: ClipEntry[];
+  /** Distinct recordings this meeting holds. 1 for every row on prod. */
+  recordingCount?: number;
+  /** False = `MW_COMBINE` off: the UI shows the clip list but no "Add a
+   * recording…" and no align step. */
+  combineEnabled?: boolean;
+  /** True = "Add a recording…" may be offered. */
+  canAddRecording?: boolean;
+  /** Why not, in the route's own sentence; null when it can. */
+  addBlockedReason?: string | null;
 }
 
 /** POST /api/transcripts/:id/split */
@@ -1145,4 +1203,465 @@ export function mayDeleteRecordingFiles(input: {
 }): boolean {
   if (!input.graphApplied) return true;
   return input.recordingsKept.length === 0;
+}
+
+// ---------------------------------------------------------------------------
+// Phase 3b — several recordings, one meeting
+// (docs/recordings-phase3b-combine-spec.md; behind MW_COMBINE)
+// ---------------------------------------------------------------------------
+
+/**
+ * Two DIFFERENT captures of one meeting: the Teams video plus the phone that
+ * caught the corridor, the Meet recording that stopped and the tray recording
+ * that ran on. The recordings stay what they are — own file, own
+ * transcription, own diarization space (DEC-1) — and the MEETING lists more
+ * than one clip, each on a different recording, placed on one timeline.
+ *
+ * Everything below is pure and is the wire contract the sheet, the align step
+ * and `darth-cli meetings clips …` all speak.
+ */
+
+/** A meeting may hold at most this many clips (spec §API). */
+export const MAX_CLIPS_PER_MEETING = 6;
+
+/** `recordings.source_kind` — mirrored here so the contract stays pure. */
+export type ClipSourceKind = 'recorder' | 'upload' | 'meet' | 'teams' | 'text' | 'aai-import';
+
+/** What a clip's source line is built from. */
+export interface ClipSourceFacts {
+  sourceKind: string | null;
+  /** True = the CALLER owns the recording. */
+  mine: boolean;
+  ownerName?: string | null;
+  ownerEmail?: string | null;
+  /** The recording's original filename, when it had one. */
+  originalFilename?: string | null;
+}
+
+/** "Atira" from "Atira Wijaya" / "atira@trames.sg". */
+function ownerFirstName(f: ClipSourceFacts): string {
+  const name = (f.ownerName ?? '').trim();
+  if (name) return name.split(/\s+/)[0]!;
+  const email = (f.ownerEmail ?? '').trim();
+  if (email) return email.split('@')[0]!;
+  return 'someone else';
+}
+
+/**
+ * The recording-strip vocabulary for one clip — "Teams recording", "Recorded
+ * on Atira's Mac", "Upload · corridor.m4a".
+ *
+ * NEVER a bare filename as a title (spec §API): the filename only ever rides
+ * behind a word that says what kind of thing it is.
+ */
+export function clipSourceLabel(f: ClipSourceFacts): string {
+  const file = (f.originalFilename ?? '').trim();
+  switch (f.sourceKind) {
+    case 'teams':
+      return f.mine ? 'Teams recording' : `${ownerFirstName(f)}’s Teams recording`;
+    case 'meet':
+      return f.mine ? 'Meet recording' : `${ownerFirstName(f)}’s Meet recording`;
+    case 'recorder':
+      return f.mine ? 'Recorded on your Mac' : `Recorded on ${ownerFirstName(f)}’s Mac`;
+    case 'text':
+      return f.mine ? 'Pasted transcript' : `${ownerFirstName(f)}’s pasted transcript`;
+    case 'aai-import':
+      return 'Imported transcription';
+    case 'upload':
+    default: {
+      const who = f.mine ? 'Upload' : `${ownerFirstName(f)}’s upload`;
+      return file ? `${who} · ${file}` : `${who}`;
+    }
+  }
+}
+
+/** One clip of a meeting, as the sheet and the CLI see it. */
+export interface ClipEntry {
+  ord: number;
+  recordingId: string;
+  fromMs: number;
+  /** null = to the end of the recording. */
+  toMs: number | null;
+  offsetMs: number;
+  textPolicy: ClipTextPolicy;
+  /**
+   * Does this clip's recording have text yet? False = it was added while
+   * still transcribing (only legal with `exclude`: playable now, text later)
+   * — the meeting is materialised again when it completes.
+   */
+  transcribed: boolean;
+  /** How long the clip runs, ms. null = unknown (open-ended, no duration). */
+  durationMs: number | null;
+  /** "Teams recording" / "Recorded on Atira’s Mac" / "Upload · corridor.m4a". */
+  sourceLabel: string;
+  /** The recording's owner — a clip is somebody's bytes and the list says so. */
+  ownerEmail: string | null;
+  ownerName: string | null;
+  /** True = the caller owns the recording. */
+  mine: boolean;
+  /** True = this clip provides the meeting's canonical file (the player's
+   * default part, `local_audio_path`). */
+  primary: boolean;
+  recordingDurationMs: number | null;
+  recordingStartedAt: string | null;
+}
+
+export type CombineRefusalCode =
+  | 'disabled'
+  | 'read-only'
+  | 'recording-not-found'
+  | 'not-owned'
+  | 'already-clipped'
+  | 'not-transcribed'
+  | 'too-many-clips'
+  | 'last-clip'
+  | 'clip-not-found'
+  | 'window-invalid'
+  | 'offset-invalid'
+  | 'policy-invalid'
+  | 'no-clip'
+  | 'upload-deferred';
+
+export interface CombineRefusal {
+  code: CombineRefusalCode;
+  /** Shown to the user verbatim. */
+  message: string;
+}
+
+const COMBINE_REFUSAL_TEXT: Record<CombineRefusalCode, string> = {
+  disabled: 'Adding a second recording is not available on this server.',
+  'read-only': 'You have read-only access here.',
+  'recording-not-found': 'That recording is not available to you.',
+  'not-owned':
+    'That recording belongs to someone else. Only its owner can add it to this meeting — ask them to add it themselves.',
+  'already-clipped': 'That recording is already part of this meeting.',
+  'not-transcribed':
+    'That recording has no transcript yet. Add it as “Audio only” for now — its text appears here when it finishes.',
+  'too-many-clips': `A meeting can hold ${MAX_CLIPS_PER_MEETING} recordings at most.`,
+  'last-clip': 'This is the meeting’s only recording — removing it would leave nothing to play.',
+  'clip-not-found': 'That recording is not part of this meeting.',
+  'window-invalid': 'The start has to come before the end.',
+  'offset-invalid': 'The offset has to be a time from the start of this meeting.',
+  'policy-invalid': 'Choose Text, Fill gaps only, or Audio only.',
+  'no-clip': 'This meeting has no recording to add to.',
+  'upload-deferred':
+    'Attaching a fresh upload to this meeting is not wired up yet — upload it first, then add it from “my unlinked recordings”.',
+};
+
+export function combineRefusal(code: CombineRefusalCode, message?: string): CombineRefusal {
+  return { code, message: message ?? COMBINE_REFUSAL_TEXT[code] };
+}
+
+/** POST /api/transcripts/:id/clips */
+export interface AddClipRequest {
+  /** Source (a) another meeting the caller can EDIT, or (b) one of the
+   * caller's own unlinked recordings. Both arrive as a recording id from
+   * `GET …/clips/candidates`. */
+  recordingId?: string;
+  /** Source (c), DEFERRED — see `upload-deferred` above. */
+  uploadSessionId?: string;
+  /** The window of the RECORDING to take. Defaults: the whole thing. */
+  fromMs?: number;
+  toMs?: number | null;
+  /** `mm:ss` / `h:mm:ss` forms for the CLI and a typed field; ms wins. */
+  from?: string;
+  to?: string;
+  /** Where `fromMs` lands on the MEETING timeline. Never guessed by the
+   * server — it is the person's click on the align step (spec §"The offset"). */
+  offsetMs?: number;
+  offset?: string;
+  textPolicy?: ClipTextPolicy;
+}
+
+/** PATCH /api/transcripts/:id/clips/:ord */
+export interface PatchClipRequest {
+  offsetMs?: number;
+  offset?: string;
+  textPolicy?: ClipTextPolicy;
+  fromMs?: number;
+  toMs?: number | null;
+  from?: string;
+  to?: string;
+}
+
+/** What every clip mutation answers with: the whole list again. */
+export interface ClipMutationOk {
+  ok: true;
+  clips: ClipEntry[];
+  /** How long the meeting now runs on its own timeline. */
+  spanMs: number;
+  /** Distinct recordings the meeting now holds — the listing's "2 recordings". */
+  recordingCount: number;
+  /** What the meeting's text became when it was re-materialised. */
+  materialised: {
+    utterances: number;
+    durationSec: number | null;
+    speakerCount: number | null;
+  };
+}
+
+export type ClipMutationResponse = ClipMutationOk | { error: string; code?: CombineRefusalCode };
+
+/** One row of `GET /api/transcripts/:id/clips/candidates`. */
+export interface ClipCandidate {
+  recordingId: string;
+  sourceLabel: string;
+  startedAt: string | null;
+  durationMs: number | null;
+  /** The recording has a completed transcription. */
+  transcribed: boolean;
+  mine: boolean;
+  ownerEmail: string | null;
+  ownerName: string | null;
+  /** The meeting this recording belongs to — ONLY when the caller can open
+   * it. null for a recording of the caller's that no meeting claims. */
+  meeting: { id: string; url: string; title: string | null } | null;
+  /** True = no meeting names it (the Recordings tab's "not linked yet"). */
+  unlinked: boolean;
+  /** False = the caller may not add it (someone else's bytes — privacy). */
+  addable: boolean;
+  blockedReason: string | null;
+  /**
+   * What the offset would be if both `started_at` were trusted, ms. The
+   * align step seeds its search window with this; it is NEVER applied on its
+   * own (spec §"The offset — never guessed silently").
+   */
+  nominalOffsetMs: number | null;
+}
+
+export interface ClipCandidatesResponse {
+  /** False = MW_COMBINE off, clips off, or this meeting has no clip to add to. */
+  enabled: boolean;
+  canEdit: boolean;
+  candidates: ClipCandidate[];
+  /** How many more clips this meeting may take. 0 = the cap is reached. */
+  slotsLeft: number;
+}
+
+// --- The align job ---------------------------------------------------------
+
+/** POST /api/recordings/:id/align */
+export interface AlignRequest {
+  /** The OTHER recording — the one `:id` is measured against. */
+  against: string;
+  /** Where to look first, ms. Absent = from the two `started_at`s, else 0. */
+  nominalOffsetMs?: number;
+  /** Half-width of the search, ms. Absent = ±120 s with a nominal, ±30 min
+   * without one (spec §"The offset"). */
+  searchWindowMs?: number;
+}
+
+/** Below this the answer is "could not line these up — set it by ear". */
+export const ALIGN_MIN_CONFIDENCE = 0.4;
+/** ±120 s around a nominal we have a reason to believe. */
+export const ALIGN_WINDOW_MS = 120_000;
+/** ±30 min when there is no nominal at all. */
+export const ALIGN_WIDE_WINDOW_MS = 30 * 60_000;
+
+export interface AlignOk {
+  ok: true;
+  /**
+   * How far `:id` starts AFTER `against`, in ms: add it to a position on
+   * `against`'s timeline to get the same instant on `:id`'s. Negative = it
+   * started first. This is the number that becomes a clip's `offsetMs` when
+   * `against` is the meeting's primary recording and sits at offset 0.
+   */
+  offsetMs: number;
+  /**
+   * 0–1. The correlation peak's height over the background of the search
+   * window (peak ÷ the 99th percentile of everything further than 2 s away),
+   * squashed to 0–1. 1.0 = the peak towers over everything else; 0.4 is the
+   * floor below which the UI says "set it by ear". It is NOT a probability
+   * and it is never a licence to apply the offset automatically.
+   */
+  confidence: number;
+  /** Clock drift between the two devices, parts per million; null when the
+   * overlap was too short to measure one. ~50 ppm was the SI-BL pair. */
+  driftPpm: number | null;
+  method: string;
+  nominalOffsetMs: number;
+  searchWindowMs: number;
+  /** How much audio the two files actually share at the answer, ms. */
+  overlapMs: number | null;
+  /** Set when the confidence is under the floor — the sentence to show. */
+  advice: string | null;
+}
+
+export type AlignResponse = AlignOk | { error: string; code?: string };
+
+/** 'good' = show it; 'weak' = show it with the warning; 'none' = by ear. */
+export function alignVerdict(confidence: number): 'good' | 'weak' | 'none' {
+  if (!Number.isFinite(confidence) || confidence < ALIGN_MIN_CONFIDENCE) return 'none';
+  return confidence >= 0.65 ? 'good' : 'weak';
+}
+
+/** The sentence that goes with a weak or missing alignment. */
+export function alignAdvice(confidence: number): string | null {
+  switch (alignVerdict(confidence)) {
+    case 'none':
+      return 'Could not line these up — set the offset by ear.';
+    case 'weak':
+      return 'A weak match — check the two waveforms line up before you use it.';
+    default:
+      return null;
+  }
+}
+
+/**
+ * The offset the two recordings' clocks imply, ms — `b` minus `a`.
+ *
+ * Every one of these clocks is known to be unreliable (a Teams filename is in
+ * the ORGANISER's timezone, an m4a `creation_time` is the END of the clip),
+ * which is the whole reason the correlation exists. This only ever seeds the
+ * search window.
+ */
+export function nominalOffsetMsBetween(
+  aStartedAt: string | Date | null | undefined,
+  bStartedAt: string | Date | null | undefined
+): number | null {
+  const at = toMs(aStartedAt);
+  const bt = toMs(bStartedAt);
+  if (at === null || bt === null) return null;
+  return bt - at;
+}
+
+function toMs(v: string | Date | null | undefined): number | null {
+  if (v === null || v === undefined || v === '') return null;
+  const t = v instanceof Date ? v.getTime() : Date.parse(v);
+  return Number.isNaN(t) ? null : t;
+}
+
+// --- Validation ------------------------------------------------------------
+
+/** The clip's extent on the MEETING timeline, given what we know of its
+ * recording's length. `null` end = open-ended and the length is unknown. */
+export function clipEntryExtent(
+  clip: Pick<ClipEntry, 'fromMs' | 'toMs' | 'offsetMs' | 'recordingDurationMs'>
+): [number, number | null] {
+  const start = clip.offsetMs;
+  if (clip.toMs !== null) return [start, start + Math.max(0, clip.toMs - clip.fromMs)];
+  if (clip.recordingDurationMs != null) {
+    return [start, start + Math.max(0, clip.recordingDurationMs - clip.fromMs)];
+  }
+  return [start, null];
+}
+
+const POLICY_RANK: Record<ClipTextPolicy, number> = { include: 0, gap_fill: 1, exclude: 2 };
+
+/**
+ * Which clip a `t:<ms>` chip should play — the part that HAS audio at that
+ * moment, preferring the one whose text the reader is looking at.
+ *
+ * Order (spec §"Reader and writer changes"): `include` first, then
+ * `gap_fill`, then `exclude`; ties go to the clip that starts later, which is
+ * the one whose own timeline the moment sits further inside. `null` = nothing
+ * covers that moment (a hole), and the chip stays on the current part.
+ */
+export function candidateClipForTime(clips: ClipEntry[], meetingMs: number): ClipEntry | null {
+  let best: ClipEntry | null = null;
+  let bestRank = Number.POSITIVE_INFINITY;
+  for (const clip of clips) {
+    const [lo, hi] = clipEntryExtent(clip);
+    if (meetingMs < lo) continue;
+    if (hi !== null && meetingMs >= hi) continue;
+    const rank = POLICY_RANK[clip.textPolicy] ?? 0;
+    if (rank < bestRank || (rank === bestRank && best !== null && clip.offsetMs > best.offsetMs)) {
+      best = clip;
+      bestRank = rank;
+    }
+  }
+  return best;
+}
+
+export interface AddClipCheckInput {
+  /** The meeting's clips as they are now. */
+  clips: Array<Pick<ClipWindow, 'ord' | 'recordingId'>>;
+  recordingId: string;
+  /** Does the CALLER own the recording? Only an owner may hand its bytes to
+   * a meeting's readers (spec §Privacy). */
+  ownedByCaller: boolean;
+  /** Has the recording a completed transcription? */
+  transcribed: boolean;
+  fromMs: number;
+  toMs: number | null;
+  offsetMs: number;
+  textPolicy: ClipTextPolicy;
+}
+
+/**
+ * Every refusal `POST …/clips` can produce about the CLIP, in the order the
+ * spec lists them. Pure so the sheet greys the same rows out for the same
+ * reasons the route will turn down.
+ */
+export function validateAddClip(input: AddClipCheckInput): CombineRefusal | null {
+  if (input.clips.length === 0) return combineRefusal('no-clip');
+  if (input.clips.length >= MAX_CLIPS_PER_MEETING) return combineRefusal('too-many-clips');
+  if (!input.ownedByCaller) return combineRefusal('not-owned');
+  if (input.clips.some((c) => c.recordingId === input.recordingId)) {
+    return combineRefusal('already-clipped');
+  }
+  if (!isClipTextPolicy(input.textPolicy)) return combineRefusal('policy-invalid');
+  // "Playable now, text later": a recording still being transcribed may join
+  // as `exclude` only, and the meeting is materialised again when it lands.
+  if (!input.transcribed && input.textPolicy !== 'exclude') return combineRefusal('not-transcribed');
+  const window = validateClipWindowShape(input.fromMs, input.toMs, input.offsetMs);
+  if (window) return window;
+  return null;
+}
+
+/** `from < to`, both real, and an offset that lands on the meeting. */
+export function validateClipWindowShape(
+  fromMs: number,
+  toMs: number | null,
+  offsetMs: number
+): CombineRefusal | null {
+  if (!Number.isFinite(fromMs) || fromMs < 0) return combineRefusal('window-invalid');
+  if (toMs !== null && (!Number.isFinite(toMs) || toMs <= fromMs)) {
+    return combineRefusal('window-invalid');
+  }
+  if (toMs !== null && toMs - fromMs < MIN_CLIP_MS) return combineRefusal('window-invalid');
+  if (!Number.isFinite(offsetMs) || offsetMs < 0) return combineRefusal('offset-invalid');
+  return null;
+}
+
+export interface PatchClipCheckInput {
+  clips: Array<Pick<ClipWindow, 'ord' | 'recordingId'>>;
+  ord: number;
+  fromMs: number;
+  toMs: number | null;
+  offsetMs: number;
+  textPolicy: ClipTextPolicy;
+  transcribed: boolean;
+}
+
+export function validatePatchClip(input: PatchClipCheckInput): CombineRefusal | null {
+  if (!input.clips.some((c) => c.ord === input.ord)) return combineRefusal('clip-not-found');
+  if (!isClipTextPolicy(input.textPolicy)) return combineRefusal('policy-invalid');
+  if (!input.transcribed && input.textPolicy !== 'exclude') return combineRefusal('not-transcribed');
+  return validateClipWindowShape(input.fromMs, input.toMs, input.offsetMs);
+}
+
+/**
+ * Un-combine = delete the clip. Never the last one: a meeting with no clip
+ * has no text and no bytes, and the permanent-delete rule from 3a
+ * (`mayDeleteRecordingFiles`) is what keeps the recording itself alive.
+ */
+export function validateDeleteClip(
+  clips: Array<Pick<ClipWindow, 'ord' | 'recordingId'>>,
+  ord: number
+): CombineRefusal | null {
+  if (!clips.some((c) => c.ord === ord)) return combineRefusal('clip-not-found');
+  if (clips.length <= 1) return combineRefusal('last-clip');
+  return null;
+}
+
+/** The next free `ord` for a meeting's clips — its identity, never its
+ * position (§5a), so it only ever grows. */
+export function nextClipOrd(clips: Array<Pick<ClipWindow, 'ord'>>): number {
+  return clips.reduce((max, c) => Math.max(max, c.ord), -1) + 1;
+}
+
+/** Distinct recordings a clip set reads — the listing's "2 recordings". */
+export function recordingCountOf(clips: Array<Pick<ClipWindow, 'recordingId'>>): number {
+  return new Set(clips.map((c) => c.recordingId)).size;
 }

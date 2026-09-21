@@ -355,3 +355,223 @@ export async function setClipMirror(
   `;
   publishEvent({ kind: 'meta', assemblyaiId });
 }
+
+// ---------------------------------------------------------------------------
+// Phase 3b — several recordings, one meeting (MW_COMBINE)
+// ---------------------------------------------------------------------------
+
+/**
+ * `MW_COMBINE`, AND-ed with everything under it.
+ *
+ * Lazy per call, like `clipsFlagOn` — a pm2 restart flips it, not a rebuild.
+ * Combining is a strict extension of clips: it writes a SECOND clip row on a
+ * meeting and materialises the merged payload onto its row, so a server with
+ * `MW_COMBINE=1` and `MW_CLIPS=0` would write clips nothing reads.
+ */
+export function combineFlagOn(): boolean {
+  const on = (v: string | undefined) => !!v && v !== '0' && v.toLowerCase() !== 'false';
+  return on(process.env.MW_COMBINE) && clipsFlagOn();
+}
+
+export async function combineEnabled(): Promise<boolean> {
+  if (!combineFlagOn()) return false;
+  return clipsEnabled();
+}
+
+/** Everything a clip row needs to describe its recording to a person. */
+export interface ClipRecordingDetail {
+  id: string;
+  owner_user_id: string;
+  source_kind: string;
+  started_at: string | null;
+  duration_ms: number | null;
+  /** A completed transcription with a payload exists. */
+  transcribed: boolean;
+  /** The name the file was uploaded under, from the canonical media's
+   * `source_ref` (the stored name is a uuid and tells a person nothing). */
+  original_filename: string | null;
+  deleted_at: string | null;
+}
+
+const recordingDetailCols = () => sql`
+  r.id, r.owner_user_id, r.source_kind, r.started_at,
+  r.duration_ms::float8 AS duration_ms, r.deleted_at,
+  EXISTS (
+    SELECT 1 FROM ${sql(SCHEMA)}.recording_transcriptions rt
+    WHERE rt.recording_id = r.id AND rt.status = 'completed' AND rt.payload IS NOT NULL
+  ) AS transcribed,
+  (
+    SELECT m.source_ref->>'originalFilename'
+    FROM ${sql(SCHEMA)}.recording_media m
+    WHERE m.recording_id = r.id AND m.kind = 'canonical'
+    ORDER BY m.ord LIMIT 1
+  ) AS original_filename
+`;
+
+/**
+ * INTERNAL-ONLY — the recordings behind a set of clip rows. The caller has
+ * already passed `resolveAccess` on the MEETING those clips belong to, which
+ * is reachability route (a).
+ */
+export async function recordingDetailsFor(
+  recordingIds: string[]
+): Promise<Map<string, ClipRecordingDetail>> {
+  const out = new Map<string, ClipRecordingDetail>();
+  if (recordingIds.length === 0) return out;
+  const rows = await sql<ClipRecordingDetail[]>`
+    SELECT ${recordingDetailCols()}
+    FROM ${sql(SCHEMA)}.recordings r
+    WHERE r.id = ANY(${recordingIds}::uuid[])
+  `;
+  for (const r of rows) out.set(r.id, r);
+  return out;
+}
+
+/**
+ * One candidate recording, as the caller-scoped query returns it. The
+ * meeting columns are NULL when no meeting the caller can open holds it —
+ * which, together with the WHERE below, means the caller owns it and nothing
+ * claims it (the Recordings tab's "not linked to a meeting yet").
+ */
+export interface AddableRecordingRow extends ClipRecordingDetail {
+  mine: boolean;
+  meeting_id: string | null;
+  meeting_title: string | null;
+  meeting_original_filename: string | null;
+  meeting_has_event: boolean | null;
+  meeting_scratch: boolean | null;
+  meeting_recorded_at: string | null;
+  meeting_created_at: string | null;
+  /** The caller may EDIT that meeting (owner, or a non-read share). */
+  meeting_can_edit: boolean | null;
+}
+
+/**
+ * CALLER-SCOPED — every recording this caller may be OFFERED as a clip
+ * source: their own live recordings, plus the recordings of meetings they can
+ * EDIT (spec §Privacy — "every list of candidate recordings is caller-scoped").
+ *
+ * The scoping is the whole point, and it is the same predicate
+ * `listSiblingMeetingsForRecordings` uses: a recording has no ACL, so the only
+ * things that may put one on this list are (b) the caller owns it, or (a) the
+ * caller can reach it through a meeting they can open AND edit. A read-only
+ * reader of a meeting never sees its recording offered — they could not add it
+ * anywhere anyway, and the offer itself would be a leak
+ * (feedback_privacy_caller_scoping_gate).
+ *
+ * Whether the caller may actually ADD one is a SEPARATE question the route
+ * answers from `owner_user_id` (`validateAddClip`): someone else's bytes are
+ * theirs to give, not ours. The row is listed so the sheet can say so.
+ *
+ * The meeting columns come from ONE lateral, scoped to the caller, so a
+ * meeting they cannot open never contributes its title — not even to a row
+ * they are allowed to see by route (b).
+ */
+export async function listAddableRecordings(
+  caller: { userId: string; email: string },
+  opts?: { limit?: number; recordingId?: string }
+): Promise<AddableRecordingRow[]> {
+  const normEmail = caller.email.trim().toLowerCase();
+  return sql<AddableRecordingRow[]>`
+    SELECT ${recordingDetailCols()},
+           (r.owner_user_id = ${caller.userId}) AS mine,
+           mt.assemblyai_id     AS meeting_id,
+           mt.title             AS meeting_title,
+           mt.original_filename AS meeting_original_filename,
+           mt.has_event         AS meeting_has_event,
+           mt.scratch           AS meeting_scratch,
+           mt.recorded_at       AS meeting_recorded_at,
+           mt.created_at        AS meeting_created_at,
+           mt.can_edit          AS meeting_can_edit
+    FROM ${sql(SCHEMA)}.recordings r
+    LEFT JOIN LATERAL (
+      SELECT t.assemblyai_id, t.title, t.original_filename, t.scratch,
+             t.recorded_at, t.created_at,
+             (t.gmeet_context->>'eventId' IS NOT NULL) AS has_event,
+             (t.user_id = ${caller.userId} OR s.access IS DISTINCT FROM 'read') AS can_edit
+      FROM ${sql(SCHEMA)}.meeting_clips c
+      JOIN ${sql(SCHEMA)}.transcripts t ON t.id = c.transcript_id
+      LEFT JOIN ${sql(SCHEMA)}.transcript_shares s
+        ON s.transcript_id = t.id AND s.shared_with_email = ${normEmail}
+      WHERE c.recording_id = r.id
+        AND t.deleted_at IS NULL
+        AND (t.user_id = ${caller.userId} OR s.id IS NOT NULL)
+      ORDER BY (t.user_id = ${caller.userId}) DESC, t.created_at, t.id
+      LIMIT 1
+    ) mt ON true
+    WHERE r.deleted_at IS NULL
+      AND (r.owner_user_id = ${caller.userId} OR mt.can_edit IS TRUE)
+      ${opts?.recordingId ? sql`AND r.id = ${opts.recordingId}::uuid` : sql``}
+    ORDER BY r.started_at DESC NULLS LAST, r.created_at DESC
+    LIMIT ${opts?.limit ?? 100}
+  `;
+}
+
+/**
+ * INTERNAL-ONLY — write ONE clip row without disturbing the others.
+ *
+ * `applyMeetingClips` is a whole-set apply (it deletes every ord the caller
+ * did not name), which is right for a split that rewrites the set and wrong
+ * for an add that must leave the existing clips exactly where they are. The
+ * meeting has already been gated, and `recordingExists` checked, by the route.
+ */
+export async function upsertMeetingClip(input: {
+  transcriptId: number;
+  ord: number;
+  recordingId: string;
+  fromMs: number;
+  toMs: number | null;
+  offsetMs: number;
+  textPolicy: string;
+  createdBy?: string | null;
+}): Promise<void> {
+  await sql`
+    INSERT INTO ${sql(SCHEMA)}.meeting_clips
+      (transcript_id, ord, recording_id, transcription_id, from_ms, to_ms,
+       offset_ms, text_policy, created_by)
+    VALUES (${input.transcriptId}, ${input.ord}, ${input.recordingId}::uuid, NULL,
+            ${input.fromMs}, ${input.toMs}, ${input.offsetMs},
+            ${input.textPolicy}, ${input.createdBy ?? null})
+    ON CONFLICT (transcript_id, ord) DO UPDATE SET
+      recording_id = EXCLUDED.recording_id,
+      from_ms      = EXCLUDED.from_ms,
+      to_ms        = EXCLUDED.to_ms,
+      offset_ms    = EXCLUDED.offset_ms,
+      text_policy  = EXCLUDED.text_policy
+  `;
+}
+
+/** INTERNAL-ONLY — un-combine: one clip goes, the recording stays (spec
+ * §"Reader and writer changes"). Returns the recording it pointed at. */
+export async function deleteMeetingClip(
+  transcriptId: number,
+  ord: number
+): Promise<string | null> {
+  const rows = await sql<Array<{ recording_id: string }>>`
+    DELETE FROM ${sql(SCHEMA)}.meeting_clips
+    WHERE transcript_id = ${transcriptId} AND ord = ${ord}
+    RETURNING recording_id
+  `;
+  return rows[0]?.recording_id ?? null;
+}
+
+/**
+ * INTERNAL-ONLY — every OTHER meeting that holds a clip on this recording and
+ * carries clip windows of its own, i.e. the meetings whose text has to be
+ * rebuilt when this recording's transcription lands (spec §API: "playable
+ * now, text later — materialise again on completion").
+ */
+export async function clippedMeetingsOnRecordingExcept(
+  recordingId: string,
+  exceptTranscriptId: number
+): Promise<number[]> {
+  const rows = await sql<Array<{ transcript_id: number }>>`
+    SELECT DISTINCT c.transcript_id
+    FROM ${sql(SCHEMA)}.meeting_clips c
+    JOIN ${sql(SCHEMA)}.transcripts t ON t.id = c.transcript_id
+    WHERE c.recording_id = ${recordingId}::uuid
+      AND c.transcript_id <> ${exceptTranscriptId}
+      AND t.gmeet_context ? 'clips'
+  `;
+  return rows.map((r) => r.transcript_id);
+}

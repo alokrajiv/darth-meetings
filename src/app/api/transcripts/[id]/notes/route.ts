@@ -5,7 +5,7 @@ import { logActivity } from '@/db-ops/transcript-activity';
 import { setAutoNotesForUser } from '@/db-ops/transcripts';
 import { generateAutoNotes, getContentCached } from '@/lib/server/auto-notes';
 import { suggestSpeakersForTranscript } from '@/lib/server/voiceprint';
-import { canonicalMedia, resolveMeetingContent } from '@/lib/server/recordings';
+import { resolveMeetingContent } from '@/lib/server/recordings';
 
 export const runtime = 'nodejs';
 
@@ -65,7 +65,7 @@ export const POST = withAuth(async ({ user, request }, { params }) => {
     await suggestSpeakersForTranscript(
       access.ownerUserId,
       id,
-      canonicalMedia(resolved.media),
+      resolved.media /* every file: a combined meeting embeds each recording's voices from ITS OWN file (mediaForSpeaker) */,
       content
     );
   })().catch((err) => console.warn('[notes POST] suggest failed:', err));

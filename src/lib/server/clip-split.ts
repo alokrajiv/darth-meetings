@@ -52,6 +52,7 @@ import { deleteAnnotationsForMeeting } from '@/db-ops/transcriptions';
 import { logActivity } from '@/db-ops/transcript-activity';
 import { resolveAccess, type ResolvedAccess } from '@/db-ops/transcript-access';
 import { materialiseMeeting } from '@/lib/server/clip-materialise';
+import { combineView } from '@/lib/server/clip-combine';
 import { removeRecordingGraphForMeeting } from '@/lib/server/recording-sync';
 import { resolveLinkedEventRef } from '@/lib/server/linked-event-ref';
 import { autoShareToInternalInvitees } from '@/lib/server/auto-share';
@@ -251,6 +252,12 @@ export async function clipsView(
   const state = await meetingClipState(access.row);
   if (!state.recordingId) return empty;
 
+  // Phase 3b: the clip list with each recording's source named, and whether
+  // "Add a recording…" may be offered. Served whenever clips are on — a
+  // one-recording meeting is a one-entry list — with only the ADD behind
+  // `MW_COMBINE` (docs/recordings-phase3b-combine-spec.md).
+  const combine = await combineView(access, caller);
+
   const bounds = windowBoundsFor(state.clips, state.recordingId);
   const siblingRows = await listSiblingMeetingsForRecordings(
     [...new Set(state.clips.map((c) => c.recordingId))],
@@ -305,6 +312,11 @@ export async function clipsView(
     unsplitBlockedReason: unsplit.reason,
     splittable: !splitBlocked,
     splitBlockedReason: splitBlocked?.message ?? null,
+    entries: combine.entries,
+    recordingCount: combine.recordingCount,
+    combineEnabled: combine.combineEnabled,
+    canAddRecording: combine.canAddRecording,
+    addBlockedReason: combine.addBlockedReason,
   };
 }
 

@@ -10,6 +10,8 @@ import { recordAiRun, getLatestSessionId } from '@/db-ops/ai-runs';
 import { getServerAccessToken } from '@/lib/server/google-oauth';
 import { fetchRecordingFromDrive, fetchRecordingFromTeams } from '@/lib/server/recording-fetch';
 import { findPeopleByEmails, searchPeople, type Person } from '@/db-ops/people';
+import { combineFlagOn } from '@/db-ops/clips';
+import { splitSpeakerLabel } from '@/lib/recording-clips';
 import {
   getForUser,
   setAutoNotesForUser,
@@ -139,13 +141,15 @@ THIS MEETING HAS VIDEO and you have the grab_frames tool (batch several timestam
  */
 function buildSpeakerContext(
   labels: SpeakerLabel[],
-  suggestions: SpeakerSuggestionMap
+  suggestions: SpeakerSuggestionMap,
+  naming?: SpeakerNaming
 ): string {
+  const say = (label: string) => (naming ? naming.of(label) : speakerDisplayLabel(label));
   const lines: string[] = [];
   for (const l of labels) {
     if (l.customName.trim()) {
       lines.push(
-        `- Speaker ${l.originalSpeaker}: ${l.customName.trim()} (confirmed by a human${l.description.trim() ? `; context: ${l.description.trim()}` : ''})`
+        `- Speaker ${say(l.originalSpeaker)}: ${l.customName.trim()} (confirmed by a human${l.description.trim() ? `; context: ${l.description.trim()}` : ''})`
       );
     }
   }
@@ -154,14 +158,14 @@ function buildSpeakerContext(
     if (named.has(sp)) continue;
     if (s.source === 'voice') {
       lines.push(
-        `- Speaker ${sp}: very likely ${s.name} (${Math.round(s.confidence * 100)}% voice-fingerprint match) — treat as their identity unless the transcript contradicts it`
+        `- Speaker ${say(sp)}: very likely ${s.name} (${Math.round(s.confidence * 100)}% voice-fingerprint match) — treat as their identity unless the transcript contradicts it`
       );
     } else if (s.confidence > 0) {
       // Meet↔AAI timeline-alignment vote (source 'context' with a real
       // confidence — Claude's own prior text guesses carry confidence 0 and
       // are deliberately NOT fed back, to avoid self-reinforcement).
       lines.push(
-        `- Speaker ${sp}: likely ${s.name} (${s.evidence ?? `${Math.round(s.confidence * 100)}% timeline overlap with Google Meet's transcript`}) — strong hint; verify against the transcript`
+        `- Speaker ${say(sp)}: likely ${s.name} (${s.evidence ?? `${Math.round(s.confidence * 100)}% timeline overlap with Google Meet's transcript`}) — strong hint; verify against the transcript`
       );
     }
   }
@@ -252,6 +256,38 @@ function buildMeetCrossReference(row: TranscriptRow): string {
  * can reason about overlaps, restarts, and device differences instead of
  * being confused by them.
  */
+/**
+ * The SOURCES block: what a COMBINED meeting is made of — one line per clip,
+ * saying which recording it is, where it sits on the meeting timeline, what
+ * its text contributes, and (the fact the model most needs) that each
+ * recording was diarized on its own, so a letter means different people in
+ * different recordings.
+ *
+ * It REPLACES the stitched-parts block for a meeting over several recordings
+ * (docs/recordings-phase3b-combine-spec.md §"Reader and writer changes") and
+ * falls back to it for everything else — a concatenated upload is still one
+ * recording with joins in it, and that block is the right description of it.
+ *
+ * Lazy and best-effort, like every other context builder here: a failure
+ * costs the prompt one paragraph, never the run.
+ */
+async function buildSourcesContext(row: TranscriptRow): Promise<string> {
+  if (!combineFlagOn()) return buildUploadedPartsContext(row);
+  try {
+    const { combineState } = await import('@/lib/server/clip-combine');
+    const { buildSourcesBlock } = await import('@/lib/server/clip-combine');
+    const state = await combineState(
+      { row, access: 'owner', ownerUserId: row.user_id },
+      { userId: row.user_id }
+    );
+    const block = buildSourcesBlock(state.entries);
+    if (block) return block;
+  } catch (err) {
+    console.warn('[auto-notes] sources block failed (continuing without):', err);
+  }
+  return buildUploadedPartsContext(row);
+}
+
 function buildUploadedPartsContext(row: TranscriptRow): string {
   const parts = row.gmeet_context?.uploadedParts;
   if (!parts || parts.length < 2) return '';
@@ -349,9 +385,58 @@ function speakerDisplayLabel(speaker: string): string {
   return colon >= 0 ? speaker.slice(colon + 1) : speaker;
 }
 
+/**
+ * Short prompt names for a COMBINED meeting's speakers, and the way back
+ * (Phase 3b, docs/recordings-phase3b-combine-spec.md).
+ *
+ * A meeting over two recordings labels its speakers `<recordingId>:A`, and the
+ * two recordings each have an "A" who is a different person. Stripping the
+ * prefix would merge them; printing the uuid tells the model nothing AND makes
+ * the answer unusable, because the ID pass matches the model's keys back
+ * against the real labels.
+ *
+ * So: number the recordings in first-appearance order and call them `1A`,
+ * `1B`, `2A`. `of()` is what the prompt prints, `resolve()` takes whatever the
+ * model answered with — the alias, or the full label if it copied that — and
+ * gives back the label `speaker_mappings` is keyed by. A single-recording
+ * meeting gets the identity map, so every prompt on prod is byte-identical.
+ */
+export interface SpeakerNaming {
+  of(label: string): string;
+  resolve(key: string): string | null;
+  /** True = this meeting really holds more than one diarization space. */
+  namespaced: boolean;
+}
+
+export function speakerNaming(speakers: string[]): SpeakerNaming {
+  const parts = speakers.map((label) => ({ label, ...splitSpeakerLabel(label) }));
+  const recordings: string[] = [];
+  for (const p of parts) {
+    if (p.recordingId && !recordings.includes(p.recordingId)) recordings.push(p.recordingId);
+  }
+  const namespaced = recordings.length > 1;
+  const toAlias = new Map<string, string>();
+  const fromAlias = new Map<string, string>();
+  for (const p of parts) {
+    const alias = namespaced
+      ? `${recordings.indexOf(p.recordingId!) + 1}${p.speaker}`
+      : p.speaker;
+    toAlias.set(p.label, alias);
+    // Last writer wins only if two labels really collide, which `namespaced`
+    // rules out; a single-recording meeting maps a label to itself.
+    fromAlias.set(alias, p.label);
+  }
+  return {
+    namespaced,
+    of: (label) => toAlias.get(label) ?? speakerDisplayLabel(label),
+    resolve: (key) => fromAlias.get(key.trim()) ?? (toAlias.has(key) ? key : null),
+  };
+}
+
 function buildTranscriptText(
   content: TranscriptResponse,
-  labels: SpeakerLabel[]
+  labels: SpeakerLabel[],
+  naming?: SpeakerNaming
 ): string {
   const nameFor = new Map(
     labels
@@ -359,7 +444,8 @@ function buildTranscriptText(
       .map((l) => [l.originalSpeaker, l.customName.trim()])
   );
   const lines = (content.utterances ?? []).map((u) => {
-    const who = nameFor.get(u.speaker) ?? `Speaker ${speakerDisplayLabel(u.speaker)}`;
+    const who =
+      nameFor.get(u.speaker) ?? `Speaker ${naming ? naming.of(u.speaker) : speakerDisplayLabel(u.speaker)}`;
     const t = Math.floor(u.start / 1000);
     const stamp = `${Math.floor(t / 60)}:${String(t % 60).padStart(2, '0')}`;
     return `[${stamp}] ${who}: ${u.text}`;
@@ -519,8 +605,13 @@ export async function generateAutoNotes(
     const mappings = await getMappingsForUser(ownerUserId, assemblyaiId);
     const labels = mappings?.speaker_labels ?? [];
     const existingSuggestions = mappings?.suggestions ?? {};
-    const transcriptText = buildTranscriptText(content, labels);
-    const speakerContext = buildSpeakerContext(labels, existingSuggestions);
+    // Phase 3b: a combined meeting's labels are `<recordingId>:A`, so the
+    // prompt gets short per-recording aliases (1A / 2A) instead. A
+    // single-recording meeting's naming is the identity and every prompt on
+    // prod is unchanged.
+    const naming = speakerNaming([...new Set((content.utterances ?? []).map((u) => u.speaker))]);
+    const transcriptText = buildTranscriptText(content, labels, naming);
+    const speakerContext = buildSpeakerContext(labels, existingSuggestions, naming);
     const attachmentContext = await buildAttachmentContext(row.id);
     const meetCrossRef = buildMeetCrossReference(row);
     const peopleContext = await buildPeopleContext(row);
@@ -531,7 +622,7 @@ export async function generateAutoNotes(
       : '';
 
     const prompt =
-      PROMPT_HEADER + styleContext + attachmentContext + buildUploadedPartsContext(row) +
+      PROMPT_HEADER + styleContext + attachmentContext + (await buildSourcesContext(row)) +
       meetCrossRef + peopleContext + speakerContext + transcriptText;
 
     // Incremental top-up: a forced regeneration (speaker renamed, context
@@ -775,20 +866,25 @@ function buildPeopleTools() {
  * are framed as inputs to evaluate. Excludes the pass's own prior output
  * (via 'id') so re-runs never self-reinforce.
  */
-function buildIdPassHints(labels: SpeakerLabel[], suggestions: SpeakerSuggestionMap): string {
+function buildIdPassHints(
+  labels: SpeakerLabel[],
+  suggestions: SpeakerSuggestionMap,
+  naming?: SpeakerNaming
+): string {
+  const say = (label: string) => (naming ? naming.of(label) : speakerDisplayLabel(label));
   const lines: string[] = [];
   const named = new Set<string>();
   for (const l of labels) {
     if (!l.customName.trim()) continue;
     named.add(l.originalSpeaker);
-    lines.push(`- Speaker ${l.originalSpeaker}: ${l.customName.trim()} (CONFIRMED by a human — exclude from your output)`);
+    lines.push(`- Speaker ${say(l.originalSpeaker)}: ${l.customName.trim()} (CONFIRMED by a human — exclude from your output)`);
   }
   for (const [sp, s] of Object.entries(suggestions)) {
     if (named.has(sp) || s.via === 'id') continue;
     if (s.source === 'voice') {
-      lines.push(`- Speaker ${sp}: voiceprint matched "${s.name}" at ${Math.round(s.confidence * 100)}% similarity (hint only)`);
+      lines.push(`- Speaker ${say(sp)}: voiceprint matched "${s.name}" at ${Math.round(s.confidence * 100)}% similarity (hint only)`);
     } else if (s.confidence > 0) {
-      lines.push(`- Speaker ${sp}: possibly "${s.name}" (${s.evidence ?? 'timeline overlap with the Meet transcript'})`);
+      lines.push(`- Speaker ${say(sp)}: possibly "${s.name}" (${s.evidence ?? 'timeline overlap with the Meet transcript'})`);
     }
   }
   if (lines.length === 0) return 'Speaker hints: none yet — work from the transcript, directory, and frames.\n\nTranscript follows:\n\n';
@@ -848,6 +944,11 @@ export async function identifySpeakers(
 
     await setSpeakerIdForUser(ownerUserId, assemblyaiId, { status: 'running' });
 
+    // The prompt names speakers `1A` / `2A` for a combined meeting and `A` for
+    // every other; `naming.resolve` takes the model's key back to the label
+    // `speaker_mappings` is keyed by (Phase 3b).
+    const naming = speakerNaming([...allSpeakers]);
+
     const frameSource = await frameSourceForRow(row);
     const videoOk = frameSource ? await hasVideoStream(frameSource.filename) : false;
     const durationMs = (row.duration ?? content.audio_duration ?? 0) * 1000 || null;
@@ -867,11 +968,11 @@ export async function identifySpeakers(
     const prompt =
       SPEAKER_ID_PROMPT +
       (videoOk ? 'THIS MEETING HAS VIDEO and you have the grab_frames tool.\n\n' : '') +
-      buildUploadedPartsContext(row) +
+      (await buildSourcesContext(row)) +
       buildMeetCrossReference(row) +
       (await buildPeopleContext(row)) +
-      buildIdPassHints(labels, suggestions) +
-      buildTranscriptText(content, labels);
+      buildIdPassHints(labels, suggestions, naming) +
+      buildTranscriptText(content, labels, naming);
 
     const started = Date.now();
     let run;
@@ -911,9 +1012,10 @@ export async function identifySpeakers(
     const current = (await getMappingsForUser(ownerUserId, assemblyaiId))?.suggestions ?? suggestions;
     const merged: SpeakerSuggestionMap = { ...current };
     let added = 0;
-    for (const [sp, g] of Object.entries(guessed)) {
+    for (const [key, g] of Object.entries(guessed)) {
+      const sp = naming.resolve(key);
       const name = typeof g?.name === 'string' ? g.name.trim().slice(0, 80) : '';
-      if (!name || named.has(sp) || !allSpeakers.has(sp)) continue;
+      if (!sp || !name || named.has(sp) || !allSpeakers.has(sp)) continue;
       const confidence = Math.max(0, Math.min(1, typeof g?.confidence === 'number' ? g.confidence : 0));
       const existing = merged[sp];
       if (existing?.source === 'voice') {
@@ -1044,8 +1146,13 @@ export async function generateAutoReport(
     const mappings = await getMappingsForUser(ownerUserId, assemblyaiId);
     const labels = mappings?.speaker_labels ?? [];
     const existingSuggestions = mappings?.suggestions ?? {};
-    const transcriptText = buildTranscriptText(content, labels);
-    const speakerContext = buildSpeakerContext(labels, existingSuggestions);
+    // Phase 3b: a combined meeting's labels are `<recordingId>:A`, so the
+    // prompt gets short per-recording aliases (1A / 2A) instead. A
+    // single-recording meeting's naming is the identity and every prompt on
+    // prod is unchanged.
+    const naming = speakerNaming([...new Set((content.utterances ?? []).map((u) => u.speaker))]);
+    const transcriptText = buildTranscriptText(content, labels, naming);
+    const speakerContext = buildSpeakerContext(labels, existingSuggestions, naming);
     const attachmentContext = await buildAttachmentContext(row.id);
     const attachmentLinks = await buildAttachmentLinkIndex(row.id);
     const meetCrossRef = buildMeetCrossReference(row);
@@ -1075,7 +1182,7 @@ export async function generateAutoReport(
       (videoOk ? VIDEO_CONTEXT : '') +
       attachmentLinks +
       attachmentContext +
-      buildUploadedPartsContext(row) +
+      (await buildSourcesContext(row)) +
       meetCrossRef +
       peopleContext +
       speakerContext +

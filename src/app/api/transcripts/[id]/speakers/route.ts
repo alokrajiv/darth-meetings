@@ -9,7 +9,7 @@ import {
 } from '@/db-ops/speaker-mappings';
 import { enrollFromTranscript } from '@/lib/server/voiceprint';
 import { getContentCached } from '@/lib/server/auto-notes';
-import { canonicalMedia, resolveMeetingContent } from '@/lib/server/recordings';
+import { resolveMeetingContent } from '@/lib/server/recordings';
 
 export const runtime = 'nodejs';
 
@@ -91,7 +91,7 @@ export const PUT = withAuth(async ({ user, request }, { params }) => {
       getContentCached(access.ownerUserId, access.row),
       resolveMeetingContent(access.row),
     ]);
-    await enrollFromTranscript(canonicalMedia(resolved.media), content, labels);
+    await enrollFromTranscript(resolved.media /* every file: a combined meeting embeds each recording's voices from ITS OWN file (mediaForSpeaker) */, content, labels);
   })().catch((err) => console.warn('[speakers PUT] voiceprint enroll failed:', err));
 
   void logActivity({

@@ -239,6 +239,35 @@ describe('two recordings, one meeting', () => {
     expect(out.content?.language_code).toBeUndefined();
   });
 
+  // Phase 3b (docs/recordings-phase3b-combine-spec.md §"Reader and writer
+  // changes": "verify `words[]` and `text`"). The word list is what a search
+  // highlight and the karaoke line read, and a word whose speaker was NOT
+  // namespaced would point at the wrong person's name.
+  test('words[] is namespaced and shifted exactly like its utterances', () => {
+    const out = resolveClips(clips, MEETING);
+    const words = out.content?.words ?? [];
+    expect(words.map((w) => w.speaker)).toEqual([
+      `${REC_A}:A`,
+      `${REC_A}:A`,
+      `${REC_A}:A`,
+      `${REC_A}:A`,
+      `${REC_A}:B`,
+      `${REC_A}:B`,
+      `${REC_B}:A`,
+      `${REC_B}:A`,
+      `${REC_B}:B`,
+    ]);
+    // Every word sits inside an utterance of the merged list.
+    const utterances = out.content?.utterances ?? [];
+    for (const w of words) {
+      expect(utterances.some((u) => w.start >= u.start && w.start < u.end)).toBe(true);
+    }
+    // The second recording's words carry its offset.
+    expect(words.filter((w) => w.speaker?.startsWith(REC_B)).map((w) => w.start)).toEqual([
+      20_000, 21_200, 24_000,
+    ]);
+  });
+
   test('status degrades to the worst of the contributing jobs', () => {
     const erroring = { ...payloadB, status: 'error' as const };
     expect(

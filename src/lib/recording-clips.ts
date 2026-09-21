@@ -146,6 +146,37 @@ function prefixSpeaker(recordingId: string, speaker: string | undefined): string
   return `${recordingId}:${speaker}`;
 }
 
+/**
+ * `<recordingId>:<label>` — the namespaced speaker label a meeting over
+ * SEVERAL recordings carries (Phase 3b).
+ *
+ * Exported because three things outside the resolver have to speak it: the
+ * voiceprint pass (each recording's snippets are cut from ITS file, so the
+ * label says which file), `speaker_mappings` (rows are per meeting and keyed
+ * by label, so the prefixed labels get their own entries) and the People card
+ * (which shows the recording's source label beside each voice).
+ */
+export function prefixSpeakerLabel(recordingId: string, speaker: string): string {
+  return `${recordingId}:${speaker}`;
+}
+
+const PREFIXED_LABEL_RE =
+  /^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}):(.+)$/;
+
+/**
+ * Split a speaker label back into the recording it came from and the bare
+ * diarization label. A single-recording meeting's label has no prefix, so
+ * `recordingId` comes back null and `speaker` is the label itself.
+ *
+ * The uuid shape is part of the test on purpose: a Meet/Teams import can
+ * carry a REAL NAME as its speaker label ("Kawen Koh"), and a name with a
+ * colon in it must not be mistaken for a namespace.
+ */
+export function splitSpeakerLabel(label: string): { recordingId: string | null; speaker: string } {
+  const m = PREFIXED_LABEL_RE.exec(label);
+  return m ? { recordingId: m[1]!, speaker: m[2]! } : { recordingId: null, speaker: label };
+}
+
 /** The one distinct value, or undefined when the inputs disagree / are empty. */
 function singleValue<T>(values: Array<T | null | undefined>): T | undefined {
   const seen = values.filter((v): v is T => v !== null && v !== undefined);

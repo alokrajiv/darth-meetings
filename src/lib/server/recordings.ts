@@ -434,7 +434,8 @@ export async function resolveMeetingContent(
 
   const media = scopeMediaToRow(
     row,
-    mediaForRecordings(orderedRecordingIds, loaded, clipOffsetMs, windows)
+    mediaForRecordings(orderedRecordingIds, loaded, clipOffsetMs, windows),
+    orderedRecordingIds[0] ?? null
   );
 
   return {
@@ -471,8 +472,30 @@ export async function resolveMeetingContent(
  * Phase 3 (clips), with its own access rule; it must never be a side effect
  * of a backfill.
  */
-function scopeMediaToRow(row: MediaOnlyRow, media: ResolvedMedia[]): ResolvedMedia[] {
-  return row.local_audio_path ? media : [];
+export function scopeMediaToRow(
+  row: MediaOnlyRow,
+  media: ResolvedMedia[],
+  /**
+   * The recording the meeting's OWN row describes — the first one on its
+   * timeline, which is the one `local_audio_path` names. Everything else in
+   * `media` got here because somebody ADDED a clip on another recording, and
+   * that add is the consent (see below). Omitted = Phase 1 behaviour.
+   */
+  primaryRecordingId?: string | null
+): ResolvedMedia[] {
+  if (row.local_audio_path) return media;
+  // Phase 3b (spec §Privacy): "media of a clip's recording is served when the
+  // CLIP exists on the meeting — the add is the consent". Only the OWNER of a
+  // recording can add it (`validateAddClip`), so a clip on a second recording
+  // is that owner deliberately handing its bytes to this meeting's readers.
+  //
+  // The meeting's OWN recording is still withheld, which is the Phase 1 guard
+  // untouched: two meetings can sit on one recording because two people
+  // imported the same AssemblyAI job (landmine #14), and only one of them ever
+  // held the bytes. That case has exactly one recording, so nothing below
+  // survives the filter and the answer is `[]`, byte for byte as before.
+  if (!primaryRecordingId) return [];
+  return media.filter((m) => m.recordingId && m.recordingId !== primaryRecordingId);
 }
 
 // ---------------------------------------------------------------------------
@@ -544,7 +567,11 @@ export async function resolveMediaForMeetings(
     const { orderedRecordingIds, clipOffsetMs, windows } = placeRecordings(clips);
     out.set(
       row.id,
-      scopeMediaToRow(row, mediaForRecordings(orderedRecordingIds, graph, clipOffsetMs, windows))
+      scopeMediaToRow(
+        row,
+        mediaForRecordings(orderedRecordingIds, graph, clipOffsetMs, windows),
+        orderedRecordingIds[0] ?? null
+      )
     );
   }
   return out;

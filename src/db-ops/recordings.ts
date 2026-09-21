@@ -591,6 +591,14 @@ export function recordingCountExpr() {
       WHERE c.transcript_id = t.id
         AND (m.kind = 'part'
              OR (m.kind = 'canonical' AND m.source_ref->>'derived' IS NULL))
+    ), (
+      -- Phase 3b floor: a meeting that holds TWO recordings is "2 recordings"
+      -- on the listing strip even before the second one's media row lands (a
+      -- recording added while its bytes are still being fetched). Below this
+      -- floor the strip would have said "Recording" for a combined meeting.
+      SELECT count(DISTINCT c.recording_id)
+      FROM ${sql(SCHEMA)}.meeting_clips c
+      WHERE c.transcript_id = t.id
     ), 1)::int
   `;
 }

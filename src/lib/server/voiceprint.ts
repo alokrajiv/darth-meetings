@@ -1,6 +1,7 @@
 import 'server-only';
 import { resolveAudioPath } from '@/lib/server/audio-storage';
-import { localMsIn, type ResolvedMedia } from '@/lib/server/recordings';
+import { canonicalMedia, localMsIn, type ResolvedMedia } from '@/lib/server/recordings';
+import { splitSpeakerLabel } from '@/lib/recording-clips';
 import { listAll, enrollSample } from '@/db-ops/voiceprints';
 import {
   getForUser as getMappingsForUser,
@@ -62,6 +63,49 @@ interface Segment {
 }
 
 /**
+ * Every media file the meeting has, or just the one a caller handed over.
+ *
+ * The array form is what a meeting over SEVERAL recordings needs (Phase 3b):
+ * each recording's snippets have to be cut from ITS OWN file, so the caller
+ * passes `resolved.media` and the label says which one. The single form is
+ * what every 3a caller passed (`canonicalMedia(...)`) and still means "this
+ * meeting has one file and it is this".
+ */
+export type VoiceprintMedia = ResolvedMedia | ResolvedMedia[] | null;
+
+function asList(media: VoiceprintMedia): ResolvedMedia[] {
+  if (media === null) return [];
+  return Array.isArray(media) ? media : [media];
+}
+
+/**
+ * The file a diarized speaker's voice is IN.
+ *
+ * A meeting over one recording has one answer and the label is a bare letter.
+ * A meeting over two carries `<recordingId>:<letter>` labels
+ * (`resolveClips` — the namespace exists precisely because "A" of one
+ * recording is not "A" of the other), and the prefix names the file: cutting
+ * a phone clip's snippets out of the Teams video would embed the wrong
+ * person, or silence.
+ *
+ * Falls back to the canonical when the label carries no prefix, which is
+ * every meeting on prod today.
+ */
+export function mediaForSpeaker(media: VoiceprintMedia, speaker: string): ResolvedMedia | null {
+  const list = asList(media);
+  if (list.length === 0) return null;
+  const { recordingId } = splitSpeakerLabel(speaker);
+  if (recordingId) {
+    // The recording's CANONICAL file — the one the transcription was made
+    // from, and therefore the one its utterance times are measured against.
+    const mine = list.filter((m) => m.recordingId === recordingId);
+    if (mine.length > 0) return mine[0]!;
+    return null;
+  }
+  return canonicalMedia(list) ?? list[0]!;
+}
+
+/**
  * Pick the best utterances for a speaker: longest first (more speech = more
  * stable embedding), capped at 6 segments. The sidecar further caps each
  * segment at 20s.
@@ -70,7 +114,8 @@ interface Segment {
  * what the resolver says that file is, so its `offsetMs` converts between
  * them (0 for a compat meeting, where the canonical starts at t=0 — landmine
  * #15, which is why the conversion goes through the resolver rather than
- * being assumed).
+ * being assumed). In a combined meeting the file is the SPEAKER's recording,
+ * so `localMsIn` maps through that clip's placement, not the primary's.
  */
 function pickSegments(
   content: TranscriptResponse,
@@ -137,12 +182,11 @@ function audioPathFor(media: ResolvedMedia | null): string | null {
  * `local_audio_path`.
  */
 export async function enrollFromTranscript(
-  media: ResolvedMedia | null,
+  media: VoiceprintMedia,
   content: TranscriptResponse | null,
   labels: SpeakerLabel[]
 ): Promise<void> {
-  const audioPath = audioPathFor(media);
-  if (!audioPath || !media || !content?.utterances?.length) return;
+  if (asList(media).length === 0 || !content?.utterances?.length) return;
 
   for (const label of labels) {
     const name = label.customName.trim();
@@ -155,7 +199,11 @@ export async function enrollFromTranscript(
       continue;
     }
     try {
-      const segments = pickSegments(content, label.originalSpeaker, media);
+      // Phase 3b: the file this speaker's voice is actually in.
+      const from = mediaForSpeaker(media, label.originalSpeaker);
+      const audioPath = audioPathFor(from);
+      if (!audioPath || !from) continue;
+      const segments = pickSegments(content, label.originalSpeaker, from);
       const embedding = await embedViaSidecar(audioPath, segments);
       if (embedding) {
         await enrollSample(name, embedding);
@@ -176,11 +224,10 @@ export async function enrollFromTranscript(
 export async function suggestSpeakersForTranscript(
   ownerUserId: string,
   assemblyaiId: string,
-  media: ResolvedMedia | null,
+  media: VoiceprintMedia,
   content: TranscriptResponse | null
 ): Promise<SpeakerSuggestionMap> {
-  const audioPath = audioPathFor(media);
-  if (!audioPath || !media || !content?.utterances?.length) return {};
+  if (asList(media).length === 0 || !content?.utterances?.length) return {};
 
   // Enrolments made under a group label before the rule existed stay in the
   // table (deleting is a human's call) but never become a suggestion.
@@ -192,7 +239,13 @@ export async function suggestSpeakersForTranscript(
 
   for (const speaker of speakers) {
     try {
-      const segments = pickSegments(content, speaker, media);
+      // Each recording's snippets come out of ITS file. A label with no
+      // prefix is a single-recording meeting and resolves to the canonical,
+      // exactly as before.
+      const from = mediaForSpeaker(media, speaker);
+      const audioPath = audioPathFor(from);
+      if (!audioPath || !from) continue;
+      const segments = pickSegments(content, speaker, from);
       const embedding = await embedViaSidecar(audioPath, segments);
       if (!embedding) continue;
 
