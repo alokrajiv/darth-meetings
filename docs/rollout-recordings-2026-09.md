@@ -15,6 +15,7 @@ Flags live in `~/apps/meeting-whisperer/.env.local` on the VM; every one is read
 | `MW_RECORDINGS` | readers go through the recordings resolver |
 | `MW_MINTED_IDS` | new meetings keep their own uuid instead of taking the AssemblyAI job id |
 | `MW_TRANSCRIPTION_VERSIONS` | "Transcribe again" adds a version to the same meeting |
+| `MW_SAME_FILE_CHECK` | an upload whose bytes the same owner already has is answered before anything is spent |
 | `DARTH_MEDIA_ACCOUNT` / `DARTH_MEDIA_CONTAINER` / `MW_MEDIA_ARCHIVE` | copy every media file to the permanent blob account |
 
 ## A. Deploy + AssemblyAI keeps nothing  (no migration needed)
@@ -66,6 +67,17 @@ Flags live in `~/apps/meeting-whisperer/.env.local` on the VM; every one is read
       Rollback: unset; stored versions stay readable and are never deleted by the sync.
 - [ ] First real use: re-run one of the five Indonesian-detected meetings with Language = English; check the old
       version is still there under Versions with its edits and names.
+
+## F. Same-file check (Phase 2c) — committed 2ceb786
+
+- Upload hashes start being STORED as soon as B's `MW_RECORDINGS_WRITE` is on (no extra flag) — so the check has
+  history on the day it is switched on. Videos uploaded before that cannot be back-hashed (the stored file is the
+  faststart-remuxed copy, not the bytes the user had).
+- [ ] **ALOK** set `MW_SAME_FILE_CHECK=1`, restart. Only `dupAware` clients are ever answered: the web dialog (when
+      its UI lands), tray ≥ 0.3.11.
+- [ ] **ALOK** tray 0.3.11: `cd poc/mac-recorder && ./make-app.sh --release && ./dist-scripts/deploy-to-dot6.sh`.
+- darth-cli needs a four-line change before it may send `dupAware` (exact lines in
+  `docs/recordings-same-file-spec.md` §8 of the as-built notes) — for the CLI agent; until then it behaves as today.
 
 ## Order and dependencies
 
