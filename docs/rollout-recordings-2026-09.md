@@ -16,6 +16,8 @@ Flags live in `~/apps/meeting-whisperer/.env.local` on the VM; every one is read
 | `MW_MINTED_IDS` | new meetings keep their own uuid instead of taking the AssemblyAI job id |
 | `MW_TRANSCRIPTION_VERSIONS` | "Transcribe again" adds a version to the same meeting |
 | `MW_SAME_FILE_CHECK` | an upload whose bytes the same owner already has is answered before anything is spent |
+| `MW_CLIPS` | split a window of a recording off into its own meeting (no re-transcription, no file cut) |
+| `MW_MEDIA_FROM_BLOB` | /audio answers browsers with a 60-minute signed blob link instead of streaming through the VM |
 | `DARTH_MEDIA_ACCOUNT` / `DARTH_MEDIA_CONTAINER` / `MW_MEDIA_ARCHIVE` | copy every media file to the permanent blob account |
 
 ## A. Deploy + AssemblyAI keeps nothing  (no migration needed)
@@ -78,6 +80,19 @@ Flags live in `~/apps/meeting-whisperer/.env.local` on the VM; every one is read
 - [ ] **ALOK** tray 0.3.11: `cd poc/mac-recorder && ./make-app.sh --release && ./dist-scripts/deploy-to-dot6.sh`.
 - darth-cli needs a four-line change before it may send `dupAware` (exact lines in
   `docs/recordings-same-file-spec.md` §8 of the as-built notes) — for the CLI agent; until then it behaves as today.
+
+## G. Clips (Phase 3a) — server committed bb6f34b, UI in progress
+
+- [ ] **ALOK** set `MW_CLIPS=1`, restart (needs B, C and E on). First real use: split the kerner podcast row into the
+      podcast and the 1:1 with "Split off a part…", check both play only their window and the source's notes still
+      cite the right moments.
+- darth-cli verbs `clips` / `propose-clips` / `split` / `unsplit` are specified in
+  `docs/recordings-phase3-clips-spec.md` ("darth-cli verb spec") — for the CLI agent.
+
+## H. Playback from blob (DEC-3 stage B) — committed 174214d
+
+- [ ] After D has archived the media: set `MW_MEDIA_FROM_BLOB=1`, restart; play a meeting on a phone and a laptop,
+      seek, and check Safari (the one browser no fake could prove — the player falls back to the app path by itself).
 
 ## Order and dependencies
 
