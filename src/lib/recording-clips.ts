@@ -1,0 +1,275 @@
+/**
+ * Clip resolution — the pure half of the recordings resolver
+ * (docs/recordings-phase1-spec.md §3).
+ *
+ * A MEETING's text is its ordered CLIPS over RECORDINGS: each clip selects
+ * `[from_ms, to_ms)` of one recording's transcription and lands it at
+ * `offset_ms` on the meeting's timeline. Nothing here touches the database,
+ * the filesystem or `server-only` — `src/lib/server/recordings.ts` loads the
+ * rows and calls in, and the tests drive this module directly.
+ *
+ * The contract that matters is COMPAT MODE: exactly one clip with defaults
+ * returns the stored payload **verbatim** — same object, no map, no re-tag,
+ * no re-join, plain `"<index>"` edit keys. Every live row is that case after
+ * the backfill, so `/content`, `/edits`, `/speakers`, darth-cli and every
+ * offline pin stay byte-identical. The non-compat branch below is written
+ * and tested now so Phase 3 has nothing left to invent, but no prod row
+ * reaches it yet.
+ */
+
+import type { TranscriptResponse } from '@/lib/format';
+
+export const CLIP_TEXT_POLICIES = ['include', 'gap_fill', 'exclude'] as const;
+export type ClipTextPolicy = (typeof CLIP_TEXT_POLICIES)[number];
+
+export function isClipTextPolicy(v: unknown): v is ClipTextPolicy {
+  return typeof v === 'string' && (CLIP_TEXT_POLICIES as readonly string[]).includes(v);
+}
+
+/**
+ * How far a `gap_fill` clip must stay clear of an `include` clip's speech
+ * before it is allowed to contribute (design §2.4 — the SI-BL case: a phone
+ * clip filling a Teams video's dead-audio hole must not double up on the
+ * edges where both mics caught the same words).
+ */
+export const GAP_FILL_TOLERANCE_MS = 1500;
+
+/** One `meeting_clips` row plus the payload it reads. */
+export interface ResolvableClip {
+  ord: number;
+  recordingId: string;
+  fromMs: number;
+  /** NULL = to the end of the recording. */
+  toMs: number | null;
+  offsetMs: number;
+  textPolicy: ClipTextPolicy;
+  /** The clip's transcription payload; null = the recording has none yet. */
+  payload: TranscriptResponse | null;
+}
+
+/** Meeting-level facts the derived payload needs but clips can't know. */
+export interface ClipMeetingFacts {
+  /** The document's public id (`transcripts.assemblyai_id`). */
+  id: string;
+  createdAt: string;
+  completedAt?: string | null;
+}
+
+export interface ResolvedClipContent {
+  /** null = no clip has a payload (nothing to serve). */
+  content: TranscriptResponse | null;
+  /**
+   * The edit-map key of each utterance in `content.utterances`, same order.
+   * Compat: `"<index>"` — exactly what `transcript_edits.edits` is keyed by
+   * today. Non-compat: `"<recordingId>:<index in that transcription>"`, so a
+   * re-ordered or re-windowed meeting never re-points an existing edit
+   * (design §2.2).
+   */
+  utteranceKeys: string[];
+  compat: boolean;
+}
+
+type Utterance = NonNullable<TranscriptResponse['utterances']>[number];
+type Word = NonNullable<TranscriptResponse['words']>[number];
+
+/**
+ * Compat = exactly one clip, no window, no shift, contributing text. The
+ * caller adds the other half of the test (that the clip's transcription
+ * covers the canonical media) — that needs media rows, which this module
+ * deliberately doesn't see.
+ */
+export function isCompatClipSet(clips: ResolvableClip[]): boolean {
+  if (clips.length !== 1) return false;
+  const c = clips[0]!;
+  return c.fromMs === 0 && c.toMs === null && c.offsetMs === 0 && c.textPolicy === 'include';
+}
+
+/** `from_ms <= start < to_ms` — lower bound inclusive, upper exclusive. */
+function inWindow(clip: ResolvableClip, startMs: number): boolean {
+  if (startMs < clip.fromMs) return false;
+  return clip.toMs === null || startMs < clip.toMs;
+}
+
+/** Recording ms → meeting ms for this clip. */
+function shift(clip: ResolvableClip, ms: number): number {
+  return ms - clip.fromMs + clip.offsetMs;
+}
+
+function prefixSpeaker(recordingId: string, speaker: string | undefined): string | undefined {
+  if (speaker === undefined) return undefined;
+  return `${recordingId}:${speaker}`;
+}
+
+/** The one distinct value, or undefined when the inputs disagree / are empty. */
+function singleValue<T>(values: Array<T | null | undefined>): T | undefined {
+  const seen = values.filter((v): v is T => v !== null && v !== undefined);
+  if (seen.length === 0) return undefined;
+  const first = seen[0]!;
+  return seen.every((v) => v === first) ? first : undefined;
+}
+
+interface Contribution {
+  clip: ResolvableClip;
+  /** Meeting-time utterances, paired with their stable key. */
+  utterances: Array<{ u: Utterance; key: string }>;
+  words: Word[];
+  /** Meeting-time extent of the contributed utterances, [start, end]. */
+  spanMs: [number, number] | null;
+}
+
+function contributionOf(clip: ResolvableClip): Contribution {
+  const payload = clip.payload;
+  const utterances: Contribution['utterances'] = [];
+  const words: Word[] = [];
+  let lo = Number.POSITIVE_INFINITY;
+  let hi = Number.NEGATIVE_INFINITY;
+
+  (payload?.utterances ?? []).forEach((u, index) => {
+    if (!inWindow(clip, u.start)) return;
+    const start = shift(clip, u.start);
+    const end = shift(clip, u.end);
+    if (start < lo) lo = start;
+    if (end > hi) hi = end;
+    utterances.push({
+      u: { ...u, start, end, speaker: prefixSpeaker(clip.recordingId, u.speaker) ?? u.speaker },
+      key: `${clip.recordingId}:${index}`,
+    });
+  });
+
+  // Words ride the same window so a word-level consumer (search highlight,
+  // the karaoke line) never points outside its utterance.
+  for (const w of payload?.words ?? []) {
+    if (!inWindow(clip, w.start)) continue;
+    words.push({
+      ...w,
+      start: shift(clip, w.start),
+      end: shift(clip, w.end),
+      speaker: prefixSpeaker(clip.recordingId, w.speaker),
+    });
+  }
+
+  return {
+    clip,
+    utterances,
+    words,
+    spanMs: Number.isFinite(lo) ? [lo, hi] : null,
+  };
+}
+
+/** Does this meeting-time interval sit within ±tolerance of any `include` speech? */
+function nearIncludedSpeech(
+  includedUtterances: Utterance[],
+  start: number,
+  end: number
+): boolean {
+  return includedUtterances.some(
+    (v) => v.start - GAP_FILL_TOLERANCE_MS < end && start < v.end + GAP_FILL_TOLERANCE_MS
+  );
+}
+
+function spansOverlap(a: [number, number], b: [number, number]): boolean {
+  return a[0] < b[1] && b[0] < a[1];
+}
+
+/**
+ * Resolve a meeting's clips into the payload `/content` serves.
+ *
+ * Compat mode returns `clips[0].payload` by reference — callers may rely on
+ * that identity (it is what keeps the JSON byte-identical). `compatAllowed`
+ * is the caller's half of the compat test: the clip's transcription must
+ * also cover the recording's canonical media, which needs media rows this
+ * module never sees. Pass false and the merge branch runs instead.
+ */
+export function resolveClips(
+  clips: ResolvableClip[],
+  meeting: ClipMeetingFacts,
+  opts?: { compatAllowed?: boolean }
+): ResolvedClipContent {
+  const ordered = [...clips].sort((a, b) => a.ord - b.ord);
+
+  if (opts?.compatAllowed !== false && isCompatClipSet(ordered)) {
+    const payload = ordered[0]!.payload;
+    return {
+      content: payload,
+      utteranceKeys: (payload?.utterances ?? []).map((_, i) => String(i)),
+      compat: true,
+    };
+  }
+
+  const contributions = ordered
+    .filter((c) => c.payload && c.textPolicy !== 'exclude')
+    .map(contributionOf);
+
+  // `gap_fill` is resolved against every `include` clip's speech, whatever
+  // their ord — a filler clip placed first must still yield to a later
+  // primary one.
+  const includedUtterances = contributions
+    .filter((c) => c.clip.textPolicy === 'include')
+    .flatMap((c) => c.utterances.map((e) => e.u));
+
+  const kept = contributions.map((c) => {
+    if (c.clip.textPolicy !== 'gap_fill') return c;
+    const utterances = c.utterances.filter(
+      (e) => !nearIncludedSpeech(includedUtterances, e.u.start, e.u.end)
+    );
+    const windows = utterances.map((e) => e.u);
+    const words = c.words.filter((w) => windows.some((u) => w.start >= u.start && w.start < u.end));
+    const lo = utterances.length ? Math.min(...utterances.map((e) => e.u.start)) : null;
+    const hi = utterances.length ? Math.max(...utterances.map((e) => e.u.end)) : null;
+    return {
+      ...c,
+      utterances,
+      words,
+      spanMs: lo !== null && hi !== null ? ([lo, hi] as [number, number]) : null,
+    };
+  });
+
+  // Concatenate in `ord`; only sort by time when two clips genuinely overlap
+  // on the meeting timeline (back-to-back clips must keep their authored
+  // order even when a stray end time bleeds a few ms into the next one).
+  const spans = kept.map((c) => c.spanMs).filter((s): s is [number, number] => s !== null);
+  const overlapping = spans.some((a, i) => spans.slice(i + 1).some((b) => spansOverlap(a, b)));
+
+  const merged = kept.flatMap((c) => c.utterances);
+  if (overlapping) merged.sort((a, b) => a.u.start - b.u.start);
+  const mergedWords = kept.flatMap((c) => c.words);
+  if (overlapping) mergedWords.sort((a, b) => a.start - b.start);
+
+  const payloads = kept.map((c) => c.clip.payload!);
+  if (payloads.length === 0) {
+    return { content: null, utteranceKeys: [], compat: false };
+  }
+
+  const endMs = merged.reduce((max, e) => Math.max(max, e.u.end), 0);
+  const status: TranscriptResponse['status'] = payloads.some((p) => p.status === 'error')
+    ? 'error'
+    : payloads.every((p) => p.status === 'completed')
+      ? 'completed'
+      : 'processing';
+
+  const content: TranscriptResponse = {
+    id: meeting.id,
+    status,
+    // AAI's own `text` is the raw join of the utterance texts; a merged
+    // meeting's is the join of what it actually shows.
+    text: merged.map((e) => e.u.text).join(' '),
+    created: meeting.createdAt,
+    ...(meeting.completedAt ? { completed: meeting.completedAt } : {}),
+    ...(endMs > 0 ? { audio_duration: endMs / 1000 } : {}),
+    utterances: merged.map((e) => e.u),
+    ...(mergedWords.length ? { words: mergedWords } : {}),
+    // Job-level facts only survive when every contributing transcription
+    // agrees — two recordings in two languages have no single language_code.
+    ...(singleValue(payloads.map((p) => p.language_code)) !== undefined
+      ? { language_code: singleValue(payloads.map((p) => p.language_code)) }
+      : {}),
+    ...(singleValue(payloads.map((p) => p.confidence)) !== undefined
+      ? { confidence: singleValue(payloads.map((p) => p.confidence)) }
+      : {}),
+    ...(singleValue(payloads.map((p) => p.speech_model_used)) !== undefined
+      ? { speech_model_used: singleValue(payloads.map((p) => p.speech_model_used)) }
+      : {}),
+  };
+
+  return { content, utteranceKeys: merged.map((e) => e.key), compat: false };
+}

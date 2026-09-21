@@ -192,6 +192,24 @@ permanent delete (a recording's files are removed only when no other live meetin
    `text_policy`, speaker prefixing, index renumbering).
 4. `bun test`, `bunx tsc --noEmit`, `bunx eslint` clean. `bun run build` with no env.
 
+## 5a. Rulings after Phase 1a (2026-09-21, from the build's open questions)
+
+- `gmeet_context.combinedParts` is a COUNT, not an array: backfill emits N `part` rows with no filename/offset and
+  `source_ref {"combined": true}`. A stitched/combined canonical carries `source_ref.derived = 'concat'` and is not
+  counted by `recordingCountExpr()` — that keeps `recording_count` equal to today's `GREATEST(...)`.
+- `source_kind`: `recorder` by the marker OR the reverse link `recorder_recordings.transcript_id` (43 tray meetings,
+  only 4 carry the marker); Meet/Teams VIDEO imports have a real AAI id, so `gmeet_context` decides meet/teams.
+  When two meetings share a recording the owner row (earliest `created_at`, then lowest id) wins.
+- **Compat is decided by the clip alone** (one clip, default window). If its transcription does not cover the
+  canonical media, the payload is STILL returned verbatim and only `media[].transcribed` says so — prefixing the
+  speakers of a single-recording meeting helps nobody. (Reverses the literal reading 1a implemented.)
+- **The meeting timeline orders clips by `offset_ms`, then `ord`.** `ord` is identity, not position. (Reverses 1a.)
+- `recordings.started_at`: `actuals.anchorIso`, else `recorder_recordings.started_at`.
+- The resolver's `rev` and the offline plan's `revExpr()` are different things. `revExpr()` is not touched while
+  every row is compat — a changed plan rev re-downloads every pin on every device.
+- Migrations hard-code `SET search_path = meeting_whisperer_prod`; applying 044 to a stage schema means sed-ing that
+  line. Leave the convention; say so in the migration header.
+
 ## 6. Rollout
 
 Migration 044 (Alok applies) → deploy with the flag off (dual-write starts) → backfill `--apply` (Alok) →
