@@ -469,6 +469,10 @@ export async function listPagedForUser(
              -- The Darth Recorder registry row behind this upload: pairs the
              -- listing row with the tray's live progress.
              t.gmeet_context->'recorder'->>'recordingId' AS recorder_recording_id,
+             -- Phase 3a: a meeting split off a longer recording. The strip
+             -- says "Part of a longer recording"; the SOURCE of the split is
+             -- deliberately not exposed here (caller-scoped, GET …/clips).
+             (t.gmeet_context ? 'splitFrom') AS split_off,
              CASE
                WHEN t.gmeet_context->>'provider' = 'teams' THEN 'teams'
                WHEN t.assemblyai_id LIKE 'gmeet-%'
@@ -581,6 +585,7 @@ export async function listPagedForUser(
            b.source, b.speech_model, b.recorded_at, b.auto_notes_status,
            b.upload_bytes_received, b.upload_bytes_total,
            b.upload_parts_done, b.upload_parts_total, b.recorder_recording_id,
+           b.split_off,
            b.provider, b.has_event, b.deferred_mode, b.deferred_error,
            b.recording_count, b.auto_state,
            -- Evaluated for the page's rows only (t is joined below for both

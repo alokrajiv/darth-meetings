@@ -91,6 +91,9 @@ export interface ArchiveStripRow {
   deferred_background?: string | null;
   original_filename?: string | null;
   auto_state?: 'passed' | 'gated' | 'auto' | null;
+  /** Phase 3a (v2 listing): this meeting is a WINDOW of a longer recording.
+   * The row is otherwise ordinary — it is only the strip that says so. */
+  split_off?: boolean | null;
   /** The caller's access + the owner: a Mac recording on a SHARED row was
    * recorded on the owner's Mac, not the caller's ("Recorded on Atira's
    * Mac" — Alok, 2026-09-21, an Editor on Atira's Hypercare upload). */
@@ -286,6 +289,26 @@ export function stripForArchiveRow(row: ArchiveStripRow, opts: ArchiveStripOptio
 
   // Completed (or an unknown terminal status): only speak when there is
   // something a plain meeting would not have.
+  //
+  // Phase 3a: being a PART of a longer recording is the first thing to say
+  // about such a row — it explains why a 28-minute meeting sits next to an
+  // hour-long one with the same date and the same voices. It wins over the
+  // source sentence (a Mac recording split in two is still, first, a part),
+  // and it deliberately does NOT name the meeting it came from: that is a
+  // caller-scoped question only GET …/clips answers.
+  if (row.split_off) {
+    return {
+      source,
+      state: 'transcribed',
+      tone: 'muted',
+      text: join(['Part of a longer recording', dur]),
+      title:
+        'A stretch of one recording, split off as its own meeting — nothing was cut; open it to see which recording it is part of.',
+      progress: null,
+      action: null,
+      busy: false,
+    };
+  }
   if (source === 'mac') {
     return {
       source,

@@ -566,11 +566,18 @@ export async function liveMeetingsForRecording(
  *  - a stitched/combined upload → the canonical IS the concat, a derivative
  *    of the parts, so it is stamped `source_ref.derived` at write time and
  *    excluded → N
+ *
+ * DISTINCT on the media, not on the join: since Phase 3a a meeting can hold
+ * SEVERAL clips of the SAME file (a source that was shrunk has a head clip
+ * and a tail clip with a hole between them), and counting join rows made it
+ * "Recording · 2 parts" on the listing — one file, one capture, one hole. It
+ * also broke the equality the diff gate checks, because the jsonb expression
+ * it is compared against still says 1 for such a row.
  */
 export function recordingCountExpr() {
   return sql`
     GREATEST((
-      SELECT count(*)
+      SELECT count(DISTINCT m.id)
       FROM ${sql(SCHEMA)}.meeting_clips c
       JOIN ${sql(SCHEMA)}.recording_media m ON m.recording_id = c.recording_id
       WHERE c.transcript_id = t.id
@@ -590,7 +597,7 @@ export async function recordingCountsForMeetings(
 ): Promise<Map<number, number>> {
   if (transcriptIds.length === 0) return new Map();
   const rows = await sql<Array<{ transcript_id: number; n: number }>>`
-    SELECT c.transcript_id, GREATEST(count(*), 1)::int AS n
+    SELECT c.transcript_id, GREATEST(count(DISTINCT m.id), 1)::int AS n
     FROM ${sql(SCHEMA)}.meeting_clips c
     JOIN ${sql(SCHEMA)}.recording_media m ON m.recording_id = c.recording_id
     WHERE c.transcript_id = ANY(${transcriptIds})

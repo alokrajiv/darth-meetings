@@ -3,7 +3,8 @@
 import { useRef, useState } from 'react';
 import { MeetLogo, TeamsLogo } from '@/components/provider-icon';
 import { formatDuration, formatTime, type StoredTranscript, type TranscriptAccess } from '@/lib/format';
-import { recordingFacts } from '@/lib/recording-facts';
+import { clipRelationLines, recordingFacts, type ClipRelationInput } from '@/lib/recording-facts';
+import { formatTimestamp } from '@/lib/clips';
 import {
   ChevronDown,
   ChevronUp,
@@ -29,6 +30,12 @@ interface RecordingCardProps {
   videoFetching: boolean;
   videoFetchError: string | null;
   onFetchVideo: () => void;
+  /**
+   * Phase 3a: what else lives on this recording. Already caller-scoped by
+   * `GET …/clips` — a meeting the reader cannot open is simply not in here,
+   * and the card then says nothing about it (its existence is itself a leak).
+   */
+  clips?: ClipRelationInput | null;
 }
 
 /**
@@ -48,8 +55,10 @@ export function RecordingCard({
   videoFetching,
   videoFetchError,
   onFetchVideo,
+  clips,
 }: RecordingCardProps) {
   const facts = recordingFacts({ ...row, access, owner_email: ownerEmail, owner_name: ownerName });
+  const clipRelations = clips ? clipRelationLines(clips, formatTimestamp) : [];
   const ctx = row.gmeet_context;
   const [segmentsOpen, setSegmentsOpen] = useState(false);
   const [uploadError, setUploadError] = useState<string | null>(null);
@@ -162,6 +171,19 @@ export function RecordingCard({
       {facts.heldVsAdded && (
         <div className="ml-[22px] mt-0.5 text-[11px] text-muted-foreground">{facts.heldVsAdded}</div>
       )}
+
+      {/* One recording, several meetings — the sentence that says so, and a
+          link to the other one. Nothing is cut: both play the same file. */}
+      {clipRelations.map((line) => (
+        <p key={line.key} className="ml-[22px] mt-1.5 text-[11px] leading-snug text-muted-foreground">
+          {line.text}
+          {line.href && (
+            <a href={line.href} className="font-medium text-primary hover:underline">
+              {line.linkText} ↗
+            </a>
+          )}
+        </p>
+      ))}
 
       {facts.segmentCount > 1 && (
         <>

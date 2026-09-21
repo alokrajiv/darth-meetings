@@ -69,6 +69,51 @@ export interface ClipWindow {
  */
 export type StoredClips = ClipWindow[];
 
+/** A uuid — the only shape a recording id ever has. */
+const RECORDING_ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/**
+ * `gmeet_context.clips`, validated.
+ *
+ * Lives HERE, in the pure contract, because three very different callers need
+ * the same answer: the recording graph (`lib/recording-graph.ts`, which
+ * re-exports it), the resolver's fallback path (`mediaFromRow` — with
+ * `MW_RECORDINGS` off a split meeting's window has to come from the row), and
+ * the CLIENT (`lib/clip-window.ts`): the transcript page clamps its player
+ * from the row it already has, so a split-off meeting never plays the whole
+ * hour while `GET …/clips` is still in flight — or when `MW_CLIPS` is off and
+ * that route answers `enabled: false` for a meeting that was split anyway.
+ *
+ * A malformed mirror reads as ABSENT rather than as an error — a meeting must
+ * never become invisible to the resolver because somebody wrote junk into its
+ * context.
+ */
+export function storedClipsInContext(g: { clips?: unknown } | null | undefined): StoredClips | null {
+  const raw = g?.clips;
+  if (!Array.isArray(raw) || raw.length === 0) return null;
+  const out: StoredClips = [];
+  const ords = new Set<number>();
+  for (const entry of raw) {
+    if (!entry || typeof entry !== 'object') return null;
+    const c = entry as Record<string, unknown>;
+    const ord = c.ord;
+    const recordingId = c.recordingId;
+    const fromMs = c.fromMs;
+    const toMs = c.toMs ?? null;
+    const offsetMs = c.offsetMs;
+    if (typeof ord !== 'number' || !Number.isInteger(ord) || ord < 0 || ords.has(ord)) return null;
+    if (typeof recordingId !== 'string' || !RECORDING_ID_RE.test(recordingId)) return null;
+    if (typeof fromMs !== 'number' || !Number.isFinite(fromMs) || fromMs < 0) return null;
+    if (toMs !== null && (typeof toMs !== 'number' || !Number.isFinite(toMs) || toMs <= fromMs)) {
+      return null;
+    }
+    if (typeof offsetMs !== 'number' || !Number.isFinite(offsetMs) || offsetMs < 0) return null;
+    ords.add(ord);
+    out.push({ ord, recordingId, fromMs, toMs: toMs as number | null, offsetMs });
+  }
+  return out;
+}
+
 /** `gmeet_context.splitFrom` on a meeting that was split off another one. */
 export interface SplitProvenance {
   /** The SOURCE meeting's public id. NEVER served to a caller who cannot

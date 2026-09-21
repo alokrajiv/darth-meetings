@@ -50,6 +50,10 @@ import { RerunDiarizationButton } from '@/components/rerun-diarization-button';
 import { IngestFailureNote } from '@/components/ingest-failure-note';
 import { TranscriptSourcesCard } from '@/components/transcript-sources-card';
 import { RecordingCard } from '@/components/recording-card';
+import { SplitClipDialog } from '@/components/split-clip-dialog';
+import { useClips } from '@/hooks/use-clips';
+import { holesBeforeUtterance, windowFromContext, holesFromContext } from '@/lib/clip-window';
+import { formatTimestamp } from '@/lib/clips';
 import { PersonChip } from '@/components/person-chip';
 import { safeDate, usesEventRange, whenLine } from '@/lib/when';
 import { countVoices, speakerNameStates } from '@/lib/speaker-name-state';
@@ -88,6 +92,8 @@ import {
   Sparkles,
   MoreHorizontal,
   CloudDownload,
+  Scissors,
+  Undo2,
   Video,
   FileAudio,
   FileText,
@@ -467,6 +473,41 @@ function TranscriptDetailInner({ transcriptId }: { transcriptId: string }) {
   const [currentTime, setCurrentTime] = useState(0); // seconds, from <audio>
   const [audioAvailable, setAudioAvailable] = useState(true);
 
+  // --- clips: one recording, several meetings (Phase 3a) ---------------------
+  // The player's window comes off the ROW, not off the route: a meeting split
+  // off a longer recording must be clamped on its first frame — never "the
+  // whole hour for one round-trip" — and must stay clamped on a server where
+  // MW_CLIPS was switched off after the split (lib/clip-window.ts).
+  const clips = useClips(transcriptId);
+  const playerWindow = useMemo(
+    () => windowFromContext(row?.gmeet_context) ?? null,
+    [row?.gmeet_context]
+  );
+  // Stretches that are now a meeting of their own. Same reasoning: the row
+  // knows, so the transcript's dividers are right from the first render; the
+  // route's answer is used only if the row somehow has no mirror.
+  const clipHoles = useMemo(() => {
+    const fromRow = holesFromContext(
+      row?.gmeet_context,
+      row?.duration != null ? row.duration * 1000 : null
+    );
+    return fromRow.length > 0 ? fromRow : (clips.data?.holes ?? []);
+  }, [row?.gmeet_context, row?.duration, clips.data?.holes]);
+  /** Other meetings on the same recording — already caller-scoped by the
+   * route, so every one of them may be named on the page. */
+  const clipSiblings = useMemo(() => clips.data?.siblings ?? [], [clips.data?.siblings]);
+  /** The meeting this one was split off — only ever set when the reader can
+   * open it (the route resolves it caller-scoped first). */
+  const splitFrom = clips.data?.splitFrom ?? null;
+  /** What the Recording card says about the other meetings on this
+   * recording — nothing at all until the (caller-scoped) route answers. */
+  const clipRelationInput =
+    splitFrom || clipSiblings.some((s) => s.isSplitOff)
+      ? { splitFrom, siblings: clipSiblings }
+      : null;
+  const [splitOpen, setSplitOpen] = useState(false);
+  const [unsplitError, setUnsplitError] = useState<string | null>(null);
+
   // --- view mode + find/replace ---
   const [viewMode, setViewMode] = useState<ViewMode>('edited');
   const [findReplaceOpen, setFindReplaceOpen] = useState(false);
@@ -500,6 +541,21 @@ function TranscriptDetailInner({ transcriptId }: { transcriptId: string }) {
     }
     return map;
   }, [row?.auto_segments, content?.utterances]);
+
+  // Phase 3a: where the transcript shows a hole — the divider hangs above the
+  // first thing said after the stretch that became its own meeting.
+  const holeByUtterance = useMemo(
+    () => holesBeforeUtterance(content?.utterances, clipHoles),
+    [content?.utterances, clipHoles]
+  );
+  /** The meeting a hole became, but ONLY if the reader can open it: the
+   * route returns siblings caller-scoped, so "not in the list" means "not
+   * yours to know about" and the divider stays nameless. */
+  const holeSibling = useCallback(
+    (hole: { fromMs: number; toMs: number }) =>
+      clipSiblings.find((sib) => sib.isSplitOff && sib.fromMs === hole.fromMs) ?? null,
+    [clipSiblings]
+  );
 
   /**
    * The AI segment the playhead is currently inside — shown as a "Now: …"
@@ -1010,6 +1066,35 @@ function TranscriptDetailInner({ transcriptId }: { transcriptId: string }) {
     },
     [storedParts, activePart]
   );
+
+  // --- Split / un-split (Phase 3a) ------------------------------------------
+  // The menu item appears only when the server says this meeting HAS a clip
+  // it could give away. The window rules are checked live in the dialog
+  // (`validateSplitWindow`, the same pure function the route uses); the few
+  // refusals only the server can know — a transcription shared with another
+  // person's copy of the same call, a re-run mid-flight — come back as the
+  // route's own sentence.
+  const canSplit =
+    !!clips.data?.enabled &&
+    !!clips.data.canEdit &&
+    clips.data.clips.length > 0 &&
+    clips.data.spanMs > 0 &&
+    row?.status === 'completed' &&
+    !row?.gmeet_context?.retranscribing &&
+    videoParts.length === 0;
+  const handleUnsplit = useCallback(async () => {
+    setOverflowMenuOpen(false);
+    const name = splitFrom?.title?.trim() || 'the meeting it came from';
+    if (!window.confirm(`Put this part back into ${name}? This meeting disappears.`)) return;
+    setUnsplitError(null);
+    try {
+      const out = await clips.unsplit();
+      router.push(out.meeting.url);
+    } catch (err) {
+      setUnsplitError(err instanceof Error ? err.message : 'Could not put it back');
+    }
+  }, [clips, splitFrom, router]);
+
   const [videoFetching, setVideoFetching] = useState(false);
   const [videoFetchError, setVideoFetchError] = useState<string | null>(null);
   const fetchVideo = useCallback(
@@ -2404,7 +2489,11 @@ function TranscriptDetailInner({ transcriptId }: { transcriptId: string }) {
    */
   const previousTranscriptionNote = transcriptions.data?.notesStale ? (
     <div className="mb-3 flex items-center justify-between gap-2 rounded-md border bg-muted/60 px-3 py-2 text-xs">
-      <span className="text-muted-foreground">{NOTES_FROM_PREVIOUS_TRANSCRIPTION}</span>
+      {/* Phase 3a: a split writes its own reason ("Part of this meeting was
+          split off on 22 Sep") — say that rather than the version sentence. */}
+      <span className="text-muted-foreground">
+        {transcriptions.data.notesStale.reason?.trim() || NOTES_FROM_PREVIOUS_TRANSCRIPTION}
+      </span>
       {canEdit && (
         <Button
           variant="ghost"
@@ -2547,6 +2636,52 @@ function TranscriptDetailInner({ transcriptId }: { transcriptId: string }) {
                 <Download className="h-3.5 w-3.5 text-muted-foreground" />
                 Download raw markdown
               </button>
+              {/* Phase 3a — one recording, several meetings. Offered only
+                  when the server says this meeting has a clip it could give
+                  away; the dialog greys "Split" for the window rules and the
+                  route has the last word on the rest. */}
+              {canSplit && (
+                <button
+                  type="button"
+                  disabled={blocked}
+                  onClick={() => {
+                    setOverflowMenuOpen(false);
+                    setSplitOpen(true);
+                  }}
+                  className="flex w-full items-center gap-2 rounded px-3 py-1.5 text-left text-sm hover:bg-muted disabled:opacity-50"
+                  title={
+                    blocked
+                      ? OFFLINE_TITLE
+                      : 'Make a stretch of this recording a meeting of its own — nothing is cut and nothing is transcribed again'
+                  }
+                >
+                  <Scissors className="h-3.5 w-3.5 text-muted-foreground" />
+                  Split off a part…
+                </button>
+              )}
+              {splitFrom && (
+                <button
+                  type="button"
+                  disabled={blocked || !clips.data?.canUnsplit || clips.unsplitting}
+                  onClick={() => void handleUnsplit()}
+                  className="flex w-full items-center gap-2 rounded px-3 py-1.5 text-left text-sm hover:bg-muted disabled:opacity-50"
+                  title={
+                    blocked
+                      ? OFFLINE_TITLE
+                      : (clips.data?.unsplitBlockedReason ??
+                        'Merge this back into the meeting it was split off')
+                  }
+                >
+                  {clips.unsplitting ? (
+                    <Loader2 className="h-3.5 w-3.5 animate-spin text-muted-foreground" />
+                  ) : (
+                    <Undo2 className="h-3.5 w-3.5 text-muted-foreground" />
+                  )}
+                  <span className="min-w-0 truncate">
+                    Put it back into {splitFrom.title?.trim() || 'the longer meeting'}
+                  </span>
+                </button>
+              )}
               <div className="my-1 h-px bg-border" />
               <button
                 type="button"
@@ -2571,6 +2706,11 @@ function TranscriptDetailInner({ transcriptId }: { transcriptId: string }) {
       </AppHeader>
 
       <div className="mx-auto max-w-[1200px] px-6 py-6">
+        {unsplitError && (
+          <div className="mb-4 rounded-md border border-destructive/40 bg-destructive/5 px-3 py-2 text-sm text-destructive">
+            {unsplitError}
+          </div>
+        )}
         {row.scratch && !row.deleted_at && (
           <div className="mb-4 flex flex-wrap items-center gap-3 rounded-md border border-amber-400/60 bg-amber-50 px-3 py-2 text-sm dark:bg-amber-950/30">
             <Hourglass className="h-4 w-4 shrink-0 text-amber-600 dark:text-amber-500" />
@@ -2923,6 +3063,8 @@ function TranscriptDetailInner({ transcriptId }: { transcriptId: string }) {
                       ? hasLocalVideo
                       : VIDEO_EXT_RE.test(activePartInfo?.filename ?? ''))
                   }
+                  window={playerWindow}
+                  holes={clipHoles}
                   onTimeUpdate={(t) => setCurrentTime(t + activePartOffset)}
                   onLoadedMetadata={() => {
                     const ps = pendingPartSeekRef.current;
@@ -3509,8 +3651,33 @@ function TranscriptDetailInner({ transcriptId }: { transcriptId: string }) {
                           index === 0 ||
                           content.utterances![index - 1]!.speaker !== utterance.speaker ||
                           segmentByUtterance.has(index);
+                        const hole = holeByUtterance.get(index);
                         return (
                           <div key={index}>
+                            {/* Phase 3a: this stretch is a meeting of its own
+                                now. A quiet rule, not a warning — nothing is
+                                missing, it simply lives next door. */}
+                            {hole && (
+                              <div className="flex items-center gap-2 pt-6 pb-1.5" data-clip-hole>
+                                <div className="h-px flex-1 bg-border" />
+                                <span className="text-[11px] text-muted-foreground">
+                                  {formatTimestamp(hole.fromMs)} – {formatTimestamp(hole.toMs)} is
+                                  its own meeting
+                                  {holeSibling(hole) && (
+                                    <>
+                                      {': '}
+                                      <a
+                                        href={holeSibling(hole)!.url}
+                                        className="font-medium text-primary hover:underline"
+                                      >
+                                        {holeSibling(hole)!.title?.trim() || 'Open it'} ↗
+                                      </a>
+                                    </>
+                                  )}
+                                </span>
+                                <div className="h-px flex-1 bg-border" />
+                              </div>
+                            )}
                             {viewMode === 'edited' && segmentByUtterance.has(index) && (
                               <div className="flex scroll-mt-36 items-center gap-2 pt-6 pb-1.5">
                                 <span className="font-mono text-[11px] tabular-nums text-muted-foreground">
@@ -3599,6 +3766,7 @@ function TranscriptDetailInner({ transcriptId }: { transcriptId: string }) {
                 videoFetching={videoFetching}
                 videoFetchError={videoFetchError}
                 onFetchVideo={() => void fetchVideo()}
+                clips={clipRelationInput}
               />
               <TranscriptSourcesCard
                 row={row}
@@ -3780,6 +3948,7 @@ function TranscriptDetailInner({ transcriptId }: { transcriptId: string }) {
                 videoFetching={videoFetching}
                 videoFetchError={videoFetchError}
                 onFetchVideo={() => void fetchVideo()}
+                clips={clipRelationInput}
               />
               <TranscriptSourcesCard
                 row={row}
@@ -3833,6 +4002,31 @@ function TranscriptDetailInner({ transcriptId }: { transcriptId: string }) {
               markAiStale('calendar', 'the linked calendar event (attendees, title, time)');
           }}
         />
+
+        {/* Phase 3a — "from when Paola joined until she left is its own
+            meeting". Mounted only when it can be opened, so the calendar
+            fetch it makes never runs on a meeting that cannot be split. */}
+        {canSplit && (
+          <SplitClipDialog
+            open={splitOpen}
+            onClose={() => setSplitOpen(false)}
+            transcriptId={row.assemblyai_id}
+            meetingTitle={row.title}
+            spanMs={clips.data?.spanMs ?? (row.duration ?? 0) * 1000}
+            clips={clips.data?.clips ?? []}
+            holes={clipHoles}
+            utterances={content?.utterances ?? []}
+            recordingStartedAt={
+              clips.data?.recording?.startedAt ?? row.recorded_at ?? row.created_at
+            }
+            playheadMs={currentTime * 1000}
+            onPreview={(ms) => seekMeetingTime(ms / 1000)}
+            onSplit={(url) => {
+              setSplitOpen(false);
+              router.push(url);
+            }}
+          />
+        )}
 
         <OfflinePinDialog
           open={offlinePinOpen}

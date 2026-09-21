@@ -23,7 +23,7 @@
 
 import { createHash } from 'node:crypto';
 import type { GmeetContext } from '@/lib/format';
-import type { StoredClips } from '@/lib/clips';
+import { storedClipsInContext, type StoredClips } from '@/lib/clips';
 import { aaiJobIdOf } from '@/lib/aai-job-state';
 import { videoPartOffsets } from '@/lib/part-offsets';
 
@@ -343,36 +343,11 @@ export function desiredClipFor(transcriptId: number): DesiredClip {
 }
 
 /**
- * `gmeet_context.clips`, validated. Exported because the RESOLVER needs it
- * too: with `MW_RECORDINGS` off it serves a meeting from its row alone, and a
- * split meeting's window has to come from somewhere (lib/server/recordings.ts
- * `mediaFromRow`).
+ * `gmeet_context.clips`, validated — re-exported from the pure contract
+ * (`lib/clips.ts`), which is where it has to live: the CLIENT reads the same
+ * mirror to clamp its player, and this module pulls in `node:crypto`.
  */
-export function storedClipsInContext(g: GmeetContext | null | undefined): StoredClips | null {
-  const raw = (g as { clips?: unknown } | null | undefined)?.clips;
-  if (!Array.isArray(raw) || raw.length === 0) return null;
-  const out: StoredClips = [];
-  const ords = new Set<number>();
-  for (const entry of raw) {
-    if (!entry || typeof entry !== 'object') return null;
-    const c = entry as Record<string, unknown>;
-    const ord = c.ord;
-    const recordingId = c.recordingId;
-    const fromMs = c.fromMs;
-    const toMs = c.toMs ?? null;
-    const offsetMs = c.offsetMs;
-    if (typeof ord !== 'number' || !Number.isInteger(ord) || ord < 0 || ords.has(ord)) return null;
-    if (typeof recordingId !== 'string' || !AAI_ID.test(recordingId)) return null;
-    if (typeof fromMs !== 'number' || !Number.isFinite(fromMs) || fromMs < 0) return null;
-    if (toMs !== null && (typeof toMs !== 'number' || !Number.isFinite(toMs) || toMs <= fromMs)) {
-      return null;
-    }
-    if (typeof offsetMs !== 'number' || !Number.isFinite(offsetMs) || offsetMs < 0) return null;
-    ords.add(ord);
-    out.push({ ord, recordingId, fromMs, toMs: toMs as number | null, offsetMs });
-  }
-  return out;
-}
+export { storedClipsInContext } from '@/lib/clips';
 
 /**
  * The clip windows the ROW declares, or null when it declares none.

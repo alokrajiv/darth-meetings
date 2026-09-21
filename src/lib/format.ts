@@ -660,6 +660,14 @@ export interface TranscriptListRow {
   /** gmeet_context.recorder.recordingId (v2 listing only): the Darth
    * Recorder registry row behind this upload, null for everything else. */
   recorder_recording_id?: string | null;
+  /** Phase 3a (v2 listing only): this meeting is a WINDOW of a longer
+   * recording — it was split off another meeting
+   * (`gmeet_context.splitFrom`). A boolean and nothing more: which meeting
+   * it came from is a caller-scoped question the listing does not ask, and
+   * naming it here would leak a meeting the reader may not be able to open
+   * (spec §API). The legacy listing does not select it, so darth-cli's
+   * payload is unchanged. */
+  split_off?: boolean | null;
   /** Conferencing product of the source meeting (listing glyphs); null =
    * plain upload/import with no meeting identity. */
   provider?: 'gmeet' | 'teams' | null;

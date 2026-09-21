@@ -1,3 +1,4 @@
+import type { GmeetContext } from '@/lib/format';
 import { NextResponse } from 'next/server';
 import { withAuth } from '@/lib/auth/with-auth';
 import {
@@ -28,6 +29,21 @@ export const runtime = 'nodejs';
  * shared). If the row is still pending, refresh from AAI before returning.
  * Also bumps last_accessed on the owner's row.
  */
+/**
+ * `gmeet_context.splitFrom` names the SOURCE meeting a split-off row came
+ * from. That id is served only by GET …/clips, which checks the caller can
+ * open the source; the detail payload goes to everyone the row is shared
+ * with, so the source id is replaced by a bare flag here. The page never
+ * reads it — every sibling name and link comes from the clips route.
+ */
+function withoutSplitSource<T extends { gmeet_context: GmeetContext | null }>(row: T): T {
+  const ctx = row.gmeet_context;
+  if (!ctx?.splitFrom) return row;
+  const { meetingId: _omit, ...rest } = ctx.splitFrom;
+  void _omit;
+  return { ...row, gmeet_context: { ...ctx, splitFrom: { ...rest, meetingId: '' } } };
+}
+
 export const GET = withAuth(async ({ user }, { params }) => {
   const { id } = await params;
   const access = await resolveAccess(user.userId, user.email, id);
@@ -50,7 +66,7 @@ export const GET = withAuth(async ({ user }, { params }) => {
 
   return NextResponse.json({
     transcript: {
-      ...refreshed,
+      ...withoutSplitSource(refreshed),
       access: access.access,
       owner_email: owner?.email ?? null,
       owner_name: owner?.name ?? null,
@@ -129,7 +145,7 @@ export const PATCH = withAuth(async ({ user, request }, { params }) => {
   });
 
   return NextResponse.json({
-    transcript: updated ? { ...updated, access: access.access, owner_email: null, owner_name: null } : null,
+    transcript: updated ? { ...withoutSplitSource(updated), access: access.access, owner_email: null, owner_name: null } : null,
   });
 });
 

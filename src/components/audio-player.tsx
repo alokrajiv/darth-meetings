@@ -1,8 +1,24 @@
 'use client';
 
 import { forwardRef, useCallback, useEffect, useImperativeHandle, useRef, useState } from 'react';
-import { Film, X } from 'lucide-react';
+import { Film, Pause, Play, X } from 'lucide-react';
+import {
+  clampMeetingMs,
+  fileMsOf,
+  holeAt,
+  meetingMsOf,
+  pastWindowEnd,
+  windowDurationMs,
+  type PlaybackWindow,
+} from '@/lib/clip-window';
+import { formatTimestamp, type ClipHole } from '@/lib/clips';
 
+/**
+ * Every second in this interface is MEETING time — what the transcript shows
+ * and what a `t:` chip means. With a window (Phase 3a) that is file time
+ * minus `windowFromMs`; the player does the mapping so no caller has to
+ * (lib/clip-window.ts).
+ */
 export interface AudioPlayerHandle {
   /** Seek to a position (seconds) and start playing. */
   seekToSeconds: (seconds: number) => void;
@@ -34,6 +50,23 @@ interface AudioPlayerProps {
   mediaTitle?: string;
   /** Second line on the lock screen — e.g. the meeting date. */
   mediaSubtitle?: string;
+  /**
+   * The window of the file this meeting is (Phase 3a — a meeting split off a
+   * longer recording). null/undefined = the whole file, which is every
+   * meeting that was never split.
+   *
+   * Nothing is cut: `/audio` serves the same bytes. The PLAYER clamps —
+   * playback starts at `fromMs`, stops at `toMs`, the scrubber spans the
+   * window and the clock reads from 0. Native controls cannot lie about a
+   * file's duration, so a windowed player draws its own transport.
+   */
+  window?: PlaybackWindow | null;
+  /**
+   * Stretches of THIS meeting's timeline that are now a meeting of their own
+   * (the source's side of a split). Not its content any more, so playback
+   * skips them.
+   */
+  holes?: ClipHole[];
 }
 
 /** Suffix the transcript page appends to document.title. */
@@ -100,10 +133,48 @@ function audioVariantUrl(src: string): string | null {
  */
 export const AudioPlayer = forwardRef<AudioPlayerHandle, AudioPlayerProps>(
   function AudioPlayer(
-    { src, hasVideo, onTimeUpdate, onLoadedMetadata, onError, className, mediaTitle, mediaSubtitle },
+    {
+      src,
+      hasVideo,
+      onTimeUpdate,
+      onLoadedMetadata,
+      onError,
+      className,
+      mediaTitle,
+      mediaSubtitle,
+      // `window` as a prop name reads right at the call site and would be a
+      // trap in here, where the global is used for timers — so it is renamed
+      // exactly once, on the way in.
+      window: clipWindow = null,
+      holes,
+    },
     ref
   ) {
     const mediaRef = useRef<HTMLMediaElement | null>(null);
+    // Live in a ref too: the media event handlers below are recreated every
+    // render, but the imperative handle and the Media Session handlers are
+    // not, and they all have to map through the SAME window.
+    const windowRef = useRef<PlaybackWindow | null>(clipWindow);
+    windowRef.current = clipWindow;
+    const holesRef = useRef<ClipHole[]>(holes ?? []);
+    holesRef.current = holes ?? [];
+    const windowed = clipWindow !== null;
+    /** File seconds for a MEETING position. */
+    const toFileSec = useCallback(
+      (meetingSec: number) => fileMsOf(meetingSec * 1000, windowRef.current) / 1000,
+      []
+    );
+    /** MEETING seconds for a file position. */
+    const toMeetingSec = useCallback(
+      (fileSec: number) => meetingMsOf(fileSec * 1000, windowRef.current) / 1000,
+      []
+    );
+    // What the custom transport renders. Only kept in state when there IS a
+    // window — a plain player leaves the native controls to do this.
+    const [position, setPosition] = useState(0); // meeting seconds
+    const [spanSec, setSpanSec] = useState<number | null>(null);
+    const [playing, setPlaying] = useState(false);
+    const [scrubbing, setScrubbing] = useState<number | null>(null);
     const [videoOn, setVideoOn] = useState(false);
     // Carry position/play-state across the audio<->video element swap.
     const carryRef = useRef<{ t: number; playing: boolean } | null>(null);
@@ -159,7 +230,7 @@ export const AudioPlayer = forwardRef<AudioPlayerHandle, AudioPlayerProps>(
         seekToSeconds(seconds: number) {
           const el = mediaRef.current;
           if (!el) return;
-          el.currentTime = seconds;
+          el.currentTime = toFileSec(seconds);
           // Best-effort autoplay; browsers may block on first interaction.
           void el.play().catch(() => {});
         },
@@ -170,7 +241,7 @@ export const AudioPlayer = forwardRef<AudioPlayerHandle, AudioPlayerProps>(
           // browsers throw INDEX_SIZE_ERR otherwise).
           if (el.readyState >= 1) {
             try {
-              el.currentTime = seconds;
+              el.currentTime = toFileSec(seconds);
             } catch {
               /* ignore */
             }
@@ -184,8 +255,63 @@ export const AudioPlayer = forwardRef<AudioPlayerHandle, AudioPlayerProps>(
           return !!el && !el.paused && !el.ended;
         },
       }),
-      []
+      [toFileSec]
     );
+
+    /**
+     * The file seconds a ±N-second nudge lands on, kept inside the window.
+     * Without the clamp, "forward 10 s" at the end of a 13-minute part would
+     * start playing the meeting next door.
+     */
+    const seekWithin = useCallback(
+      (m: HTMLMediaElement, deltaSec: number): number => {
+        const fileDuration = Number.isFinite(m.duration) ? m.duration * 1000 : null;
+        const target = toMeetingSec(m.currentTime) + deltaSec;
+        return toFileSec(clampMeetingMs(target * 1000, windowRef.current, fileDuration) / 1000);
+      },
+      [toFileSec, toMeetingSec]
+    );
+
+    /**
+     * Keep playback inside this meeting: start at the window, stop at its
+     * end, and step over a hole that belongs to a meeting split off this one.
+     * Returns the MEETING seconds the caller should report.
+     */
+    const clampPlayhead = useCallback((m: HTMLMediaElement): number => {
+      const w = windowRef.current;
+      if (w && m.currentTime * 1000 < w.fromMs - 250) {
+        // Before the window: the initial seek has not landed (or a native
+        // control was used on a browser that still shows one).
+        try {
+          m.currentTime = w.fromMs / 1000;
+        } catch {
+          /* metadata not ready yet — the loadedmetadata seek will do it */
+        }
+        return 0;
+      }
+      if (pastWindowEnd(m.currentTime * 1000, w)) {
+        m.pause();
+        try {
+          m.currentTime = w!.toMs! / 1000;
+        } catch {
+          /* ignore */
+        }
+        return meetingMsOf(w!.toMs!, w) / 1000;
+      }
+      const meetingMs = meetingMsOf(m.currentTime * 1000, w);
+      const hole = holeAt(holesRef.current, meetingMs);
+      if (hole) {
+        // Not this meeting's content any more — step over it rather than
+        // play somebody else's conversation.
+        try {
+          m.currentTime = fileMsOf(hole.toMs, w) / 1000;
+        } catch {
+          /* ignore */
+        }
+        return hole.toMs / 1000;
+      }
+      return meetingMs / 1000;
+    }, []);
 
     const toggleVideo = () => {
       const el = mediaRef.current;
@@ -307,16 +433,14 @@ export const AudioPlayer = forwardRef<AudioPlayerHandle, AudioPlayerProps>(
           'seekbackward',
           (d) => {
             const m = el();
-            if (m) m.currentTime = Math.max(0, m.currentTime - (d.seekOffset ?? SEEK_STEP_SEC));
+            if (m) m.currentTime = seekWithin(m, -(d.seekOffset ?? SEEK_STEP_SEC));
           },
         ],
         [
           'seekforward',
           (d) => {
             const m = el();
-            if (!m) return;
-            const max = Number.isFinite(m.duration) ? m.duration : Infinity;
-            m.currentTime = Math.min(max, m.currentTime + (d.seekOffset ?? SEEK_STEP_SEC));
+            if (m) m.currentTime = seekWithin(m, d.seekOffset ?? SEEK_STEP_SEC);
           },
         ],
         [
@@ -324,8 +448,11 @@ export const AudioPlayer = forwardRef<AudioPlayerHandle, AudioPlayerProps>(
           (d) => {
             const m = el();
             if (!m || typeof d.seekTime !== 'number') return;
-            if (d.fastSeek && typeof m.fastSeek === 'function') m.fastSeek(d.seekTime);
-            else m.currentTime = d.seekTime;
+            // `seekTime` comes back in the units setPositionState reported —
+            // meeting seconds.
+            const file = toFileSec(d.seekTime);
+            if (d.fastSeek && typeof m.fastSeek === 'function') m.fastSeek(file);
+            else m.currentTime = file;
           },
         ],
       ];
@@ -353,19 +480,23 @@ export const AudioPlayer = forwardRef<AudioPlayerHandle, AudioPlayerProps>(
           /* ignore */
         }
       };
-    }, [applyMetadata]);
+    }, [applyMetadata, seekWithin, toFileSec]);
 
     const syncPositionState = (m: HTMLMediaElement) => {
       if (typeof navigator === 'undefined' || !('mediaSession' in navigator)) return;
       const ms = navigator.mediaSession;
       if (typeof ms.setPositionState !== 'function') return;
-      const duration = m.duration;
+      // The lock screen shows the MEETING, not the file: a 13-minute part of
+      // an hour-long recording must not read "1:00:00" on a phone either.
+      const fileDuration = Number.isFinite(m.duration) ? m.duration * 1000 : null;
+      const span = windowDurationMs(windowRef.current, fileDuration);
+      const duration = span === null ? NaN : span / 1000;
       if (!Number.isFinite(duration) || duration <= 0) return;
       try {
         ms.setPositionState({
           duration,
           playbackRate: m.playbackRate || 1,
-          position: Math.min(Math.max(0, m.currentTime), duration),
+          position: Math.min(Math.max(0, toMeetingSec(m.currentTime)), duration),
         });
       } catch {
         /* out-of-range values throw — harmless */
@@ -383,20 +514,41 @@ export const AudioPlayer = forwardRef<AudioPlayerHandle, AudioPlayerProps>(
     const mediaEvents = {
       onTimeUpdate: (e: React.SyntheticEvent<HTMLMediaElement>) => {
         const m = e.target as HTMLMediaElement;
-        onTimeUpdate?.(m.currentTime);
+        const at = clampPlayhead(m);
+        setPosition(at);
+        onTimeUpdate?.(at);
         syncPositionState(m);
       },
       onLoadedMetadata: (e: React.SyntheticEvent<HTMLMediaElement>) => {
-        syncPositionState(e.target as HTMLMediaElement);
+        const m = e.target as HTMLMediaElement;
+        const fileDuration = Number.isFinite(m.duration) ? m.duration * 1000 : null;
+        const span = windowDurationMs(windowRef.current, fileDuration);
+        setSpanSec(span === null ? null : span / 1000);
+        // A split-off meeting opens at its own 0, not at the top of the hour.
+        // A pending seek from the parent (a part switch, a `t:` chip clicked
+        // before the media was ready) overrides this a tick later.
+        const w = windowRef.current;
+        if (w && m.currentTime * 1000 < w.fromMs) {
+          try {
+            m.currentTime = w.fromMs / 1000;
+          } catch {
+            /* ignore */
+          }
+        }
+        syncPositionState(m);
         onLoadedMetadata?.();
       },
       onPlay: (e: React.SyntheticEvent<HTMLMediaElement>) => {
         // The page sets document.title after its own fetch — re-read it now.
         applyMetadata();
+        setPlaying(true);
         setPlaybackState('playing');
         syncPositionState(e.target as HTMLMediaElement);
       },
-      onPause: () => setPlaybackState('paused'),
+      onPause: () => {
+        setPlaying(false);
+        setPlaybackState('paused');
+      },
       onRateChange: (e: React.SyntheticEvent<HTMLMediaElement>) =>
         syncPositionState(e.target as HTMLMediaElement),
       onError: handleMediaError,
@@ -408,6 +560,85 @@ export const AudioPlayer = forwardRef<AudioPlayerHandle, AudioPlayerProps>(
     const videoElementSrc = forceViaApp ? viaAppUrl(src) : src;
     const audioElementSrc = audioSrc && forceViaApp ? viaAppUrl(audioSrc) : audioSrc;
 
+    const togglePlay = () => {
+      const m = mediaRef.current;
+      if (!m) return;
+      if (m.paused || m.ended) void m.play().catch(() => {});
+      else m.pause();
+    };
+
+    const scrubTo = (meetingSec: number) => {
+      const m = mediaRef.current;
+      if (!m) return;
+      try {
+        m.currentTime = toFileSec(meetingSec);
+      } catch {
+        /* metadata not ready */
+      }
+      setPosition(meetingSec);
+    };
+
+    /**
+     * The transport a WINDOWED player draws for itself.
+     *
+     * `<audio controls>` reads its duration off the file and there is no way
+     * to tell it otherwise — on a meeting that is 20:00–33:20 of an hour it
+     * would show an hour-long scrubber, start at 0:00 and happily play into
+     * the next meeting. So the element goes silent (no `controls`) and this
+     * row says the truth: a clock that starts at 0, a scrubber that spans the
+     * window, and ±10 s that stop at its edges. Both controls are ordinary
+     * focusable elements, so Tab/Space/arrow keys work as they always did.
+     */
+    const transport = windowed ? (
+      <div className="flex items-center gap-2 py-0.5" data-clip-transport>
+        <button
+          type="button"
+          onClick={togglePlay}
+          aria-label={playing ? 'Pause' : 'Play'}
+          title={playing ? 'Pause' : 'Play'}
+          className="flex h-7 w-7 shrink-0 items-center justify-center rounded-full border bg-card text-foreground hover:bg-muted"
+        >
+          {playing ? <Pause className="h-3.5 w-3.5" /> : <Play className="ml-0.5 h-3.5 w-3.5" />}
+        </button>
+        <span className="shrink-0 font-mono text-[11px] tabular-nums text-muted-foreground" data-clip-position>
+          {formatTimestamp((scrubbing ?? position) * 1000)}
+        </span>
+        {/* `step` is one second: an arrow key has to move a noticeable amount
+            — at 0.1 it would take four thousand presses to cross a
+            13-minute part. */}
+        <input
+          type="range"
+          min={0}
+          max={spanSec ?? 0}
+          step={1}
+          value={scrubbing ?? Math.min(position, spanSec ?? position)}
+          disabled={spanSec === null}
+          aria-label="Seek within this meeting"
+          onChange={(e) => setScrubbing(Number(e.target.value))}
+          onMouseUp={() => {
+            if (scrubbing !== null) scrubTo(scrubbing);
+            setScrubbing(null);
+          }}
+          onTouchEnd={() => {
+            if (scrubbing !== null) scrubTo(scrubbing);
+            setScrubbing(null);
+          }}
+          onKeyUp={() => {
+            if (scrubbing !== null) scrubTo(scrubbing);
+            setScrubbing(null);
+          }}
+          onBlur={() => {
+            if (scrubbing !== null) scrubTo(scrubbing);
+            setScrubbing(null);
+          }}
+          className="h-1 min-w-0 flex-1 cursor-pointer accent-primary"
+        />
+        <span className="shrink-0 font-mono text-[11px] tabular-nums text-muted-foreground" data-clip-span>
+          {spanSec === null ? '—' : formatTimestamp(spanSec * 1000)}
+        </span>
+      </div>
+    ) : null;
+
     return (
       <div className="relative">
         {videoOn ? (
@@ -416,7 +647,7 @@ export const AudioPlayer = forwardRef<AudioPlayerHandle, AudioPlayerProps>(
               mediaRef.current = el;
             }}
             src={videoElementSrc}
-            controls
+            controls={!windowed}
             preload="metadata"
             playsInline
             className="max-h-[50vh] w-full rounded-md bg-black"
@@ -428,15 +659,16 @@ export const AudioPlayer = forwardRef<AudioPlayerHandle, AudioPlayerProps>(
               mediaRef.current = el;
             }}
             src={audioElementSrc}
-            controls
+            controls={!windowed}
             preload="metadata"
-            className={className ?? 'w-full'}
+            className={windowed ? 'hidden' : (className ?? 'w-full')}
             {...mediaEvents}
           />
         ) : (
           // Probe in flight — keep the row's height so nothing jumps.
           <div className={className ?? 'h-10 w-full'} aria-hidden />
         )}
+        {transport}
         {hasVideo && (
           <button
             type="button"

@@ -1,6 +1,14 @@
 import { describe, expect, test } from 'bun:test';
 import { formatBytes } from '../format';
-import { recordingFacts, recordingMediaOf, recordingSourceOf, type RecordingFactsRow } from '../recording-facts';
+import {
+  clipRelationLines,
+  recordingFacts,
+  recordingMediaOf,
+  recordingSourceOf,
+  type ClipRelationInput,
+  type RecordingFactsRow,
+} from '../recording-facts';
+import { formatTimestamp } from '../clips';
 
 // The Hypercare row (591b102e…, 2026-09-21) as an Editor sees it: Atira's
 // Darth Recorder upload, 8 segments, 56m 45s, 648 379 934 bytes, video.
@@ -131,4 +139,70 @@ describe('recordingFacts — other sources', () => {
 test('a bigint byte total delivered as a string still formats', () => {
   const f = recordingFacts({ ...hypercare, upload_bytes_total: '648379934' as unknown as number });
   expect(f.bytes).toBe(648379934);
+});
+
+// ---------------------------------------------------------------------------
+// Clips — one recording, several meetings (Phase 3a)
+
+describe('clipRelationLines', () => {
+  const fmt = (ms: number) => formatTimestamp(ms);
+  const sib = (over: Partial<ClipRelationInput['siblings'][number]> = {}) => ({
+    id: 'n-1',
+    url: '/transcript/n-1',
+    title: 'Paola 1:1',
+    fromMs: 1_200_000,
+    toMs: 2_000_000,
+    isSplitOff: true,
+    trashed: false,
+    ...over,
+  });
+
+  test('the split-off meeting says which stretch of which meeting it is', () => {
+    const [line] = clipRelationLines(
+      {
+        splitFrom: { title: 'Kerner podcast', url: '/transcript/m-1', fromMs: 760_000, toMs: 2_465_000 },
+        siblings: [],
+      },
+      fmt
+    );
+    expect(line!.text).toBe('Part of a longer recording — 12:40 to 41:05 of ');
+    expect(line!.linkText).toBe('Kerner podcast');
+    expect(line!.href).toBe('/transcript/m-1');
+    expect(line!.isPart).toBe(true);
+  });
+
+  test('the source says a part of it is its own meeting', () => {
+    const [line] = clipRelationLines({ splitFrom: null, siblings: [sib()] }, fmt);
+    expect(line!.text).toBe('A part of this recording is its own meeting: ');
+    expect(line!.linkText).toBe('Paola 1:1');
+    expect(line!.isPart).toBe(false);
+  });
+
+  test('an untitled sibling still opens', () => {
+    const [line] = clipRelationLines({ splitFrom: null, siblings: [sib({ title: null })] }, fmt);
+    expect(line!.linkText).toBe('open it');
+  });
+
+  test('a trashed sibling is not "its own meeting" any more', () => {
+    expect(clipRelationLines({ splitFrom: null, siblings: [sib({ trashed: true })] }, fmt)).toEqual([]);
+  });
+
+  test('a sibling that merely shares the recording is not a split-off', () => {
+    expect(clipRelationLines({ splitFrom: null, siblings: [sib({ isSplitOff: false })] }, fmt)).toEqual([]);
+  });
+
+  test('an ordinary meeting says nothing at all', () => {
+    expect(clipRelationLines({ splitFrom: null, siblings: [] }, fmt)).toEqual([]);
+  });
+
+  test('a meeting can be both a part and a parent (a part split again)', () => {
+    const lines = clipRelationLines(
+      {
+        splitFrom: { title: 'Workshop', url: '/transcript/m-1', fromMs: 0, toMs: 600_000 },
+        siblings: [sib(), sib({ id: 'n-2', url: '/transcript/n-2', title: 'Debrief' })],
+      },
+      fmt
+    );
+    expect(lines.map((l) => l.linkText)).toEqual(['Workshop', 'Paola 1:1', 'Debrief']);
+  });
 });

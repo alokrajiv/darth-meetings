@@ -73,6 +73,42 @@ describe('stripForArchiveRow — silence is the default', () => {
   });
 });
 
+describe('stripForArchiveRow — a part of a longer recording (Phase 3a)', () => {
+  test('says what it is, with its own length', () => {
+    const m = stripForArchiveRow(arow({ split_off: true, duration: 1705 }), opts)!;
+    expect(m.text).toBe('Part of a longer recording · 28m 25s');
+    expect(m.state).toBe('transcribed');
+    expect(m.tone).toBe('muted');
+    expect(m.action).toBeNull();
+    expect(m.busy).toBe(false);
+  });
+
+  test('never names the meeting it came from — that is caller-scoped', () => {
+    const m = stripForArchiveRow(arow({ split_off: true, duration: 1705 }), opts)!;
+    expect(`${m.text} ${m.title}`).not.toContain('abc');
+  });
+
+  test('wins over the Mac sentence — it is first a part', () => {
+    const m = stripForArchiveRow(
+      arow({ split_off: true, recorder_recording_id: 'r', duration: 1705 }),
+      opts
+    )!;
+    expect(m.text).toBe('Part of a longer recording · 28m 25s');
+    expect(m.source).toBe('mac');
+  });
+
+  test('says nothing extra while the row is still uploading or failed', () => {
+    expect(stripForArchiveRow(arow({ split_off: true, status: 'processing' }), opts)!.state).toBe(
+      'transcribing'
+    );
+  });
+
+  test('a row without the field is unchanged', () => {
+    expect(stripForArchiveRow(arow({ split_off: null }), opts)).toBeNull();
+    expect(stripForArchiveRow(arow(), opts)).toBeNull();
+  });
+});
+
 describe('stripForArchiveRow — in flight', () => {
   test('multi-part Mac upload reads part N of M over the whole recording', () => {
     const m = stripForArchiveRow(

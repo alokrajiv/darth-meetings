@@ -51,8 +51,10 @@ export const GET = withAuth(async ({ user }, { params }) => {
     running: null,
     versions: [],
     // With versions off there is no "previous transcription" to talk about —
-    // a marker left from before a rollback must not keep a banner up.
-    notesStale: null,
+    // a marker left from before a rollback must not keep a banner up. A marker
+    // with its own sentence (a split: "Part of this meeting was split off…")
+    // is not about versions and still applies.
+    notesStale: notesStale?.reason ? notesStale : null,
   };
   if (!(await transcriptionVersionsEnabled())) return NextResponse.json(off);
 

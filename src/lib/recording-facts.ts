@@ -200,3 +200,78 @@ export function recordingFacts(row: RecordingFactsRow): RecordingFacts {
     heldVsAdded,
   };
 }
+
+// ---------------------------------------------------------------------------
+// Clips — one recording, several meetings (Phase 3a)
+// ---------------------------------------------------------------------------
+
+/** One sentence the Recording card adds when this recording holds more than
+ * one meeting. `href`/`linkText` name a meeting the reader CAN open — the
+ * route only ever returns those (spec §API). */
+export interface ClipRelationLine {
+  /** Stable key for React. */
+  key: string;
+  /** The sentence up to the link. */
+  text: string;
+  href: string | null;
+  linkText: string | null;
+  /** True = "this meeting is a part of a longer one". */
+  isPart: boolean;
+}
+
+/** The clips half of `ClipsResponse`, as the card needs it. */
+export interface ClipRelationInput {
+  splitFrom: { title: string | null; url: string; fromMs: number; toMs: number } | null;
+  siblings: Array<{
+    id: string;
+    url: string;
+    title: string | null;
+    fromMs: number;
+    toMs: number | null;
+    isSplitOff: boolean;
+    trashed: boolean;
+  }>;
+}
+
+/**
+ * "Part of a longer recording — 12:40 to 41:05 of *Kerner podcast* ↗" on the
+ * split-off meeting, and "A part of this recording is its own meeting:
+ * *Paola 1:1* ↗" on the one it came from.
+ *
+ * Both are plain sentences about MEETINGS, never about files
+ * (docs/transcript-page-redesign.md). Times are the window in the recording,
+ * which is what someone scrubbing the longer meeting would see.
+ *
+ * `fmtTime` is passed in so the card and a test agree without this module
+ * importing the player's formatter.
+ */
+export function clipRelationLines(
+  input: ClipRelationInput,
+  fmtTime: (ms: number) => string
+): ClipRelationLine[] {
+  const lines: ClipRelationLine[] = [];
+  if (input.splitFrom) {
+    lines.push({
+      key: 'split-from',
+      text: `Part of a longer recording — ${fmtTime(input.splitFrom.fromMs)} to ${fmtTime(
+        input.splitFrom.toMs
+      )} of `,
+      href: input.splitFrom.url,
+      linkText: input.splitFrom.title?.trim() || 'the longer meeting',
+      isPart: true,
+    });
+  }
+  // Trashed siblings still hold their clip (that is what keeps the bytes
+  // alive), but "its own meeting" is not true of something in the trash.
+  const splitOff = input.siblings.filter((s) => s.isSplitOff && !s.trashed);
+  for (const s of splitOff) {
+    lines.push({
+      key: `split-off-${s.id}`,
+      text: 'A part of this recording is its own meeting: ',
+      href: s.url,
+      linkText: s.title?.trim() || 'open it',
+      isPart: false,
+    });
+  }
+  return lines;
+}
