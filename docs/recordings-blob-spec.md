@@ -10,10 +10,19 @@ Depends on Phase 1 tables (`recording_media.blob_name`, `.sha256`, `.bytes`).
   browser/tray → block blob via a per-blob user-delegation SAS → the VM pulls it once, verifies sha256, deletes it
   (`src/lib/server/darth-uploads.ts`, `darth-uploads-store.ts`, `docs/darth-uploads.md`). Auth = the VM's managed
   identity (Storage Blob Data Contributor on the account); no keys anywhere; `allowSharedKeyAccess=false`.
-- **The account has a lifecycle rule: delete 1 day after last write.** Permanent media must not be under it.
-  → NEEDS ALOK (management plane): confirm the rule's scope; either scope it to container `meetings` (prefix match)
-  or create the permanent container in a way the rule cannot touch. Until he confirms, Stage A must refuse to mark
-  anything archived (see the canary below).
+- **The transit account deletes everything after a day — verified 2026-09-22** (`az storage account
+  management-policy show`, read-only): rule `expire-uploads`, enabled, blockBlob, `daysAfterModificationGreaterThan: 1`,
+  **no prefix filter** → it applies to every container in `darthuploads` (today: `chat`, `meetings`), including any
+  new one. Permanent media put there would be destroyed the next day.
+  → NEEDS ALOK (management plane, his call): **a separate account for permanent media** (recommended:
+  `darthmedia`, same region/RG `prod-internal-rg`, Standard_LRS or ZRS, `allowSharedKeyAccess=false`, no public
+  access, blob soft-delete 14 d + container soft-delete, CORS for the meetings origin, the VM identity `darth-p01`
+  gets Storage Blob Data Contributor) — transit and archive have opposite lifecycles and should not share a rule
+  set. Alternative: add `prefixMatch: ["chat/", "meetings/"]` to `expire-uploads` and use a third container; one
+  edit, but a future rule change in the chat repo could then delete the archive.
+  Config is therefore `DARTH_MEDIA_ACCOUNT` + `DARTH_MEDIA_CONTAINER` (default `meetings-media`), independent of
+  `DARTH_UPLOADS_*`. Unset → every stage below is off. The canary (Stage A.4) stays as the guard against a rule
+  appearing later.
 - VM: media today = 80 GB under `~/apps/meeting-whisperer/storage/` on the root disk (495 GB, 287 GB free), a single
   copy with no backup. NVMe scratch `/temphigh` = 216 GB, 101 GB free, ephemeral (lost on deallocate) — cache and
   scratch only, never the only copy of anything.
@@ -23,7 +32,7 @@ Depends on Phase 1 tables (`recording_media.blob_name`, `.sha256`, `.bytes`).
 
 ## Layout
 
-Container **`meetings-media`** (env `DARTH_MEDIA_CONTAINER`, same account). Blob name
+Container **`meetings-media`** in the media account (`DARTH_MEDIA_ACCOUNT` / `DARTH_MEDIA_CONTAINER`). Blob name
 `<recording_id>/<media_id><.ext>`: no user id, no filename, no meeting title in the path (names leak; ids do not).
 Blob properties: `Content-Type` from the extension (the player needs it after a redirect), `Content-Disposition:
 inline`. Metadata: `sha256`, `kind`. Tier Hot; a later lifecycle rule may move blobs untouched for 90 d to Cool —
