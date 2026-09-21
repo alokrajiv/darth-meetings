@@ -15,6 +15,7 @@ import {
   archiveParticipantsExpr,
 } from '@/db-ops/meeting-filter-sql';
 import { EMPTY_MEETING_FILTERS, type MeetingFilters } from '@/lib/server/meeting-filters';
+import { AAI_JOB_ID_RE, AAI_STUCK_HOURS } from '@/lib/aai-job-state';
 import type { LabelFilter } from '@/lib/labels';
 import type {
   GmeetContext,
@@ -214,7 +215,13 @@ export async function listVisibleToUser(
 /** Minimal row shape the AAI pending-refresh fan-out needs. */
 export type PendingRefreshRow = Pick<
   TranscriptListRow,
-  'user_id' | 'assemblyai_id' | 'status' | 'completed_at' | 'duration' | 'speaker_count'
+  | 'user_id'
+  | 'assemblyai_id'
+  | 'status'
+  | 'created_at'
+  | 'completed_at'
+  | 'duration'
+  | 'speaker_count'
 >;
 
 /**
@@ -225,6 +232,13 @@ export type PendingRefreshRow = Pick<
  * placeholder ids never reached AAI, so they are excluded by id as well as
  * by status ('ext-' rows can sit in 'processing' while a background text
  * import normalizes).
+ *
+ * Bounded by age: past AAI_STUCK_HOURS the job is the sweeper's problem, not
+ * the listing's (lib/aai-job-state). Without this bound the 19 rows that had
+ * been stuck in 'processing' in prod since 2026-09-15 were re-polled against
+ * AssemblyAI on every single listing load, forever. The clock starts at the
+ * last upload heartbeat, not at row creation — a multi-GB body can be
+ * streaming for hours before AAI ever sees it.
  */
 export async function listPendingVisibleToUser(
   userId: string,
@@ -232,8 +246,8 @@ export async function listPendingVisibleToUser(
 ): Promise<PendingRefreshRow[]> {
   const normEmail = email.trim().toLowerCase();
   return sql<PendingRefreshRow[]>`
-    SELECT t.user_id, t.assemblyai_id, t.status, t.completed_at, t.duration,
-           t.speaker_count
+    SELECT t.user_id, t.assemblyai_id, t.status, t.created_at, t.completed_at,
+           t.duration, t.speaker_count
     FROM ${sql(SCHEMA)}.transcripts t
     LEFT JOIN ${sql(SCHEMA)}.transcript_shares s
       ON s.transcript_id = t.id
@@ -244,6 +258,8 @@ export async function listPendingVisibleToUser(
       AND t.assemblyai_id NOT LIKE 'up-%'
       AND t.assemblyai_id NOT LIKE 'defer-%'
       AND t.assemblyai_id NOT LIKE 'ext-%'
+      AND COALESCE(t.upload_progress_at, t.created_at)
+            > now() - make_interval(hours => ${AAI_STUCK_HOURS})
   `;
 }
 
@@ -935,6 +951,80 @@ export async function clearIngestFailure(userId: string, assemblyaiId: string): 
   publishEvent({ kind: 'meta', assemblyaiId });
 }
 
+/**
+ * Rows a `submitted to AssemblyAI` job has been sitting on for too long.
+ *
+ * Deliberately NOT filtered by `deleted_at`: 19 of the 20 rows stuck in
+ * 'processing' in prod on 2026-09-21 were in the trash, and a trashed row
+ * still gets polled the moment somebody opens its permalink. Deliberately
+ * NOT user-scoped either — this is the sweeper's global view; the writes it
+ * makes go back through the user-scoped `markAaiGaveUp`.
+ *
+ * `assemblyai_id ~* <uuid>` is the same "did this ever reach AAI?" test as
+ * `isAaiJobId`, applied in SQL so the LIMIT is spent on real candidates.
+ * Rows still waiting in OUR pipeline ('uploading', 'waiting', `up-…`,
+ * `defer-…`, `ext-…`) fail one of the two predicates and are never returned.
+ */
+export interface StuckAaiRow {
+  user_id: string;
+  assemblyai_id: string;
+  status: string;
+  created_at: string;
+  deleted_at: string | null;
+  waiting_since: string;
+  original_filename: string | null;
+  title: string | null;
+  language_code: string | null;
+  speech_model: string | null;
+  local_audio_path: string | null;
+  gmeet_context: GmeetContext | null;
+}
+
+export async function listStuckAtAai(hours: number, limit: number): Promise<StuckAaiRow[]> {
+  return sql<StuckAaiRow[]>`
+    SELECT user_id, assemblyai_id, status, created_at, deleted_at,
+           COALESCE(upload_progress_at, created_at) AS waiting_since,
+           original_filename, title, language_code, speech_model,
+           local_audio_path, gmeet_context
+    FROM ${sql(SCHEMA)}.transcripts
+    WHERE status IN ('queued', 'processing')
+      AND assemblyai_id ~* ${AAI_JOB_ID_RE.source}
+      AND COALESCE(upload_progress_at, created_at) < now() - make_interval(hours => ${hours})
+    ORDER BY COALESCE(upload_progress_at, created_at) ASC
+    LIMIT ${limit}
+  `;
+}
+
+/**
+ * Terminal failure for a job AssemblyAI accepted and then never finished (or
+ * lost — a 404 on the poll). The row flips to 'error' carrying the SAME
+ * `ingestFailure` marker a failed hand-off uses, so the reason reaches the
+ * listing (`deferred_error`), the detail page (`IngestFailureNote`) and the
+ * "Retry" action for free. `retryable: false` keeps the automatic
+ * ingest-retry sweeper off it — giving up means giving up; the human can
+ * still press Retry, which re-sends the stored recording.
+ *
+ * Guarded on the pending statuses so a row that completed between the poll
+ * and this write is never clobbered. Returns false when nothing matched.
+ */
+export async function markAaiGaveUp(
+  userId: string,
+  assemblyaiId: string,
+  failure: NonNullable<GmeetContext['ingestFailure']>
+): Promise<boolean> {
+  const rows = await sql<Array<{ id: number }>>`
+    UPDATE ${sql(SCHEMA)}.transcripts
+    SET status = 'error',
+        gmeet_context = COALESCE(gmeet_context, '{}'::jsonb) ||
+          ${sql.json({ ingestFailure: failure } as unknown as never)}
+    WHERE user_id = ${userId} AND assemblyai_id = ${assemblyaiId}
+      AND status IN ('queued', 'processing')
+    RETURNING id
+  `;
+  if (rows[0]) publishEvent({ kind: 'status', assemblyaiId });
+  return rows.length > 0;
+}
+
 /** Kept-failure rows whose backoff has elapsed, oldest due first. */
 export async function listIngestRetryRows(limit: number): Promise<TranscriptRow[]> {
   return sql<TranscriptRow[]>`
@@ -1236,9 +1326,6 @@ export async function setCachedContentForUser(
   `;
 }
 
-/** @deprecated use setCachedContentForUser — kept for the import flow's clarity */
-export const setImportedContentForUser = setCachedContentForUser;
-
 /**
  * Sweep candidates for the auto-notes watchdog: completed transcripts whose
  * notes never ran (status NULL, older than the grace window) or whose run is
@@ -1476,8 +1563,17 @@ export async function setVideoPartStoredForUser(
       )
     )
     WHERE user_id = ${userId} AND assemblyai_id = ${assemblyaiId}
-      AND jsonb_typeof(gmeet_context->'videoParts') = 'array'
-      AND jsonb_array_length(gmeet_context->'videoParts') > 0
+      -- CASE, not a jsonb_typeof(...) = 'array' AND jsonb_array_length(...)
+      -- conjunction: WHERE terms are not evaluated left to right, so on a row
+      -- whose videoParts is a JSON null the planner is free to run the length
+      -- first and error with "cannot get array length of a scalar".
+      -- Same shape as listAaiDeletePending.
+      AND COALESCE(
+            jsonb_array_length(
+              CASE WHEN jsonb_typeof(gmeet_context->'videoParts') = 'array'
+                   THEN gmeet_context->'videoParts' END
+            ), 0
+          ) > 0
   `;
   publishEvent({ kind: 'meta', assemblyaiId });
 }
@@ -1574,8 +1670,15 @@ export async function setUploadPartBytesForUser(
       )
     )
     WHERE user_id = ${userId} AND assemblyai_id = ${assemblyaiId}
-      AND jsonb_typeof(gmeet_context->'uploadGroup'->'parts') = 'array'
-      AND jsonb_array_length(gmeet_context->'uploadGroup'->'parts') > 0
+      -- CASE for the same reason as setVideoPartStoredForUser above: a JSON
+      -- null in the parts array would make the bare conjunction error out
+      -- depending on which term the planner evaluates first.
+      AND COALESCE(
+            jsonb_array_length(
+              CASE WHEN jsonb_typeof(gmeet_context->'uploadGroup'->'parts') = 'array'
+                   THEN gmeet_context->'uploadGroup'->'parts' END
+            ), 0
+          ) > 0
     RETURNING gmeet_context
   `;
   return rows[0]?.gmeet_context ?? null;

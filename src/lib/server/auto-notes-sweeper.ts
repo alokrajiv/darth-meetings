@@ -7,6 +7,7 @@ import {
   listNotesBacklog,
   listSpeakerIdBacklog,
   listStaleUploads,
+  listStuckAtAai,
   mergeGmeetContextForUser,
   softDeleteForUser,
 } from '@/db-ops/transcripts';
@@ -15,6 +16,8 @@ import {
   deleteOnCompleteEnabled,
   isAaiJobId,
 } from '@/lib/server/aai-retention';
+import { AAI_STUCK_HOURS, AAI_STUCK_REASON } from '@/lib/aai-job-state';
+import { giveUpOnAaiJob } from '@/lib/server/aai-giveup';
 import { identityForUser } from '@/db-ops/transcript-activity';
 import { deleteUploadSession, listExpiredUploadSessions } from '@/db-ops/upload-sessions';
 import { uploadsStore } from '@/lib/server/darth-uploads-store';
@@ -33,6 +36,12 @@ import { SCRATCH_TTL_DAYS } from '@/lib/format';
  *     kill in-flight generations). Never-ran notes are NOT picked up:
  *     generation waits for a human to review speaker labels and click
  *     "confirm & generate" on the detail page, however long that takes.
+ *   - stuck AssemblyAI jobs (DEC-4): a job AAI accepted and has been sitting
+ *     on for more than AAI_STUCK_HOURS is never coming back — flip the row to
+ *     'error' with a reason a human can act on. Trashed rows included (19 of
+ *     the 20 stuck rows in prod on 2026-09-21 were in the trash). Rows still
+ *     waiting in OUR pipeline ('uploading', 'waiting', `up-`/`defer-`/`ext-`
+ *     ids) are never touched — the query only accepts real AAI job ids.
  *   - AssemblyAI retention (DEC-4): retry the delete-at-AAI for recently
  *     completed rows whose job is still there — the delete at completion is
  *     fire-and-forget and AAI can be down. Off unless
@@ -67,6 +76,9 @@ const SCRATCH_PER_SWEEP = 50;
 // row being safe) and belongs to scripts/aai-purge.ts.
 const AAI_DELETE_SINCE_HOURS = 72;
 const AAI_DELETE_PER_SWEEP = 10;
+// Give-up pass. Generous per sweep because it is a pure DB write with no
+// outbound call — the prod backlog (19 rows) drains in one tick.
+const AAI_STUCK_PER_SWEEP = 50;
 
 let started = false;
 
@@ -122,6 +134,25 @@ async function sweep(): Promise<void> {
     }
   } catch (err) {
     console.warn('[notes-sweeper] scratch expiry query failed:', err);
+  }
+
+  // DEC-4: jobs AssemblyAI accepted and never finished. No outbound call —
+  // asking AAI again is exactly what we are stopping. One log line per row so
+  // "why did my transcript fail?" has an answer in the pm2 log.
+  try {
+    const stuck = await listStuckAtAai(AAI_STUCK_HOURS, AAI_STUCK_PER_SWEEP);
+    for (const s of stuck) {
+      const flipped = await giveUpOnAaiJob(s.user_id, s.assemblyai_id, AAI_STUCK_REASON, s);
+      if (flipped) {
+        console.log(
+          `[notes-sweeper] gave up on AssemblyAI job ${s.assemblyai_id} ` +
+            `(waiting since ${s.waiting_since}${s.deleted_at ? ', trashed' : ''}` +
+            `${s.local_audio_path ? '' : ', no stored media'})`
+        );
+      }
+    }
+  } catch (err) {
+    console.warn('[notes-sweeper] stuck-AAI query failed:', err);
   }
 
   // DEC-4: jobs that should already be gone from AssemblyAI. deleteAtAaiIfSafe

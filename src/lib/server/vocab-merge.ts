@@ -83,31 +83,9 @@ export function mergeVocabs(org: VocabPayload, user: VocabPayload): MergedVocab 
   };
 }
 
-/**
- * Apply a list of custom spellings as a plain string-replace pass to a piece
- * of text. Used by the post-import flow so imported transcripts benefit from
- * the company glossary even though we can't re-run them through AAI.
- *
- * Case-insensitive match, longest-from-first to avoid partial overwrites.
- */
-export function applyCustomSpellingsToText(
-  text: string,
-  spellings: Array<{ to: string; from: string[] }>
-): string {
-  if (!text) return text;
-  const pairs: Array<[string, string]> = [];
-  for (const s of spellings) {
-    for (const f of s.from) {
-      const fc = f.trim();
-      if (fc) pairs.push([fc, s.to]);
-    }
-  }
-  pairs.sort((a, b) => b[0].length - a[0].length);
-
-  let result = text;
-  for (const [from, to] of pairs) {
-    const escaped = from.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-    result = result.replace(new RegExp(escaped, 'gi'), to);
-  }
-  return result;
-}
+// `applyCustomSpellingsToText` lived here until 2026-09-21. Its only caller
+// was POST /api/import/execute — the "import from your own AssemblyAI key"
+// flow, removed with DEC-4 (docs/recordings-first-class-design.md §7: the
+// AssemblyAI id stops being an identity, so there is nothing to import from
+// an AAI account). Custom spellings still reach AAI as `custom_spelling` on
+// every submit; nothing else ever re-spelled stored text.

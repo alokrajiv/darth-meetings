@@ -1,5 +1,6 @@
 import 'server-only';
 import { deleteTranscript } from '@/lib/server/assemblyai';
+import { isAaiJobId } from '@/lib/aai-job-state';
 import { getForUser, stampAaiDeleted, type TranscriptRow } from '@/db-ops/transcripts';
 
 /**
@@ -23,12 +24,11 @@ import { getForUser, stampAaiDeleted, type TranscriptRow } from '@/db-ops/transc
  * AssemblyAI job ids are plain UUIDs. Every id we mint ourselves carries a
  * prefix instead (`up-`, `defer-`, `ext-`, `gmeet-`, `teams-`), so a UUID
  * test is the one check that stays correct when another prefix is added.
+ * The test itself lives in `@/lib/aai-job-state` — the give-up rules need it
+ * too and that module is pure (unit-testable); re-exported here so existing
+ * importers of `isAaiJobId` are unaffected.
  */
-const AAI_JOB_ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
-
-export function isAaiJobId(id: string): boolean {
-  return AAI_JOB_ID_RE.test(id);
-}
+export { isAaiJobId } from '@/lib/aai-job-state';
 
 /** Lazy, per-call — see the module comment. */
 export function deleteOnCompleteEnabled(): boolean {

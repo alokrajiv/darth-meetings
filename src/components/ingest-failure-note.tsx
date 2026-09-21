@@ -39,15 +39,29 @@ export function IngestFailureNote({
     }
   };
   const when = failure.nextAt ? new Date(failure.nextAt) : null;
+  // 'aai-job' is the other kind of failure: AssemblyAI ACCEPTED the job and
+  // then lost it (404) or never finished it (>6 h). The hand-off worked, so
+  // saying it failed — and promising automatic retries that will not run —
+  // would be a lie. Copy says what happened and points at the button.
+  const gaveUpAtAai = failure.stage === 'aai-job';
   return (
     <span className="inline-flex flex-wrap items-center gap-x-2 gap-y-1" data-ingest-failure>
       <span title={failure.message}>
-        Transcription hand-off failed ({failure.message}). The recording is saved on the server
-        {failure.retryable
-          ? when && when.getTime() > Date.now()
-            ? ` — next automatic retry ${when.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}.`
-            : ' — retrying automatically.'
-          : ' — automatic retries gave up after 3 days.'}
+        {gaveUpAtAai ? (
+          <>
+            AssemblyAI never returned a result ({failure.message}). The recording is saved on the
+            server{canRetry ? ' — retry to send it again.' : '.'}
+          </>
+        ) : (
+          <>
+            Transcription hand-off failed ({failure.message}). The recording is saved on the server
+            {failure.retryable
+              ? when && when.getTime() > Date.now()
+                ? ` — next automatic retry ${when.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}.`
+                : ' — retrying automatically.'
+              : ' — automatic retries gave up after 3 days.'}
+          </>
+        )}
       </span>
       {canRetry && (
         <button

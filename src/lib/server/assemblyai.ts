@@ -1,12 +1,22 @@
 import 'server-only';
 import { AssemblyAI } from 'assemblyai';
 import type { TranscriptResponse } from '@/lib/format';
+import { describeAaiError } from '@/lib/aai-errors';
 import {
   DEFAULT_SPEECH_MODEL,
   keytermsSupported,
   speechModelsRequest,
   type SpeechModel,
 } from '@/lib/aai-language';
+
+/**
+ * How to read an SDK failure — notably "did AssemblyAI answer 404?", which
+ * under DEC-4 is a terminal answer rather than something to retry. The
+ * implementation is pure (`@/lib/aai-errors`, unit-tested) and re-exported
+ * here so every caller reaches for it through the AAI wrapper it already
+ * imports.
+ */
+export { describeAaiError, isAaiNotFound, type AaiErrorInfo } from '@/lib/aai-errors';
 
 /**
  * Server-only AssemblyAI wrapper.
@@ -136,12 +146,12 @@ export async function deleteTranscript(id: string): Promise<boolean> {
     await getClient().transcripts.delete(id);
     return true;
   } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    if (/\b404\b|not found/i.test(message)) {
+    const info = describeAaiError(error);
+    if (info.notFound) {
       console.warn('[assemblyai] delete: already gone at AAI:', id);
       return true;
     }
-    console.warn('[assemblyai] delete failed for', id, '-', message);
+    console.warn('[assemblyai] delete failed for', id, '-', info.message);
     return false;
   }
 }

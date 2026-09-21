@@ -1,12 +1,22 @@
 import 'server-only';
-import { getTranscript } from '@/lib/server/assemblyai';
+import { getTranscript, isAaiNotFound } from '@/lib/server/assemblyai';
 import { updateStatusForUser, type TranscriptRow } from '@/db-ops/transcripts';
+import { AAI_GONE_REASON, isAaiJobId } from '@/lib/aai-job-state';
+import { giveUpOnAaiJob } from '@/lib/server/aai-giveup';
 import { onTranscriptCompleted } from '@/lib/server/post-completion';
 
 /**
  * If the stored row is still queued/processing, fetch the latest state from
  * AssemblyAI and persist it. Returns the (possibly updated) row. Swallows
  * upstream errors so a transient AAI hiccup doesn't break the list endpoint.
+ *
+ * Three things stop the poll before it reaches AAI: a terminal status, an id
+ * AssemblyAI never issued (`ext-…`, `gmeet-…`, `teams-…`), a
+ * TRASHED row (opening `/transcript/<id>` of a soft-deleted pending row used
+ * to poll AssemblyAI on every load — `resolveAccess` does not filter
+ * `deleted_at`, by design, so the guard lives here). Jobs pending past AAI_STUCK_HOURS are
+ * flipped to 'error' by the 5-minute sweeper (lib/server/auto-notes-sweeper.ts). A 404 from AAI is handled inline —
+ * under 24 h retention that answer is final, not a blip.
  */
 export async function refreshIfPending(
   userId: string,
@@ -22,6 +32,21 @@ export async function refreshIfPending(
   ) {
     return row;
   }
+
+  // …and neither has it heard of `ext-…` (text imports normalising in the
+  // background sit in 'processing'), `gmeet-…` or `teams-…`. The listing
+  // fan-out already excluded those by id; this path never did.
+  if (!isAaiJobId(row.assemblyai_id)) return row;
+
+  // In the trash: nobody is waiting for this status, and 19 prod rows sat
+  // here burning an AAI call per page open.
+  if (row.deleted_at) return row;
+
+  // No age guard here on purpose: a row re-sent by Retry keeps its old
+  // created_at (only upload_progress_at moves), so an age test on created_at
+  // would stop polling a job that was submitted a minute ago. Stuck jobs are
+  // flipped to 'error' by the sweeper within five minutes, which ends the
+  // polling through the status check above.
 
   try {
     const aai = await getTranscript(row.assemblyai_id);
@@ -57,6 +82,14 @@ export async function refreshIfPending(
 
     return updated ?? row;
   } catch (error) {
+    // AAI no longer has the job. Terminal under DEC-4 — stop re-asking.
+    if (isAaiNotFound(error)) {
+      // `userId` is always the OWNER (resolveAccess hands us ownerUserId) —
+      // the same scoping updateStatusForUser above writes under. The row is
+      // already loaded, so no re-read.
+      const flipped = await giveUpOnAaiJob(userId, row.assemblyai_id, AAI_GONE_REASON, row);
+      return flipped ? { ...row, status: 'error' } : row;
+    }
     console.warn('[transcript-sync] refresh failed:', error);
     return row;
   }

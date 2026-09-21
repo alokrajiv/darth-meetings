@@ -9,7 +9,9 @@ import {
   updateUploadProgress,
   type PendingRefreshRow,
 } from '@/db-ops/transcripts';
-import { getTranscript } from '@/lib/server/assemblyai';
+import { getTranscript, isAaiNotFound } from '@/lib/server/assemblyai';
+import { AAI_GONE_REASON } from '@/lib/aai-job-state';
+import { giveUpOnAaiJob } from '@/lib/server/aai-giveup';
 import { saveAudioBytes, saveAudioStreamToTemp } from '@/lib/server/audio-storage';
 import { onTranscriptCompleted } from '@/lib/server/post-completion';
 import { parseMeetingFilters } from '@/lib/server/meeting-filters';
@@ -41,6 +43,12 @@ export const maxDuration = 900;
  * query's rows, decoupled from pagination). First observed completion stores
  * the payload in the same write and fires onTranscriptCompleted (speaker
  * suggestions + the AAI-side delete, fire-and-forget).
+ *
+ * Two terminal outcomes are handled here rather than retried forever (DEC-4:
+ * AAI keeps nothing of ours, retention is 24 h):
+ *   - a job AAI has been holding past AAI_STUCK_HOURS is skipped — the
+ *     5-minute sweeper flips it to 'error';
+ *   - a 404 flips it right here, because that answer cannot improve.
  */
 async function refreshPendingAgainstAai<T extends PendingRefreshRow>(
   rows: T[]
@@ -100,6 +108,16 @@ async function refreshPendingAgainstAai<T extends PendingRefreshRow>(
           });
         }
       } catch (err) {
+        // AssemblyAI does not have this job any more. Final — flip the row
+        // so the listing stops showing an eternal "Transcribing…" spinner
+        // and stops re-asking on every load.
+        if (isAaiNotFound(err)) {
+          // No row argument: the listing projection is thin on purpose, so
+          // the marker's replay options are read from the full row inside.
+          const flipped = await giveUpOnAaiJob(row.user_id, row.assemblyai_id, AAI_GONE_REASON);
+          if (flipped) rows[i] = { ...row, status: 'error' };
+          return;
+        }
         console.warn('[GET /api/transcripts] refresh failed for', row.assemblyai_id, err);
       }
     })

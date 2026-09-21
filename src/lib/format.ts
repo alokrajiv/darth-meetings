@@ -373,7 +373,13 @@ export interface GmeetContext {
    * backoff until it lands or `retryable` is cleared (72 h). Cleared on
    * success. POST /api/transcripts/:id/retry-ingest does it on demand. */
   ingestFailure?: {
-    stage: 'aai-upload' | 'aai-submit';
+    /**
+     * 'aai-upload' / 'aai-submit' — the hand-off itself failed, bytes on our
+     * disk, sweeper retrying. 'aai-job' — AssemblyAI ACCEPTED the job and
+     * then never finished it (stuck >6 h) or lost it (404 on the poll); we
+     * gave up, `retryable` is false, and Retry re-sends the stored file.
+     */
+    stage: 'aai-upload' | 'aai-submit' | 'aai-job';
     message: string;
     firstAt: string;
     at: string;
