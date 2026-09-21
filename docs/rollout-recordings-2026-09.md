@@ -59,9 +59,11 @@ Flags live in `~/apps/meeting-whisperer/.env.local` on the VM; every one is read
       uploads or AI runs are active. Local files are never deleted by this stage.
 - [ ] `scripts/media-archive-status.ts --check-blobs` clean; after 36 h the canary says `CANARY OK`.
 
-## E. Transcription versions (Phase 2) — when it lands
+## E. Transcription versions (Phase 2) — committed 2332967
 
-- [ ] **ALOK** apply `migrations/046_transcription_versions.sql`; set `MW_TRANSCRIPTION_VERSIONS=1` (needs B on).
+- [ ] **ALOK** apply `migrations/046_transcription_versions.sql`; set `MW_TRANSCRIPTION_VERSIONS=1`, restart (needs B's
+      `MW_RECORDINGS_WRITE` and a backfilled graph — a meeting with no clip falls back to the old new-row flow).
+      Rollback: unset; stored versions stay readable and are never deleted by the sync.
 - [ ] First real use: re-run one of the five Indonesian-detected meetings with Language = English; check the old
       version is still there under Versions with its edits and names.
 
