@@ -39,7 +39,7 @@ export interface RecordingFactsRow {
   local_audio_path: string | null;
   drive_file_id?: string | null;
   duration: number | null;
-  upload_bytes_total?: number | null;
+  upload_bytes_total?: number | string | null;
   created_at: string;
   recorded_at: string | null;
   gmeet_context: GmeetContext | null;
@@ -164,7 +164,10 @@ export function recordingFacts(row: RecordingFactsRow): RecordingFacts {
     }
   }
 
-  const bytes = row.upload_bytes_total && row.upload_bytes_total > 0 ? row.upload_bytes_total : null;
+  // bigint columns arrive as strings from the detail route (SELECT t.*), so
+  // coerce; "0 B" rendered on the Hypercare row (648 379 934 as a string).
+  const rawBytes = Number(row.upload_bytes_total ?? 0);
+  const bytes = Number.isFinite(rawBytes) && rawBytes > 0 ? rawBytes : null;
   const durationSec = row.duration ?? null;
 
   const facts: string[] = [];

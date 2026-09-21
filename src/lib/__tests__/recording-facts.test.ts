@@ -127,3 +127,8 @@ describe('recordingFacts — other sources', () => {
     expect(recordingMediaOf({ ...base, original_filename: 'x', local_audio_path: null })).toBe('audio');
   });
 });
+
+test('a bigint byte total delivered as a string still formats', () => {
+  const f = recordingFacts({ ...hypercare, upload_bytes_total: '648379934' as unknown as number });
+  expect(f.bytes).toBe(648379934);
+});
