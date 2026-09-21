@@ -37,6 +37,7 @@ import {
   GoogleNotConnectedError,
 } from '@/lib/google-token';
 import type { StoredTranscript } from '@/lib/format';
+import { TRANSCRIPTION_LANGUAGE_OPTIONS } from '@/lib/aai-language';
 import { defaultReportPref, type ReportPref } from '@/lib/report-pref';
 import { uploadFileChunked } from '@/lib/chunked-upload';
 import { OFFLINE_TITLE, useOfflineGate } from '@/lib/offline/offline-context';
@@ -70,16 +71,18 @@ interface AudioUploadProps {
   onTranscriptCreated?: () => void;
 }
 
-const LANGUAGE_OPTIONS = [
-  { code: '', label: 'Auto Detect' },
-  { code: 'en', label: 'English' },
-  { code: 'zh', label: 'Chinese (Mandarin)' },
-  { code: 'es', label: 'Spanish' },
-  { code: 'fr', label: 'French' },
-  { code: 'de', label: 'German' },
-  { code: 'ja', label: 'Japanese' },
-  { code: 'ko', label: 'Korean' },
-];
+/**
+ * One list of languages for every submit (lib/aai-language.ts). The upload
+ * stepper used to carry its own shorter copy, which quietly meant a Bahasa
+ * or Tamil recording could be re-transcribed into the right language from
+ * the transcript page but not uploaded as one in the first place. Both paths
+ * end in the same `submitTranscription`: the code is passed through verbatim,
+ * `keyterms_prompt` is dropped for anything non-English (keytermsSupported),
+ * and the model list carries the Universal-2 fallback for languages 3.5 Pro
+ * does not cover — so every code here is as submittable from here as it is
+ * from "Transcribe again".
+ */
+const LANGUAGE_OPTIONS = TRANSCRIPTION_LANGUAGE_OPTIONS;
 
 interface UploadStatus {
   file: File;

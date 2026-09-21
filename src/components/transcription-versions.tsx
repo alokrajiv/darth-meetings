@@ -65,14 +65,21 @@ export function TranscriptionVersions({
             const busy = activatingId === v.id;
             return (
               <li key={v.id} className="border-b border-dashed pb-1.5 last:border-0 last:pb-0">
-                <div className="flex items-baseline gap-1.5">
+                {/* Inline, not flex: a model name that wraps (narrow rail, or
+                    390 px) must carry its status with it — as flex siblings
+                    the status aligns to the model's FIRST baseline and reads
+                    as "Universal-2 — asked for Universal-3.5 · reading now"
+                    above a stranded "Pro". */}
+                <div>
                   <span className={v.active ? 'font-medium' : ''}>{c.model}</span>
-                  {v.active && <span className="shrink-0 text-muted-foreground">· reading now</span>}
+                  {v.active && (
+                    <span className="whitespace-nowrap text-muted-foreground"> · reading now</span>
+                  )}
                   {v.status === 'processing' && (
-                    <span className="shrink-0 text-muted-foreground">· running</span>
+                    <span className="whitespace-nowrap text-muted-foreground"> · running</span>
                   )}
                   {v.status === 'error' && (
-                    <span className="shrink-0 text-destructive">· failed</span>
+                    <span className="whitespace-nowrap text-destructive"> · failed</span>
                   )}
                 </div>
                 <div className="text-muted-foreground">
