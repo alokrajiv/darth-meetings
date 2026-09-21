@@ -15,6 +15,8 @@ import {
   archiveParticipantsExpr,
 } from '@/db-ops/meeting-filter-sql';
 import { EMPTY_MEETING_FILTERS, type MeetingFilters } from '@/lib/server/meeting-filters';
+import { recordingCountExpr } from '@/db-ops/recordings';
+import { recordingsEnabled } from '@/lib/server/recordings';
 import { AAI_JOB_ID_RE, AAI_STUCK_HOURS } from '@/lib/aai-job-state';
 import type { LabelFilter } from '@/lib/labels';
 import type {
@@ -414,14 +416,23 @@ export async function listPagedForUser(
              COALESCE(t.gmeet_context->'deferredImport'->>'error',
                       t.gmeet_context->'ingestFailure'->>'message') AS deferred_error,
              t.gmeet_context->'deferredImport'->>'background' AS deferred_background,
-             -- Meetings with more than one recording: extra Meet segments
-             -- (videoParts, on top of the primary), a stitched multi-file
-             -- upload (uploadedParts), or a combined re-transcription.
-             GREATEST(
+             -- Meetings with more than one recording. With MW_RECORDINGS on
+             -- this counts the meeting's own recording_media (one correlated
+             -- aggregate, inside this materialized fence, caller-scoping
+             -- inherited from the CTE); off, it is the jsonb it always was:
+             -- extra Meet segments (videoParts, on top of the primary), a
+             -- stitched multi-file upload (uploadedParts), or a combined
+             -- re-transcription. The two agree row for row — that equality
+             -- is what the diff gate checks (spec §5a).
+             ${
+               recordingsEnabled()
+                 ? recordingCountExpr()
+                 : sql`GREATEST(
                1 + COALESCE(jsonb_array_length(t.gmeet_context->'videoParts'), 0),
                COALESCE(jsonb_array_length(t.gmeet_context->'uploadedParts'), 0),
                COALESCE((t.gmeet_context->>'combinedParts')::int, 0)
-             )::int AS recording_count,
+             )::int`
+             } AS recording_count,
              -- Series auto-import lifecycle: 'passed' = imported AND speaker
              -- review jumped through automatically (report generated
              -- unattended — the blue dot), 'gated' = auto-imported but held

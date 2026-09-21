@@ -3,6 +3,7 @@ import { withAuth } from '@/lib/auth/with-auth';
 import { resolveAccess } from '@/db-ops/transcript-access';
 import { getContentCached, identifySpeakers } from '@/lib/server/auto-notes';
 import { suggestSpeakersForTranscript } from '@/lib/server/voiceprint';
+import { canonicalMedia, resolveMeetingContent } from '@/lib/server/recordings';
 
 export const runtime = 'nodejs';
 
@@ -39,11 +40,14 @@ export const POST = withAuth(async ({ user }, { params }) => {
   }
 
   try {
-    const content = await getContentCached(access.ownerUserId, access.row);
+    const [content, resolved] = await Promise.all([
+      getContentCached(access.ownerUserId, access.row),
+      resolveMeetingContent(access.row),
+    ]);
     const suggestions = await suggestSpeakersForTranscript(
       access.ownerUserId,
       id,
-      access.row.local_audio_path,
+      canonicalMedia(resolved.media),
       content
     );
     // AI pass retry: only when it isn't already running/completed — a manual

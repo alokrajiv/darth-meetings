@@ -4,7 +4,8 @@ import { stat } from 'node:fs/promises';
 import { Readable } from 'node:stream';
 import { withAuth } from '@/lib/auth/with-auth';
 import { resolveAccess } from '@/db-ops/transcript-access';
-import { extractFrame, hasVideoStream } from '@/lib/server/video-frames';
+import { extractFrame, frameSourceFor, hasVideoStream } from '@/lib/server/video-frames';
+import { resolveMeetingContent } from '@/lib/server/recordings';
 
 export const runtime = 'nodejs';
 
@@ -16,6 +17,9 @@ export const runtime = 'nodejs';
  * later hit is a plain file read. Used by the AI notes' embedded
  * screenshots — the notes agent writes `frame:<ms>` refs which the server
  * rewrites to this URL.
+ *
+ * `:frame` is a MEETING-time offset and the frame comes out of the meeting's
+ * canonical file (`frameSourceFor`) — see the note there about landmine #15.
  */
 export const GET = withAuth(async ({ user }, { params }) => {
   const { id, frame } = await params;
@@ -30,13 +34,13 @@ export const GET = withAuth(async ({ user }, { params }) => {
     return NextResponse.json({ error: 'Bad frame timestamp' }, { status: 400 });
   }
 
-  const audioFilename = access.row.local_audio_path;
-  if (!audioFilename || !(await hasVideoStream(audioFilename))) {
+  const source = frameSourceFor((await resolveMeetingContent(access.row)).media);
+  if (!source || !(await hasVideoStream(source.filename))) {
     return NextResponse.json({ error: 'No video stored for this transcript' }, { status: 404 });
   }
 
   try {
-    const abs = await extractFrame(access.row.assemblyai_id, audioFilename, ms);
+    const abs = await extractFrame(access.row.assemblyai_id, source.filename, ms);
     const st = await stat(abs);
     const stream = Readable.toWeb(createReadStream(abs)) as ReadableStream;
     return new NextResponse(stream, {

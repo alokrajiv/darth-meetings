@@ -1,6 +1,7 @@
 import { NextResponse } from 'next/server';
 import { withAuth } from '@/lib/auth/with-auth';
 import { restoreForUser } from '@/db-ops/transcripts';
+import { queueRecordingGraphSync } from '@/lib/server/recording-sync';
 import { resolveAccess } from '@/db-ops/transcript-access';
 
 export const runtime = 'nodejs';
@@ -28,5 +29,8 @@ export const POST = withAuth(async ({ user }, { params }) => {
   if (!restored) {
     return NextResponse.json({ error: 'Not in the trash' }, { status: 409 });
   }
+  // Trash keeps the clips (nothing was deleted), so this is only a heal: a
+  // row trashed while MW_RECORDINGS_WRITE was off gets its graph here.
+  queueRecordingGraphSync(access.ownerUserId, id, 'restore');
   return NextResponse.json({ ok: true });
 });

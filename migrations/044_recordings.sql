@@ -20,6 +20,13 @@
 -- recording must state which of the two it used
 -- (feedback_privacy_caller_scoping_gate).
 
+-- CONVENTION (spec §5a): every migration here hard-codes the PROD schema on
+-- the line below. Applying this to any other schema — the stage clone, a
+-- local scratch cluster, the writers' integration check — means sed-ing that
+-- one line first, e.g.
+--   sed 's/meeting_whisperer_prod/meeting_whisperer_stage/' 044_recordings.sql | psql …
+-- The convention stays as it is: a migration that picked its schema from the
+-- environment would be one typo away from creating prod tables somewhere else.
 SET search_path = meeting_whisperer_prod, public;
 
 -- One capture. `owner_user_id` is the darth user id family used by

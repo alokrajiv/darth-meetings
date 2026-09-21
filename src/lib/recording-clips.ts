@@ -15,6 +15,15 @@
  * offline pin stay byte-identical. The non-compat branch below is written
  * and tested now so Phase 3 has nothing left to invent, but no prod row
  * reaches it yet.
+ *
+ * Two rulings from spec §5a are load-bearing here:
+ *  - **The clip alone decides compat.** Whether the transcription covered
+ *    the recording's canonical media does NOT enter into it: prefixing the
+ *    speakers of a single-recording meeting helps nobody, and only
+ *    `media[].transcribed` should say "this file was not heard".
+ *  - **The meeting timeline orders clips by `offset_ms`, then `ord`.** `ord`
+ *    is the clip's identity (its primary key with the meeting, what an edit
+ *    key survives a re-window by), not its position.
  */
 
 import type { TranscriptResponse } from '@/lib/format';
@@ -73,15 +82,41 @@ type Utterance = NonNullable<TranscriptResponse['utterances']>[number];
 type Word = NonNullable<TranscriptResponse['words']>[number];
 
 /**
- * Compat = exactly one clip, no window, no shift, contributing text. The
- * caller adds the other half of the test (that the clip's transcription
- * covers the canonical media) — that needs media rows, which this module
- * deliberately doesn't see.
+ * Compat = exactly one clip, no window, no shift, contributing text. That is
+ * the WHOLE test (§5a): nothing about the recording's files, its media rows
+ * or what the transcription happened to hear can take a 1:1 meeting out of
+ * compat mode.
  */
 export function isCompatClipSet(clips: ResolvableClip[]): boolean {
   if (clips.length !== 1) return false;
   const c = clips[0]!;
   return c.fromMs === 0 && c.toMs === null && c.offsetMs === 0 && c.textPolicy === 'include';
+}
+
+/**
+ * Meeting-timeline order: where the clip lands (`offset_ms`) first, `ord`
+ * only as the tie-break (§5a). Exported so the server resolver numbers its
+ * media with the same order the text comes out in.
+ */
+export function compareClipsOnTimeline(
+  a: { offsetMs: number; ord: number },
+  b: { offsetMs: number; ord: number }
+): number {
+  return a.offsetMs - b.offsetMs || a.ord - b.ord;
+}
+
+/**
+ * Is this a key `resolveClips` could have minted, i.e. something
+ * `transcript_edits.edits` may legally be keyed by?
+ *
+ * Compat meetings key by plain utterance index — that is what every row in
+ * prod uses and what the edits route has always validated. A multi-clip
+ * meeting keys by `<recordingId>:<index in that recording's transcription>`
+ * so a re-window or a re-order never re-points an existing edit (§2.2). The
+ * key space is minted and validated in the same module on purpose.
+ */
+export function isUtteranceKey(key: string): boolean {
+  return /^\d+$/.test(key) || /^[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}:\d+$/.test(key);
 }
 
 /** `from_ms <= start < to_ms` — lower bound inclusive, upper exclusive. */
@@ -175,19 +210,16 @@ function spansOverlap(a: [number, number], b: [number, number]): boolean {
  * Resolve a meeting's clips into the payload `/content` serves.
  *
  * Compat mode returns `clips[0].payload` by reference — callers may rely on
- * that identity (it is what keeps the JSON byte-identical). `compatAllowed`
- * is the caller's half of the compat test: the clip's transcription must
- * also cover the recording's canonical media, which needs media rows this
- * module never sees. Pass false and the merge branch runs instead.
+ * that identity (it is what keeps the JSON byte-identical). There is no
+ * caller-supplied override: the clip decides, and nothing else (§5a).
  */
 export function resolveClips(
   clips: ResolvableClip[],
-  meeting: ClipMeetingFacts,
-  opts?: { compatAllowed?: boolean }
+  meeting: ClipMeetingFacts
 ): ResolvedClipContent {
-  const ordered = [...clips].sort((a, b) => a.ord - b.ord);
+  const ordered = [...clips].sort(compareClipsOnTimeline);
 
-  if (opts?.compatAllowed !== false && isCompatClipSet(ordered)) {
+  if (isCompatClipSet(ordered)) {
     const payload = ordered[0]!.payload;
     return {
       content: payload,
@@ -224,9 +256,10 @@ export function resolveClips(
     };
   });
 
-  // Concatenate in `ord`; only sort by time when two clips genuinely overlap
-  // on the meeting timeline (back-to-back clips must keep their authored
-  // order even when a stray end time bleeds a few ms into the next one).
+  // Concatenate in timeline order (`offset_ms`, then `ord`); only sort by
+  // utterance time when two clips genuinely overlap on the meeting timeline
+  // (back-to-back clips must keep their clip order even when a stray end
+  // time bleeds a few ms into the next one).
   const spans = kept.map((c) => c.spanMs).filter((s): s is [number, number] => s !== null);
   const overlapping = spans.some((a, i) => spans.slice(i + 1).some((b) => spansOverlap(a, b)));
 

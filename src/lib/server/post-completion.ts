@@ -5,6 +5,7 @@ import { deleteAtAaiIfSafe } from '@/lib/server/aai-retention';
 import { maybeAutoReview } from '@/lib/server/auto-review';
 import { suggestSpeakersFromMeet } from '@/lib/server/meet-align';
 import { suggestSpeakersForTranscript } from '@/lib/server/voiceprint';
+import { canonicalMedia, resolveMeetingContent } from '@/lib/server/recordings';
 import { identityForUser } from '@/db-ops/transcript-activity';
 import { autoMarkerOf } from '@/lib/auto-marker';
 import { notifyUser } from '@/lib/server/darth-notify';
@@ -42,8 +43,8 @@ export function onTranscriptCompleted(
   setTimeout(() => {
     void (async () => {
       try {
-        // Re-read so we have local_audio_path + the payload the completion
-        // write stored, even when the caller only had a skinny listing row.
+        // Re-read so we have the media + the payload the completion write
+        // stored, even when the caller only had a skinny listing row.
         const full = await getForUser(ownerUserId, assemblyaiId);
         if (!full || full.status !== 'completed') return;
 
@@ -54,8 +55,12 @@ export function onTranscriptCompleted(
           (err) => console.warn('[post-completion] AAI delete failed:', err)
         );
 
-        // The payload, from the DB — completion is its only writer now.
-        const content = await getContentCached(ownerUserId, full);
+        // The payload and the media, from the DB through the resolver —
+        // completion is the payload's only writer now.
+        const [content, resolved] = await Promise.all([
+          getContentCached(ownerUserId, full),
+          resolveMeetingContent(full),
+        ]);
 
         // Voiceprint speaker suggestions (fast, seconds). AI notes are NOT
         // auto-generated any more — the user triggers them from the detail
@@ -64,7 +69,7 @@ export function onTranscriptCompleted(
         await suggestSpeakersForTranscript(
           ownerUserId,
           full.assemblyai_id,
-          full.local_audio_path,
+          canonicalMedia(resolved.media),
           content
         ).catch((err) => console.warn('[post-completion] suggest failed:', err));
 

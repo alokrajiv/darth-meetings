@@ -7,6 +7,7 @@ import { getForUser, mergeGmeetContextForUser } from '@/db-ops/transcripts';
 import { audioFileExists, getAudioDir } from '@/lib/server/audio-storage';
 import { buildAudioOnly, getAudioOnlyDir } from '@/lib/server/audio-only';
 import { ensureFaststart } from '@/lib/server/media-faststart';
+import { queueDerivativeMediaDrop, queueRecordingGraphSync } from '@/lib/server/recording-sync';
 import type { GmeetContext } from '@/lib/format';
 
 /**
@@ -144,6 +145,11 @@ async function prepareRow(row: MediaRow, opts: { nice: boolean; tag: string }): 
     ...(ok ? {} : { attempts: prevAttempts + 1, error: errors.join('; ').slice(0, 300) }),
   };
   await mergeGmeetContextForUser(row.user_id, row.assemblyai_id, { media }, { quiet: true });
+  // The extracts that exist now become `audio_only` media rows (the sync
+  // stats the disk). The faststart remux gets NO row on purpose: it rewrites
+  // the source file in place, so there is no second file to point at — the
+  // canonical row already describes those bytes.
+  queueRecordingGraphSync(row.user_id, row.assemblyai_id, 'media-prep');
   console.log(
     `${opts.tag} ${row.assemblyai_id}: ${report.join(' | ')} (${((Date.now() - started) / 1000).toFixed(1)}s` +
       (ok ? ')' : `, attempt ${media.attempts}/${MAX_ATTEMPTS})`)
@@ -224,6 +230,8 @@ async function sweepOrphanDerivatives(): Promise<void> {
   if (!sources) return; // can't tell what is live — do nothing
   const liveStems = new Set(sources.map((f) => path.parse(f).name));
   const now = Date.now();
+  /** Files removed below, so their `recording_media` rows can go too. */
+  const dropped: string[] = [];
   for (const f of entries) {
     const abs = path.join(dir, f);
     if (f.endsWith('.tmp')) {
@@ -238,8 +246,10 @@ async function sweepOrphanDerivatives(): Promise<void> {
     const stem = path.parse(f).name;
     if (liveStems.has(stem)) continue;
     await fsp.unlink(abs).catch(() => {});
+    dropped.push(f);
     console.log(`[media-sweeper] removed orphan derivative ${f} (no source ${stem}.* in the audio dir)`);
   }
+  queueDerivativeMediaDrop(dropped, '[media-sweeper]');
 }
 
 async function tick(): Promise<void> {

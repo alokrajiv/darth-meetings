@@ -22,6 +22,7 @@ import { sniffMediaExtension } from '@/lib/server/video-frames';
 import { normalizeMultiTrack } from '@/lib/server/multitrack';
 import { autoAttachSeries } from '@/lib/server/series-attach';
 import { prepareMediaForPlayback } from '@/lib/server/media-sweeper';
+import { queueRecordingGraphSync } from '@/lib/server/recording-sync';
 import type { GmeetContext } from '@/lib/format';
 
 /**
@@ -128,6 +129,11 @@ async function keepFailedIngest(
     `[ingest] ${stage} failed — kept as ${row.assemblyai_id} (attempt ${attempts}, ` +
       `${retryable ? 'retry ' + row.gmeet_context?.ingestFailure?.nextAt : 'gave up'}): ${errorText(causeErr)}`
   );
+  // The placeholder now OWNS bytes, so it stops being an empty placeholder
+  // and earns a recording. When the retry sweeper later promotes it to the
+  // real AssemblyAI id, the sync migrates that recording rather than leaving
+  // a second one behind (db-ops/recordings.ts `applyRecordingGraph`).
+  queueRecordingGraphSync(userId, row.assemblyai_id, 'ingest/kept-failure');
   return row;
 }
 
@@ -306,6 +312,12 @@ export async function ingestLocalAudio(
     console.error('[ingest] local audio rename failed:', error);
     await deleteAudioFile(tempFilename);
   }
+
+  // Dual-write, last: the row is complete (id promoted or inserted, context
+  // stamped, media named) so the derived graph is the final one. Callers that
+  // keep writing to the row afterwards — the Meet importer's context merge,
+  // the recorder link — fire their own sync.
+  queueRecordingGraphSync(userId, row.assemblyai_id, 'ingest');
 
   return row;
 }

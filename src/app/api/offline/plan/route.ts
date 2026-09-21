@@ -5,6 +5,7 @@ import { getOfflinePrefs, type OfflinePrefs } from '@/db-ops/user-prefs';
 import { listOfflinePlanRows, type OfflinePlanRow } from '@/db-ops/offline-plan';
 import { resolveAudioPath } from '@/lib/server/audio-storage';
 import { hasVideoStream } from '@/lib/server/video-frames';
+import { resolveMediaForMeetings, type ResolvedMedia } from '@/lib/server/recordings';
 
 export const runtime = 'nodejs';
 
@@ -27,13 +28,12 @@ export const runtime = 'nodejs';
 
 const MAX_IDS = 200;
 const ID_RE = /^[A-Za-z0-9._-]+$/;
-/** Same rule the transcript page applies to videoParts entries. */
-const VIDEO_EXT = /\.(mp4|webm|mov|mkv|m4v)$/i;
 /** ffprobe fan-out for primaries not yet in hasVideoStream's cache. */
 const PROBE_CONCURRENCY = 6;
 
 export interface PlanMeetingPart {
-  /** 1 = primary (local_audio_path); N >= 2 = gmeet_context.videoParts[N-2]. */
+  /** `?part=N` as the audio route numbers it: 1 = the canonical recording,
+   * N >= 2 = the extra files, in capture order. */
   part: number;
   filename: string;
   isVideo: boolean;
@@ -87,7 +87,21 @@ export const GET = withAuth(async ({ user, request }) => {
     user.email,
     ids !== null ? { ids } : { limit }
   );
-  const meetings = await mapLimit(rows, PROBE_CONCURRENCY, toPlanMeeting);
+  // One media resolve for the whole page, not one per meeting: the plan is
+  // asked for up to 200 ids at a time. The plan row is skinny, so the
+  // fallback path gets the two columns it reads (the offsets the resolver
+  // would compute from `actuals` are not part of the plan).
+  const media = await resolveMediaForMeetings(
+    rows.map((r) => ({
+      id: r.id,
+      duration: r.duration,
+      local_audio_path: r.local_audio_path,
+      gmeet_context: { videoParts: Array.isArray(r.video_parts) ? r.video_parts : undefined },
+    }))
+  );
+  const meetings = await mapLimit(rows, PROBE_CONCURRENCY, (row) =>
+    toPlanMeeting(row, media.get(row.id) ?? [])
+  );
 
   const body: OfflinePlanResponse = {
     prefs,
@@ -97,30 +111,34 @@ export const GET = withAuth(async ({ user, request }) => {
   return NextResponse.json(body, { headers: { 'Cache-Control': 'private, no-store' } });
 });
 
-async function toPlanMeeting(row: OfflinePlanRow): Promise<PlanMeeting> {
+async function toPlanMeeting(
+  row: OfflinePlanRow,
+  media: ResolvedMedia[]
+): Promise<PlanMeeting> {
   const parts: PlanMeetingPart[] = [];
   let hasLocal = false;
   let isVideo = false;
 
-  if (row.local_audio_path) {
-    const bytes = await storedBytes(row.local_audio_path);
+  // No canonical file ⇒ nothing to pin, and the extra files are not offered
+  // on their own (they are only playable next to the primary).
+  const canonical = media.find((m) => m.part === 1);
+  if (canonical) {
+    const bytes = await storedBytes(canonical.filename);
     hasLocal = bytes !== null;
     // ffprobe-backed (cached per filename): the stored extension is only a
     // hint for the primary — Drive names arrive without one.
-    isVideo = hasLocal ? await hasVideoStream(row.local_audio_path) : false;
-    parts.push({ part: 1, filename: row.local_audio_path, isVideo, bytes });
+    isVideo = hasLocal ? await hasVideoStream(canonical.filename) : false;
+    parts.push({ part: 1, filename: canonical.filename, isVideo, bytes });
 
-    // Part numbers are positional (route indexes videoParts[N-2]), so an
-    // entry whose bytes haven't landed yet is skipped, not renumbered.
-    const videoParts = Array.isArray(row.video_parts) ? row.video_parts : [];
-    for (let i = 0; i < videoParts.length; i++) {
-      const filename = videoParts[i]?.filename;
-      if (!filename) continue;
+    // Part numbers are positional, so a file whose bytes haven't landed yet
+    // is absent from the resolver's media rather than renumbering the rest.
+    for (const m of media) {
+      if (m.part === 1) continue;
       parts.push({
-        part: i + 2,
-        filename,
-        isVideo: VIDEO_EXT.test(filename),
-        bytes: await storedBytes(filename),
+        part: m.part,
+        filename: m.filename,
+        isVideo: m.isVideo === true,
+        bytes: await storedBytes(m.filename),
       });
     }
   }

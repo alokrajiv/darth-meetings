@@ -7,6 +7,7 @@ import {
 } from '@/db-ops/speaker-mappings';
 import { getContentCached, generateAutoReport } from '@/lib/server/auto-notes';
 import { enrollFromTranscript } from '@/lib/server/voiceprint';
+import { canonicalMedia, resolveMeetingContent } from '@/lib/server/recordings';
 import { notifyUser, APP_URL } from '@/lib/server/darth-notify';
 import { dm, headlines, meetingLine } from '@/lib/server/dm-copy';
 import { autoMarkerOf, autoRecipients, autoSourceLabel } from '@/lib/auto-marker';
@@ -134,7 +135,8 @@ export async function maybeAutoReview(ownerUserId: string, assemblyaiId: string)
     await upsertMappingsForUser(ownerUserId, assemblyaiId, merged);
     // Same free-enrollment rule as a human confirm.
     void (async () => {
-      await enrollFromTranscript(row.local_audio_path, content, merged);
+      const resolved = await resolveMeetingContent(row);
+      await enrollFromTranscript(canonicalMedia(resolved.media), content, merged);
     })().catch((err) => console.warn('[auto-review] voiceprint enroll failed:', err));
   }
 

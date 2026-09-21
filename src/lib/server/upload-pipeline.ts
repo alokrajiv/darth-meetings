@@ -15,6 +15,7 @@ import { resolveAccess } from '@/db-ops/transcript-access';
 import { deleteAudioFile, deleteAudioFilesByPrefix } from '@/lib/server/audio-storage';
 import { concatMediaSmart, probeDurationSec } from '@/lib/server/media-concat';
 import { IngestError, ingestLocalAudio } from '@/lib/server/ingest';
+import { queueRecordingGraphSync } from '@/lib/server/recording-sync';
 import type { GmeetAttendee, GmeetContext, StoredTranscript } from '@/lib/format';
 import type { RecorderMatch } from '@/lib/recorder';
 import type { DarthUser } from '@/lib/auth/session';
@@ -299,6 +300,11 @@ async function linkRecorderRecording(
   try {
     const ok = await linkRecordingTranscript(userId, recordingId, transcriptId);
     if (!ok) console.warn(`[upload] recorder recording ${recordingId} not found for this owner`);
+    // The link is written AFTER ingest, and it is what makes the recording
+    // `source_kind = 'recorder'` and gives it `recorder_recording_id` +
+    // `started_at` (spec §5a) — so the graph is re-derived here, not left at
+    // the value ingest saw a moment ago.
+    if (ok) queueRecordingGraphSync(userId, transcriptId, 'upload/recorder-link');
   } catch (err) {
     console.warn('[upload] linking the recorder recording failed:', err);
   }
@@ -593,7 +599,11 @@ export async function finalizeUpload(
       );
       for (const p of parts) await deleteAudioFile(p.tempFilename);
       // Persist the stitch map on the row BEFORE ingest — the placeholder
-      // is promoted in place, context intact, so the map survives.
+      // is promoted in place, context intact, so the map survives. That
+      // ordering is also what lets the dual-write inside `ingestLocalAudio`
+      // see the group: ONE recording whose canonical is the concat
+      // (`source_ref.derived = 'concat'`) with a `part` row per
+      // `uploadedParts` entry, offsets included.
       await mergeGmeetContextForUser(
         user.userId,
         groupRow.assemblyai_id,

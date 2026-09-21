@@ -4,6 +4,7 @@ import { promises as fsp } from 'node:fs';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { getStorageDir, resolveAudioPath } from '@/lib/server/audio-storage';
+import { canonicalMedia, type ResolvedMedia } from '@/lib/server/recordings';
 
 const execFileP = promisify(execFile);
 
@@ -13,6 +14,21 @@ const execFileP = promisify(execFile);
  * `${MW_STORAGE_DIR}/frames/<assemblyaiId>/<ms>.jpg` so repeat requests
  * (notes agent + the serving route + regenerations) never re-decode.
  */
+
+/**
+ * Which of a meeting's files a frame at a MEETING-time offset is taken from.
+ *
+ * Today: always the canonical one, whatever the timestamp — the same "frames
+ * read the primary file only" rule the app has always had (design §4,
+ * landmine #15). Every `frame:<ms>` already written into a summary or report
+ * means "ms into the canonical file", so picking a stop-restart part by its
+ * offset here would silently re-point existing citations at a different
+ * image. Mapping meeting ms → (file, local ms) arrives with Phase 3, when a
+ * clip can have a real window; this function is where it lands.
+ */
+export function frameSourceFor(media: ResolvedMedia[]): ResolvedMedia | null {
+  return canonicalMedia(media);
+}
 
 const FRAME_WIDTH = 960; // ~700 tokens/frame for the model; plenty for slides
 const EXEC_OPTS = { timeout: 60_000, maxBuffer: 16 * 1024 * 1024 } as const;

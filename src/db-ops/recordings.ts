@@ -3,6 +3,8 @@ import { sql } from '@/lib/db';
 import { SCHEMAS } from '@/lib/constants/database';
 import type { TranscriptResponse } from '@/lib/format';
 import type { ClipTextPolicy } from '@/lib/recording-clips';
+import type { TransactionSql } from 'postgres';
+import type { DesiredClip, DesiredGraph, GraphMeetingRow } from '@/lib/recording-graph';
 
 /**
  * First-class recordings (migration 044) — recordings, their files, their
@@ -22,8 +24,9 @@ import type { ClipTextPolicy } from '@/lib/recording-clips';
  *                    client-supplied id without that gate first
  *                    (feedback_privacy_caller_scoping_gate).
  *
- * Nothing calls this module yet: Phase 1a creates the tables and the ops,
- * Phase 1b wires the writers and readers up.
+ * Callers: the resolver (`lib/server/recordings.ts`, behind MW_RECORDINGS) and
+ * the dual-write sync (`lib/server/recording-sync.ts`, behind
+ * MW_RECORDINGS_WRITE). With both flags unset nothing here runs.
  */
 
 const SCHEMA = SCHEMAS.MEETING_WHISPERER;
@@ -608,4 +611,396 @@ export async function loadMeetingRecordingGraph(
     listRecordingMedia(recordingIds),
   ]);
   return { clips, recordings, transcriptions, media };
+}
+
+/**
+ * INTERNAL-ONLY — the same graph for MANY meetings in four round trips
+ * total, not four per meeting. The offline plan asks for up to 200 ids at
+ * once; a per-meeting loop there would be the N+1 spec §3 rules out. Ids
+ * with no clips are simply absent from the map (the caller falls back to the
+ * row's own columns). The caller has already gated on those meetings.
+ *
+ * Payloads come along for the ride, so this is for callers that need the
+ * MEDIA of many meetings — never for a listing that only needs a count
+ * (`recordingCountExpr`).
+ */
+export async function loadMeetingRecordingGraphs(
+  transcriptIds: number[]
+): Promise<Map<number, MeetingRecordingGraph>> {
+  const out = new Map<number, MeetingRecordingGraph>();
+  const clips = await listClipsForMeetings(transcriptIds);
+  if (clips.length === 0) return out;
+
+  const recordingIds = [...new Set(clips.map((c) => c.recording_id))];
+  const [recordings, transcriptions, media] = await Promise.all([
+    sql<RecordingRow[]>`
+      SELECT ${recordingCols} FROM ${sql(SCHEMA)}.recordings
+      WHERE id = ANY(${recordingIds}::uuid[])
+    `,
+    listRecordingTranscriptions(recordingIds),
+    listRecordingMedia(recordingIds),
+  ]);
+
+  for (const clip of clips) {
+    let graph = out.get(clip.transcript_id);
+    if (!graph) {
+      graph = { clips: [], recordings: [], transcriptions: [], media: [] };
+      out.set(clip.transcript_id, graph);
+    }
+    graph.clips.push(clip);
+  }
+  // Each meeting sees only the recordings its own clips point at — the
+  // arrays are small (one recording per meeting today) and the resolver
+  // filters by recording_id anyway.
+  for (const graph of out.values()) {
+    const mine = new Set(graph.clips.map((c) => c.recording_id));
+    graph.recordings = recordings.filter((r) => mine.has(r.id));
+    graph.transcriptions = transcriptions.filter((t) => mine.has(t.recording_id));
+    graph.media = media.filter((m) => mine.has(m.recording_id));
+  }
+  return out;
+}
+
+// ---------------------------------------------------------------------------
+// Dual-write (Phase 1 writers) — see lib/server/recording-sync.ts
+// ---------------------------------------------------------------------------
+
+/**
+ * Every meeting that holds a given `assemblyai_id`, oldest first, with the
+ * columns `deriveRecordingGraph` reads and the tray link it needs.
+ *
+ * Usually one row. Two rows means two people imported the same Meet call
+ * (landmine #14) and the earlier one OWNS the recording — which is why this
+ * is not scoped to a user: the sync derives the recording from the owner's
+ * row whoever triggered it. It is INTERNAL-ONLY and never serves a response;
+ * the caller reached it by writing to one of these meetings.
+ *
+ * The recorder join prefers the reverse link (`transcript_id`) and falls back
+ * to the `gmeet_context.recorder` marker, guarded by a uuid-shaped test so a
+ * junk marker can never make the cast throw.
+ */
+export async function loadGraphMeetingRows(assemblyaiId: string): Promise<GraphMeetingRow[]> {
+  return sql<GraphMeetingRow[]>`
+    SELECT t.id, t.user_id, t.assemblyai_id, t.original_filename, t.status,
+           t.created_at, t.completed_at, t.duration, t.language_code,
+           t.speech_model, t.local_audio_path, t.deleted_at, t.gmeet_context,
+           (t.imported_content IS NOT NULL) AS has_content,
+           rr.id         AS recorder_recording_id,
+           rr.started_at AS recorder_started_at
+    FROM ${sql(SCHEMA)}.transcripts t
+    LEFT JOIN LATERAL (
+      SELECT r.id, r.started_at
+      FROM ${sql(SCHEMA)}.recorder_recordings r
+      WHERE r.transcript_id = t.assemblyai_id
+         OR (t.gmeet_context->'recorder'->>'recordingId' ~ '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$'
+             AND r.id::text = t.gmeet_context->'recorder'->>'recordingId')
+      ORDER BY (r.transcript_id = t.assemblyai_id) DESC, r.created_at
+      LIMIT 1
+    ) rr ON true
+    WHERE t.assemblyai_id = ${assemblyaiId}
+    ORDER BY t.created_at, t.id
+  `;
+}
+
+export interface ApplyRecordingGraphInput {
+  graph: DesiredGraph;
+  /** One per meeting that reads this recording — normally just the meeting
+   * that was written; two when a shared AssemblyAI job's owner has not been
+   * synced yet and the second importer is the one writing. */
+  clips: DesiredClip[];
+  /** Stamped on a clip this call creates; existing clips keep their author. */
+  createdBy?: string | null;
+}
+
+export interface ApplyRecordingGraphResult {
+  recordingId: string;
+  /** Recordings a clip moved OFF and that nothing points at any more — a
+   * placeholder promotion (`up-…` → the AssemblyAI id) is the only way to
+   * get one. Their rows were deleted, so nothing is orphaned or duplicated. */
+  migratedFrom: string[];
+  mediaWritten: number;
+  staleMediaRemoved: number;
+}
+
+/**
+ * INTERNAL-ONLY — write one meeting's desired graph. The caller has already
+ * decided the meeting is theirs to write (it just changed the row).
+ *
+ * ONE transaction, idempotent on the deterministic ids, so running it twice
+ * changes nothing and two meetings sharing an AssemblyAI job converge on the
+ * same recording. The payload is copied INSIDE Postgres
+ * (`INSERT … SELECT imported_content`): ~0.5 GB of jsonb must never
+ * round-trip through JS (spec §2.3).
+ */
+export async function applyRecordingGraph(
+  input: ApplyRecordingGraphInput
+): Promise<ApplyRecordingGraphResult> {
+  const { graph, clips } = input;
+  const rec = graph.recording;
+  const keepMediaIds = graph.media.map((m) => m.id);
+  const migratedFrom: string[] = [];
+  let staleMediaRemoved = 0;
+
+  await sql.begin(async (tx) => {
+    // What these meetings pointed at BEFORE — a promotion changes the answer.
+    const priorIds = new Set<string>();
+    for (const clip of clips) {
+      const prior = await tx<Array<{ recording_id: string }>>`
+        SELECT recording_id FROM ${tx(SCHEMA)}.meeting_clips
+        WHERE transcript_id = ${clip.transcriptId} AND ord = ${clip.ord}
+      `;
+      const priorId = prior[0]?.recording_id;
+      if (priorId && priorId !== rec.id) priorIds.add(priorId);
+    }
+
+    await tx`
+      INSERT INTO ${tx(SCHEMA)}.recordings
+        (id, owner_user_id, source_kind, started_at, duration_ms, recorder_recording_id)
+      VALUES (${rec.id}::uuid, ${rec.ownerUserId}, ${rec.sourceKind},
+              ${rec.startedAt}, ${rec.durationMs}, ${rec.recorderRecordingId}::uuid)
+      ON CONFLICT (id) DO UPDATE SET
+        source_kind           = EXCLUDED.source_kind,
+        started_at            = COALESCE(EXCLUDED.started_at, recordings.started_at),
+        duration_ms           = COALESCE(EXCLUDED.duration_ms, recordings.duration_ms),
+        recorder_recording_id = COALESCE(EXCLUDED.recorder_recording_id,
+                                         recordings.recorder_recording_id),
+        updated_at            = now()
+    `;
+
+    for (const m of graph.media) {
+      await tx`
+        INSERT INTO ${tx(SCHEMA)}.recording_media
+          (id, recording_id, kind, ord, offset_ms, duration_ms, filename, bytes,
+           has_video, source_ref, of_media_id)
+        VALUES (${m.id}::uuid, ${rec.id}::uuid, ${m.kind}, ${m.ord},
+                ${m.offsetMs}, ${m.durationMs}, ${m.filename}, ${m.bytes},
+                ${m.hasVideo}, ${m.sourceRef ? tx.json(m.sourceRef as never) : null},
+                ${m.ofMediaId}::uuid)
+        ON CONFLICT (id) DO UPDATE SET
+          kind        = EXCLUDED.kind,
+          ord         = EXCLUDED.ord,
+          offset_ms   = COALESCE(EXCLUDED.offset_ms, recording_media.offset_ms),
+          duration_ms = COALESCE(EXCLUDED.duration_ms, recording_media.duration_ms),
+          filename    = COALESCE(EXCLUDED.filename, recording_media.filename),
+          bytes       = COALESCE(EXCLUDED.bytes, recording_media.bytes),
+          has_video   = COALESCE(EXCLUDED.has_video, recording_media.has_video),
+          source_ref  = COALESCE(EXCLUDED.source_ref, recording_media.source_ref),
+          of_media_id = COALESCE(EXCLUDED.of_media_id, recording_media.of_media_id)
+      `;
+    }
+
+    // Files the row no longer describes. Derivatives are only judged when
+    // the caller actually looked at the disk — an unprobed sync must not
+    // delete an `audio_only` row it simply did not ask about.
+    const stale = await tx<Array<{ id: string }>>`
+      DELETE FROM ${tx(SCHEMA)}.recording_media
+      WHERE recording_id = ${rec.id}::uuid
+        AND NOT (id = ANY(${keepMediaIds}::uuid[]))
+        AND (${graph.filesProbed} OR kind IN ('canonical', 'part'))
+      RETURNING id
+    `;
+    staleMediaRemoved = stale.length;
+
+    const t = graph.transcription;
+    await tx`
+      INSERT INTO ${tx(SCHEMA)}.recording_transcriptions
+        (id, recording_id, provider, provider_job_id, speech_model, language_code,
+         status, payload, covers, created_at, completed_at)
+      SELECT ${t.id}::uuid, ${rec.id}::uuid, ${t.provider}, ${t.providerJobId},
+             ${t.speechModel}, ${t.languageCode}, ${t.status},
+             src.imported_content, ${tx.json(t.covers as never)},
+             src.created_at, src.completed_at
+      FROM ${tx(SCHEMA)}.transcripts src
+      WHERE src.id = ${graph.payloadFromTranscriptId}
+      ON CONFLICT (id) DO UPDATE SET
+        status          = EXCLUDED.status,
+        provider_job_id = COALESCE(EXCLUDED.provider_job_id,
+                                   recording_transcriptions.provider_job_id),
+        speech_model    = COALESCE(EXCLUDED.speech_model,
+                                   recording_transcriptions.speech_model),
+        language_code   = COALESCE(EXCLUDED.language_code,
+                                   recording_transcriptions.language_code),
+        payload         = COALESCE(EXCLUDED.payload, recording_transcriptions.payload),
+        covers          = EXCLUDED.covers,
+        completed_at    = COALESCE(EXCLUDED.completed_at,
+                                   recording_transcriptions.completed_at)
+    `;
+
+    await tx`
+      UPDATE ${tx(SCHEMA)}.recordings
+      SET active_transcription_id = ${t.id}::uuid, updated_at = now()
+      WHERE id = ${rec.id}::uuid
+    `;
+
+    for (const clip of clips) {
+      await tx`
+        INSERT INTO ${tx(SCHEMA)}.meeting_clips
+          (transcript_id, ord, recording_id, transcription_id, from_ms, to_ms,
+           offset_ms, text_policy, created_by)
+        VALUES (${clip.transcriptId}, ${clip.ord}, ${rec.id}::uuid,
+                ${clip.transcriptionId}::uuid, ${clip.fromMs}, ${clip.toMs},
+                ${clip.offsetMs}, ${clip.textPolicy}, ${input.createdBy ?? null})
+        ON CONFLICT (transcript_id, ord) DO UPDATE SET
+          recording_id = EXCLUDED.recording_id,
+          from_ms      = EXCLUDED.from_ms,
+          to_ms        = EXCLUDED.to_ms,
+          offset_ms    = EXCLUDED.offset_ms,
+          text_policy  = EXCLUDED.text_policy
+      `;
+    }
+
+    // Promotion: a clip has just moved off the placeholder's recording. If
+    // nothing else points at it, it exists for no one — drop it whole rather
+    // than leave a second recording of the same bytes behind.
+    for (const priorId of priorIds) {
+      const still = await tx<Array<{ transcript_id: number }>>`
+        SELECT transcript_id FROM ${tx(SCHEMA)}.meeting_clips
+        WHERE recording_id = ${priorId}::uuid LIMIT 1
+      `;
+      if (still.length > 0) continue;
+      await tx`DELETE FROM ${tx(SCHEMA)}.recording_transcriptions WHERE recording_id = ${priorId}::uuid`;
+      await tx`DELETE FROM ${tx(SCHEMA)}.recording_media WHERE recording_id = ${priorId}::uuid`;
+      await tx`DELETE FROM ${tx(SCHEMA)}.recordings WHERE id = ${priorId}::uuid`;
+      migratedFrom.push(priorId);
+    }
+  });
+
+  return {
+    recordingId: rec.id,
+    migratedFrom,
+    mediaWritten: graph.media.length,
+    staleMediaRemoved,
+  };
+}
+
+export interface RemoveMeetingGraphResult {
+  clipsRemoved: number;
+  /** Recordings that lost their last clip and were deleted with their rows. */
+  recordingsRemoved: string[];
+  /** Recordings kept because another meeting still clips them — the shared
+   * AssemblyAI job (landmine #14). Their bytes must survive too. */
+  recordingsKept: string[];
+}
+
+/**
+ * INTERNAL-ONLY — the meeting is being permanently deleted; take its clips
+ * with it. A recording's own rows go only when NO clip of any meeting is
+ * left on it (a trashed meeting still counts: restoring it must find its
+ * recording). Files are NOT touched here — Phase 1 leaves the existing
+ * delete-by-filename walk in `[id]/route.ts` exactly as it is.
+ */
+export async function removeMeetingFromRecordingGraph(
+  transcriptId: number
+): Promise<RemoveMeetingGraphResult> {
+  const removed: string[] = [];
+  const kept: string[] = [];
+  let clipsRemoved = 0;
+
+  await sql.begin(async (tx) => {
+    const gone = await tx<Array<{ recording_id: string }>>`
+      DELETE FROM ${tx(SCHEMA)}.meeting_clips
+      WHERE transcript_id = ${transcriptId}
+      RETURNING recording_id
+    `;
+    clipsRemoved = gone.length;
+    for (const recordingId of new Set(gone.map((g) => g.recording_id))) {
+      const still = await tx<Array<{ transcript_id: number }>>`
+        SELECT transcript_id FROM ${tx(SCHEMA)}.meeting_clips
+        WHERE recording_id = ${recordingId}::uuid LIMIT 1
+      `;
+      if (still.length > 0) {
+        kept.push(recordingId);
+        continue;
+      }
+      await tx`DELETE FROM ${tx(SCHEMA)}.recording_transcriptions WHERE recording_id = ${recordingId}::uuid`;
+      await tx`DELETE FROM ${tx(SCHEMA)}.recording_media WHERE recording_id = ${recordingId}::uuid`;
+      await tx`DELETE FROM ${tx(SCHEMA)}.recordings WHERE id = ${recordingId}::uuid`;
+      removed.push(recordingId);
+    }
+  });
+
+  return { clipsRemoved, recordingsRemoved: removed, recordingsKept: kept };
+}
+
+/**
+ * INTERNAL-ONLY — the A5 derivative sweep removed these files from disk, so
+ * their rows go too. Only rebuildable kinds are ever matched: a canonical or
+ * a part is the recording itself and never disappears behind our back.
+ */
+export async function dropDerivativeMediaByFilename(filenames: string[]): Promise<number> {
+  if (filenames.length === 0) return 0;
+  const rows = await sql<Array<{ id: string }>>`
+    DELETE FROM ${sql(SCHEMA)}.recording_media
+    WHERE kind IN ('audio_only', 'faststart')
+      AND filename = ANY(${filenames})
+    RETURNING id
+  `;
+  return rows.length;
+}
+
+/**
+ * INTERNAL-ONLY — DEC-4: we deleted the job at AssemblyAI. The stamp mirrors
+ * `gmeet_context.aai` and is keyed on the job id, so the one transcription
+ * behind however many meetings held that id is stamped once.
+ */
+export async function stampTranscriptionProviderDeleted(
+  providerJobId: string,
+  deletedAt: Date | string
+): Promise<number> {
+  const rows = await sql<Array<{ id: string }>>`
+    UPDATE ${sql(SCHEMA)}.recording_transcriptions
+    SET provider_deleted_at = COALESCE(provider_deleted_at, ${deletedAt})
+    WHERE provider_job_id = ${providerJobId}
+    RETURNING id
+  `;
+  return rows.length;
+}
+
+export interface RecordingOwnershipMove {
+  moved: string[];
+  /** Left with the old owner because another LIVE meeting also clips them. */
+  shared: string[];
+}
+
+/**
+ * INTERNAL-ONLY — ownership of a meeting moved (landmine #1). Its recordings
+ * follow, but only the ones no other live meeting holds a clip on: a shared
+ * recording (one AssemblyAI job, two importers) belongs to whoever imported
+ * it first and a transfer of one of the two meetings must not take it away
+ * from the other.
+ *
+ * Takes the caller's transaction so the move commits with the rest of the
+ * transfer — a half-transferred meeting is exactly what that transaction
+ * exists to prevent.
+ */
+export async function moveRecordingOwnershipForMeeting(
+  tx: TransactionSql,
+  transcriptId: number,
+  fromUserId: string,
+  toUserId: string
+): Promise<RecordingOwnershipMove> {
+  const mine = await tx<Array<{ recording_id: string; shared: boolean }>>`
+    SELECT c.recording_id,
+           EXISTS (
+             SELECT 1
+             FROM ${tx(SCHEMA)}.meeting_clips c2
+             JOIN ${tx(SCHEMA)}.transcripts t2 ON t2.id = c2.transcript_id
+             WHERE c2.recording_id = c.recording_id
+               AND c2.transcript_id <> ${transcriptId}
+               AND t2.deleted_at IS NULL
+           ) AS shared
+    FROM ${tx(SCHEMA)}.meeting_clips c
+    WHERE c.transcript_id = ${transcriptId}
+    GROUP BY c.recording_id
+  `;
+  const movable = mine.filter((r) => !r.shared).map((r) => r.recording_id);
+  const shared = mine.filter((r) => r.shared).map((r) => r.recording_id);
+  if (movable.length === 0) return { moved: [], shared };
+  const moved = await tx<Array<{ id: string }>>`
+    UPDATE ${tx(SCHEMA)}.recordings
+    SET owner_user_id = ${toUserId}, updated_at = now()
+    WHERE id = ANY(${movable}::uuid[]) AND owner_user_id = ${fromUserId}
+    RETURNING id
+  `;
+  return { moved: moved.map((r) => r.id), shared };
 }

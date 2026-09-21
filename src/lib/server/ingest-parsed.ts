@@ -8,6 +8,7 @@ import { autoNameSpeakers, registerPeopleFromMeeting } from '@/lib/server/import
 import { autoShareToInternalInvitees } from '@/lib/server/auto-share';
 import { autoAttachSeries } from '@/lib/server/series-attach';
 import { onTranscriptCompleted } from '@/lib/server/post-completion';
+import { queueRecordingGraphSync } from '@/lib/server/recording-sync';
 import { synthesizeTranscriptResponse, type ParsedMeetTranscript } from '@/lib/server/gmeet';
 import type { GmeetAttendee, GmeetContext, MeetParticipantInfo } from '@/lib/format';
 
@@ -63,7 +64,7 @@ export async function createTextImportPlaceholder(
     scratch?: boolean;
   }
 ): Promise<TranscriptRow> {
-  return createImportedForUser(user.userId, {
+  const row = await createImportedForUser(user.userId, {
     assemblyaiId: opts.sourceId,
     originalFilename: opts.originalFilename ?? null,
     status: 'processing',
@@ -77,6 +78,12 @@ export async function createTextImportPlaceholder(
     title: opts.title ?? null,
     scratch: opts.scratch ?? false,
   });
+  // An `ext-` placeholder already carries a (empty) payload, so it is not one
+  // of the "nothing behind it" placeholders the backfill skips: it gets a
+  // recording now and the same one is filled in when the import lands (same
+  // sourceId ⇒ same row ⇒ same ids).
+  queueRecordingGraphSync(user.userId, opts.sourceId, 'text-import/placeholder');
+  return row;
 }
 
 export async function ingestParsedUtterances(
@@ -125,6 +132,11 @@ export async function ingestParsedUtterances(
   if (recordedAtIso) {
     await setRecordedAtForUser(user.userId, sourceId, new Date(recordedAtIso)).catch(() => {});
   }
+
+  // Dual-write: a parsed import has no media of ours, so the graph is one
+  // recording (source_kind meet/teams/text) carrying one transcription whose
+  // provider is the parser, not AssemblyAI.
+  queueRecordingGraphSync(user.userId, sourceId, 'ingest-parsed');
 
   // Real names from the source → name the speakers + map to invitee emails.
   try {

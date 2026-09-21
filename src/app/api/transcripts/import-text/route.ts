@@ -26,6 +26,7 @@ import {
 import { tryParseTranscriptText } from '@/lib/server/transcript-text-parse';
 import { resolveLinkedEventRef } from '@/lib/server/linked-event-ref';
 import { updateMetaForUser, updateStatusForUser, type TranscriptRow } from '@/db-ops/transcripts';
+import { queueRecordingGraphSync } from '@/lib/server/recording-sync';
 import { publishEvent } from '@/lib/server/event-bus';
 import type { MeetUtterance } from '@/lib/format';
 
@@ -260,6 +261,8 @@ async function normalizeTextInBackground(
     // Flip the placeholder to 'error' with the reason where the listing's
     // error rendering can surface it (description subline).
     await updateStatusForUser(user.userId, sourceId, { status: 'error' }).catch(() => {});
+    // The `ext-` placeholder's transcription follows the row into 'error'.
+    queueRecordingGraphSync(user.userId, sourceId, 'import-text/failed');
     await updateMetaForUser(user.userId, sourceId, {
       description: `AI normalization failed: ${String(err).slice(0, 300)}`,
     }).catch(() => {});

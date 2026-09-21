@@ -1,8 +1,10 @@
 import { describe, expect, test } from 'bun:test';
 import type { TranscriptResponse } from '../format';
 import {
+  compareClipsOnTimeline,
   GAP_FILL_TOLERANCE_MS,
   isCompatClipSet,
+  isUtteranceKey,
   resolveClips,
   type ResolvableClip,
 } from '../recording-clips';
@@ -116,11 +118,58 @@ describe('compat mode — the byte-identity contract', () => {
     expect(isCompatClipSet([])).toBe(false);
   });
 
-  test('compatAllowed:false (the job did not cover the canonical file) merges instead', () => {
-    const out = resolveClips([clip()], MEETING, { compatAllowed: false });
-    expect(out.compat).toBe(false);
-    expect(out.content).not.toBe(payloadA);
-    expect(out.content?.utterances?.[0]?.speaker).toBe(`${REC_A}:A`);
+  // §5a: the clip alone decides. "The transcription did not cover the
+  // canonical media" used to force the merge branch; it no longer can, and
+  // resolveClips has no override left for a caller to pass.
+  test('nothing outside the clip can take a 1:1 meeting out of compat', () => {
+    expect(resolveClips.length).toBe(2); // (clips, meeting) — no opts
+    const out = resolveClips([clip()], MEETING);
+    expect(out.compat).toBe(true);
+    expect(out.content).toBe(payloadA);
+    expect(out.content?.utterances?.[0]?.speaker).toBe('A');
+  });
+});
+
+describe('the edit-map key space', () => {
+  test('accepts exactly the keys resolveClips mints', () => {
+    // Compat — what every transcript_edits row in prod is keyed by.
+    for (const k of resolveClips([clip()], MEETING).utteranceKeys) {
+      expect(isUtteranceKey(k)).toBe(true);
+    }
+    // Non-compat — `<recordingId>:<index>`.
+    const merged = resolveClips(
+      [clip({ ord: 0 }), clip({ ord: 1, recordingId: REC_B, payload: payloadB, offsetMs: 20_000 })],
+      MEETING
+    );
+    expect(merged.utteranceKeys.length).toBeGreaterThan(0);
+    for (const k of merged.utteranceKeys) expect(isUtteranceKey(k)).toBe(true);
+  });
+
+  test('rejects anything else — the route validates writes with this', () => {
+    expect(isUtteranceKey('')).toBe(false);
+    expect(isUtteranceKey('-1')).toBe(false);
+    expect(isUtteranceKey('1.5')).toBe(false);
+    expect(isUtteranceKey('speaker')).toBe(false);
+    expect(isUtteranceKey(`${REC_A}:`)).toBe(false);
+    expect(isUtteranceKey(`${REC_A}:x`)).toBe(false);
+    expect(isUtteranceKey(`not-a-uuid:0`)).toBe(false);
+    expect(isUtteranceKey(`${REC_A}:0:0`)).toBe(false);
+    expect(isUtteranceKey(' 0')).toBe(false);
+  });
+});
+
+describe('meeting-timeline order (§5a: offset_ms, then ord)', () => {
+  test('compareClipsOnTimeline sorts by offset first and uses ord only to break ties', () => {
+    const clips = [
+      { ord: 0, offsetMs: 9000 },
+      { ord: 2, offsetMs: 0 },
+      { ord: 1, offsetMs: 0 },
+    ];
+    expect([...clips].sort(compareClipsOnTimeline)).toEqual([
+      { ord: 1, offsetMs: 0 },
+      { ord: 2, offsetMs: 0 },
+      { ord: 0, offsetMs: 9000 },
+    ]);
   });
 });
 
@@ -322,7 +371,7 @@ describe('overlapping clips under each text_policy', () => {
     expect(clear.content?.utterances?.map((u) => u.text)).toContain('Can you hear me now?');
   });
 
-  test('gap_fill yields to an include clip that comes LATER in ord', () => {
+  test('gap_fill yields to every include clip, whatever the clip order', () => {
     const fillerFirst: ResolvableClip = { ...phone('gap_fill'), ord: 0 };
     const primaryLast: ResolvableClip = { ...primary, ord: 1 };
     const out = resolveClips([fillerFirst, primaryLast], MEETING);
@@ -335,22 +384,26 @@ describe('overlapping clips under each text_policy', () => {
     expect(out.content?.words?.map((w) => w.text)).toContain('Yes,');
   });
 
-  test('non-overlapping clips keep their authored (ord) order, not time order', () => {
+  test('non-overlapping clips come out in TIMELINE order, whatever their ord', () => {
     const out = resolveClips(
       [
-        // A's first 6 s, placed at 6–12 s on the meeting timeline …
+        // A's first 6 s, placed at 6–12 s on the meeting timeline, authored
+        // first …
         clip({ ord: 0, toMs: 6000, offsetMs: 6000 }),
-        // … and B, placed at 0–6 s, but authored second.
+        // … and B, placed at 0–6 s, authored second.
         clip({ ord: 1, recordingId: REC_B, payload: payloadB, offsetMs: 0 }),
       ],
       MEETING
     );
-    // The windows only touch, so no sort runs and ord wins over the clock.
+    // §5a: `ord` is identity, not position — the clip that starts earlier is
+    // read first even though it was added later. (The windows only touch, so
+    // the overlap sort never runs: this is the clip order itself.)
     expect(out.content?.utterances?.map((u) => [u.start, u.speaker])).toEqual([
-      [6000, `${REC_A}:A`],
-      [9000, `${REC_A}:A`],
       [0, `${REC_B}:A`],
       [4000, `${REC_B}:B`],
+      [6000, `${REC_A}:A`],
+      [9000, `${REC_A}:A`],
     ]);
+    expect(out.utteranceKeys).toEqual([`${REC_B}:0`, `${REC_B}:1`, `${REC_A}:0`, `${REC_A}:1`]);
   });
 });

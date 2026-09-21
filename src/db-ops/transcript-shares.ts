@@ -2,6 +2,8 @@ import 'server-only';
 import { sql } from '@/lib/db';
 import { SCHEMAS } from '@/lib/constants/database';
 import { publishEvent } from '@/lib/server/event-bus';
+import { moveRecordingOwnershipForMeeting } from '@/db-ops/recordings';
+import { recordingsWriteEnabled } from '@/lib/server/recording-sync';
 import type { TranscriptShare } from '@/lib/format';
 
 // CRUD for transcript_shares. Everything here assumes the caller has already
@@ -124,6 +126,12 @@ export interface TransferOwnershipInput {
  * on (user_id, assemblyai_id)) to the new owner, deletes the new owner's
  * share row, and adds the old owner back as an editor. All in one
  * transaction so a failure can't leave the transcript half-transferred.
+ *
+ * The meeting's RECORDINGS follow too (landmine #1) — but only the ones no
+ * other live meeting clips. A recording shared with a second meeting (one
+ * AssemblyAI job, two importers) keeps its original owner: the other
+ * importer did not give anything away. Inside the same transaction, because
+ * the recording's owner is the second way it is reachable at all.
  */
 export async function transferOwnership(
   input: TransferOwnershipInput
@@ -181,6 +189,23 @@ export async function transferOwnership(
       ON CONFLICT (transcript_id, shared_with_email) DO UPDATE
         SET access = 'edit', updated_at = now()
     `;
+    if (recordingsWriteEnabled()) {
+      const move = await moveRecordingOwnershipForMeeting(
+        tx,
+        input.transcriptRowId,
+        input.oldOwnerUserId,
+        input.newOwnerUserId
+      );
+      if (move.moved.length > 0 || move.shared.length > 0) {
+        console.log(
+          `[recording-sync] transfer meeting ${input.transcriptRowId}: ` +
+            `moved ${move.moved.length} recording(s)` +
+            (move.shared.length > 0
+              ? `, left ${move.shared.length} with the old owner (still clipped elsewhere)`
+              : '')
+        );
+      }
+    }
   });
 
   publishEvent({ kind: 'shares' });

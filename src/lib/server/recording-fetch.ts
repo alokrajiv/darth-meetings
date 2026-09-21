@@ -12,6 +12,7 @@ import {
 } from '@/lib/server/audio-storage';
 import { sniffMediaExtension } from '@/lib/server/video-frames';
 import { prepareMediaForPlayback } from '@/lib/server/media-sweeper';
+import { queueRecordingGraphSync } from '@/lib/server/recording-sync';
 
 /** Drive-side refusal with an HTTP status the API route can pass through. */
 export class RecordingFetchError extends Error {
@@ -124,6 +125,9 @@ async function doFetchPart({
     filename,
     bytes: dl.bytes,
   });
+  // The part now has bytes: its `recording_media` row gains a filename (the
+  // offset was already derived from the Meet wall clock, lib/part-offsets.ts).
+  queueRecordingGraphSync(ownerUserId, assemblyaiId, 'recording-fetch/part');
   prepareMediaForPlayback(ownerUserId, assemblyaiId);
   return { bytes: dl.bytes };
 }
@@ -155,6 +159,7 @@ async function doFetchTeams({
   const filename = `${assemblyaiId}${sniffed ?? '.mp4'}`;
   await renameAudioFile(dl.tempFilename, filename);
   await setLocalAudioPathForUser(ownerUserId, assemblyaiId, filename);
+  queueRecordingGraphSync(ownerUserId, assemblyaiId, 'recording-fetch/teams');
   prepareMediaForPlayback(ownerUserId, assemblyaiId);
   return { bytes: dl.bytes };
 }
@@ -191,6 +196,9 @@ async function doFetch({
   }
   await renameAudioFile(dl.tempFilename, filename);
   await setLocalAudioPathForUser(ownerUserId, assemblyaiId, filename);
+  // The meeting had a transcript but no bytes until now: this is where its
+  // recording gains a `canonical` media row.
+  queueRecordingGraphSync(ownerUserId, assemblyaiId, 'recording-fetch/drive');
   // Meet recordings are the moov-last case (tech-debt A1) — remux + extract now.
   prepareMediaForPlayback(ownerUserId, assemblyaiId);
   return { bytes: dl.bytes };

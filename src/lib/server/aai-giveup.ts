@@ -5,6 +5,7 @@ import {
   type StuckAaiRow,
   type TranscriptRow,
 } from '@/db-ops/transcripts';
+import { queueRecordingGraphSync } from '@/lib/server/recording-sync';
 import type { GmeetContext } from '@/lib/format';
 
 /**
@@ -103,7 +104,12 @@ export async function giveUpOnAaiJob(
       retryable: false,
       opts: replayOpts(row),
     });
-    if (flipped) console.warn(`[aai-giveup] ${assemblyaiId} → error: ${reason}`);
+    if (flipped) {
+      console.warn(`[aai-giveup] ${assemblyaiId} → error: ${reason}`);
+      // The transcription's status follows the row: 'error', with whatever
+      // payload (none) it has. Nothing is deleted — a Retry re-submits.
+      queueRecordingGraphSync(userId, assemblyaiId, 'aai-giveup');
+    }
     return flipped;
   } catch (err) {
     console.warn(`[aai-giveup] could not mark ${assemblyaiId}:`, err);

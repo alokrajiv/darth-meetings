@@ -14,6 +14,7 @@ import { AAI_GONE_REASON } from '@/lib/aai-job-state';
 import { giveUpOnAaiJob } from '@/lib/server/aai-giveup';
 import { saveAudioBytes, saveAudioStreamToTemp } from '@/lib/server/audio-storage';
 import { onTranscriptCompleted } from '@/lib/server/post-completion';
+import { queueRecordingGraphSync } from '@/lib/server/recording-sync';
 import { parseMeetingFilters } from '@/lib/server/meeting-filters';
 import { resolveLinkedEventRef } from '@/lib/server/linked-event-ref';
 import { parseLabelFilter } from '@/lib/labels';
@@ -99,6 +100,9 @@ async function refreshPendingAgainstAai<T extends PendingRefreshRow>(
           duration: aai.audio_duration ?? row.duration,
           speaker_count: speakerCount ?? row.speaker_count,
         };
+        // Dual-write: the listing's own completion write is a status/payload
+        // change like the detail page's, and mirrors the same way.
+        queueRecordingGraphSync(row.user_id, row.assemblyai_id, 'listing-refresh');
         // First observation of completion → auto-notes + speaker
         // suggestions (fire-and-forget, owner-scoped) and the AAI-side
         // delete, which verifies our copy against this utterance count.

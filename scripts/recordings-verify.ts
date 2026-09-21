@@ -1,0 +1,476 @@
+/**
+ * Drift check for the first-class-recordings tables — READ ONLY.
+ *
+ * Recomputes the desired graph for every meeting with the SAME rules the
+ * backfill and the app's dual-write use (`src/lib/recording-graph.ts`) and
+ * prints every row where the tables disagree. This is what we run on prod
+ * after `scripts/recordings-backfill.ts --apply`, and then periodically
+ * during the soak week: a writer that was missed shows up here as a meeting
+ * whose clip/media/transcription no longer matches its `transcripts` row.
+ *
+ *   SCHEMA_PREFIX=prod bun run scripts/recordings-verify.ts
+ *   SCHEMA_PREFIX=stage bun run scripts/recordings-verify.ts --check-files ./storage
+ *   SCHEMA_PREFIX=prod bun run scripts/recordings-verify.ts --only <aai-id> --verbose
+ *
+ * Without `--check-files` the byte counts and the `audio_only` rows are not
+ * judged at all (the script may be run from a laptop that has no storage
+ * dir); with it they are. Nothing is ever written: the session is opened
+ * `default_transaction_read_only`, so even a bug cannot change a row.
+ *
+ * Exit code 0 = no drift, 1 = drift found, 2 = refused to run.
+ */
+
+import postgres from 'postgres';
+import path from 'node:path';
+import { existsSync, statSync } from 'node:fs';
+import {
+  deriveRecordingGraph,
+  desiredClipFor,
+  isRealAaiId,
+  ownerRowOf,
+  recordingFilenames,
+  skipReason,
+  type DesiredGraph,
+  type GraphFileFacts,
+  type GraphMeetingRow,
+} from '@/lib/recording-graph';
+
+// ---------------------------------------------------------------------------
+// Arguments
+// ---------------------------------------------------------------------------
+
+const argv = process.argv.slice(2);
+const flag = (name: string) => argv.includes(name);
+function value(name: string): string | null {
+  const i = argv.indexOf(name);
+  return i >= 0 && i + 1 < argv.length ? argv[i + 1]! : null;
+}
+
+const ONLY = value('--only');
+const CHECK_FILES = value('--check-files');
+const VERBOSE = flag('--verbose');
+const MAX_LINES = Number(value('--max-lines') ?? 200);
+
+const explicitPrefix = (value('--schema-prefix') || process.env.SCHEMA_PREFIX || '').trim() || null;
+if (!explicitPrefix) {
+  console.error(
+    'refused: set SCHEMA_PREFIX (env or --schema-prefix <name>) so the schema being read is a choice, not a default.'
+  );
+  process.exit(2);
+}
+const SCHEMA = `meeting_whisperer_${explicitPrefix}`;
+
+console.log(`[recordings-verify] schema  : ${SCHEMA} (read-only)`);
+if (ONLY) console.log(`[recordings-verify] only    : ${ONLY}`);
+console.log(
+  `[recordings-verify] files   : ${CHECK_FILES ? path.resolve(CHECK_FILES) : 'not probed (bytes + audio_only not judged)'}`
+);
+
+// ---------------------------------------------------------------------------
+// Comparison helpers
+// ---------------------------------------------------------------------------
+
+/** Postgres hands back Date / string / bigint-as-string; normalise to compare. */
+function norm(v: unknown): string {
+  if (v === null || v === undefined) return '∅';
+  if (v instanceof Date) return v.toISOString();
+  if (typeof v === 'number') return String(v);
+  if (typeof v === 'string') {
+    // A timestamptz arrives as a Date, but a jsonb string does not — leave it.
+    return v;
+  }
+  if (typeof v === 'object') {
+    const o = v as Record<string, unknown>;
+    return JSON.stringify(Object.keys(o).sort().map((k) => [k, o[k]]));
+  }
+  return String(v);
+}
+
+function tsEqual(a: unknown, b: unknown): boolean {
+  if (a === null || a === undefined) return b === null || b === undefined;
+  if (b === null || b === undefined) return false;
+  const x = a instanceof Date ? a.getTime() : Date.parse(String(a));
+  const y = b instanceof Date ? b.getTime() : Date.parse(String(b));
+  return x === y;
+}
+
+interface Problem {
+  meeting: string;
+  what: string;
+}
+
+const problems: Problem[] = [];
+function flagDrift(meeting: string, what: string): void {
+  problems.push({ meeting, what });
+}
+function expectEq(meeting: string, label: string, expected: unknown, actual: unknown): void {
+  if (norm(expected) !== norm(actual)) {
+    flagDrift(meeting, `${label}: expected ${norm(expected)}, found ${norm(actual)}`);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Rows
+// ---------------------------------------------------------------------------
+
+interface ActualRecording {
+  id: string;
+  owner_user_id: string;
+  source_kind: string;
+  started_at: Date | null;
+  duration_ms: string | number | null;
+  recorder_recording_id: string | null;
+  active_transcription_id: string | null;
+  deleted_at: Date | null;
+}
+interface ActualMedia {
+  id: string;
+  recording_id: string;
+  kind: string;
+  ord: number;
+  offset_ms: string | number | null;
+  duration_ms: string | number | null;
+  filename: string | null;
+  has_video: boolean | null;
+  source_ref: Record<string, unknown> | null;
+  of_media_id: string | null;
+}
+interface ActualTranscription {
+  id: string;
+  recording_id: string;
+  provider: string;
+  provider_job_id: string | null;
+  speech_model: string | null;
+  language_code: string | null;
+  status: string;
+  has_payload: boolean;
+  utterances: number | null;
+  covers: { media?: string[]; timeline?: string } | null;
+}
+interface ActualClip {
+  transcript_id: number;
+  ord: number;
+  recording_id: string;
+  transcription_id: string | null;
+  from_ms: string | number | null;
+  to_ms: string | number | null;
+  offset_ms: string | number | null;
+  text_policy: string;
+}
+
+const sql = postgres({ max: 1, onnotice: () => {} });
+
+function fileFactsFor(row: GraphMeetingRow): GraphFileFacts | undefined {
+  if (!CHECK_FILES) return undefined;
+  const storage = path.resolve(CHECK_FILES);
+  const audio = new Map<string, number | null>();
+  const audioOnly = new Map<string, number | null>();
+  for (const name of recordingFilenames(row)) {
+    const abs = path.join(storage, 'audio', name);
+    if (existsSync(abs)) {
+      try {
+        audio.set(name, statSync(abs).size);
+      } catch {
+        audio.set(name, null);
+      }
+    }
+    const stem = name.replace(/\.[^./]+$/, '');
+    const extract = path.join(storage, 'audio-only', `${stem}.m4a`);
+    if (existsSync(extract)) {
+      try {
+        audioOnly.set(stem, statSync(extract).size);
+      } catch {
+        audioOnly.set(stem, null);
+      }
+    }
+  }
+  return { audio, audioOnly };
+}
+
+/** Kinds this run is entitled to judge. */
+const judgedKinds = (graph: DesiredGraph) =>
+  graph.filesProbed ? new Set(['canonical', 'part', 'audio_only', 'faststart']) : new Set(['canonical', 'part']);
+
+async function main() {
+  await sql.unsafe('SET default_transaction_read_only = on');
+
+  const rows = await sql<GraphMeetingRow[]>`
+    SELECT t.id, t.user_id, t.assemblyai_id, t.original_filename, t.status,
+           t.created_at, t.completed_at, t.duration, t.language_code,
+           t.speech_model, t.local_audio_path, t.deleted_at, t.gmeet_context,
+           (t.imported_content IS NOT NULL) AS has_content,
+           CASE WHEN jsonb_typeof(t.imported_content->'utterances') = 'array'
+                THEN jsonb_array_length(t.imported_content->'utterances') END AS row_utterances,
+           rr.id         AS recorder_recording_id,
+           rr.started_at AS recorder_started_at
+    FROM ${sql(SCHEMA)}.transcripts t
+    LEFT JOIN LATERAL (
+      SELECT r.id, r.started_at
+      FROM ${sql(SCHEMA)}.recorder_recordings r
+      WHERE r.transcript_id = t.assemblyai_id
+         OR (t.gmeet_context->'recorder'->>'recordingId' ~ '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$'
+             AND r.id::text = t.gmeet_context->'recorder'->>'recordingId')
+      ORDER BY (r.transcript_id = t.assemblyai_id) DESC, r.created_at
+      LIMIT 1
+    ) rr ON true
+    ${ONLY ? sql`WHERE t.assemblyai_id = ${ONLY}` : sql``}
+    ORDER BY t.created_at, t.id
+  `;
+
+  const [recordings, media, transcriptions, clips] = await Promise.all([
+    sql<ActualRecording[]>`
+      SELECT id, owner_user_id, source_kind, started_at, duration_ms::float8 AS duration_ms,
+             recorder_recording_id, active_transcription_id, deleted_at
+      FROM ${sql(SCHEMA)}.recordings
+    `,
+    sql<ActualMedia[]>`
+      SELECT id, recording_id, kind, ord, offset_ms::float8 AS offset_ms,
+             duration_ms::float8 AS duration_ms, filename, has_video, source_ref, of_media_id
+      FROM ${sql(SCHEMA)}.recording_media
+    `,
+    sql<ActualTranscription[]>`
+      SELECT id, recording_id, provider, provider_job_id, speech_model, language_code, status,
+             (payload IS NOT NULL) AS has_payload,
+             CASE WHEN jsonb_typeof(payload->'utterances') = 'array'
+                  THEN jsonb_array_length(payload->'utterances') END AS utterances,
+             covers
+      FROM ${sql(SCHEMA)}.recording_transcriptions
+    `,
+    sql<ActualClip[]>`
+      SELECT transcript_id, ord, recording_id, transcription_id,
+             from_ms::float8 AS from_ms, to_ms::float8 AS to_ms,
+             offset_ms::float8 AS offset_ms, text_policy
+      FROM ${sql(SCHEMA)}.meeting_clips
+    `,
+  ]);
+
+  const recById = new Map(recordings.map((r) => [r.id, r]));
+  const txnById = new Map(transcriptions.map((t) => [t.id, t]));
+  const mediaByRecording = new Map<string, ActualMedia[]>();
+  for (const m of media) {
+    mediaByRecording.set(m.recording_id, [...(mediaByRecording.get(m.recording_id) ?? []), m]);
+  }
+  const clipsByMeeting = new Map<number, ActualClip[]>();
+  for (const c of clips) {
+    clipsByMeeting.set(c.transcript_id, [...(clipsByMeeting.get(c.transcript_id) ?? []), c]);
+  }
+
+  const byAaiId = new Map<string, GraphMeetingRow[]>();
+  for (const row of rows) {
+    if (!isRealAaiId(row.assemblyai_id) || skipReason(row)) continue;
+    byAaiId.set(row.assemblyai_id, [...(byAaiId.get(row.assemblyai_id) ?? []), row]);
+  }
+
+  let checked = 0;
+  let skippedRows = 0;
+  const liveMeetingIds = new Set(rows.map((r) => r.id));
+  const expectedRecordingIds = new Set<string>();
+
+  for (const row of rows) {
+    const tag = `${row.assemblyai_id} (#${row.id})`;
+    const why = skipReason(row);
+    const mine = clipsByMeeting.get(row.id) ?? [];
+    if (why) {
+      skippedRows += 1;
+      // A skipped placeholder must own nothing: if it does, a writer created
+      // a graph the backfill would never have made.
+      if (mine.length > 0) flagDrift(tag, `skipped row (${why}) has ${mine.length} clip(s)`);
+      continue;
+    }
+    checked += 1;
+
+    const group = byAaiId.get(row.assemblyai_id) ?? [row];
+    const owner = ownerRowOf(group) ?? row;
+    const graph = deriveRecordingGraph(owner, fileFactsFor(owner));
+    expectedRecordingIds.add(graph.recording.id);
+
+    // ---- the clip -----------------------------------------------------
+    const want = desiredClipFor(row.id);
+    if (mine.length === 0) {
+      flagDrift(tag, 'no clip (the meeting is invisible to the resolver)');
+      continue;
+    }
+    if (mine.length > 1) {
+      flagDrift(tag, `${mine.length} clips — Phase 1 expects exactly one`);
+    }
+    const clip = mine.find((c) => c.ord === want.ord);
+    if (!clip) {
+      flagDrift(tag, `no clip at ord ${want.ord}`);
+      continue;
+    }
+    expectEq(tag, 'clip.recording_id', graph.recording.id, clip.recording_id);
+    expectEq(tag, 'clip.transcription_id', want.transcriptionId, clip.transcription_id);
+    expectEq(tag, 'clip.from_ms', want.fromMs, clip.from_ms);
+    expectEq(tag, 'clip.to_ms', want.toMs, clip.to_ms);
+    expectEq(tag, 'clip.offset_ms', want.offsetMs, clip.offset_ms);
+    expectEq(tag, 'clip.text_policy', want.textPolicy, clip.text_policy);
+
+    // Only the OWNER's row decides the recording; a second importer's row
+    // would compare the same values twice and report every drift twice.
+    if (owner.id !== row.id) continue;
+
+    // ---- the recording ------------------------------------------------
+    const rec = recById.get(graph.recording.id);
+    if (!rec) {
+      flagDrift(tag, `recording ${graph.recording.id} missing`);
+      continue;
+    }
+    expectEq(tag, 'recording.owner_user_id', graph.recording.ownerUserId, rec.owner_user_id);
+    expectEq(tag, 'recording.source_kind', graph.recording.sourceKind, rec.source_kind);
+    if (!tsEqual(graph.recording.startedAt, rec.started_at)) {
+      flagDrift(
+        tag,
+        `recording.started_at: expected ${norm(graph.recording.startedAt)}, found ${norm(rec.started_at)}`
+      );
+    }
+    expectEq(tag, 'recording.duration_ms', graph.recording.durationMs, rec.duration_ms);
+    expectEq(
+      tag,
+      'recording.recorder_recording_id',
+      graph.recording.recorderRecordingId,
+      rec.recorder_recording_id
+    );
+    expectEq(
+      tag,
+      'recording.active_transcription_id',
+      graph.transcription.id,
+      rec.active_transcription_id
+    );
+    if (rec.deleted_at && !row.deleted_at) {
+      flagDrift(tag, 'recording is soft-deleted but its meeting is live');
+    }
+
+    // ---- the files ----------------------------------------------------
+    const kinds = judgedKinds(graph);
+    const actualMedia = (mediaByRecording.get(graph.recording.id) ?? []).filter((m) =>
+      kinds.has(m.kind)
+    );
+    const wantMedia = new Map(graph.media.filter((m) => kinds.has(m.kind)).map((m) => [m.id, m]));
+    for (const m of actualMedia) {
+      if (!wantMedia.has(m.id)) {
+        flagDrift(tag, `media ${m.kind}#${m.ord} ${m.id} is not derivable from the row`);
+      }
+    }
+    for (const [id, m] of wantMedia) {
+      const actual = actualMedia.find((a) => a.id === id);
+      if (!actual) {
+        flagDrift(tag, `media ${m.kind}#${m.ord} (${m.filename ?? 'no file'}) missing`);
+        continue;
+      }
+      const label = `media ${m.kind}#${m.ord}`;
+      expectEq(tag, `${label}.kind`, m.kind, actual.kind);
+      expectEq(tag, `${label}.ord`, m.ord, actual.ord);
+      expectEq(tag, `${label}.offset_ms`, m.offsetMs, actual.offset_ms);
+      expectEq(tag, `${label}.duration_ms`, m.durationMs, actual.duration_ms);
+      expectEq(tag, `${label}.filename`, m.filename, actual.filename);
+      expectEq(tag, `${label}.has_video`, m.hasVideo, actual.has_video);
+      expectEq(tag, `${label}.source_ref`, m.sourceRef, actual.source_ref);
+      expectEq(tag, `${label}.of_media_id`, m.ofMediaId, actual.of_media_id);
+    }
+
+    // ---- the transcription --------------------------------------------
+    const txn = txnById.get(graph.transcription.id);
+    if (!txn) {
+      flagDrift(tag, `transcription ${graph.transcription.id} missing`);
+      continue;
+    }
+    expectEq(tag, 'transcription.recording_id', graph.recording.id, txn.recording_id);
+    expectEq(tag, 'transcription.provider', graph.transcription.provider, txn.provider);
+    expectEq(
+      tag,
+      'transcription.provider_job_id',
+      graph.transcription.providerJobId,
+      txn.provider_job_id
+    );
+    expectEq(tag, 'transcription.status', graph.transcription.status, txn.status);
+    expectEq(tag, 'transcription.speech_model', graph.transcription.speechModel, txn.speech_model);
+    expectEq(tag, 'transcription.language_code', graph.transcription.languageCode, txn.language_code);
+    expectEq(tag, 'transcription.covers', graph.transcription.covers, txn.covers);
+    if (owner.has_content !== txn.has_payload) {
+      flagDrift(
+        tag,
+        `transcription.payload: row ${owner.has_content ? 'has' : 'has no'} imported_content, transcription ${txn.has_payload ? 'has' : 'has no'} payload`
+      );
+    }
+    const rowUtterances = (owner as GraphMeetingRow & { row_utterances?: number | null })
+      .row_utterances;
+    if (owner.has_content && (rowUtterances ?? null) !== (txn.utterances ?? null)) {
+      flagDrift(
+        tag,
+        `transcription.payload utterances: row ${rowUtterances ?? '∅'}, transcription ${txn.utterances ?? '∅'}`
+      );
+    }
+  }
+
+  // ---- orphans (only meaningful over the whole schema) ------------------
+  if (!ONLY) {
+    for (const c of clips) {
+      if (!liveMeetingIds.has(c.transcript_id)) {
+        flagDrift(`clip #${c.transcript_id}`, 'clip points at a transcripts row that is gone');
+      }
+      if (!recById.has(c.recording_id)) {
+        flagDrift(`clip #${c.transcript_id}`, `clip points at missing recording ${c.recording_id}`);
+      }
+    }
+    const clipped = new Set(clips.map((c) => c.recording_id));
+    for (const r of recordings) {
+      if (!clipped.has(r.id)) {
+        flagDrift(`recording ${r.id}`, 'no meeting clips this recording (orphan)');
+      } else if (!expectedRecordingIds.has(r.id)) {
+        flagDrift(`recording ${r.id}`, 'clipped, but no row derives this id');
+      }
+    }
+    for (const m of media) {
+      if (!recById.has(m.recording_id)) {
+        flagDrift(`media ${m.id}`, `belongs to missing recording ${m.recording_id}`);
+      }
+    }
+    for (const t of transcriptions) {
+      if (!recById.has(t.recording_id)) {
+        flagDrift(`transcription ${t.id}`, `belongs to missing recording ${t.recording_id}`);
+      }
+    }
+  }
+
+  // ---- report -----------------------------------------------------------
+  const byMeeting = new Map<string, string[]>();
+  for (const p of problems) {
+    byMeeting.set(p.meeting, [...(byMeeting.get(p.meeting) ?? []), p.what]);
+  }
+
+  console.log('');
+  console.log('─── recordings drift report ─────────────────────────────────');
+  console.log(`schema                 : ${SCHEMA}`);
+  console.log(`meetings scanned       : ${rows.length}`);
+  console.log(`  checked              : ${checked}`);
+  console.log(`  skipped (placeholder): ${skippedRows}`);
+  console.log(`recordings in table    : ${recordings.length}`);
+  console.log(`media rows             : ${media.length}`);
+  console.log(`transcriptions         : ${transcriptions.length}`);
+  console.log(`clips                  : ${clips.length}`);
+  console.log('');
+  console.log(`rows with drift        : ${byMeeting.size}`);
+  console.log(`findings               : ${problems.length}`);
+  let printed = 0;
+  for (const [meeting, whats] of byMeeting) {
+    for (const what of VERBOSE ? whats : whats.slice(0, 3)) {
+      if (printed++ >= MAX_LINES) break;
+      console.log(`  ${meeting}  ${what}`);
+    }
+    if (!VERBOSE && whats.length > 3) console.log(`  ${meeting}  … and ${whats.length - 3} more`);
+    if (printed >= MAX_LINES) {
+      console.log(`  … output capped at ${MAX_LINES} lines (pass --max-lines N)`);
+      break;
+    }
+  }
+  console.log('─────────────────────────────────────────────────────────────');
+
+  await sql.end();
+  process.exit(problems.length > 0 ? 1 : 0);
+}
+
+main().catch(async (err) => {
+  console.error('[recordings-verify] failed:', err);
+  await sql.end();
+  process.exit(2);
+});

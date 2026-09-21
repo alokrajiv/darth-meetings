@@ -7,6 +7,7 @@ import {
   upsertForUser as upsertEditsForUser,
   patchUtteranceForUser,
 } from '@/db-ops/transcript-edits';
+import { isUtteranceKey } from '@/lib/recording-clips';
 import type { TranscriptEditMap } from '@/lib/format';
 
 export const runtime = 'nodejs';
@@ -19,6 +20,15 @@ export const runtime = 'nodejs';
  * With sharing: collaborators with 'edit' access write to the OWNER's edits
  * row. There is no per-collaborator edit layer — last-write-wins across
  * everyone with access. Read-only collaborators see edits but can't write.
+ *
+ * KEYS. The map is keyed by whatever `resolveMeetingContent` reports as
+ * `utteranceKeys` for the meeting, which is why the validation lives in
+ * `lib/recording-clips.ts` next to the code that mints them. For a compat
+ * meeting — every row in prod today — that is the plain utterance index this
+ * route has always taken, so nothing here changes shape while the flag is
+ * on. A multi-clip meeting keys by `<recordingId>:<index>`; GET is a
+ * pass-through either way (the client matches the keys it was handed against
+ * the keys it stored), so the resolver is not consulted on read.
  */
 
 function isPlainObject(v: unknown): v is Record<string, unknown> {
@@ -29,7 +39,7 @@ function validateEditMap(value: unknown): TranscriptEditMap | null {
   if (!isPlainObject(value)) return null;
   const out: TranscriptEditMap = {};
   for (const [key, raw] of Object.entries(value)) {
-    if (!/^\d+$/.test(key)) return null;
+    if (!isUtteranceKey(key)) return null;
     if (!isPlainObject(raw)) return null;
     const entry: { text?: string; speaker?: string } = {};
     if ('text' in raw) {
@@ -110,13 +120,29 @@ export const PATCH = withAuth(async ({ user, request }, { params }) => {
     return NextResponse.json({ error: 'Invalid JSON body' }, { status: 400 });
   }
 
-  const { utteranceIndex, text, speaker } = (body ?? {}) as {
+  const { utteranceIndex, utteranceKey, text, speaker } = (body ?? {}) as {
     utteranceIndex?: unknown;
+    utteranceKey?: unknown;
     text?: unknown;
     speaker?: unknown;
   };
 
-  if (typeof utteranceIndex !== 'number' || !Number.isInteger(utteranceIndex) || utteranceIndex < 0) {
+  // `utteranceKey` is the general form (what /content's resolver hands the
+  // client); `utteranceIndex` is the compat spelling every client sends
+  // today and stays the only one accepted for a plain index.
+  let key: string;
+  if (utteranceKey !== undefined) {
+    if (typeof utteranceKey !== 'string' || !isUtteranceKey(utteranceKey)) {
+      return NextResponse.json({ error: 'utteranceKey is not a valid utterance key' }, { status: 400 });
+    }
+    key = utteranceKey;
+  } else if (
+    typeof utteranceIndex === 'number' &&
+    Number.isInteger(utteranceIndex) &&
+    utteranceIndex >= 0
+  ) {
+    key = String(utteranceIndex);
+  } else {
     return NextResponse.json(
       { error: 'utteranceIndex must be a non-negative integer' },
       { status: 400 }
@@ -144,14 +170,14 @@ export const PATCH = withAuth(async ({ user, request }, { params }) => {
     );
   }
 
-  const row = await patchUtteranceForUser(access.ownerUserId, id, utteranceIndex, patch);
+  const row = await patchUtteranceForUser(access.ownerUserId, id, key, patch);
 
   void logActivity({
     transcriptId: access.row.id,
     userId: user.userId,
     email: user.email,
     action: 'edit_text',
-    details: { utteranceIndex },
+    details: { utteranceIndex: /^\d+$/.test(key) ? Number(key) : key },
   });
 
   return NextResponse.json({ edits: row.edits });

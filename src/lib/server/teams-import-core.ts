@@ -25,6 +25,10 @@ import { parseTeamsVtt } from '@/lib/server/teams-vtt';
 import { teamsSourceId, teamsCacheCode } from '@/lib/server/teams-ids';
 import { callerInvolvedInOccurrence } from '@/db-ops/calendar-event-cache';
 import { ingestParsedUtterances } from '@/lib/server/ingest-parsed';
+import {
+  queueRecordingGraphSync,
+  removeRecordingGraphForMeetingId,
+} from '@/lib/server/recording-sync';
 import { saveAudioStreamToTemp, deleteAudioFile } from '@/lib/server/audio-storage';
 import { IngestError, ingestLocalAudio } from '@/lib/server/ingest';
 import { autoShareToInternalInvitees } from '@/lib/server/auto-share';
@@ -515,6 +519,13 @@ export async function executeTeamsImport(
           console.error('[meetings] repoint retry failed — click-time /m/ link will be lost', opts.placeholderAssemblyaiId, err2)
         );
       }
+      // The placeholder's row is about to vanish; take its clips with it so
+      // no clip is left pointing at a transcript_id nothing answers to.
+      await removeRecordingGraphForMeetingId(
+        user.userId,
+        opts.placeholderAssemblyaiId,
+        'teams/import retire-placeholder'
+      );
       await deleteForUser(user.userId, opts.placeholderAssemblyaiId);
     }
     return out(201, { transcript: row, mode, autoShared });
@@ -565,6 +576,9 @@ export async function executeTeamsImport(
         quiet: true,
       });
       row.gmeet_context = { ...row.gmeet_context, ...finalContext };
+      // ingest's dual-write saw the queue-time context; re-derive over the
+      // execution-time one (Graph artifact ids land in the media source_ref).
+      queueRecordingGraphSync(user.userId, row.assemblyai_id, 'teams/import');
     }
     const meetingStart = recording!.createdDateTime ?? event.startTime;
     if (meetingStart && !Number.isNaN(Date.parse(meetingStart))) {

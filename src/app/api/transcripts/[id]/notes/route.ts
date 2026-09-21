@@ -5,6 +5,7 @@ import { logActivity } from '@/db-ops/transcript-activity';
 import { setAutoNotesForUser } from '@/db-ops/transcripts';
 import { generateAutoNotes, getContentCached } from '@/lib/server/auto-notes';
 import { suggestSpeakersForTranscript } from '@/lib/server/voiceprint';
+import { canonicalMedia, resolveMeetingContent } from '@/lib/server/recordings';
 
 export const runtime = 'nodejs';
 
@@ -57,11 +58,14 @@ export const POST = withAuth(async ({ user, request }, { params }) => {
   // Also refresh voiceprint suggestions — lets older transcripts (completed
   // before the feature shipped) pick up speaker auto-detection on demand.
   void (async () => {
-    const content = await getContentCached(access.ownerUserId, access.row);
+    const [content, resolved] = await Promise.all([
+      getContentCached(access.ownerUserId, access.row),
+      resolveMeetingContent(access.row),
+    ]);
     await suggestSpeakersForTranscript(
       access.ownerUserId,
       id,
-      access.row.local_audio_path,
+      canonicalMedia(resolved.media),
       content
     );
   })().catch((err) => console.warn('[notes POST] suggest failed:', err));

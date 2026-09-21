@@ -4,6 +4,7 @@ import { updateStatusForUser, type TranscriptRow } from '@/db-ops/transcripts';
 import { AAI_GONE_REASON, isAaiJobId } from '@/lib/aai-job-state';
 import { giveUpOnAaiJob } from '@/lib/server/aai-giveup';
 import { onTranscriptCompleted } from '@/lib/server/post-completion';
+import { queueRecordingGraphSync } from '@/lib/server/recording-sync';
 
 /**
  * If the stored row is still queued/processing, fetch the latest state from
@@ -77,8 +78,12 @@ export async function refreshIfPending(
       onTranscriptCompleted(userId, row.assemblyai_id, {
         utterances: aai.utterances?.length ?? null,
       });
-      if (updated) return { ...updated, imported_content: aai };
     }
+    // Dual-write: the transcription's status, payload and completed_at come
+    // from the row that was just written, so the sync re-reads and copies
+    // `imported_content` inside Postgres.
+    if (updated) queueRecordingGraphSync(userId, row.assemblyai_id, 'transcript-sync');
+    if (completed && updated) return { ...updated, imported_content: aai };
 
     return updated ?? row;
   } catch (error) {

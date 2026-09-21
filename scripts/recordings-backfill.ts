@@ -26,6 +26,10 @@
  * same Meet call — landmine #14) collapse onto ONE recording with two clips.
  * One transaction per meeting, so an interrupted run resumes where it stopped.
  *
+ * The derivation rules live in `src/lib/recording-graph.ts`, shared with the
+ * app's dual-write (`src/lib/server/recording-sync.ts`) — one set of rules,
+ * or the backfill and the running app would fight over the same rows.
+ *
  * The payload is copied INSIDE Postgres (`INSERT … SELECT imported_content`):
  * ~0.5 GB of jsonb must never round-trip through JS.
  */
@@ -33,9 +37,18 @@
 import postgres from 'postgres';
 import path from 'node:path';
 import { existsSync, statSync } from 'node:fs';
-import { createHash } from 'node:crypto';
-import type { GmeetContext } from '@/lib/format';
-import { videoPartOffsets } from '@/lib/part-offsets';
+import {
+  canonicalKeyOf,
+  deriveRecordingGraph,
+  desiredClipFor,
+  isRealAaiId,
+  ownerRowOf,
+  skipReason,
+  recordingFilenames,
+  type DesiredGraph,
+  type GraphFileFacts,
+  type GraphMeetingRow,
+} from '@/lib/recording-graph';
 
 // ---------------------------------------------------------------------------
 // Arguments
@@ -77,305 +90,48 @@ if (ONLY) console.log(`[recordings-backfill] only     : ${ONLY}`);
 if (CHECK_FILES) console.log(`[recordings-backfill] storage  : ${path.resolve(CHECK_FILES)}`);
 
 // ---------------------------------------------------------------------------
-// Deterministic ids
-// ---------------------------------------------------------------------------
-
-/** uuidv5(DNS, 'recordings.meetings.darth-internal.trames.io') — the namespace
- * every id below hangs off, so the ids are reproducible from this file alone. */
-const NAMESPACE = '914c7e92-21a5-5ff9-a8f3-6288554ba588';
-
-function uuidv5(namespace: string, name: string): string {
-  const ns = Buffer.from(namespace.replace(/-/g, ''), 'hex');
-  const digest = createHash('sha1').update(Buffer.concat([ns, Buffer.from(name, 'utf8')])).digest();
-  const b = Buffer.from(digest.subarray(0, 16));
-  b[6] = (b[6]! & 0x0f) | 0x50; // version 5
-  b[8] = (b[8]! & 0x3f) | 0x80; // RFC 4122 variant
-  const h = b.toString('hex');
-  return `${h.slice(0, 8)}-${h.slice(8, 12)}-${h.slice(12, 16)}-${h.slice(16, 20)}-${h.slice(20)}`;
-}
-
-const recordingIdFor = (canonicalKey: string) => uuidv5(NAMESPACE, `rec:${canonicalKey}`);
-const mediaIdFor = (recordingId: string, kind: string, ord: number) =>
-  uuidv5(NAMESPACE, `media:${recordingId}:${kind}:${ord}`);
-const transcriptionIdFor = (recordingId: string) => uuidv5(NAMESPACE, `txn:${recordingId}:0`);
-
-// ---------------------------------------------------------------------------
-// Classification
-// ---------------------------------------------------------------------------
-
-interface Row {
-  id: number;
-  user_id: string;
-  assemblyai_id: string;
-  original_filename: string | null;
-  status: string;
-  created_at: string;
-  completed_at: string | null;
-  duration: number | null;
-  language_code: string | null;
-  speech_model: string | null;
-  local_audio_path: string | null;
-  deleted_at: string | null;
-  gmeet_context: GmeetContext | null;
-  has_content: boolean;
-}
-
-const AAI_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
-const SYNTHETIC = /^(gmeet-|teams-|ext-|up-|defer-)/;
-const isRealAaiId = (id: string) => AAI_ID.test(id) && !SYNTHETIC.test(id);
-
-type SourceKind = 'recorder' | 'upload' | 'meet' | 'teams' | 'text' | 'aai-import';
-
-/**
- * Where the bytes came from. Two additions to the spec's prefix-first rule,
- * both because the prefix alone under-reports on prod:
- *  - `recorder` is decided by the marker OR the reverse link
- *    (`recorder_recordings.transcript_id`). On prod 43 meetings came from the
- *    tray but only 4 carry `gmeet_context.recorder` — the marker is younger
- *    than the flow.
- *  - a Meet/Teams VIDEO import carries a REAL AssemblyAI id (only the
- *    transcript-Doc imports get a `gmeet-`/`teams-` id), so without the
- *    `gmeet_context` checks 208 Meet meetings would be filed as uploads.
- */
-function sourceKindOf(row: Row, recorderRecordingId: string | null): SourceKind {
-  const g = row.gmeet_context;
-  if (g?.recorder || recorderRecordingId) return 'recorder';
-  const id = row.assemblyai_id;
-  if (id.startsWith('gmeet-')) return 'meet';
-  if (id.startsWith('teams-')) return 'teams';
-  if (id.startsWith('ext-')) return 'text';
-  if (g?.provider === 'teams' || g?.teams) return 'teams';
-  if (g?.videoFileId || g?.meetingCode || g?.actuals) return 'meet';
-  // Imported from AssemblyAI by id: a real job, no bytes of ours, no
-  // conferencing context. (All 35 such rows on prod are source='imported'.)
-  if (isRealAaiId(id) && !row.local_audio_path && !g) return 'aai-import';
-  return 'upload';
-}
-
-type Provider = 'assemblyai' | 'meet-doc' | 'teams-vtt' | 'text';
-function providerOf(row: Row): Provider {
-  const id = row.assemblyai_id;
-  if (id.startsWith('gmeet-')) return 'meet-doc';
-  if (id.startsWith('teams-')) return 'teams-vtt';
-  if (id.startsWith('ext-')) return 'text';
-  return 'assemblyai';
-}
-
-function statusOf(row: Row): 'processing' | 'completed' | 'error' {
-  if (row.status === 'completed') return 'completed';
-  if (row.status === 'error') return 'error';
-  return 'processing';
-}
-
-/**
- * The key two meetings must share to collapse onto one recording: the
- * AssemblyAI job when there is a real one, else the row's own identity.
- */
-function canonicalKeyOf(row: Row): string {
-  return isRealAaiId(row.assemblyai_id)
-    ? row.assemblyai_id
-    : `${row.assemblyai_id}|${row.user_id}`;
-}
-
-// ---------------------------------------------------------------------------
 // The plan for one meeting
 // ---------------------------------------------------------------------------
 
-interface MediaPlan {
-  id: string;
-  kind: 'canonical' | 'part' | 'audio_only';
-  ord: number;
-  offsetMs: number | null;
-  durationMs: number | null;
-  filename: string | null;
-  bytes: number | null;
-  hasVideo: boolean | null;
-  sourceRef: Record<string, unknown> | null;
-  ofMediaId: string | null;
-}
-
 interface MeetingPlan {
-  row: Row;
-  canonicalKey: string;
-  recordingId: string;
+  row: GraphMeetingRow;
+  graph: DesiredGraph;
   /** False = another meeting already owns this recording; only a clip is written. */
   owns: boolean;
-  sourceKind: SourceKind;
-  startedAt: string | null;
-  durationMs: number | null;
-  recorderRecordingId: string | null;
-  media: MediaPlan[];
-  transcriptionId: string;
-  provider: Provider;
-  providerJobId: string | null;
-  covers: { media: string[]; timeline: 'wall' | 'concat' };
   /** local_audio_path that is NOT on disk (only filled with --check-files). */
   missingFile: string | null;
 }
 
-const VIDEO_EXT = /\.(mp4|webm|mov|mkv|m4v)$/i;
-
-function statOf(storageDir: string | null, filename: string | null) {
-  if (!storageDir || !filename) return { exists: null as boolean | null, bytes: null };
-  const abs = path.join(path.resolve(storageDir), 'audio', filename);
-  if (!existsSync(abs)) return { exists: false, bytes: null };
-  try {
-    return { exists: true, bytes: statSync(abs).size };
-  } catch {
-    return { exists: true, bytes: null };
-  }
-}
-
-function planFor(row: Row, owns: boolean, recorderByTranscript: Map<string, string>): MeetingPlan {
-  const g = row.gmeet_context;
-  const canonicalKey = canonicalKeyOf(row);
-  const recordingId = recordingIdFor(canonicalKey);
-  const durationMs = row.duration != null ? Math.round(row.duration * 1000) : null;
-  const recorderRecordingId =
-    g?.recorder?.recordingId ?? recorderByTranscript.get(row.assemblyai_id) ?? null;
-
-  // A concat row's canonical file is a DERIVATIVE of its parts, not a capture
-  // of its own — the listing's recording_count leans on this stamp.
-  const uploadedParts = g?.uploadedParts ?? [];
-  const combinedParts = typeof g?.combinedParts === 'number' ? g.combinedParts : 0;
-  const isConcat = uploadedParts.length > 0 || combinedParts > 0;
-
-  const media: MediaPlan[] = [];
-  if (row.local_audio_path) {
-    const st = statOf(CHECK_FILES, row.local_audio_path);
-    const id = mediaIdFor(recordingId, 'canonical', 0);
-    media.push({
-      id,
-      kind: 'canonical',
-      ord: 0,
-      offsetMs: 0,
-      durationMs,
-      filename: row.local_audio_path,
-      bytes: st.bytes,
-      hasVideo: VIDEO_EXT.test(row.local_audio_path),
-      sourceRef: {
-        ...(g?.videoFileId ? { driveFileId: g.videoFileId } : {}),
-        ...(g?.teams?.recordingId ? { teamsRecordingId: g.teams.recordingId } : {}),
-        ...(row.original_filename ? { originalFilename: row.original_filename } : {}),
-        ...(isConcat ? { derived: 'concat' } : {}),
-      },
-      ofMediaId: null,
-    });
-    // The rebuildable 64 kbps extract, when it is already on disk.
-    if (CHECK_FILES && st.exists) {
-      const stem = row.local_audio_path.replace(/\.[^.]+$/, '');
-      const extract = path.join(path.resolve(CHECK_FILES), 'audio-only', `${stem}.m4a`);
-      if (existsSync(extract)) {
-        media.push({
-          id: mediaIdFor(recordingId, 'audio_only', 0),
-          kind: 'audio_only',
-          ord: 0,
-          offsetMs: 0,
-          durationMs,
-          filename: `${stem}.m4a`,
-          bytes: statSync(extract).size,
-          hasVideo: false,
-          sourceRef: null,
-          ofMediaId: id,
-        });
+/**
+ * What is on disk under `--check-files <storageDir>`. Without it the graph
+ * carries no byte counts and no `audio_only` rows — the same "not probed"
+ * answer `scripts/recordings-verify.ts` gives by default, so the two agree.
+ */
+function fileFactsFor(row: GraphMeetingRow): GraphFileFacts | undefined {
+  if (!CHECK_FILES) return undefined;
+  const storage = path.resolve(CHECK_FILES);
+  const audio = new Map<string, number | null>();
+  const audioOnly = new Map<string, number | null>();
+  for (const name of recordingFilenames(row)) {
+    const abs = path.join(storage, 'audio', name);
+    if (existsSync(abs)) {
+      try {
+        audio.set(name, statSync(abs).size);
+      } catch {
+        audio.set(name, null);
+      }
+    }
+    const stem = name.replace(/\.[^./]+$/, '');
+    const extract = path.join(storage, 'audio-only', `${stem}.m4a`);
+    if (existsSync(extract)) {
+      try {
+        audioOnly.set(stem, statSync(extract).size);
+      } catch {
+        audioOnly.set(stem, null);
       }
     }
   }
-
-  // The parts. Today's listing takes GREATEST of the three jsonb shapes, so
-  // the longest list is the one that describes the capture; a row carrying
-  // two of them at once does not exist in prod but would not be double
-  // counted here either.
-  const fromVideoParts = videoPartOffsets(g).map((p, i) => ({
-    ord: i,
-    offsetMs: p.offsetSec != null ? Math.round(p.offsetSec * 1000) : null,
-    durationMs: p.durationSec != null ? Math.round(p.durationSec * 1000) : null,
-    filename: p.filename ?? null,
-    sourceRef: { driveFileId: (g?.videoParts ?? [])[i]?.fileId ?? null } as Record<string, unknown>,
-  }));
-  const fromUploaded = [...uploadedParts]
-    .sort((a, b) => a.index - b.index)
-    .map((p, i) => ({
-      ord: i,
-      offsetMs: p.offsetSec != null ? Math.round(p.offsetSec * 1000) : null,
-      durationMs: p.durationSec != null ? Math.round(p.durationSec * 1000) : null,
-      // The stitch consumed the source temp files; only their offsets survive.
-      filename: null as string | null,
-      sourceRef: {
-        ...(p.originalFilename ? { originalFilename: p.originalFilename } : {}),
-        ...(p.comment ? { comment: p.comment } : {}),
-      } as Record<string, unknown>,
-    }));
-  const fromCombined = Array.from({ length: combinedParts }, (_, i) => ({
-    ord: i,
-    offsetMs: null as number | null,
-    durationMs: null as number | null,
-    filename: null as string | null,
-    // combinedParts is only a COUNT in gmeet_context — no filenames, no
-    // offsets survived the combine. The rows exist so the meeting still says
-    // "N recordings"; Phase 3 fills the windows in.
-    sourceRef: { combined: true } as Record<string, unknown>,
-  }));
-  const parts = [fromVideoParts, fromUploaded, fromCombined].sort((a, b) => b.length - a.length)[0]!;
-  for (const p of parts) {
-    media.push({
-      id: mediaIdFor(recordingId, 'part', p.ord),
-      kind: 'part',
-      ord: p.ord,
-      offsetMs: p.offsetMs,
-      durationMs: p.durationMs,
-      filename: p.filename,
-      bytes: statOf(CHECK_FILES, p.filename).bytes,
-      hasVideo: p.filename ? VIDEO_EXT.test(p.filename) : null,
-      sourceRef: p.sourceRef,
-      ofMediaId: null,
-    });
-  }
-
-  const canonicalId = media.find((m) => m.kind === 'canonical')?.id;
-  const partIds = media.filter((m) => m.kind === 'part').map((m) => m.id);
-  const covers = {
-    // A concat job heard its parts through the concat; a wall-time job heard
-    // only the primary — which is why a Meet stop/restart part shows the
-    // "not transcribed" warning today.
-    media: isConcat
-      ? [...(canonicalId ? [canonicalId] : []), ...partIds]
-      : canonicalId
-        ? [canonicalId]
-        : [],
-    timeline: (isConcat ? 'concat' : 'wall') as 'wall' | 'concat',
-  };
-
-  const missing =
-    CHECK_FILES && row.local_audio_path && statOf(CHECK_FILES, row.local_audio_path).exists === false
-      ? row.local_audio_path
-      : null;
-
-  return {
-    row,
-    canonicalKey,
-    recordingId,
-    owns,
-    sourceKind: sourceKindOf(row, recorderRecordingId),
-    startedAt: g?.actuals?.anchorIso ?? null,
-    durationMs,
-    recorderRecordingId,
-    media,
-    transcriptionId: transcriptionIdFor(recordingId),
-    provider: providerOf(row),
-    providerJobId: isRealAaiId(row.assemblyai_id) ? row.assemblyai_id : null,
-    covers,
-    missingFile: missing,
-  };
-}
-
-/** Placeholders with nothing behind them: no payload, no bytes, no job. */
-function skipReason(row: Row): string | null {
-  const placeholder = row.assemblyai_id.startsWith('up-') || row.assemblyai_id.startsWith('defer-');
-  if (placeholder && !row.has_content && !row.local_audio_path) {
-    return `placeholder (${row.assemblyai_id.split('-')[0]}-) with no payload and no media`;
-  }
-  return null;
+  return { audio, audioOnly };
 }
 
 // ---------------------------------------------------------------------------
@@ -388,40 +144,68 @@ const sql = postgres({ max: 1, onnotice: () => {} });
 async function main() {
   if (!APPLY) await sql.unsafe('SET default_transaction_read_only = on');
 
-  const rows = await sql<Row[]>`
+  // The recorder join mirrors db-ops/recordings.ts `loadGraphMeetingRows`:
+  // the reverse link first, the `gmeet_context.recorder` marker second, and
+  // `started_at` comes along for §5a's fallback anchor.
+  const rows = await sql<GraphMeetingRow[]>`
     SELECT t.id, t.user_id, t.assemblyai_id, t.original_filename, t.status,
            t.created_at, t.completed_at, t.duration, t.language_code,
            t.speech_model, t.local_audio_path, t.deleted_at, t.gmeet_context,
-           (t.imported_content IS NOT NULL) AS has_content
+           (t.imported_content IS NOT NULL) AS has_content,
+           rr.id         AS recorder_recording_id,
+           rr.started_at AS recorder_started_at
     FROM ${sql(SCHEMA)}.transcripts t
+    LEFT JOIN LATERAL (
+      SELECT r.id, r.started_at
+      FROM ${sql(SCHEMA)}.recorder_recordings r
+      WHERE r.transcript_id = t.assemblyai_id
+         OR (t.gmeet_context->'recorder'->>'recordingId' ~ '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$'
+             AND r.id::text = t.gmeet_context->'recorder'->>'recordingId')
+      ORDER BY (r.transcript_id = t.assemblyai_id) DESC, r.created_at
+      LIMIT 1
+    ) rr ON true
     ${ONLY ? sql`WHERE t.assemblyai_id = ${ONLY}` : sql``}
     ORDER BY t.created_at, t.id
   `;
 
-  const recorderLinks = await sql<Array<{ id: string; transcript_id: string }>>`
-    SELECT id, transcript_id FROM ${sql(SCHEMA)}.recorder_recordings
-    WHERE transcript_id IS NOT NULL
-  `;
-  const recorderByTranscript = new Map(recorderLinks.map((r) => [r.transcript_id, r.id]));
-
   const skipped: Array<{ id: string; why: string }> = [];
+  const kept: GraphMeetingRow[] = [];
+  for (const row of rows) {
+    const why = skipReason(row);
+    if (why) skipped.push({ id: row.assemblyai_id, why });
+    else kept.push(row);
+  }
+
+  // Meetings that must collapse onto ONE recording: only a REAL AssemblyAI
+  // job is shared (a `gmeet-<record>` id is the same string for every
+  // importer but each parsed their own copy — `canonicalKeyOf` keys those on
+  // transcripts.id).
+  const byAaiId = new Map<string, GraphMeetingRow[]>();
+  for (const row of kept) {
+    if (!isRealAaiId(row.assemblyai_id)) continue;
+    byAaiId.set(row.assemblyai_id, [...(byAaiId.get(row.assemblyai_id) ?? []), row]);
+  }
+
   const plans: MeetingPlan[] = [];
   const owners = new Set<string>();
   const groupMembers = new Map<string, string[]>();
 
-  // Rows arrive oldest-first, so the first survivor of a shared AssemblyAI id
-  // owns the recording (spec §1: "owner = the earlier created_at").
-  for (const row of rows) {
-    const why = skipReason(row);
-    if (why) {
-      skipped.push({ id: row.assemblyai_id, why });
-      continue;
-    }
-    const key = canonicalKeyOf(row);
+  for (const row of kept) {
+    const group = byAaiId.get(row.assemblyai_id) ?? [row];
+    const owner = ownerRowOf(group) ?? row;
+    const key = canonicalKeyOf(owner);
     groupMembers.set(key, [...(groupMembers.get(key) ?? []), row.assemblyai_id]);
     const owns = !owners.has(key);
     owners.add(key);
-    plans.push(planFor(row, owns, recorderByTranscript));
+    plans.push({
+      row,
+      graph: deriveRecordingGraph(owner, fileFactsFor(owner)),
+      owns,
+      missingFile:
+        CHECK_FILES && row.local_audio_path && !existsSync(path.join(path.resolve(CHECK_FILES), 'audio', row.local_audio_path))
+          ? row.local_audio_path
+          : null,
+    });
   }
 
   if (APPLY) {
@@ -437,15 +221,22 @@ async function main() {
   await sql.end();
 }
 
-/** One transaction per meeting: an interrupted run resumes cleanly. */
+/**
+ * One transaction per meeting: an interrupted run resumes cleanly. The
+ * statements are the ones `applyRecordingGraph` runs in the app; they are
+ * repeated here rather than imported because the script targets an arbitrary
+ * schema through its own connection, while db-ops is bound to the app's.
+ */
 async function writePlan(plan: MeetingPlan) {
+  const { graph } = plan;
+  const rec = graph.recording;
   await sql.begin(async (tx) => {
     if (plan.owns) {
       await tx`
         INSERT INTO ${tx(SCHEMA)}.recordings
           (id, owner_user_id, source_kind, started_at, duration_ms, recorder_recording_id)
-        VALUES (${plan.recordingId}::uuid, ${plan.row.user_id}, ${plan.sourceKind},
-                ${plan.startedAt}, ${plan.durationMs}, ${plan.recorderRecordingId}::uuid)
+        VALUES (${rec.id}::uuid, ${rec.ownerUserId}, ${rec.sourceKind},
+                ${rec.startedAt}, ${rec.durationMs}, ${rec.recorderRecordingId}::uuid)
         ON CONFLICT (id) DO UPDATE SET
           source_kind           = EXCLUDED.source_kind,
           started_at            = COALESCE(EXCLUDED.started_at, recordings.started_at),
@@ -455,12 +246,12 @@ async function writePlan(plan: MeetingPlan) {
           updated_at            = now()
       `;
 
-      for (const m of plan.media) {
+      for (const m of graph.media) {
         await tx`
           INSERT INTO ${tx(SCHEMA)}.recording_media
             (id, recording_id, kind, ord, offset_ms, duration_ms, filename, bytes,
              has_video, source_ref, of_media_id)
-          VALUES (${m.id}::uuid, ${plan.recordingId}::uuid, ${m.kind}, ${m.ord},
+          VALUES (${m.id}::uuid, ${rec.id}::uuid, ${m.kind}, ${m.ord},
                   ${m.offsetMs}, ${m.durationMs}, ${m.filename}, ${m.bytes},
                   ${m.hasVideo}, ${m.sourceRef ? tx.json(m.sourceRef as never) : null},
                   ${m.ofMediaId}::uuid)
@@ -478,37 +269,42 @@ async function writePlan(plan: MeetingPlan) {
       }
 
       // The payload never leaves Postgres.
+      const t = graph.transcription;
       await tx`
         INSERT INTO ${tx(SCHEMA)}.recording_transcriptions
           (id, recording_id, provider, provider_job_id, speech_model, language_code,
            status, payload, covers, created_at, completed_at)
-        SELECT ${plan.transcriptionId}::uuid, ${plan.recordingId}::uuid, ${plan.provider},
-               ${plan.providerJobId}, ${plan.row.speech_model}, ${plan.row.language_code},
-               ${statusOf(plan.row)}, t.imported_content, ${tx.json(plan.covers as never)},
-               t.created_at, t.completed_at
-        FROM ${tx(SCHEMA)}.transcripts t
-        WHERE t.id = ${plan.row.id}
+        SELECT ${t.id}::uuid, ${rec.id}::uuid, ${t.provider}, ${t.providerJobId},
+               ${t.speechModel}, ${t.languageCode}, ${t.status},
+               src.imported_content, ${tx.json(t.covers as never)},
+               src.created_at, src.completed_at
+        FROM ${tx(SCHEMA)}.transcripts src
+        WHERE src.id = ${graph.payloadFromTranscriptId}
         ON CONFLICT (id) DO UPDATE SET
-          status        = EXCLUDED.status,
-          payload       = COALESCE(EXCLUDED.payload, recording_transcriptions.payload),
-          covers        = EXCLUDED.covers,
-          completed_at  = COALESCE(EXCLUDED.completed_at,
-                                   recording_transcriptions.completed_at)
+          status          = EXCLUDED.status,
+          provider_job_id = COALESCE(EXCLUDED.provider_job_id,
+                                     recording_transcriptions.provider_job_id),
+          payload         = COALESCE(EXCLUDED.payload, recording_transcriptions.payload),
+          covers          = EXCLUDED.covers,
+          completed_at    = COALESCE(EXCLUDED.completed_at,
+                                     recording_transcriptions.completed_at)
       `;
 
       await tx`
         UPDATE ${tx(SCHEMA)}.recordings
-        SET active_transcription_id = ${plan.transcriptionId}::uuid, updated_at = now()
-        WHERE id = ${plan.recordingId}::uuid
+        SET active_transcription_id = ${t.id}::uuid, updated_at = now()
+        WHERE id = ${rec.id}::uuid
       `;
     }
 
+    const clip = desiredClipFor(plan.row.id);
     await tx`
       INSERT INTO ${tx(SCHEMA)}.meeting_clips
         (transcript_id, ord, recording_id, transcription_id, from_ms, to_ms,
          offset_ms, text_policy, created_by)
-      VALUES (${plan.row.id}, 0, ${plan.recordingId}::uuid, NULL, 0, NULL, 0,
-              'include', 'recordings-backfill')
+      VALUES (${clip.transcriptId}, ${clip.ord}, ${rec.id}::uuid,
+              ${clip.transcriptionId}::uuid, ${clip.fromMs}, ${clip.toMs},
+              ${clip.offsetMs}, ${clip.textPolicy}, 'recordings-backfill')
       ON CONFLICT (transcript_id, ord) DO UPDATE SET
         recording_id = EXCLUDED.recording_id,
         from_ms      = EXCLUDED.from_ms,
@@ -526,12 +322,15 @@ function report(
   groupMembers: Map<string, string[]>
 ) {
   const bySource = new Map<string, number>();
-  for (const p of plans) bySource.set(p.sourceKind, (bySource.get(p.sourceKind) ?? 0) + 1);
+  for (const p of plans) {
+    const kind = p.graph.recording.sourceKind;
+    bySource.set(kind, (bySource.get(kind) ?? 0) + 1);
+  }
 
   const shared = [...groupMembers.entries()].filter(([, ids]) => ids.length > 1);
   const missing = plans.filter((p) => p.missingFile);
-  const mediaRows = plans.filter((p) => p.owns).reduce((n, p) => n + p.media.length, 0);
-  const multiPart = plans.filter((p) => p.owns && p.media.some((m) => m.kind === 'part'));
+  const mediaRows = plans.filter((p) => p.owns).reduce((n, p) => n + p.graph.media.length, 0);
+  const multiPart = plans.filter((p) => p.owns && p.graph.media.some((m) => m.kind === 'part'));
   const noPayload = plans.filter((p) => p.owns && !p.row.has_content);
 
   console.log('');

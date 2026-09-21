@@ -8,12 +8,13 @@ import {
 } from '../part-offsets';
 
 /**
- * The detail page has carried this arithmetic inline since the multi-video
- * ship (`src/app/transcript/[id]/page.tsx`, the `partAnchorMs` / `storedParts`
- * / `seekMeetingTime` memos). `pageStoredParts` / `pageSeek` below are that
- * code, copied verbatim, so the shared module is held to the behaviour that
- * is live today — if page.tsx is ever changed without this module, these
- * tests fail rather than the player quietly disagreeing with the transcript.
+ * The detail page carried this arithmetic inline from the multi-video ship
+ * (2026-08-11) until it was lifted into this module; `page.tsx` now calls
+ * `storedVideoParts` / `partForMeetingTime` directly. `pageStoredParts` /
+ * `pageSeek` below are the page's OLD code, frozen verbatim, so the module
+ * stays held to the behaviour that shipped — the "identical to the detail
+ * page today" block at the bottom is the equality that made the refactor
+ * safe, and it keeps being the one that would catch a drift.
  */
 function pageAnchor(g: GmeetContext | null): number | null {
   const iso =
@@ -159,7 +160,7 @@ describe('partForMeetingTime', () => {
   });
 });
 
-describe('identical to the detail page today', () => {
+describe('identical to the detail page before the refactor', () => {
   const fixtures: Array<[string, GmeetContext | null]> = [
     ['stop-restart with an unfetched middle', stopRestart],
     ['no anchor at all', noAnchor],

@@ -3,6 +3,7 @@ import { createHash } from 'node:crypto';
 import type { StoredTranscript, TranscriptResponse } from '@/lib/format';
 import { storedVideoParts } from '@/lib/part-offsets';
 import {
+  compareClipsOnTimeline,
   resolveClips,
   type ResolvableClip,
   type ClipTextPolicy,
@@ -10,20 +11,19 @@ import {
 } from '@/lib/recording-clips';
 import {
   loadMeetingRecordingGraph,
+  loadMeetingRecordingGraphs,
   type MeetingRecordingGraph,
-  type RecordingMediaRow,
   type RecordingTranscriptionRow,
 } from '@/db-ops/recordings';
 
 /**
  * THE resolver (docs/recordings-phase1-spec.md §3).
  *
- * Every reader of a meeting's text or media is meant to come through here
- * instead of touching `imported_content` / `local_audio_path` /
- * `gmeet_context.videoParts` itself. Phase 1a only builds it; Phase 1b moves
- * the readers over (`content`, `audio`, `frames`, `edits`, `speakers`,
- * `offline-plan`, `auto-notes`, `voiceprint`, `meet-align`,
- * `post-completion`, permanent delete).
+ * Every reader of a meeting's text or media comes through here instead of
+ * touching `imported_content` / `local_audio_path` /
+ * `gmeet_context.videoParts` itself: `content`, `audio`, `frames`,
+ * `speakers` (the enrolment side), the offline plan, `auto-notes`,
+ * `voiceprint`, `post-completion` and the v2 listing's `recording_count`.
  *
  * Three ways out, in order:
  *  1. MW_RECORDINGS unset/0  → the row's own columns, today's code path.
@@ -54,9 +54,34 @@ export interface ResolvedMedia {
   offsetMs: number;
   durationMs: number | null;
   /** Was this file's audio inside the transcription? A Meet stop-restart
-   * part is false — that is today's amber "not transcribed" warning. */
+   * part is false — that is today's amber "not transcribed" warning. It is
+   * also the ONLY place "the job did not hear this file" shows up: it never
+   * takes a one-clip meeting out of compat (spec §5a). */
   transcribed: boolean;
 }
+
+/**
+ * The minimum a row needs for the resolver. `StoredTranscript` satisfies it;
+ * so does a skinny listing/offline row that selects these six columns, which
+ * is how the offline plan resolves 200 meetings without loading 200 payloads.
+ */
+export type ResolvableMeetingRow = Pick<
+  StoredTranscript,
+  | 'id'
+  | 'assemblyai_id'
+  | 'created_at'
+  | 'completed_at'
+  | 'duration'
+  | 'local_audio_path'
+  | 'gmeet_context'
+  | 'imported_content'
+>;
+
+/** Just the media half — what the offline plan and the player need. */
+export type MediaOnlyRow = Pick<
+  ResolvableMeetingRow,
+  'id' | 'duration' | 'local_audio_path' | 'gmeet_context'
+>;
 
 export interface ResolvedMeetingContent {
   /** What `/content` serves. null = nothing stored yet. */
@@ -107,7 +132,7 @@ function isVideoName(filename: string | null): boolean | null {
 // Fallback — the row's own columns (today's behaviour, byte for byte)
 // ---------------------------------------------------------------------------
 
-function resolveFromRow(row: StoredTranscript): ResolvedMeetingContent {
+function mediaFromRow(row: MediaOnlyRow): ResolvedMedia[] {
   const durationMs = row.duration != null ? Math.round(row.duration * 1000) : null;
   const media: ResolvedMedia[] = [];
   if (row.local_audio_path) {
@@ -137,7 +162,11 @@ function resolveFromRow(row: StoredTranscript): ResolvedMeetingContent {
       transcribed: false,
     });
   }
+  return media;
+}
 
+function resolveFromRow(row: ResolvableMeetingRow): ResolvedMeetingContent {
+  const media = mediaFromRow(row);
   const content = row.imported_content;
   return {
     content,
@@ -170,19 +199,6 @@ function activeTranscriptionFor(
   }
   // listRecordingTranscriptions orders newest first.
   return mine.find((t) => t.status === 'completed') ?? mine[0] ?? null;
-}
-
-/** Does the job's `covers` list the recording's canonical file? */
-function coversCanonical(
-  transcription: RecordingTranscriptionRow | null,
-  media: RecordingMediaRow[]
-): boolean {
-  const canonical = media.find((m) => m.kind === 'canonical');
-  // No canonical file at all (a text / Meet-doc import) — nothing to cover.
-  if (!canonical) return true;
-  const covered = transcription?.covers?.media;
-  if (!Array.isArray(covered)) return true;
-  return covered.includes(canonical.id);
 }
 
 /**
@@ -239,7 +255,7 @@ function clipPolicy(raw: string): ClipTextPolicy {
  * copy of a meeting whose clips just changed.
  */
 export async function resolveMeetingContent(
-  row: StoredTranscript,
+  row: ResolvableMeetingRow,
   graph?: MeetingRecordingGraph
 ): Promise<ResolvedMeetingContent> {
   if (!recordingsEnabled()) return resolveFromRow(row);
@@ -259,7 +275,15 @@ export async function resolveMeetingContent(
     return resolveFromRow(row);
   }
 
-  const clips = [...loaded.clips].sort((a, b) => a.ord - b.ord);
+  // Meeting-timeline order: `offset_ms` first, `ord` only as the tie-break
+  // (§5a). The media numbering below follows the same order, so "part 2" is
+  // the second thing that happens in the meeting, not the second row added.
+  const clips = [...loaded.clips].sort((a, b) =>
+    compareClipsOnTimeline(
+      { offsetMs: a.offset_ms, ord: a.ord },
+      { offsetMs: b.offset_ms, ord: b.ord }
+    )
+  );
   const orderedRecordingIds: string[] = [];
   const clipOffsetMs = new Map<string, number>();
   for (const c of clips) {
@@ -282,29 +306,16 @@ export async function resolveMeetingContent(
     };
   });
 
-  // The other half of the compat test (spec §3): the single default clip's
-  // transcription must cover the canonical media. A clip reading a job that
-  // did NOT hear the file we play is not the 1:1 case, so it goes through
-  // the merge branch (prefixed speakers, derived text) like any other.
-  const single = clips.length === 1 ? clips[0]! : null;
-  const compatAllowed =
-    !!single &&
-    coversCanonical(
-      activeTranscriptionFor(loaded, single.recording_id, single.transcription_id),
-      loaded.media.filter((m) => m.recording_id === single.recording_id)
-    );
+  // Compat is the clip's call alone (§5a). A job that did not hear the file
+  // we play still hands its payload back verbatim; the only place that fact
+  // surfaces is `media[].transcribed`.
+  const resolved = resolveClips(resolvable, {
+    id: row.assemblyai_id,
+    createdAt: row.created_at,
+    completedAt: row.completed_at,
+  });
 
-  const resolved = resolveClips(
-    resolvable,
-    {
-      id: row.assemblyai_id,
-      createdAt: row.created_at,
-      completedAt: row.completed_at,
-    },
-    { compatAllowed }
-  );
-
-  const media = mediaForRecordings(orderedRecordingIds, loaded, clipOffsetMs);
+  const media = scopeMediaToRow(row, mediaForRecordings(orderedRecordingIds, loaded, clipOffsetMs));
 
   return {
     content: resolved.content,
@@ -327,4 +338,98 @@ export async function resolveMeetingContent(
     utteranceKeys: resolved.utteranceKeys,
     fallback: false,
   };
+}
+
+/**
+ * Phase 1 privacy guard. Two meetings can sit on ONE recording (two users
+ * holding the same AssemblyAI job), and only one of them may ever have held
+ * the bytes. While the meeting row is still the source of truth, a meeting
+ * that has no `local_audio_path` of its own gets NO media from the shared
+ * recording — otherwise turning the flag on would hand user B a file user A
+ * uploaded (the one mismatch the 2026-09-21 diff gate found, meeting id 4).
+ * Sharing a recording's bytes across meetings becomes a deliberate act in
+ * Phase 3 (clips), with its own access rule; it must never be a side effect
+ * of a backfill.
+ */
+function scopeMediaToRow(row: MediaOnlyRow, media: ResolvedMedia[]): ResolvedMedia[] {
+  return row.local_audio_path ? media : [];
+}
+
+// ---------------------------------------------------------------------------
+// What the readers actually ask for
+// ---------------------------------------------------------------------------
+
+/**
+ * The file a meeting's transcript times are measured against — "Video 1",
+ * `?part=1`, today's `local_audio_path`.
+ *
+ * Frames, voiceprint snippets and the audio-only derivative all read THIS
+ * file and no other: a meeting-ms → (part, local ms) mapping is landmine #15
+ * and belongs to Phase 3, where clips gain a real window. Until then the
+ * canonical starts at meeting ms 0 and the mapping is the identity.
+ */
+export function canonicalMedia(media: ResolvedMedia[]): ResolvedMedia | null {
+  return media.find((m) => m.part === 1) ?? null;
+}
+
+/** `?part=N`. N < 2 is not a part — the primary is served by the plain route. */
+export function mediaPart(media: ResolvedMedia[], partNo: number): ResolvedMedia | null {
+  if (!Number.isInteger(partNo) || partNo < 2) return null;
+  return media.find((m) => m.part === partNo) ?? null;
+}
+
+/** Recording ms for a position on the MEETING timeline, inside `m`. */
+export function localMsIn(m: ResolvedMedia, meetingMs: number): number {
+  return Math.max(0, Math.round(meetingMs - m.offsetMs));
+}
+
+/**
+ * Media inventory for MANY meetings at once — the offline plan hands 200 ids
+ * over and must not pay four queries each (spec §3: "no N+1 on the listing").
+ * Flag off, this touches no database at all.
+ *
+ * PRIVACY: the caller has already decided these meetings are visible to it
+ * (the offline plan's own owner-or-share CTE). Reachability route (a).
+ */
+export async function resolveMediaForMeetings(
+  rows: MediaOnlyRow[]
+): Promise<Map<number, ResolvedMedia[]>> {
+  const out = new Map<number, ResolvedMedia[]>();
+  if (!recordingsEnabled()) {
+    for (const row of rows) out.set(row.id, mediaFromRow(row));
+    return out;
+  }
+
+  let graphs: Map<number, MeetingRecordingGraph>;
+  try {
+    graphs = await loadMeetingRecordingGraphs(rows.map((r) => r.id));
+  } catch (err) {
+    console.error('[recordings] batch load failed, falling back:', err);
+    for (const row of rows) out.set(row.id, mediaFromRow(row));
+    return out;
+  }
+
+  for (const row of rows) {
+    const graph = graphs.get(row.id);
+    if (!graph || graph.clips.length === 0) {
+      out.set(row.id, mediaFromRow(row));
+      continue;
+    }
+    const clips = [...graph.clips].sort((a, b) =>
+      compareClipsOnTimeline(
+        { offsetMs: a.offset_ms, ord: a.ord },
+        { offsetMs: b.offset_ms, ord: b.ord }
+      )
+    );
+    const orderedRecordingIds: string[] = [];
+    const clipOffsetMs = new Map<string, number>();
+    for (const c of clips) {
+      if (!orderedRecordingIds.includes(c.recording_id)) {
+        orderedRecordingIds.push(c.recording_id);
+        clipOffsetMs.set(c.recording_id, c.offset_ms - c.from_ms);
+      }
+    }
+    out.set(row.id, scopeMediaToRow(row, mediaForRecordings(orderedRecordingIds, graph, clipOffsetMs)));
+  }
+  return out;
 }

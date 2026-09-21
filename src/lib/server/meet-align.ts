@@ -13,10 +13,15 @@ import type {
  * Meet ↔ AAI speaker alignment.
  *
  * When a meeting was imported in 'both' mode we hold two transcripts of the
- * same audio: AAI's (acoustic diarization, anonymous "A"/"B" labels, ms
- * timestamps relative to recording start) and Google Meet's (REAL names,
- * device-level attribution, same nominal timebase — the recording start is
- * the anchor used when capturing actuals).
+ * same audio: AAI's (acoustic diarization, anonymous "A"/"B" labels) and
+ * Google Meet's (REAL names, device-level attribution, same nominal timebase
+ * — the recording start is the anchor used when capturing actuals).
+ *
+ * `content` is whatever the resolver served (callers get it from
+ * `getContentCached`), so its ms are MEETING time; Meet's sidecar is in the
+ * same timebase because the anchor is the recording start either way. This
+ * module stays pure over the two utterance lists — it has no business
+ * knowing which recordings they came from.
  *
  * Overlap voting: for each AAI speaker, sum the overlap duration against
  * each Meet name's speech windows. A decisive winner (share of voted time

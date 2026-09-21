@@ -1,5 +1,6 @@
 import 'server-only';
 import { resolveAudioPath } from '@/lib/server/audio-storage';
+import { localMsIn, type ResolvedMedia } from '@/lib/server/recordings';
 import { listAll, enrollSample } from '@/db-ops/voiceprints';
 import {
   getForUser as getMappingsForUser,
@@ -64,10 +65,17 @@ interface Segment {
  * Pick the best utterances for a speaker: longest first (more speech = more
  * stable embedding), capped at 6 segments. The sidecar further caps each
  * segment at 20s.
+ *
+ * Utterance times are MEETING time; the sidecar slices a FILE. `media` is
+ * what the resolver says that file is, so its `offsetMs` converts between
+ * them (0 for a compat meeting, where the canonical starts at t=0 — landmine
+ * #15, which is why the conversion goes through the resolver rather than
+ * being assumed).
  */
 function pickSegments(
   content: TranscriptResponse,
-  speaker: string
+  speaker: string,
+  media: ResolvedMedia
 ): Segment[] {
   const utterances = (content.utterances ?? []).filter(
     (u) => u.speaker === speaker && u.end - u.start >= 1500
@@ -75,7 +83,7 @@ function pickSegments(
   return utterances
     .sort((a, b) => (b.end - b.start) - (a.end - a.start))
     .slice(0, 6)
-    .map((u) => ({ start_ms: u.start, end_ms: u.end }));
+    .map((u) => ({ start_ms: localMsIn(media, u.start), end_ms: localMsIn(media, u.end) }));
 }
 
 async function embedViaSidecar(
@@ -110,10 +118,10 @@ function cosine(a: number[], b: number[]): number {
   return dot / (Math.sqrt(na) * Math.sqrt(nb) || 1);
 }
 
-function audioPathFor(localAudioFilename: string | null): string | null {
-  if (!localAudioFilename) return null;
+function audioPathFor(media: ResolvedMedia | null): string | null {
+  if (!media) return null;
   try {
-    return resolveAudioPath(localAudioFilename);
+    return resolveAudioPath(media.filename);
   } catch {
     return null;
   }
@@ -123,14 +131,18 @@ function audioPathFor(localAudioFilename: string | null): string | null {
  * Enroll voiceprints from a transcript's named speakers. Called after a
  * speaker-labels save (and by the backfill script). Only labels with a
  * non-empty customName enroll; failures are logged and swallowed.
+ *
+ * `media` is the meeting's canonical file as the resolver reports it
+ * (`canonicalMedia(resolveMeetingContent(row).media)`), not a raw
+ * `local_audio_path`.
  */
 export async function enrollFromTranscript(
-  localAudioFilename: string | null,
+  media: ResolvedMedia | null,
   content: TranscriptResponse | null,
   labels: SpeakerLabel[]
 ): Promise<void> {
-  const audioPath = audioPathFor(localAudioFilename);
-  if (!audioPath || !content?.utterances?.length) return;
+  const audioPath = audioPathFor(media);
+  if (!audioPath || !media || !content?.utterances?.length) return;
 
   for (const label of labels) {
     const name = label.customName.trim();
@@ -143,7 +155,7 @@ export async function enrollFromTranscript(
       continue;
     }
     try {
-      const segments = pickSegments(content, label.originalSpeaker);
+      const segments = pickSegments(content, label.originalSpeaker, media);
       const embedding = await embedViaSidecar(audioPath, segments);
       if (embedding) {
         await enrollSample(name, embedding);
@@ -164,11 +176,11 @@ export async function enrollFromTranscript(
 export async function suggestSpeakersForTranscript(
   ownerUserId: string,
   assemblyaiId: string,
-  localAudioFilename: string | null,
+  media: ResolvedMedia | null,
   content: TranscriptResponse | null
 ): Promise<SpeakerSuggestionMap> {
-  const audioPath = audioPathFor(localAudioFilename);
-  if (!audioPath || !content?.utterances?.length) return {};
+  const audioPath = audioPathFor(media);
+  if (!audioPath || !media || !content?.utterances?.length) return {};
 
   // Enrolments made under a group label before the rule existed stay in the
   // table (deleting is a human's call) but never become a suggestion.
@@ -180,7 +192,7 @@ export async function suggestSpeakersForTranscript(
 
   for (const speaker of speakers) {
     try {
-      const segments = pickSegments(content, speaker);
+      const segments = pickSegments(content, speaker, media);
       const embedding = await embedViaSidecar(audioPath, segments);
       if (!embedding) continue;
 

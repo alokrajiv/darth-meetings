@@ -15,6 +15,7 @@ import { deleteTranscript as aaiDelete } from '@/lib/server/assemblyai';
 import { deleteAudioFile } from '@/lib/server/audio-storage';
 import { dropAudioOnly } from '@/lib/server/audio-only';
 import { refreshIfPending } from '@/lib/server/transcript-sync';
+import { removeRecordingGraphForMeeting } from '@/lib/server/recording-sync';
 
 export const runtime = 'nodejs';
 
@@ -138,6 +139,13 @@ export const PATCH = withAuth(async ({ user, request }, { params }) => {
  * + shares via FK cascade + AAI transcript + audio files) happens when the
  * row is already in the trash, when it's a placeholder (`up-…`/`defer-…` —
  * nothing worth keeping), or on ?permanent=1.
+ *
+ * Soft delete leaves the recording graph alone on purpose: a trashed meeting
+ * still holds its clip, which is what makes restore work and what stops a
+ * recording being reaped while one of its meetings sits in the trash.
+ * Permanent delete takes the clips, and any recording that has no clip left
+ * goes with them. The FILE walk below is unchanged in Phase 1 — it still
+ * reads the row's own `local_audio_path` / `videoParts`.
  */
 export const DELETE = withAuth(async ({ user, request }, { params }) => {
   const { id } = await params;
@@ -162,6 +170,9 @@ export const DELETE = withAuth(async ({ user, request }, { params }) => {
 
   await aaiDelete(id);
   await deleteSpeakerMappingsForUser(access.ownerUserId, id);
+  // Before the row goes: `meeting_clips.transcript_id` has no FK (it is the
+  // int family), so an orphan clip would survive the row forever.
+  await removeRecordingGraphForMeeting(access.row.id, 'permanent-delete');
   await deleteForUser(access.ownerUserId, id);
   // Each stored recording may have an audio-only derivative (offline pins);
   // drop it with the source so nothing outlives the row.

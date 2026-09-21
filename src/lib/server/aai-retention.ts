@@ -2,6 +2,7 @@ import 'server-only';
 import { deleteTranscript } from '@/lib/server/assemblyai';
 import { isAaiJobId } from '@/lib/aai-job-state';
 import { getForUser, stampAaiDeleted, type TranscriptRow } from '@/db-ops/transcripts';
+import { queueProviderDeletedStamp } from '@/lib/server/recording-sync';
 
 /**
  * DEC-4 — "AssemblyAI keeps nothing of ours"
@@ -111,6 +112,9 @@ export async function deleteAtAaiIfSafe(
   const stamp = { deletedAt: new Date().toISOString(), jobId: assemblyaiId };
   try {
     const copies = await stampAaiDeleted(assemblyaiId, stamp);
+    // DEC-4's other half: one `recording_transcriptions` row holds this job
+    // however many meetings point at it, so the stamp is keyed on the job id.
+    queueProviderDeletedStamp(assemblyaiId, stamp.deletedAt);
     console.log(
       `[aai-retention] deleted ${assemblyaiId} at AAI (${row.imported_content?.utterances?.length ?? 0} utterances kept, ${copies} row(s) stamped)`
     );

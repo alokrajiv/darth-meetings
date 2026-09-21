@@ -2,6 +2,7 @@ import { NextResponse } from 'next/server';
 import { withAuth } from '@/lib/auth/with-auth';
 import { resolveAccess } from '@/db-ops/transcript-access';
 import { logPayloadMissing } from '@/lib/server/aai-retention';
+import { resolveMeetingContent } from '@/lib/server/recordings';
 
 export const runtime = 'nodejs';
 
@@ -15,6 +16,11 @@ export const runtime = 'nodejs';
  * nothing to cache here. A finished row with no payload is a real fault and
  * says so; it is never papered over with a call to AssemblyAI, whose copy is
  * deleted as soon as ours is safe.
+ *
+ * The payload comes from `resolveMeetingContent` — the meeting's clips over
+ * its recordings. In compat (every row today) that IS `imported_content`,
+ * returned by reference, so the JSON on the wire is byte-identical whether
+ * MW_RECORDINGS is on or off.
  */
 export const GET = withAuth(async ({ user }, { params }) => {
   const { id } = await params;
@@ -24,8 +30,9 @@ export const GET = withAuth(async ({ user }, { params }) => {
     return NextResponse.json({ error: 'Not found' }, { status: 404 });
   }
 
-  if (access.row.imported_content) {
-    return NextResponse.json({ content: access.row.imported_content });
+  const resolved = await resolveMeetingContent(access.row);
+  if (resolved.content) {
+    return NextResponse.json({ content: resolved.content });
   }
 
   const status = access.row.status;

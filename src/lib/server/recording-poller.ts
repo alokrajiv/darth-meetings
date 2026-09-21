@@ -16,6 +16,7 @@ import {
 } from '@/lib/server/gmeet';
 import { getServerAccessToken } from '@/lib/server/google-oauth';
 import { fetchRecordingFromDrive, fetchVideoPartFromDrive } from '@/lib/server/recording-fetch';
+import { queueRecordingGraphSync } from '@/lib/server/recording-sync';
 import { executeGmeetImport } from '@/lib/server/gmeet-import-core';
 import { generateAutoReport } from '@/lib/server/auto-notes';
 import { notifyUser } from '@/lib/server/darth-notify';
@@ -260,6 +261,13 @@ async function checkRow(row: {
       attempts: (pending.attempts ?? 0) + 1,
     },
   });
+
+  // The diff just added Meet videos to the row. Each becomes a `part` media
+  // row of the SAME recording (DEC-1), with `offset_ms` from the wall-clock
+  // delta (lib/part-offsets.ts) — filenames follow when the bytes land, and
+  // each fetch below re-syncs. The awaits below can run for minutes, so the
+  // offsets are written now rather than only after the downloads.
+  queueRecordingGraphSync(row.user_id, row.assemblyai_id, 'recording-poller/attach');
 
   // Bytes, best-effort: context already has every fileId, so the sweeper /
   // page-visit auto-fetch retries anything that fails here.

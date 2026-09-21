@@ -4,15 +4,20 @@ import { withAuth } from '@/lib/auth/with-auth';
 import { resolveAccess } from '@/db-ops/transcript-access';
 import { resolveAudioPath } from '@/lib/server/audio-storage';
 import { ensureAudioOnly } from '@/lib/server/audio-only';
+import { canonicalMedia, mediaPart, resolveMeetingContent } from '@/lib/server/recordings';
 
 export const runtime = 'nodejs';
 
 /**
  * GET /api/transcripts/:id/audio[?part=N][&variant=audio]
  *
- * `?part=N` (N >= 2) serves an EXTRA recording segment of a multi-video
- * meeting — gmeet_context.videoParts[N-2]'s stored file (the primary video
- * is "part 1" and lives in local_audio_path, served by the plain route).
+ * `?part=N` (N >= 2) serves an EXTRA file of a multi-video meeting — today
+ * gmeet_context.videoParts[N-2]'s stored file (the primary video is "part 1"
+ * and lives in local_audio_path, served by the plain route). Both come from
+ * `resolveMeetingContent().media`, which reproduces that numbering exactly:
+ * the canonical is 1, the parts follow in capture order, and a part whose
+ * bytes never landed keeps its number reserved rather than renumbering the
+ * ones after it.
  *
  * `?variant=audio` asks for the SOUNDTRACK only — offline "audio" pins, and
  * since 2026-09-18 the player itself whenever its video toggle is off
@@ -30,8 +35,8 @@ export const runtime = 'nodejs';
  * audio_url row ignores it and redirects as before.
  *
  * Returns the audio for a transcript. Resolution order:
- *   1. local_audio_path (imported transcripts whose bytes we downloaded) →
- *      stream from disk with HTTP Range support so the player can seek.
+ *   1. the meeting's canonical file (bytes we hold on the VM) → stream from
+ *      disk with HTTP Range support so the player can seek.
  *   2. an audio_url already stored on the row → 302 (legacy rows only).
  *   3. nothing → 404.
  * There is no step that asks AssemblyAI for a URL any more (DEC-4).
@@ -50,15 +55,14 @@ export const GET = withAuth(async ({ user, request }, { params }) => {
 
   const searchParams = new URL(request.url).searchParams;
   const audioOnly = searchParams.get('variant') === 'audio';
+  const media = (await resolveMeetingContent(row)).media;
 
-  // Extra segment of a multi-video meeting.
+  // Extra file of a multi-video meeting. `?part=1` (and anything below 2, or
+  // non-numeric) is not a part: it 404s exactly as videoParts[N-2] did.
   const partParam = searchParams.get('part');
   if (partParam) {
-    const partNo = Number.parseInt(partParam, 10);
-    const part = Number.isInteger(partNo)
-      ? row.gmeet_context?.videoParts?.[partNo - 2]
-      : undefined;
-    if (!part?.filename) {
+    const part = mediaPart(media, Number.parseInt(partParam, 10));
+    if (!part) {
       return NextResponse.json({ error: 'No such video part' }, { status: 404 });
     }
     try {
@@ -71,12 +75,14 @@ export const GET = withAuth(async ({ user, request }, { params }) => {
     }
   }
 
-  // Path 1 — local file (uploaded with bytes saved on the server, or imported)
-  if (row.local_audio_path) {
+  // Path 1 — the canonical file (uploaded with bytes saved on the server, or
+  // imported).
+  const canonical = canonicalMedia(media);
+  if (canonical) {
     try {
       return audioOnly
-        ? await streamAudioOnly(request, row.local_audio_path)
-        : await streamLocalFile(request, resolveAudioPath(row.local_audio_path));
+        ? await streamAudioOnly(request, canonical.filename)
+        : await streamLocalFile(request, resolveAudioPath(canonical.filename));
     } catch (err) {
       console.error('[GET /api/transcripts/:id/audio] local stream failed:', err);
       // Fall through to remote URL — though that's almost certainly broken

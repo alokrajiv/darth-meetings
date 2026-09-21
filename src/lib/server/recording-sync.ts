@@ -1,0 +1,264 @@
+import 'server-only';
+import { promises as fsp } from 'node:fs';
+import { resolveAudioPath } from '@/lib/server/audio-storage';
+import { getAudioOnlyPath } from '@/lib/server/audio-only';
+import {
+  deriveRecordingGraph,
+  desiredClipFor,
+  isRealAaiId,
+  ownerRowOf,
+  recordingFilenames,
+  skipReason,
+  type GraphFileFacts,
+  type GraphMeetingRow,
+} from '@/lib/recording-graph';
+import {
+  applyRecordingGraph,
+  dropDerivativeMediaByFilename,
+  loadGraphMeetingRows,
+  removeMeetingFromRecordingGraph,
+  stampTranscriptionProviderDeleted,
+} from '@/db-ops/recordings';
+
+/**
+ * Dual-write: keep recordings / recording_media / recording_transcriptions /
+ * meeting_clips equal to what the `transcripts` row says
+ * (docs/recordings-phase1-spec.md §3, "Writers").
+ *
+ * ONE function does it. Every writer — ingest, the stitcher, the Meet/Teams
+ * importers, the pollers, the derivative sweeper, delete — re-reads the row
+ * it just wrote and hands it here; the desired graph is then derived with the
+ * SAME rules the backfill uses (`lib/recording-graph.ts`) and applied
+ * idempotently on deterministic ids. There is deliberately no "apply this
+ * delta" API: a writer that forgets a field would silently desync, whereas
+ * re-deriving the whole graph cannot.
+ *
+ * `MW_RECORDINGS_WRITE` gates it, separately from the readers' flag
+ * `MW_RECORDINGS` so writes can be switched on first and soak. Unset/`0` =
+ * today's behaviour, byte for byte, and not one new query.
+ *
+ * NOTE on turning the flag back OFF: writes stop, so the tables drift from
+ * the rows (a permanently deleted meeting leaves its clips behind). Turning
+ * it on again heals every row that is written afterwards; run
+ * `scripts/recordings-verify.ts` to find the rest.
+ *
+ * Callers use `queueRecordingGraphSync` — fire-and-forget with a logged
+ * catch. A user's upload must never fail, or wait, because a mirror table
+ * could not be written.
+ */
+
+/**
+ * Read lazily, never at module scope: `bun run build` must succeed with no
+ * env at all, and the flag is flipped by restarting the server, not by
+ * rebuilding.
+ */
+export function recordingsWriteEnabled(): boolean {
+  const raw = process.env.MW_RECORDINGS_WRITE;
+  return !!raw && raw !== '0' && raw.toLowerCase() !== 'false';
+}
+
+export type RecordingSyncResult =
+  | { status: 'off' }
+  | { status: 'skipped'; reason: string }
+  | {
+      status: 'written';
+      recordingId: string;
+      clips: number;
+      media: number;
+      migratedFrom: string[];
+      staleMediaRemoved: number;
+    };
+
+// globalThis, not module scope: Next bundles this module once per route
+// graph, so a module-scope map would not serialise a sync started in a route
+// against one started from the instrumentation graph's pollers.
+const g = globalThis as unknown as {
+  __mwRecordingSyncInflight?: Map<string, Promise<RecordingSyncResult>>;
+};
+const inflight = (g.__mwRecordingSyncInflight ??= new Map<string, Promise<RecordingSyncResult>>());
+
+/** Bytes on disk for the row's own files, and which extracts exist. */
+async function probeFiles(row: GraphMeetingRow): Promise<GraphFileFacts> {
+  const audio = new Map<string, number | null>();
+  const audioOnly = new Map<string, number | null>();
+  for (const name of recordingFilenames(row)) {
+    let src: string;
+    try {
+      src = resolveAudioPath(name);
+    } catch {
+      continue; // an unsafe stored name: nothing on disk answers to it
+    }
+    const st = await fsp.stat(src).catch(() => null);
+    if (st) audio.set(name, st.size);
+    const extract = await fsp.stat(getAudioOnlyPath(name)).catch(() => null);
+    if (extract && extract.size > 0) {
+      audioOnly.set(name.replace(/\.[^./]+$/, ''), extract.size);
+    }
+  }
+  return { audio, audioOnly };
+}
+
+/**
+ * Re-derive and write one meeting's graph. Awaitable — used by the tests,
+ * the verifier's `--fix`-less counterpart and anywhere a caller genuinely
+ * wants the result. Production call sites use `queueRecordingGraphSync`.
+ *
+ * `userId` is always the OWNER of the meeting row (every writer here already
+ * holds it); it selects which of the rows sharing an `assemblyai_id` is
+ * "mine". The RECORDING is derived from whichever of them owns it.
+ */
+export async function syncRecordingGraphForMeeting(
+  userId: string,
+  assemblyaiId: string,
+  opts?: { probeFiles?: boolean }
+): Promise<RecordingSyncResult> {
+  if (!recordingsWriteEnabled()) return { status: 'off' };
+
+  const rows = await loadGraphMeetingRows(assemblyaiId);
+  const me = rows.find((r) => r.user_id === userId);
+  if (!me) return { status: 'skipped', reason: 'row is gone' };
+  const why = skipReason(me);
+  if (why) return { status: 'skipped', reason: why };
+
+  // Only a REAL AssemblyAI job collapses two meetings onto one recording. A
+  // synthetic id (`gmeet-<record>`) is identical for every importer by
+  // design but each of them parsed their own copy, so those stay separate —
+  // `canonicalKeyOf` keys them on `transcripts.id`.
+  const owner = (isRealAaiId(assemblyaiId) ? ownerRowOf(rows) : me) ?? me;
+  if (skipReason(owner)) return { status: 'skipped', reason: 'owner row is a placeholder' };
+
+  const files = opts?.probeFiles === false ? undefined : await probeFiles(owner);
+  const graph = deriveRecordingGraph(owner, files);
+
+  // The owner's own clip is written too when someone else triggered this, so
+  // a shared job converges from whichever side is touched first.
+  const clips = [desiredClipFor(me.id), ...(owner.id === me.id ? [] : [desiredClipFor(owner.id)])];
+  const applied = await applyRecordingGraph({ graph, clips, createdBy: 'recording-sync' });
+
+  return {
+    status: 'written',
+    recordingId: applied.recordingId,
+    clips: clips.length,
+    media: applied.mediaWritten,
+    migratedFrom: applied.migratedFrom,
+    staleMediaRemoved: applied.staleMediaRemoved,
+  };
+}
+
+/**
+ * The call every writer makes: never awaited, never throws, one log line
+ * when something interesting happened (a promotion, a stale file dropped) or
+ * when it failed.
+ *
+ * Concurrent syncs of the same meeting are serialised — two writers touching
+ * one row (the poller stamping a part while a fetch stores its bytes) would
+ * otherwise update the same recording rows in two transactions at once.
+ */
+export function queueRecordingGraphSync(
+  userId: string,
+  assemblyaiId: string,
+  tag: string
+): void {
+  if (!recordingsWriteEnabled()) return;
+  const key = `${userId}|${assemblyaiId}`;
+  const previous = inflight.get(key);
+  const run = (previous ?? Promise.resolve())
+    .catch(() => {})
+    .then(() => syncRecordingGraphForMeeting(userId, assemblyaiId))
+    .then((result) => {
+      if (result.status === 'written' && result.migratedFrom.length > 0) {
+        console.log(
+          `[recording-sync] ${tag} ${assemblyaiId}: promoted onto ${result.recordingId}, ` +
+            `dropped ${result.migratedFrom.join(', ')}`
+        );
+      } else if (result.status === 'written' && result.staleMediaRemoved > 0) {
+        console.log(
+          `[recording-sync] ${tag} ${assemblyaiId}: ${result.staleMediaRemoved} stale media row(s) removed`
+        );
+      }
+      return result;
+    })
+    .catch((err) => {
+      console.warn(`[recording-sync] ${tag} ${assemblyaiId} failed:`, err);
+      return { status: 'skipped', reason: 'error' } as RecordingSyncResult;
+    })
+    .finally(() => {
+      if (inflight.get(key) === run) inflight.delete(key);
+    });
+  inflight.set(key, run);
+}
+
+/**
+ * Permanent delete: the meeting's clips go, and with them any recording that
+ * has no clip left. Awaited by the delete route — a meeting the user asked
+ * to destroy must not leave rows behind, and the call is already on a slow
+ * path (AAI delete + unlinking files).
+ *
+ * The FILE deletion logic is untouched in Phase 1: the route still walks the
+ * row's own `local_audio_path` / `videoParts`. A recording kept alive by
+ * another meeting's clip is logged so the shared-job case is visible while
+ * that stays true.
+ */
+export async function removeRecordingGraphForMeeting(
+  transcriptId: number,
+  tag: string
+): Promise<void> {
+  if (!recordingsWriteEnabled()) return;
+  try {
+    const out = await removeMeetingFromRecordingGraph(transcriptId);
+    if (out.recordingsKept.length > 0) {
+      console.log(
+        `[recording-sync] ${tag} meeting ${transcriptId}: kept ${out.recordingsKept.length} ` +
+          `recording(s) still clipped by another meeting (${out.recordingsKept.join(', ')})`
+      );
+    }
+  } catch (err) {
+    console.warn(`[recording-sync] ${tag} meeting ${transcriptId} cleanup failed:`, err);
+  }
+}
+
+/**
+ * Same, for a row the caller only knows by its `assemblyai_id` — the
+ * placeholder retirements that `deleteForUser` performs (a deferred import
+ * whose real row has just been created, a stitch that could not be kept).
+ * Resolves the int id first, so a placeholder that never had a graph costs
+ * one indexed read and nothing else.
+ */
+export async function removeRecordingGraphForMeetingId(
+  userId: string,
+  assemblyaiId: string,
+  tag: string
+): Promise<void> {
+  if (!recordingsWriteEnabled()) return;
+  try {
+    const rows = await loadGraphMeetingRows(assemblyaiId);
+    const mine = rows.find((r) => r.user_id === userId);
+    if (mine) await removeRecordingGraphForMeeting(mine.id, tag);
+  } catch (err) {
+    console.warn(`[recording-sync] ${tag} ${assemblyaiId} cleanup failed:`, err);
+  }
+}
+
+/**
+ * The A5 derivative sweep removed these `audio-only/<stem>.m4a` files; drop
+ * the rows that described them. Never touches a canonical or a part.
+ */
+export function queueDerivativeMediaDrop(filenames: string[], tag: string): void {
+  if (!recordingsWriteEnabled() || filenames.length === 0) return;
+  void dropDerivativeMediaByFilename(filenames)
+    .then((n) => {
+      if (n > 0) console.log(`[recording-sync] ${tag}: dropped ${n} derivative media row(s)`);
+    })
+    .catch((err) => console.warn(`[recording-sync] ${tag} derivative drop failed:`, err));
+}
+
+/**
+ * DEC-4: the AssemblyAI job was deleted at AssemblyAI. Mirrors the
+ * `gmeet_context.aai` stamp onto `recording_transcriptions`.
+ */
+export function queueProviderDeletedStamp(providerJobId: string, deletedAt: string): void {
+  if (!recordingsWriteEnabled()) return;
+  void stampTranscriptionProviderDeleted(providerJobId, deletedAt).catch((err) =>
+    console.warn(`[recording-sync] provider-deleted stamp failed for ${providerJobId}:`, err)
+  );
+}

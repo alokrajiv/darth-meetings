@@ -9,6 +9,7 @@ import {
 } from '@/db-ops/speaker-mappings';
 import { enrollFromTranscript } from '@/lib/server/voiceprint';
 import { getContentCached } from '@/lib/server/auto-notes';
+import { canonicalMedia, resolveMeetingContent } from '@/lib/server/recordings';
 
 export const runtime = 'nodejs';
 
@@ -83,9 +84,14 @@ export const PUT = withAuth(async ({ user, request }, { params }) => {
 
   // Every confirmed name is free enrollment data: update that person's
   // voiceprint from this meeting's audio (fire-and-forget, best-effort).
+  // Text and media both come from the resolver, so the utterance ms and the
+  // file they are sliced out of always belong to the same timeline.
   void (async () => {
-    const content = await getContentCached(access.ownerUserId, access.row);
-    await enrollFromTranscript(access.row.local_audio_path, content, labels);
+    const [content, resolved] = await Promise.all([
+      getContentCached(access.ownerUserId, access.row),
+      resolveMeetingContent(access.row),
+    ]);
+    await enrollFromTranscript(canonicalMedia(resolved.media), content, labels);
   })().catch((err) => console.warn('[speakers PUT] voiceprint enroll failed:', err));
 
   void logActivity({

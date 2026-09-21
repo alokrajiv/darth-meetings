@@ -18,6 +18,9 @@ import type { GmeetContext } from '@/lib/format';
 const SCHEMA = SCHEMAS.MEETING_WHISPERER;
 
 export interface OfflinePlanRow {
+  /** `transcripts.id` — internal, never served; the media inventory is
+   * resolved per meeting id (lib/server/recordings.ts). */
+  id: number;
   assemblyai_id: string;
   title: string | null;
   recorded_at: string | null;
@@ -35,9 +38,17 @@ export interface OfflinePlanRow {
  * `rev` covers the row fields the transcript page shows (title, description,
  * the three AI artefact stamps, completed_at), the media identity
  * (local_audio_path + videoParts) and the newest edit to the two OWNER-
- * keyed satellite tables (transcript_edits / speaker_mappings are keyed by
+ * keyed satellite tables.
+ *
+ * DO NOT move this onto the recordings tables while every row is compat
+ * (spec §5a): the resolver's `rev` and this one are different things, and a
+ * changed plan rev re-downloads every pinned meeting on every device. It
+ * stays on the columns the writers keep dual-writing until the clips are
+ * what actually decides a meeting's media.
+ *
+ * Those satellite tables (transcript_edits / speaker_mappings) are keyed by
  * the owner's user_id + assemblyai_id — collaborators write into the
- * owner's rows, see transcript-shares.ts). `concat` keeps every separator
+ * owner's rows, see transcript-shares.ts. `concat` keeps every separator
  * for NULLs (unlike concat_ws) so a value moving between columns changes
  * the hash.
  */
@@ -97,7 +108,7 @@ export async function listOfflinePlanRows(
         AND t.status = 'completed'
         ${ids !== null ? sql`AND t.assemblyai_id = ANY(${ids})` : sql``}
     )
-    SELECT assemblyai_id, title, recorded_at, created_at, duration, provider,
+    SELECT id, assemblyai_id, title, recorded_at, created_at, duration, provider,
            local_audio_path, video_parts, rev
     FROM visible
     WHERE rn = 1

@@ -4,7 +4,8 @@ import { z } from 'zod';
 import { tool, createSdkMcpServer } from '@anthropic-ai/claude-agent-sdk';
 import { logPayloadMissing } from '@/lib/server/aai-retention';
 import { runClaudeWithMeta, parseJsonFromClaude } from '@/lib/server/claude-agent';
-import { extractFrame, hasVideoStream } from '@/lib/server/video-frames';
+import { extractFrame, frameSourceFor, hasVideoStream } from '@/lib/server/video-frames';
+import { resolveMeetingContent, type ResolvedMedia } from '@/lib/server/recordings';
 import { recordAiRun, getLatestSessionId } from '@/db-ops/ai-runs';
 import { getServerAccessToken } from '@/lib/server/google-oauth';
 import { fetchRecordingFromDrive, fetchRecordingFromTeams } from '@/lib/server/recording-fetch';
@@ -337,6 +338,17 @@ async function buildPeopleContext(row: TranscriptRow): Promise<string> {
   );
 }
 
+/**
+ * What to call an unnamed diarized speaker in the prompt. A compat meeting's
+ * label is AssemblyAI's bare letter ("A"); a multi-clip meeting's is
+ * `<recordingId>:A`, and pasting a uuid into the prompt tells the model
+ * nothing — the recording is already described in the Sources block.
+ */
+function speakerDisplayLabel(speaker: string): string {
+  const colon = speaker.lastIndexOf(':');
+  return colon >= 0 ? speaker.slice(colon + 1) : speaker;
+}
+
 function buildTranscriptText(
   content: TranscriptResponse,
   labels: SpeakerLabel[]
@@ -347,7 +359,7 @@ function buildTranscriptText(
       .map((l) => [l.originalSpeaker, l.customName.trim()])
   );
   const lines = (content.utterances ?? []).map((u) => {
-    const who = nameFor.get(u.speaker) ?? `Speaker ${u.speaker}`;
+    const who = nameFor.get(u.speaker) ?? `Speaker ${speakerDisplayLabel(u.speaker)}`;
     const t = Math.floor(u.start / 1000);
     const stamp = `${Math.floor(t / 60)}:${String(t % 60).padStart(2, '0')}`;
     return `[${stamp}] ${who}: ${u.text}`;
@@ -356,12 +368,16 @@ function buildTranscriptText(
 }
 
 /**
- * The stored payload, or null. DB-only since DEC-4
+ * The meeting's payload, or null. DB-only since DEC-4
  * (docs/recordings-first-class-design.md §7): whoever observed completion
  * wrote the payload in the same statement, and AssemblyAI's copy is deleted
  * right after — so there is no fallback to fall back to. A finished row with
  * nothing stored is logged loudly rather than silently re-fetched; callers
  * already treat null as "can't run this pass".
+ *
+ * It goes through `resolveMeetingContent`, so a meeting that is more than
+ * one clip over one recording reads as the merged text everything else sees.
+ * In compat that is `imported_content` itself, by reference.
  *
  * `ownerUserId` is kept in the signature: every caller has it and it is what
  * a future re-read would need.
@@ -370,11 +386,20 @@ export async function getContentCached(
   ownerUserId: string,
   row: TranscriptRow
 ): Promise<TranscriptResponse | null> {
-  if (row.imported_content?.utterances?.length) return row.imported_content;
+  const content = (await resolveMeetingContent(row)).content;
+  if (content?.utterances?.length) return content;
   if (row.status === 'completed' || row.status === 'error') {
     logPayloadMissing(row.assemblyai_id, `auto-notes (owner ${ownerUserId})`);
   }
   return null;
+}
+
+/**
+ * The file an AI run may grab frames from — the meeting's canonical one, per
+ * `frameSourceFor`. Null when nothing playable is stored.
+ */
+async function frameSourceForRow(row: TranscriptRow): Promise<ResolvedMedia | null> {
+  return frameSourceFor((await resolveMeetingContent(row)).media);
 }
 
 /**
@@ -654,7 +679,7 @@ export async function generateAutoNotes(
     }
 
     // Harmless when no frame refs; keeps any legacy embeds rendering.
-    notes = rewriteFrameRefs(notes, assemblyaiId, row.local_audio_path);
+    notes = rewriteFrameRefs(notes, assemblyaiId, (await frameSourceForRow(row))?.filename ?? null);
 
     await setAutoNotesForUser(ownerUserId, assemblyaiId, {
       status: 'completed',
@@ -816,13 +841,14 @@ export async function identifySpeakers(
 
     await setSpeakerIdForUser(ownerUserId, assemblyaiId, { status: 'running' });
 
-    const videoOk = row.local_audio_path ? await hasVideoStream(row.local_audio_path) : false;
+    const frameSource = await frameSourceForRow(row);
+    const videoOk = frameSource ? await hasVideoStream(frameSource.filename) : false;
     const durationMs = (row.duration ?? content.audio_duration ?? 0) * 1000 || null;
     const agentOpts = {
       mcpServers: {
         people: buildPeopleTools(),
         ...(videoOk
-          ? { video: buildVideoTools(assemblyaiId, row.local_audio_path!, durationMs) }
+          ? { video: buildVideoTools(assemblyaiId, frameSource!.filename, durationMs) }
           : {}),
       },
       allowedTools: [
@@ -1023,16 +1049,14 @@ export async function generateAutoReport(
       ? `\nUSER INSTRUCTIONS for this report — follow them:\n${instructions}\n\n`
       : '';
 
-    const videoOk =
-      opts.useVideo !== false && row.local_audio_path
-        ? await hasVideoStream(row.local_audio_path)
-        : false;
+    const frameSource = opts.useVideo !== false ? await frameSourceForRow(row) : null;
+    const videoOk = frameSource ? await hasVideoStream(frameSource.filename) : false;
     const durationMs = (row.duration ?? content.audio_duration ?? 0) * 1000 || null;
     const agentOpts = videoOk
       ? {
           effort: 'high',
           mcpServers: {
-            video: buildVideoTools(assemblyaiId, row.local_audio_path!, durationMs),
+            video: buildVideoTools(assemblyaiId, frameSource!.filename, durationMs),
           },
           allowedTools: ['mcp__video__grab_frames'],
         }
@@ -1068,7 +1092,7 @@ export async function generateAutoReport(
       resultChars: report.length,
     });
 
-    report = rewriteFrameRefs(report, assemblyaiId, row.local_audio_path);
+    report = rewriteFrameRefs(report, assemblyaiId, frameSource?.filename ?? null);
 
     await setAutoReportForUser(ownerUserId, assemblyaiId, {
       status: 'completed',

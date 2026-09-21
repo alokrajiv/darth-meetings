@@ -28,6 +28,10 @@ import { copyAudioToTemp, deleteAudioFile } from '@/lib/server/audio-storage';
 import { concatMediaToTemp } from '@/lib/server/media-concat';
 import { IngestError, ingestLocalAudio } from '@/lib/server/ingest';
 import { ingestParsedUtterances } from '@/lib/server/ingest-parsed';
+import {
+  queueRecordingGraphSync,
+  removeRecordingGraphForMeetingId,
+} from '@/lib/server/recording-sync';
 import { resolveAccess } from '@/db-ops/transcript-access';
 import type {
   GmeetAttendee,
@@ -937,6 +941,13 @@ export async function executeGmeetImport(
           console.error('[meetings] repoint retry failed — click-time /m/ link will be lost', opts.placeholderAssemblyaiId, err2)
         );
       }
+      // The placeholder's row is about to vanish; take its clips with it so
+      // no clip is left pointing at a transcript_id nothing answers to.
+      await removeRecordingGraphForMeetingId(
+        user.userId,
+        opts.placeholderAssemblyaiId,
+        'gmeet/import retire-placeholder'
+      );
       await deleteForUser(user.userId, opts.placeholderAssemblyaiId);
     }
 
@@ -1069,6 +1080,10 @@ export async function executeGmeetImport(
         quiet: true,
       });
       row.gmeet_context = { ...row.gmeet_context, ...finalContext };
+      // The context ingest's dual-write saw was the queue-time one; this is
+      // the execution-time one (fresh actuals ⇒ the recording's started_at,
+      // videoParts ⇒ its `part` media). Re-derive.
+      queueRecordingGraphSync(user.userId, row.assemblyai_id, 'gmeet/import');
     }
     const meetingStart = event.startTime ?? actuals?.conferenceStart;
     if (meetingStart && !Number.isNaN(Date.parse(meetingStart))) {

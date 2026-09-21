@@ -66,16 +66,20 @@ export async function upsertForUser(
 /**
  * Patch a single utterance's override. Reads the current map, merges in the
  * new entry, writes back. Used by inline edit (one utterance at a time).
+ *
+ * `utterance` is the map key: a plain index for a compat meeting (what every
+ * caller passes today) or the `<recordingId>:<index>` key a multi-clip
+ * meeting's resolver mints. The route validates the shape.
  */
 export async function patchUtteranceForUser(
   userId: string,
   assemblyaiId: string,
-  utteranceIndex: number,
+  utterance: number | string,
   patch: { text?: string; speaker?: string }
 ): Promise<TranscriptEditsRow> {
   const existing = await getForUser(userId, assemblyaiId);
   const currentEdits = existing?.edits ?? {};
-  const key = String(utteranceIndex);
+  const key = String(utterance);
   const currentEntry = currentEdits[key] ?? {};
   const mergedEntry = { ...currentEntry, ...patch };
 

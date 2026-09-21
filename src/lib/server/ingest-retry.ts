@@ -11,6 +11,7 @@ import {
 import { relinkRecordingTranscript } from '@/db-ops/recorder';
 import { audioFileExists } from '@/lib/server/audio-storage';
 import { IngestError, ingestLocalAudio } from '@/lib/server/ingest';
+import { queueRecordingGraphSync } from '@/lib/server/recording-sync';
 import type { SpeechModel } from '@/lib/aai-language';
 
 /**
@@ -82,6 +83,9 @@ export async function retryIngest(
       const relinked = await relinkRecordingTranscript(fresh.assemblyai_id, out.assemblyai_id).catch(
         () => 0
       );
+      // `ingestLocalAudio` already synced the promoted row; the recorder
+      // relink happens after it and changes `recorder_recording_id`.
+      if (relinked) queueRecordingGraphSync(fresh.user_id, out.assemblyai_id, 'ingest-retry/relink');
       console.log(
         `[ingest-retry] ${fresh.assemblyai_id} → ${out.assemblyai_id} submitted` +
           (relinked ? ` (recorder registry relinked ×${relinked})` : '')
@@ -107,6 +111,9 @@ export async function retryIngest(
         },
         fresh.local_audio_path
       ).catch(() => {});
+      // The row is back at 'error' under its placeholder id — mirror the
+      // status so the transcription does not sit at 'processing' forever.
+      queueRecordingGraphSync(fresh.user_id, fresh.assemblyai_id, 'ingest-retry/failed');
       return { ok: false, error: message };
     } finally {
       clearInterval(heartbeat);

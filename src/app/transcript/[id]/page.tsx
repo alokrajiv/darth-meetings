@@ -36,6 +36,7 @@ import { PeopleCard } from '@/components/people-card';
 import { SpeakerReviewDialog } from '@/components/speaker-review-dialog';
 import { GenerateDialog } from '@/components/generate-dialog';
 import { storedReportPref } from '@/lib/report-pref';
+import { partForMeetingTime, storedVideoParts } from '@/lib/part-offsets';
 import { AttachmentPanel } from '@/components/attachment-panel';
 import { ShareDialog } from '@/components/share-dialog';
 import { LinkEventDialog } from '@/components/link-event-dialog';
@@ -952,34 +953,13 @@ function TranscriptDetailInner({ transcriptId }: { transcriptId: string }) {
     () => row?.gmeet_context?.videoParts ?? [],
     [row?.gmeet_context?.videoParts]
   );
-  const partAnchorMs = useMemo(() => {
-    const g = row?.gmeet_context;
-    const iso =
-      g?.actuals?.anchorIso ??
-      g?.actuals?.recordings?.find((r) => r.fileId && r.fileId === g?.videoFileId)?.startTime ??
-      g?.actuals?.recordings?.[0]?.startTime;
-    const ms = iso ? Date.parse(iso) : NaN;
-    return Number.isNaN(ms) ? null : ms;
-  }, [row?.gmeet_context]);
+  // The arithmetic itself lives in lib/part-offsets.ts — the ONE place that
+  // knows where a part starts on the meeting timeline, shared with the
+  // server-side resolver so the player and the transcript can never quietly
+  // disagree.
   const storedParts = useMemo(
-    () =>
-      videoParts
-        .map((p, i) => {
-          const startMs = p.startTime ? Date.parse(p.startTime) : NaN;
-          const endMs = p.endTime ? Date.parse(p.endTime) : NaN;
-          return {
-            partNo: i + 2,
-            filename: p.filename,
-            offsetSec:
-              partAnchorMs != null && !Number.isNaN(startMs)
-                ? (startMs - partAnchorMs) / 1000
-                : null,
-            durationSec:
-              !Number.isNaN(startMs) && !Number.isNaN(endMs) ? (endMs - startMs) / 1000 : null,
-          };
-        })
-        .filter((p) => !!p.filename),
-    [videoParts, partAnchorMs]
+    () => storedVideoParts(row?.gmeet_context),
+    [row?.gmeet_context]
   );
   // Segments Google is still generating (recordingPending watches them) or
   // whose bytes we haven't pulled yet — surfaced so a second video is never
@@ -1000,15 +980,7 @@ function TranscriptDetailInner({ transcriptId }: { transcriptId: string }) {
    */
   const seekMeetingTime = useCallback(
     (seconds: number, opts?: { play?: boolean }) => {
-      let target = 1;
-      let offset = 0;
-      for (const p of storedParts) {
-        if (p.offsetSec != null && seconds >= p.offsetSec && p.offsetSec > offset) {
-          target = p.partNo;
-          offset = p.offsetSec;
-        }
-      }
-      const local = Math.max(0, seconds - offset);
+      const { partNo: target, localSec: local } = partForMeetingTime(storedParts, seconds);
       if (target !== activePart) {
         pendingPartSeekRef.current = { t: local, play: !!opts?.play };
         setActivePart(target);
