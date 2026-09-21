@@ -41,7 +41,9 @@ export type ActivityAction =
   | 'set_notes'
   | 'set_report'
   | 'label_add'
-  | 'label_remove';
+  | 'label_remove'
+  | 'split_off'
+  | 'split_from';
 
 export interface ActivityRow {
   id: number;
@@ -167,6 +169,10 @@ function actionVerb(row: ActivityRow): string {
       const d = row.details as { path?: string } | null;
       return d?.path ? `removed label ${d.path}` : 'removed a label';
     }
+    case 'split_off':
+      return 'split a part off into its own meeting';
+    case 'split_from':
+      return 'split this off a longer recording';
     default:
       return row.action;
   }

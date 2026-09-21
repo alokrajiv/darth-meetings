@@ -9,6 +9,8 @@ import {
   type ClipTextPolicy,
   isClipTextPolicy,
 } from '@/lib/recording-clips';
+import { windowBoundsFor, type ClipWindow } from '@/lib/clips';
+import { storedClipsInContext as storedClipsFromContext } from '@/lib/recording-graph';
 import {
   loadMeetingRecordingGraph,
   loadMeetingRecordingGraphs,
@@ -82,6 +84,24 @@ export interface ResolvedMedia {
   blobName: string | null;
   /** The `audio_only` extract of THIS file, when one has been built. */
   audioOnly: ResolvedMediaDerivative | null;
+  /**
+   * The window of this FILE the meeting uses, in file ms (Phase 3a,
+   * docs/recordings-phase3-clips-spec.md "Media and the window").
+   *
+   * `null`/`null` = the whole file, which is what every meeting that was never
+   * split has — and also what a SOURCE meeting keeps after a shrink: it still
+   * plays every second, it just has a hole in the middle (the clips say where;
+   * `holesOf` in lib/clips.ts turns them into the gaps the player skips).
+   *
+   * A split-off meeting gets real bounds. Nothing is cut: `/audio` serves the
+   * same bytes as always and the PLAYER clamps — displayed time is file time
+   * minus `windowFromMs`, seeking maps back, playback stops at `windowToMs`.
+   * The ms mapping itself is `localMsIn`, which every frame grab and every
+   * voiceprint snippet already goes through.
+   */
+  windowFromMs: number | null;
+  /** null = to the end of the file. */
+  windowToMs: number | null;
 }
 
 /**
@@ -160,13 +180,27 @@ function mediaFromRow(row: MediaOnlyRow): ResolvedMedia[] {
   const durationMs = row.duration != null ? Math.round(row.duration * 1000) : null;
   const media: ResolvedMedia[] = [];
   if (row.local_audio_path) {
+    // The row's OWN mirror of its clips (`gmeet_context.clips`) is what makes
+    // this path correct for a split meeting even with MW_RECORDINGS off: the
+    // window and the offset are on the row, so the player still clamps and
+    // `localMsIn` still maps meeting ms onto the file. Absent = the whole
+    // file, byte for byte what Phase 1 returned.
+    // Timeline order, exactly as `placeRecordings` uses below: the clip that
+    // lands FIRST on the meeting's timeline is the one whose
+    // `offset_ms − from_ms` places the file. `ord` is identity, not position
+    // (§5a), so reading `clips[0]` off the stored array would be wrong the
+    // moment a second split re-ordered it.
+    const stored = storedClipsFromContext(row.gmeet_context);
+    const first = stored ? [...stored].sort(compareClipsOnTimeline)[0]! : null;
+    const window = first ? windowBoundsFor(stored!, first.recordingId) : null;
+    const base = first ? first.offsetMs - first.fromMs : 0;
     media.push({
       part: 1,
       mediaId: '',
       recordingId: '',
       filename: row.local_audio_path,
       isVideo: isVideoName(row.local_audio_path),
-      offsetMs: 0,
+      offsetMs: base,
       durationMs,
       transcribed: true,
       // Fallback mode reads the `transcripts` row alone, which knows nothing
@@ -174,6 +208,8 @@ function mediaFromRow(row: MediaOnlyRow): ResolvedMedia[] {
       // `?variant=audio` still works — it goes through the local extract.
       blobName: null,
       audioOnly: null,
+      windowFromMs: window?.fromMs ?? null,
+      windowToMs: window?.toMs ?? null,
     });
   }
   // The extra videos of a stop-restart Meet recording, placed by the SAME
@@ -191,6 +227,10 @@ function mediaFromRow(row: MediaOnlyRow): ResolvedMedia[] {
       transcribed: false,
       blobName: null,
       audioOnly: null,
+      // A stop/restart part is never windowed: a split only ever takes a
+      // window of the canonical file (a multi-part meeting refuses to split).
+      windowFromMs: null,
+      windowToMs: null,
     });
   }
   return media;
@@ -242,7 +282,8 @@ function activeTranscriptionFor(
 function mediaForRecordings(
   orderedRecordingIds: string[],
   graph: MeetingRecordingGraph,
-  clipOffsetMs: Map<string, number>
+  clipOffsetMs: Map<string, number>,
+  windows: Map<string, { fromMs: number | null; toMs: number | null }>
 ): ResolvedMedia[] {
   const out: ResolvedMedia[] = [];
   // Derivatives by the media they were built from. `graph.media` already
@@ -282,6 +323,11 @@ function mediaForRecordings(
         transcribed: covered.size === 0 ? m.kind === 'canonical' : covered.has(m.id),
         blobName: m.blob_name,
         audioOnly: derivatives.get(m.id) ?? null,
+        // Only the CANONICAL file carries the meeting's window: a clip always
+        // windows the file the transcription was made from, and a meeting with
+        // stop/restart parts cannot be split at all.
+        windowFromMs: m.kind === 'canonical' ? (windows.get(recordingId)?.fromMs ?? null) : null,
+        windowToMs: m.kind === 'canonical' ? (windows.get(recordingId)?.toMs ?? null) : null,
       });
     }
   }
@@ -290,6 +336,38 @@ function mediaForRecordings(
 
 function clipPolicy(raw: string): ClipTextPolicy {
   return isClipTextPolicy(raw) ? raw : 'include';
+}
+
+/**
+ * The meeting's placement of each recording: where its first clip lands
+ * (`offset_ms − from_ms`, the number `localMsIn` inverts) and the bounds the
+ * player must clamp to. One pass over the clips, shared by both resolvers.
+ */
+function placeRecordings(
+  clips: Array<{ ord: number; recording_id: string; from_ms: number; to_ms: number | null; offset_ms: number }>
+): {
+  orderedRecordingIds: string[];
+  clipOffsetMs: Map<string, number>;
+  windows: Map<string, { fromMs: number | null; toMs: number | null }>;
+} {
+  const orderedRecordingIds: string[] = [];
+  const clipOffsetMs = new Map<string, number>();
+  for (const c of clips) {
+    if (!orderedRecordingIds.includes(c.recording_id)) {
+      orderedRecordingIds.push(c.recording_id);
+      clipOffsetMs.set(c.recording_id, c.offset_ms - c.from_ms);
+    }
+  }
+  const asWindows: ClipWindow[] = clips.map((c) => ({
+    ord: c.ord,
+    recordingId: c.recording_id,
+    fromMs: c.from_ms,
+    toMs: c.to_ms,
+    offsetMs: c.offset_ms,
+  }));
+  const windows = new Map<string, { fromMs: number | null; toMs: number | null }>();
+  for (const id of orderedRecordingIds) windows.set(id, windowBoundsFor(asWindows, id));
+  return { orderedRecordingIds, clipOffsetMs, windows };
 }
 
 /**
@@ -330,14 +408,7 @@ export async function resolveMeetingContent(
       { offsetMs: b.offset_ms, ord: b.ord }
     )
   );
-  const orderedRecordingIds: string[] = [];
-  const clipOffsetMs = new Map<string, number>();
-  for (const c of clips) {
-    if (!orderedRecordingIds.includes(c.recording_id)) {
-      orderedRecordingIds.push(c.recording_id);
-      clipOffsetMs.set(c.recording_id, c.offset_ms - c.from_ms);
-    }
-  }
+  const { orderedRecordingIds, clipOffsetMs, windows } = placeRecordings(clips);
 
   const resolvable: ResolvableClip[] = clips.map((c) => {
     const transcription = activeTranscriptionFor(loaded, c.recording_id, c.transcription_id);
@@ -361,7 +432,10 @@ export async function resolveMeetingContent(
     completedAt: row.completed_at,
   });
 
-  const media = scopeMediaToRow(row, mediaForRecordings(orderedRecordingIds, loaded, clipOffsetMs));
+  const media = scopeMediaToRow(
+    row,
+    mediaForRecordings(orderedRecordingIds, loaded, clipOffsetMs, windows)
+  );
 
   return {
     content: resolved.content,
@@ -467,15 +541,11 @@ export async function resolveMediaForMeetings(
         { offsetMs: b.offset_ms, ord: b.ord }
       )
     );
-    const orderedRecordingIds: string[] = [];
-    const clipOffsetMs = new Map<string, number>();
-    for (const c of clips) {
-      if (!orderedRecordingIds.includes(c.recording_id)) {
-        orderedRecordingIds.push(c.recording_id);
-        clipOffsetMs.set(c.recording_id, c.offset_ms - c.from_ms);
-      }
-    }
-    out.set(row.id, scopeMediaToRow(row, mediaForRecordings(orderedRecordingIds, graph, clipOffsetMs)));
+    const { orderedRecordingIds, clipOffsetMs, windows } = placeRecordings(clips);
+    out.set(
+      row.id,
+      scopeMediaToRow(row, mediaForRecordings(orderedRecordingIds, graph, clipOffsetMs, windows))
+    );
   }
   return out;
 }

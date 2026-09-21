@@ -17,6 +17,8 @@ import { SCHEMAS } from '@/lib/constants/database';
 //   share_remove      — collaborator removed
 //   label_add         — label assigned   (details {label_id, path})
 //   label_remove      — label unassigned (details {label_id, path})
+//   split_off         — a window of this meeting became its own (details {newId, fromMs, toMs})
+//   split_from        — this meeting was split off another (details {sourceId, fromMs, toMs})
 
 const SCHEMA = SCHEMAS.MEETING_WHISPERER;
 
@@ -36,7 +38,11 @@ export type ActivityAction =
   | 'set_notes'
   | 'set_report'
   | 'label_add'
-  | 'label_remove';
+  | 'label_remove'
+  // Phase 3a clips: `split_off` on the SOURCE ("a part of this became its own
+  // meeting"), `split_from` on the new one. Both carry the window in ms.
+  | 'split_off'
+  | 'split_from';
 
 export interface ActivityRow {
   id: number;

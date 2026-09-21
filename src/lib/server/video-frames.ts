@@ -4,7 +4,7 @@ import { promises as fsp } from 'node:fs';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { getStorageDir, resolveAudioPath } from '@/lib/server/audio-storage';
-import { canonicalMedia, type ResolvedMedia } from '@/lib/server/recordings';
+import { canonicalMedia, localMsIn, type ResolvedMedia } from '@/lib/server/recordings';
 
 const execFileP = promisify(execFile);
 
@@ -18,16 +18,35 @@ const execFileP = promisify(execFile);
 /**
  * Which of a meeting's files a frame at a MEETING-time offset is taken from.
  *
- * Today: always the canonical one, whatever the timestamp — the same "frames
- * read the primary file only" rule the app has always had (design §4,
- * landmine #15). Every `frame:<ms>` already written into a summary or report
- * means "ms into the canonical file", so picking a stop-restart part by its
- * offset here would silently re-point existing citations at a different
- * image. Mapping meeting ms → (file, local ms) arrives with Phase 3, when a
- * clip can have a real window; this function is where it lands.
+ * Always the canonical one, whatever the timestamp — the same "frames read the
+ * primary file only" rule the app has always had (design §4, landmine #15).
+ * Every `frame:<ms>` already written into a summary or report means "ms into
+ * this meeting", so picking a stop-restart part by its offset here would
+ * silently re-point existing citations at a different image.
  */
 export function frameSourceFor(media: ResolvedMedia[]): ResolvedMedia | null {
   return canonicalMedia(media);
+}
+
+/**
+ * THE meeting-ms → (file, file-ms) seam (landmine #15, closed in Phase 3a).
+ *
+ * A meeting split off a longer recording plays a WINDOW of the same file, so
+ * its `frame:<ms>` citations — which are meeting-relative, and must stay that
+ * way for the notes to keep working — are `windowFromMs + ms` into the file.
+ * `localMsIn` is the one arithmetic that says so, and every frame grab goes
+ * through here: the route, the notes agent's `grab_frames` tool, and the
+ * pre-warm that follows a generated report.
+ *
+ * Null when nothing playable is stored.
+ */
+export function frameRequestFor(
+  media: ResolvedMedia[],
+  meetingMs: number
+): { source: ResolvedMedia; fileMs: number } | null {
+  const source = frameSourceFor(media);
+  if (!source) return null;
+  return { source, fileMs: localMsIn(source, meetingMs) };
 }
 
 const FRAME_WIDTH = 960; // ~700 tokens/frame for the model; plenty for slides
@@ -112,16 +131,24 @@ export function framePath(assemblyaiId: string, ms: number): string {
 }
 
 /**
- * Extract (or reuse a cached) frame at `ms` into the frame cache dir.
+ * Extract (or reuse a cached) frame into the frame cache dir.
  * Returns the absolute path of the jpeg. Throws if ffmpeg fails (no video
  * stream, timestamp past EOF, …).
+ *
+ * `fileMs` is an offset into the FILE (what ffmpeg seeks to); `cacheMs` is the
+ * MEETING-time offset the citation used, and is what the cache is keyed by —
+ * two meetings clipping one recording each keep their own cache under their
+ * own id, at the ms their own notes name. Callers get both from
+ * `frameRequestFor`; they are equal for every meeting that was never split.
  */
 export async function extractFrame(
   assemblyaiId: string,
   audioFilename: string,
-  ms: number
+  fileMs: number,
+  cacheMs: number = fileMs
 ): Promise<string> {
-  const out = framePath(assemblyaiId, ms);
+  const ms = fileMs;
+  const out = framePath(assemblyaiId, cacheMs);
   try {
     await fsp.access(out);
     return out; // cached

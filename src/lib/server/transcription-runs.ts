@@ -30,6 +30,12 @@ import { decideRunPoll, type RunPollObservation } from '@/lib/transcription-run-
 import { getTranscript, isAaiNotFound, submitTranscription, uploadFile } from '@/lib/server/assemblyai';
 import { vocabForSubmit } from '@/lib/server/ingest';
 import { audioFileSize, resolveAudioPath } from '@/lib/server/audio-storage';
+import { rematerialiseMeetingsOnRecording } from '@/lib/server/clip-materialise';
+import {
+  alignMeetingsToTranscription,
+  listMeetingsOnRecording,
+  type MeetingOnRecording,
+} from '@/db-ops/clips';
 import { onTranscriptCompleted } from '@/lib/server/post-completion';
 import { queueRecordingGraphSync } from '@/lib/server/recording-sync';
 import type { StoredTranscript } from '@/lib/format';
@@ -430,6 +436,28 @@ async function pollOnce(target: RunPollRow): Promise<void> {
 // Switching versions
 // ---------------------------------------------------------------------------
 
+
+/**
+ * Align every meeting on the recording to the version that has just gone
+ * live, and hand back the ones that are NOT the meeting being activated (the
+ * caller queues their graph syncs). Never throws: a version that is live must
+ * not be rolled back because a sibling's bookkeeping failed.
+ */
+async function alignAndListMeetings(
+  recordingId: string,
+  transcriptionId: string,
+  self: { id: number }
+): Promise<MeetingOnRecording[]> {
+  try {
+    await alignMeetingsToTranscription(recordingId, transcriptionId);
+    const all = await listMeetingsOnRecording(recordingId);
+    return all.filter((m) => m.transcript_id !== self.id);
+  } catch (err) {
+    console.warn(`[transcription-run] sibling alignment on ${recordingId} failed:`, err);
+    return [];
+  }
+}
+
 export type ActivateOutcome =
   | {
       ok: true;
@@ -489,11 +517,36 @@ export async function activateTranscription(input: {
 
   await applyActivatePlan(decision, { assemblyaiId: row.assemblyai_id });
 
+  // Phase 3a: a version swap re-materialises EVERY meeting with a clip on
+  // this recording — their windows stay, their text updates
+  // (docs/recordings-phase3-clips-spec.md "Model"). This meeting included:
+  // the plan above copied the WHOLE payload onto the row, which is right for
+  // an un-clipped meeting and wrong for a clipped one, and this is what puts
+  // its window back. Un-clipped meetings are skipped inside, so the 1:1 case
+  // — every row on prod — costs one cheap query and no write.
+  await rematerialiseMeetingsOnRecording(ref.recordingId, 'activate').catch((err) =>
+    console.warn(`[transcription-run] ${row.assemblyai_id}: re-materialise after activate failed:`, err)
+  );
+
+  // Phase 3a again, and the half that is easy to miss: a run can be started
+  // from ANY meeting on the recording, including one that only holds a window
+  // of it. The OTHER meetings now show the new text, so their rows must also
+  // name the new job, model and language — otherwise the graph derived from
+  // the meeting that OWNS the recording would describe a transcription that
+  // is not the active one, and DEC-4 retention would still hold the old job.
+  const siblings = await alignAndListMeetings(ref.recordingId, decision.activeTranscriptionId, row);
+
   // The dual-write re-derives the meeting's graph from the row it has just
   // been given — with the recording's new active pointer as an input, so it
   // targets the version that is now live instead of re-deriving the one the
   // meeting was born with (lib/recording-graph.ts `GraphTableFacts`).
   queueRecordingGraphSync(input.ownerUserId, row.assemblyai_id, 'transcription-activate');
+  // …and the same for every other meeting on the recording. A borrower's sync
+  // writes its clips and stops; the owner's re-derives the transcription row
+  // (its `covers`, its job id) from the row that has just been aligned.
+  for (const s of siblings) {
+    queueRecordingGraphSync(s.user_id, s.assemblyai_id, 'transcription-activate/sibling');
+  }
 
   if (decision.brandNew) {
     // A new diarization space: the speaker suggestions and the ID pass have to

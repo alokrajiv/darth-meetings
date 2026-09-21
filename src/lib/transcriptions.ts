@@ -89,8 +89,11 @@ export interface TranscriptionsResponse {
   canEdit: boolean;
   running: RunningTranscription | null;
   versions: TranscriptionVersion[];
-  /** Set when the summary/report were written from another version. */
-  notesStale: { since: string; fromTranscriptionId: string } | null;
+  /** Set when the summary/report were written from another version — or, as
+   * of Phase 3a, from a WIDER window of the same recording (a part of this
+   * meeting was split off). `reason`, when present, is the sentence to show
+   * instead of the default "Written from the previous transcription". */
+  notesStale: { since: string; fromTranscriptionId: string; reason?: string } | null;
 }
 
 /** POST /api/transcripts/:id/transcriptions/:tid/activate — response. */

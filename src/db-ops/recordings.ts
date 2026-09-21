@@ -747,6 +747,9 @@ export interface ApplyRecordingGraphResult {
   migratedFrom: string[];
   mediaWritten: number;
   staleMediaRemoved: number;
+  /** Clip rows dropped because the row no longer declares that `ord` — how an
+   * un-split closes the hole it left (Phase 3a). */
+  staleClipsRemoved: number;
 }
 
 /**
@@ -767,6 +770,7 @@ export async function applyRecordingGraph(
   const keepMediaIds = graph.media.map((m) => m.id);
   const migratedFrom: string[] = [];
   let staleMediaRemoved = 0;
+  let staleClipsRemoved = 0;
   // Asked before the transaction opens — see the note at its only use below.
   const has046 = await transcriptionVersionTablesExist().catch(() => false);
   // Same reason (a missing table aborts the transaction): the stale-media
@@ -865,13 +869,19 @@ export async function applyRecordingGraph(
     }
 
     const t = graph.transcription;
+    // `wholeRecording` false = this meeting is CLIPPED and its
+    // `imported_content` is the materialised window. Sending NULL makes the
+    // `COALESCE(EXCLUDED.payload, …)` below a no-op, so the recording's real
+    // transcription survives a re-derivation of a split meeting's graph
+    // (docs/recordings-phase3-clips-spec.md "Model").
     await tx`
       INSERT INTO ${tx(SCHEMA)}.recording_transcriptions
         (id, recording_id, provider, provider_job_id, speech_model, language_code,
          status, payload, covers, created_at, completed_at)
       SELECT ${t.id}::uuid, ${rec.id}::uuid, ${t.provider}, ${t.providerJobId},
              ${t.speechModel}, ${t.languageCode}, ${t.status},
-             src.imported_content, ${tx.json(t.covers as never)},
+             ${graph.wholeRecording ? tx`src.imported_content` : tx`NULL::jsonb`},
+             ${tx.json(t.covers as never)},
              src.created_at, src.completed_at
       FROM ${tx(SCHEMA)}.transcripts src
       WHERE src.id = ${graph.payloadFromTranscriptId}
@@ -900,7 +910,7 @@ export async function applyRecordingGraph(
         INSERT INTO ${tx(SCHEMA)}.meeting_clips
           (transcript_id, ord, recording_id, transcription_id, from_ms, to_ms,
            offset_ms, text_policy, created_by)
-        VALUES (${clip.transcriptId}, ${clip.ord}, ${rec.id}::uuid,
+        VALUES (${clip.transcriptId}, ${clip.ord}, ${clip.recordingId ?? rec.id}::uuid,
                 ${clip.transcriptionId}::uuid, ${clip.fromMs}, ${clip.toMs},
                 ${clip.offsetMs}, ${clip.textPolicy}, ${input.createdBy ?? null})
         ON CONFLICT (transcript_id, ord) DO UPDATE SET
@@ -910,6 +920,20 @@ export async function applyRecordingGraph(
           offset_ms    = EXCLUDED.offset_ms,
           text_policy  = EXCLUDED.text_policy
       `;
+    }
+
+    // Clips the row no longer declares. An un-split is the case that needs
+    // this: the source goes back from two clips to one, and without the
+    // delete the second window would live on and the hole with it. The
+    // meeting's own ords are the only ones touched.
+    for (const transcriptId of new Set(clips.map((c) => c.transcriptId))) {
+      const keep = clips.filter((c) => c.transcriptId === transcriptId).map((c) => c.ord);
+      const dropped = await tx<Array<{ ord: number }>>`
+        DELETE FROM ${tx(SCHEMA)}.meeting_clips
+        WHERE transcript_id = ${transcriptId} AND NOT (ord = ANY(${keep}))
+        RETURNING ord
+      `;
+      staleClipsRemoved += dropped.length;
     }
 
     // Promotion: a clip has just moved off the placeholder's recording. If
@@ -987,7 +1011,120 @@ export async function applyRecordingGraph(
     migratedFrom,
     mediaWritten: graph.media.length,
     staleMediaRemoved,
+    staleClipsRemoved,
   };
+}
+
+export interface SiblingMeetingRow {
+  transcript_id: number;
+  assemblyai_id: string;
+  title: string | null;
+  from_ms: number;
+  to_ms: number | null;
+  duration: number | null;
+  trashed: boolean;
+  split_from: string | null;
+}
+
+/**
+ * CALLER-SCOPED — the other meetings on these recordings that THIS caller can
+ * open ("also from this recording: …").
+ *
+ * The scoping is the whole point and the reason this is not a plain join on
+ * `meeting_clips`: a recording has no ACL, so the only thing that may decide
+ * whether a sibling is mentioned is whether the caller could open it as a
+ * MEETING (owner, or a share on their lower-cased email — the same predicate
+ * `resolveAccess` and the listing use). A sibling's id, its title, its window
+ * and even the fact that a count is non-zero are all leaks: a person shared
+ * only the split-off half must not be able to tell that the longer meeting it
+ * came from exists (spec §API, feedback_privacy_caller_scoping_gate).
+ *
+ * Trashed meetings ARE returned, flagged: they still hold their clip, they
+ * still keep the bytes alive, and the caller may want to restore one.
+ */
+export async function listSiblingMeetingsForRecordings(
+  recordingIds: string[],
+  excludeTranscriptId: number,
+  caller: { userId: string; email: string }
+): Promise<SiblingMeetingRow[]> {
+  if (recordingIds.length === 0) return [];
+  const normEmail = caller.email.trim().toLowerCase();
+  return sql<SiblingMeetingRow[]>`
+    SELECT DISTINCT ON (t.id)
+           t.id   AS transcript_id,
+           t.assemblyai_id,
+           t.title,
+           c.from_ms::float8 AS from_ms,
+           c.to_ms::float8   AS to_ms,
+           t.duration,
+           (t.deleted_at IS NOT NULL) AS trashed,
+           t.gmeet_context->'splitFrom'->>'meetingId' AS split_from
+    FROM ${sql(SCHEMA)}.meeting_clips c
+    JOIN ${sql(SCHEMA)}.transcripts t ON t.id = c.transcript_id
+    LEFT JOIN ${sql(SCHEMA)}.transcript_shares s
+      ON s.transcript_id = t.id AND s.shared_with_email = ${normEmail}
+    WHERE c.recording_id = ANY(${recordingIds}::uuid[])
+      AND c.transcript_id <> ${excludeTranscriptId}
+      AND (t.user_id = ${caller.userId} OR s.id IS NOT NULL)
+    ORDER BY t.id, c.ord
+  `;
+}
+
+/**
+ * INTERNAL-ONLY — write ONLY a meeting's clips, over a recording it does not
+ * own (Phase 3a: the meeting that was split off another one).
+ *
+ * A borrower has its own row, its own `local_audio_path` (the source's
+ * canonical filename, so it plays) and its own materialised text — but no
+ * recording, no media and no transcription of its own. Running the full
+ * `applyRecordingGraph` for it would mint a SECOND recording over the same
+ * bytes; running nothing at all would let a healed sync point it back at the
+ * whole file. So: exactly the clips, plus the same stale-ord delete.
+ *
+ * The caller has already decided the meeting is theirs to write (it just
+ * changed the row) and has checked that the recording exists.
+ */
+export async function applyMeetingClips(
+  transcriptId: number,
+  clips: DesiredClip[],
+  createdBy?: string | null
+): Promise<{ written: number; staleClipsRemoved: number }> {
+  let staleClipsRemoved = 0;
+  await sql.begin(async (tx) => {
+    for (const clip of clips) {
+      if (!clip.recordingId) throw new Error('applyMeetingClips needs an explicit recordingId');
+      await tx`
+        INSERT INTO ${tx(SCHEMA)}.meeting_clips
+          (transcript_id, ord, recording_id, transcription_id, from_ms, to_ms,
+           offset_ms, text_policy, created_by)
+        VALUES (${transcriptId}, ${clip.ord}, ${clip.recordingId}::uuid,
+                ${clip.transcriptionId}::uuid, ${clip.fromMs}, ${clip.toMs},
+                ${clip.offsetMs}, ${clip.textPolicy}, ${createdBy ?? null})
+        ON CONFLICT (transcript_id, ord) DO UPDATE SET
+          recording_id = EXCLUDED.recording_id,
+          from_ms      = EXCLUDED.from_ms,
+          to_ms        = EXCLUDED.to_ms,
+          offset_ms    = EXCLUDED.offset_ms,
+          text_policy  = EXCLUDED.text_policy
+      `;
+    }
+    const keep = clips.map((c) => c.ord);
+    const dropped = await tx<Array<{ ord: number }>>`
+      DELETE FROM ${tx(SCHEMA)}.meeting_clips
+      WHERE transcript_id = ${transcriptId} AND NOT (ord = ANY(${keep}))
+      RETURNING ord
+    `;
+    staleClipsRemoved = dropped.length;
+  });
+  return { written: clips.length, staleClipsRemoved };
+}
+
+/** INTERNAL-ONLY — does this recording row exist (and is it live)? */
+export async function recordingExists(recordingId: string): Promise<boolean> {
+  const rows = await sql<Array<{ id: string }>>`
+    SELECT id FROM ${sql(SCHEMA)}.recordings WHERE id = ${recordingId}::uuid
+  `;
+  return rows.length > 0;
 }
 
 export interface RemoveMeetingGraphResult {

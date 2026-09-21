@@ -5,7 +5,7 @@ import { tool, createSdkMcpServer } from '@anthropic-ai/claude-agent-sdk';
 import { logPayloadMissing } from '@/lib/server/aai-retention';
 import { runClaudeWithMeta, parseJsonFromClaude } from '@/lib/server/claude-agent';
 import { extractFrame, frameSourceFor, hasVideoStream } from '@/lib/server/video-frames';
-import { resolveMeetingContent, type ResolvedMedia } from '@/lib/server/recordings';
+import { localMsIn, resolveMeetingContent, type ResolvedMedia } from '@/lib/server/recordings';
 import { recordAiRun, getLatestSessionId } from '@/db-ops/ai-runs';
 import { getServerAccessToken } from '@/lib/server/google-oauth';
 import { fetchRecordingFromDrive, fetchRecordingFromTeams } from '@/lib/server/recording-fetch';
@@ -407,7 +407,8 @@ async function frameSourceForRow(row: TranscriptRow): Promise<ResolvedMedia | nu
  * A closure counter caps total frames per run — vision tokens are the cost
  * driver here, not ffmpeg.
  */
-function buildVideoTools(assemblyaiId: string, audioFilename: string, durationMs: number | null) {
+function buildVideoTools(assemblyaiId: string, source: ResolvedMedia, durationMs: number | null) {
+  const audioFilename = source.filename;
   let grabbed = 0;
   const MAX_PER_CALL = 8;
   const MAX_PER_RUN = 24;
@@ -441,7 +442,11 @@ function buildVideoTools(assemblyaiId: string, audioFilename: string, durationMs
             const m = Math.floor(ms / 60000);
             const s = Math.floor((ms % 60000) / 1000);
             try {
-              const abs = await extractFrame(assemblyaiId, audioFilename, ms);
+              // The model asks in MEETING ms (what the transcript it is
+              // reading shows). For a meeting split off a longer recording,
+              // the file is shared and the seek is `localMsIn` — the same
+              // mapping the `frame:<ms>` it writes will be served through.
+              const abs = await extractFrame(assemblyaiId, audioFilename, localMsIn(source, ms), ms);
               const data = await fsp.readFile(abs);
               grabbed++;
               content.push({ type: 'text', text: `Frame at ${m}:${String(s).padStart(2, '0')} (${ms} ms):` });
@@ -459,10 +464,12 @@ function buildVideoTools(assemblyaiId: string, audioFilename: string, durationMs
 
 /** Rewrite the agent's frame:<ms> refs to real serving URLs and pre-warm the
  * extraction cache so first render is instant. */
-function rewriteFrameRefs(notes: string, assemblyaiId: string, audioFilename: string | null): string {
+function rewriteFrameRefs(notes: string, assemblyaiId: string, source: ResolvedMedia | null): string {
   return notes.replace(/\(frame:(\d+)\)/g, (_m, msStr: string) => {
     const ms = Number.parseInt(msStr, 10);
-    if (audioFilename) void extractFrame(assemblyaiId, audioFilename, ms).catch(() => {});
+    if (source) {
+      void extractFrame(assemblyaiId, source.filename, localMsIn(source, ms), ms).catch(() => {});
+    }
     return `(/api/transcripts/${assemblyaiId}/frames/${ms}.jpg)`;
   });
 }
@@ -679,7 +686,7 @@ export async function generateAutoNotes(
     }
 
     // Harmless when no frame refs; keeps any legacy embeds rendering.
-    notes = rewriteFrameRefs(notes, assemblyaiId, (await frameSourceForRow(row))?.filename ?? null);
+    notes = rewriteFrameRefs(notes, assemblyaiId, await frameSourceForRow(row));
 
     await setAutoNotesForUser(ownerUserId, assemblyaiId, {
       status: 'completed',
@@ -848,7 +855,7 @@ export async function identifySpeakers(
       mcpServers: {
         people: buildPeopleTools(),
         ...(videoOk
-          ? { video: buildVideoTools(assemblyaiId, frameSource!.filename, durationMs) }
+          ? { video: buildVideoTools(assemblyaiId, frameSource!, durationMs) }
           : {}),
       },
       allowedTools: [
@@ -1056,7 +1063,7 @@ export async function generateAutoReport(
       ? {
           effort: 'high',
           mcpServers: {
-            video: buildVideoTools(assemblyaiId, frameSource!.filename, durationMs),
+            video: buildVideoTools(assemblyaiId, frameSource!, durationMs),
           },
           allowedTools: ['mcp__video__grab_frames'],
         }
@@ -1092,7 +1099,7 @@ export async function generateAutoReport(
       resultChars: report.length,
     });
 
-    report = rewriteFrameRefs(report, assemblyaiId, frameSource?.filename ?? null);
+    report = rewriteFrameRefs(report, assemblyaiId, frameSource);
 
     await setAutoReportForUser(ownerUserId, assemblyaiId, {
       status: 'completed',

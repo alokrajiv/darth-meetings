@@ -23,6 +23,7 @@
 
 import { createHash } from 'node:crypto';
 import type { GmeetContext } from '@/lib/format';
+import type { StoredClips } from '@/lib/clips';
 import { aaiJobIdOf } from '@/lib/aai-job-state';
 import { videoPartOffsets } from '@/lib/part-offsets';
 
@@ -267,13 +268,21 @@ export interface DesiredTranscription {
   covers: { media: string[]; timeline: 'wall' | 'concat' };
 }
 
-/** The clip a Phase 1 meeting takes: the whole recording, in place. */
+/**
+ * A clip the meeting row says it takes.
+ *
+ * Phase 1: always exactly one, over the whole recording. Phase 3a: whatever
+ * `gmeet_context.clips` says — see `desiredClipsFor`, and `recordingId`, which
+ * is how a SPLIT-OFF meeting points at a recording it does not derive.
+ */
 export interface DesiredClip {
   transcriptId: number;
   ord: number;
+  /** The recording the clip reads. Absent = the one this row derives. */
+  recordingId?: string;
   transcriptionId: null;
   fromMs: number;
-  toMs: null;
+  toMs: number | null;
   offsetMs: number;
   textPolicy: 'include';
 }
@@ -286,6 +295,21 @@ export interface DesiredGraph {
   /** `transcripts.id` whose `imported_content` is the transcription payload —
    * copied in SQL, never through JS (spec §2.3). */
   payloadFromTranscriptId: number;
+  /**
+   * Do this row's own columns still describe the WHOLE recording?
+   *
+   * True for every meeting that has never been clipped — the Phase 1 world,
+   * where `imported_content` IS the transcription and `duration` IS the
+   * recording's length. FALSE once a meeting carries clip windows (Phase 3a):
+   * its payload is the MATERIALISED window and its duration is the window's.
+   * Two things follow, and both matter:
+   *   - the payload must NOT be copied onto the transcription (it would
+   *     destroy the text every meeting on the recording reads, this one
+   *     included, a little more on every pass);
+   *   - the row's duration must NOT be written onto the recording or its
+   *     canonical file. `recordings-verify` skips the same two comparisons.
+   */
+  wholeRecording: boolean;
   /** True = the caller passed file facts, so derivative rows are authoritative
    * and a stale `audio_only` row may be deleted. */
   filesProbed: boolean;
@@ -303,7 +327,7 @@ function isoOrNull(value: string | Date | null | undefined): string | null {
 }
 
 /**
- * The clip every Phase 1 meeting gets: `(ord 0, from 0, to NULL, offset 0,
+ * The clip every UN-CLIPPED meeting gets: `(ord 0, from 0, to NULL, offset 0,
  * include)` — the 1:1 case the resolver serves in compat mode.
  */
 export function desiredClipFor(transcriptId: number): DesiredClip {
@@ -316,6 +340,91 @@ export function desiredClipFor(transcriptId: number): DesiredClip {
     offsetMs: 0,
     textPolicy: 'include',
   };
+}
+
+/**
+ * `gmeet_context.clips`, validated. Exported because the RESOLVER needs it
+ * too: with `MW_RECORDINGS` off it serves a meeting from its row alone, and a
+ * split meeting's window has to come from somewhere (lib/server/recordings.ts
+ * `mediaFromRow`).
+ */
+export function storedClipsInContext(g: GmeetContext | null | undefined): StoredClips | null {
+  const raw = (g as { clips?: unknown } | null | undefined)?.clips;
+  if (!Array.isArray(raw) || raw.length === 0) return null;
+  const out: StoredClips = [];
+  const ords = new Set<number>();
+  for (const entry of raw) {
+    if (!entry || typeof entry !== 'object') return null;
+    const c = entry as Record<string, unknown>;
+    const ord = c.ord;
+    const recordingId = c.recordingId;
+    const fromMs = c.fromMs;
+    const toMs = c.toMs ?? null;
+    const offsetMs = c.offsetMs;
+    if (typeof ord !== 'number' || !Number.isInteger(ord) || ord < 0 || ords.has(ord)) return null;
+    if (typeof recordingId !== 'string' || !AAI_ID.test(recordingId)) return null;
+    if (typeof fromMs !== 'number' || !Number.isFinite(fromMs) || fromMs < 0) return null;
+    if (toMs !== null && (typeof toMs !== 'number' || !Number.isFinite(toMs) || toMs <= fromMs)) {
+      return null;
+    }
+    if (typeof offsetMs !== 'number' || !Number.isFinite(offsetMs) || offsetMs < 0) return null;
+    ords.add(ord);
+    out.push({ ord, recordingId, fromMs, toMs: toMs as number | null, offsetMs });
+  }
+  return out;
+}
+
+/**
+ * The clip windows the ROW declares, or null when it declares none.
+ *
+ * `gmeet_context.clips` is the mirror that makes a split survive
+ * (docs/recordings-phase3-clips-spec.md "Model"): the desired graph is derived
+ * from the row, so without it the next dual-write would heal a split meeting
+ * back to one full-recording clip. A malformed mirror reads as ABSENT rather
+ * than as an error — a meeting must never become invisible to the resolver
+ * because somebody wrote junk into its context.
+ */
+export function storedClipsOf(row: GraphMeetingRow): StoredClips | null {
+  return storedClipsInContext(row.gmeet_context);
+}
+
+/**
+ * Does this meeting only BORROW a recording — i.e. every clip it declares
+ * points at a recording other than the one its own row derives?
+ *
+ * That is exactly a meeting split off another one: it has its own id (so
+ * `canonicalKeyOf` would mint it a recording of its own) and its own
+ * `local_audio_path` (so it plays), but the bytes, the media rows and the
+ * transcription belong to the SOURCE's recording. A borrower contributes its
+ * clips and nothing else — deriving a second recording for the same file is
+ * precisely what must not happen.
+ */
+export function borrowsRecording(row: GraphMeetingRow): boolean {
+  const stored = storedClipsOf(row);
+  if (!stored) return false;
+  const own = recordingIdFor(canonicalKeyOf(row));
+  return stored.every((c) => c.recordingId !== own);
+}
+
+/**
+ * The clips a meeting should have: its declared windows, or the single
+ * whole-recording clip every un-clipped meeting gets.
+ */
+export function desiredClipsFor(row: GraphMeetingRow): DesiredClip[] {
+  const stored = storedClipsOf(row);
+  if (!stored) return [desiredClipFor(row.id)];
+  return stored
+    .map((c) => ({
+      transcriptId: row.id,
+      ord: c.ord,
+      recordingId: c.recordingId,
+      transcriptionId: null as null,
+      fromMs: c.fromMs,
+      toMs: c.toMs,
+      offsetMs: c.offsetMs,
+      textPolicy: 'include' as const,
+    }))
+    .sort((a, b) => a.ord - b.ord);
 }
 
 /**
@@ -349,7 +458,11 @@ export function deriveRecordingGraph(
   const g = ownerRow.gmeet_context;
   const canonicalKey = canonicalKeyOf(ownerRow);
   const recordingId = recordingIdFor(canonicalKey);
-  const durationMs = ownerRow.duration != null ? Math.round(ownerRow.duration * 1000) : null;
+  // A clipped row's duration is its WINDOW's, not the recording's — leaving it
+  // null makes every upsert below a COALESCE no-op rather than a shrink.
+  const wholeRecording = storedClipsOf(ownerRow) === null;
+  const durationMs =
+    wholeRecording && ownerRow.duration != null ? Math.round(ownerRow.duration * 1000) : null;
 
   // A concat row's canonical file is a DERIVATIVE of its parts, not a capture
   // of its own — the listing's recording_count leans on this stamp.
@@ -499,6 +612,7 @@ export function deriveRecordingGraph(
       covers,
     },
     payloadFromTranscriptId: ownerRow.id,
+    wholeRecording,
     filesProbed: !!files,
   };
 }

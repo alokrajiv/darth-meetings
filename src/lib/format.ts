@@ -7,6 +7,7 @@
 
 import type { ReportPref } from '@/lib/report-pref';
 import type { RunningTranscription } from '@/lib/transcriptions';
+import type { SplitProvenance, StoredClips } from '@/lib/clips';
 
 /** Temporary (scratch) transcripts are moved to the trash this many days
  * after creation (migration 042). The sweeper, the listing hint and the
@@ -218,7 +219,26 @@ export interface GmeetContext {
    * `since` (db-ops/transcriptions.ts `clearNotesStaleIfRegenerated`). They
    * are never regenerated automatically — that costs money and they are
    * still mostly right — so the page offers "Regenerate" instead. */
-  notesStale?: { since: string; fromTranscriptionId: string } | null;
+  notesStale?: { since: string; fromTranscriptionId: string; reason?: string } | null;
+  /** Phase 3a (docs/recordings-phase3-clips-spec.md): the WINDOWS of a
+   * recording this meeting uses, mirrored from `meeting_clips`.
+   *
+   * It lives on the row because the desired recording graph is derived FROM
+   * THE ROW (`lib/recording-graph.ts`): without the mirror the next
+   * dual-write would "heal" a split meeting back to one clip over the whole
+   * recording and silently undo the split. Absent — every row on prod today —
+   * means exactly that one whole-recording clip.
+   *
+   * It is also what makes the resolver's FALLBACK path (MW_RECORDINGS off)
+   * correct for a split meeting: the window is on the row, so the player
+   * still clamps and frame/voiceprint ms still map onto the shared file. */
+  clips?: StoredClips | null;
+  /** Phase 3a: this meeting was split off another one.
+   *
+   * PRIVACY: `meetingId` names a meeting the reader may not be able to open,
+   * so it is never served to a caller who cannot (`GET …/clips` resolves it
+   * caller-scoped first). */
+  splitFrom?: SplitProvenance | null;
   /** DEC-4 (docs/recordings-first-class-design.md §7): the AssemblyAI job
    * behind this row has been deleted AT AssemblyAI — our payload + the local
    * media are the only copies left, and nothing may ask AAI about `jobId`

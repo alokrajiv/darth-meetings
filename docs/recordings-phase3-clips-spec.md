@@ -99,3 +99,79 @@ delete of either keeps the other playing and deletes files only with the last on
 sibling visibility is caller-scoped (a user shared only N never learns M exists). Browser pass of the split dialog,
 the windowed player (seek, end-of-window stop, chips, video), light/dark/390 px. `TZ=UTC bun test`, `tsc`, `eslint`,
 env-less build.
+
+## As built — the SERVER half (2026-09-22)
+
+The API, the model, the media mapping, the un-split and the proposer are done as
+specified, behind `MW_CLIPS` (lazy env) AND `MW_RECORDINGS_WRITE` AND migrations
+044–046 AND a backfilled clip on the meeting. **No new migration**: a clip with a
+real window is a `meeting_clips` row 044 already describes. The UI (§UI) is not
+built.
+
+### Files
+
+| | |
+|---|---|
+| `src/lib/clips.ts` | **the wire contract**, pure: the types, `parseTimestampMs`/`formatTimestamp`/`formatDuration`, `validateSplitWindow` + the refusal codes, `clipExtentMs`/`meetingSpanMs`/`holesOf`/`windowBoundsFor`, `planSplit`/`planUnsplit`, `selectWindow`/`rekeyEditMap`/`mergeOrder`/`mergeEditMaps`, the deterministic proposal candidates, `adoptProposals`, `mayDeleteRecordingFiles`. No server imports — the dialog greys out "Split" for exactly the reasons the server refuses for. |
+| `src/db-ops/clips.ts` | the gate (`clipsFlagOn` / `clipsEnabled`), the clip and recording reads, every user's edits/names, `copySpeakerMappings`, `restoreMeetingPayloadFromRecording` (SQL copy), `setClipMirror`, `listMeetingsOnRecording`, `alignMeetingsToTranscription`. |
+| `src/lib/server/clip-split.ts` | `clipsView`, `splitMeeting`, `unsplitMeeting`, `meetingClipState`. |
+| `src/lib/server/clip-proposer.ts` | the deterministic pass, the prompt, the single agent call (`ai_runs` kind `clip_proposal`). |
+| `src/lib/server/clip-materialise.ts` | `materialiseMeeting` / `rematerialiseMeetingsOnRecording`. |
+| routes | `…/clips` (GET), `…/split`, `…/clips/propose`, `…/unsplit` (POST). |
+
+### Rulings where the brief left a gap
+
+- **How a split survives the graph sync.** `applyRecordingGraph` derives the
+  desired graph from the ROW, so both halves mirror their windows in
+  `gmeet_context.clips`. The SOURCE keeps owning its recording and gains
+  `wholeRecording: false` — its materialised payload is never copied back onto
+  the transcription and its shrunken duration never onto the recording; the
+  stale-`ord` delete removes a window it no longer declares. The SPLIT-OFF
+  meeting points its clip at the SOURCE's recording id, which makes
+  `borrowsRecording` true: its sync writes clips and nothing else, so no second
+  recording is ever minted over the same bytes. `recordings-verify` reads the
+  same mirror (`desiredClipsFor`) and counts borrowers separately.
+- **A meeting whose clips come back to the default loses the mirror entirely**
+  (not an empty one), or the row would stay "clipped" for ever. That is what an
+  un-split turns on, and why it restores the payload with a SQL copy rather than
+  through the resolver.
+- **The split-off meeting's id.** A bare uuid (1b's rule), or the source's
+  `gmeet-`/`teams-`/`ext-` prefix when it has one. It carries the SOURCE's
+  `aai_job_id`, without which its bare uuid would read as an AssemblyAI job id
+  everywhere and retention would try to delete a job AssemblyAI never had. Its
+  permanent delete therefore does NOT delete that job.
+- **It is born `completed`**, never `processing`: a processing row with a job id
+  is exactly what the listing poller and the stuck-at-AssemblyAI sweeper pick
+  up. Its `speaker_id_status` is copied (or set to `completed` when names came
+  with it) so the speaker-ID backlog sweeper does not spend a model call on it.
+- **A version swap started from a clipped meeting** must align the OTHER
+  meetings on the recording (`aai_job_id`, model, language) and queue their
+  graph syncs — otherwise the meeting that owns the recording keeps describing a
+  transcription that is no longer active.
+- **`duration` is an integer of seconds.** A window of 800 001 ms is 800.
+- **Refusals** carry a `SplitRefusalCode`. Added beyond the brief: a meeting
+  with `videoParts` (stop/restart Meet videos) refuses as `multi-recording` —
+  only the first file was transcribed and a window has no single file to clamp.
+- **Un-split requires EDIT access to BOTH meetings** and never names the one in
+  the way.
+- Offline pins duplicate the bytes per meeting id, as the spec says to note and
+  not solve.
+
+### darth-cli (other repo — not edited)
+
+Four verbs, all of them thin wrappers over the routes above:
+
+```
+meetings clips <id> [--json]
+meetings propose-clips <id> [--instruction "…"] [--json]
+meetings split <id> --from 12:40 --to 41:05 [--title …] [--event <ref>] [--keep-in-both]
+meetings unsplit <id>
+```
+
+`--from` / `--to` accept `mm:ss`, `h:mm:ss` or ms and are sent as `from`/`to`
+strings (the server parses them with the same `parseTimestampMs` the dialog
+uses); `--event <ref>` is the existing `<eventId>|<startIso>` or meeting-code
+form `link` already takes. `split` answers `201 SplitOk` (`meeting.id/url`,
+`moved.edits`, `moved.speakerNames`, `source.clips`, `linkedEvent`), every
+refusal `{ error, code }`. `clips` answers `ClipsResponse`, whose `siblings` are
+already caller-scoped — the CLI may print them verbatim.

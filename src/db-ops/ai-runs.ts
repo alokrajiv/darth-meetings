@@ -9,7 +9,16 @@ import type { ClaudeRunMeta } from '@/lib/server/claude-agent';
 
 const SCHEMA = SCHEMAS.MEETING_WHISPERER;
 
-export type AiRunKind = 'auto_notes' | 'auto_report' | 'speaker_id' | 'import_normalize' | 'ask';
+export type AiRunKind =
+  | 'auto_notes'
+  | 'auto_report'
+  | 'speaker_id'
+  | 'import_normalize'
+  | 'ask'
+  /** Phase 3a: the single call that picks and names clip windows
+   * (`POST /api/transcripts/:id/clips/propose`). `kind` is a plain text
+   * column, so this needs no migration. */
+  | 'clip_proposal';
 
 export interface AiRunRow {
   id: number;

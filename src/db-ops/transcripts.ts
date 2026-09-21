@@ -1426,6 +1426,39 @@ export async function setLocalAudioPathForUser(
  * and nothing re-fetches it from AAI later. What is left here is the import
  * flow, which already holds the payload when it creates the row.
  */
+/**
+ * Phase 3a — the MATERIALISED text of a clipped meeting, plus the facts that
+ * move with it (docs/recordings-phase3-clips-spec.md "Model").
+ *
+ * The meeting row is what every reader reads (Phase 1), so a meeting that uses
+ * only part of a recording has to carry the resolved result of its clips on
+ * the row like any other meeting. `lib/server/clip-materialise.ts` is the only
+ * caller and the only place the arithmetic lives; this just writes it.
+ *
+ * `recordedAt` is passed only when the caller means to move it (a split-off
+ * meeting starts later than its source); `undefined` leaves it alone.
+ */
+export async function setMaterialisedContentForUser(
+  userId: string,
+  assemblyaiId: string,
+  input: {
+    content: TranscriptResponse | null;
+    durationSec: number | null;
+    speakerCount: number | null;
+    recordedAt?: Date | null;
+  }
+): Promise<void> {
+  await sql`
+    UPDATE ${sql(SCHEMA)}.transcripts
+    SET imported_content = ${input.content ? sql.json(input.content as unknown as never) : null},
+        duration         = ${input.durationSec},
+        speaker_count    = ${input.speakerCount}
+        ${input.recordedAt !== undefined ? sql`, recorded_at = ${input.recordedAt}` : sql``}
+    WHERE user_id = ${userId} AND assemblyai_id = ${assemblyaiId}
+  `;
+  publishEvent({ kind: 'status', assemblyaiId });
+}
+
 export async function setCachedContentForUser(
   userId: string,
   assemblyaiId: string,

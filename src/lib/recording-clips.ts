@@ -24,6 +24,16 @@
  *  - **The meeting timeline orders clips by `offset_ms`, then `ord`.** `ord`
  *    is the clip's identity (its primary key with the meeting, what an edit
  *    key survives a re-window by), not its position.
+ *
+ * And one from Phase 3a (docs/recordings-phase3-clips-spec.md "Model"), which
+ * reverses what Phase 1 wrote here for the single-recording case:
+ *  - **ONE recording ⇒ one diarization space ⇒ plain keys and plain speaker
+ *    labels**, window or no window. A split meeting's text is MATERIALISED
+ *    onto its row, and the row is what every reader reads — the detail page
+ *    keys an edit by the array index of the utterance it is rendering, so a
+ *    `<recordingId>:<index>` key would simply never be found. Prefixing (and
+ *    with it the recording-scoped key space) starts in Phase 3b, when a
+ *    meeting can genuinely hold two diarization spaces.
  */
 
 import type { TranscriptResponse } from '@/lib/format';
@@ -109,11 +119,12 @@ export function compareClipsOnTimeline(
  * Is this a key `resolveClips` could have minted, i.e. something
  * `transcript_edits.edits` may legally be keyed by?
  *
- * Compat meetings key by plain utterance index — that is what every row in
- * prod uses and what the edits route has always validated. A multi-clip
- * meeting keys by `<recordingId>:<index in that recording's transcription>`
- * so a re-window or a re-order never re-points an existing edit (§2.2). The
- * key space is minted and validated in the same module on purpose.
+ * A meeting over ONE recording keys by plain utterance index — every row in
+ * prod, every split half, and what the edits route has always validated. A
+ * meeting over TWO recordings (Phase 3b) keys by
+ * `<recordingId>:<index in that recording's transcription>`, because the two
+ * index spaces would otherwise collide. The key space is minted and validated
+ * in the same module on purpose.
  */
 export function isUtteranceKey(key: string): boolean {
   return /^\d+$/.test(key) || /^[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}:\d+$/.test(key);
@@ -152,7 +163,7 @@ interface Contribution {
   spanMs: [number, number] | null;
 }
 
-function contributionOf(clip: ResolvableClip): Contribution {
+function contributionOf(clip: ResolvableClip, namespaced: boolean): Contribution {
   const payload = clip.payload;
   const utterances: Contribution['utterances'] = [];
   const words: Word[] = [];
@@ -166,8 +177,15 @@ function contributionOf(clip: ResolvableClip): Contribution {
     if (start < lo) lo = start;
     if (end > hi) hi = end;
     utterances.push({
-      u: { ...u, start, end, speaker: prefixSpeaker(clip.recordingId, u.speaker) ?? u.speaker },
-      key: `${clip.recordingId}:${index}`,
+      u: namespaced
+        ? { ...u, start, end, speaker: prefixSpeaker(clip.recordingId, u.speaker) ?? u.speaker }
+        : { ...u, start, end },
+      // Only a two-recording meeting needs the recording in the key. A
+      // single-recording meeting is re-keyed to its position in the MERGED
+      // list below (two windows of one recording would otherwise mint the
+      // same `"0"` twice), because that position is what its row stores and
+      // what its page renders.
+      key: namespaced ? `${clip.recordingId}:${index}` : String(index),
     });
   });
 
@@ -179,7 +197,7 @@ function contributionOf(clip: ResolvableClip): Contribution {
       ...w,
       start: shift(clip, w.start),
       end: shift(clip, w.end),
-      speaker: prefixSpeaker(clip.recordingId, w.speaker),
+      ...(namespaced ? { speaker: prefixSpeaker(clip.recordingId, w.speaker) } : {}),
     });
   }
 
@@ -228,9 +246,15 @@ export function resolveClips(
     };
   }
 
+  // DEC-1: one recording = one job = one diarization space, so a meeting that
+  // reads a single recording keeps AssemblyAI's bare letters and plain index
+  // keys however many windows it takes of it. Two recordings is where "A" of
+  // one is not "A" of the other, and only there is the namespace earned.
+  const namespaced = new Set(ordered.map((c) => c.recordingId)).size > 1;
+
   const contributions = ordered
     .filter((c) => c.payload && c.textPolicy !== 'exclude')
-    .map(contributionOf);
+    .map((c) => contributionOf(c, namespaced));
 
   // `gap_fill` is resolved against every `include` clip's speech, whatever
   // their ord — a filler clip placed first must still yield to a later
@@ -304,5 +328,9 @@ export function resolveClips(
       : {}),
   };
 
-  return { content, utteranceKeys: merged.map((e) => e.key), compat: false };
+  return {
+    content,
+    utteranceKeys: namespaced ? merged.map((e) => e.key) : merged.map((_, i) => String(i)),
+    compat: false,
+  };
 }

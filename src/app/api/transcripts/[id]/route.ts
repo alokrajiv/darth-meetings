@@ -18,6 +18,7 @@ import { dropAudioOnly } from '@/lib/server/audio-only';
 import { refreshIfPending } from '@/lib/server/transcript-sync';
 import { removeRecordingGraphForMeeting } from '@/lib/server/recording-sync';
 import { deleteAnnotationsForMeeting } from '@/db-ops/transcriptions';
+import { mayDeleteRecordingFiles } from '@/lib/clips';
 
 export const runtime = 'nodejs';
 
@@ -173,7 +174,10 @@ export const DELETE = withAuth(async ({ user, request }, { params }) => {
   // The AssemblyAI JOB, not the meeting: since Phase 1b an upload's meeting
   // id is one we minted and AAI has never heard of it. Nothing to delete for
   // a row that never went there.
-  const jobId = aaiJobIdOf(access.row);
+  // Phase 3a: a meeting SPLIT OFF another one carries the source's job id (so
+  // its own minted uuid is never mistaken for one). That job is not its to
+  // delete — the meeting it came from still reads the same transcription.
+  const jobId = access.row.gmeet_context?.splitFrom ? null : aaiJobIdOf(access.row);
   if (jobId) await aaiDelete(jobId);
   await deleteSpeakerMappingsForUser(access.ownerUserId, id);
   // Before the row goes: `meeting_clips.transcript_id` has no FK (it is the
@@ -183,26 +187,44 @@ export const DELETE = withAuth(async ({ user, request }, { params }) => {
   await deleteAnnotationsForMeeting(access.row.id).catch((err) =>
     console.warn('[DELETE /api/transcripts] parked annotations cleanup failed:', err)
   );
-  await removeRecordingGraphForMeeting(access.row.id, 'permanent-delete');
+  const cleanup = await removeRecordingGraphForMeeting(access.row.id, 'permanent-delete');
   await deleteForUser(access.ownerUserId, id);
   // Again, after the row is gone: a fire-and-forget graph sync that was in
   // flight can re-create the clip between the purge above and the delete. A
   // sync that starts from here on finds no row and does nothing, so this
   // second pass is the last word. Idempotent.
-  await removeRecordingGraphForMeeting(access.row.id, 'permanent-delete/after');
-  // Each stored recording may have an audio-only derivative (offline pins);
-  // drop it with the source so nothing outlives the row.
-  if (access.row.local_audio_path) {
-    await deleteAudioFile(access.row.local_audio_path);
-    await dropAudioOnly(access.row.local_audio_path);
-  }
-  // Extra recording segments (multi-video meetings) live in sidecar files.
-  for (const part of access.row.gmeet_context?.videoParts ?? []) {
-    if (part.filename) {
-      await deleteAudioFile(part.filename);
-      await dropAudioOnly(part.filename);
+  const after = await removeRecordingGraphForMeeting(access.row.id, 'permanent-delete/after');
+
+  // Phase 3a: the bytes are SHARED. A meeting split off this one (or this one
+  // split off another) plays the same canonical file under its own
+  // `local_audio_path`, so the old "walk the row and unlink" would delete a
+  // recording out from under a meeting that is still there — trashed ones
+  // included, because restoring must find its audio. The files go only when
+  // the RECORDING went with the clips (lib/clips.ts `mayDeleteRecordingFiles`).
+  const mayDeleteFiles = mayDeleteRecordingFiles({
+    graphApplied: cleanup.applied && after.applied,
+    recordingsKept: [...cleanup.recordingsKept, ...after.recordingsKept],
+  });
+  if (mayDeleteFiles) {
+    // Each stored recording may have an audio-only derivative (offline pins);
+    // drop it with the source so nothing outlives the row.
+    if (access.row.local_audio_path) {
+      await deleteAudioFile(access.row.local_audio_path);
+      await dropAudioOnly(access.row.local_audio_path);
     }
+    // Extra recording segments (multi-video meetings) live in sidecar files.
+    for (const part of access.row.gmeet_context?.videoParts ?? []) {
+      if (part.filename) {
+        await deleteAudioFile(part.filename);
+        await dropAudioOnly(part.filename);
+      }
+    }
+  } else {
+    console.log(
+      `[DELETE /api/transcripts] ${id}: files kept — another meeting still clips ` +
+        `${[...new Set([...cleanup.recordingsKept, ...after.recordingsKept])].join(', ')}`
+    );
   }
 
-  return NextResponse.json({ ok: true });
+  return NextResponse.json({ ok: true, filesRemoved: mayDeleteFiles });
 });

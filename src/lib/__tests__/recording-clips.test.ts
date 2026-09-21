@@ -257,9 +257,11 @@ describe('window edges — from_ms inclusive, to_ms exclusive', () => {
     expect(out.content?.utterances?.map((u) => u.text)).toEqual([
       'Shall we start with the SI-BL backlog?',
     ]);
-    // Keys stay pinned to the index inside the transcription, so an existing
-    // edit on utterance 1 still finds its utterance after a re-window.
-    expect(out.utteranceKeys).toEqual([`${REC_A}:1`]);
+    // ONE recording ⇒ one diarization space ⇒ plain index keys, keyed to the
+    // position in the MATERIALISED list this meeting shows (Phase 3a). A
+    // split re-keys the edits at split time (lib/clips.ts `rekeyEditMap`);
+    // the recording-scoped key space is for two recordings, not two windows.
+    expect(out.utteranceKeys).toEqual(['0']);
   });
 
   test('from_ms shifts the window to offset_ms on the meeting timeline', () => {
@@ -282,12 +284,62 @@ describe('window edges — from_ms inclusive, to_ms exclusive', () => {
   });
 });
 
+// Phase 3a (docs/recordings-phase3-clips-spec.md "Model"): DEC-1 says one
+// recording is one job and one diarization space, so however many WINDOWS of
+// it a meeting takes, "A" means the same person throughout. Prefixing and the
+// recording-scoped key space are earned only by a second recording (3b).
+describe('one recording, several windows — the split source', () => {
+  // What a shrink leaves behind: 0–3 s and 14 s→end, with the 3–14 s window
+  // now a meeting of its own. M keeps its original timeline (the hole is at
+  // 3–14 s), so every `t:<ms>` in its notes still points at the right moment.
+  const shrunk: ResolvableClip[] = [
+    clip({ ord: 0, fromMs: 0, toMs: 3000, offsetMs: 0 }),
+    clip({ ord: 1, fromMs: 14_000, toMs: null, offsetMs: 14_000 }),
+  ];
+
+  test('speaker labels stay exactly as AssemblyAI diarized them', () => {
+    const out = resolveClips(shrunk, MEETING);
+    expect(out.compat).toBe(false);
+    expect(out.content?.utterances?.map((u) => u.speaker)).toEqual(['A', 'B']);
+    expect(out.content?.words?.every((w) => w.speaker === 'A' || w.speaker === 'B')).toBe(true);
+  });
+
+  test('edit keys are the positions in the list the meeting actually shows', () => {
+    const out = resolveClips(shrunk, MEETING);
+    // Utterance 1 of the recording went to the other meeting; what is left is
+    // re-keyed 0,1 — which is what the row stores and what the page renders.
+    expect(out.content?.utterances?.map((u) => u.text)).toEqual([
+      'Morning everyone.',
+      'Sure, I have the numbers.',
+    ]);
+    expect(out.utteranceKeys).toEqual(['0', '1']);
+    for (const k of out.utteranceKeys) expect(isUtteranceKey(k)).toBe(true);
+  });
+
+  test('the hole is kept: the remaining windows sit where they always were', () => {
+    const out = resolveClips(shrunk, MEETING);
+    expect(out.content?.utterances?.map((u) => [u.start, u.end])).toEqual([
+      [0, 2000],
+      [14_000, 17_500],
+    ]);
+  });
+
+  test('the split-off meeting starts at 0 and keys from 0', () => {
+    const out = resolveClips([clip({ ord: 0, fromMs: 3000, toMs: 14_000, offsetMs: 0 })], MEETING);
+    expect(out.content?.utterances?.map((u) => [u.start, u.text])).toEqual([
+      [0, 'Shall we start with the SI-BL backlog?'],
+    ]);
+    expect(out.utteranceKeys).toEqual(['0']);
+    expect(out.content?.utterances?.[0]?.speaker).toBe('A');
+  });
+});
+
 describe('words ride the same window', () => {
-  test('windowed, shifted and namespaced like their utterances', () => {
+  test('windowed and shifted like their utterances, labels untouched', () => {
     const out = resolveClips([clip({ fromMs: 3000, toMs: 10_000, offsetMs: 1000 })], MEETING);
     expect(out.content?.words).toEqual([
-      { text: 'Shall', start: 1000, end: 1300, confidence: 0.97, speaker: `${REC_A}:A` },
-      { text: 'backlog?', start: 3400, end: 4000, confidence: 0.95, speaker: `${REC_A}:A` },
+      { text: 'Shall', start: 1000, end: 1300, confidence: 0.97, speaker: 'A' },
+      { text: 'backlog?', start: 3400, end: 4000, confidence: 0.95, speaker: 'A' },
     ]);
   });
 

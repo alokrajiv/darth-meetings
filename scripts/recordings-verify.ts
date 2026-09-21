@@ -24,9 +24,10 @@ import postgres from 'postgres';
 import path from 'node:path';
 import { existsSync, statSync } from 'node:fs';
 import {
+  borrowsRecording,
   canonicalKeyOf,
   deriveRecordingGraph,
-  desiredClipFor,
+  desiredClipsFor,
   isJobIdMeeting,
   ownerRowOf,
   recordingFilenames,
@@ -201,6 +202,49 @@ function fileFactsFor(row: GraphMeetingRow): GraphFileFacts | undefined {
   return { audio, audioOnly };
 }
 
+/**
+ * The clips a meeting should have, against the ones it has.
+ *
+ * Phase 1 expected exactly one, over the whole recording. Phase 3a lets the
+ * ROW declare its windows in `gmeet_context.clips` — the mirror that makes a
+ * split survive the next dual-write — so the expectation is
+ * `desiredClipsFor(row)` and the verifier reads the same thing the writer
+ * does. `expectedRecordingId` is null for a meeting that only BORROWS a
+ * recording (it was split off another one): its clips name a recording it
+ * does not derive, which is the whole point.
+ */
+function checkClips(
+  tag: string,
+  row: GraphMeetingRow,
+  actual: ActualClip[],
+  expectedRecordingId: string | null
+): boolean {
+  const want = desiredClipsFor(row);
+  if (actual.length === 0) {
+    flagDrift(tag, 'no clip (the meeting is invisible to the resolver)');
+    return false;
+  }
+  if (actual.length !== want.length) {
+    flagDrift(tag, `${actual.length} clips, the row declares ${want.length}`);
+  }
+  let ok = true;
+  for (const w of want) {
+    const clip = actual.find((c) => c.ord === w.ord);
+    if (!clip) {
+      flagDrift(tag, `no clip at ord ${w.ord}`);
+      ok = false;
+      continue;
+    }
+    expectEq(tag, `clip[${w.ord}].recording_id`, w.recordingId ?? expectedRecordingId, clip.recording_id);
+    expectEq(tag, `clip[${w.ord}].transcription_id`, w.transcriptionId, clip.transcription_id);
+    expectEq(tag, `clip[${w.ord}].from_ms`, w.fromMs, clip.from_ms);
+    expectEq(tag, `clip[${w.ord}].to_ms`, w.toMs, clip.to_ms);
+    expectEq(tag, `clip[${w.ord}].offset_ms`, w.offsetMs, clip.offset_ms);
+    expectEq(tag, `clip[${w.ord}].text_policy`, w.textPolicy, clip.text_policy);
+  }
+  return ok;
+}
+
 /** Kinds this run is entitled to judge. */
 const judgedKinds = (graph: DesiredGraph) =>
   graph.filesProbed ? new Set(['canonical', 'part', 'audio_only', 'faststart']) : new Set(['canonical', 'part']);
@@ -307,6 +351,8 @@ async function main() {
 
   let checked = 0;
   let skippedRows = 0;
+  /** Meetings split off another one — clips only, by design (Phase 3a). */
+  let borrowed = 0;
   const liveMeetingIds = new Set(rows.map((r) => r.id));
   const expectedRecordingIds = new Set<string>();
 
@@ -323,6 +369,18 @@ async function main() {
     }
     checked += 1;
 
+    // ---- a meeting that only BORROWS a recording (Phase 3a) -------------
+    // It was split off another meeting: its own row would derive a recording
+    // of its own, but the bytes, the media and the transcription belong to
+    // the SOURCE. Judge its clips against the mirror on its row and stop —
+    // there is deliberately no recording, no media and no transcription of
+    // its own to compare, and its id must not be expected either.
+    if (borrowsRecording(row)) {
+      borrowed += 1;
+      checkClips(tag, row, mine, null);
+      continue;
+    }
+
     const group = byAaiId.get(row.assemblyai_id) ?? [row];
     const owner = ownerRowOf(group) ?? row;
     // Phase 2: a meeting that has been re-transcribed reads a version whose
@@ -337,26 +395,8 @@ async function main() {
     });
     expectedRecordingIds.add(graph.recording.id);
 
-    // ---- the clip -----------------------------------------------------
-    const want = desiredClipFor(row.id);
-    if (mine.length === 0) {
-      flagDrift(tag, 'no clip (the meeting is invisible to the resolver)');
-      continue;
-    }
-    if (mine.length > 1) {
-      flagDrift(tag, `${mine.length} clips — Phase 1 expects exactly one`);
-    }
-    const clip = mine.find((c) => c.ord === want.ord);
-    if (!clip) {
-      flagDrift(tag, `no clip at ord ${want.ord}`);
-      continue;
-    }
-    expectEq(tag, 'clip.recording_id', graph.recording.id, clip.recording_id);
-    expectEq(tag, 'clip.transcription_id', want.transcriptionId, clip.transcription_id);
-    expectEq(tag, 'clip.from_ms', want.fromMs, clip.from_ms);
-    expectEq(tag, 'clip.to_ms', want.toMs, clip.to_ms);
-    expectEq(tag, 'clip.offset_ms', want.offsetMs, clip.offset_ms);
-    expectEq(tag, 'clip.text_policy', want.textPolicy, clip.text_policy);
+    // ---- the clips ----------------------------------------------------
+    if (!checkClips(tag, row, mine, graph.recording.id)) continue;
 
     // Only the OWNER's row decides the recording; a second importer's row
     // would compare the same values twice and report every drift twice.
@@ -376,7 +416,13 @@ async function main() {
         `recording.started_at: expected ${norm(graph.recording.startedAt)}, found ${norm(rec.started_at)}`
       );
     }
-    expectEq(tag, 'recording.duration_ms', graph.recording.durationMs, rec.duration_ms);
+    // A clipped row cannot vouch for the recording's length (its own duration
+    // is the window's), so the graph leaves `durationMs` null and the stored
+    // value — written when the row still described the whole recording — is
+    // not drift.
+    if (graph.wholeRecording) {
+      expectEq(tag, 'recording.duration_ms', graph.recording.durationMs, rec.duration_ms);
+    }
     expectEq(
       tag,
       'recording.recorder_recording_id',
@@ -414,7 +460,12 @@ async function main() {
       expectEq(tag, `${label}.kind`, m.kind, actual.kind);
       expectEq(tag, `${label}.ord`, m.ord, actual.ord);
       expectEq(tag, `${label}.offset_ms`, m.offsetMs, actual.offset_ms);
-      expectEq(tag, `${label}.duration_ms`, m.durationMs, actual.duration_ms);
+      // Same reason as `recording.duration_ms` above: a clipped row's own
+      // duration is its window's, so the graph sends NULL, the upsert
+      // COALESCEs and the stored value is not drift.
+      if (graph.wholeRecording) {
+        expectEq(tag, `${label}.duration_ms`, m.durationMs, actual.duration_ms);
+      }
       expectEq(tag, `${label}.filename`, m.filename, actual.filename);
       expectEq(tag, `${label}.has_video`, m.hasVideo, actual.has_video);
       expectEq(tag, `${label}.source_ref`, m.sourceRef, actual.source_ref);
@@ -439,6 +490,11 @@ async function main() {
     expectEq(tag, 'transcription.speech_model', graph.transcription.speechModel, txn.speech_model);
     expectEq(tag, 'transcription.language_code', graph.transcription.languageCode, txn.language_code);
     expectEq(tag, 'transcription.covers', graph.transcription.covers, txn.covers);
+    // A CLIPPED meeting's `imported_content` is the materialised window, not
+    // the transcription's payload, so neither the presence nor the utterance
+    // count may be compared (`deriveRecordingGraph` refuses to copy it for
+    // the same reason — docs/recordings-phase3-clips-spec.md "Model").
+    if (!graph.wholeRecording) continue;
     if (owner.has_content !== txn.has_payload) {
       flagDrift(
         tag,
@@ -569,6 +625,7 @@ async function main() {
   console.log(`meetings scanned       : ${rows.length}`);
   console.log(`  checked              : ${checked}`);
   console.log(`  skipped (placeholder): ${skippedRows}`);
+  console.log(`  split off another    : ${borrowed}  (clips only, by design)`);
   console.log(`recordings in table    : ${recordings.length}`);
   console.log(`media rows             : ${media.length}`);
   console.log(`transcriptions         : ${transcriptions.length}`);

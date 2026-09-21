@@ -4,7 +4,7 @@ import { stat } from 'node:fs/promises';
 import { Readable } from 'node:stream';
 import { withAuth } from '@/lib/auth/with-auth';
 import { resolveAccess } from '@/db-ops/transcript-access';
-import { extractFrame, frameSourceFor, hasVideoStream } from '@/lib/server/video-frames';
+import { extractFrame, frameRequestFor, hasVideoStream } from '@/lib/server/video-frames';
 import { resolveMeetingContent } from '@/lib/server/recordings';
 
 export const runtime = 'nodejs';
@@ -19,7 +19,11 @@ export const runtime = 'nodejs';
  * rewrites to this URL.
  *
  * `:frame` is a MEETING-time offset and the frame comes out of the meeting's
- * canonical file (`frameSourceFor`) — see the note there about landmine #15.
+ * canonical file. For a meeting split off a longer recording that file is
+ * shared and the offset is window-relative, so the seek goes through
+ * `frameRequestFor` (lib/server/video-frames.ts) — the one place meeting ms
+ * becomes file ms. The cache stays keyed by the MEETING's ms, which is what
+ * the citation in its notes says.
  */
 export const GET = withAuth(async ({ user }, { params }) => {
   const { id, frame } = await params;
@@ -34,13 +38,18 @@ export const GET = withAuth(async ({ user }, { params }) => {
     return NextResponse.json({ error: 'Bad frame timestamp' }, { status: 400 });
   }
 
-  const source = frameSourceFor((await resolveMeetingContent(access.row)).media);
-  if (!source || !(await hasVideoStream(source.filename))) {
+  const request = frameRequestFor((await resolveMeetingContent(access.row)).media, ms);
+  if (!request || !(await hasVideoStream(request.source.filename))) {
     return NextResponse.json({ error: 'No video stored for this transcript' }, { status: 404 });
   }
 
   try {
-    const abs = await extractFrame(access.row.assemblyai_id, source.filename, ms);
+    const abs = await extractFrame(
+      access.row.assemblyai_id,
+      request.source.filename,
+      request.fileMs,
+      ms
+    );
     const st = await stat(abs);
     const stream = Readable.toWeb(createReadStream(abs)) as ReadableStream;
     return new NextResponse(stream, {

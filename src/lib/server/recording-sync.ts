@@ -3,9 +3,10 @@ import { promises as fsp } from 'node:fs';
 import { resolveAudioPath } from '@/lib/server/audio-storage';
 import { getAudioOnlyPath } from '@/lib/server/audio-only';
 import {
+  borrowsRecording,
   canonicalKeyOf,
   deriveRecordingGraph,
-  desiredClipFor,
+  desiredClipsFor,
   isJobIdMeeting,
   ownerRowOf,
   recordingFilenames,
@@ -16,9 +17,11 @@ import {
 } from '@/lib/recording-graph';
 import {
   activeTranscriptionIdOf,
+  applyMeetingClips,
   applyRecordingGraph,
   dropDerivativeMediaByFilename,
   loadGraphMeetingRows,
+  recordingExists,
   removeMeetingFromRecordingGraph,
   stampTranscriptionProviderDeleted,
 } from '@/db-ops/recordings';
@@ -75,6 +78,9 @@ export type RecordingSyncResult =
       media: number;
       migratedFrom: string[];
       staleMediaRemoved: number;
+      /** Phase 3a: the meeting only CLIPS a recording somebody else owns, so
+       * nothing but its clip rows was written. */
+      borrowed?: true;
     };
 
 // globalThis, not module scope: Next bundles this module once per route
@@ -134,6 +140,28 @@ export async function syncRecordingGraphForMeeting(
   // them parsed their own copy, and a minted id (Phase 1b) is unique to one
   // meeting by construction, so both stay separate — `canonicalKeyOf` keys
   // them on `transcripts.id`.
+  // Phase 3a: a meeting split off another one BORROWS the source's recording.
+  // It has an id of its own, so deriving would mint a second recording over
+  // the same bytes; it has declared clips, so doing nothing would let the next
+  // sync heal it back to the whole file. Write its clips and stop.
+  if (borrowsRecording(me)) {
+    const clips = desiredClipsFor(me);
+    const recordingId = clips[0]!.recordingId!;
+    if (!(await recordingExists(recordingId))) {
+      return { status: 'skipped', reason: `clipped recording ${recordingId} is gone` };
+    }
+    const out = await applyMeetingClips(me.id, clips, 'recording-sync');
+    return {
+      status: 'written',
+      recordingId,
+      clips: out.written,
+      media: 0,
+      migratedFrom: [],
+      staleMediaRemoved: 0,
+      borrowed: true,
+    };
+  }
+
   const owner = (isJobIdMeeting(me) ? ownerRowOf(rows) : me) ?? me;
   if (skipReason(owner)) return { status: 'skipped', reason: 'owner row is a placeholder' };
 
@@ -149,8 +177,11 @@ export async function syncRecordingGraphForMeeting(
   const graph = deriveRecordingGraph(owner, files, { activeTranscriptionId });
 
   // The owner's own clip is written too when someone else triggered this, so
-  // a shared job converges from whichever side is touched first.
-  const clips = [desiredClipFor(me.id), ...(owner.id === me.id ? [] : [desiredClipFor(owner.id)])];
+  // a shared job converges from whichever side is touched first. Both come
+  // from `desiredClipsFor`, which honours the row's declared windows — that
+  // is what stops a re-derivation healing a SPLIT meeting back to one clip
+  // over the whole recording (docs/recordings-phase3-clips-spec.md).
+  const clips = [...desiredClipsFor(me), ...(owner.id === me.id ? [] : desiredClipsFor(owner))];
   const applied = await applyRecordingGraph({ graph, clips, createdBy: 'recording-sync' });
 
   // DEC-3 Stage A: the files this sync has just described get their permanent
@@ -263,15 +294,31 @@ export async function recordingIdForMeeting(
 }
 
 /**
+ * What a permanent delete's graph cleanup did — the input to the FILE
+ * decision (`mayDeleteRecordingFiles`, lib/clips.ts).
+ */
+export interface RecordingGraphCleanup {
+  /** False = the flag is off or the cleanup threw; the caller keeps today's
+   * behaviour (walk the row and unlink), which is all that can be true then. */
+  applied: boolean;
+  recordingsRemoved: string[];
+  /** Still clipped by another meeting — live OR trashed. Their bytes must
+   * survive this delete. */
+  recordingsKept: string[];
+}
+
+/**
  * Permanent delete: the meeting's clips go, and with them any recording that
  * has no clip left. Awaited by the delete route — a meeting the user asked
  * to destroy must not leave rows behind, and the call is already on a slow
  * path (AAI delete + unlinking files).
  *
- * The LOCAL file deletion logic is untouched in Phase 1: the route still walks
- * the row's own `local_audio_path` / `videoParts`. A recording kept alive by
- * another meeting's clip is logged so the shared-job case is visible while
- * that stays true.
+ * Phase 3a changed what the CALLER does with the answer. Until clips had real
+ * windows, a meeting's `local_audio_path` was its own file and the route could
+ * simply unlink it. A split-off meeting borrows the source's canonical
+ * filename so it can play, so that walk would take the bytes out from under
+ * every other meeting on the recording. `recordingsKept` is the gate: files go
+ * only when the recording itself went.
  *
  * The BLOBS of the recordings that were actually removed go too (DEC-3 Stage
  * A.7). Their names are read before the rows are destroyed — afterwards
@@ -281,8 +328,10 @@ export async function recordingIdForMeeting(
 export async function removeRecordingGraphForMeeting(
   transcriptId: number,
   tag: string
-): Promise<void> {
-  if (!recordingsWriteEnabled()) return;
+): Promise<RecordingGraphCleanup> {
+  if (!recordingsWriteEnabled()) {
+    return { applied: false, recordingsRemoved: [], recordingsKept: [] };
+  }
   try {
     const blobs = await blobsHeldByMeeting(transcriptId);
     const out = await removeMeetingFromRecordingGraph(transcriptId);
@@ -292,11 +341,20 @@ export async function removeRecordingGraphForMeeting(
     if (out.recordingsKept.length > 0) {
       console.log(
         `[recording-sync] ${tag} meeting ${transcriptId}: kept ${out.recordingsKept.length} ` +
-          `recording(s) still clipped by another meeting (${out.recordingsKept.join(', ')})`
+          `recording(s) still clipped by another meeting (${out.recordingsKept.join(', ')}) ` +
+          '— their files stay'
       );
     }
+    return {
+      applied: true,
+      recordingsRemoved: out.recordingsRemoved,
+      recordingsKept: out.recordingsKept,
+    };
   } catch (err) {
     console.warn(`[recording-sync] ${tag} meeting ${transcriptId} cleanup failed:`, err);
+    // A cleanup that threw tells us nothing about who else holds the bytes.
+    // Keeping the files is the only safe answer.
+    return { applied: true, recordingsRemoved: [], recordingsKept: ['unknown'] };
   }
 }
 
