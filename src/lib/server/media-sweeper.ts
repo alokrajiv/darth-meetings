@@ -17,6 +17,7 @@ import {
   fmtBytes,
   localMediaPath,
 } from '@/lib/server/media-archive';
+import { sweepPendingLocalCopies } from '@/lib/server/aai-from-blob';
 import { listMediaToArchive } from '@/db-ops/recordings';
 import type { GmeetContext } from '@/lib/format';
 
@@ -47,6 +48,12 @@ import type { GmeetContext } from '@/lib/format';
  * never while an ingest or an AI run is in flight. It is last in the tick and
  * inert unless DARTH_MEDIA_ACCOUNT and MW_MEDIA_ARCHIVE are both set.
  *
+ * And the other direction, DEC-3 Stage C (`aai-from-blob.ts`): a recording
+ * whose bytes went to AssemblyAI straight from the blob has no local copy
+ * until the background fetch lands one. Such a row is left out of the
+ * preparation candidates until it does, and `sweepPendingLocalCopies` retries
+ * one fetch per tick for the ones that never landed.
+ *
  * State lives in `gmeet_context.media` (see GmeetContext): a row qualifies
  * while `faststart`/`audioOnly` are not both true or `parts` is below the
  * number of stored videoParts (a part fetched later re-qualifies the row).
@@ -73,6 +80,8 @@ const ARCHIVE_MAX_FILES_PER_TICK = 5;
 const ARCHIVE_SCAN_PER_TICK = 50;
 /** Blobs whose rows are already gone, retried per tick. */
 const ARCHIVE_DELETE_PER_TICK = 25;
+/** Stage C local copies fetched per tick — a whole recording each. */
+const BLOB_LOCAL_COPIES_PER_TICK = 1;
 
 interface MediaRow {
   user_id: string;
@@ -221,6 +230,15 @@ async function listMediaPrepCandidates(limit: number): Promise<MediaRow[]> {
       AND local_audio_path IS NOT NULL
       AND assemblyai_id NOT LIKE 'up-%'
       AND assemblyai_id NOT LIKE 'defer-%'
+      -- DEC-3 Stage C: the row names a file whose bytes are still in Azure
+      -- and on their way down. Preparing it now would only burn the three
+      -- attempts on "file missing"; sweepPendingLocalCopies owns such a row
+      -- until landedAt is stamped, and the fetch runs the preparation itself
+      -- the moment the bytes are there.
+      AND NOT (
+        gmeet_context->'blobFirst' IS NOT NULL
+        AND gmeet_context->'blobFirst'->>'landedAt' IS NULL
+      )
       AND (
         (gmeet_context->'media'->>'faststart') IS DISTINCT FROM 'true'
         OR (gmeet_context->'media'->>'audioOnly') IS DISTINCT FROM 'true'
@@ -370,6 +388,15 @@ async function tick(): Promise<void> {
     await sweepOrphanDerivatives();
   } catch (err) {
     console.warn('[media-sweeper] derivative sweep failed:', err);
+  }
+  try {
+    // DEC-3 Stage C: local copies that never landed (the process died between
+    // the hand-off and the fetch, Azure hiccupped). One per tick — it is a
+    // whole recording's download and nobody is waiting for it. Inert, and not
+    // one query, unless MW_AAI_FROM_BLOB and the media account are both set.
+    await sweepPendingLocalCopies(BLOB_LOCAL_COPIES_PER_TICK);
+  } catch (err) {
+    console.warn('[aai-from-blob] local-copy retry pass failed:', err);
   }
   try {
     // Last: the derivatives this tick just built are candidates too, and the

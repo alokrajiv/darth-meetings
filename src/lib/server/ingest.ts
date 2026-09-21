@@ -209,6 +209,95 @@ export interface IngestOptions {
   scratch?: boolean;
 }
 
+/**
+ * The half of the ingest that has nothing to do with a local file: bias the
+ * submit with the merged vocab and hand AssemblyAI a URL it can read.
+ *
+ * `audioUrl` is AssemblyAI's own upload URL on the local-file path and a
+ * read SAS on the permanent media blob under DEC-3 Stage C
+ * (`lib/server/aai-from-blob.ts`) — AssemblyAI cannot tell the difference and
+ * neither can anything below this line. Throws the raw error: both callers
+ * have their own idea of what to keep when a submit fails.
+ */
+export async function submitForIngest(
+  userId: string,
+  audioUrl: string,
+  opts: IngestOptions
+): Promise<{ id: string; status: string; model: SpeechModel }> {
+  const { keytermsPrompt, customSpelling } = await vocabForSubmit(userId, opts.extraKeyterms);
+  return submitTranscription(audioUrl, {
+    languageCode: opts.languageCode,
+    keytermsPrompt,
+    customSpelling,
+    model: opts.speechModel,
+  });
+}
+
+/**
+ * The other reusable half: the row. Promote the placeholder in place when
+ * there is one, else insert. Same function on both paths so a Stage C meeting
+ * is born exactly as a pull-path one is.
+ *
+ * `audioUrl` is what lands in `transcripts.audio_url`. Stage C passes NULL on
+ * purpose: its URL is a SAS, i.e. a bearer credential for the blob, and the
+ * column is read back by the audio route and copied into exports.
+ */
+export async function createOrPromoteRow(
+  userId: string,
+  submitted: { id: string; status: string; model: SpeechModel },
+  audioUrl: string | null,
+  opts: IngestOptions
+): Promise<TranscriptRow> {
+  let promoted: TranscriptRow | null = null;
+  if (opts.placeholderAssemblyaiId) {
+    // What the meeting ends up called is decided inside promoteUploadingRow
+    // (Phase 1b): the placeholder's own uuid when minted ids are on, the
+    // job id when they are not. `submitted.id` is always the JOB.
+    promoted = await promoteUploadingRow(userId, opts.placeholderAssemblyaiId, {
+      assemblyaiId: submitted.id,
+      status: submitted.status,
+      audioUrl,
+      speechModel: submitted.model,
+    });
+  }
+  // No placeholder, or the sweeper reaped it mid-upload → fresh insert.
+  const row =
+    promoted ??
+    (await createForUser(userId, {
+      assemblyaiId: newMeetingId(submitted.id, await mintedIdsEnabled()),
+      aaiJobId: submitted.id,
+      originalFilename: opts.originalFilename,
+      status: submitted.status,
+      speechModel: submitted.model,
+      languageCode: opts.languageCode ?? null,
+      title: opts.title ?? null,
+      audioUrl,
+      driveFileId: opts.driveFileId ?? null,
+      gmeetContext: opts.gmeetContext ?? null,
+      scratch: opts.scratch ?? false,
+    }));
+  return row;
+}
+
+/**
+ * Attach the new row to its recurring series. Outside `createOrPromoteRow` so
+ * that the local path's "a failure here must not delete the temp file"
+ * ordering is exactly what it has always been.
+ *
+ * Uses the ROW's context, not opts — promoted placeholder rows carry the
+ * linked-event context stamped at upload start.
+ */
+export async function attachSeriesForRow(row: TranscriptRow): Promise<void> {
+  await autoAttachSeries({
+    id: row.id,
+    assemblyai_id: row.assemblyai_id,
+    gmeet_context: row.gmeet_context,
+    title: row.title,
+    user_id: row.user_id,
+    scratch: row.scratch,
+  });
+}
+
 export async function ingestLocalAudio(
   userId: string,
   tempFilename: string,
@@ -248,16 +337,9 @@ export async function ingestLocalAudio(
     if (mixFilename) await deleteAudioFile(mixFilename).catch(() => {});
   }
 
-  const { keytermsPrompt, customSpelling } = await vocabForSubmit(userId, opts.extraKeyterms);
-
   let submitted: { id: string; status: string; model: SpeechModel };
   try {
-    submitted = await submitTranscription(audioUrl, {
-      languageCode: opts.languageCode,
-      keytermsPrompt,
-      customSpelling,
-      model: opts.speechModel,
-    });
+    submitted = await submitForIngest(userId, audioUrl, opts);
   } catch (error) {
     const kept = await keepFailedIngest(userId, tempFilename, opts, 'aai-submit', error).catch((e) => {
       console.error('[ingest] keeping the failed submit failed too:', e);
@@ -269,34 +351,7 @@ export async function ingestLocalAudio(
 
   let row: TranscriptRow;
   try {
-    let promoted: TranscriptRow | null = null;
-    if (opts.placeholderAssemblyaiId) {
-      // What the meeting ends up called is decided inside promoteUploadingRow
-      // (Phase 1b): the placeholder's own uuid when minted ids are on, the
-      // job id when they are not. `submitted.id` is always the JOB.
-      promoted = await promoteUploadingRow(userId, opts.placeholderAssemblyaiId, {
-        assemblyaiId: submitted.id,
-        status: submitted.status,
-        audioUrl,
-        speechModel: submitted.model,
-      });
-    }
-    // No placeholder, or the sweeper reaped it mid-upload → fresh insert.
-    row =
-      promoted ??
-      (await createForUser(userId, {
-        assemblyaiId: newMeetingId(submitted.id, await mintedIdsEnabled()),
-        aaiJobId: submitted.id,
-        originalFilename: opts.originalFilename,
-        status: submitted.status,
-        speechModel: submitted.model,
-        languageCode: opts.languageCode ?? null,
-        title: opts.title ?? null,
-        audioUrl: audioUrl,
-        driveFileId: opts.driveFileId ?? null,
-        gmeetContext: opts.gmeetContext ?? null,
-        scratch: opts.scratch ?? false,
-      }));
+    row = await createOrPromoteRow(userId, submitted, audioUrl, opts);
   } catch (error) {
     // Transcription was submitted but we lost the row — don't also leak the
     // temp file on disk.
@@ -304,16 +359,7 @@ export async function ingestLocalAudio(
     throw error;
   }
 
-  // Use the ROW's context, not opts — promoted placeholder rows carry the
-  // linked-event context stamped at upload start.
-  await autoAttachSeries({
-    id: row.id,
-    assemblyai_id: row.assemblyai_id,
-    gmeet_context: row.gmeet_context,
-    title: row.title,
-    user_id: row.user_id,
-    scratch: row.scratch,
-  });
+  await attachSeriesForRow(row);
 
   // Keep our own copy of the audio. AAI deletes uploaded audio immediately
   // after transcription, so their audio_url is useless for playback. The

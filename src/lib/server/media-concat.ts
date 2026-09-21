@@ -5,8 +5,37 @@ import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { randomUUID } from 'node:crypto';
 import { ensureAudioDir, getAudioDir, resolveAudioPath } from '@/lib/server/audio-storage';
+import { dropScratchDir, makeScratchDir, moveFromScratch } from '@/lib/server/scratch-dir';
 
 const execFileP = promisify(execFile);
+
+/**
+ * Where one concat job works. With `MW_SCRATCH_DIR` set (the VM's NVMe —
+ * DEC-3's scratch rule) the list file and the several-GB output are written
+ * there and the result is moved into the audio dir at the end; with it unset
+ * this is today's code exactly: straight into the audio dir, no move.
+ */
+interface ConcatOpts {
+  /** Names the scratch directory (`<root>/<scratchId>/`). */
+  scratchId?: string;
+}
+
+async function openWorkspace(
+  scratchId: string | undefined
+): Promise<{ dir: string; scratch: string | null }> {
+  await ensureAudioDir();
+  const scratch = scratchId ? await makeScratchDir(scratchId) : null;
+  return { dir: scratch ?? getAudioDir(), scratch };
+}
+
+/** Put the finished output where the ingest expects it (`<audio dir>/<name>`). */
+async function landOutput(
+  workspace: { dir: string; scratch: string | null },
+  outName: string
+): Promise<void> {
+  if (!workspace.scratch) return; // already written in the audio dir
+  await moveFromScratch(path.join(workspace.dir, outName), resolveAudioPath(outName));
+}
 
 /**
  * Concatenate stored media files (a multi-video meeting's primary + part
@@ -18,16 +47,16 @@ const execFileP = promisify(execFile);
  * (mixed containers/codecs) ffmpeg fails and we surface its stderr — better
  * an honest error than a silent hours-long re-encode on the VM.
  */
-export async function concatMediaToTemp(filenames: string[]): Promise<string> {
-  await ensureAudioDir();
-  const listPath = path.join(getAudioDir(), `concat-${randomUUID()}.txt`);
+export async function concatMediaToTemp(filenames: string[], opts: ConcatOpts = {}): Promise<string> {
+  const workspace = await openWorkspace(opts.scratchId);
+  const listPath = path.join(workspace.dir, `concat-${randomUUID()}.txt`);
   // Container by CONTENT, not habit: stitched phone recordings (m4a) are
   // audio-only AAC — naming them .mp4 made the transcript page call them
   // "Uploaded video" and offer a video toggle (Alok 2026-08-30). The
   // re-encode path below already picks this way.
   const firstHasVideo = filenames.length > 0 ? await hasVideo(filenames[0]!) : false;
   const outName = `concat-${randomUUID()}.${firstHasVideo ? 'mp4' : 'm4a'}`;
-  const outAbs = resolveAudioPath(outName);
+  const outAbs = path.join(workspace.dir, outName);
   // ffmpeg concat-demuxer list syntax: file 'path' — single quotes escaped.
   const list = filenames
     .map((f) => `file '${resolveAudioPath(f).replace(/'/g, "'\\''")}'`)
@@ -53,6 +82,7 @@ export async function concatMediaToTemp(filenames: string[]): Promise<string> {
       ],
       { timeout: 10 * 60_000, maxBuffer: 16 * 1024 * 1024 }
     );
+    await landOutput(workspace, outName);
     return outName;
   } catch (err) {
     await fsp.unlink(outAbs).catch(() => {});
@@ -61,6 +91,7 @@ export async function concatMediaToTemp(filenames: string[]): Promise<string> {
     throw new Error(`ffmpeg concat failed${stderr ? `: ${stderr}` : `: ${String(err)}`}`);
   } finally {
     await fsp.unlink(listPath).catch(() => {});
+    await dropScratchDir(workspace.scratch);
   }
 }
 
@@ -110,12 +141,15 @@ async function hasVideo(filename: string): Promise<boolean> {
  * Slow by design (real transcode); callers should try concatMediaToTemp
  * first. Use concatMediaSmart for the try-fast-then-fall-back pair.
  */
-export async function concatMediaReencodeToTemp(filenames: string[]): Promise<string> {
-  await ensureAudioDir();
+export async function concatMediaReencodeToTemp(
+  filenames: string[],
+  opts: ConcatOpts = {}
+): Promise<string> {
+  const workspace = await openWorkspace(opts.scratchId);
   const n = filenames.length;
   const allVideo = (await Promise.all(filenames.map(hasVideo))).every(Boolean);
   const outName = allVideo ? `concat-${randomUUID()}.mp4` : `concat-${randomUUID()}.m4a`;
-  const outAbs = resolveAudioPath(outName);
+  const outAbs = path.join(workspace.dir, outName);
   const inputs = filenames.flatMap((f) => ['-i', resolveAudioPath(f)]);
   const filter = allVideo
     ? filenames.map((_, i) => `[${i}:v:0][${i}:a:0]`).join('') + `concat=n=${n}:v=1:a=1[v][a]`
@@ -140,12 +174,15 @@ export async function concatMediaReencodeToTemp(filenames: string[]): Promise<st
       ],
       { timeout: 60 * 60_000, maxBuffer: 16 * 1024 * 1024 }
     );
+    await landOutput(workspace, outName);
     return outName;
   } catch (err) {
     await fsp.unlink(outAbs).catch(() => {});
     const stderr =
       err && typeof err === 'object' && 'stderr' in err ? String(err.stderr).slice(-500) : '';
     throw new Error(`ffmpeg re-encode concat failed${stderr ? `: ${stderr}` : `: ${String(err)}`}`);
+  } finally {
+    await dropScratchDir(workspace.scratch);
   }
 }
 
@@ -188,13 +225,14 @@ async function probeStreamSignature(filename: string): Promise<string> {
  * verified against the summed inputs before being trusted.
  */
 export async function concatMediaSmart(
-  filenames: string[]
+  filenames: string[],
+  opts: ConcatOpts = {}
 ): Promise<{ filename: string; reencoded: boolean }> {
   const signatures = await Promise.all(filenames.map(probeStreamSignature));
   const uniform = signatures.every((s) => s === signatures[0] && !s.startsWith('unreadable'));
   if (uniform) {
     try {
-      const out = await concatMediaToTemp(filenames);
+      const out = await concatMediaToTemp(filenames, opts);
       const durations = await Promise.all(filenames.map(probeDurationSec));
       const expected = durations.reduce<number>((s, d) => s + (d ?? 0), 0);
       const actual = await probeDurationSec(out);
@@ -210,5 +248,5 @@ export async function concatMediaSmart(
       console.warn('[media-concat] stream-copy failed, falling back to re-encode:', err);
     }
   }
-  return { filename: await concatMediaReencodeToTemp(filenames), reencoded: true };
+  return { filename: await concatMediaReencodeToTemp(filenames, opts), reencoded: true };
 }

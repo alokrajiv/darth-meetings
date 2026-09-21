@@ -11,6 +11,12 @@ import { abandonUpload, finalizeUpload, groupProgressAdder } from '@/lib/server/
 import { findUploadGroupRow, updateUploadProgress } from '@/db-ops/transcripts';
 import { pullBlobToTemp, uploadsStore } from '@/lib/server/darth-uploads-store';
 import {
+  BlobIngestFailed,
+  aaiFromBlobFlagOn,
+  copyTransitToMedia,
+  planBlobIngest,
+} from '@/lib/server/aai-from-blob';
+import {
   duplicateForUpload,
   identityForPart,
   sameFileStoreEnabled,
@@ -64,6 +70,84 @@ async function sameFileVerdict(
 }
 
 /**
+ * DEC-3 Stage C — try to finish this blob session WITHOUT the bytes ever
+ * touching the VM (`docs/recordings-blob-spec.md`, `MW_AAI_FROM_BLOB`).
+ *
+ * `null` = not taken; the caller pulls exactly as before and nothing has
+ * changed (no blob written, no row touched, the transit blob intact). A
+ * non-null answer is the response to send, plus whether it succeeded — the
+ * caller then deletes the transit blob, which on this path happens after the
+ * row exists rather than after the pull, so that every failure mode above can
+ * still fall back.
+ *
+ * The three failure shapes, all of which fall back:
+ *  - not eligible (flag, account, recorder upload, group, unknown extension);
+ *  - the server-side copy or its verify failed;
+ *  - AssemblyAI refused the submit — nothing was created, and the pull path
+ *    can do better (it keeps the bytes as a visible Failed row for the
+ *    ingest-retry sweeper).
+ */
+async function tryAaiFromBlob(
+  user: DarthUser,
+  session: UploadSessionRow,
+  partHash: string | null
+): Promise<{ ok: boolean; response: NextResponse } | null> {
+  const planned = await planBlobIngest(user.userId, session).catch((err) => {
+    console.warn('[aai-from-blob] planning failed:', err);
+    return { ok: false as const, reason: 'planning failed' };
+  });
+  if (!planned.ok) {
+    if (aaiFromBlobFlagOn()) {
+      console.log(`[aai-from-blob] ${session.id}: pull path — ${planned.reason}`);
+    }
+    return null;
+  }
+  const copied = await copyTransitToMedia(
+    planned.store,
+    planned.transit,
+    session.blob_name!,
+    planned.plan
+  );
+  if (!copied.ok) {
+    console.warn(`[aai-from-blob] ${session.id}: copy failed, pulling instead — ${copied.error}`);
+    return null;
+  }
+  console.log(
+    `[aai-from-blob] ${session.id}: ${session.size} B copied to ${planned.plan.blobName} in ${copied.ms} ms (server-side)`
+  );
+  try {
+    const done = await finalizeUpload(user, session.spec, session.size, {
+      part: partHash,
+      fromBlob: copied.source,
+    });
+    const ok = done.status >= 200 && done.status < 300 && 'transcript' in done.body;
+    if (ok && 'transcript' in done.body) {
+      await setUploadSessionStatus(session.id, 'done', null, done.body.transcript.assemblyai_id);
+    } else {
+      const msg = 'error' in done.body ? done.body.error : `finalize returned ${done.status}`;
+      await setUploadSessionStatus(session.id, 'failed', msg);
+    }
+    return { ok, response: NextResponse.json(done.body, { status: done.status }) };
+  } catch (error) {
+    if (error instanceof BlobIngestFailed) {
+      // Nothing was created. Take the permanent copy back out — the pull path
+      // will archive the file itself once it is on disk — and fall back.
+      await planned.store.delete(planned.plan.blobName).catch(() => {});
+      return null;
+    }
+    console.error(`[uploads] finalize crashed ${session.id}:`, error);
+    await setUploadSessionStatus(session.id, 'failed', String(error));
+    return {
+      ok: false,
+      response: NextResponse.json(
+        { error: 'Finalizing the upload failed', detail: String(error) },
+        { status: 500 }
+      ),
+    };
+  }
+}
+
+/**
  * POST /api/uploads/:id/complete — every chunk is in; run the shared
  * finalize tail (multi-file group bookkeeping / stitch, AAI ingest,
  * placeholder promotion). Exactly-once: the session flips open →
@@ -81,6 +165,14 @@ async function sameFileVerdict(
  * deletes the blob, abandons the placeholder and answers 410 — the client
  * starts over). From there the same finalize tail; the blob is deleted once
  * the bytes are on disk.
+ *
+ * With `MW_AAI_FROM_BLOB` on (DEC-3 Stage C) an eligible single-file blob
+ * session skips the pull entirely: Azure copies the transit blob into the
+ * permanent media container server-side and AssemblyAI is handed a read SAS on
+ * it, so the recording is transcribing while the VM fetches its own copy in
+ * the background. Anything not eligible — a group, a Darth Recorder upload
+ * (multi-track, DEC-1), a copy that failed, a submit AssemblyAI refused —
+ * falls through to the pull above with nothing changed (`tryAaiFromBlob`).
  *
  * The same file, again (MW_SAME_FILE_CHECK, docs/recordings-same-file-spec.md):
  * when the session was opened with `dupAware: true` and the caller already has
@@ -155,6 +247,24 @@ export const POST = withAuth(async ({ user, request }, { params }) => {
         { status: 409 }
       );
     }
+
+    // DEC-3 Stage C: hand AssemblyAI the bytes where they already are.
+    // Azure copies the transit blob into the permanent container itself and
+    // the job reads it from a 6-hour read SAS — no pull, no `files.upload`,
+    // no bytes through this VM. Every way of not being eligible (flag off, no
+    // account, a recorder upload, a group, a copy that failed) falls through
+    // to the pull below with nothing changed; the transit blob is still there
+    // precisely because this path deletes it only once the row exists.
+    const fast = await tryAaiFromBlob(user, session, blobVerdict.part);
+    if (fast) {
+      if (fast.ok) {
+        await store
+          .delete(session.blob_name)
+          .catch((err) => console.warn(`[uploads] blob delete after copy failed ${id} (lifecycle rule will):`, err));
+      }
+      return fast.response;
+    }
+
     // Pull. Progress writes keep the listing moving and the placeholder's
     // heartbeat alive (the stale-upload sweeper keys on it). One part of a
     // multi-file group reports the WHOLE recording's bytes (P2) — the group

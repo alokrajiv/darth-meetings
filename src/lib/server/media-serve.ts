@@ -84,6 +84,16 @@ export function redactSas(url: string): string {
   return `${url.slice(0, q)}?<sas redacted>`;
 }
 
+/**
+ * `redactSas` applied to every URL inside a free-text string — an error
+ * message, an SDK exception, an AssemblyAI rejection that quotes back the
+ * `audio_url` we sent it (Stage C). Anything that reaches a `console.*` on a
+ * path where a SAS exists goes through this first.
+ */
+export function redactSasInText(text: string): string {
+  return text.replace(/https?:\/\/[^\s"']+/g, (u) => redactSas(u));
+}
+
 export type RedirectDecision = { redirect: true } | { redirect: false; reason: string };
 
 /**

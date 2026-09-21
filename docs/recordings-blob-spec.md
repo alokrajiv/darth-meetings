@@ -210,6 +210,106 @@ still works as an explicit opt-out for anyone who wants it in a URL — it is si
   and our SAS simply expires. Keep the TTL as short as the longest realistic queue + processing time.
 - The transit pull path stays as the fallback when the flag is off or the copy fails.
 
+### Stage C as built — 2026-09-22
+
+Inert until `MW_AAI_FROM_BLOB` is set AND both accounts are configured. Every upload that is not eligible — and
+every failure on the way — falls back to the pull path with nothing changed: no blob written, no row touched, the
+transit blob still there. That is why the transit blob is deleted **after the row exists** on this path rather
+than after the copy as the sketch above said: the fallback needs those bytes.
+
+| Piece | File |
+|---|---|
+| The gates, the plan (blob name + ids before the row exists), the server-side copy + verify, the 6 h SAS, the row, the background local copy, the re-archive after a faststart remux, the sweeper's retry | `src/lib/server/aai-from-blob.ts` |
+| `copyFromUrl` on the `MediaBlobLike` seam (`Put Block From URL` × N + `Put Block List`), `copyBlockPlan` / `copyBlockId` | `src/lib/server/media-store.ts` (+ the fake) |
+| `submitForIngest` / `createOrPromoteRow` / `attachSeriesForRow` — the two halves of the ingest made reusable without a local file; `ingestLocalAudio` keeps its exact shape and error ordering | `src/lib/server/ingest.ts` |
+| `FinalizeHashes.fromBlob`, the one-line branch, and `BlobIngestFailed` rethrown before any cleanup | `src/lib/server/upload-pipeline.ts` |
+| `tryAaiFromBlob` — the whole attempt, with the transit delete on success | `src/app/api/uploads/[id]/complete/route.ts` |
+| DEC-4: "media we hold" = a local file that EXISTS or a blob-verified canonical | `src/lib/server/aai-retention.ts` |
+| The `blobFirst` marker | `src/lib/format.ts` (`GmeetContext`) |
+| The prep candidates skip a row whose bytes are still in flight; one retry fetch per tick | `src/lib/server/media-sweeper.ts` |
+| `getRecordingMediaRow`, `clearMediaArchiveStamp` | `src/db-ops/recordings.ts` |
+| `redactSasInText` | `src/lib/server/media-serve.ts` |
+| `MW_SCRATCH_DIR` — the stitch works on the NVMe (item 2, below) | `src/lib/server/scratch-dir.ts`, `media-concat.ts`, `upload-pipeline.ts` |
+| INFO, never drift: blob-before-local, and the Stage C counters | `scripts/recordings-verify.ts`, `scripts/media-archive-status.ts` |
+| Tests | `src/lib/server/__tests__/aai-from-blob.test.ts` (15), `tmp/media-ingest/` (56-check scratch-PG integration, real ffmpeg, AssemblyAI stubbed) |
+
+**The multitrack decision: recorder uploads take the PULL path, always.** `normalizeMultiTrack` re-muxes a Darth
+Recorder file so the MIX is track 0 *before* AssemblyAI hears it; handing a multi-track file over as-is is the
+2026-09-16 incident (a Slack huddle transcribed from the system track alone — 484 words instead of 1429). Whether
+a file is multi-track cannot be known without probing the bytes, and not having the bytes is the whole point of
+this stage. The tray is the only producer of such files and it identifies itself on every upload
+(`recorderRecordingId` at open, or `gmeet_context.recorder`), so `blobFastPathRefusal` sends every recorder upload
+down the pull path. One line changes the day the tray declares `multiTrack: false` at open — that is the follow-up
+worth having, because the tray is also the biggest user of blob transit.
+
+**The blob-naming / adoption decision.** The blob is written at the name Stage A would choose —
+`<recording id>/<media id><.ext>` — computed BEFORE the row exists, which is possible because every id involved is
+deterministic:
+
+- the recording is `rec:t<placeholder's transcripts.id>` and a MINTED promotion does not move that key
+  (`canonicalKeyOf`), which is why `mintedIdsEnabled()` is a gate: without minting, the promotion renames the
+  meeting to the job id, the canonical key becomes the job id and the blob would be at the wrong name;
+- the canonical media is `media:<recording>:canonical:0`;
+- the stored filename is `<minted meeting id>.<ext>`, so a file whose extension `audioFilename` cannot recover
+  (`.bin`, which would have to be SNIFFED from the bytes) is refused rather than named differently from what the
+  archive would later compute.
+
+The STAMP is nevertheless the authority: `recording_media.blob_name` is a plain string and every reader (Stage B,
+the delete paths, `--check-blobs`) goes through it, so if reality ever diverges from the prediction — the
+stale-upload sweeper reaped the placeholder mid-flight and the row was inserted fresh — the stamp still names the
+blob that exists and nothing is stranded. The deterministic name only buys `archiveMedia`'s adopt-by-name for the
+case where the stamp itself was lost (a restart between the copy and the UPDATE).
+
+**Where the hash check moved.** The pull path verifies the client's sha256 by reading every byte. Stage C cannot:
+the size is verified against the committed transit blob, the hash is written as blob metadata and *believed* until
+the background fetch reads the bytes back and hashes them. A mismatch there is a loud `SHA MISMATCH` line; the file
+and the blob are kept (they are what AssemblyAI is transcribing) and the row's + the blob's hashes are corrected to
+what the bytes actually are. Only de-duplication ever cared about the claimed value.
+
+**The faststart consequence, and why the blob is uploaded twice for a moov-last video.** The invariant everything
+downstream leans on is "what a media row says about its blob is true of the file that row names". `ensureFaststart`
+rewrites the canonical file in place, so after the local copy lands the first blob is no longer the file. The local
+copy job therefore runs faststart itself, awaited, and on `remuxed` clears the stamp and lets `archiveMedia` put the
+remuxed file up under the same name (`clearMediaArchiveStamp` refuses unless the row is still at the deterministic
+name, so nothing can be stranded). Cost: for a moov-last video the bytes go up twice — once by Azure's own copy
+engine (no VM egress) and once as an ordinary archive upload. The win is unchanged: AssemblyAI is never sent the
+file, and the transcription starts before the VM has seen a byte.
+
+**Item 2 is the scratch-dir change only** (the spec's "anything that must be manipulated first" keeps the pull
+path in this stage, as the brief allowed). `MW_SCRATCH_DIR` unset is not a different default — it is literally the
+old code path, the stitch written straight into the audio dir with no move. Set (`/temphigh/mw-scratch` on the VM)
+each stitch gets `<root>/<group uuid>/` for its list file and its several-GB output, and the result is moved into
+the audio dir with an EXDEV-safe move. An unusable scratch root logs once and falls back to the audio dir.
+
+**What the owner must provision** (beyond Stage A's and B's):
+
+- **Roles: nothing new, given Stage A's assignment.** The destination write is the VM identity's own (Storage Blob
+  Data Contributor on the media account). The SOURCE of a cross-account `Put Block From URL` is authorised by a
+  **SAS in the URL**, not by our identity — so the copy mints a 60-minute read SAS on the transit blob, which needs
+  `generateUserDelegationKey` on `darthuploads`, and Storage Blob Data Contributor on that account (which the VM has
+  had since the chat rollout) contains it. Nothing has to be granted for the copy that is not already true. If
+  either assignment is ever narrowed to a container, add `Storage Blob Delegator` at account scope on that account.
+- **CORS: not needed.** Every party to the copy is server-side (Azure ↔ Azure), and AssemblyAI fetches the SAS URL
+  from its own backend.
+- The 6 h SAS is the only credential that leaves the VM on this path, and it goes to AssemblyAI alone.
+
+**Live proof on the VM once the account exists** (the spec's "C" line):
+
+1. `MW_MEDIA_ARCHIVE` on and archiving healthy (`media-archive-status` says CANARY OK), `MW_MINTED_IDS=1`,
+   `MW_RECORDINGS_WRITE=1`.
+2. `MW_AAI_FROM_BLOB=1`, pm2 restart. Upload a short recording from the WEB dialog (not the tray — the tray takes
+   the pull path by design).
+3. `pm2 logs meeting-whisperer` shows `[aai-from-blob] <session>: N B copied to <blob> in … ms (server-side)` and
+   `[aai-from-blob] <meeting>: job <id> reads <blob>`; it must NOT show an AssemblyAI upload for that row.
+4. Watch the VM's outbound bytes while the copy runs (`nload`/`ifstat`): ≈ 0 for the copy, then one DOWNLOAD of the
+   recording when the background fetch runs, then — for a moov-last video only — one upload of the remuxed file.
+5. `SELECT gmeet_context->'blobFirst' FROM transcripts WHERE assemblyai_id = '<meeting>'` → `landedAt` set within a
+   couple of minutes; the file is in `storage/audio/`; `recording_media` has `blob_name` + `sha256` + `bytes`.
+6. `scripts/media-archive-status.ts` prints `blob before local : … 0 still waiting`.
+7. `pm2 logs meeting-whisperer --lines 2000 | grep -c 'sig='` → `0`.
+8. Play the meeting (with Stage B on) and confirm the redirect serves the FASTSTART bytes — i.e. seeking on a phone
+   is instant, which is what the re-archive is for.
+
 ## Stage D — the VM becomes a cache   flag `MW_MEDIA_CACHE`  (last; needs Alok's go)
 
 - Local reads go through `ensureLocal(media)` → path in `/temphigh/mw-cache/` (LRU by atime, cap 60 GB, never evicts

@@ -345,6 +345,14 @@ export async function addRecordingMedia(input: RecordingMediaInsert): Promise<Re
   return rows[0]!;
 }
 
+/** INTERNAL-ONLY — one media row by its (deterministic) id. */
+export async function getRecordingMediaRow(id: string): Promise<RecordingMediaRow | null> {
+  const rows = await sql<RecordingMediaRow[]>`
+    SELECT ${mediaCols} FROM ${sql(SCHEMA)}.recording_media WHERE id = ${id}::uuid
+  `;
+  return rows[0] ?? null;
+}
+
 /** INTERNAL-ONLY — every file of the given recordings, in player order. */
 export async function listRecordingMedia(recordingIds: string[]): Promise<RecordingMediaRow[]> {
   if (recordingIds.length === 0) return [];
@@ -1372,6 +1380,30 @@ export async function stampMediaArchived(
     UPDATE ${sql(SCHEMA)}.recording_media
     SET blob_name = ${p.blobName}, sha256 = ${p.sha256}, bytes = ${p.bytes}
     WHERE id = ${id}::uuid
+    RETURNING id
+  `;
+  return rows.length > 0;
+}
+
+/**
+ * INTERNAL-ONLY — forget that a media row is archived, so the next
+ * `archiveMedia` copies the file again (DEC-3 Stage C).
+ *
+ * ONE caller: the Stage C local-copy job, when the faststart remux has
+ * rewritten the file in place and the bytes on disk are therefore no longer
+ * the bytes in the blob. The blob is replaced under the SAME deterministic
+ * name, so nothing is orphaned — which is also why this refuses unless the row
+ * still carries the name the archive would choose (`expectBlobName`): a row
+ * whose blob lives somewhere else would leak that blob.
+ */
+export async function clearMediaArchiveStamp(
+  id: string,
+  expectBlobName: string
+): Promise<boolean> {
+  const rows = await sql<Array<{ id: string }>>`
+    UPDATE ${sql(SCHEMA)}.recording_media
+    SET blob_name = NULL, sha256 = NULL
+    WHERE id = ${id}::uuid AND blob_name = ${expectBlobName}
     RETURNING id
   `;
   return rows.length > 0;

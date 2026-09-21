@@ -1,8 +1,11 @@
 import 'server-only';
 import { deleteTranscript } from '@/lib/server/assemblyai';
 import { aaiJobIdOf } from '@/lib/aai-job-state';
+import { audioFileExists } from '@/lib/server/audio-storage';
 import { getForUser, stampAaiDeleted, type TranscriptRow } from '@/db-ops/transcripts';
-import { queueProviderDeletedStamp } from '@/lib/server/recording-sync';
+import { getRecordingMediaRow } from '@/db-ops/recordings';
+import { mediaIdFor } from '@/lib/recording-graph';
+import { queueProviderDeletedStamp, recordingIdForMeeting } from '@/lib/server/recording-sync';
 
 /**
  * DEC-4 — "AssemblyAI keeps nothing of ours"
@@ -48,16 +51,43 @@ export type RetentionOutcome =
   | 'failed';
 
 /**
- * The safety gate. Deleting at AAI is irreversible, so it only happens when
- * the row reads back with a real payload and local media. `expectedUtterances`
- * is the count the caller counted — what AAI returned in the completing poll,
- * or what the sweeper's candidate query saw. A mismatch means the row moved
- * under us between then and the re-read, so we stop.
+ * Do we hold these bytes? Until DEC-3 the answer was "the row names a local
+ * file", which was the same thing. Stage C (`MW_AAI_FROM_BLOB`) separates
+ * them: the recording is in the permanent media container from the moment
+ * AssemblyAI starts reading it, and the VM's own copy arrives minutes later —
+ * so a row can be completely safe with no file on this disk yet.
+ *
+ * "Blob verified" is exactly what the archive means by it: `blob_name` AND
+ * `sha256` on the canonical media row, which are only ever written after Azure
+ * has confirmed the size and carries the hash (`stampMediaArchived`). One
+ * indexed read, and only when there is no usable local file — a row with its
+ * bytes on disk costs a `stat` and nothing else.
  */
-function unsafeReason(
+async function mediaIsSafe(row: TranscriptRow): Promise<string | null> {
+  if (row.local_audio_path && (await audioFileExists(row.local_audio_path))) return null;
+  const recordingId = await recordingIdForMeeting(row.user_id, row.assemblyai_id).catch(() => null);
+  if (recordingId) {
+    const media = await getRecordingMediaRow(mediaIdFor(recordingId, 'canonical', 0)).catch(
+      () => null
+    );
+    if (media?.blob_name && media.sha256) return null;
+  }
+  return row.local_audio_path
+    ? 'the local media file is gone and nothing is archived'
+    : 'no media stored locally';
+}
+
+/**
+ * The safety gate. Deleting at AAI is irreversible, so it only happens when
+ * the row reads back with a real payload and media we actually hold.
+ * `expectedUtterances` is the count the caller counted — what AAI returned in
+ * the completing poll, or what the sweeper's candidate query saw. A mismatch
+ * means the row moved under us between then and the re-read, so we stop.
+ */
+async function unsafeReason(
   row: TranscriptRow,
   expectedUtterances: number | null
-): string | null {
+): Promise<string | null> {
   if (row.status !== 'completed') return `status is ${row.status}`;
   const stored = row.imported_content?.utterances?.length ?? 0;
   if (stored === 0) return 'stored payload has no utterances';
@@ -65,8 +95,7 @@ function unsafeReason(
     return `stored ${stored} utterances, AAI returned ${expectedUtterances}`;
   }
   if (!row.imported_content?.words?.length) return 'stored payload has no words';
-  if (!row.local_audio_path) return 'no media stored locally';
-  return null;
+  return mediaIsSafe(row);
 }
 
 /**
@@ -108,7 +137,7 @@ export async function deleteAtAaiIfSafe(
   const stamped = row.gmeet_context?.aai;
   if (stamped?.deletedAt && stamped.jobId === jobId) return 'skipped';
 
-  const reason = unsafeReason(row, expectedUtterances);
+  const reason = await unsafeReason(row, expectedUtterances);
   if (reason) {
     console.warn(`[aai-retention] NOT deleting ${jobId} at AAI: ${reason}`);
     return 'unsafe';

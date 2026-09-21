@@ -16,14 +16,16 @@
  * nothing here edits it. Instead this module:
  *  - reuses `createAzureBlobStore` for the whole `BlobLike` seam (same
  *    managed-identity credential, same SAS/stat/read/write/delete), and
- *  - adds the four methods a PERMANENT store needs that a TRANSIT store never
+ *  - adds the five methods a PERMANENT store needs that a TRANSIT store never
  *    did: `putStream` (block upload with a content type + disposition),
  *    `setMetadata` (the sha256 + kind stamp, written after the bytes because
  *    the hash is only known once the stream ends), `properties` (size +
- *    metadata + content type, for verify-then-stamp and for adopt) and
+ *    metadata + content type, for verify-then-stamp and for adopt),
  *    `readRange` (Stage B's proxy: a byte range of a blob, so a caller that
- *    may not be redirected can still seek).
- * The in-memory fake grows the same four methods —
+ *    may not be redirected can still seek) and `copyFromUrl` (Stage C:
+ *    Azure pulls the bytes from another blob's URL itself — the VM never sees
+ *    them).
+ * The in-memory fake grows the same five methods —
  * `__tests__/helpers/fake-media-blob.ts`.
  *
  * No `server-only`: like `darth-uploads.ts` this is a plain Node module (the
@@ -48,6 +50,38 @@ export const DARTH_MEDIA_CONTAINER_DEFAULT = 'meetings-media';
 /** Block size and parallelism of an archive upload (spec Stage A.1). */
 export const MEDIA_BLOCK_BYTES = 8 * 1024 * 1024;
 export const MEDIA_UPLOAD_PARALLEL = 4;
+
+/**
+ * Block size and parallelism of a SERVER-SIDE copy (Stage C, `copyFromUrl`).
+ *
+ * Bigger blocks than an upload because nothing streams through this process:
+ * each block is one `Put Block From URL` call telling the storage front end to
+ * fetch that byte range itself. 64 MiB is well inside the 100 MiB per-block
+ * limit and keeps a 3 GB recording at ~48 calls; the 50,000-block ceiling is
+ * 3.2 TB away.
+ */
+export const MEDIA_COPY_BLOCK_BYTES = 64 * 1024 * 1024;
+export const MEDIA_COPY_PARALLEL = 4;
+
+/**
+ * Block ids must be equal-length base64 strings within one blob; a zero-padded
+ * decimal index is the simplest thing that is also readable in a block list.
+ */
+export function copyBlockId(index: number): string {
+  return Buffer.from(`mw-copy-${String(index).padStart(6, '0')}`).toString('base64');
+}
+
+/** The block plan of a server-side copy: one `Put Block From URL` per entry. */
+export function copyBlockPlan(
+  totalBytes: number,
+  blockBytes = MEDIA_COPY_BLOCK_BYTES
+): Array<{ id: string; offset: number; count: number }> {
+  const plan: Array<{ id: string; offset: number; count: number }> = [];
+  for (let offset = 0, i = 0; offset < totalBytes; offset += blockBytes, i += 1) {
+    plan.push({ id: copyBlockId(i), offset, count: Math.min(blockBytes, totalBytes - offset) });
+  }
+  return plan;
+}
 
 /** What `properties` reports about a committed blob. */
 export interface MediaBlobProperties {
@@ -88,6 +122,20 @@ export interface MediaBlobLike extends BlobLike {
    * blob does not exist.
    */
   readRange(blobName: string, start: number, end: number): Promise<ReadableStream<Uint8Array>>;
+  /**
+   * SERVER-SIDE copy of `totalBytes` from `sourceUrl` (a blob URL carrying its
+   * own read SAS — the source may be in another account) into `blobName`.
+   * Stage C: the bytes go account → account inside Azure and never cross this
+   * VM. Implemented as `Put Block From URL` × N + `Put Block List`, so it is
+   * synchronous (we know when it is done), size-unbounded and resumable by
+   * simply re-running it — nothing is readable until the block list commits.
+   */
+  copyFromUrl(
+    blobName: string,
+    sourceUrl: string,
+    totalBytes: number,
+    opts?: MediaPutOptions
+  ): Promise<{ bytes: number }>;
 }
 
 /**
@@ -161,6 +209,34 @@ export function createAzureMediaStore(cfg: UploadsConfig, deps: MediaStoreDeps =
     },
     async setMetadata(blobName, metadata) {
       await container.getBlockBlobClient(blobName).setMetadata(metadata);
+    },
+    async copyFromUrl(blobName, sourceUrl, totalBytes, opts = {}) {
+      const client = container.getBlockBlobClient(blobName);
+      const plan = copyBlockPlan(totalBytes, opts.blockBytes ?? MEDIA_COPY_BLOCK_BYTES);
+      let next = 0;
+      const workers = Array.from(
+        { length: Math.max(1, Math.min(opts.parallel ?? MEDIA_COPY_PARALLEL, plan.length)) },
+        async () => {
+          for (;;) {
+            const job = plan[next++];
+            if (!job) return;
+            // The SDK's `offset`/`count` are the SOURCE's byte range; the
+            // destination order is decided by the block list below.
+            await client.stageBlockFromURL(job.id, sourceUrl, job.offset, job.count);
+          }
+        }
+      );
+      await Promise.all(workers);
+      await client.commitBlockList(
+        plan.map((b) => b.id),
+        {
+          blobHTTPHeaders: {
+            ...(opts.contentType ? { blobContentType: opts.contentType } : {}),
+            ...(opts.contentDisposition ? { blobContentDisposition: opts.contentDisposition } : {}),
+          },
+        }
+      );
+      return { bytes: totalBytes };
     },
     async readRange(blobName, start, end) {
       // `download(offset, count)` — Azure's count is a LENGTH, the seam's

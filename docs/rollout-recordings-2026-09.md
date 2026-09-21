@@ -19,6 +19,8 @@ Flags live in `~/apps/meeting-whisperer/.env.local` on the VM; every one is read
 | `MW_CLIPS` | split a window of a recording off into its own meeting (no re-transcription, no file cut) |
 | `MW_MEDIA_FROM_BLOB` | /audio answers browsers with a 60-minute signed blob link instead of streaming through the VM |
 | `DARTH_MEDIA_ACCOUNT` / `DARTH_MEDIA_CONTAINER` / `MW_MEDIA_ARCHIVE` | copy every media file to the permanent blob account |
+| `MW_AAI_FROM_BLOB` | AssemblyAI reads the recording from the blob; the VM stops pushing it there (Stage C) |
+| `MW_SCRATCH_DIR` | the stitch of a multi-file upload works on the NVMe (`/temphigh/mw-scratch`) instead of the root disk |
 
 ## A. Deploy + AssemblyAI keeps nothing  (no migration needed)
 
@@ -94,7 +96,19 @@ Flags live in `~/apps/meeting-whisperer/.env.local` on the VM; every one is read
 - [ ] After D has archived the media: set `MW_MEDIA_FROM_BLOB=1`, restart; play a meeting on a phone and a laptop,
       seek, and check Safari (the one browser no fake could prove — the player falls back to the app path by itself).
 
+## I. AssemblyAI reads the blob (DEC-3 stage C)
+
+- [ ] Needs B (`MW_RECORDINGS_WRITE` + `MW_MINTED_IDS`) and D (the media account, `MW_MEDIA_ARCHIVE`, canary OK).
+- [ ] **ALOK** set `MW_AAI_FROM_BLOB=1`, restart. Then upload a short recording **from the web dialog** and follow
+      the eight live-proof steps in `docs/recordings-blob-spec.md` ("Stage C as built"): the pm2 log must show a
+      server-side copy and no AssemblyAI upload for that row, `blobFirst.landedAt` must appear within a couple of
+      minutes, and `grep -c 'sig='` must stay 0.
+- The Darth Recorder tray deliberately keeps the pull path (a tray file may be multi-track — DEC-1); so does every
+  multi-file group. Nothing to switch off for them.
+- [ ] Optional, independent: **ALOK** `mkdir -p /temphigh/mw-scratch`, set `MW_SCRATCH_DIR=/temphigh/mw-scratch`,
+      restart — the stitch of a multi-file upload then works on the NVMe. Unset = today's behaviour exactly.
+
 ## Order and dependencies
 
 A is independent and can go today. B needs only its two migrations. C, D(archive) and E all need B's
-`MW_RECORDINGS_WRITE`. Nothing here needs a darth-cli release.
+`MW_RECORDINGS_WRITE`; I needs B + D. Nothing here needs a darth-cli release.

@@ -143,6 +143,8 @@ interface ActualMedia {
   // read only for the INFO block at the end of the report.
   blob_name: string | null;
   sha256: string | null;
+  /** Only for the INFO block: how long a blob-only row has been blob-only. */
+  created_at: Date;
 }
 interface ActualTranscription {
   id: string;
@@ -313,7 +315,7 @@ async function main() {
     sql<ActualMedia[]>`
       SELECT id, recording_id, kind, ord, offset_ms::float8 AS offset_ms,
              duration_ms::float8 AS duration_ms, filename, has_video, source_ref, of_media_id,
-             blob_name, sha256
+             blob_name, sha256, created_at
       FROM ${sql(SCHEMA)}.recording_media
     `,
     sql<ActualTranscription[]>`
@@ -593,8 +595,16 @@ async function main() {
         const p = localOf(m);
         return p ? existsSync(p) : false;
       });
+      // Blob-before-local is Stage C's NORMAL state for the first minutes of
+      // a recording's life (`MW_AAI_FROM_BLOB`: AssemblyAI reads the blob and
+      // the VM fetches its copy afterwards), and Stage D's normal state for
+      // ever after. Neither is drift; the age is what tells them apart.
+      const fresh = lostLocal.filter(
+        (m) => Date.now() - m.created_at.getTime() < 24 * 3600_000
+      );
       infos.push(
-        `  archived, local file gone    : ${lostLocal.length}  (blob-only; expected once Stage D drains storage/)`
+        `  archived, local file gone    : ${lostLocal.length}  (blob-only: ${fresh.length} newer than 24 h` +
+          ` — Stage C's fetch may still be in flight; the rest is expected once Stage D drains storage/)`
       );
       infos.push(
         `  local file present, no blob  : ${waiting.length}  (what the backfill still has to copy)`

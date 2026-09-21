@@ -15,6 +15,7 @@ import { resolveAccess } from '@/db-ops/transcript-access';
 import { deleteAudioFile, deleteAudioFilesByPrefix } from '@/lib/server/audio-storage';
 import { concatMediaSmart, probeDurationSec } from '@/lib/server/media-concat';
 import { IngestError, ingestLocalAudio } from '@/lib/server/ingest';
+import { BlobIngestFailed, ingestBlobAudio, type BlobIngestSource } from '@/lib/server/aai-from-blob';
 import { queueRecordingGraphSync } from '@/lib/server/recording-sync';
 import { stampUploadIdentity } from '@/lib/server/same-file';
 import { normalizePartSha256, normalizeSha256, partHashesInOrder, uploadIdentityHash } from '@/lib/same-file';
@@ -580,6 +581,14 @@ export interface FinalizeHashes {
    * (docs/recordings-same-file-spec.md).
    */
   part?: string | null;
+  /**
+   * DEC-3 Stage C: the bytes are already in the PERMANENT media container and
+   * there is no temp file on this VM. AssemblyAI reads them from the SAS this
+   * carries, and the local copy is fetched afterwards
+   * (`lib/server/aai-from-blob.ts`). Absent = today's local-file ingest, byte
+   * for byte. Single files only — a group is stitched on the VM first.
+   */
+  fromBlob?: BlobIngestSource | null;
 }
 
 /**
@@ -677,8 +686,11 @@ export async function finalizeUpload(
         offset += durations[i] ?? 0;
         return entry;
       });
+      // The stitch works on the NVMe when `MW_SCRATCH_DIR` is set (DEC-3's
+      // scratch rule) and in the audio dir exactly as before when it is not.
       const { filename: combinedTemp, reencoded } = await concatMediaSmart(
-        parts.map((p) => p.tempFilename)
+        parts.map((p) => p.tempFilename),
+        { scratchId: groupUuid }
       );
       console.log(
         `[upload] stitched ${multi.total} recordings for ${groupRow.assemblyai_id}` +
@@ -795,20 +807,26 @@ export async function finalizeUpload(
     }, 60_000);
     heartbeat.unref?.();
     let row;
+    const ingestOpts = {
+      originalFilename: spec.originalFilename,
+      languageCode: spec.languageCode,
+      title: sourceRow?.title ?? spec.linkedEvent?.title?.slice(0, 300) ?? null,
+      extraKeyterms:
+        sourceSpeakers.length > 0 || attendeeNames.length > 0
+          ? [...sourceSpeakers, ...attendeeNames]
+          : undefined,
+      gmeetContext,
+      placeholderAssemblyaiId: placeholderId,
+      speechModel: spec.speechModel,
+      scratch: spec.scratch ?? false,
+    };
     try {
-      row = await ingestLocalAudio(user.userId, tempFilename, {
-        originalFilename: spec.originalFilename,
-        languageCode: spec.languageCode,
-        title: sourceRow?.title ?? spec.linkedEvent?.title?.slice(0, 300) ?? null,
-        extraKeyterms:
-          sourceSpeakers.length > 0 || attendeeNames.length > 0
-            ? [...sourceSpeakers, ...attendeeNames]
-            : undefined,
-        gmeetContext,
-        placeholderAssemblyaiId: placeholderId,
-        speechModel: spec.speechModel,
-        scratch: spec.scratch ?? false,
-      });
+      // Stage C or today's path — the SAME options, the same row, the same
+      // everything after it. The difference is only where AssemblyAI reads the
+      // bytes from and whether this VM holds them yet.
+      row = hashes.fromBlob
+        ? await ingestBlobAudio(user.userId, hashes.fromBlob, ingestOpts)
+        : await ingestLocalAudio(user.userId, tempFilename, ingestOpts);
     } finally {
       clearInterval(heartbeat);
     }
@@ -822,6 +840,11 @@ export async function finalizeUpload(
     await stampSingleIdentity(user.userId, row.assemblyai_id, partHash);
     return { status: 201, body: { transcript: row } };
   } catch (error) {
+    // Stage C's submit failed before anything was created: the placeholder is
+    // untouched and the transit blob is still there, so the caller re-runs
+    // this same tail on the pull path — which, unlike this one, can keep the
+    // bytes on disk as a visible Failed row. Rethrown BEFORE any cleanup.
+    if (error instanceof BlobIngestFailed) throw error;
     if (error instanceof IngestError && error.keptRow) {
       // Bytes are stored, the row stays visible as Failed and the sweeper
       // retries the hand-off: for the client this upload succeeded.

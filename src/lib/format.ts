@@ -456,6 +456,27 @@ export interface GmeetContext {
    * only the upload pipeline writes it and no sync derives it.
    */
   upload?: { sha256?: string; partSha256?: string[] } | null;
+  /**
+   * DEC-3 Stage C (`MW_AAI_FROM_BLOB`, lib/server/aai-from-blob.ts): these
+   * bytes reached AssemblyAI as a read SAS on the PERMANENT media blob and
+   * never passed through this VM. The blob is the first copy; the local one is
+   * fetched in the background afterwards and `landedAt` is stamped when it
+   * arrives (with `remuxed` when the faststart pass then rewrote the file, so
+   * the blob was replaced by the archive).
+   *
+   * Read by the media sweeper twice: to leave a row alone while its file is
+   * still on its way, and to retry a fetch that never landed.
+   */
+  blobFirst?: {
+    blobName: string;
+    sha256: string;
+    bytes: number;
+    at: string;
+    landedAt?: string | null;
+    remuxed?: boolean;
+    error?: string;
+    attempts?: number;
+  } | null;
   /** Import queued while Google was still preparing the needed artifact
    * (transcript Doc for 'transcript' mode, video file for 'video', both for
    * 'both'). Lives on a `defer-…` placeholder row (status 'waiting'); the

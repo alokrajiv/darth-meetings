@@ -2,10 +2,11 @@
  * Where the media archive has got to — READ ONLY.
  *
  * Counts what `recording_media` says (archived / still to copy / nothing to
- * copy, by kind and in bytes), prints the lifecycle canary's verdict and the
- * queue of blobs waiting to be deleted. This is the totals line the sweeper's
- * per-tick log deliberately does not print (docs/recordings-blob-spec.md,
- * Stage A.3/A.4).
+ * copy, by kind and in bytes), prints the lifecycle canary's verdict, the
+ * queue of blobs waiting to be deleted, and how many recordings are in the
+ * blob but not (yet) on this VM — Stage C's normal state for a few minutes.
+ * This is the totals line the sweeper's per-tick log deliberately does not
+ * print (docs/recordings-blob-spec.md, Stage A.3/A.4/C).
  *
  *   SCHEMA_PREFIX=prod bun run scripts/media-archive-status.ts
  *   SCHEMA_PREFIX=prod bun run scripts/media-archive-status.ts --check-blobs
@@ -109,6 +110,9 @@ async function main() {
   console.log(
     `archive flag      : MW_MEDIA_ARCHIVE=${process.env.MW_MEDIA_ARCHIVE ?? '(unset)'}`
   );
+  console.log(
+    `blob-first flag   : MW_AAI_FROM_BLOB=${process.env.MW_AAI_FROM_BLOB ?? '(unset)'}`
+  );
 
   // ---- totals -----------------------------------------------------------
   const totals = await sql<TotalRow[]>`
@@ -210,6 +214,31 @@ async function main() {
         console.log(`  ${pad(r.blob_name, 48)} attempts ${r.attempts} ${r.last_error ?? ''}`);
       }
     }
+  }
+
+  // ---- blob before local (DEC-3 Stage C) --------------------------------
+  // A recording whose bytes went to AssemblyAI straight from the blob has no
+  // local copy until the background fetch lands one. That is NOT drift and
+  // never touches the exit code — but a row still waiting hours later means
+  // the fetch (and its per-tick sweeper retry) is failing, so it is counted
+  // here rather than left to be discovered by a 404 on playback.
+  const blobFirst = await sql<Array<{ total: number; pending: number; stale: number; remuxed: number }>>`
+    SELECT count(*)::int AS total,
+           count(*) FILTER (WHERE gmeet_context->'blobFirst'->>'landedAt' IS NULL)::int AS pending,
+           count(*) FILTER (WHERE gmeet_context->'blobFirst'->>'landedAt' IS NULL
+                              AND created_at < now() - interval '6 hours')::int AS stale,
+           count(*) FILTER (WHERE (gmeet_context->'blobFirst'->>'remuxed') = 'true')::int AS remuxed
+    FROM ${sql(SCHEMA)}.transcripts
+    WHERE deleted_at IS NULL AND gmeet_context->'blobFirst' IS NOT NULL
+  `.catch(() => null);
+  if (blobFirst?.[0] && blobFirst[0].total > 0) {
+    const b = blobFirst[0];
+    console.log(
+      `blob before local : ${b.total} recording(s) reached AssemblyAI from the blob; ` +
+        `${b.pending} still waiting for their local copy` +
+        (b.stale > 0 ? `, ${b.stale} of them older than 6 h — CHECK THE LOG` : '') +
+        (b.remuxed > 0 ? ` (${b.remuxed} re-archived after a faststart remux)` : '')
+    );
   }
 
   // ---- --check-blobs ----------------------------------------------------
