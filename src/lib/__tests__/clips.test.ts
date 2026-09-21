@@ -19,10 +19,12 @@ import {
   parseTimestampMs,
   planSplit,
   planUnsplit,
+  recordingAnchorIso,
   rekeyEditMap,
   selectWindow,
   silenceBoundaries,
   speakerBoundaries,
+  splitPrecondition,
   validateSplitWindow,
   windowBoundsFor,
   type ClipWindow,
@@ -675,5 +677,100 @@ describe('the file-deletion rule (spec §Media — "test it hard")', () => {
 
   test('a cleanup that threw keeps the files (it knows nothing about who holds them)', () => {
     expect(mayDeleteRecordingFiles({ graphApplied: true, recordingsKept: ['unknown'] })).toBe(false);
+  });
+});
+
+
+describe('split preconditions — one answer for the menu and the route', () => {
+  /** A meeting nothing is wrong with. */
+  const ok = {
+    enabled: true,
+    trashed: false,
+    status: 'completed',
+    retranscribing: false,
+    sharedJob: false,
+    videoParts: 0,
+    hasClip: true,
+    spanMs: SPAN,
+  };
+
+  test('nothing in the way: null, which is what lets the menu offer it', () => {
+    expect(splitPrecondition(ok)).toBeNull();
+  });
+
+  test('each blocker has its own code and its own sentence', () => {
+    expect(splitPrecondition({ ...ok, enabled: false })?.code).toBe('disabled');
+    expect(splitPrecondition({ ...ok, trashed: true })?.message).toMatch(/trash/i);
+    expect(splitPrecondition({ ...ok, status: 'processing' })?.code).toBe('not-completed');
+    expect(splitPrecondition({ ...ok, retranscribing: true })?.code).toBe('transcribing');
+    expect(splitPrecondition({ ...ok, sharedJob: true })?.code).toBe('shared-job');
+    expect(splitPrecondition({ ...ok, videoParts: 2 })?.code).toBe('multi-recording');
+    expect(splitPrecondition({ ...ok, hasClip: false })?.code).toBe('no-clip');
+  });
+
+  test('every refusal says something — a greyed item always has a tooltip', () => {
+    for (const over of [
+      { enabled: false },
+      { trashed: true },
+      { status: 'error' },
+      { retranscribing: true },
+      { sharedJob: true },
+      { videoParts: 1 },
+      { hasClip: false },
+      { spanMs: 0 },
+    ]) {
+      const refusal = splitPrecondition({ ...ok, ...over });
+      expect(refusal).not.toBeNull();
+      expect(refusal!.message.length).toBeGreaterThan(10);
+    }
+  });
+
+  test('a meeting with no length on its timeline has no part to give away', () => {
+    expect(splitPrecondition({ ...ok, spanMs: 0 })?.code).toBe('no-clip');
+    expect(splitPrecondition({ ...ok, spanMs: Number.NaN })?.code).toBe('no-clip');
+  });
+
+  test('the trash is named as the trash, not as "still being transcribed"', () => {
+    const trashed = splitPrecondition({ ...ok, trashed: true, status: 'processing' })!;
+    expect(trashed.message).toMatch(/trash/i);
+  });
+
+  test('switched off wins over everything — nothing about clips is shown at all', () => {
+    expect(
+      splitPrecondition({ ...ok, enabled: false, trashed: true, status: 'error' })?.code
+    ).toBe('disabled');
+  });
+});
+
+describe('the recording anchor — a day for the calendar pre-filter', () => {
+  const started = '2026-09-21T08:30:00.000Z';
+  const recorded = '2026-09-21T09:00:00.000Z';
+  const created = '2026-09-22T01:00:00.000Z';
+
+  test('the recording’s own clock wins', () => {
+    expect(recordingAnchorIso(started, recorded, created)).toBe(started);
+  });
+
+  test('no recording clock: the meeting’s curated moment', () => {
+    expect(recordingAnchorIso(null, recorded, created)).toBe(recorded);
+    expect(recordingAnchorIso(undefined, recorded, created)).toBe(recorded);
+  });
+
+  test('neither: the day it landed here, because a poor anchor beats none', () => {
+    expect(recordingAnchorIso(null, null, created)).toBe(created);
+  });
+
+  test('Dates are accepted as readily as strings', () => {
+    expect(recordingAnchorIso(new Date(started), null, null)).toBe(started);
+  });
+
+  test('a junk value is skipped, not returned as "Invalid Date"', () => {
+    expect(recordingAnchorIso('not a date', recorded, created)).toBe(recorded);
+    expect(recordingAnchorIso('', null, created)).toBe(created);
+  });
+
+  test('nothing usable at all is null', () => {
+    expect(recordingAnchorIso(null, null, null)).toBeNull();
+    expect(recordingAnchorIso('nope', 'never', undefined)).toBeNull();
   });
 });

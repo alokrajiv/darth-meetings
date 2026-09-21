@@ -66,7 +66,11 @@ restoring N). Keep it simple: implement "put it back" only from N's page menu, o
   window crossing an existing hole, meeting not `completed`, meeting whose transcription is mid re-run, non-compat
   multi-RECORDING meetings, legacy two-owner job.
 - `GET  /api/transcripts/:id/clips` → the meeting's clips + sibling meetings on the same recording that the CALLER
-  can access ("also from this recording: …" — never reveal a sibling the caller cannot open).
+  can access ("also from this recording: …" — never reveal a sibling the caller cannot open). It also answers
+  `splittable` / `splitBlockedReason` from `splitPrecondition` — the same pure function the split route refuses
+  from — so the ⋯ menu greys the item with the route's own sentence instead of inferring the rules a second time;
+  and `recording.startedAt` falls back to the meeting's `recorded_at`, then `created_at` (`recordingAnchorIso`), so
+  the split dialog's calendar pre-filter always has a day to ask about.
 - `POST /api/transcripts/:id/clips/propose` `{ instruction? }` → **proposals only, nothing written**:
   `[{ fromMs, toMs, title, reason, eventRef? , confidence }]`. Inputs the proposer may use: utterances with speaker
   names, speaker first/last-heard times ("when Paola came in / left"), silences ≥ 45 s, topic shifts, and the

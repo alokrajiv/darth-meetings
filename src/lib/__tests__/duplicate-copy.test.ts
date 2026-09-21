@@ -5,6 +5,7 @@ import {
   NOTHING_UPLOADED,
   UNTITLED_MATCH,
   duplicateCopy,
+  duplicateRowLine,
   matchAction,
   matchDay,
   matchFacts,
@@ -13,6 +14,7 @@ import {
   matchTitle,
   stillTranscribing,
 } from '@/lib/duplicate-copy';
+import { formatDuration } from '@/lib/format';
 import { dayLabelCompact } from '@/lib/when';
 
 /**
@@ -56,31 +58,30 @@ describe('matchTitle', () => {
 });
 
 describe('matchLength', () => {
-  test('the spec example: 4182 s is 1h 09m', () => {
-    expect(matchLength(4182)).toBe('1h 09m');
+  /** The listing, the Recording card and this dialog are one number: whatever
+   * `formatDuration` says, and never a second opinion. */
+  test('is the listing formatter, seconds and all', () => {
+    for (const secs of [4182, 3 * 3600 + 5 * 60, 47 * 60 + 45, 60, 38]) {
+      expect(matchLength(secs)).toBe(formatDuration(secs));
+    }
   });
-  test('minutes inside an hour are zero padded', () => {
-    expect(matchLength(3 * 3600 + 5 * 60)).toBe('3h 05m');
-    expect(matchLength(2 * 3600 + 59 * 60 + 59)).toBe('2h 59m');
+  test('the "56m" bug: a 56m 45s meeting says 56m 45s here too', () => {
+    expect(matchLength(56 * 60 + 45)).toBe('56m 45s');
   });
-  test('under an hour is plain minutes', () => {
-    expect(matchLength(47 * 60)).toBe('47m');
-    expect(matchLength(60)).toBe('1m');
-  });
-  test('under a minute is seconds', () => {
+  test('over an hour, under a minute', () => {
+    expect(matchLength(4182)).toBe('1h 9m');
     expect(matchLength(38)).toBe('38s');
-    expect(matchLength(1)).toBe('1s');
   });
-  test('nothing usable is null, never "0m"', () => {
+  test('a fractional second is floored, not rounded up past the mark', () => {
+    expect(matchLength(45.9)).toBe('45s');
+  });
+  test('nothing usable is null, never "0s"', () => {
     expect(matchLength(null)).toBeNull();
     expect(matchLength(undefined)).toBeNull();
     expect(matchLength(0)).toBeNull();
     expect(matchLength(0.4)).toBeNull();
     expect(matchLength(Number.NaN)).toBeNull();
     expect(matchLength(Number.POSITIVE_INFINITY)).toBeNull();
-  });
-  test('an exact hour has no stray minutes', () => {
-    expect(matchLength(3600)).toBe('1h 00m');
   });
 });
 
@@ -102,7 +103,7 @@ describe('matchDay', () => {
 describe('matchFacts', () => {
   test('title · day · length', () => {
     const facts = matchFacts(match(), NOW_2026);
-    expect(facts).toBe(`Weekly sync · ${dayLabelCompact(WED_17_SEP, NOW_2026)} · 1h 09m`);
+    expect(facts).toBe(`Weekly sync · ${dayLabelCompact(WED_17_SEP, NOW_2026)} · 1h 9m`);
   });
   test('missing parts are dropped, not dashed', () => {
     expect(matchFacts(match({ when: null, durationSec: null }), NOW_2026)).toBe('Weekly sync');
@@ -141,10 +142,30 @@ describe('matchNote and the action', () => {
   });
 });
 
+describe('duplicateRowLine', () => {
+  test('headline, colon, then the match', () => {
+    expect(duplicateRowLine(match(), NOW_2026)).toBe(
+      `${DUPLICATE_HEADLINE}: ${matchFacts(match(), NOW_2026)}`
+    );
+  });
+  test('an em dash in the title does not collide with the join', () => {
+    const line = duplicateRowLine(match({ title: 'Kerner — Q3 close' }), NOW_2026);
+    // The only em dash on the line is the one the title brought.
+    expect(line.split('—').length - 1).toBe(1);
+    expect(line.startsWith(`${DUPLICATE_HEADLINE}: Kerner — Q3 close ·`)).toBe(true);
+  });
+  test('an untitled match still reads as a sentence', () => {
+    expect(duplicateRowLine(match({ title: null }), NOW_2026)).toContain(
+      `${DUPLICATE_HEADLINE}: ${UNTITLED_MATCH}`
+    );
+  });
+});
+
 describe('duplicateCopy', () => {
   test('carries the headline, the facts and the reassurance', () => {
     const copy = duplicateCopy(match(), NOW_2026);
     expect(copy.headline).toBe(DUPLICATE_HEADLINE);
+    expect(copy.rowLine).toBe(duplicateRowLine(match(), NOW_2026));
     expect(copy.facts).toContain('Weekly sync');
     expect(copy.reassurance).toBe(NOTHING_UPLOADED);
     expect(copy.note).toBeNull();

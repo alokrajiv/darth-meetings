@@ -47,7 +47,7 @@ import {
   type UploadOutcome,
 } from '@/lib/chunked-upload';
 import { shouldHashInBrowser, type DuplicateMatch } from '@/lib/same-file';
-import { duplicateCopy, matchAction, matchFacts, matchNote } from '@/lib/duplicate-copy';
+import { duplicateCopy, duplicateRowLine, matchAction, matchNote } from '@/lib/duplicate-copy';
 import { OFFLINE_TITLE, useOfflineGate } from '@/lib/offline/offline-context';
 import { isNetworkFailure } from '@/lib/offline/offline-fetch';
 
@@ -1305,11 +1305,15 @@ export function AudioUpload({ onTranscriptCreated }: AudioUploadProps) {
                     sentence, same two ways out, in the row it belongs to. */}
                 {upload.status === 'duplicate' && upload.duplicate && (
                   <div className="mt-1 space-y-1.5">
-                    {/* The status beside the file name already reads "Already
-                        yours", so the headline is not repeated here — only the
-                        facts, the one extra note, and what did NOT happen. */}
+                    {/* One line, headline and all (`duplicateRowLine`): the
+                        status chip on the right says "Already yours" in two
+                        words, but this row is what gets read, and a bare
+                        "Title · day · length" under a file name does not say
+                        what happened. The join is a colon — a title with an em
+                        dash in it makes an em-dash join read as three equal
+                        clauses. */}
                     <p className="text-xs text-foreground">
-                      {matchFacts(upload.duplicate)}
+                      {duplicateRowLine(upload.duplicate)}
                     </p>
                     <p className="text-xs text-muted-foreground">
                       {matchNote(upload.duplicate) ? `${matchNote(upload.duplicate)} ` : ''}

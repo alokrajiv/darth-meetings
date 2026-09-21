@@ -8,8 +8,10 @@ import {
   mergeOrder,
   planSplit,
   planUnsplit,
+  recordingAnchorIso,
   rekeyEditMap,
   selectWindow,
+  splitPrecondition,
   splitRefusal,
   windowBoundsFor,
   type ClipSibling,
@@ -186,6 +188,36 @@ export async function meetingClipState(row: StoredTranscript): Promise<MeetingCl
 }
 
 /**
+ * "Could this meeting be split right now?" — asked of the DATABASE, answered
+ * by the pure `splitPrecondition`.
+ *
+ * Both callers go through here: the GET, to say whether the menu item may be
+ * offered and why not, and the POST, to refuse. One function, therefore one
+ * answer — the menu cannot offer what the route would turn down.
+ */
+async function splitPreconditionFor(
+  row: StoredTranscript,
+  state: MeetingClipState
+): Promise<SplitRefusal | null> {
+  return splitPrecondition({
+    enabled: true,
+    trashed: !!row.deleted_at,
+    status: row.status,
+    retranscribing: !!row.gmeet_context?.retranscribing,
+    // The one legacy pair of meetings that share an AssemblyAI job: two rows,
+    // one set of bytes, and a split would rewrite `imported_content` on one of
+    // them while the other kept showing the old text under the same id.
+    sharedJob: (await meetingCopyCount(row.assemblyai_id)) > 1,
+    // A stop/restart Meet meeting has several playable files and only the
+    // first was transcribed; a window of "the meeting" has no single file to
+    // clamp.
+    videoParts: row.gmeet_context?.videoParts?.length ?? 0,
+    hasClip: !!state.recordingId && state.clips.length > 0,
+    spanMs: state.spanMs,
+  });
+}
+
+/**
  * `GET /api/transcripts/:id/clips`.
  *
  * PRIVACY: siblings and `splitFrom` are resolved through the CALLER's own
@@ -211,6 +243,8 @@ export async function clipsView(
     splitFrom: null,
     canUnsplit: false,
     unsplitBlockedReason: null,
+    splittable: false,
+    splitBlockedReason: null,
   };
   if (!(await clipsEnabled())) return empty;
 
@@ -241,6 +275,7 @@ export async function clipsView(
   // "it came back from the caller-scoped sibling query".
   const sourceSibling = provenance ? (siblings.find((s) => s.isSource) ?? null) : null;
   const unsplit = await unsplitVerdict(access, state, sourceSibling);
+  const splitBlocked = await splitPreconditionFor(access.row, state);
 
   return {
     enabled: true,
@@ -248,7 +283,14 @@ export async function clipsView(
     recording: {
       id: state.recordingId,
       durationMs: state.recordingDurationMs,
-      startedAt: state.recordingStartedAt,
+      // The recording's own clock when it has one, else the meeting's — the
+      // dialog's calendar pre-filter needs a day to ask about, and an
+      // approximate anchor beats none (`recordingAnchorIso`).
+      startedAt: recordingAnchorIso(
+        state.recordingStartedAt,
+        access.row.recorded_at,
+        access.row.created_at
+      ),
     },
     clips: state.clips,
     spanMs: state.spanMs,
@@ -261,6 +303,8 @@ export async function clipsView(
         : null,
     canUnsplit: unsplit.can,
     unsplitBlockedReason: unsplit.reason,
+    splittable: !splitBlocked,
+    splitBlockedReason: splitBlocked?.message ?? null,
   };
 }
 
@@ -327,28 +371,13 @@ export async function splitMeeting(input: SplitInput): Promise<ClipOpResult<Spli
   const row = access.row;
 
   if (!(await clipsEnabled())) return refuse(splitRefusal('disabled'));
-  if (row.deleted_at) {
-    return refuse(splitRefusal('not-completed', 'This meeting is in the trash.'));
-  }
-  if (row.status !== 'completed') return refuse(splitRefusal('not-completed'));
-  if (row.gmeet_context?.retranscribing) return refuse(splitRefusal('transcribing'));
-  // The one legacy pair of meetings that share an AssemblyAI job: two rows,
-  // one set of bytes, and a split would rewrite `imported_content` on one of
-  // them while the other kept showing the old text under the same id.
-  if ((await meetingCopyCount(row.assemblyai_id)) > 1) return refuse(splitRefusal('shared-job'));
-  // A stop/restart Meet meeting has several playable files and only the first
-  // was transcribed; a window of "the meeting" has no single file to clamp.
-  if ((row.gmeet_context?.videoParts?.length ?? 0) > 0) {
-    return refuse(
-      splitRefusal(
-        'multi-recording',
-        'This meeting has more than one video, which cannot be split yet.'
-      )
-    );
-  }
 
+  // Every refusal about the MEETING comes from the one function the GET
+  // answers `splittable` with, so a menu item that was offered is an item
+  // this route accepts (`splitPrecondition`).
   const state = await meetingClipState(row);
-  if (!state.recordingId || state.clips.length === 0) return refuse(splitRefusal('no-clip'));
+  const blocked = await splitPreconditionFor(row, state);
+  if (blocked) return refuse(blocked);
 
   const plan = planSplit({
     clips: state.clips,

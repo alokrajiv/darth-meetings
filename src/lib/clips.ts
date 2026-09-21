@@ -238,6 +238,85 @@ export function splitRefusal(code: SplitRefusalCode, message?: string): SplitRef
 }
 
 /**
+ * What the split route checks about the MEETING — before any window is even
+ * named.
+ *
+ * It exists so the ⋯ menu stops guessing. `GET …/clips` answers
+ * `splittable` / `splitBlockedReason` from this function and `POST …/split`
+ * refuses from the same one, so an item the menu offers is an item the server
+ * will accept, and a greyed item carries the route's own sentence as its
+ * tooltip instead of a client-side approximation that drifts.
+ *
+ * Access is deliberately NOT one of these: `canEdit` sits beside `splittable`
+ * on the same response, and a reader is shown no split item at all rather
+ * than a greyed one explaining a permission they were never offered.
+ *
+ * Order matters: the first true thing is the thing the reader is told, and
+ * "still being transcribed" beats "shares its transcription" because it is
+ * the one that will stop being true on its own.
+ */
+export interface SplitPreconditionInput {
+  /** `MW_CLIPS` on and migrations 044–046 present. */
+  enabled: boolean;
+  /** The meeting is in the trash. */
+  trashed: boolean;
+  /** `transcripts.status`. */
+  status: string;
+  /** A re-transcription is in flight (`gmeet_context.retranscribing`). */
+  retranscribing: boolean;
+  /** The legacy pair: two meeting rows over ONE AssemblyAI job. */
+  sharedJob: boolean;
+  /** Playable videos beyond the first (a stop/restart Meet meeting). */
+  videoParts: number;
+  /** The meeting holds at least one clip on a recording. */
+  hasClip: boolean;
+  /** How long the meeting runs on its own timeline. */
+  spanMs: number;
+}
+
+export function splitPrecondition(input: SplitPreconditionInput): SplitRefusal | null {
+  if (!input.enabled) return splitRefusal('disabled');
+  if (input.trashed) return splitRefusal('not-completed', 'This meeting is in the trash.');
+  if (input.status !== 'completed') return splitRefusal('not-completed');
+  if (input.retranscribing) return splitRefusal('transcribing');
+  if (input.sharedJob) return splitRefusal('shared-job');
+  if (input.videoParts > 0) {
+    return splitRefusal(
+      'multi-recording',
+      'This meeting has more than one video, which cannot be split yet.'
+    );
+  }
+  if (!input.hasClip || !(input.spanMs > 0)) return splitRefusal('no-clip');
+  return null;
+}
+
+/**
+ * When the recording's clock starts, for a client that wants to line the
+ * recording up against a calendar.
+ *
+ * The recording's own `started_at` is the truth. When the graph has none
+ * (every row ingested before Phase 2, and every meeting whose recording row
+ * was never stamped), the meeting's curated moment is the next best anchor,
+ * and the day it landed here is the last resort — a poor anchor still beats
+ * `null`, which leaves the split dialog's calendar pre-filter with no day to
+ * ask about at all.
+ *
+ * Returns an ISO string, or null when not one of the three is a real date.
+ */
+export function recordingAnchorIso(
+  startedAt: string | Date | null | undefined,
+  recordedAt: string | Date | null | undefined,
+  createdAt: string | Date | null | undefined
+): string | null {
+  for (const candidate of [startedAt, recordedAt, createdAt]) {
+    if (candidate === null || candidate === undefined || candidate === '') continue;
+    const d = candidate instanceof Date ? candidate : new Date(candidate);
+    if (!Number.isNaN(d.getTime())) return d.toISOString();
+  }
+  return null;
+}
+
+/**
  * Is `[fromMs, toMs)` a window this meeting can give away?
  *
  * `clips` are the meeting's current clips; `spanMs` is how long the meeting
@@ -921,6 +1000,13 @@ export interface ClipsResponse {
    * the UI hides everything about clips and nothing else changes. */
   enabled: boolean;
   canEdit: boolean;
+  /**
+   * `startedAt` is when the recording's clock starts — the recording's own
+   * `started_at`, else the meeting's curated moment, else the day it landed
+   * here (`recordingAnchorIso`). The split dialog's calendar pre-filter asks
+   * for the meetings of THAT day, so an anchor that is merely approximate is
+   * worth much more than none.
+   */
   recording: { id: string; durationMs: number | null; startedAt: string | null } | null;
   clips: ClipWindow[];
   /** How long this meeting runs on its own timeline. */
@@ -935,6 +1021,19 @@ export interface ClipsResponse {
   canUnsplit: boolean;
   /** Why not, in words that never name a meeting the caller cannot open. */
   unsplitBlockedReason: string | null;
+  /**
+   * True = "Split off a part…" may be offered. Decided by `splitPrecondition`
+   * — the same function `POST …/split` refuses from — so the menu never
+   * offers what the route would turn down, and never hides what it would
+   * accept. Access is not part of it: see `canEdit`.
+   */
+  splittable: boolean;
+  /**
+   * Why it cannot be split, in the route's own sentence; null when it can
+   * (and when clips are off, where there is nothing to explain because
+   * nothing about clips is shown).
+   */
+  splitBlockedReason: string | null;
 }
 
 /** POST /api/transcripts/:id/split */

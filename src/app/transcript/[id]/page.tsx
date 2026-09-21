@@ -506,6 +506,7 @@ function TranscriptDetailInner({ transcriptId }: { transcriptId: string }) {
       ? { splitFrom, siblings: clipSiblings }
       : null;
   const [splitOpen, setSplitOpen] = useState(false);
+  const [unsplitConfirmOpen, setUnsplitConfirmOpen] = useState(false);
   const [unsplitError, setUnsplitError] = useState<string | null>(null);
 
   // --- view mode + find/replace ---
@@ -1068,32 +1069,32 @@ function TranscriptDetailInner({ transcriptId }: { transcriptId: string }) {
   );
 
   // --- Split / un-split (Phase 3a) ------------------------------------------
-  // The menu item appears only when the server says this meeting HAS a clip
-  // it could give away. The window rules are checked live in the dialog
-  // (`validateSplitWindow`, the same pure function the route uses); the few
-  // refusals only the server can know — a transcription shared with another
-  // person's copy of the same call, a re-run mid-flight — come back as the
-  // route's own sentence.
-  const canSplit =
-    !!clips.data?.enabled &&
-    !!clips.data.canEdit &&
-    clips.data.clips.length > 0 &&
-    clips.data.spanMs > 0 &&
-    row?.status === 'completed' &&
-    !row?.gmeet_context?.retranscribing &&
-    videoParts.length === 0;
+  // The menu item is OFFERED whenever clips apply here and the reader may
+  // write; whether it is LIVE is the server's answer, not ours. `splittable`
+  // and `splitBlockedReason` come from `splitPrecondition` — the same pure
+  // function `POST …/split` refuses from — so the item is greyed with the
+  // route's own sentence (in the trash, still transcribing, a re-run
+  // mid-flight, several videos, a transcription shared with another person's
+  // copy of the call) instead of vanishing for reasons nobody can see. The
+  // window rules stay live in the dialog (`validateSplitWindow`).
+  const clipsOffered = !!clips.data?.enabled && !!clips.data.canEdit;
+  const canSplit = clipsOffered && !!clips.data?.splittable;
+  const splitBlockedReason = clips.data?.splitBlockedReason ?? null;
+  /** This meeting is itself a part of a longer recording. */
+  const isPart = !!splitFrom;
   const handleUnsplit = useCallback(async () => {
-    setOverflowMenuOpen(false);
-    const name = splitFrom?.title?.trim() || 'the meeting it came from';
-    if (!window.confirm(`Put this part back into ${name}? This meeting disappears.`)) return;
     setUnsplitError(null);
     try {
       const out = await clips.unsplit();
+      setUnsplitConfirmOpen(false);
       router.push(out.meeting.url);
     } catch (err) {
+      // The dialog goes; the refusal stays on the page, where it can be read
+      // without a modal in the way.
+      setUnsplitConfirmOpen(false);
       setUnsplitError(err instanceof Error ? err.message : 'Could not put it back');
     }
-  }, [clips, splitFrom, router]);
+  }, [clips, router]);
 
   const [videoFetching, setVideoFetching] = useState(false);
   const [videoFetchError, setVideoFetchError] = useState<string | null>(null);
@@ -2636,34 +2637,20 @@ function TranscriptDetailInner({ transcriptId }: { transcriptId: string }) {
                 <Download className="h-3.5 w-3.5 text-muted-foreground" />
                 Download raw markdown
               </button>
-              {/* Phase 3a — one recording, several meetings. Offered only
-                  when the server says this meeting has a clip it could give
-                  away; the dialog greys "Split" for the window rules and the
-                  route has the last word on the rest. */}
-              {canSplit && (
-                <button
-                  type="button"
-                  disabled={blocked}
-                  onClick={() => {
-                    setOverflowMenuOpen(false);
-                    setSplitOpen(true);
-                  }}
-                  className="flex w-full items-center gap-2 rounded px-3 py-1.5 text-left text-sm hover:bg-muted disabled:opacity-50"
-                  title={
-                    blocked
-                      ? OFFLINE_TITLE
-                      : 'Make a stretch of this recording a meeting of its own — nothing is cut and nothing is transcribed again'
-                  }
-                >
-                  <Scissors className="h-3.5 w-3.5 text-muted-foreground" />
-                  Split off a part…
-                </button>
-              )}
+              {/* Phase 3a — one recording, several meetings. On a meeting
+                  that is ITSELF a part, both are legal and both stay: "put it
+                  back" comes first because it is the one that undoes what the
+                  reader is looking at, and splitting again is the rarer,
+                  additive thing underneath it. */}
               {splitFrom && (
                 <button
                   type="button"
                   disabled={blocked || !clips.data?.canUnsplit || clips.unsplitting}
-                  onClick={() => void handleUnsplit()}
+                  onClick={() => {
+                    setOverflowMenuOpen(false);
+                    setUnsplitError(null);
+                    setUnsplitConfirmOpen(true);
+                  }}
                   className="flex w-full items-center gap-2 rounded px-3 py-1.5 text-left text-sm hover:bg-muted disabled:opacity-50"
                   title={
                     blocked
@@ -2680,6 +2667,33 @@ function TranscriptDetailInner({ transcriptId }: { transcriptId: string }) {
                   <span className="min-w-0 truncate">
                     Put it back into {splitFrom.title?.trim() || 'the longer meeting'}
                   </span>
+                </button>
+              )}
+              {clipsOffered && (
+                <button
+                  type="button"
+                  disabled={blocked || !canSplit}
+                  onClick={() => {
+                    setOverflowMenuOpen(false);
+                    setSplitOpen(true);
+                  }}
+                  className="flex w-full items-center gap-2 rounded px-3 py-1.5 text-left text-sm hover:bg-muted disabled:opacity-50"
+                  title={
+                    blocked
+                      ? OFFLINE_TITLE
+                      : (splitBlockedReason ??
+                        (isPart
+                          ? 'Splits this part again — a stretch of it becomes a meeting of its own; nothing is cut and nothing is transcribed again'
+                          : 'Make a stretch of this recording a meeting of its own — nothing is cut and nothing is transcribed again'))
+                  }
+                >
+                  <Scissors className="h-3.5 w-3.5 text-muted-foreground" />
+                  <span className="min-w-0 truncate">Split off a part…</span>
+                  {isPart && !splitBlockedReason && (
+                    <span className="ml-auto shrink-0 text-[11px] text-muted-foreground">
+                      splits this part again
+                    </span>
+                  )}
                 </button>
               )}
               <div className="my-1 h-px bg-border" />
@@ -4076,6 +4090,44 @@ function TranscriptDetailInner({ transcriptId }: { transcriptId: string }) {
           onSelect={toggleLabel}
           resetKey={transcriptId}
         />
+
+        {/* Un-split, confirmed. A `window.confirm` here was the one modal on
+            the page the browser drew — no focus return, no wording we can
+            weigh, and "OK" for something that removes a meeting. Same idiom
+            as the share confirm below: name the meeting it goes back into,
+            say what disappears, and put the destructive verb on the right. */}
+        <Dialog
+          open={unsplitConfirmOpen}
+          onOpenChange={(v) => {
+            // Esc / overlay must not walk out on a request already in flight.
+            if (!v && !clips.unsplitting) setUnsplitConfirmOpen(false);
+          }}
+        >
+          <DialogContent className="max-w-md">
+            <DialogHeader>
+              <DialogTitle>Put this part back?</DialogTitle>
+              <DialogDescription>
+                Its text, edits and speaker names go back into{' '}
+                <span className="font-medium text-foreground">
+                  {splitFrom?.title?.trim() || 'the meeting it came from'}
+                </span>
+                , and this meeting disappears. The recording itself is untouched.
+              </DialogDescription>
+            </DialogHeader>
+            <DialogFooter className="gap-2">
+              <Button
+                variant="outline"
+                onClick={() => setUnsplitConfirmOpen(false)}
+                disabled={clips.unsplitting}
+              >
+                Cancel
+              </Button>
+              <Button onClick={() => void handleUnsplit()} disabled={clips.unsplitting}>
+                {clips.unsplitting ? 'Putting it back…' : 'Put it back'}
+              </Button>
+            </DialogFooter>
+          </DialogContent>
+        </Dialog>
 
         <Dialog open={!!pendingShare} onOpenChange={(v) => !v && setPendingShare(null)}>
           <DialogContent className="max-w-md">

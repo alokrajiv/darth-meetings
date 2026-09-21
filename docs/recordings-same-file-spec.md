@@ -50,8 +50,13 @@ Old clients that do not understand `duplicate`: the tray and darth-cli are versi
 `duplicate` when the request says it understands it (`"dupAware": true` in the open body); otherwise today's behaviour.
 
 ## Clients
-- **Web upload dialog**: "You already have this recording — *Title* · Wed 17 Sep · 1h 09m" with **Open it** /
-  **Upload anyway**; for a trashed match **Restore it**. No filename-as-title.
+- **Web upload dialog**: "You already have this recording" as the dialog's own heading, then
+  "*Title* · Wed 17 Sep · 56m 45s", with **Open it** / **Upload anyway**; for a trashed match **Restore it**.
+  No filename-as-title. The upload ROW, which has no heading of its own, says it on one line —
+  "You already have this recording: *Title* · Wed 17 Sep · 56m 45s" (`duplicateRowLine`). The join is a COLON,
+  not the em dash sketched above: titles contain em dashes ("Kerner — Q3 close") and the dash join then reads as
+  three equal clauses. The length is `formatDuration` — the SAME formatter as the listing, seconds included, so one
+  meeting never reads "56m" here and "56m 45s" there.
 - **Tray**: a duplicate at open means the recording is already up — mark it `uploaded` with that meeting id, show the
   normal "Uploaded · Open transcript" card. No prompt.
 - **darth-cli** (other repo — report the exact change needed, do not edit): print the match and exit 0 with the

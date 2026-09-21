@@ -1,4 +1,5 @@
 import type { DuplicateMatch } from '@/lib/same-file';
+import { formatDuration } from '@/lib/format';
 import { dayLabelCompact, safeDate } from '@/lib/when';
 
 /**
@@ -41,17 +42,20 @@ export function matchDay(when: string | null, now: Date = new Date()): string | 
 }
 
 /**
- * "1h 09m" / "47m" / "38s". Zero-padded minutes inside an hour so a column of
- * these lines up and "1h 9m" never reads as nine of something.
+ * "1h 9m" / "56m 45s" / "38s" — THE duration of this app, `formatDuration`
+ * from `lib/format.ts`, which is what every listing row, the Recording card
+ * and the offline archive print.
+ *
+ * It used to have a formatter of its own, which dropped the seconds inside an
+ * hour ("56m" where the listing said "56m 45s" for the same meeting). Two
+ * renderings of one number is how a reader ends up wondering whether they are
+ * looking at two different recordings — exactly the doubt this whole dialog
+ * exists to remove. Null-ish and sub-second stay null: a length we do not
+ * know is left out of the facts line rather than printed as "0s".
  */
 export function matchLength(durationSec: number | null | undefined): string | null {
   if (durationSec == null || !Number.isFinite(durationSec) || durationSec < 1) return null;
-  const total = Math.floor(durationSec);
-  const h = Math.floor(total / 3600);
-  const m = Math.floor((total % 3600) / 60);
-  if (h > 0) return `${h}h ${String(m).padStart(2, '0')}m`;
-  if (m > 0) return `${m}m`;
-  return `${total}s`;
+  return formatDuration(Math.floor(durationSec));
 }
 
 /**
@@ -62,6 +66,23 @@ export function matchFacts(match: DuplicateMatch, now: Date = new Date()): strin
   return [matchTitle(match), matchDay(match.when, now), matchLength(match.durationSec)]
     .filter((p): p is string => !!p)
     .join(' · ');
+}
+
+/**
+ * The whole thing on ONE line, for the upload row: "You already have this
+ * recording: Weekly sync · Wed 17 Sep · 56m 45s".
+ *
+ * The row has no dialog title to carry the headline, so it carries it itself
+ * — joined with a COLON, not with the em dash the spec sketched
+ * (docs/recordings-same-file-spec.md §Clients). Meeting titles contain em
+ * dashes often enough ("Kerner — Q3 close") that
+ * "You already have this recording — Kerner — Q3 close · Wed 17 Sep" reads as
+ * three clauses of equal weight and the title stops looking like a title. A
+ * colon keeps the headline a headline and hands the rest to the match. The
+ * dialog's own headline is untouched: it is a heading, not a sentence.
+ */
+export function duplicateRowLine(match: DuplicateMatch, now: Date = new Date()): string {
+  return `${DUPLICATE_HEADLINE}: ${matchFacts(match, now)}`;
 }
 
 /**
@@ -93,6 +114,8 @@ export function matchAction(match: DuplicateMatch): MatchAction {
 /** Everything the dialog (and the upload row) renders, in one object. */
 export interface DuplicateCopy {
   headline: string;
+  /** Headline + facts on one line, for a place with no heading of its own. */
+  rowLine: string;
   facts: string;
   note: string | null;
   reassurance: string;
@@ -102,6 +125,7 @@ export interface DuplicateCopy {
 export function duplicateCopy(match: DuplicateMatch, now: Date = new Date()): DuplicateCopy {
   return {
     headline: DUPLICATE_HEADLINE,
+    rowLine: duplicateRowLine(match, now),
     facts: matchFacts(match, now),
     note: matchNote(match),
     reassurance: NOTHING_UPLOADED,
