@@ -28,6 +28,18 @@ export function dayLabel(d: Date): string {
   return `${DAYS[d.getDay()]} ${d.getDate()} ${MONTHS[d.getMonth()]} ${d.getFullYear()}`;
 }
 
+/**
+ * "Wed 17 Sep" — the same names as `dayLabel`, without the year, and with the
+ * year added back whenever it is not the year we are in. For a date shown
+ * inside a sentence the reader is already holding in their head ("you already
+ * have this recording — …"), the year is noise right up until it is the whole
+ * point.
+ */
+export function dayLabelCompact(d: Date, now: Date = new Date()): string {
+  const base = `${DAYS[d.getDay()]} ${d.getDate()} ${MONTHS[d.getMonth()]}`;
+  return d.getFullYear() === now.getFullYear() ? base : `${base} ${d.getFullYear()}`;
+}
+
 export function sameDay(a: Date, b: Date): boolean {
   return a.getFullYear() === b.getFullYear() && a.getMonth() === b.getMonth() && a.getDate() === b.getDate();
 }

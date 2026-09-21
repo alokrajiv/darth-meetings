@@ -76,7 +76,24 @@ export function RowMenu({
   const popRef = useRef<HTMLDivElement>(null);
   const btnRef = useRef<HTMLButtonElement>(null);
 
-  const close = useCallback(() => setOpen(false), []);
+  /**
+   * Closing puts focus back on the trigger — which is what a menu owes the
+   * keyboard, and, less obviously, the only way a DIALOG opened from a menu
+   * item can hand focus back to anything at all. The dialog's primitive
+   * (`components/ui/dialog.tsx`) remembers whoever had focus when it opened;
+   * if that is a menu item, the menu has unmounted by the time the dialog
+   * closes and there is nowhere to go. Moving focus to the trigger HERE —
+   * synchronously, inside the click handler, before React commits the menu's
+   * unmount and the dialog's mount — means the dialog remembers the trigger
+   * instead, and the reader lands back on the row they were working in.
+   */
+  const close = useCallback(() => {
+    // Only when focus is actually inside the menu: an outside click closes
+    // this too, and taking focus off whatever the reader just clicked would
+    // be its own bug.
+    if (popRef.current?.contains(document.activeElement)) btnRef.current?.focus();
+    setOpen(false);
+  }, []);
 
   useEffect(() => {
     if (!open) return;

@@ -46,19 +46,94 @@ function DialogOverlay({
   )
 }
 
+/**
+ * Focus goes back to whatever opened the dialog — for EVERY dialog in the app.
+ *
+ * Why this lives here and not in each dialog: Radix's modal content handler is
+ *
+ *   onCloseAutoFocus: composeEventHandlers(props.onCloseAutoFocus, (event) => {
+ *     event.preventDefault();
+ *     context.triggerRef.current?.focus();
+ *   })
+ *
+ * (@radix-ui/react-dialog 1.1.15, dist/index.mjs:146). It `preventDefault()`s
+ * unconditionally — which switches OFF FocusScope's own restore to the
+ * previously focused element — and then focuses `triggerRef`, the node rendered
+ * by `<DialogTrigger>`. Almost nothing in this app uses `DialogTrigger`: open
+ * state is lifted (`open={x} onOpenChange={setX}`) and the opener is a plain
+ * button, a table-row menu item or a `window` event. So `triggerRef.current` is
+ * `null`, `null?.focus()` does nothing, and focus lands on `<body>` — the caret
+ * at the top of a 4000-line page instead of on the link just pressed.
+ *
+ * The fix: remember who had focus when the dialog opened, and put it back
+ * ourselves. Ours runs FIRST (it is `props.onCloseAutoFocus`), so calling
+ * `preventDefault()` keeps Radix's null-focus from running at all. When there
+ * is nowhere sensible to go — the opener was unmounted, or disabled by the very
+ * action the dialog performed, or there was no opener (a `window` event) — we
+ * do NOT preventDefault, and Radix's `DialogTrigger` path still gets its turn.
+ */
+function useOpenerFocus(
+  onOpenAutoFocus: React.ComponentProps<typeof DialogPrimitive.Content>["onOpenAutoFocus"],
+  onCloseAutoFocus: React.ComponentProps<typeof DialogPrimitive.Content>["onCloseAutoFocus"]
+) {
+  const openerRef = React.useRef<HTMLElement | null>(null)
+
+  const handleOpenAutoFocus = React.useCallback(
+    (event: Event) => {
+      // Fires while the opener still holds focus, before the content takes it.
+      const active = document.activeElement
+      openerRef.current =
+        active instanceof HTMLElement && active !== document.body ? active : null
+      onOpenAutoFocus?.(event)
+    },
+    [onOpenAutoFocus]
+  )
+
+  const handleCloseAutoFocus = React.useCallback(
+    (event: Event) => {
+      onCloseAutoFocus?.(event)
+      const opener = openerRef.current
+      openerRef.current = null
+      if (event.defaultPrevented) return // the dialog took focus somewhere itself
+      if (!opener || !opener.isConnected) return
+      // Focusing a disabled control silently drops focus to <body> — exactly
+      // the bug. Leave it to Radix (and let the reader keep their own focus).
+      if (
+        opener.hasAttribute("disabled") ||
+        opener.getAttribute("aria-disabled") === "true"
+      ) {
+        return
+      }
+      event.preventDefault()
+      opener.focus()
+    },
+    [onCloseAutoFocus]
+  )
+
+  return { handleOpenAutoFocus, handleCloseAutoFocus }
+}
+
 function DialogContent({
   className,
   children,
   showCloseButton = true,
+  onOpenAutoFocus,
+  onCloseAutoFocus,
   ...props
 }: React.ComponentProps<typeof DialogPrimitive.Content> & {
   showCloseButton?: boolean
 }) {
+  const { handleOpenAutoFocus, handleCloseAutoFocus } = useOpenerFocus(
+    onOpenAutoFocus,
+    onCloseAutoFocus
+  )
   return (
     <DialogPortal data-slot="dialog-portal">
       <DialogOverlay />
       <DialogPrimitive.Content
         data-slot="dialog-content"
+        onOpenAutoFocus={handleOpenAutoFocus}
+        onCloseAutoFocus={handleCloseAutoFocus}
         className={cn(
           "bg-background data-[state=open]:animate-in data-[state=closed]:animate-out data-[state=closed]:fade-out-0 data-[state=open]:fade-in-0 data-[state=closed]:zoom-out-95 data-[state=open]:zoom-in-95 fixed top-[50%] left-[50%] z-50 grid w-full max-w-[calc(100%-2rem)] translate-x-[-50%] translate-y-[-50%] gap-4 rounded-lg border p-6 shadow-lg duration-200 sm:max-w-lg",
           className

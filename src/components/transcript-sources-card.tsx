@@ -310,6 +310,61 @@ export function TranscriptSourcesCard({
     : null;
   const [advancedOpen, setAdvancedOpen] = useState(false);
 
+  // --- The two older re-transcribe actions, and where they go ------------
+  // They do something "Transcribe again…" still cannot: they make a SEPARATE
+  // meeting out of the video — which is the only route for a quick import that
+  // never ran AssemblyAI, and the only way to combine several videos. So they
+  // stay, unchanged. What was wrong was the pairing: three near-identical
+  // offers side by side, two of them shouting (full-width outline buttons)
+  // over the one that is normally right. When both would show, the older two
+  // move under one quiet disclosure that says plainly what they do instead.
+  const [moreWaysOpen, setMoreWaysOpen] = useState(false);
+  const retranscribeFromVideoButton = canRetranscribeFromVideo ? (
+    <Button
+      variant="outline"
+      size="sm"
+      className="mt-2 h-8 w-full justify-start gap-2 text-[13px]"
+      disabled={disabled || retranscribing !== null}
+      onClick={() => void retranscribeFromVideo()}
+      title={disabled ? 'Not available offline' : `This transcript is the text ${isTeams ? 'Teams' : 'Meet'} wrote — no acoustic speaker separation or voiceprint matching ran. Run the full AssemblyAI pipeline over the meeting video; a new transcript is created alongside this one`}
+    >
+      {retranscribing ? (
+        <Loader2 className="h-4 w-4 animate-spin text-muted-foreground" />
+      ) : (
+        <AudioWaveform className="h-4 w-4 text-primary" />
+      )}
+      {retranscribing === 'fetching'
+        ? 'Downloading the video…'
+        : retranscribing === 'submitting'
+          ? 'Submitting for transcription…'
+          : row.local_audio_path
+            ? 'Re-transcribe from video'
+            : 'Fetch video & re-transcribe'}
+    </Button>
+  ) : null;
+  const combineRetranscribeButton = canCombineRetranscribe ? (
+    <Button
+      variant="outline"
+      size="sm"
+      className="mt-2 h-8 w-full justify-start gap-2 text-[13px]"
+      disabled={disabled || combining}
+      onClick={() => void combineAndRetranscribe()}
+      title={disabled ? 'Not available offline' : 'Concatenate every stored video of this meeting and run a fresh AssemblyAI transcription over the whole thing — a new transcript is created alongside this one'}
+    >
+      {combining ? (
+        <Loader2 className="h-4 w-4 animate-spin text-muted-foreground" />
+      ) : (
+        <Video className="h-4 w-4 text-primary" />
+      )}
+      {combining
+        ? 'Combining & submitting…'
+        : `Transcribe all ${partsStored + 1} videos together`}
+    </Button>
+  ) : null;
+  /** Both kinds of action are on offer: fold the older pair away. */
+  const pairedWithVersions =
+    versioned && canEdit && !!(retranscribeFromVideoButton || combineRetranscribeButton);
+
   return (
     <div className="rounded-lg border bg-card p-3">
       <div className="text-[11px] font-semibold uppercase tracking-wider text-muted-foreground">
@@ -436,48 +491,8 @@ export function TranscriptSourcesCard({
           player but not transcribed.
         </p>
       )}
-      {canRetranscribeFromVideo && (
-        <Button
-          variant="outline"
-          size="sm"
-          className="mt-2 h-8 w-full justify-start gap-2 text-[13px]"
-          disabled={disabled || retranscribing !== null}
-          onClick={() => void retranscribeFromVideo()}
-          title={disabled ? 'Not available offline' : `This transcript is the text ${isTeams ? 'Teams' : 'Meet'} wrote — no acoustic speaker separation or voiceprint matching ran. Run the full AssemblyAI pipeline over the meeting video; a new transcript is created alongside this one`}
-        >
-          {retranscribing ? (
-            <Loader2 className="h-4 w-4 animate-spin text-muted-foreground" />
-          ) : (
-            <AudioWaveform className="h-4 w-4 text-primary" />
-          )}
-          {retranscribing === 'fetching'
-            ? 'Downloading the video…'
-            : retranscribing === 'submitting'
-              ? 'Submitting for transcription…'
-              : row.local_audio_path
-                ? 'Re-transcribe from video'
-                : 'Fetch video & re-transcribe'}
-        </Button>
-      )}
-      {canCombineRetranscribe && (
-        <Button
-          variant="outline"
-          size="sm"
-          className="mt-2 h-8 w-full justify-start gap-2 text-[13px]"
-          disabled={disabled || combining}
-          onClick={() => void combineAndRetranscribe()}
-          title={disabled ? 'Not available offline' : 'Concatenate every stored video of this meeting and run a fresh AssemblyAI transcription over the whole thing — a new transcript is created alongside this one'}
-        >
-          {combining ? (
-            <Loader2 className="h-4 w-4 animate-spin text-muted-foreground" />
-          ) : (
-            <Video className="h-4 w-4 text-primary" />
-          )}
-          {combining
-            ? 'Combining & submitting…'
-            : `Transcribe all ${partsStored + 1} videos together`}
-        </Button>
-      )}
+      {!pairedWithVersions && retranscribeFromVideoButton}
+      {!pairedWithVersions && combineRetranscribeButton}
       {isAaiRow && outcomeSentence && (
         <p className="mt-2 text-[11px] leading-snug text-muted-foreground">
           {outcomeSentence}
@@ -611,6 +626,50 @@ export function TranscriptSourcesCard({
               activatingId={transcriptions?.activatingId ?? null}
               onActivate={(id) => transcriptions!.activate(id)}
             />
+          )}
+          {pairedWithVersions && (
+            <>
+              <button
+                type="button"
+                onClick={() => setMoreWaysOpen((v) => !v)}
+                aria-expanded={moreWaysOpen}
+                className="mt-1.5 flex items-center gap-1 text-[11px] text-muted-foreground hover:text-foreground"
+              >
+                More ways to transcribe
+                {moreWaysOpen ? (
+                  <ChevronUp className="h-3 w-3" />
+                ) : (
+                  <ChevronDown className="h-3 w-3" />
+                )}
+              </button>
+              {moreWaysOpen && (
+                // Exactly ONE of the two can ever be here: "Re-transcribe from
+                // video" wants a Meet/Teams primary and "Transcribe all N
+                // videos together" wants the opposite
+                // (`transcriptCoversPartOnly` excludes both primaries). So
+                // there is no shared preamble — it would only say in advance
+                // what the one line below says properly.
+                <div className="mt-1 rounded-md border bg-muted/30 px-2 py-1.5">
+                  {retranscribeFromVideoButton}
+                  {retranscribeFromVideoButton && (
+                    <p className="mt-1 text-[11px] leading-snug text-muted-foreground">
+                      Makes a separate meeting from the video, heard by AssemblyAI — speakers
+                      separated acoustically and matched to voiceprints, which the{' '}
+                      {isTeams ? 'Teams' : 'Meet'} text never had. This meeting stays exactly as
+                      it is.
+                    </p>
+                  )}
+                  {combineRetranscribeButton}
+                  {combineRetranscribeButton && (
+                    <p className="mt-1 text-[11px] leading-snug text-muted-foreground">
+                      Joins all {partsStored + 1} videos end to end and makes a separate meeting
+                      from the whole thing — the only way to cover the parts this transcript
+                      misses. This meeting stays exactly as it is.
+                    </p>
+                  )}
+                </div>
+              )}
+            </>
           )}
         </div>
       )}

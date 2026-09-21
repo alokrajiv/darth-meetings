@@ -1,8 +1,9 @@
 'use client';
 
 import { useState } from 'react';
-import { ChevronDown, ChevronUp, Loader2 } from 'lucide-react';
+import { ChevronDown, ChevronUp, Loader2, X } from 'lucide-react';
 import { setAsideSentence, versionCopy } from '@/lib/transcription-copy';
+import { TRANSIENT_NOTE_FADE_MS, useTransientNote } from '@/hooks/use-transient-note';
 import type { ActivateTranscriptionResponse, TranscriptionVersion } from '@/lib/transcriptions';
 
 interface TranscriptionVersionsProps {
@@ -34,14 +35,17 @@ export function TranscriptionVersions({
   onActivate,
 }: TranscriptionVersionsProps) {
   const [open, setOpen] = useState(false);
-  const [switched, setSwitched] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  // What the switch did to your edits and names. It used to sit there for the
+  // rest of the session; it is news, not state, so it goes away by itself and
+  // can be dismissed at once.
+  const switched = useTransientNote();
 
   const switchTo = async (id: string) => {
     setError(null);
-    setSwitched(null);
+    switched.dismiss();
     try {
-      setSwitched(setAsideSentence(await onActivate(id)));
+      switched.show(setAsideSentence(await onActivate(id)));
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Could not switch version');
     }
@@ -113,8 +117,39 @@ export function TranscriptionVersions({
           })}
         </ul>
       )}
-      {switched && <p className="mt-1.5 text-[11px] leading-snug text-muted-foreground">{switched}</p>}
-      {error && <p className="mt-1.5 text-xs text-destructive">{error}</p>}
+      {/* Always in the DOM so the live region exists before the sentence lands
+          — a region created and filled in the same tick often goes
+          unannounced. Empty it takes no space, so nothing below it moves. */}
+      <div
+        style={switched.fading ? { transitionDuration: `${TRANSIENT_NOTE_FADE_MS}ms` } : undefined}
+        className={`flex items-start gap-1.5 transition-opacity motion-reduce:transition-none ${
+          switched.note ? 'mt-1.5' : ''
+        } ${switched.fading ? 'opacity-0' : 'opacity-100'}`}
+      >
+        <p
+          role="status"
+          aria-live="polite"
+          className="min-w-0 flex-1 text-[11px] leading-snug text-muted-foreground"
+        >
+          {switched.note && <span key={switched.id}>{switched.note}</span>}
+        </p>
+        {switched.note && (
+          <button
+            type="button"
+            aria-label="Dismiss"
+            title="Dismiss"
+            onClick={switched.dismiss}
+            className="-mt-0.5 shrink-0 rounded p-0.5 text-muted-foreground hover:bg-muted hover:text-foreground"
+          >
+            <X className="h-3 w-3" />
+          </button>
+        )}
+      </div>
+      {error && (
+        <p role="alert" className="mt-1.5 text-xs text-destructive">
+          {error}
+        </p>
+      )}
     </>
   );
 }

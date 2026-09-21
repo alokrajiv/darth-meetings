@@ -1,6 +1,6 @@
 'use client';
 
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useState } from 'react';
 import {
   Dialog,
   DialogContent,
@@ -60,14 +60,10 @@ export function RetranscribeDialog({
   /** The server said these settings repeat the current version; the next
    * press sends `force`. Also set locally, before asking. */
   const [confirming, setConfirming] = useState(false);
-  /**
-   * Who to hand the focus ring back to when this closes. Radix restores it
-   * by itself in principle, but in this app it lands on <body> (the same is
-   * true of every other dialog here) — so the caret ends up at the top of a
-   * 4000-line page instead of on the link the reader just pressed. Captured
-   * in `onOpenAutoFocus`, which fires while the opener still holds focus.
-   */
-  const openerRef = useRef<HTMLElement | null>(null);
+  // Focus goes back to "Transcribe again…" on close — handled for every dialog
+  // in the app by `components/ui/dialog.tsx` (see `useOpenerFocus` there for
+  // why Radix does not do it), including the case where a submit has just
+  // disabled the opener. Nothing to do here.
 
   // Fresh choices every time it opens — the defaults are the honest ones.
   useEffect(() => {
@@ -113,22 +109,7 @@ export function RetranscribeDialog({
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent
-        className="max-w-md"
-        onOpenAutoFocus={() => {
-          openerRef.current =
-            document.activeElement instanceof HTMLElement ? document.activeElement : null;
-        }}
-        onCloseAutoFocus={(e) => {
-          const opener = openerRef.current;
-          // Only take over when there is somewhere sensible to go: after a
-          // submit the trigger is disabled (a run is now in flight), and
-          // forcing focus onto a disabled control would silently drop it.
-          if (!opener || !opener.isConnected || opener.hasAttribute('disabled')) return;
-          e.preventDefault();
-          opener.focus();
-        }}
-      >
+      <DialogContent className="max-w-md">
         <DialogHeader>
           <DialogTitle className="text-base font-semibold">Transcribe again</DialogTitle>
           <DialogDescription className="text-xs">

@@ -85,6 +85,14 @@ export interface ChunkedUploadParams {
   dupAware?: boolean;
   /** The user saw the match and chose "Upload anyway". */
   force?: boolean;
+  /**
+   * This file's whole-file sha256, already computed by the caller with
+   * `hashUploadFile`. Supplied so the dialog can run its own visible,
+   * cancellable "Checking…" step (and build a group's `multi.partSha256`)
+   * without the file being read a second time here. `null`/absent = hash it
+   * here if the blob path or the duplicate check needs one.
+   */
+  sha256?: string | null;
 }
 
 export interface ChunkedUploadHooks {
@@ -544,13 +552,34 @@ async function hashForOpen(
   hooks: ChunkedUploadHooks,
   needBlob: boolean
 ): Promise<string | null> {
+  return hashUploadFile(file, { ...hooks, requireWorker: needBlob });
+}
+
+/**
+ * The whole-file sha256 of an upload, or `null` when this browser cannot
+ * produce one cheaply enough to be worth it.
+ *
+ * Exported because the upload dialog needs the SAME hash before it starts the
+ * upload — to show a cancellable "Checking…" while it happens, and to declare
+ * a stitch group's `multi.partSha256`. Handing the result back through
+ * `params.sha256` is what keeps a file from being read twice.
+ *
+ * `requireWorker` is the blob path's rule: a multi-GB main-thread hash is not
+ * an option, so without a Web Worker it gives up and the blob path is skipped.
+ * The duplicate check is happy with the chunked fallback.
+ *
+ * Never throws for hashing's own sake — only for a genuine cancel. Hashing is
+ * never load-bearing: without it the duplicate check simply moves to complete.
+ */
+export async function hashUploadFile(
+  file: File,
+  hooks: ChunkedUploadHooks & { requireWorker?: boolean } = {}
+): Promise<string | null> {
   const note = (pct: number) => hooks.onNote?.(`Preparing — reading the file… ${pct}%`);
   try {
     hooks.onNote?.('Preparing — reading the file…');
     if (hashingAvailable()) return await hashFile(file, note, hooks.signal, HASH_SLICE_BYTES);
-    // The blob path REQUIRES a worker (a multi-GB main-thread hash is not an
-    // option); the duplicate check is happy with the chunked fallback.
-    if (needBlob || !shouldHashInBrowser(file.size)) return null;
+    if (hooks.requireWorker || !shouldHashInBrowser(file.size)) return null;
     const h = sha256Factory().create();
     for (let start = 0; start < file.size; start += MAIN_THREAD_HASH_SLICE) {
       if (hooks.signal?.aborted) throw new UploadError('Upload cancelled');
@@ -561,8 +590,6 @@ async function hashForOpen(
     return h.digest();
   } catch (err) {
     if (hooks.signal?.aborted || isAbortError(err)) throw new UploadError('Upload cancelled');
-    // Hashing is never load-bearing for the upload itself: without it the
-    // blob path is skipped and the duplicate check moves to complete.
     return null;
   } finally {
     hooks.onNote?.(null);
@@ -630,11 +657,13 @@ async function runUpload(
   const needBlob = !params.noBlob && file.size >= UPLOAD_BLOB_MIN_BYTES;
   const wantDupHash = !!params.dupAware && shouldHashInBrowser(file.size);
   let blobAsk: BlobAsk | null = null;
-  let sha256: string | null = null;
-  if (needBlob || wantDupHash) {
+  // The caller may already have read the file (the dialog's "Checking…" step);
+  // reading it a second time here would be minutes of nothing on a big file.
+  let sha256: string | null = params.sha256 ?? null;
+  if (!sha256 && (needBlob || wantDupHash)) {
     sha256 = await hashForOpen(file, hooks, needBlob);
-    if (sha256 && needBlob) blobAsk = { sha256, coarse: coarsePointer() };
   }
+  if (sha256 && needBlob) blobAsk = { sha256, coarse: coarsePointer() };
   let restarts = 0;
   for (;;) {
     const session = await openSession(file, fingerprint, params, hooks.signal, blobAsk, sha256);

@@ -26,6 +26,7 @@ import {
   Sparkles,
   Film,
   FileText,
+  Files,
   Laptop,
 } from 'lucide-react';
 import { useCompanion } from '@/lib/companion/companion-client';
@@ -39,7 +40,14 @@ import {
 import type { StoredTranscript } from '@/lib/format';
 import { TRANSCRIPTION_LANGUAGE_OPTIONS } from '@/lib/aai-language';
 import { defaultReportPref, type ReportPref } from '@/lib/report-pref';
-import { uploadFileChunked } from '@/lib/chunked-upload';
+import {
+  UploadError,
+  hashUploadFile,
+  uploadFileChunkedAware,
+  type UploadOutcome,
+} from '@/lib/chunked-upload';
+import { shouldHashInBrowser, type DuplicateMatch } from '@/lib/same-file';
+import { duplicateCopy, matchAction, matchFacts, matchNote } from '@/lib/duplicate-copy';
 import { OFFLINE_TITLE, useOfflineGate } from '@/lib/offline/offline-context';
 import { isNetworkFailure } from '@/lib/offline/offline-fetch';
 
@@ -86,13 +94,18 @@ const LANGUAGE_OPTIONS = TRANSCRIPTION_LANGUAGE_OPTIONS;
 
 interface UploadStatus {
   file: File;
-  status: 'uploading' | 'transcribing' | 'completed' | 'error';
+  status: 'uploading' | 'transcribing' | 'completed' | 'error' | 'duplicate';
   progress: number;
   transcriptId?: string;
   error?: string;
   /** Transient sub-status under the progress bar ("Resuming from 42%",
    * "Retrying chunk 12…"). */
   note?: string | null;
+  /** 'duplicate': the recording the server recognised. Nothing was created —
+   * the row is here to say so and to offer the two ways out. */
+  duplicate?: DuplicateMatch;
+  /** 'duplicate': "Upload anyway" for this row. */
+  onForce?: () => void;
 }
 
 /** What the stepper attaches to the upload when the user links a calendar
@@ -110,6 +123,33 @@ interface LinkedEvent {
   attendees: Array<{ email: string; name?: string; responseStatus?: string }>;
 }
 
+/**
+ * Everything one "Start Transcription" press decided, frozen. Held so that
+ * "Upload anyway" can replay exactly the same upload with `force` — and with
+ * the hashes it already paid for.
+ */
+interface UploadRun {
+  files: File[];
+  /** N files → ONE meeting (ordered concat), vs. N independent meetings. */
+  stitch: boolean;
+  comments: string[];
+  languageCode: string;
+  linked: LinkedEvent | null;
+  pref: ReportPref;
+  temporary: boolean;
+  /** One whole-file sha256 per file, in order; `null` where the file was too
+   * big to hash in the tab. `undefined` = not computed yet. */
+  hashes?: (string | null)[];
+  /** The reader has seen the match and said go ahead. */
+  force: boolean;
+  /** Cancels the "Checking…" read (and, after it, the upload). */
+  controller: AbortController;
+  /** This run owns no dialog: it goes straight to a row in the uploads list,
+   * and its answer (duplicate, error) is shown there. Set for the files of an
+   * independent batch, which are N unrelated meetings with no one question. */
+  detached?: boolean;
+}
+
 interface CalendarEventLite {
   id: string;
   summary?: string;
@@ -122,7 +162,7 @@ interface CalendarEventLite {
   conferenceData?: { conferenceId?: string };
 }
 
-type DialogStep = 'connect' | 'pick' | 'files' | 'link' | 'process';
+type DialogStep = 'connect' | 'pick' | 'files' | 'link' | 'process' | 'duplicate';
 
 const POLL_INTERVAL_MS = 3000;
 
@@ -283,6 +323,21 @@ export function AudioUpload({ onTranscriptCreated }: AudioUploadProps) {
   // the tick-box in that case so the two never disagree.
   const [scratch, setScratch] = useState(false);
 
+  // --- "You already have this recording" (docs/recordings-same-file-spec.md).
+  // Between "Start Transcription" and the first byte the file is read once and
+  // the server gets a chance to recognise it. `checking` is that pause — quiet,
+  // cancellable, and in a slot that is always there so nothing moves when it
+  // appears. `duplicate` is the answer, shown in this same dialog.
+  const [checking, setChecking] = useState(false);
+  const [checkNote, setCheckNote] = useState<string | null>(null);
+  const [duplicate, setDuplicate] = useState<DuplicateMatch | null>(null);
+  const checkAbortRef = useRef<AbortController | null>(null);
+  /** "Upload anyway" for the match on screen: the very same run with `force`,
+   * and with the hashes already paid for — never a fresh read of the files. */
+  const forceRetryRef = useRef<(() => void) | null>(null);
+  const [restoring, setRestoring] = useState(false);
+  const [restoreError, setRestoreError] = useState<string | null>(null);
+
   const formatFileSize = (bytes: number): string => {
     if (bytes === 0) return '0 Bytes';
     const k = 1024;
@@ -342,6 +397,10 @@ export function AudioUpload({ onTranscriptCreated }: AudioUploadProps) {
   // server verifies it; a re-dropped file resumes from the chunks already
   // on the server. Linked-event context and the report preference ride in
   // the session-open call.
+  //
+  // `uploadFileChunkedAware` (docs/recordings-same-file-spec.md) can answer
+  // "you already have this recording" instead of a transcript, in which case
+  // NOTHING was created — no row, no session, no bytes moved.
   const uploadFile = (
     file: File,
     languageCode: string,
@@ -359,16 +418,28 @@ export function AudioUpload({ onTranscriptCreated }: AudioUploadProps) {
        * the listing's "N of M bytes" is about the whole meeting, not part 1
        * (docs/recorder-upload-ux.md P2). */
       groupBytes?: number;
+      /** Every part's hash, declared on part 1 so the whole group can be
+       * answered before a byte moves. */
+      partSha256?: string[];
       progressFile: File;
       base: number;
       span: number;
     },
     /** Temporary transcript — see the `scratch` state. */
-    temporary = false
-  ): Promise<StoredTranscript> => {
+    temporary = false,
+    /** The same-file check's context: the hash the dialog already computed,
+     * "I have seen the match", the cancel signal, and the moment the server
+     * accepted the open (past the check — the dialog can let go). */
+    check?: {
+      sha256?: string | null;
+      force?: boolean;
+      signal?: AbortSignal;
+      onOpened?: () => void;
+    }
+  ): Promise<UploadOutcome> => {
     const target = multi?.progressFile ?? file;
     const label = multi ? `${file.name}: ` : '';
-    return uploadFileChunked(
+    return uploadFileChunkedAware(
       file,
       {
         languageCode: languageCode || undefined,
@@ -381,12 +452,17 @@ export function AudioUpload({ onTranscriptCreated }: AudioUploadProps) {
               total: multi.total,
               comment: multi.comment,
               groupBytes: multi.groupBytes,
+              partSha256: multi.partSha256,
             }
           : null,
         scratch: temporary && !linked,
+        sha256: check?.sha256 ?? null,
+        force: check?.force,
       },
       {
+        signal: check?.signal,
         onProgress: (loaded, total) => {
+          check?.onOpened?.();
           // Upload owns the 0–50% band; transcription polling owns the rest.
           const frac = total > 0 ? loaded / total : 0;
           updateUpload(target, {
@@ -394,6 +470,7 @@ export function AudioUpload({ onTranscriptCreated }: AudioUploadProps) {
           });
         },
         onResumed: (bytes, total) => {
+          check?.onOpened?.();
           updateUpload(target, {
             note: `${label}Resuming — ${Math.round((bytes / total) * 100)}% was already on the server`,
           });
@@ -404,139 +481,210 @@ export function AudioUpload({ onTranscriptCreated }: AudioUploadProps) {
     );
   };
 
-  const submitForTranscription = async (
-    file: File,
-    languageCode: string,
-    linked: LinkedEvent | null,
-    pref: ReportPref,
-    temporary = false
-  ) => {
-    if (file.size > MAX_FILE_BYTES) {
-      throw new Error(
-        `File is ${formatFileSize(file.size)} — the upload limit is ${formatFileSize(MAX_FILE_BYTES)}`
+  /**
+   * One press of "Start Transcription" (or of "Upload anyway"), start to end.
+   *
+   * The shape exists because of the same-file check: between the press and the
+   * first byte there is now a question the server may answer with "you already
+   * have this recording", and the answer belongs in the dialog the reader is
+   * still looking at — not in a second modal, and not in a row that appears
+   * after the dialog has vanished. So the dialog stays open, quietly, until
+   * either the answer arrives (→ the duplicate panel) or the open goes through
+   * (→ `handOff`, and the uploads list takes over exactly as before).
+   *
+   * Everything it needs is in `run`, never read from state: "Upload anyway"
+   * replays the same object with `force`, and re-uses the hashes so the files
+   * are never read twice.
+   */
+  const runUpload = async (spec: UploadRun) => {
+    let run = spec;
+    const progressFile = run.files[0]!;
+    const signal = run.controller.signal;
+    const owns = !run.detached; // this run is the one the open dialog is about
+    let handedOff = false;
+    /** Past the question: give the reader their dialog back. */
+    const handOff = () => {
+      if (handedOff) return;
+      handedOff = true;
+      setUploads((prev) =>
+        prev.some((u) => u.file === progressFile)
+          ? prev
+          : [...prev, { file: progressFile, status: 'uploading', progress: 0 }]
       );
+      if (!owns) return;
+      setChecking(false);
+      setCheckNote(null);
+      setDuplicate(null);
+      checkAbortRef.current = null;
+      forceRetryRef.current = null;
+      setIsDialogOpen(false);
+      setPendingFiles([]);
+      setStitchMode(false);
+      setPartComments([]);
+      setScratch(false);
+    };
+    if (!owns) handOff(); // the row is the whole story for a detached run
+    /** The answer. In the dialog while it is still open, on the row after. */
+    const showDuplicate = (m: DuplicateMatch) => {
+      const again = () => {
+        const controller = new AbortController();
+        // The dialog's × (and Cancel) abort whatever `checkAbortRef` holds;
+        // without this the replay would be the one run nothing could stop.
+        if (!handedOff) checkAbortRef.current = controller;
+        void runUpload({ ...run, force: true, controller });
+      };
+      if (handedOff) {
+        updateUpload(progressFile, {
+          status: 'duplicate',
+          progress: 0,
+          note: null,
+          duplicate: m,
+          onForce: again,
+        });
+        return;
+      }
+      setChecking(false);
+      setCheckNote(null);
+      checkAbortRef.current = null;
+      forceRetryRef.current = again;
+      setDuplicate(m);
+      setStep('duplicate');
+    };
+    const fail = (err: unknown) => {
+      if (signal.aborted && owns && !handedOff) {
+        // The reader pressed Cancel during "Checking…". Nothing happened, and
+        // the dialog stays exactly where it was.
+        setChecking(false);
+        setCheckNote(null);
+        checkAbortRef.current = null;
+        setStep('process');
+        return;
+      }
+      handOff();
+      updateUpload(progressFile, {
+        status: 'error',
+        error: err instanceof Error ? err.message : 'Upload failed',
+      });
+    };
+
+    if (owns) {
+      // NOT setDuplicate(null): "Upload anyway" replays through here while its
+      // own panel is on screen, and blanking it mid-press empties the dialog.
+      setRestoreError(null);
+      setChecking(true);
     }
 
-    updateUpload(file, { status: 'uploading', progress: 0 });
+    try {
+      for (const file of run.files) {
+        if (file.size > MAX_FILE_BYTES) {
+          throw new UploadError(
+            `${run.files.length > 1 ? `${file.name} is` : 'File is'} ${formatFileSize(file.size)} — the upload limit is ${formatFileSize(MAX_FILE_BYTES)}`
+          );
+        }
+      }
 
-    const transcript = await uploadFile(file, languageCode, linked, pref, undefined, temporary);
+      // --- "Checking…" — read each file once, here, so the answer arrives
+      // before any byte moves. Files too big to hash in the tab are checked on
+      // the VM at complete instead; that is not a failure, just later.
+      if (!run.hashes) {
+        const hashes: (string | null)[] = [];
+        for (const [i, file] of run.files.entries()) {
+          if (owns) {
+            setCheckNote(
+              run.files.length > 1 ? `Checking ${i + 1} of ${run.files.length}…` : 'Checking…'
+            );
+          }
+          hashes.push(
+            shouldHashInBrowser(file.size) ? await hashUploadFile(file, { signal }) : null
+          );
+        }
+        run = { ...run, hashes };
+      }
+      if (signal.aborted) throw new UploadError('Upload cancelled');
+      if (owns) setCheckNote('Checking…');
 
-    updateUpload(file, {
-      status: 'transcribing',
-      progress: 50,
-      transcriptId: transcript.assemblyai_id,
-    });
-    // Surface to the parent right away so the newly queued row shows up in
-    // the list, even before it finishes transcribing.
-    onTranscriptCreated?.();
-
-    await pollUntilDone(file, transcript.assemblyai_id);
+      const outcome = run.stitch
+        ? await runStitchGroup(run, handOff, signal)
+        : await runSingle(run, handOff, signal);
+      if (outcome.kind === 'duplicate') {
+        showDuplicate(outcome.duplicate);
+        return;
+      }
+      handOff();
+      updateUpload(progressFile, {
+        status: 'transcribing',
+        progress: 50,
+        transcriptId: outcome.transcript.assemblyai_id,
+      });
+      // Surface to the parent right away so the newly queued row shows up in
+      // the list, even before it finishes transcribing.
+      onTranscriptCreated?.();
+      await pollUntilDone(progressFile, outcome.transcript.assemblyai_id);
+    } catch (err) {
+      fail(err);
+    }
   };
+
+  const runSingle = (run: UploadRun, onOpened: () => void, signal: AbortSignal) =>
+    uploadFile(
+      run.files[0]!,
+      run.languageCode,
+      run.linked,
+      run.pref,
+      undefined,
+      run.temporary,
+      { sha256: run.hashes?.[0] ?? null, force: run.force, signal, onOpened }
+    );
 
   /** Stitch path: N ordered files → one meeting. One progress entry (keyed on
    * the first file); files upload sequentially into the server-side group;
-   * the last response is the real ingested row, then normal polling. */
-  const submitStitchGroup = async (
-    files: File[],
-    comments: string[],
-    languageCode: string,
-    linked: LinkedEvent | null,
-    pref: ReportPref,
-    temporary = false
-  ) => {
+   * the last response is the real ingested row, then normal polling.
+   *
+   * Part 1 declares every part's hash when we have them all, so the GROUP's
+   * identity is known at its open and the whole batch is answered before a
+   * byte moves. One unhashable file and the group falls back to being answered
+   * at the last part's complete — still before the AssemblyAI hand-off. */
+  const runStitchGroup = async (
+    run: UploadRun,
+    onOpened: () => void,
+    signal: AbortSignal
+  ): Promise<UploadOutcome> => {
+    const { files, hashes } = run;
     const progressFile = files[0]!;
-    for (const file of files) {
-      if (file.size > MAX_FILE_BYTES) {
-        throw new Error(
-          `${file.name} is ${formatFileSize(file.size)} — the upload limit is ${formatFileSize(MAX_FILE_BYTES)}`
-        );
-      }
-    }
-    updateUpload(progressFile, { status: 'uploading', progress: 0 });
     const group = crypto.randomUUID();
     const totalBytes = files.reduce((s, f) => s + f.size, 0) || 1;
+    const everyPartHashed = !!hashes && hashes.length === files.length && hashes.every((h) => !!h);
     let doneBytes = 0;
-    let last: StoredTranscript | null = null;
+    let last: UploadOutcome | null = null;
     for (const [i, file] of files.entries()) {
       // Part 1 opens the group row (link, report pref, temporary flag all
       // land there); parts 2..N inherit from it server-side (openUpload
       // drops their reportPref outright).
       last = await uploadFile(
         file,
-        languageCode,
-        i === 0 ? linked : null,
-        pref,
+        run.languageCode,
+        i === 0 ? run.linked : null,
+        run.pref,
         {
           group,
           index: i + 1,
           total: files.length,
-          comment: comments[i]?.trim() || undefined,
+          comment: run.comments[i]?.trim() || undefined,
           groupBytes: totalBytes,
+          partSha256: i === 0 && everyPartHashed ? (hashes as string[]) : undefined,
           progressFile,
           base: (doneBytes / totalBytes) * 50,
           span: (file.size / totalBytes) * 50,
         },
-        i === 0 && temporary
+        i === 0 && run.temporary,
+        { sha256: hashes?.[i] ?? null, force: run.force, signal, onOpened }
       );
+      // A duplicate group is answered whole — stop before part 2 goes up.
+      if (last.kind === 'duplicate') return last;
       doneBytes += file.size;
     }
-    updateUpload(progressFile, {
-      status: 'transcribing',
-      progress: 50,
-      transcriptId: last!.assemblyai_id,
-    });
-    onTranscriptCreated?.();
-    await pollUntilDone(progressFile, last!.assemblyai_id);
+    return last!;
   };
-
-  const startUpload = useCallback(
-    async (
-      files: File[],
-      languageCode: string,
-      linked: LinkedEvent | null,
-      pref: ReportPref,
-      stitch?: { comments: string[] },
-      /** Temporary transcript (migration 042) — passed in, never read from
-       * state: this callback is memoised once. */
-      temporary = false
-    ) => {
-      if (stitch && files.length > 1) {
-        const progressFile = files[0]!;
-        setUploads((prev) => [
-          ...prev,
-          { file: progressFile, status: 'uploading', progress: 0 },
-        ]);
-        try {
-          await submitStitchGroup(files, stitch.comments, languageCode, linked, pref, temporary);
-        } catch (error) {
-          updateUpload(progressFile, {
-            status: 'error',
-            error: error instanceof Error ? error.message : 'Upload failed',
-          });
-        }
-        return;
-      }
-      for (const file of files) {
-        const uploadStatus: UploadStatus = {
-          file,
-          status: 'uploading',
-          progress: 0,
-        };
-        setUploads((prev) => [...prev, uploadStatus]);
-
-        try {
-          await submitForTranscription(file, languageCode, linked, pref, temporary);
-        } catch (error) {
-          updateUpload(file, {
-            status: 'error',
-            error: error instanceof Error ? error.message : 'Upload failed',
-          });
-        }
-      }
-    },
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-    []
-  );
 
   const handleFilesSelected = useCallback(
     (files: FileList) => {
@@ -747,26 +895,90 @@ export function AudioUpload({ onTranscriptCreated }: AudioUploadProps) {
   };
 
   const handleConfirmUpload = () => {
-    setIsDialogOpen(false);
     const stitching = stitchMode && pendingFiles.length > 1;
     // A linked event only attaches when it maps to ONE transcript — never to
     // each row of an independent batch.
     const linked = canLink ? buildLinkedEvent() : null;
-    startUpload(
-      pendingFiles,
-      selectedLanguage,
+    const base = {
+      stitch: stitching,
+      comments: partComments,
+      languageCode: selectedLanguage,
       linked,
-      resolveReportPref(reportPref, pendingFiles.some(isVideoFile)),
-      stitching ? { comments: partComments } : undefined,
-      scratch && !linked
-    );
+      pref: resolveReportPref(reportPref, pendingFiles.some(isVideoFile)),
+      temporary: scratch && !linked,
+      force: false,
+    };
+    // One meeting — one question worth holding the dialog open for.
+    if (stitching || pendingFiles.length === 1) {
+      const controller = new AbortController();
+      checkAbortRef.current = controller;
+      void runUpload({ ...base, files: pendingFiles, controller });
+      return;
+    }
+    // An independent batch is N meetings that have nothing to do with each
+    // other; there is no one answer to wait for, so the dialog closes as it
+    // always did and a duplicate among them is answered on its own row.
+    const files = pendingFiles;
+    setIsDialogOpen(false);
     setPendingFiles([]);
     setStitchMode(false);
     setPartComments([]);
     setScratch(false);
+    void (async () => {
+      for (const file of files) {
+        await runUpload({
+          ...base,
+          files: [file],
+          controller: new AbortController(),
+          detached: true,
+        });
+      }
+    })();
+  };
+
+  /** "Cancel" during "Checking…": stop reading the file, stay where we were. */
+  const cancelChecking = () => {
+    checkAbortRef.current?.abort();
+    checkAbortRef.current = null;
+    setChecking(false);
+    setCheckNote(null);
+  };
+
+  /** "Open it" / "Restore it" on a match. A trashed meeting is put back first
+   * — the whole reason the trash is reported at all is that restoring beats
+   * transcribing the same audio again. */
+  const goToMatch = async (match: DuplicateMatch) => {
+    const action = matchAction(match);
+    if (action.kind === 'restore') {
+      setRestoring(true);
+      setRestoreError(null);
+      try {
+        const res = await fetch(`/api/transcripts/${match.meetingId}/restore`, { method: 'POST' });
+        if (!res.ok) {
+          const detail = (await res.json().catch(() => ({}))) as { error?: string };
+          throw new Error(detail.error || `Could not put it back (${res.status})`);
+        }
+        onTranscriptCreated?.();
+      } catch (err) {
+        setRestoreError(
+          isNetworkFailure(err) ? OFFLINE_TITLE : err instanceof Error ? err.message : 'Could not put it back'
+        );
+        setRestoring(false);
+        return;
+      }
+    }
+    window.location.href = action.href;
   };
 
   const handleCancelUpload = () => {
+    checkAbortRef.current?.abort();
+    checkAbortRef.current = null;
+    forceRetryRef.current = null;
+    setChecking(false);
+    setCheckNote(null);
+    setDuplicate(null);
+    setRestoring(false);
+    setRestoreError(null);
     setIsDialogOpen(false);
     setPendingFiles([]);
     setStitchMode(false);
@@ -954,6 +1166,8 @@ export function AudioUpload({ onTranscriptCreated }: AudioUploadProps) {
         return <CheckCircle className="h-4 w-4 text-status-ok" />;
       case 'error':
         return <AlertCircle className="h-4 w-4 text-destructive" />;
+      case 'duplicate':
+        return <Files className="h-4 w-4 text-muted-foreground" />;
       default:
         return <FileAudio className="h-4 w-4 text-primary" />;
     }
@@ -969,6 +1183,8 @@ export function AudioUpload({ onTranscriptCreated }: AudioUploadProps) {
         return 'Transcript ready';
       case 'error':
         return upload.error || 'Error';
+      case 'duplicate':
+        return 'Already yours';
       default:
         return 'Processing...';
     }
@@ -1055,7 +1271,9 @@ export function AudioUpload({ onTranscriptCreated }: AudioUploadProps) {
                   </div>
                   <div className="flex shrink-0 items-center gap-2">
                     <span className="text-xs text-muted-foreground">{getStatusText(upload)}</span>
-                    {(upload.status === 'completed' || upload.status === 'error') && (
+                    {(upload.status === 'completed' ||
+                      upload.status === 'error' ||
+                      upload.status === 'duplicate') && (
                       <Button
                         variant="ghost"
                         size="sm"
@@ -1082,6 +1300,46 @@ export function AudioUpload({ onTranscriptCreated }: AudioUploadProps) {
                 {upload.status === 'error' && upload.error && (
                   <p className="mt-1 text-xs text-destructive">{upload.error}</p>
                 )}
+                {/* The answer came after the dialog had already let go — a big
+                    file, checked on the server once the bytes were there. Same
+                    sentence, same two ways out, in the row it belongs to. */}
+                {upload.status === 'duplicate' && upload.duplicate && (
+                  <div className="mt-1 space-y-1.5">
+                    {/* The status beside the file name already reads "Already
+                        yours", so the headline is not repeated here — only the
+                        facts, the one extra note, and what did NOT happen. */}
+                    <p className="text-xs text-foreground">
+                      {matchFacts(upload.duplicate)}
+                    </p>
+                    <p className="text-xs text-muted-foreground">
+                      {matchNote(upload.duplicate) ? `${matchNote(upload.duplicate)} ` : ''}
+                      Nothing has been added to your list.
+                    </p>
+                    <div className="flex flex-wrap items-center gap-2">
+                      <Button
+                        size="sm"
+                        variant="outline"
+                        className="h-7"
+                        disabled={restoring}
+                        onClick={() => void goToMatch(upload.duplicate!)}
+                      >
+                        {restoring && <Loader2 className="h-3.5 w-3.5 animate-spin" />}
+                        {matchAction(upload.duplicate).label}
+                      </Button>
+                      <Button
+                        size="sm"
+                        variant="ghost"
+                        className="h-7"
+                        onClick={() => upload.onForce?.()}
+                      >
+                        Upload anyway
+                      </Button>
+                    </div>
+                    {restoreError && (
+                      <p className="text-xs text-destructive">{restoreError}</p>
+                    )}
+                  </div>
+                )}
               </div>
             ))}
           </div>
@@ -1100,8 +1358,31 @@ export function AudioUpload({ onTranscriptCreated }: AudioUploadProps) {
               {step === 'files' && 'Upload media'}
               {step === 'link' && 'Link to a calendar meeting?'}
               {step === 'process' && 'How should it be processed?'}
+              {step === 'duplicate' && 'You already have this recording'}
             </DialogTitle>
           </DialogHeader>
+
+          {/* The same file, again (docs/recordings-same-file-spec.md). Inline,
+              in the dialog the reader is already in — a second modal on top of
+              a modal to say "actually, nothing happened" would be absurd. */}
+          {step === 'duplicate' && duplicate && (
+            <div className="min-w-0 space-y-2 py-2">
+              <p className="text-sm font-medium">{duplicateCopy(duplicate).facts}</p>
+              {duplicateCopy(duplicate).note && (
+                <p className="text-sm text-muted-foreground">{duplicateCopy(duplicate).note}</p>
+              )}
+              <p className="text-xs text-muted-foreground">
+                {duplicateCopy(duplicate).reassurance} Transcribing it again costs credit and
+                gives you a second copy of the same meeting.
+              </p>
+              {restoreError && (
+                <p className="flex items-center gap-1 text-xs text-destructive">
+                  <AlertCircle className="h-4 w-4" />
+                  {restoreError}
+                </p>
+              )}
+            </div>
+          )}
 
           {step === 'connect' && (
             <div className="min-w-0 space-y-3 py-2">
@@ -1733,12 +2014,27 @@ export function AudioUpload({ onTranscriptCreated }: AudioUploadProps) {
                   </label>
                 )}
               </div>
+              {/* Always here, empty or not, so "Checking…" appears into space
+                  that was already reserved and the buttons never move. */}
+              <p
+                aria-live="polite"
+                className="flex min-h-[18px] items-center gap-1.5 px-1 text-xs text-muted-foreground"
+              >
+                {checking && (
+                  <>
+                    <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                    {checkNote ?? 'Checking…'}
+                  </>
+                )}
+              </p>
             </div>
           )}
 
           <DialogFooter>
-            {!(step === 'pick' && pasteResult) && (
-              <Button variant="ghost" onClick={handleCancelUpload}>
+            {/* On the duplicate step the two answers ARE the buttons; the
+                corner × is the "neither" (nothing has happened anyway). */}
+            {!(step === 'pick' && pasteResult) && step !== 'duplicate' && (
+              <Button variant="ghost" onClick={checking ? cancelChecking : handleCancelUpload}>
                 Cancel
               </Button>
             )}
@@ -1805,12 +2101,42 @@ export function AudioUpload({ onTranscriptCreated }: AudioUploadProps) {
               <>
                 <Button
                   variant="ghost"
+                  disabled={checking}
                   onClick={() => (canLink && googleOk !== false ? setStep('link') : setStep('files'))}
                 >
                   Back
                 </Button>
-                <Button onClick={handleConfirmUpload} disabled={blocked} title={blocked ? OFFLINE_TITLE : undefined}>
+                <Button
+                  onClick={handleConfirmUpload}
+                  disabled={blocked || checking}
+                  title={blocked ? OFFLINE_TITLE : undefined}
+                >
+                  {/* The word "Checking…" belongs to the line above, which is
+                      the live region and the only one that can say "2 of 3".
+                      Saying it here too put it on screen twice, 60 px apart,
+                      at 390 px. The spinner is enough of a busy sign. */}
+                  {checking && <Loader2 className="h-4 w-4 animate-spin" />}
                   Start Transcription
+                </Button>
+              </>
+            )}
+            {step === 'duplicate' && duplicate && (
+              <>
+                <Button
+                  variant="ghost"
+                  disabled={checking || restoring}
+                  onClick={() => forceRetryRef.current?.()}
+                  title="Transcribe these bytes again as a second meeting"
+                >
+                  {checking && <Loader2 className="h-4 w-4 animate-spin" />}
+                  Upload anyway
+                </Button>
+                <Button
+                  disabled={checking || restoring}
+                  onClick={() => void goToMatch(duplicate)}
+                >
+                  {restoring && <Loader2 className="h-4 w-4 animate-spin" />}
+                  {matchAction(duplicate).label}
                 </Button>
               </>
             )}
