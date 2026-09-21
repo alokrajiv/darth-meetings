@@ -210,8 +210,23 @@ permanent delete (a recording's files are removed only when no other live meetin
 - Migrations hard-code `SET search_path = meeting_whisperer_prod`; applying 044 to a stage schema means sed-ing that
   line. Leave the convention; say so in the migration header.
 
-## 6. Rollout
+## 6. Rollout (as built, 2026-09-21 — d6481a3)
 
-Migration 044 (Alok applies) → deploy with the flag off (dual-write starts) → backfill `--apply` (Alok) →
-diff script against prod read-only → flag on → a week with offline pins and darth-cli as the canaries → Phase 1b/2.
-Rollback at any point = flag off; the tables are additive.
+Two flags, both lazy-read from the VM's `.env.local`: `MW_RECORDINGS_WRITE` (dual-write) and `MW_RECORDINGS`
+(readers). Order matters:
+
+1. Apply `migrations/044_recordings.sql` on the VM (additive).
+2. `./deploy.sh` with both flags unset — nothing changes.
+3. Set `MW_RECORDINGS_WRITE=1`, restart. Writes that happen from here on keep the tables in step, so the
+   backfill cannot miss anything.
+4. `SCHEMA_PREFIX=prod bun run scripts/recordings-backfill.ts` (dry run), then `--apply --i-know-this-is-prod
+   --check-files <storage dir>`.
+5. `SCHEMA_PREFIX=prod bun run scripts/recordings-verify.ts --check-files <storage dir>` → must say 0 findings.
+6. Set `MW_RECORDINGS=1`, restart. Soak a week; run the verifier daily (exit 1 = drift). Canaries: offline pins
+   (the plan `rev` must not move) and darth-cli.
+Rollback at any point = unset the flag(s) and restart; the tables are additive. If `MW_RECORDINGS_WRITE` is ever
+turned off and on again, run the verifier — deletes that happened while it was off leave orphan clips.
+
+Gate result before commit: scratch Postgres loaded with a read-only dump of prod (deleted afterwards), 681
+meetings × flag off/on over /transcripts/<id>, /content, /edits, /speakers, /audio (+Range, ?variant, every
+?part=N), offline plan incl. rev, v2 + legacy listings for 13 callers: 10,342 comparisons, 0 mismatches.
