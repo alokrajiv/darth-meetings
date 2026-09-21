@@ -1,6 +1,6 @@
 'use client';
 
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { TableCell, TableRow } from '@/components/ui/table';
 import { Button } from '@/components/ui/button';
 import { Badge } from '@/components/ui/badge';
@@ -14,11 +14,13 @@ import {
 } from '@/lib/format';
 import { msConnectHref, msLinkMissing, useMsLinkStatus } from '@/components/connect-nudge-banner';
 // Stream S2 owns companion-client.ts — imported here, never edited here.
-import { getCompanion, useCompanion } from '@/lib/companion/companion-client';
-import { recorderRowCopy, type RecorderRecordingRef } from '@/lib/recorder';
-import { ExternalLink, EyeOff, FileText, Loader2, Repeat, Search, Settings2, Upload, Video, VideoOff, Zap } from 'lucide-react';
-import { MeetLogo, TeamsLogo } from '@/components/provider-icon';
+import { useCompanion } from '@/lib/companion/companion-client';
+import { stripForCalendarRow } from '@/lib/recording-strip';
+import { EyeOff, ExternalLink, Laptop, Plus, Repeat, Search, Upload, Zap } from 'lucide-react';
 import { requestMediaUpload } from '@/components/audio-upload';
+import { PersonChip } from '@/components/person-chip';
+import { RowMenu, type RowMenuItem, type RowMenuSection } from '@/components/row-menu';
+import { RecorderRefStrip, RecordingStrip, SourceGlyph } from '@/components/recording-strip';
 import { OFFLINE_TITLE, useOfflineGate } from '@/lib/offline/offline-context';
 import { isNetworkFailure } from '@/lib/offline/offline-fetch';
 
@@ -46,51 +48,12 @@ export type CalendarDayGroup = CalendarMeetingsResponse['days'][number];
  * rules and the "No Meet link" badge. */
 export type CalendarLayer = 'unimported' | 'norec';
 
-function statusGlyph(r: CalendarMeetingRow) {
-  if (r.hasRecording) {
-    return (
-      <span title="Recording available" className="shrink-0">
-        <Video className="h-3.5 w-3.5 text-muted-foreground" />
-      </span>
-    );
-  }
-  if (r.hasTranscript) {
-    return (
-      <span title="Transcript available" className="shrink-0">
-        <FileText className="h-3.5 w-3.5 text-muted-foreground" />
-      </span>
-    );
-  }
-  if (r.recordingPreparing || r.transcriptPreparing) {
-    return (
-      <span title="Google is still preparing the recording/transcript" className="shrink-0">
-        <Video className="h-3.5 w-3.5 animate-pulse text-amber-500" />
-      </span>
-    );
-  }
-  return (
-    <span title="No recording" className="shrink-0">
-      <VideoOff className="h-3.5 w-3.5 text-muted-foreground/40" />
-    </span>
-  );
-}
-
+/** ONE glyph per calendar row: the conferencing provider, or a muted
+ * "no link" mark (docs/listing-ui-redesign.md §5). */
 function providerGlyph(r: CalendarMeetingRow) {
-  if (r.provider === 'teams') {
-    return (
-      <span title="Microsoft Teams meeting" className="shrink-0">
-        <TeamsLogo className="h-3.5 w-3.5" />
-      </span>
-    );
-  }
-  if (r.hasMeet || r.meetingCode) {
-    return (
-      <span title="Google Meet meeting" className="shrink-0">
-        <MeetLogo className="h-3.5 w-3.5" />
-      </span>
-    );
-  }
-  return null;
+  if (r.provider === 'teams') return <SourceGlyph source="teams" title="Microsoft Teams meeting" />;
+  if (r.hasMeet || r.meetingCode) return <SourceGlyph source="meet" title="Google Meet meeting" />;
+  return <SourceGlyph source="none" title="No conferencing link on the invite" />;
 }
 
 /**
@@ -225,7 +188,7 @@ export function TeamsChatVerdictLine({
         verdict.reason ? verdict.reason : verdict.held ? (verdict.recorded ? 'held-recorded' : 'held') : 'not-held'
       }
       title={title}
-      className={`inline-flex min-w-0 shrink items-center gap-1 truncate text-[11px] ${color} ${className}`}
+      className={`inline-flex min-w-0 shrink items-center gap-1 truncate text-[11px] leading-5 ${color} ${className}`}
     >
       <span className="shrink-0 rounded border border-current/30 px-1 text-[9px] uppercase tracking-wide opacity-70">
         Teams chat
@@ -247,7 +210,7 @@ export function ConnectMicrosoftHint({ className = '' }: { className?: string })
       type="button"
       data-connect-microsoft-hint
       disabled={blocked}
-      className={`min-w-0 max-w-[34ch] shrink truncate text-left text-[11px] text-primary/80 underline-offset-2 hover:underline disabled:cursor-not-allowed disabled:opacity-60 disabled:hover:no-underline ${className}`}
+      className={`min-w-0 max-w-[34ch] shrink truncate text-left text-[11px] leading-5 text-primary/80 underline-offset-2 hover:underline disabled:cursor-not-allowed disabled:opacity-60 disabled:hover:no-underline ${className}`}
       title={blocked ? OFFLINE_TITLE : 'Teams meeting chats record when a call started/ended and whether it was recorded. Connect your Microsoft account (via Darth Tasks) to read them.'}
       onClick={(e) => {
         e.stopPropagation();
@@ -259,372 +222,11 @@ export function ConnectMicrosoftHint({ className = '' }: { className?: string })
   );
 }
 
-/**
- * A Darth Recorder recording matched this occurrence (migration 041). It
- * REPLACES the Teams-chat "recorded elsewhere — not importable here" line,
- * which survives in the tooltip: a recording on somebody's Mac is a better
- * answer than "Microsoft owns it".
- *
- *  - the caller's own Mac → Upload (drives the local tray over the companion
- *    websocket; no tray connected → say so),
- *  - a colleague's Mac    → Ask to upload (POST …/nudge, one DM per 6 h),
- *  - already uploaded     → straight to the transcript.
- */
-function RecorderRecordingLine({
-  rec,
-  row: r,
-  originalNote,
-  disabled = false,
-}: {
-  rec: RecorderRecordingRef;
-  row: CalendarMeetingRow;
-  /** The Teams-chat verdict this line is standing in for, if any. */
-  originalNote?: string | null;
-  disabled?: boolean;
-}) {
-  const companion = useCompanion();
-  const [nudgedAt, setNudgedAt] = useState<string | null>(rec.nudgedAt);
-  const [busy, setBusy] = useState(false);
-  const [note, setNote] = useState<string | null>(null);
-  const { text, action, actionLabel, title } = recorderRowCopy(rec, {
-    durationText: rec.durationS ? formatDuration(rec.durationS) : null,
-    originalNote,
-  });
-
-  const askToUpload = async () => {
-    setBusy(true);
-    setNote(null);
-    try {
-      const res = await fetch(`/api/recorder/recordings/${rec.id}/nudge`, { method: 'POST' });
-      const j = (await res.json().catch(() => ({}))) as {
-        sent_at?: string;
-        error?: string;
-        transcript_id?: string;
-      };
-      if (res.ok) {
-        setNudgedAt(j.sent_at ?? new Date().toISOString());
-        setNote('asked just now');
-      } else if (res.status === 429) {
-        setNudgedAt(j.sent_at ?? new Date().toISOString());
-        setNote('already asked');
-      } else {
-        setNote(j.error ?? `Could not ask (${res.status})`);
-      }
-    } catch (err) {
-      setNote(isNetworkFailure(err) ? OFFLINE_TITLE : 'Could not ask');
-    } finally {
-      setBusy(false);
-    }
-  };
-
-  const uploadHere = () => {
-    setNote(null);
-    // Same linked-event shape the web upload sends; the tray forwards it to
-    // the one-shot route untouched.
-    const ok = getCompanion().upload(rec.id, {
-      id: r.eventId,
-      title: r.title,
-      startTime: r.eventStart,
-      endTime: r.eventEnd,
-      meetingCode: r.meetingCode,
-    });
-    setNote(ok ? 'uploading…' : 'Open Darth Recorder on that Mac to upload it');
-  };
-
-  const askedLabel = nudgedAt
-    ? `asked ${new Date(nudgedAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}`
-    : null;
-
-  return (
-    <span
-      data-recorder-recording={rec.status}
-      data-recorder-mine={rec.mine ? '1' : '0'}
-      title={title}
-      className="inline-flex min-w-0 shrink items-center gap-1 truncate text-[11px] text-foreground/70"
-    >
-      <span className="shrink-0 rounded border border-current/30 px-1 text-[9px] uppercase tracking-wide opacity-70">
-        Recorder
-      </span>
-      <span className="truncate">{text}</span>
-      {action === 'open' && rec.transcriptId && (
-        <a
-          href={`/transcript/${rec.transcriptId}`}
-          onClick={(e) => e.stopPropagation()}
-          className="shrink-0 text-primary underline-offset-2 hover:underline"
-        >
-          Open transcript
-        </a>
-      )}
-      {action === 'upload' && (
-        <button
-          type="button"
-          disabled={disabled || busy}
-          title={
-            disabled
-              ? OFFLINE_TITLE
-              : companion.connected
-                ? 'Upload it from this Mac now — it transcribes itself'
-                : 'Darth Recorder is not connected to this page; open the tray on the Mac that holds the file'
-          }
-          onClick={(e) => {
-            e.stopPropagation();
-            uploadHere();
-          }}
-          className="shrink-0 text-primary underline-offset-2 hover:underline disabled:cursor-not-allowed disabled:opacity-60"
-        >
-          {companion.connected ? actionLabel : 'Open Darth Recorder'}
-        </button>
-      )}
-      {action === 'nudge' &&
-        (askedLabel && !busy ? (
-          <span className="shrink-0 text-muted-foreground">{askedLabel}</span>
-        ) : (
-          <button
-            type="button"
-            disabled={disabled || busy}
-            title={disabled ? OFFLINE_TITLE : title}
-            onClick={(e) => {
-              e.stopPropagation();
-              void askToUpload();
-            }}
-            className="shrink-0 text-primary underline-offset-2 hover:underline disabled:cursor-not-allowed disabled:opacity-60"
-          >
-            {busy ? 'Asking…' : actionLabel}
-          </button>
-        ))}
-      {note && <span className="shrink-0 truncate text-muted-foreground">· {note}</span>}
-    </span>
-  );
-}
-
 /** Local YYYY-MM-DD of an ISO instant — matches the upload stepper's day. */
 function localDayOf(iso: string): string {
   const d = new Date(iso);
   const p = (n: number) => String(n).padStart(2, '0');
   return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`;
-}
-
-/**
- * Per-event settings gear. Opens a fixed-position popover (same idiom as
- * SeriesBadge — position:fixed escapes the listing table's overflow-hidden
- * container) with the event's key facts (time, organizer, attendees,
- * recurring info) and its actions: hide this occurrence, hide the whole
- * recurring series + future ones, and — for events with no artifacts —
- * upload a recording pre-linked to this event. Hides POST
- * /api/calendar-mutes and let the host silently refetch via onMuteChanged.
- */
-function EventGearMenu({
-  row: r,
-  layer,
-  onMuteChanged,
-  disabled = false,
-}: {
-  row: CalendarMeetingRow;
-  layer: CalendarLayer;
-  onMuteChanged?: () => void;
-  /** Offline mode / network down: the menu opens, its actions are inert. */
-  disabled?: boolean;
-}) {
-  const [open, setOpen] = useState(false);
-  const [pos, setPos] = useState<{ top: number; left: number } | null>(null);
-  const [busy, setBusy] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-  const popRef = useRef<HTMLDivElement>(null);
-  const btnRef = useRef<HTMLButtonElement>(null);
-
-  const close = useCallback(() => {
-    setOpen(false);
-    setError(null);
-  }, []);
-
-  useEffect(() => {
-    if (!open) return;
-    const onDown = (e: MouseEvent) => {
-      if (
-        popRef.current &&
-        !popRef.current.contains(e.target as Node) &&
-        !btnRef.current?.contains(e.target as Node)
-      ) {
-        close();
-      }
-    };
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') close();
-    };
-    // Any scroll invalidates the fixed anchor — just close.
-    const onScroll = () => close();
-    document.addEventListener('mousedown', onDown);
-    document.addEventListener('keydown', onKey);
-    window.addEventListener('scroll', onScroll, true);
-    return () => {
-      document.removeEventListener('mousedown', onDown);
-      document.removeEventListener('keydown', onKey);
-      window.removeEventListener('scroll', onScroll, true);
-    };
-  }, [open, close]);
-
-  const openPopover = (e: React.MouseEvent) => {
-    e.stopPropagation();
-    const rect = (e.currentTarget as HTMLElement).getBoundingClientRect();
-    const width = 264;
-    setPos({
-      top: rect.bottom + 6,
-      left: Math.max(8, Math.min(rect.left, window.innerWidth - width - 8)),
-    });
-    setError(null);
-    setOpen(true);
-  };
-
-  const mute = async (kind: 'occurrence' | 'series', value: string) => {
-    setBusy(true);
-    setError(null);
-    try {
-      const res = await fetch('/api/calendar-mutes', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        credentials: 'include',
-        body: JSON.stringify({ kind, value, title: r.title ?? undefined }),
-      });
-      if (!res.ok) throw new Error(`Failed to hide (${res.status})`);
-      close();
-      onMuteChanged?.();
-    } catch (err) {
-      setError(isNetworkFailure(err) ? OFFLINE_TITLE : err instanceof Error ? err.message : 'Failed to hide');
-    } finally {
-      setBusy(false);
-    }
-  };
-
-  const canUpload = layer === 'norec' && !!r.eventId;
-  const gearChat =
-    r.provider === 'teams' ? teamsChatVerdictFromRow(r as TeamsChatRowFields) : null;
-  // Explicit true only — null on a verdict-bearing row means own tenant
-  // (external rows are always created with raw.external = true).
-  const gearExternal = (r as TeamsChatRowFields).chatExternal === true;
-  const startTs = new Date(r.eventStart);
-  const timeLine =
-    startTs.toLocaleDateString([], { weekday: 'short', day: 'numeric', month: 'short' }) +
-    ' · ' +
-    startTs.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) +
-    (r.eventEnd
-      ? '–' + new Date(r.eventEnd).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
-      : '');
-
-  return (
-    <>
-      <Button
-        ref={btnRef}
-        size="sm"
-        variant="ghost"
-        className="h-7 w-7 p-0 text-muted-foreground opacity-0 transition-opacity hover:text-foreground group-hover:opacity-100"
-        title="Event settings"
-        onClick={openPopover}
-      >
-        <Settings2 className="h-3.5 w-3.5" />
-        <span className="sr-only">Event settings</span>
-      </Button>
-      {open && pos && (
-        <div
-          ref={popRef}
-          onClick={(e) => e.stopPropagation()}
-          style={{ position: 'fixed', top: pos.top, left: pos.left, width: 288 }}
-          className="z-50 rounded-lg border bg-popover p-2 text-popover-foreground shadow-[0_4px_16px_-2px_rgb(0_0_0/0.12),0_1px_2px_0_rgb(0_0_0/0.04)]"
-        >
-          <p className="truncate px-1 text-xs font-medium">
-            {r.title?.trim() || '(untitled meeting)'}
-          </p>
-          <div className="space-y-0.5 px-1 pb-1.5 pt-0.5 text-[11px] text-muted-foreground">
-            <p>{timeLine}</p>
-            {r.organizerEmail && (
-              <p className="truncate">
-                {r.organizerSelf ? 'Organized by you' : r.organizerEmail}
-                {r.attendeeCount ? ` · ${r.attendeeCount} attendees` : ''}
-              </p>
-            )}
-            <p>
-              {r.provider === 'teams'
-                ? 'Microsoft Teams'
-                : r.hasMeet || r.meetingCode
-                  ? 'Google Meet'
-                  : 'No conferencing link'}
-              {r.hasRecording
-                ? ` · recording ×${r.recordingCount}`
-                : r.hasTranscript
-                  ? ' · transcript only'
-                  : r.recordingPreparing || r.transcriptPreparing
-                    ? ' · preparing…'
-                    : ' · no artifacts'}
-            </p>
-            {r.recurringEventId && (
-              <p>
-                Recurring series
-                {r.seriesCount ? ` · ${r.seriesCount} occurrences seen` : ''}
-              </p>
-            )}
-            {gearChat && (
-              <p>
-                {teamsChatVerdictCopy(gearChat, { external: gearExternal }).text}
-                {' · '}
-                <span title={`Source: Teams chat · checked ${new Date(gearChat.checkedAt).toLocaleString()}`}>
-                  Teams chat
-                </span>
-              </p>
-            )}
-          </div>
-          <div className="space-y-0.5 border-t pt-1.5">
-            {canUpload && (
-              <button
-                type="button"
-                disabled={busy || disabled}
-                title={disabled ? OFFLINE_TITLE : undefined}
-                onClick={() => {
-                  close();
-                  requestMediaUpload({
-                    date: localDayOf(r.eventStart),
-                    eventId: r.eventId!,
-                  });
-                }}
-                className="flex w-full items-center gap-1.5 rounded px-1.5 py-1 text-left text-sm hover:bg-muted disabled:opacity-50"
-              >
-                <Upload className="h-3.5 w-3.5 text-muted-foreground" />
-                Upload a recording for this meeting…
-              </button>
-            )}
-            <button
-              type="button"
-              disabled={busy || disabled}
-              title={disabled ? OFFLINE_TITLE : undefined}
-              onClick={() => void mute('occurrence', r.key)}
-              className="flex w-full items-center gap-1.5 rounded px-1.5 py-1 text-left text-sm hover:bg-muted disabled:opacity-50"
-            >
-              <EyeOff className="h-3.5 w-3.5 text-muted-foreground" />
-              Hide this occurrence
-            </button>
-            {r.recurringEventId && (
-              <button
-                type="button"
-                disabled={busy || disabled}
-                title={disabled ? OFFLINE_TITLE : undefined}
-                onClick={() => void mute('series', r.recurringEventId!)}
-                className="flex w-full items-center gap-1.5 rounded px-1.5 py-1 text-left text-sm hover:bg-muted disabled:opacity-50"
-              >
-                <EyeOff className="h-3.5 w-3.5 text-muted-foreground" />
-                Hide all{r.seriesCount ? ` ${r.seriesCount}` : ''} occurrence
-                {r.seriesCount === 1 ? '' : 's'} + future ones
-              </button>
-            )}
-          </div>
-          {busy && (
-            <div className="flex items-center gap-2 px-1 pt-1 text-xs text-muted-foreground">
-              <Loader2 className="h-3.5 w-3.5 animate-spin" /> Hiding…
-            </div>
-          )}
-          {disabled && !error && <p className="px-1 pt-1 text-xs text-muted-foreground">{OFFLINE_TITLE}</p>}
-          {error && <p className="px-1 pt-1 text-xs text-destructive">{error}</p>}
-        </div>
-      )}
-    </>
-  );
 }
 
 interface CalendarEventRowProps {
@@ -643,17 +245,23 @@ interface CalendarEventRowProps {
   onMuteChanged?: () => void;
   /** The row's series chip was clicked — host opens its SeriesDialog. */
   onOpenSeries?: (seriesId: number) => void;
-  /** Offline mode / network down: row click, Import/Check/Upload, the gear
-   * actions and the series chip are inert (visible, "Not available offline"). */
+  /** Offline mode / network down: row click, Import / the Add-recording
+   * menu, the ⋯ actions and the series chip are inert (visible, "Not
+   * available offline"). */
   disabled?: boolean;
 }
 
 /**
  * One calendar-event row, rendered INSIDE the merged listing table. It emits
  * a cell per visible archive column so organizer/time/duration/attendees sit
- * in the same grid as the archive rows' Owner/Date/Duration/Speakers. A
- * subtle tinted background keeps imported vs not-imported readable at a
- * glance. Pure presentation — fetching, day grouping, and merging live in
+ * in the same grid as the archive rows' Owner/Date/Duration/Speakers.
+ *
+ * Anatomy (docs/listing-ui-redesign.md §5): provider glyph · title · series
+ * chip on the first line; the recording strip (cloud state, a matched Darth
+ * Recorder recording, the Teams-chat verdict) on the second; ONE control in
+ * the action cell — Import… (or the ⚡ auto-sync chip), the strip's own
+ * button, or the "Add recording ▾" menu — plus a hover ⋯ for Hide.
+ * Pure presentation — fetching, day grouping, and merging live in
  * TranscriptTable.
  */
 export function CalendarEventRow({
@@ -667,30 +275,26 @@ export function CalendarEventRow({
   onOpenSeries,
   disabled = false,
 }: CalendarEventRowProps) {
+  const companion = useCompanion();
   // Unimported rows (artifacts known) import straight away. A row in the
-  // "No recording" layer — Meet OR Teams — has NO known artifacts: the old
-  // Import… button opened the dialog only for it to answer "never started" /
-  // show a Teams row with nothing selectable (D10). Now the button is
-  // "Check…": one live probe through the discovery service (Meet:
+  // "No recording" layer — Meet OR Teams — has NO known artifacts: "check"
+  // runs one live probe through the discovery service (Meet:
   // /api/meet/evidence, Teams: /api/teams/evidence — both write back to the
   // cache); if the provider does hold something the import dialog opens on
-  // it, otherwise the row says so inline. When the cache already records a
-  // probe that found nothing ('none'/'none'), the row says so up front.
+  // it, otherwise the row says so inline.
   const isTeams = r.provider === 'teams';
   const providerName = isTeams ? 'Microsoft' : 'Google';
   const canImport = !!r.meetingCode && !!onImportMeeting && layer === 'unimported';
   const canCheck =
     !canImport && layer === 'norec' && r.hasMeet && !!r.meetingCode && !!onImportMeeting;
-  // Upload… sits next to Check… rather than behind it: a row that can be
-  // probed is exactly the row someone has their own recording of, and the
-  // hover-only gear was the only path to it until 2026-09-21.
   const canUpload = !canImport && layer === 'norec' && !!r.eventId;
   const knownEmpty =
     canCheck && r.recordingState === 'none' && r.transcriptState === 'none';
   const [checking, setChecking] = useState(false);
-  const [checkNote, setCheckNote] = useState<string | null>(null);
+  const [note, setNote] = useState<string | null>(null);
+  const [muteBusy, setMuteBusy] = useState(false);
   // Teams chat evidence (was the call held / recorded) — the cache row's
-  // verdict (norec view fields) or, after a Check…, the live one the
+  // verdict (norec view fields) or, after a check, the live one the
   // evidence route returns alongside the artifact probe.
   const [chatLive, setChatLive] = useState<TeamsChatVerdict | null>(null);
   const [externalLive, setExternalLive] = useState<boolean | null>(null);
@@ -698,17 +302,16 @@ export function CalendarEventRow({
   const chat = chatLive ?? (isTeams ? teamsChatVerdictFromRow(chatFields) : null);
   // chatExternal is only stamped (raw.external = true) on rows CREATED for
   // external occurrences — own-tenant rows carry NULL, which reliably means
-  // "our tenant" whenever a verdict exists. Treat only an explicit true as
-  // external so own-tenant held+recorded rows get the "recording still
-  // processing" copy instead of the unknown-tenant fallback.
+  // "our tenant" whenever a verdict exists.
   const chatExternal = externalLive ?? (chatFields.chatExternal === true);
   const wantsChatHint = isTeams && layer === 'norec' && !chat;
   const ms = useMsLinkStatus(wantsChatHint);
   const showConnectMsHint = wantsChatHint && msLinkMissing(ms);
+
   const checkEvidence = async () => {
     if (!r.meetingCode) return;
     setChecking(true);
-    setCheckNote(null);
+    setNote(null);
     try {
       const res = isTeams
         ? await fetch('/api/teams/evidence', {
@@ -732,7 +335,7 @@ export function CalendarEventRow({
             }),
           });
       if (res.status === 404) {
-        setCheckNote('Connect Google first');
+        setNote('Connect Google first');
         return;
       }
       const j = (await res.json().catch(() => ({}))) as {
@@ -746,7 +349,7 @@ export function CalendarEventRow({
       };
       if (!res.ok) throw new Error(j.error || `Check failed (${res.status})`);
       if (isTeams) {
-        // The evidence route now carries the chat verdict (own-tenant AND
+        // The evidence route carries the chat verdict (own-tenant AND
         // external) — keep it on the row whatever the artifact outcome.
         const live = asTeamsChatVerdict(j.chat);
         if (live) setChatLive(live);
@@ -760,27 +363,141 @@ export function CalendarEventRow({
       }
       if (j.verdict?.importable) {
         // The probe wrote the evidence back — the row migrates to "Not
-        // imported" on refetch; open the dialog on it meanwhile. Teams: the
-        // dialog keys its rows by the canonical cache code the server returns.
+        // imported" on refetch; open the dialog on it meanwhile.
         onMuteChanged?.();
         onImportMeeting?.({ meetingCode: j.code ?? r.meetingCode, eventStart: r.eventStart });
       } else if (j.checkFailed) {
-        setCheckNote(`${providerName} didn’t answer — try again`);
+        setNote(`${providerName} didn’t answer — try again`);
       } else if (isTeams && asTeamsChatVerdict(j.chat)) {
-        // The verdict line says it better than a generic "nothing" note.
-        setCheckNote(null);
+        setNote(null);
       } else if (isTeams && j.resolved === false) {
-        setCheckNote('Microsoft has no record of this meeting');
+        setNote('Microsoft has no record of this meeting');
       } else {
-        setCheckNote(`Nothing at ${providerName} — never recorded`);
+        setNote(`Nothing at ${providerName} — never recorded`);
       }
     } catch (err) {
-      setCheckNote(isNetworkFailure(err) ? OFFLINE_TITLE : err instanceof Error ? err.message : 'Check failed');
+      setNote(isNetworkFailure(err) ? OFFLINE_TITLE : err instanceof Error ? err.message : 'Check failed');
     } finally {
       setChecking(false);
     }
   };
 
+  const mute = async (kind: 'occurrence' | 'series', value: string) => {
+    setMuteBusy(true);
+    setNote(null);
+    try {
+      const res = await fetch('/api/calendar-mutes', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        credentials: 'include',
+        body: JSON.stringify({ kind, value, title: r.title ?? undefined }),
+      });
+      if (!res.ok) throw new Error(`Failed to hide (${res.status})`);
+      onMuteChanged?.();
+    } catch (err) {
+      setNote(isNetworkFailure(err) ? OFFLINE_TITLE : err instanceof Error ? err.message : 'Failed to hide');
+    } finally {
+      setMuteBusy(false);
+    }
+  };
+
+  const openUpload = () => {
+    if (!r.eventId) return;
+    requestMediaUpload({ date: localDayOf(r.eventStart), eventId: r.eventId });
+  };
+
+  // ---- Menus -------------------------------------------------------------
+  const lastChecked = r.evidenceCheckedAt
+    ? ` (${new Date(r.evidenceCheckedAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })})`
+    : '';
+  const whereItems: RowMenuItem[] = [];
+  if (canCheck) {
+    whereItems.push({
+      key: 'check',
+      label: `At ${providerName} — check`,
+      hint: knownEmpty
+        ? `Nothing was there last time${lastChecked}; recap artifacts land minutes after the call`
+        : `Ask ${providerName} whether the call left a recording or transcript`,
+      icon: <Search />,
+      busy: checking,
+      disabled: disabled,
+      title: disabled ? OFFLINE_TITLE : undefined,
+      onSelect: () => checkEvidence(),
+    });
+  }
+  if (canUpload) {
+    whereItems.push({
+      key: 'file',
+      label: 'In a file — upload…',
+      hint: 'A phone clip, a Zoom export, anything with audio',
+      icon: <Upload />,
+      disabled: disabled,
+      title: disabled ? OFFLINE_TITLE : undefined,
+      onSelect: openUpload,
+    });
+    if (companion.connected) {
+      whereItems.push({
+        key: 'mac',
+        label: 'On this Mac — Darth Recorder…',
+        hint: 'Pick it from the recordings on this Mac',
+        icon: <Laptop />,
+        disabled: disabled,
+        title: disabled ? OFFLINE_TITLE : undefined,
+        onSelect: openUpload,
+      });
+    }
+  }
+  const hideItems: RowMenuItem[] = [
+    {
+      key: 'hide-occ',
+      label: 'Hide this occurrence',
+      icon: <EyeOff />,
+      disabled: disabled || muteBusy,
+      title: disabled ? OFFLINE_TITLE : undefined,
+      onSelect: () => mute('occurrence', r.key),
+    },
+  ];
+  if (r.recurringEventId) {
+    hideItems.push({
+      key: 'hide-series',
+      label: `Hide all${r.seriesCount ? ` ${r.seriesCount}` : ''} occurrence${r.seriesCount === 1 ? '' : 's'} + future ones`,
+      icon: <EyeOff />,
+      disabled: disabled || muteBusy,
+      title: disabled ? OFFLINE_TITLE : undefined,
+      onSelect: () => mute('series', r.recurringEventId!),
+    });
+  }
+  const startTs = new Date(r.eventStart);
+  const timeLine =
+    startTs.toLocaleDateString([], { weekday: 'short', day: 'numeric', month: 'short' }) +
+    ' · ' +
+    startTs.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) +
+    (r.eventEnd
+      ? '–' + new Date(r.eventEnd).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
+      : '');
+  const facts = (
+    <div className="space-y-0.5 text-[11px] text-muted-foreground">
+      <p className="truncate text-xs font-medium text-foreground">{r.title?.trim() || '(untitled meeting)'}</p>
+      <p>{timeLine}</p>
+      {r.organizerEmail && (
+        <p className="truncate">
+          {r.organizerSelf ? 'Organized by you' : r.organizerEmail}
+          {r.attendeeCount ? ` · ${r.attendeeCount} attendees` : ''}
+        </p>
+      )}
+    </div>
+  );
+  // The "Add recording ▾" menu is THE action of a bare norec row; once a
+  // Darth Recorder recording is matched, the strip's button takes over and
+  // the same choices fold into the ⋯.
+  const addRecordingIsPrimary = layer === 'norec' && !r.recorderRecording && whereItems.length > 0;
+  const dotsSections: RowMenuSection[] = [];
+  if (!addRecordingIsPrimary && whereItems.length > 0) {
+    dotsSections.push({ key: 'where', heading: 'Where is the recording?', items: whereItems });
+  }
+  dotsSections.push({ key: 'hide', items: hideItems });
+
+  // ---- Cells -------------------------------------------------------------
   const middleCell = (key: string) => {
     switch (key) {
       case 'labels':
@@ -789,15 +506,11 @@ export function CalendarEventRow({
         return null;
       case 'owner':
         return r.organizerEmail ? (
-          <span className="block max-w-[16ch] truncate text-xs text-muted-foreground">
-            {r.organizerSelf ? 'You' : r.organizerEmail}
-          </span>
+          <PersonChip email={r.organizerEmail} self={!!r.organizerSelf} />
         ) : (
           <span className="text-xs text-muted-foreground">—</span>
         );
       case 'date':
-        // Calendar rows only exist in the merged (day-grouped) view, where
-        // the Date column shows time-of-day — same as archive rows there.
         return (
           <span
             className="text-xs tabular-nums text-muted-foreground"
@@ -827,8 +540,7 @@ export function CalendarEventRow({
   };
 
   // "Going in" on a not-yet-imported meeting = the import dialog focused on
-  // it (same mechanism as the reminder rows and the Import… button). The
-  // buttons/badges inside all stopPropagation already.
+  // it (same mechanism as the reminder rows and the Import… button).
   const rowClickable = !!r.meetingCode && !!onImportMeeting && layer === 'unimported' && !disabled;
   const autoVia = r.autoSync
     ? r.autoSync.source === 'series'
@@ -846,11 +558,62 @@ export function CalendarEventRow({
         ? `Already queued${autoVia} — it lands on its own once the artifacts are ready.${autoReport}`
         : `Already imported${autoVia} — the listing catches up on the next refresh.`);
 
+  // The cloud state line. The Import… control stays in the action cell, so
+  // the strip never grows a second one.
+  const cloud = stripForCalendarRow(
+    {
+      provider: r.provider,
+      hasMeet: r.hasMeet || !!r.meetingCode,
+      hasRecording: r.hasRecording,
+      hasTranscript: r.hasTranscript,
+      recordingCount: r.recordingCount,
+      recordingPreparing: r.recordingPreparing,
+      transcriptPreparing: r.transcriptPreparing,
+      durationSecs: r.durationSecs,
+      recordingState: r.recordingState,
+      transcriptState: r.transcriptState,
+      evidenceCheckedAt: r.evidenceCheckedAt,
+      layer,
+    },
+    { fmtDuration: formatDuration, canImport: false }
+  );
+  const artifactBadges =
+    r.hasRecording || r.hasTranscript ? (
+      <span className="inline-flex min-w-0 items-center gap-1">
+        {r.hasRecording && (
+          <ArtifactBadge
+            label={`Recording${r.recordingCount > 1 ? ` ×${r.recordingCount}` : ''} at ${providerName}`}
+            href={r.videoFileId ? `https://drive.google.com/file/d/${r.videoFileId}/view` : null}
+            destination="the recording in Google Drive"
+            className="shrink-0 px-1.5 py-0 text-[10px] font-normal"
+          />
+        )}
+        {r.hasTranscript && (
+          <ArtifactBadge
+            label={r.geminiNotes ? 'Gemini notes' : 'Transcript'}
+            href={r.transcriptDocId ? `https://docs.google.com/document/d/${r.transcriptDocId}/edit` : null}
+            destination="the transcript Doc in Google Docs"
+            className="shrink-0 px-1.5 py-0 text-[10px] font-normal"
+          />
+        )}
+        {r.transcriptParseable === false && (
+          <ArtifactBadge
+            label="transcript unparseable"
+            href={r.transcriptDocId ? `https://docs.google.com/document/d/${r.transcriptDocId}/edit` : null}
+            destination="the transcript Doc in Google Docs"
+            className="shrink-0 border-amber-500/50 px-1.5 py-0 text-[10px] font-normal text-amber-600 dark:text-amber-500"
+          />
+        )}
+        {r.durationSecs ? <span className="truncate">· {formatDuration(r.durationSecs)}</span> : null}
+      </span>
+    ) : null;
+
   return (
     <TableRow
       onClick={rowClickable ? () => onImportMeeting!({ meetingCode: r.meetingCode!, eventStart: r.eventStart }) : undefined}
       aria-disabled={disabled || undefined}
       title={disabled ? OFFLINE_TITLE : undefined}
+      data-calendar-row={layer}
       className={`group bg-muted/30 transition-colors hover:bg-accent/30 ${
         r.muted ? 'opacity-60' : ''
       } ${rowClickable ? 'cursor-pointer' : ''}`}
@@ -865,19 +628,13 @@ export function CalendarEventRow({
             long nowrap titles can't inflate the table's column layout — the
             content still renders at the cell's full width and truncates. */}
         <div className="w-0 min-w-full">
-        <div className="flex min-w-0 items-center gap-2">
-          {statusGlyph(r)}
-          {providerGlyph(r)}
+        <div className="flex min-w-0 items-start gap-2">
+          <span className="mt-[3px] shrink-0">{providerGlyph(r)}</span>
           <div className="min-w-0 flex-1">
-            {/* flex-wrap: badges that don't fit drop to a second line
-                instead of being clipped (clipping hid the evidence verdict
-                and made crowded rows unreadable, 2026-08-30). The title
-                keeps its floor + truncate for pathological lengths, with
-                the full text on hover. */}
-            <div className="flex min-w-0 flex-wrap items-center gap-x-2 gap-y-0.5">
+            <div className="flex min-w-0 items-center gap-2">
               <div
                 title={r.title?.trim() || undefined}
-                className={`min-w-[7rem] max-w-full truncate text-sm ${
+                className={`min-w-0 truncate text-sm ${
                   r.title?.trim()
                     ? 'font-medium text-foreground/80'
                     : 'italic text-muted-foreground'
@@ -885,55 +642,6 @@ export function CalendarEventRow({
               >
                 {r.title?.trim() || '(untitled meeting)'}
               </div>
-              {r.hasRecording && (
-                <ArtifactBadge
-                  label={`Recording${r.recordingCount > 1 ? ` ×${r.recordingCount}` : ''}`}
-                  href={r.videoFileId ? `https://drive.google.com/file/d/${r.videoFileId}/view` : null}
-                  destination="the recording in Google Drive"
-                  className="shrink-0 text-[10px]"
-                />
-              )}
-              {r.hasTranscript && (
-                <ArtifactBadge
-                  label="Transcript"
-                  href={r.transcriptDocId ? `https://docs.google.com/document/d/${r.transcriptDocId}/edit` : null}
-                  destination="the transcript Doc in Google Docs"
-                  className="shrink-0 text-[10px]"
-                />
-              )}
-              {!r.hasRecording && r.recordingPreparing && (
-                <Badge
-                  variant="outline"
-                  className="shrink-0 border-amber-500/50 text-[10px] text-amber-600 dark:text-amber-500"
-                >
-                  recording preparing…
-                </Badge>
-              )}
-              {!r.hasTranscript && r.transcriptPreparing && (
-                <Badge
-                  variant="outline"
-                  className="shrink-0 border-amber-500/50 text-[10px] text-amber-600 dark:text-amber-500"
-                >
-                  transcript preparing…
-                </Badge>
-              )}
-              {r.hasTranscript && r.geminiNotes && (
-                <Badge
-                  variant="outline"
-                  title="Transcript lives in the Gemini-notes Doc attached to the calendar event"
-                  className="shrink-0 text-[10px] text-muted-foreground"
-                >
-                  Gemini notes
-                </Badge>
-              )}
-              {r.transcriptParseable === false && (
-                <ArtifactBadge
-                  label="transcript unparseable"
-                  href={r.transcriptDocId ? `https://docs.google.com/document/d/${r.transcriptDocId}/edit` : null}
-                  destination="the transcript Doc in Google Docs"
-                  className="shrink-0 border-amber-500/50 text-[10px] text-amber-600 dark:text-amber-500"
-                />
-              )}
               {r.seriesId !== null && (
                 <button
                   type="button"
@@ -950,36 +658,51 @@ export function CalendarEventRow({
                 </button>
               )}
               {r.muted && (
-                <Badge
-                  variant="outline"
-                  className="shrink-0 text-[10px] text-muted-foreground"
-                >
+                <Badge variant="outline" className="shrink-0 px-1.5 py-0 text-[10px] font-normal text-muted-foreground">
                   muted
                 </Badge>
               )}
               {layer === 'norec' && !r.hasMeet && (
-                <Badge
-                  variant="outline"
-                  className="shrink-0 text-[10px] text-muted-foreground/70"
-                >
+                <Badge variant="outline" className="shrink-0 px-1.5 py-0 text-[10px] font-normal text-muted-foreground/70">
                   No Meet link
                 </Badge>
               )}
-              {/* A matched Darth Recorder recording outranks the chat
-                  verdict — the verdict text rides along in its tooltip. */}
-              {isTeams && layer === 'norec' && chat && !r.recorderRecording && (
-                <TeamsChatVerdictLine verdict={chat} external={chatExternal} />
-              )}
-              {r.recorderRecording && (
-                <RecorderRecordingLine
-                  rec={r.recorderRecording}
-                  row={r}
-                  originalNote={chat ? teamsChatVerdictCopy(chat, { external: chatExternal }).text : null}
-                  disabled={disabled}
-                />
-              )}
-              {showConnectMsHint && !r.recorderRecording && <ConnectMicrosoftHint />}
             </div>
+            {/* The recording strip — one line, one source of truth for the
+                occurrence's recording state (docs/listing-ui-redesign.md §4). */}
+            {r.recorderRecording ? (
+              <RecorderRefStrip
+                rec={r.recorderRecording}
+                event={{
+                  id: r.eventId,
+                  title: r.title,
+                  startTime: r.eventStart,
+                  endTime: r.eventEnd,
+                  meetingCode: r.meetingCode,
+                }}
+                originalNote={chat ? teamsChatVerdictCopy(chat, { external: chatExternal }).text : null}
+                disabled={disabled}
+              />
+            ) : cloud ? (
+              <RecordingStrip model={cloud} noGlyph disabled={disabled}>
+                {artifactBadges ?? undefined}
+              </RecordingStrip>
+            ) : null}
+            {isTeams && layer === 'norec' && chat && !r.recorderRecording && (
+              <div className="flex min-w-0">
+                <TeamsChatVerdictLine verdict={chat} external={chatExternal} />
+              </div>
+            )}
+            {showConnectMsHint && !r.recorderRecording && (
+              <div className="flex min-w-0">
+                <ConnectMicrosoftHint />
+              </div>
+            )}
+            {note && (
+              <div className="truncate text-[11px] leading-5 text-muted-foreground" data-calendar-note>
+                {note}
+              </div>
+            )}
           </div>
         </div>
         </div>
@@ -990,11 +713,7 @@ export function CalendarEventRow({
         </TableCell>
       ))}
       <TableCell className="py-1.5 pr-3">
-        {/* flex-wrap: a norec row can now carry Check… AND Upload… next to an
-            evidence note — it wraps onto a second line instead of pushing the
-            buttons out of the cell. */}
-        <div className="flex flex-wrap items-center justify-end gap-0.5">
-          <EventGearMenu row={r} layer={layer} onMuteChanged={onMuteChanged} disabled={disabled} />
+        <div className="flex items-center justify-end gap-1">
           {canImport && r.autoSync && (
             <Badge
               variant="outline"
@@ -1018,6 +737,7 @@ export function CalendarEventRow({
               className="h-7 px-2.5 text-xs"
               disabled={disabled}
               title={disabled ? OFFLINE_TITLE : undefined}
+              data-import-button
               onClick={(e) => {
                 e.stopPropagation();
                 onImportMeeting?.({
@@ -1029,64 +749,31 @@ export function CalendarEventRow({
               Import…
             </Button>
           )}
-          {canCheck && (
-            <>
-              {checkNote ? (
-                <span className="max-w-[22ch] truncate text-[11px] text-muted-foreground" title={checkNote}>
-                  {checkNote}
-                </span>
-              ) : knownEmpty && !(isTeams && chat) ? (
-                <span
-                  className="max-w-[26ch] truncate text-[11px] text-muted-foreground"
-                  title={`${providerName} was asked${
-                    r.evidenceCheckedAt
-                      ? ` (${new Date(r.evidenceCheckedAt).toLocaleString()})`
-                      : ''
-                  } and listed neither a recording nor a transcript for this occurrence. Recap artifacts usually land minutes after the call — Check… asks again.`}
-                >
-                  No recording or transcript at {providerName}
-                </span>
-              ) : null}
-              <Button
-                size="sm"
-                variant="outline"
-                className="h-7 px-2.5 text-xs"
-                disabled={checking || disabled}
-                title={disabled ? OFFLINE_TITLE : `Ask ${providerName} whether this meeting left a recording or transcript${
-                  knownEmpty ? ' (re-check — nothing was there last time)' : " (the calendar hasn't shown any yet)"
-                }`}
-                onClick={(e) => {
-                  e.stopPropagation();
-                  void checkEvidence();
-                }}
-              >
-                {checking ? (
-                  <Loader2 className="mr-1 h-3 w-3 animate-spin" />
-                ) : (
-                  <Search className="mr-1 h-3 w-3" />
-                )}
-                Check…
-              </Button>
-            </>
-          )}
-          {canUpload && (
-            <Button
-              size="sm"
-              variant="outline"
-              className="h-7 shrink-0 px-2.5 text-xs"
-              onClick={(e) => {
-                e.stopPropagation();
-                requestMediaUpload({
-                  date: localDayOf(r.eventStart),
-                  eventId: r.eventId!,
-                });
-              }}
+          {addRecordingIsPrimary && (
+            <RowMenu
+              trigger="Add recording"
+              triggerIcon={<Plus className="h-3.5 w-3.5" />}
+              header={
+                <>
+                  <p className="font-medium">Where is the recording?</p>
+                  <p className="text-[11px] text-muted-foreground">{r.title?.trim() || '(untitled meeting)'} · {timeLine}</p>
+                </>
+              }
+              sections={[{ key: 'where', items: whereItems }, { key: 'hide', items: hideItems }]}
+              busy={checking}
               disabled={disabled}
-              title={disabled ? OFFLINE_TITLE : 'Upload your own recording for this meeting'}
-            >
-              Upload…
-            </Button>
+              disabledTitle={OFFLINE_TITLE}
+              dataAttr="add-recording"
+            />
           )}
+          <RowMenu
+            ariaLabel="Event actions"
+            header={facts}
+            sections={dotsSections}
+            disabled={disabled}
+            disabledTitle={OFFLINE_TITLE}
+            dataAttr="event"
+          />
         </div>
       </TableCell>
     </TableRow>

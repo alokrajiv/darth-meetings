@@ -24,30 +24,36 @@ import {
   type TranscriptListV2Response,
 } from '@/lib/format';
 import { useLiveEvents } from '@/hooks/use-live-events';
-import { uploadProgressCopy, useCompanion } from '@/lib/companion/companion-client';
+import { useCompanion } from '@/lib/companion/companion-client';
 import {
   Archive,
   RotateCcw,
   Trash2,
   RefreshCw,
-  CalendarCheck2,
   CalendarX2,
   ChevronLeft,
   EyeOff,
   FileAudio,
-  FileText,
   Filter,
   Hourglass,
+  Laptop,
+  Link2,
+  RotateCw,
   Search,
   ChevronRight,
   Inbox,
   Columns3,
-  Film,
   GripVertical,
   Video,
   X,
 } from 'lucide-react';
-import { MeetLogo, TeamsLogo } from '@/components/provider-icon';
+import { PersonChip } from '@/components/person-chip';
+import { RowMenu, type RowMenuSection } from '@/components/row-menu';
+import { RecordingStrip, SourceGlyph } from '@/components/recording-strip';
+import { RecordingsSurface, useUnlinkedRecordings } from '@/components/recordings-surface';
+import { LinkEventDialog } from '@/components/link-event-dialog';
+import { isBareRecording, meetingTitleOf } from '@/lib/meeting-title';
+import { provenanceTitle, sourceOfArchiveRow, stripForArchiveRow } from '@/lib/recording-strip';
 import { LayersDropdown } from '@/components/layers-dropdown';
 import { SeriesBadge } from '@/components/series-badge';
 import { SeriesDialog } from '@/components/series-dialog';
@@ -100,8 +106,10 @@ interface TranscriptTableProps {
 }
 
 /** 'scratch' = the Temporary tab (migration 042): the caller's visible
- * temporary transcripts, which every other tab excludes. */
-type TabKey = 'all' | 'mine' | 'shared' | 'trash' | 'scratch';
+ * temporary transcripts, which every other tab excludes. 'recordings' =
+ * recordings that belong to no meeting yet (docs/listing-ui-redesign.md
+ * §6) — fetched by the surface itself, never by the archive fetch. */
+type TabKey = 'all' | 'mine' | 'shared' | 'trash' | 'scratch' | 'recordings';
 
 /**
  * The merged timeline's multi-select layers. 'archive' = imported rows
@@ -454,6 +462,13 @@ export function TranscriptTable({
     []
   );
 
+  // Row menu → "Link to a calendar event…" (one dialog for the whole table).
+  const [linkRow, setLinkRow] = useState<ListRow | null>(null);
+  // Bumped on every silent refetch so the Recordings tab (and its badge)
+  // follow the same live events the archive does.
+  const [liveTick, setLiveTick] = useState(0);
+  const unlinked = useUnlinkedRecordings({ enabled: !blocked, refreshKey: liveTick, tz });
+
   // People / organizer / provider filters — shared by the archive and both
   // calendar layers (the server applies them to rows AND counts). The URL
   // (?participant=&organizer=&provider=) is the source of truth on load so
@@ -601,6 +616,14 @@ export function TranscriptTable({
   const fetchArchive = useCallback(
     async (mode: 'reset' | 'more' | 'silent') => {
       const gen = mode === 'reset' ? ++archiveGenRef.current : archiveGenRef.current;
+      if (tab === 'recordings') {
+        // The Recordings tab fetches its own two halves (useUnlinkedRecordings).
+        if (mode === 'reset') {
+          setLoading(false);
+          setError(null);
+        }
+        return;
+      }
       const params = new URLSearchParams({ v: '2', tab, tz });
       if (from) params.set('from', from);
       if (to) params.set('to', to);
@@ -856,6 +879,7 @@ export function TranscriptTable({
 
   /** Silent refetch of everything currently on screen (+ chip counts). */
   const silentRefetchAll = useCallback(() => {
+    setLiveTick((n) => n + 1);
     void fetchArchiveRef.current('silent');
     let didCal = false;
     if (mergedModeRef.current) {
@@ -1078,8 +1102,8 @@ export function TranscriptTable({
    * already in the trash is deleted forever (confirmed); a queued deferred
    * import is cancelled (confirmed — the server hard-deletes placeholders).
    */
-  const handleDeleteTranscript = async (e: React.MouseEvent, t: ListRow) => {
-    e.stopPropagation();
+  const handleDeleteTranscript = async (e: React.MouseEvent | null, t: ListRow) => {
+    e?.stopPropagation();
     const trashed = !!t.deleted_at;
     const queued = t.status === 'waiting';
     if (trashed && !confirm('Delete forever? This cannot be undone.')) return;
@@ -1111,8 +1135,8 @@ export function TranscriptTable({
    * Temporary tab holds nothing else), so it is dropped locally and the
    * silent refetch reconciles counts. Editors only — same rule as renaming.
    */
-  const handleSetScratch = async (e: React.MouseEvent, t: ListRow, scratch: boolean) => {
-    e.stopPropagation();
+  const handleSetScratch = async (e: React.MouseEvent | null, t: ListRow, scratch: boolean) => {
+    e?.stopPropagation();
     try {
       const res = await fetch(`/api/transcripts/${t.assemblyai_id}`, {
         method: 'PATCH',
@@ -1135,8 +1159,8 @@ export function TranscriptTable({
     }
   };
 
-  const handleRestoreTranscript = async (e: React.MouseEvent, assemblyaiId: string) => {
-    e.stopPropagation();
+  const handleRestoreTranscript = async (e: React.MouseEvent | null, assemblyaiId: string) => {
+    e?.stopPropagation();
     try {
       const res = await fetch(`/api/transcripts/${assemblyaiId}/restore`, { method: 'POST' });
       if (!res.ok) {
@@ -1150,6 +1174,25 @@ export function TranscriptTable({
         isNetworkFailure(err)
           ? OFFLINE_TITLE
           : 'Failed to restore transcript: ' + (err instanceof Error ? err.message : 'Unknown error')
+      );
+    }
+  };
+
+  /** A stored file whose hand-off to AssemblyAI failed — submit it again
+   * (the ingest-retry sweeper would too, with backoff; this is "now"). */
+  const handleRetryIngest = async (t: ListRow) => {
+    try {
+      const res = await fetch(`/api/transcripts/${t.assemblyai_id}/retry-ingest`, { method: 'POST' });
+      if (!res.ok) {
+        const j = (await res.json().catch(() => ({}))) as { error?: string };
+        throw new Error(j.error || `Retry failed (${res.status})`);
+      }
+      void fetchArchiveRef.current('silent');
+    } catch (err) {
+      alert(
+        isNetworkFailure(err)
+          ? OFFLINE_TITLE
+          : 'Could not retry: ' + (err instanceof Error ? err.message : 'Unknown error')
       );
     }
   };
@@ -1309,168 +1352,131 @@ export function TranscriptTable({
     return () => window.removeEventListener('keydown', onKeyDown);
   }, [rowById, selected.size, toggleSelected, clearSelection]);
 
-  const statusDot = (status: string) => {
-    const base = 'inline-flex h-2 w-2 shrink-0 rounded-full';
-    switch (status) {
-      case 'completed':
-        return <span className={`${base} bg-status-ok`} aria-label="Completed" />;
-      case 'processing':
-        return <span className={`${base} bg-status-busy animate-pulse`} aria-label="Processing" />;
-      case 'uploading':
-        return <span className={`${base} bg-primary animate-pulse`} aria-label="Uploading" />;
-      case 'waiting':
-        // Deferred import — queued until the provider finishes the files.
-        return (
-          <span
-            className={`${base} bg-amber-500 animate-pulse`}
-            aria-label="Waiting for files"
-          />
-        );
-      case 'queued':
-        return <span className={`${base} bg-muted-foreground/40`} aria-label="Queued" />;
-      case 'error':
-        return <span className={`${base} bg-status-err`} aria-label="Error" />;
-      default:
-        return <span className={`${base} bg-muted-foreground/40`} aria-label={status} />;
-    }
-  };
+  /** ONE glyph per row — the source (Meet / Teams / Mac / file / text).
+   * Provenance (auto-imported…, the filename) lives in its tooltip
+   * (docs/listing-ui-redesign.md §3). */
+  const rowGlyph = (t: ListRow) => (
+    <SourceGlyph source={sourceOfArchiveRow(t)} title={provenanceTitle(t)} />
+  );
 
-  const sourceIcon = (t: ListRow) => {
-    if (t.provider === 'teams') {
-      return (
-        <span title="Microsoft Teams meeting" className="shrink-0">
-          <TeamsLogo className="h-3.5 w-3.5" />
-        </span>
-      );
-    }
-    if (t.provider === 'gmeet' || t.assemblyai_id.startsWith('gmeet-')) {
-      return (
-        <span title="Google Meet meeting" className="shrink-0">
-          <MeetLogo className="h-3.5 w-3.5" />
-        </span>
-      );
-    }
-    if (t.source === 'uploaded') {
-      return (
-        <span title="Uploaded audio" className="shrink-0">
-          <FileAudio className="h-3.5 w-3.5 text-muted-foreground" />
-        </span>
-      );
-    }
-    return (
-      <span title="Imported transcript" className="shrink-0">
-        <FileText className="h-3.5 w-3.5 text-muted-foreground" />
-      </span>
-    );
-  };
-
-  /** Calendar linkage at a glance: linked rows get share suggestions +
-   * auto-share; unlinked ones can be fixed via "Link calendar event". */
-  const calendarIcon = (t: ListRow) =>
-    t.has_event ? (
-      <span title="Linked to a calendar event" className="shrink-0">
-        <CalendarCheck2 className="h-3.5 w-3.5 text-status-ok/70" />
-      </span>
+  /** Owner as a person: initials avatar + first name, "You" for yourself. */
+  const ownerCell = (t: ListRow) =>
+    t.access === 'owner' ? (
+      <PersonChip email={null} self />
     ) : (
-      <span title="No calendar event linked" className="shrink-0">
-        <CalendarX2 className="h-3.5 w-3.5 text-muted-foreground/40" />
-      </span>
-    );
-
-  /** "N recordings" chip: extra Meet segments, a stitched multi-file upload,
-   * or a combined re-transcription — one meeting, several source videos. */
-  const recordingsChip = (t: ListRow) =>
-    (t.recording_count ?? 1) > 1 ? (
-      <span
-        title={
-          t.recorder_recording_id
-            ? `${t.recording_count} segments of one recording (the recorder rolls a new segment on every screen-share change)`
-            : `${t.recording_count} recordings in this meeting`
+      <PersonChip
+        email={t.owner_email}
+        name={t.owner_name}
+        trailing={
+          <Badge variant="outline" className="shrink-0 px-1 py-0 text-[10px] font-normal">
+            {t.access === 'edit' ? 'Editor' : 'Read'}
+          </Badge>
         }
-        className="inline-flex shrink-0 items-center gap-0.5 rounded border px-1 text-[10px] text-muted-foreground"
-      >
-        <Film className="h-3 w-3" />
-        {t.recording_count}
-      </span>
-    ) : null;
-
-  /** Series auto-import dot: blue = fully unattended (speakers
-   * auto-identified, report generated without review), amber = auto-imported
-   * but waiting on human speaker review. */
-  const autoDot = (t: ListRow) =>
-    t.auto_state === 'passed' ? (
-      <span
-        title="Auto-imported — speakers auto-identified and summary generated without review"
-        className="inline-block h-2 w-2 shrink-0 rounded-full bg-blue-500"
       />
-    ) : t.auto_state === 'gated' ? (
-      <span
-        title="Auto-imported — waiting on speaker review before the summary"
-        className="inline-block h-2 w-2 shrink-0 rounded-full bg-amber-500"
-      />
-    ) : t.auto_state === 'auto' ? (
-      <span
-        title="Auto-imported from a series"
-        className="inline-block h-2 w-2 shrink-0 rounded-full border border-blue-500"
-      />
-    ) : null;
-
-  const ownerCell = (t: ListRow) => {
-    if (t.access === 'owner') {
-      return <span className="text-xs text-muted-foreground">You</span>;
-    }
-    const first = t.owner_name?.trim().split(/\s+/)[0] || t.owner_email || '—';
-    return (
-      <span className="flex items-center gap-1.5">
-        <span className="truncate text-xs text-muted-foreground">{first}</span>
-        <Badge variant="outline" className="shrink-0 text-[10px]">
-          {t.access === 'edit' ? 'Editor' : 'Read'}
-        </Badge>
-      </span>
     );
-  };
 
-  /** Live progress line for rows mid-upload: server-persisted byte counts,
-   * refreshed by the SSE 'status' events the upload route publishes — plus the
-   * companion socket's live numbers when these bytes are coming off this Mac's
-   * Darth Recorder (docs/recorder-upload-ux.md §4). */
-  const uploadProgressLine = (t: ListRow): string => {
+  /** The recording strip's model for a row (null = nothing to say). The
+   * companion socket's live numbers win while this Mac's Darth Recorder is
+   * pushing the bytes (docs/recorder-upload-ux.md §4). */
+  const rowStrip = (t: ListRow) => {
     const recorderId = t.recorder_recording_id ?? null;
     const live = recorderId ? companion.uploads[recorderId] : undefined;
-    return uploadProgressCopy({
-      received: t.upload_bytes_received,
-      total: t.upload_bytes_total,
-      partsDone: t.upload_parts_done,
-      partsTotal: t.upload_parts_total,
-      fromRecorder: !!recorderId,
+    return stripForArchiveRow(t, {
       live:
         live && live.status === 'uploading'
           ? { pct: live.pct, bytesSent: live.bytesSent, bytesTotal: live.bytesTotal }
           : null,
-      fmt: formatBytes,
+      fmtBytes: formatBytes,
+      fmtDuration: formatDuration,
     });
   };
 
+  /** Never a filename (lib/meeting-title): a real title, or a derived
+   * "Recording from your Mac · Sat 20 Sept 22:00". The description (when the
+   * user wrote one, column-chooser toggle) is the only secondary text. */
   const titleOf = (
     t: ListRow
-  ): { primary: string; secondary: string | null; untitled: boolean } => {
-    // Secondary line: a human-written description beats the raw filename —
-    // flattened + truncated, and toggleable from the column chooser.
+  ): { primary: string; secondary: string | null; derived: boolean; filename: string | null } => {
     const desc =
       colPrefs.showDesc && t.description?.trim()
         ? cleanDescription(t.description) || null
         : null;
-    if (t.title && t.title.trim().length > 0) {
-      return {
-        primary: t.title,
-        secondary: desc ?? (colPrefs.showDesc ? t.original_filename || null : null),
-        untitled: false,
-      };
+    const { primary, kind, filename } = meetingTitleOf(t);
+    return { primary, secondary: desc, derived: kind !== 'title', filename };
+  };
+
+  /** The ⋯ menu of an archive row — everything that used to be a hover icon. */
+  const rowMenuSections = (t: ListRow): RowMenuSection[] => {
+    const uploading = t.status === 'uploading';
+    const waiting = t.status === 'waiting';
+    const placeholder = uploading || t.assemblyai_id.startsWith('defer-');
+    const trashed = !!t.deleted_at;
+    const scratch = !!t.scratch && !trashed;
+    const items: RowMenuSection['items'] = [];
+    if (trashed) {
+      if (t.access === 'owner') {
+        items.push({
+          key: 'restore',
+          label: 'Restore',
+          icon: <RotateCcw />,
+          onSelect: () => handleRestoreTranscript(null, t.assemblyai_id),
+        });
+        items.push({
+          key: 'forever',
+          label: 'Delete forever',
+          icon: <Trash2 />,
+          danger: true,
+          onSelect: () => handleDeleteTranscript(null, t),
+        });
+      }
+      return [{ key: 'trash', items }];
     }
-    if (t.original_filename) {
-      return { primary: t.original_filename, secondary: desc, untitled: false };
+    if (!placeholder && !waiting && canEditRow(t) && !t.has_event) {
+      items.push({
+        key: 'link',
+        label: 'Link to a calendar event…',
+        hint: 'Title, date and attendees come from the invite; share suggestions light up',
+        icon: <Link2 />,
+        onSelect: () => setLinkRow(t),
+      });
     }
-    return { primary: 'Untitled meeting', secondary: desc, untitled: true };
+    if (!placeholder && !waiting && canEditRow(t)) {
+      items.push(
+        scratch
+          ? {
+              key: 'keep',
+              label: 'Keep',
+              hint: 'Make it permanent — moves it to the main list',
+              icon: <Archive />,
+              onSelect: () => handleSetScratch(null, t, false),
+            }
+          : {
+              key: 'temporary',
+              label: 'Move to temporary',
+              hint: 'Out of the main list; trashed automatically after 30 days',
+              icon: <Hourglass />,
+              onSelect: () => handleSetScratch(null, t, true),
+            }
+      );
+    }
+    if (t.status === 'error' && !t.assemblyai_id.startsWith('defer-')) {
+      items.push({
+        key: 'retry',
+        label: 'Retry transcription',
+        icon: <RotateCw />,
+        onSelect: () => handleRetryIngest(t),
+      });
+    }
+    if (t.access === 'owner' && !uploading) {
+      items.push({
+        key: 'trash',
+        label: waiting ? 'Cancel queued import' : 'Move to trash',
+        icon: <Trash2 />,
+        danger: true,
+        onSelect: () => handleDeleteTranscript(null, t),
+      });
+    }
+    return [{ key: 'row', items }];
   };
 
   const renderColCell = (key: ColKey, t: ListRow) => {
@@ -1874,6 +1880,7 @@ export function TranscriptTable({
           {tabButton('mine', 'Mine', counts?.mine)}
           {tabButton('shared', 'Shared', counts?.shared)}
           {tabButton('scratch', 'Temporary', counts?.scratch)}
+          {tabButton('recordings', 'Recordings', unlinked.count)}
           {tabButton('trash', 'Trash', counts?.trash)}
         </div>
       )}
@@ -1942,7 +1949,7 @@ export function TranscriptTable({
   /** One listing row — shared by the flat list, the day-grouped view, and
    * the merged timeline. */
   const renderRow = (t: ListRow) => {
-    const { primary, secondary, untitled } = titleOf(t);
+    const { primary, secondary, derived, filename } = titleOf(t);
     const processing = t.status === 'processing' || t.status === 'queued';
     // Placeholder rows have a synthetic `up-…` / `defer-…` id — there is no
     // detail page to open until the upload/deferred import finishes and the
@@ -1952,12 +1959,11 @@ export function TranscriptTable({
     const waiting = t.status === 'waiting';
     const placeholder = uploading || t.assemblyai_id.startsWith('defer-');
     const trashed = !!t.deleted_at;
-    // Temporary (migration 042): the hint + Keep / Move-to-temporary
-    // buttons only make sense on live, real rows an editor can act on.
+    // Temporary (migration 042): the pill only shows on live rows.
     const scratch = !!t.scratch && !trashed;
-    const scratchToggle = !placeholder && !waiting && !trashed && canEditRow(t);
     const selectable = !placeholder && !trashed;
     const isSelected = selected.has(t.assemblyai_id);
+    const strip = trashed ? null : rowStrip(t);
     return (
       <TableRow
         key={t.id}
@@ -2004,15 +2010,14 @@ export function TranscriptTable({
           {/* w-0 + min-w-full: zero min-content contribution, so long nowrap
               titles/series chips can't widen the table past its container. */}
           <div className="w-0 min-w-full">
-          <div className="flex min-w-0 items-center gap-2">
-            {statusDot(t.status)}
-            {sourceIcon(t)}
-            {calendarIcon(t)}
+          <div className="flex min-w-0 items-start gap-2">
+            <span className="mt-[3px] shrink-0">{rowGlyph(t)}</span>
             <div className="min-w-0 flex-1">
               <div className="flex min-w-0 items-center gap-2">
                 <div
+                  title={filename ?? undefined}
                   className={`min-w-0 truncate text-sm font-medium ${
-                    untitled ? 'italic text-muted-foreground' : ''
+                    derived ? 'text-foreground/70' : ''
                   } ${processing || uploading || waiting ? 'text-shimmer' : ''}`}
                 >
                   {primary}
@@ -2052,8 +2057,15 @@ export function TranscriptTable({
                     }
                   />
                 )}
-                {!uploading && !waiting && !trashed && recordingsChip(t)}
-                {!trashed && autoDot(t)}
+                {!trashed && t.auto_state === 'gated' && (
+                  <span
+                    className="inline-flex shrink-0 items-center gap-1 rounded-full border border-amber-400/50 bg-amber-50 px-1.5 py-px text-[10px] text-amber-800 dark:bg-amber-950/30 dark:text-amber-300"
+                    title="Auto-imported — the summary waits until someone confirms the speakers"
+                    data-review-speakers
+                  >
+                    Review speakers
+                  </span>
+                )}
                 {scratch && (
                   <span
                     className="inline-flex shrink-0 items-center gap-1 rounded-full border border-amber-400/50 bg-amber-50 px-1.5 py-px text-[10px] text-amber-800 dark:bg-amber-950/30 dark:text-amber-300"
@@ -2065,34 +2077,21 @@ export function TranscriptTable({
                 )}
               </div>
               {trashed ? (
-                <div className="truncate text-xs text-muted-foreground">
+                <div className="truncate text-[11px] text-muted-foreground">
                   deleted {new Date(t.deleted_at!).toLocaleString()} — restore, or delete
                   forever{t.scratch ? ' · was temporary' : ''}
                 </div>
-              ) : uploading ? (
-                <div className="truncate font-mono text-[11px] text-muted-foreground">
-                  {uploadProgressLine(t)}
-                </div>
-              ) : waiting ? (
-                <div className="truncate font-mono text-[11px] text-muted-foreground">
-                  {t.deferred_background
-                    ? 'importing in the background — pulling the recording and submitting for transcription'
-                    : `import queued — ${t.provider === 'teams' ? 'Microsoft' : 'Google'} is still preparing the ${
-                        t.deferred_mode === 'video'
-                          ? 'video file'
-                          : t.deferred_mode === 'both'
-                            ? 'video + transcript'
-                            : t.provider === 'teams'
-                              ? 'transcript'
-                              : 'transcript Doc'
-                      }; runs automatically (checked every minute)`}
-                </div>
-              ) : t.status === 'error' && t.deferred_error ? (
-                <div className="truncate text-xs text-destructive/80">{t.deferred_error}</div>
-              ) : processing ? (
-                <div className="truncate font-mono text-[11px] text-muted-foreground">
-                  transcribing… — open it to share or link the calendar event
-                </div>
+              ) : strip ? (
+                // The recording strip: state · segments · duration · the one
+                // action (docs/listing-ui-redesign.md §4). Silent when there is
+                // nothing a plain meeting would not have.
+                <RecordingStrip
+                  model={strip}
+                  noGlyph
+                  disabled={blocked}
+                  disabledTitle={OFFLINE_TITLE}
+                  onAction={(kind) => (kind === 'retry' ? handleRetryIngest(t) : undefined)}
+                />
               ) : (() => {
                 // Server-side search matches ride on the row itself in v2.
                 const matchedIn = debouncedQ ? t.matched_in : undefined;
@@ -2109,6 +2108,16 @@ export function TranscriptTable({
                     </div>
                   );
                 }
+                // A filename hit is the one time the filename may show — it
+                // is what the person typed.
+                if (matchedIn === 'filename' && filename) {
+                  return (
+                    <div className="truncate text-xs text-muted-foreground">
+                      {filename}{' '}
+                      <span className="text-[10px] uppercase tracking-wide">in filename</span>
+                    </div>
+                  );
+                }
                 return secondary ? (
                   <div className="truncate text-xs text-muted-foreground">
                     {secondary}
@@ -2116,14 +2125,6 @@ export function TranscriptTable({
                 ) : null;
               })()}
             </div>
-            {t.status === 'error' && (
-              <Badge
-                variant="outline"
-                className="shrink-0 border-destructive/40 text-[10px] text-destructive"
-              >
-                Failed
-              </Badge>
-            )}
           </div>
           </div>
         </TableCell>
@@ -2146,36 +2147,13 @@ export function TranscriptTable({
                 <RotateCcw className="h-3.5 w-3.5" />
               </Button>
             )}
-            {scratchToggle && (
-              <Button
-                size="sm"
-                variant="ghost"
-                className="h-7 w-7 p-0 text-muted-foreground opacity-0 transition-opacity hover:text-foreground group-hover:opacity-100"
-                onClick={(e) => handleSetScratch(e, t, !scratch)}
-                disabled={blocked}
-                title={
-                  blocked
-                    ? OFFLINE_TITLE
-                    : scratch
-                      ? 'Keep — make this transcript permanent (moves it to the main list)'
-                      : 'Move to temporary — out of the main list, trashed automatically after 30 days'
-                }
-              >
-                {scratch ? <Archive className="h-3.5 w-3.5" /> : <Hourglass className="h-3.5 w-3.5" />}
-              </Button>
-            )}
-            {t.access === 'owner' && !uploading && (
-              <Button
-                size="sm"
-                variant="ghost"
-                className="h-7 w-7 p-0 text-muted-foreground opacity-0 transition-opacity hover:text-destructive group-hover:opacity-100"
-                onClick={(e) => handleDeleteTranscript(e, t)}
-                disabled={blocked}
-                title={blocked ? OFFLINE_TITLE : trashed ? 'Delete forever' : waiting ? 'Cancel queued import' : 'Move to trash'}
-              >
-                <Trash2 className="h-3.5 w-3.5" />
-              </Button>
-            )}
+            <RowMenu
+              ariaLabel="Meeting actions"
+              disabled={blocked}
+              disabledTitle={OFFLINE_TITLE}
+              sections={rowMenuSections(t)}
+              dataAttr="row"
+            />
             <span className="grid h-7 w-7 place-items-center">
               <ChevronRight className="h-4 w-4 text-muted-foreground opacity-0 transition-opacity group-hover:opacity-100" />
             </span>
@@ -2187,15 +2165,28 @@ export function TranscriptTable({
 
   // Day groups with pre-computed headings (server guarantees day ordering —
   // pages append whole days, never splitting one across pages).
+  // Bare recordings (no calendar event, no human title — lib/meeting-title)
+  // live in the Recordings tab, not in the meetings timeline. A search still
+  // surfaces them: a filename search must find its file.
+  const hideBare = !debouncedQ && (tab === 'all' || tab === 'mine' || tab === 'shared');
+  const visibleRows = useCallback(
+    (rows: ListRow[]) => (hideBare ? rows.filter((r) => !isBareRecording(r)) : rows),
+    [hideBare]
+  );
   const archiveGroups = useMemo(
     () =>
-      days.map((g) => {
-        const { label, sub } = dayHeading(parseDayKey(g.key));
-        return { ...g, heading: label, sub };
-      }),
-    [days]
+      days
+        .map((g) => {
+          const all = g.rows as ListRow[];
+          const rows = visibleRows(all);
+          const dropped = rows.length === all.length ? 0 : all.filter((r) => !rows.includes(r)).reduce((n, r) => n + (r.duration ?? 0), 0);
+          const { label, sub } = dayHeading(parseDayKey(g.key));
+          return { ...g, rows, totalSecs: Math.max(0, (g.totalSecs ?? 0) - dropped), heading: label, sub };
+        })
+        .filter((g) => g.rows.length > 0),
+    [days, visibleRows]
   );
-  const flatRows = useMemo(() => days.flatMap((g) => g.rows as ListRow[]), [days]);
+  const flatRows = useMemo(() => days.flatMap((g) => visibleRows(g.rows as ListRow[])), [days, visibleRows]);
 
   /**
    * The merged timeline: interleave archive rows and calendar events inside
@@ -2239,8 +2230,8 @@ export function TranscriptTable({
       for (const g of days) {
         if (!covered(g.key)) continue;
         const b = bucket(g.key);
-        b.totalSecs += g.totalSecs ?? 0;
-        for (const r of g.rows as ListRow[]) {
+        for (const r of visibleRows(g.rows as ListRow[])) {
+          b.totalSecs += r.duration ?? 0;
           b.items.push({
             at: new Date(r.recorded_at ?? r.created_at).getTime(),
             kind: 'archive',
@@ -2267,7 +2258,7 @@ export function TranscriptTable({
         const { label, sub } = dayHeading(parseDayKey(key));
         return { key, heading: label, sub, items: g.items, totalSecs: g.totalSecs };
       });
-  }, [renderMerged, layers, calSrc, days, hasMore, nextCursor]);
+  }, [renderMerged, layers, calSrc, days, hasMore, nextCursor, visibleRows]);
 
   const rowCount = flatRows.length;
   const searchEmpty = rowCount === 0 && debouncedQ.length > 0;
@@ -2587,12 +2578,48 @@ archiveErrorPanel
           </div>
         </div>
       )}
-      {renderMerged ? mergedBody : archiveBody}
-      {showSentinel && <div ref={sentinelRef} className="h-1" aria-hidden />}
+      {tab !== 'recordings' && hideBare && unlinked.count > 0 && (
+        <button
+          type="button"
+          onClick={() => setTab('recordings')}
+          data-unlinked-banner
+          className="mb-3 flex w-full items-center gap-2 rounded-lg border border-dashed px-3 py-2 text-left text-xs text-muted-foreground transition-colors hover:bg-muted/50"
+        >
+          <Laptop className="h-3.5 w-3.5 shrink-0" />
+          <span className="min-w-0 flex-1 truncate">
+            {unlinked.count} recording{unlinked.count === 1 ? ' isn’t' : 's aren’t'} linked to a meeting yet
+          </span>
+          <span className="shrink-0 font-medium text-primary">Recordings ›</span>
+        </button>
+      )}
+      {tab === 'recordings' ? (
+        container(
+          <div className="p-4">
+            <RecordingsSurface data={unlinked} disabled={blocked} onChanged={silentRefetchAll} />
+          </div>
+        )
+      ) : renderMerged ? (
+        mergedBody
+      ) : (
+        archiveBody
+      )}
+      {tab !== 'recordings' && showSentinel && <div ref={sentinelRef} className="h-1" aria-hidden />}
       {showLoadingMore && (
         <div className="flex items-center justify-center py-3 text-muted-foreground">
           <RefreshCw className="h-4 w-4 animate-spin" />
         </div>
+      )}
+      {linkRow && (
+        <LinkEventDialog
+          open
+          transcriptId={linkRow.assemblyai_id}
+          initialDateIso={linkRow.recorded_at ?? linkRow.created_at}
+          onClose={() => setLinkRow(null)}
+          onLinked={() => {
+            setLinkRow(null);
+            silentRefetchAll();
+          }}
+        />
       )}
       <SeriesDialog
         seriesId={openSeriesId}
