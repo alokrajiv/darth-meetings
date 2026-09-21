@@ -2418,8 +2418,9 @@ function TranscriptDetailInner({ transcriptId }: { transcriptId: string }) {
         )}
         {/* Offline pin state (renders nothing when the meeting is not saved). */}
         <OfflinePinStatus id={row.assemblyai_id} />
-        {/* Raw / Edited toggle */}
-        <div className="inline-flex rounded-md bg-muted p-0.5">
+        {/* Raw / Edited toggle — hidden on phones (Edited is the reading view;
+            the header has no room for it at 390 px). */}
+        <div className="hidden rounded-md bg-muted p-0.5 sm:inline-flex">
           <button
             type="button"
             onClick={() => setViewMode('raw')}

@@ -32,7 +32,7 @@ export function AppHeader({ children, breadcrumb }: AppHeaderProps) {
           <span className="grid h-7 w-7 place-items-center rounded-md bg-primary text-primary-foreground">
             <AudioLines className="h-4 w-4" />
           </span>
-          <span className="text-sm font-semibold tracking-tight">Darth Meetings</span>
+          <span className="hidden text-sm font-semibold tracking-tight sm:inline">Darth Meetings</span>
         </Link>
         {!breadcrumb && (
           <nav className="flex items-center gap-1 text-sm">
@@ -67,11 +67,13 @@ export function AppHeader({ children, breadcrumb }: AppHeaderProps) {
         )}
         {breadcrumb && (
           <nav className="flex min-w-0 items-center gap-1 text-sm text-muted-foreground">
-            <ChevronRight className="h-3.5 w-3.5 shrink-0" />
-            <Link href="/" className="shrink-0 hover:text-foreground">
+            {/* Phone: the wordmark and "Archive ›" go; the title stays. The
+                right-hand cluster is the width budget at 390 px (2026-09-21). */}
+            <ChevronRight className="hidden h-3.5 w-3.5 shrink-0 sm:block" />
+            <Link href="/" className="hidden shrink-0 hover:text-foreground sm:inline">
               Archive
             </Link>
-            <ChevronRight className="h-3.5 w-3.5 shrink-0" />
+            <ChevronRight className="hidden h-3.5 w-3.5 shrink-0 sm:block" />
             <span className="max-w-[280px] truncate font-medium text-foreground">
               {breadcrumb.title}
             </span>
@@ -81,7 +83,9 @@ export function AppHeader({ children, breadcrumb }: AppHeaderProps) {
           {children}
           <OfflineChip />
           <RecorderChip />
-          <ThemeToggle />
+          <span className="hidden sm:inline-flex">
+            <ThemeToggle />
+          </span>
         </div>
       </div>
     </header>
