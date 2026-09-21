@@ -164,7 +164,7 @@ export function RowMenu({
           role="menu"
           onClick={(e) => e.stopPropagation()}
           style={{ position: 'fixed', top: pos.top, left: pos.left, width }}
-          className="z-50 rounded-lg border bg-popover p-1 text-popover-foreground shadow-[0_4px_16px_-2px_rgb(0_0_0/0.12),0_1px_2px_0_rgb(0_0_0/0.04)]"
+          className="z-50 overflow-hidden whitespace-normal rounded-lg border bg-popover p-1 text-popover-foreground shadow-[0_4px_16px_-2px_rgb(0_0_0/0.12),0_1px_2px_0_rgb(0_0_0/0.04)]"
         >
           {header && <div className="px-2 pb-1.5 pt-1 text-xs">{header}</div>}
           {sections.map((s, si) => (
@@ -200,7 +200,7 @@ export function RowMenu({
                   <span className="min-w-0 flex-1">
                     <span className="block truncate">{it.label}</span>
                     {it.hint && (
-                      <span className="block text-[11px] leading-snug text-muted-foreground">{it.hint}</span>
+                      <span className="block whitespace-normal break-words text-[11px] leading-snug text-muted-foreground">{it.hint}</span>
                     )}
                   </span>
                 </button>
