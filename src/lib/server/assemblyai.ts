@@ -1,7 +1,12 @@
 import 'server-only';
 import { AssemblyAI } from 'assemblyai';
 import type { TranscriptResponse } from '@/lib/format';
-import { DEFAULT_SPEECH_MODEL, keytermsSupported, type SpeechModel } from '@/lib/aai-language';
+import {
+  DEFAULT_SPEECH_MODEL,
+  keytermsSupported,
+  speechModelsRequest,
+  type SpeechModel,
+} from '@/lib/aai-language';
 
 /**
  * Server-only AssemblyAI wrapper.
@@ -60,9 +65,10 @@ export async function submitTranscription(
     speaker_labels: boolean;
     /** Legacy singular field — only for 'universal'. */
     speech_model?: 'universal';
-    /** Current plural field (3.5 Pro and later); AAI falls back to
-     * Universal-2 by itself for languages the model doesn't cover. */
-    speech_models?: SpeechModel[];
+    /** Current plural field (3.5 Pro and later): a preference order AAI
+     * walks down when the detected language isn't covered by the primary.
+     * We always name the fallback (see speechModelsRequest). */
+    speech_models?: string[];
     language_code?: string;
     language_detection?: boolean;
     keyterms_prompt?: string[];
@@ -75,7 +81,14 @@ export async function submitTranscription(
     // finds more speakers and keeps English phrases universal dropped, but
     // splits some English words inside Mandarin ("em ail") — acceptable
     // because the text is mostly LLM-consumed; text search is the casualty.
-    ...(model === 'universal' ? { speech_model: 'universal' as const } : { speech_models: [model] }),
+    // 2026-09-21: the plural field carries the Universal-2 fallback too, so
+    // a language 3.5 Pro doesn't cover (Indonesian) downgrades on our
+    // instruction rather than silently. The row still records the PRIMARY as
+    // `speech_model` = what we asked for; what actually ran comes back as
+    // `speech_model_used` and is read by lib/aai-outcome.ts.
+    ...(model === 'universal'
+      ? { speech_model: 'universal' as const }
+      : { speech_models: speechModelsRequest(model) }),
   };
   if (options.languageCode) params.language_code = options.languageCode;
   // No language chosen ("Auto Detect" in the picker, and every import) →

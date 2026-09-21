@@ -750,7 +750,27 @@ export interface TranscriptResponse {
   audio_start_from?: number;
   audio_end_at?: number;
   language_code?: string;
+  /** Mean per-word ASR confidence. Below ~0.8 the text is unreliable — on
+   * the 5 forced-Indonesian rows it averages 0.61 vs 0.94 for English. */
   confidence?: number;
+  // --- What AAI actually did with the job (read by lib/aai-outcome.ts).
+  // These are echoed/added by AssemblyAI on every Universal response; older
+  // cached payloads predate them, so everything here is optional.
+  /** Echo of our request: true when we let AAI detect the language. */
+  language_detection?: boolean;
+  /** Detector's confidence in `language_code` (only with detection on). */
+  language_confidence?: number;
+  /** Echo of the legacy singular request field ('universal'). */
+  speech_model?: string | null;
+  /** Echo of the plural request field — our preference order. */
+  speech_models?: string[] | null;
+  /** The model that actually ran. Differs from what we asked for when AAI
+   * falls back (Universal-3.5 Pro → Universal-2 for e.g. Indonesian). */
+  speech_model_used?: string | null;
+  /** Echo of the attendee-name bias list we sent. */
+  keyterms_prompt?: string[] | null;
+  /** AAI's own notes about the job — dropped keyterms, model fallback. */
+  metadata?: { warnings?: Array<{ message?: string }> | null } | null;
   words?: Array<{
     text: string;
     start: number;

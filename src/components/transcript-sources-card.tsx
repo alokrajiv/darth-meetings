@@ -1,6 +1,6 @@
 'use client';
 
-import { useState } from 'react';
+import { useState, type ReactNode } from 'react';
 import { Button } from '@/components/ui/button';
 import type { SpeakerSuggestionMap, StoredTranscript } from '@/lib/format';
 import {
@@ -9,8 +9,17 @@ import {
   speechModelLabel,
 } from '@/lib/aai-language';
 import {
+  aaiOutcome,
+  aaiOutcomeNote,
+  aaiOutcomeSentence,
+  languageLabel,
+  pctLabel,
+} from '@/lib/aai-outcome';
+import {
   AudioWaveform,
   CheckCircle2,
+  ChevronDown,
+  ChevronUp,
   FileText,
   Fingerprint,
   Loader2,
@@ -256,6 +265,16 @@ export function TranscriptSourcesCard({
 
   const pct = (c: number) => `${Math.round(c * 100)}%`;
 
+  // --- What AssemblyAI actually did (lib/aai-outcome.ts). Until 2026-09-21
+  // this card printed the model we ASKED for, which was plainly false on the
+  // rows AAI downgraded to Universal-2. One plain sentence for everyone, a
+  // calm amber line when the outcome affects how the text should be read,
+  // and the raw facts behind a disclosure for whoever wants them.
+  const outcome = aaiOutcome(row);
+  const outcomeSentence = isAaiRow ? aaiOutcomeSentence(outcome) : null;
+  const outcomeNote = isAaiRow ? aaiOutcomeNote(outcome) : null;
+  const [advancedOpen, setAdvancedOpen] = useState(false);
+
   return (
     <div className="rounded-lg border bg-card p-3">
       <div className="text-[11px] font-semibold uppercase tracking-wider text-muted-foreground">
@@ -463,10 +482,9 @@ export function TranscriptSourcesCard({
             : `Transcribe all ${partsStored + 1} videos together`}
         </Button>
       )}
-      {isAaiRow && (
+      {isAaiRow && outcomeSentence && (
         <p className="mt-2 text-[11px] leading-snug text-muted-foreground">
-          Transcribed with AssemblyAI {speechModelLabel(rowModel)}
-          {onOlderModel ? ' (older model)' : ''}.
+          {outcomeSentence}
           {upgradedTo && (
             <>
               {' '}
@@ -480,6 +498,82 @@ export function TranscriptSourcesCard({
           )}
         </p>
       )}
+      {outcomeNote && (
+        <p className="mt-1.5 rounded-md border border-amber-400/50 bg-amber-50 px-2 py-1.5 text-[11px] leading-snug text-amber-900 dark:bg-amber-950/30 dark:text-amber-200">
+          {outcomeNote}
+        </p>
+      )}
+      {isAaiRow && outcomeSentence && (
+        <>
+          <button
+            type="button"
+            onClick={() => setAdvancedOpen((v) => !v)}
+            aria-expanded={advancedOpen}
+            className="mt-1.5 flex items-center gap-1 text-[11px] text-muted-foreground hover:text-foreground"
+          >
+            Advanced details
+            {advancedOpen ? (
+              <ChevronUp className="h-3 w-3" />
+            ) : (
+              <ChevronDown className="h-3 w-3" />
+            )}
+          </button>
+          {advancedOpen && (
+            <div className="mt-1 space-y-0.5 rounded-md border bg-muted/30 px-2 py-1.5 text-[11px] leading-snug">
+              <AdvancedRow label="Model asked for">
+                {outcome.requested ? speechModelLabel(outcome.requested) : 'not recorded'}
+              </AdvancedRow>
+              <AdvancedRow label="Model that ran">
+                {outcome.used ? speechModelLabel(outcome.used) : 'not recorded'}
+                {outcome.downgraded ? ' — AssemblyAI fell back' : ''}
+              </AdvancedRow>
+              <AdvancedRow label="Language">
+                {outcome.languageCode
+                  ? `${languageLabel(outcome.languageCode)} (${outcome.languageCode})`
+                  : 'not recorded'}
+                {outcome.languageDetected
+                  ? ` · detected by AssemblyAI${
+                      outcome.languageConfidence !== null
+                        ? `, ${pctLabel(outcome.languageConfidence)} confident`
+                        : ''
+                    }`
+                  : ' · set by us, no detection'}
+              </AdvancedRow>
+              <AdvancedRow label="Transcript confidence">
+                {outcome.asrConfidence !== null
+                  ? pctLabel(outcome.asrConfidence)
+                  : 'not recorded'}
+              </AdvancedRow>
+              <AdvancedRow label="Attendee-name hints">
+                {outcome.keytermsSent > 0
+                  ? `${outcome.keytermsSent} sent${
+                      outcome.keytermsDropped ? ', not applied by AssemblyAI' : ''
+                    }`
+                  : 'none sent'}
+              </AdvancedRow>
+              {outcome.warnings.length > 0 && (
+                <AdvancedRow label="AssemblyAI warnings">
+                  <span className="space-y-0.5">
+                    {outcome.warnings.map((w, i) => (
+                      <span key={i} className="block break-words">
+                        {w}
+                      </span>
+                    ))}
+                  </span>
+                </AdvancedRow>
+              )}
+              <AdvancedRow label="Job id">
+                <span className="break-all font-mono">{outcome.jobId ?? '—'}</span>
+              </AdvancedRow>
+              {outcome.noteworthy && (
+                <p className="pt-1 text-muted-foreground">
+                  why: docs/eval-aai-code-switching-2026-09-21.md
+                </p>
+              )}
+            </div>
+          )}
+        </>
+      )}
       {canUpgradeModel && !upgradedTo && (
         <Button
           variant="outline"
@@ -487,7 +581,15 @@ export function TranscriptSourcesCard({
           className="mt-2 h-8 w-full justify-start gap-2 text-[13px]"
           disabled={disabled || upgrading}
           onClick={() => void upgradeModel()}
-          title={disabled ? 'Not available offline' : `Run this meeting's stored audio through AssemblyAI ${speechModelLabel(DEFAULT_SPEECH_MODEL)} — a new transcript is created alongside this one`}
+          title={
+            disabled
+              ? 'Not available offline'
+              : outcome.downgraded
+                ? // AAI already fell back once for this language — asking for
+                  // the newer model again lands on exactly the same one.
+                  `AssemblyAI does not support ${languageLabel(outcome.languageCode) ?? 'this language'} on ${speechModelLabel(DEFAULT_SPEECH_MODEL)}, so a re-run would produce the same result — see Advanced details`
+                : `Run this meeting's stored audio through AssemblyAI ${speechModelLabel(DEFAULT_SPEECH_MODEL)} — a new transcript is created alongside this one`
+          }
         >
           {upgrading ? (
             <Loader2 className="h-4 w-4 animate-spin text-muted-foreground" />
@@ -511,6 +613,16 @@ export function TranscriptSourcesCard({
       <p className="mt-2 text-[10px] leading-snug text-muted-foreground">
         Summaries and name guesses automatically use everything listed here.
       </p>
+    </div>
+  );
+}
+
+/** Label/value row inside the Advanced details disclosure. */
+function AdvancedRow({ label, children }: { label: string; children: ReactNode }) {
+  return (
+    <div className="flex gap-2">
+      <span className="w-28 shrink-0 text-muted-foreground">{label}</span>
+      <span className="min-w-0 flex-1 break-words">{children}</span>
     </div>
   );
 }

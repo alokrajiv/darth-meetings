@@ -1,6 +1,7 @@
 import 'server-only';
 import { getTranscript } from '@/lib/server/assemblyai';
 import {
+  setCachedContentForUser,
   updateStatusForUser,
   type TranscriptRow,
 } from '@/db-ops/transcripts';
@@ -44,6 +45,16 @@ export async function refreshIfPending(
     // voiceprint speaker suggestions (fire-and-forget).
     if (aai.status === 'completed') {
       onTranscriptCompleted(userId, row.assemblyai_id);
+      // Freeze the payload now rather than on the first content fetch. AAI
+      // content is immutable once completed, and the payload is the only
+      // record of what AAI actually DID — which model ran, which language it
+      // chose, which warnings it raised (lib/aai-outcome.ts). Caching it here
+      // means the Sources card can tell the truth on the very first page
+      // load instead of one refresh later.
+      await setCachedContentForUser(userId, row.assemblyai_id, aai).catch((err) =>
+        console.warn('[transcript-sync] caching the AAI payload failed:', err)
+      );
+      if (updated) return { ...updated, imported_content: aai };
     }
 
     return updated ?? row;
