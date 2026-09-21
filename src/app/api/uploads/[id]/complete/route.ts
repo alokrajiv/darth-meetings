@@ -7,7 +7,7 @@ import {
   setUploadSessionStatus,
 } from '@/db-ops/upload-sessions';
 import { audioFileSize } from '@/lib/server/audio-storage';
-import { abandonUpload, finalizeUpload } from '@/lib/server/upload-pipeline';
+import { abandonUpload, finalizeUpload, groupProgressAdder } from '@/lib/server/upload-pipeline';
 import { updateUploadProgress } from '@/db-ops/transcripts';
 import { pullBlobToTemp, uploadsStore } from '@/lib/server/darth-uploads-store';
 
@@ -96,7 +96,10 @@ export const POST = withAuth(async ({ user, request }, { params }) => {
       );
     }
     // Pull. Progress writes keep the listing moving and the placeholder's
-    // heartbeat alive (the stale-upload sweeper keys on it).
+    // heartbeat alive (the stale-upload sweeper keys on it). One part of a
+    // multi-file group reports the WHOLE recording's bytes (P2) — the group
+    // row is read once, here, before the bytes start moving.
+    const groupRelative = await groupProgressAdder(user.userId, session.spec);
     let lastFlush = 0;
     const t0 = Date.now();
     const pulled = await pullBlobToTemp(store, {
@@ -108,7 +111,11 @@ export const POST = withAuth(async ({ user, request }, { params }) => {
         const now = Date.now();
         if (now - lastFlush < 1500) return;
         lastFlush = now;
-        void updateUploadProgress(user.userId, session.placeholder_id, bytes).catch(() => {});
+        void updateUploadProgress(
+          user.userId,
+          session.placeholder_id,
+          groupRelative(bytes)
+        ).catch(() => {});
       },
     });
     if (!pulled.ok) {

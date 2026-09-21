@@ -104,3 +104,38 @@ Unset on a laptop → the chunk path for every size, as before.
 - **Darth Recorder tray** (one-shot too — the client that actually 408'd).
   Both should move to `POST /api/uploads` with `via: 'blob'`; the server side
   is ready (the hash is a one-liner in Node and Swift).
+
+## As built 2026-09-21 — one meeting, one row, and honest progress
+
+Server half of `docs/recorder-upload-ux.md` (§1 P1/P2, §2.1–2.3). Nothing here
+is Recorder-only: every client of `POST /api/uploads` gets it.
+
+- **Auto-link at open (P1).** `recorderRecordingId` with no `linkedEvent` /
+  `eventRef`: the route reads the caller's own registry row and, when
+  `recorderMatchIsConfident(matched)` (`event_key` present, `score ≥ 0.6`,
+  `overlap ≥ 0.5` — the ONE threshold, `src/lib/server/upload-pipeline.ts`),
+  resolves it with `resolveLinkedEventRef` and opens the placeholder linked:
+  title, date, attendees, auto-share, and the calendar row folds from the
+  first byte. Logged `[uploads] auto-linked <id> → <event_key> (score …,
+  overlap …)`. A resolver failure warns and continues unlinked — never a 4xx.
+  Only part 1 of a group asks (later parts land on its row).
+- **`multi.groupBytes`** (optional, integer, ≥ this part's size): the whole
+  recording's size, declared once. Stored as `uploadGroup.bytesTotal` and as
+  the group row's `upload_bytes_total`. Present-but-invalid is a 400.
+- **`gmeet_context.recorder = { recordingId }`** is stamped on the placeholder
+  at open whenever `recorderRecordingId` was given.
+- **Group-relative progress (P2).** Every `upload_bytes_received` write for a
+  group session is Σ bytes of the parts already landed + the part in flight
+  (`groupBytesBefore` / `groupProgressBytes`, `groupProgressAdder` for the
+  byte-delivery routes): chunk PUT, the blob pull's `onProgress`, and the
+  part-landed write in `finalizeUpload`. Once every part has landed the value
+  IS the declared total, so the row flips to "upload received — handing
+  off…". Older clients (no `groupBytes`) keep whatever total they had.
+  A part's own byte count is stamped on `uploadGroup.parts[i].bytes`
+  atomically (`setUploadPartBytesForUser` — parts finalize in parallel).
+  Single-file uploads are byte-for-byte unchanged.
+- **Listing v2 only** (`?v=2`; the legacy shape stays byte-compatible for
+  darth-cli): `upload_parts_done`, `upload_parts_total`,
+  `recorder_recording_id`, straight off `gmeet_context` inside the
+  materialized base CTE.
+- Tests: `src/lib/server/__tests__/upload-group-progress.test.ts`.

@@ -24,6 +24,7 @@ import {
   type TranscriptListV2Response,
 } from '@/lib/format';
 import { useLiveEvents } from '@/hooks/use-live-events';
+import { uploadProgressCopy, useCompanion } from '@/lib/companion/companion-client';
 import {
   Archive,
   RotateCcw,
@@ -398,6 +399,10 @@ export function TranscriptTable({
   // "You're offline" panel with a "Go offline" shortcut to the archive.
   const { blocked } = useOfflineGate();
   const blockedRef = useRef(blocked);
+  // Darth Recorder on this Mac: while it is pushing a recording up, its socket
+  // knows the real byte counts long before the server does (the server only
+  // learns them at `complete`), so an uploading row borrows them.
+  const companion = useCompanion();
   blockedRef.current = blocked;
   const { enterOffline } = useOffline();
   const [tab, setTab] = useState<TabKey>('all');
@@ -1377,7 +1382,11 @@ export function TranscriptTable({
   const recordingsChip = (t: ListRow) =>
     (t.recording_count ?? 1) > 1 ? (
       <span
-        title={`${t.recording_count} recordings in this meeting`}
+        title={
+          t.recorder_recording_id
+            ? `${t.recording_count} segments of one recording (the recorder rolls a new segment on every screen-share change)`
+            : `${t.recording_count} recordings in this meeting`
+        }
         className="inline-flex shrink-0 items-center gap-0.5 rounded border px-1 text-[10px] text-muted-foreground"
       >
         <Film className="h-3 w-3" />
@@ -1422,18 +1431,24 @@ export function TranscriptTable({
   };
 
   /** Live progress line for rows mid-upload: server-persisted byte counts,
-   * refreshed by the SSE 'status' events the upload route publishes. */
+   * refreshed by the SSE 'status' events the upload route publishes — plus the
+   * companion socket's live numbers when these bytes are coming off this Mac's
+   * Darth Recorder (docs/recorder-upload-ux.md §4). */
   const uploadProgressLine = (t: ListRow): string => {
-    const received = Number(t.upload_bytes_received ?? 0);
-    const total = Number(t.upload_bytes_total ?? 0);
-    if (total > 0 && received >= total) {
-      return 'upload received — handing off to transcription…';
-    }
-    if (total > 0) {
-      const pct = Math.min(99, Math.floor((received / total) * 100));
-      return `uploading — ${pct}% · ${formatBytes(received)} of ${formatBytes(total)}`;
-    }
-    return received > 0 ? `uploading — ${formatBytes(received)} so far` : 'uploading…';
+    const recorderId = t.recorder_recording_id ?? null;
+    const live = recorderId ? companion.uploads[recorderId] : undefined;
+    return uploadProgressCopy({
+      received: t.upload_bytes_received,
+      total: t.upload_bytes_total,
+      partsDone: t.upload_parts_done,
+      partsTotal: t.upload_parts_total,
+      fromRecorder: !!recorderId,
+      live:
+        live && live.status === 'uploading'
+          ? { pct: live.pct, bytesSent: live.bytesSent, bytesTotal: live.bytesTotal }
+          : null,
+      fmt: formatBytes,
+    });
   };
 
   const titleOf = (

@@ -26,6 +26,33 @@ import RecorderCore
 /// group = the recording id, index/total), exactly like the web multi-file upload, so the
 /// server stitches them into a single transcript. `recorderRecordingId` links the transcript
 /// back to `recorder_recordings` at finalise.
+/// One progress tick about the WHOLE recording (0.3.9), never about one session: a
+/// 6-segment recording declares its 696 MB once and every tick says how many of those bytes
+/// are up. `segment` is the part in flight (1-based). P2 in docs/recorder-upload-ux.md.
+struct UploadProgress {
+    let id: String
+    let segment: Int
+    let segmentsTotal: Int
+    let bytesSent: Int
+    let bytesTotal: Int
+    var pct: Double { bytesTotal > 0 ? min(100, Double(bytesSent) / Double(bytesTotal) * 100) : 0 }
+}
+
+/// At most one progress callback per `minGap` per recording. Block PUTs ack from several
+/// threads at once, so this is locked.
+final class ProgressThrottle {
+    private let lock = NSLock()
+    private var last = Date.distantPast
+    /// The first tick and every `force`d one (a file just finished) always pass.
+    func allow(force: Bool, minGap: TimeInterval = 0.5) -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        let now = Date()
+        guard force || now.timeIntervalSince(last) >= minGap else { return false }
+        last = now
+        return true
+    }
+}
+
 final class Uploader: NSObject, URLSessionTaskDelegate {
     private let api: ApiClient
     private lazy var session: URLSession = {
@@ -41,8 +68,8 @@ final class Uploader: NSObject, URLSessionTaskDelegate {
     private(set) var active = Set<String>()
 
     /// Main queue callbacks.
-    var onProgress: ((String, Int, Double) -> Void)?           // id, segment, pct 0…100
-    var onDone: ((String, String) -> Void)?                    // id, transcript id
+    var onProgress: ((UploadProgress) -> Void)?                // ≤ 2 a second per recording
+    var onDone: ((String, String, Int, Int) -> Void)?          // id, transcript id, bytes, seconds
     var onFailed: ((String, String) -> Void)?                  // id, error
 
     static let blockTimeout: TimeInterval = 180
@@ -92,32 +119,40 @@ final class Uploader: NSObject, URLSessionTaskDelegate {
         api.syncRecording(id)
         EventLog.shared.log("upload_started", ["recording_id": id, "files": files.count, "bytes": total],
                             summary: "upload: \(id) — \(files.count) file(s), \(total) bytes")
+        let startedAt = Date()
 
         DispatchQueue.global(qos: .utility).async {
             var sentBefore = 0
             var transcriptId: String?
             let group = files.count > 1 ? id.lowercased() : nil
+            let throttle = ProgressThrottle()
             for (i, file) in files.enumerated() {
                 let result = self.putOne(file: file, size: sizes[i], recordingId: id, linkedEvent: linkedEvent,
-                                         group: group, index: i + 1, total: files.count) { sent in
-                    let pct = Double(sentBefore + Int(sent)) / Double(total) * 100
-                    DispatchQueue.main.async { self.onProgress?(id, i + 1, min(99.9, pct)) }
+                                         group: group, index: i + 1, total: files.count, groupBytes: total) { sent in
+                    // The web's socket comment promises ≤ 2 upload_progress a second (the 0.2.x
+                    // tray sent ~40 in 3 s); the tick that finishes a file always goes through.
+                    guard throttle.allow(force: Int(sent) >= sizes[i]) else { return }
+                    let p = UploadProgress(id: id, segment: i + 1, segmentsTotal: files.count,
+                                           bytesSent: min(total, sentBefore + Int(sent)), bytesTotal: total)
+                    DispatchQueue.main.async { self.onProgress?(p) }
                 }
                 switch result {
                 case .failure(let msg):
-                    DispatchQueue.main.async { self.finish(id, error: msg) }
+                    DispatchQueue.main.async { self.finish(id, error: msg, bytes: total, started: startedAt) }
                     return
                 case .success(let tid):
                     transcriptId = tid ?? transcriptId
                     sentBefore += sizes[i]
                 }
             }
-            DispatchQueue.main.async { self.finish(id, transcriptId: transcriptId) }
+            DispatchQueue.main.async { self.finish(id, transcriptId: transcriptId, bytes: total, started: startedAt) }
         }
     }
 
-    private func finish(_ id: String, transcriptId: String? = nil, error: String? = nil) {
+    private func finish(_ id: String, transcriptId: String? = nil, error: String? = nil,
+                        bytes: Int = 0, started: Date? = nil) {
         lock.lock(); active.remove(id); lock.unlock()
+        let seconds = started.map { max(0, Int(Date().timeIntervalSince($0).rounded())) } ?? 0
         if let error {
             Registry.shared.update(id, ["status": "upload_failed", "error": error])
             api.syncRecording(id)
@@ -126,9 +161,10 @@ final class Uploader: NSObject, URLSessionTaskDelegate {
         } else {
             Registry.shared.update(id, ["status": "uploaded", "transcript_id": transcriptId ?? NSNull(), "error": NSNull()])
             api.syncRecording(id)
-            EventLog.shared.log("upload_done", ["recording_id": id, "transcript_id": transcriptId ?? ""],
-                                summary: "upload: \(id) → transcript \(transcriptId ?? "?")")
-            onDone?(id, transcriptId ?? "")
+            EventLog.shared.log("upload_done", ["recording_id": id, "transcript_id": transcriptId ?? "",
+                                                "bytes": bytes, "seconds": seconds],
+                                summary: "upload: \(id) → transcript \(transcriptId ?? "?") — \(bytes) bytes in \(seconds) s")
+            onDone?(id, transcriptId ?? "", bytes, seconds)
         }
     }
 
@@ -174,7 +210,7 @@ final class Uploader: NSObject, URLSessionTaskDelegate {
 
     /// Synchronous (runs on a utility queue): one file through a resumable session.
     private func putOne(file: URL, size: Int, recordingId: String, linkedEvent: [String: Any]?,
-                        group: String?, index: Int, total: Int,
+                        group: String?, index: Int, total: Int, groupBytes: Int,
                         progress: @escaping (Int64) -> Void) -> PutResult {
         let t0 = Date()
         guard let sha256 = Self.sha256(of: file) else { return .failure("could not read \(file.lastPathComponent)") }
@@ -194,7 +230,9 @@ final class Uploader: NSObject, URLSessionTaskDelegate {
             ]
             if let linkedEvent, index == 1 { body["linkedEvent"] = linkedEvent }
             if let group {
-                body["multi"] = ["group": group, "index": index, "total": total,
+                // groupBytes (0.3.9) = the sum of every part's size, so the placeholder row is
+                // born knowing the whole recording's size instead of part 1's (P2).
+                body["multi"] = ["group": group, "index": index, "total": total, "groupBytes": groupBytes,
                                  "comment": "Darth Recorder segment \(index) of \(total)"]
             }
             return body

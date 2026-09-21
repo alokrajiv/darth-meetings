@@ -98,11 +98,24 @@ export type CompanionRecording = {
   matched: CompanionMatchedEvent | null;
 };
 
-/** Per-recording upload progress folded from upload_* events (0.2.0+). */
+/** Per-recording upload progress folded from upload_* events (0.2.0+).
+ *
+ * `bytesSent`/`bytesTotal`/`segmentsTotal`/`title` arrive from tray 0.3.9+
+ * (`upload_progress` gained them; see docs/recorder-upload-ux.md §2.4). Older
+ * trays omit them and they stay null — every renderer must treat null as
+ * "unknown" and simply leave that clause out. */
 export type CompanionUploadState = {
   status: 'uploading' | 'done' | 'failed';
   pct: number;
   segment: number | null;
+  /** Total segments of this recording, 0.3.9+ (`segments_total`). */
+  segmentsTotal: number | null;
+  /** Bytes of the WHOLE recording sent so far, 0.3.9+. */
+  bytesSent: number | null;
+  /** Bytes of the whole recording, 0.3.9+. */
+  bytesTotal: number | null;
+  /** Human title the tray shows (matched event → call title → date), 0.3.9+. */
+  title: string | null;
   transcriptId: string | null;
   error: string | null;
   at: number;
@@ -229,6 +242,9 @@ type Pending = { req: string; resolve: (r: CompanionRecording[]) => void; reject
 
 const str = (v: unknown): string | null => (typeof v === 'string' && v.length > 0 ? v : null);
 const num = (v: unknown, d = 0): number => (typeof v === 'number' && Number.isFinite(v) ? v : d);
+/** A field an older tray simply omits: unknown stays unknown, never 0. */
+const numOrNull = (v: unknown): number | null =>
+  typeof v === 'number' && Number.isFinite(v) ? v : null;
 
 function parseShare(v: unknown): CompanionShare | null {
   if (!v || typeof v !== 'object') return null;
@@ -486,12 +502,48 @@ class CompanionClient {
         const id = str(m.recording_id);
         if (id) {
           const prev = uploads[id];
+          // 0.3.9+ fields: absent → keep whatever the previous event carried
+          // (a tray that stops sending them mid-upload must not blank the line).
+          const keep = <T>(v: T | null, was: T | null | undefined): T | null => v ?? was ?? null;
           const next: CompanionUploadState =
             type === 'upload_progress'
-              ? { status: 'uploading', pct: Math.max(0, Math.min(100, num(m.pct, prev?.pct ?? 0))), segment: typeof m.segment === 'number' ? m.segment : null, transcriptId: null, error: null, at }
+              ? {
+                  status: 'uploading',
+                  pct: Math.max(0, Math.min(100, num(m.pct, prev?.pct ?? 0))),
+                  segment: typeof m.segment === 'number' ? m.segment : null,
+                  segmentsTotal: keep(numOrNull(m.segments_total), prev?.segmentsTotal),
+                  bytesSent: keep(numOrNull(m.bytes_sent), prev?.bytesSent),
+                  bytesTotal: keep(numOrNull(m.bytes_total), prev?.bytesTotal),
+                  title: keep(str(m.title), prev?.title),
+                  transcriptId: null,
+                  error: null,
+                  at,
+                }
               : type === 'upload_done'
-                ? { status: 'done', pct: 100, segment: null, transcriptId: str(m.transcript_id), error: null, at }
-                : { status: 'failed', pct: prev?.pct ?? 0, segment: null, transcriptId: null, error: str(m.error) ?? 'Upload failed', at };
+                ? {
+                    status: 'done',
+                    pct: 100,
+                    segment: null,
+                    segmentsTotal: prev?.segmentsTotal ?? null,
+                    bytesSent: keep(numOrNull(m.bytes_total), prev?.bytesSent),
+                    bytesTotal: keep(numOrNull(m.bytes_total), prev?.bytesTotal),
+                    title: keep(str(m.title), prev?.title),
+                    transcriptId: str(m.transcript_id),
+                    error: null,
+                    at,
+                  }
+                : {
+                    status: 'failed',
+                    pct: prev?.pct ?? 0,
+                    segment: null,
+                    segmentsTotal: prev?.segmentsTotal ?? null,
+                    bytesSent: prev?.bytesSent ?? null,
+                    bytesTotal: prev?.bytesTotal ?? null,
+                    title: keep(str(m.title), prev?.title),
+                    transcriptId: null,
+                    error: str(m.error) ?? 'Upload failed',
+                    at,
+                  };
           uploads = { ...uploads, [id]: next };
         }
         lastEvent = { type, at, recordingId: id };
@@ -738,8 +790,19 @@ export function recordingStatusLabel(r: CompanionRecording, upload?: CompanionUp
   switch (r.status) {
     case 'recording':
       return 'Recording now';
-    case 'uploading':
-      return upload && upload.status === 'uploading' ? `Uploading ${Math.round(upload.pct)}%` : 'Uploading…';
+    case 'uploading': {
+      if (!upload || upload.status !== 'uploading') return 'Uploading…';
+      // "Uploading 43% · 298 MB of 696 MB · part 3 of 6" — every clause is
+      // dropped when the tray did not send the numbers behind it (0.3.9+).
+      const parts = [`Uploading ${Math.round(upload.pct)}%`];
+      if (upload.bytesSent != null && upload.bytesTotal != null && upload.bytesTotal > 0) {
+        parts.push(`${formatCompanionBytes(upload.bytesSent)} of ${formatCompanionBytes(upload.bytesTotal)}`);
+      }
+      if (upload.segment != null && upload.segmentsTotal != null && upload.segmentsTotal > 1) {
+        parts.push(`part ${upload.segment} of ${upload.segmentsTotal}`);
+      }
+      return parts.join(' · ');
+    }
     case 'uploaded':
       return 'Uploaded';
     case 'upload_failed':
@@ -774,4 +837,110 @@ export function callKindLabel(kind: CompanionCall['kind'] | string | undefined):
     default:
       return 'Call';
   }
+}
+
+/** Newest first, with the row that belongs to a given calendar event pinned on
+ * top of the picker (docs/recorder-upload-ux.md P5). Pure — the input array is
+ * never mutated, and rows with no `started_at` sink to the bottom instead of
+ * jumping to the top through a NaN comparison. */
+export function sortRecordingsForPicker(
+  rows: CompanionRecording[],
+  opts: { eventId?: string | null } = {}
+): CompanionRecording[] {
+  const eventId = opts.eventId ?? null;
+  const startedMs = (r: CompanionRecording): number => {
+    const t = r.started_at ? Date.parse(r.started_at) : NaN;
+    return Number.isFinite(t) ? t : -Infinity;
+  };
+  return rows
+    .map((r, i) => ({ r, i }))
+    .sort((a, b) => {
+      const pa = recordingMatchesEvent(a.r, eventId) ? 1 : 0;
+      const pb = recordingMatchesEvent(b.r, eventId) ? 1 : 0;
+      if (pa !== pb) return pb - pa;
+      const da = startedMs(a.r);
+      const db = startedMs(b.r);
+      if (da !== db) return db - da;
+      return a.i - b.i; // stable
+    })
+    .map((x) => x.r);
+}
+
+/** Does this registry row's server-side match point at `eventId`? The tray
+ * forwards the match verbatim, so the id sits on `event_id` (0.3.x) or, on
+ * older shapes, on `id`. */
+export function recordingMatchesEvent(r: CompanionRecording, eventId: string | null | undefined): boolean {
+  if (!eventId || !r.matched) return false;
+  const m = r.matched as { event_id?: unknown; id?: unknown };
+  return m.event_id === eventId || m.id === eventId;
+}
+
+export type UploadProgressCopyInput = {
+  /** Server-persisted bytes received for the whole row. */
+  received?: number | null;
+  /** Server-persisted total (for a Recorder group: the whole recording). */
+  total?: number | null;
+  /** Parts already landed (`upload_parts_done`). */
+  partsDone?: number | null;
+  /** Parts in the group (`upload_parts_total`). */
+  partsTotal?: number | null;
+  /** The row carries a `recorder_recording_id` — say "from your Mac". */
+  fromRecorder?: boolean;
+  /** Live numbers off the companion socket; they beat the server's. */
+  live?: { pct?: number | null; bytesSent?: number | null; bytesTotal?: number | null } | null;
+  /** Byte formatter (the listing passes its own so the look never shifts). */
+  fmt?: (bytes: number) => string;
+};
+
+/**
+ * The one sentence a mid-upload listing row shows (docs/recorder-upload-ux.md
+ * §4). Never renders a number it cannot explain: a clause whose inputs are
+ * unknown is simply left out.
+ *
+ *   uploading from your Mac — part 3 of 6 · 298 MB of 696 MB
+ *   uploading — 43% · 298 MB of 696 MB
+ *   uploading — 298 MB so far
+ *   upload received — handing off to transcription…
+ */
+export function uploadProgressCopy(input: UploadProgressCopyInput): string {
+  const fmt = input.fmt ?? formatCompanionBytes;
+  const lead = input.fromRecorder ? 'uploading from your Mac' : 'uploading';
+
+  const liveBytes =
+    input.live && input.live.bytesSent != null && input.live.bytesTotal != null && input.live.bytesTotal > 0;
+  const livePct = input.live && input.live.pct != null && Number.isFinite(input.live.pct);
+  const isLive = Boolean(liveBytes || livePct);
+
+  const received = Number((liveBytes ? input.live!.bytesSent : input.received) ?? 0);
+  const total = Number((liveBytes ? input.live!.bytesTotal : input.total) ?? 0);
+
+  // The server only learns the last bytes at `complete`; a row whose byte
+  // count has caught up with its total is past uploading.
+  if (!isLive && total > 0 && received >= total) {
+    return 'upload received — handing off to transcription…';
+  }
+
+  const partsTotal = Number(input.partsTotal ?? 0);
+  const partsDone = Number(input.partsDone ?? 0);
+  // `upload_parts_done` counts parts LANDED, so the one moving is the next.
+  const showParts = partsTotal > 1 && input.partsDone != null;
+  const partInFlight = Math.min(Math.max(partsDone, 0) + 1, partsTotal);
+
+  const clauses: string[] = [];
+  if (showParts) {
+    clauses.push(`part ${partInFlight} of ${partsTotal}`);
+  } else {
+    const pct = livePct
+      ? Math.max(0, Math.min(99, Math.round(input.live!.pct!)))
+      : total > 0
+        ? Math.min(99, Math.floor((received / total) * 100))
+        : null;
+    if (pct != null) clauses.push(`${pct}%`);
+  }
+  if (total > 0) clauses.push(`${fmt(received)} of ${fmt(total)}`);
+  else if (received > 0) clauses.push(`${fmt(received)} so far`);
+
+  if (clauses.length === 0) return `${lead}…`;
+  if (isLive) clauses.push('live');
+  return `${lead} — ${clauses.join(' · ')}`;
 }

@@ -131,21 +131,88 @@ final class BannerController {
         EventLog.shared.log("banner_shown", ["kind": "grace", "seconds": secondsLeft])
     }
 
-    func showSaved(_ url: URL, seconds: Int, segments: Int, uploading: Bool, keptLocal: Bool = false) {
+    /// The recording is on disk. With `uploadId` (0.3.9) this is the LIVE upload card: the sub
+    /// line is rewritten by `updateUpload` on every throttled tick and the card never auto-hides
+    /// while bytes are moving (P3) — it is replaced by `showUploaded` / `showUploadFailed`.
+    /// The kept-local and not-uploading cards are unchanged (12 s, "Show").
+    func showSaved(_ url: URL, seconds: Int, segments: Int, uploading: Bool, keptLocal: Bool = false,
+                   uploadId: String? = nil, uploadBytes: Int = 0) {
         tickTimer?.invalidate()
+        let live = uploading ? uploadId : nil
         set(symbol: "checkmark.circle.fill", accent: .success,
             title: "Recording saved (\(seconds / 60)m \(seconds % 60)s\(segments > 1 ? ", \(segments) parts" : ""))",
-            sub: uploading ? "Uploading to Darth Meetings…"
+            sub: live != nil ? uploadSub(sent: 0, total: uploadBytes)
+                : uploading ? "Uploading to Darth Meetings…"
                 : keptLocal ? "Kept on this Mac, not uploaded — \(url.lastPathComponent)"
                 : url.lastPathComponent)
+        currentUploadId = live
         primary.isHidden = false
-        primary.title = "Show"
+        primary.title = live != nil ? "Show file" : "Show"
         primary.target = self; primary.action = #selector(showFileTapped)
         currentSaved = url
         secondary.isHidden = false
         secondary.title = "OK"
         secondary.target = self; secondary.action = #selector(dismissTapped)
-        present(compact: false, autoHideAfter: 12, near: nil)
+        present(compact: false, autoHideAfter: live == nil ? 12 : nil, near: nil)
+    }
+
+    /// An upload that did not start from a recording we just saved (the PWA's Upload button, the
+    /// 30-minute retry timer, the launch drain): the same live card, named after the recording.
+    func showUploading(title: String, bytesTotal: Int, recordingId: String) {
+        tickTimer?.invalidate()
+        set(symbol: "arrow.up.circle.fill", accent: .info,
+            title: "Uploading “\(shorten(title))”", sub: uploadSub(sent: 0, total: bytesTotal))
+        currentUploadId = recordingId
+        primary.isHidden = true
+        secondary.isHidden = false
+        secondary.title = "OK"
+        secondary.target = self; secondary.action = #selector(dismissTapped)
+        present(compact: false, autoHideAfter: nil, near: nil)
+        EventLog.shared.log("banner_shown", ["kind": "uploading", "recording_id": recordingId, "bytes": bytesTotal])
+    }
+
+    /// A throttled progress tick: rewrite the sub line in place, and only while the card on
+    /// screen is that recording's upload card (any other `set(...)` clears the id).
+    func updateUpload(progress p: UploadProgress) {
+        guard currentUploadId == p.id, panel?.isVisible == true else { return }
+        subLabel.stringValue = uploadSub(sent: p.bytesSent, total: p.bytesTotal)
+    }
+
+    private func uploadSub(sent: Int, total: Int) -> String {
+        let pct = total > 0 ? Int(min(100, Double(sent) / Double(total) * 100)) : 0
+        return "Uploading to Darth Meetings — \(pct)% · \(Fmt.bytes(sent)) of \(Fmt.bytes(total))"
+    }
+
+    /// Terminal, good: the bytes are up and AssemblyAI has them.
+    func showUploaded(title: String, seconds: Int, bytes: Int, elapsed: Int, onOpen: @escaping () -> Void) {
+        tickTimer?.invalidate()
+        openAction = onOpen
+        set(symbol: "checkmark.circle.fill", accent: .success, title: "Uploaded — transcribing now",
+            sub: "“\(shorten(title))” · \(Fmt.duration(seconds)) · \(Fmt.bytes(bytes)) in \(Fmt.duration(elapsed))")
+        primary.isHidden = false
+        primary.title = "Open"
+        primary.target = self; primary.action = #selector(openTapped)
+        secondary.isHidden = false
+        secondary.title = "OK"
+        secondary.target = self; secondary.action = #selector(dismissTapped)
+        present(compact: false, autoHideAfter: 20, near: nil)
+        EventLog.shared.log("banner_shown", ["kind": "uploaded", "title": title, "bytes": bytes, "seconds": elapsed])
+    }
+
+    /// Terminal, bad: the bytes are still here and the retry timer will have another go.
+    func showUploadFailed(title: String, error: String, onRetry: @escaping () -> Void) {
+        tickTimer?.invalidate()
+        retryAction = onRetry
+        set(symbol: "exclamationmark.triangle.fill", accent: .warning,
+            title: "Upload failed — retrying in 30 min", sub: shorten(error, 88))
+        primary.isHidden = false
+        primary.title = "Retry now"
+        primary.target = self; primary.action = #selector(retryTapped)
+        secondary.isHidden = false
+        secondary.title = "OK"
+        secondary.target = self; secondary.action = #selector(dismissTapped)
+        present(compact: false, autoHideAfter: nil, near: nil)
+        EventLog.shared.log("banner_shown", ["kind": "upload_failed", "title": title, "error": error])
     }
 
     /// Transient message. `stoppable` adds a Stop button — every warning shown while we are
@@ -208,9 +275,15 @@ final class BannerController {
     private var currentSaved: URL?
     private var installAction: (() -> Void)?
     private var signInAction: (() -> Void)?
+    private var openAction: (() -> Void)?
+    private var retryAction: (() -> Void)?
+    /// The recording whose live upload card is on screen (0.3.9) — `set(...)` clears it, so a
+    /// progress tick can never rewrite somebody else's card.
+    private var currentUploadId: String?
 
     private func set(symbol: String, accent: Accent, title: String, sub: String) {
         currentAccent = accent
+        currentUploadId = nil
         icon.image = NSImage(systemSymbolName: symbol, accessibilityDescription: nil)
         icon.contentTintColor = accent.color
         iconCircle.layer?.backgroundColor = accent.color.withAlphaComponent(0.22).cgColor
@@ -249,8 +322,8 @@ final class BannerController {
         catch { rlog("banner: snapshot failed: \(error)"); return false }
     }
 
-    private func shorten(_ s: String) -> String {
-        s.count > 42 ? String(s.prefix(41)) + "…" : s
+    private func shorten(_ s: String, _ max: Int = 42) -> String {
+        s.count > max ? String(s.prefix(max - 1)) + "…" : s
     }
 
     private func kindLabel(_ k: CallKind) -> String {
@@ -501,6 +574,14 @@ final class BannerController {
         onKeepRecording?()
     }
     @objc private func installTapped() { hide(); installAction?() }
+    @objc private func openTapped() {
+        EventLog.shared.log("banner_click", ["button": "open_transcript"], summary: "banner: Open transcript clicked")
+        hide(); openAction?()
+    }
+    @objc private func retryTapped() {
+        EventLog.shared.log("banner_click", ["button": "retry_upload"], summary: "banner: Retry now clicked")
+        hide(); retryAction?()
+    }
     @objc private func signInTapped() { EventLog.shared.log("banner_click", ["action": "sign_in"]); hide(); signInAction?() }
     @objc private func showFileTapped() {
         if let u = currentSaved { NSWorkspace.shared.activateFileViewerSelecting([u]) }

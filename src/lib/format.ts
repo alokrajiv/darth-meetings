@@ -319,6 +319,12 @@ export interface GmeetContext {
   uploadGroup?: {
     id: string;
     total: number;
+    /** Sum of every part's bytes, when the client declared it at open
+     * (`multi.groupBytes`) — the listing's "x of y" is about the whole
+     * recording, never one part (2026-09-21: a 696 MB, 6-part Recorder
+     * upload read "77% · 12.1 MB of 15 MB" because the placeholder's
+     * `upload_bytes_total` was part 1's size). */
+    bytesTotal?: number;
     parts: Array<{
       index: number;
       tempFilename: string;
@@ -327,6 +333,11 @@ export interface GmeetContext {
       bytes?: number;
     }>;
   } | null;
+  /** The Darth Recorder registry row (migration 041) these bytes came from,
+   * stamped at upload open so the listing can say "uploading from your Mac"
+   * and pair the row with the tray's live progress over the companion
+   * socket. `recorder_recordings.transcript_id` is the reverse link. */
+  recorder?: { recordingId: string } | null;
   /** The stitched-media map of a multi-file upload: one entry per source
    * file in stitch order, with the user's per-file comment. `offsetSec` is
    * where the file starts on the combined timeline. Fed into the AI prompts
@@ -525,6 +536,14 @@ export interface TranscriptListRow {
   auto_notes_status: string | null;
   upload_bytes_received: number | null;
   upload_bytes_total: number | null;
+  /** Multi-file upload in flight (v2 listing only): parts fully received so
+   * far / parts expected, from gmeet_context.uploadGroup. Null for a
+   * single-file upload. */
+  upload_parts_done?: number | null;
+  upload_parts_total?: number | null;
+  /** gmeet_context.recorder.recordingId (v2 listing only): the Darth
+   * Recorder registry row behind this upload, null for everything else. */
+  recorder_recording_id?: string | null;
   /** Conferencing product of the source meeting (listing glyphs); null =
    * plain upload/import with no meeting identity. */
   provider?: 'gmeet' | 'teams' | null;

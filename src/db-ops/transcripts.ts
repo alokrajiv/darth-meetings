@@ -372,6 +372,17 @@ export async function listPagedForUser(
              t.source, t.speech_model, t.recorded_at, t.auto_notes_status,
              t.upload_bytes_received::float8 AS upload_bytes_received,
              t.upload_bytes_total::float8 AS upload_bytes_total,
+             -- Multi-part upload in flight: parts landed / parts expected,
+             -- so the row can say "part 3 of 6" instead of a percentage of
+             -- one part (docs/recorder-upload-ux.md §2.3). uploadGroup is
+             -- JSON null once the stitch ran → both columns go null.
+             CASE WHEN jsonb_typeof(t.gmeet_context->'uploadGroup'->'parts') = 'array'
+                  THEN jsonb_array_length(t.gmeet_context->'uploadGroup'->'parts')
+             END AS upload_parts_done,
+             (t.gmeet_context->'uploadGroup'->>'total')::int AS upload_parts_total,
+             -- The Darth Recorder registry row behind this upload: pairs the
+             -- listing row with the tray's live progress.
+             t.gmeet_context->'recorder'->>'recordingId' AS recorder_recording_id,
              CASE
                WHEN t.gmeet_context->>'provider' = 'teams' THEN 'teams'
                WHEN t.assemblyai_id LIKE 'gmeet-%'
@@ -474,6 +485,7 @@ export async function listPagedForUser(
            b.language_code, b.title, b.description, b.last_accessed,
            b.source, b.speech_model, b.recorded_at, b.auto_notes_status,
            b.upload_bytes_received, b.upload_bytes_total,
+           b.upload_parts_done, b.upload_parts_total, b.recorder_recording_id,
            b.provider, b.has_event, b.deferred_mode, b.deferred_error,
            b.recording_count, b.auto_state,
            -- Evaluated for the page's rows only (t is joined below for both
@@ -1438,6 +1450,45 @@ export async function setVideoPartStoredForUser(
       AND jsonb_array_length(gmeet_context->'videoParts') > 0
   `;
   publishEvent({ kind: 'meta', assemblyaiId });
+}
+
+/**
+ * Stamp one part of an in-flight multi-file upload group with the bytes that
+ * landed (`uploadGroup.parts[i].bytes`). Atomic in SQL for the same reason
+ * setVideoPartStoredForUser is: several parts of one group finalize
+ * concurrently and a read-modify-write of the array in JS would drop a
+ * sibling's entry — which would fail the stitch. Returns the row's context
+ * AFTER the write so the caller can compute group-relative progress from the
+ * authoritative parts list.
+ */
+export async function setUploadPartBytesForUser(
+  userId: string,
+  assemblyaiId: string,
+  index: number,
+  bytes: number
+): Promise<GmeetContext | null> {
+  const rows = await sql<Array<{ gmeet_context: GmeetContext | null }>>`
+    UPDATE ${sql(SCHEMA)}.transcripts
+    SET gmeet_context = jsonb_set(
+      gmeet_context,
+      '{uploadGroup,parts}',
+      (
+        SELECT jsonb_agg(
+          CASE WHEN (p->>'index')::int = ${index}
+            THEN p || ${sql.json({ bytes } as unknown as never)}
+            ELSE p
+          END
+          ORDER BY ord
+        )
+        FROM jsonb_array_elements(gmeet_context->'uploadGroup'->'parts') WITH ORDINALITY AS t(p, ord)
+      )
+    )
+    WHERE user_id = ${userId} AND assemblyai_id = ${assemblyaiId}
+      AND jsonb_typeof(gmeet_context->'uploadGroup'->'parts') = 'array'
+      AND jsonb_array_length(gmeet_context->'uploadGroup'->'parts') > 0
+    RETURNING gmeet_context
+  `;
+  return rows[0]?.gmeet_context ?? null;
 }
 
 /**

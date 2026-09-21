@@ -7,6 +7,7 @@ import {
 } from '@/db-ops/upload-sessions';
 import { updateUploadProgress } from '@/db-ops/transcripts';
 import { audioFileSize, writeChunkAt } from '@/lib/server/audio-storage';
+import { groupProgressAdder } from '@/lib/server/upload-pipeline';
 import { chunkByteRange } from '@/lib/upload-chunking';
 
 export const runtime = 'nodejs';
@@ -99,16 +100,24 @@ export const PUT = withAuth(async ({ user, request }, { params }) => {
 
   // Listing progress: throttled to ~1 write / 1.5s per session, always
   // flushed on the final chunk. Heartbeats the placeholder too, which is
-  // what keeps the stale-upload sweeper off a live session.
+  // what keeps the stale-upload sweeper off a live session. For one part of
+  // a multi-file group the number written is the WHOLE recording's (P2):
+  // the parts already landed plus this part's bytes — one extra read of the
+  // group row per flush, which the throttle keeps cheap.
   const now = Date.now();
   const last = flushAt.get(session.id) ?? 0;
   const complete = ack.receivedCount >= session.chunk_count;
   if (complete || now - last >= 1500) {
     flushAt.set(session.id, now);
     if (complete) flushAt.delete(session.id);
-    void updateUploadProgress(user.userId, session.placeholder_id, ack.receivedBytes).catch(
-      () => {}
-    );
+    void (async () => {
+      const groupRelative = await groupProgressAdder(user.userId, session.spec);
+      await updateUploadProgress(
+        user.userId,
+        session.placeholder_id,
+        groupRelative(ack.receivedBytes)
+      );
+    })().catch(() => {});
   }
 
   return NextResponse.json({

@@ -12,14 +12,18 @@ import {
   Trash2,
   Upload,
 } from 'lucide-react';
+import { useMemo, useState } from 'react';
 import {
   formatCompanionBytes,
   formatCompanionDuration,
   getCompanion,
+  recordingMatchesEvent,
   recordingStatusLabel,
+  sortRecordingsForPicker,
   useCompanion,
   useCompanionRecordings,
   type CompanionRecording,
+  type CompanionUploadState,
 } from '@/lib/companion/companion-client';
 
 /**
@@ -47,6 +51,13 @@ export type RecorderRecordingsProps = {
   /** Rows to show before "Show all" (0 = no cap). */
   limit?: number;
   compact?: boolean;
+  /** Calendar event the surrounding dialog is about: its recording is pinned
+   * first with a "this meeting" chip (docs/recorder-upload-ux.md P5). */
+  pinEventId?: string | null;
+  /** Show already-uploaded rows straight away. The Settings card does (it is a
+   * history); the upload picker does not — they hide behind "Show N uploaded",
+   * because a picker is for picking something to upload. */
+  showUploaded?: boolean;
 };
 
 export function RecorderRecordings({
@@ -55,9 +66,30 @@ export function RecorderRecordings({
   onUploadStarted,
   limit = 0,
   compact = false,
+  pinEventId = null,
+  showUploaded = true,
 }: RecorderRecordingsProps) {
   const c = useCompanion();
   const { recordings, loading, error, refresh } = useCompanionRecordings(enabled);
+  const [showAll, setShowAll] = useState(false);
+  const [uploadedOpen, setUploadedOpen] = useState(false);
+
+  // Newest first, the dialog's own recording on top. `deleted` rows are already
+  // dropped upstream; the filter is a belt for a tray that lists them anyway.
+  const sorted = useMemo(
+    () => sortRecordingsForPicker(recordings.filter((r) => r.status !== 'deleted'), { eventId: pinEventId }),
+    [recordings, pinEventId]
+  );
+  const visible = useMemo(
+    () =>
+      showUploaded || uploadedOpen
+        ? sorted
+        : // The pinned row stays even when it is already uploaded — hiding the
+          // one row the dialog is about would be the worst possible fold.
+          sorted.filter((r) => r.status !== 'uploaded' || recordingMatchesEvent(r, pinEventId)),
+    [sorted, showUploaded, uploadedOpen, pinEventId]
+  );
+  const uploadedHiddenCount = sorted.length - visible.length;
 
   const note = (children: React.ReactNode) => (
     <p className="text-xs text-muted-foreground" data-recorder-recordings-note>
@@ -92,33 +124,53 @@ export function RecorderRecordings({
     return note('No recordings on this Mac yet. Press Record when a call is detected.');
   }
 
-  const shown = limit > 0 ? recordings.slice(0, limit) : recordings;
+  const capped = limit > 0 && !showAll;
+  const shown = capped ? visible.slice(0, limit) : visible;
 
   return (
     <div className="space-y-1.5" data-recorder-recordings>
-      {shown.map((r) => (
-        <Row
-          key={r.id}
-          r={r}
-          pct={c.uploads[r.id]?.status === 'uploading' ? c.uploads[r.id].pct : null}
-          compact={compact}
-          onUpload={() => {
-            getCompanion().upload(r.id, linkedEvent ?? r.matched ?? null);
-            onUploadStarted?.(r);
-          }}
-          onDelete={() => {
-            getCompanion().deleteRecording(r.id);
-            // The tray's recording_deleted answer refetches; an older tray never
-            // answers, so refetch anyway and the row simply stays.
-            setTimeout(refresh, 800);
-          }}
-        />
-      ))}
-      <div className="flex items-center gap-3 pt-0.5">
-        {limit > 0 && recordings.length > shown.length && (
-          <span className="text-xs text-muted-foreground">
-            +{recordings.length - shown.length} older on this Mac
-          </span>
+      <div className="max-h-[40vh] space-y-1.5 overflow-y-auto pr-1" data-recorder-recordings-scroll>
+        {shown.length === 0 && note('Nothing waiting to be uploaded on this Mac.')}
+        {shown.map((r) => (
+          <Row
+            key={r.id}
+            r={r}
+            pinned={recordingMatchesEvent(r, pinEventId)}
+            upload={c.uploads[r.id]?.status === 'uploading' ? c.uploads[r.id] : null}
+            compact={compact}
+            onUpload={() => {
+              getCompanion().upload(r.id, linkedEvent ?? r.matched ?? null);
+              onUploadStarted?.(r);
+            }}
+            onDelete={() => {
+              getCompanion().deleteRecording(r.id);
+              // The tray's recording_deleted answer refetches; an older tray
+              // never answers, so refetch anyway and the row simply stays.
+              setTimeout(refresh, 800);
+            }}
+          />
+        ))}
+      </div>
+      <div className="flex flex-wrap items-center gap-3 pt-0.5">
+        {capped && visible.length > shown.length && (
+          <button
+            type="button"
+            onClick={() => setShowAll(true)}
+            className="text-xs text-muted-foreground underline-offset-2 hover:text-foreground hover:underline"
+            data-recorder-show-all
+          >
+            Show all ({visible.length})
+          </button>
+        )}
+        {uploadedHiddenCount > 0 && (
+          <button
+            type="button"
+            onClick={() => setUploadedOpen(true)}
+            className="text-xs text-muted-foreground underline-offset-2 hover:text-foreground hover:underline"
+            data-recorder-show-uploaded
+          >
+            Show {uploadedHiddenCount} uploaded
+          </button>
         )}
         <button
           type="button"
@@ -134,13 +186,17 @@ export function RecorderRecordings({
 
 function Row({
   r,
-  pct,
+  upload,
+  pinned,
   compact,
   onUpload,
   onDelete,
 }: {
   r: CompanionRecording;
-  pct: number | null;
+  /** Live upload state off the socket, only while it is uploading. */
+  upload: CompanionUploadState | null;
+  /** This row is the recording for the meeting the dialog was opened on. */
+  pinned?: boolean;
   compact: boolean;
   onUpload: () => void;
   onDelete: () => void;
@@ -161,22 +217,37 @@ function Row({
     .filter(Boolean)
     .join(' · ');
 
-  const status = recordingStatusLabel(r, pct != null ? { status: 'uploading', pct, segment: null, transcriptId: null, error: null, at: 0 } : undefined);
+  // One label for both cases: `recordingStatusLabel` already folds the live
+  // upload state ("Uploading 43% · 298 MB of 696 MB · part 3 of 6").
+  const status = recordingStatusLabel(
+    upload ? { ...r, status: 'uploading' } : r,
+    upload ?? undefined
+  );
   const busy = r.status === 'uploading' || r.status === 'recording';
 
   return (
     <div
-      className="flex min-w-0 items-center gap-2 rounded-md border px-2.5 py-1.5"
+      className={`flex min-w-0 items-center gap-2 rounded-md border px-2.5 py-1.5${
+        pinned ? ' border-primary/40 bg-primary/[0.03]' : ''
+      }`}
       data-recorder-recording
       data-status={r.status}
+      data-recorder-pinned={pinned ? '' : undefined}
     >
       <Icon status={r.status} />
       <div className="min-w-0 flex-1">
-        <p className="truncate text-sm font-medium">{title}</p>
+        <p className="flex min-w-0 items-center gap-1.5 text-sm font-medium">
+          <span className="truncate">{title}</span>
+          {pinned && (
+            <span className="shrink-0 rounded-full border border-primary/40 px-1.5 text-[10px] font-normal text-primary">
+              this meeting
+            </span>
+          )}
+        </p>
         <p className="truncate text-xs text-muted-foreground">
           {sub}
           {sub ? ' · ' : ''}
-          {pct != null ? `Uploading ${Math.round(pct)}%` : status}
+          {status}
         </p>
       </div>
       {r.status === 'uploaded' && r.transcript_id ? (

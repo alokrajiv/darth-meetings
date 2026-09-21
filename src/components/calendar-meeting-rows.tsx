@@ -681,7 +681,10 @@ export function CalendarEventRow({
   const canImport = !!r.meetingCode && !!onImportMeeting && layer === 'unimported';
   const canCheck =
     !canImport && layer === 'norec' && r.hasMeet && !!r.meetingCode && !!onImportMeeting;
-  const canUpload = !canImport && !canCheck && layer === 'norec' && !!r.eventId;
+  // Upload… sits next to Check… rather than behind it: a row that can be
+  // probed is exactly the row someone has their own recording of, and the
+  // hover-only gear was the only path to it until 2026-09-21.
+  const canUpload = !canImport && layer === 'norec' && !!r.eventId;
   const knownEmpty =
     canCheck && r.recordingState === 'none' && r.transcriptState === 'none';
   const [checking, setChecking] = useState(false);
@@ -987,7 +990,10 @@ export function CalendarEventRow({
         </TableCell>
       ))}
       <TableCell className="py-1.5 pr-3">
-        <div className="flex items-center justify-end gap-0.5">
+        {/* flex-wrap: a norec row can now carry Check… AND Upload… next to an
+            evidence note — it wraps onto a second line instead of pushing the
+            buttons out of the cell. */}
+        <div className="flex flex-wrap items-center justify-end gap-0.5">
           <EventGearMenu row={r} layer={layer} onMuteChanged={onMuteChanged} disabled={disabled} />
           {canImport && r.autoSync && (
             <Badge
@@ -1067,7 +1073,7 @@ export function CalendarEventRow({
             <Button
               size="sm"
               variant="outline"
-              className="h-7 px-2.5 text-xs"
+              className="h-7 shrink-0 px-2.5 text-xs"
               onClick={(e) => {
                 e.stopPropagation();
                 requestMediaUpload({

@@ -4,7 +4,7 @@ import ScreenCaptureKit
 import ServiceManagement
 import RecorderCore
 
-let VERSION = "0.3.8"
+let VERSION = "0.3.9"
 let WS_PORT: UInt16 = 47800
 let PWA_URL = URL(string: "https://meetings.darth-internal.trames.io/")!
 /// Seconds between "the call ended" and an automatic stop.
@@ -33,6 +33,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     let api = ApiClient(appVersion: VERSION)
     lazy var uploader = Uploader(api: api)
     let recorder = RecordingController()
+    /// The upload the menu line, the menu-bar glyph and the ws `upload` block are about (0.3.9).
+    let uploads = UploadTracker()
     let preview = PreviewPanel()
     let watchdog = MainQueueWatchdog()
 
@@ -68,6 +70,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     // menu items we update
     let statusLine = NSMenuItem(title: "", action: nil, keyEquivalent: "")
+    /// 0.3.9: live upload progress / "Uploaded … Open transcript" / "Upload failed … Retry now".
+    let uploadLine = NSMenuItem(title: "", action: nil, keyEquivalent: "")
     let permLine = NSMenuItem(title: "", action: #selector(openScreenRecordingSettings), keyEquivalent: "")
     let shareLine = NSMenuItem(title: "", action: nil, keyEquivalent: "")
     let clientsLine = NSMenuItem(title: "", action: nil, keyEquivalent: "")
@@ -224,16 +228,37 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             self.banner.showMessage(title: "Recording source changed", sub: out, accent: .info, stoppable: true, near: self.recordingFrame, autoHide: 6)
         }
 
-        uploader.onProgress = { [weak self] id, seg, pct in
-            self?.broadcast("upload_progress", ["recording_id": id, "segment": seg, "pct": pct])
+        uploader.onProgress = { [weak self] p in
+            guard let self else { return }
+            let title = self.uploadTitle(for: Registry.shared.get(p.id))
+            self.uploads.progress(p, title: title)
+            self.refreshUploadLine()
+            self.banner.updateUpload(progress: p)
+            self.broadcast("upload_progress", [
+                "recording_id": p.id, "segment": p.segment, "segments_total": p.segmentsTotal,
+                "bytes_sent": p.bytesSent, "bytes_total": p.bytesTotal, "pct": p.pct, "title": title,
+            ])
         }
-        uploader.onDone = { [weak self] id, tid in
-            self?.broadcast("upload_done", ["recording_id": id, "transcript_id": tid])
-            self?.refreshMenu()
+        uploader.onDone = { [weak self] id, tid, bytes, seconds in
+            guard let self else { return }
+            let row = Registry.shared.get(id)
+            let title = self.uploadTitle(for: row)
+            let recorded = (row?["duration"] as? Int) ?? Int((row?["duration"] as? Double) ?? 0)
+            self.uploads.done(id: id, transcriptId: tid, title: title)
+            self.banner.showUploaded(title: title, seconds: recorded, bytes: bytes, elapsed: seconds) { [weak self] in
+                self?.openTranscript(tid)
+            }
+            self.broadcast("upload_done", ["recording_id": id, "transcript_id": tid,
+                                           "bytes_total": bytes, "seconds": seconds])
+            self.refreshMenu()
         }
         uploader.onFailed = { [weak self] id, err in
-            self?.broadcast("upload_failed", ["recording_id": id, "error": err])
-            self?.refreshMenu()
+            guard let self else { return }
+            let title = self.uploadTitle(for: Registry.shared.get(id))
+            self.uploads.failed(id: id, error: err)
+            self.banner.showUploadFailed(title: title, error: err) { [weak self] in self?.startUpload(id) }
+            self.broadcast("upload_failed", ["recording_id": id, "error": err])
+            self.refreshMenu()
         }
 
         updater.isBusy = { [weak self] in
@@ -312,7 +337,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             guard let id = row["id"] as? String else { continue }
             EventLog.shared.log("upload_retry", ["recording_id": id, "error": row["error"] ?? NSNull()],
                                 summary: "upload: retrying \(id) (was: \((row["error"] as? String) ?? "?"))")
-            uploader.upload(recordingId: id)
+            startUpload(id)
         }
     }
 
@@ -419,6 +444,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let m = NSMenu()
         statusLine.isEnabled = false
         m.addItem(statusLine)
+        uploadLine.isHidden = true
+        m.addItem(uploadLine)
         permLine.target = self
         m.addItem(permLine)
         shareLine.isEnabled = false
@@ -493,11 +520,103 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         else if let s = updater.staged { updateItem.title = "Install \(s.version) and restart"; updateItem.isEnabled = true }
         else if updater.checking { updateItem.title = "Checking for updates…"; updateItem.isEnabled = false }
         else { updateItem.title = "Check for Updates…"; updateItem.isEnabled = true }
+        refreshUploadLine()
+    }
+
+    /// The upload line alone — this runs on every throttled progress tick (≤ 2/s), so it never
+    /// walks the whole menu or the registry the way `refreshMenu` does.
+    func refreshUploadLine() {
+        if let line = uploads.menuLine() {
+            uploadLine.isHidden = false
+            uploadLine.title = line.title
+            uploadLine.target = line.actionable ? self : nil
+            uploadLine.action = line.actionable ? #selector(uploadLineClicked) : nil
+            uploadLine.isEnabled = line.actionable
+        } else {
+            uploadLine.isHidden = true
+            uploadLine.title = ""
+            uploadLine.target = nil
+            uploadLine.action = nil
+            uploadLine.isEnabled = false
+        }
+        updateStatusIcon()
+    }
+
+    /// recording > uploading > a call is live > idle. `discreet` flattens everything to the
+    /// plain glyph, uploading included.
+    func updateStatusIcon() {
+        let state: StatusIcon.State = recorder.isRecording ? .recording
+            : uploads.isUploading ? .uploading
+            : (detector.active.isEmpty ? .idle : .callDetected)
         if let b = statusItem.button {
-            b.image = StatusIcon.image(recording ? .recording : (detector.active.isEmpty ? .idle : .callDetected), discreet: discreet)
+            b.image = StatusIcon.image(state, discreet: discreet)
             // The status item's window exists only once the item is drawn — re-apply here.
             b.window?.sharingType = .none
         }
+    }
+
+    /// The upload line is clickable in its two terminal states.
+    @objc func uploadLineClicked() {
+        guard let s = uploads.current() else { return }
+        switch s.phase {
+        case .done: openTranscript(s.transcriptId)
+        case .failed: startUpload(s.id)
+        case .uploading: break
+        }
+    }
+
+    /// The transcript an upload became (the PWA falls back to its home page).
+    func openTranscript(_ transcriptId: String?) {
+        guard let transcriptId, !transcriptId.isEmpty else { NSWorkspace.shared.open(PWA_URL); return }
+        NSWorkspace.shared.open(PWA_URL.appendingPathComponent("transcript").appendingPathComponent(transcriptId))
+    }
+
+    /// What this recording is called: the calendar event it was matched to, then the call's own
+    /// window title, then when it started.
+    func uploadTitle(for row: [String: Any]?) -> String {
+        if let m = row?["matched"] as? [String: Any],
+           let t = (m["title"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines), !t.isEmpty { return t }
+        if let c = row?["call"] as? [String: Any],
+           let t = (c["title"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines), !t.isEmpty {
+            return Self.stripCallPrefix(t)
+        }
+        if let s = row?["started_at"] as? String, let d = ISO8601DateFormatter().date(from: s) {
+            let f = DateFormatter()
+            f.dateFormat = "d MMM HH:mm"
+            return f.string(from: d)
+        }
+        return "recording"
+    }
+
+    /// Only prefixes that are trivially safe to drop — a window title we do not recognise is
+    /// left exactly as it is.
+    static func stripCallPrefix(_ t: String) -> String {
+        for p in ["Meet - ", "Meet – ", "Meet — ", "Microsoft Teams - ", "Microsoft Teams — ",
+                  "Zoom Meeting - ", "Zoom - "] where t.hasPrefix(p) {
+            let rest = String(t.dropFirst(p.count)).trimmingCharacters(in: .whitespaces)
+            if !rest.isEmpty { return rest }
+        }
+        return t
+    }
+
+    /// Title, bytes still on disk and part count for a registry row.
+    func uploadFacts(_ id: String) -> (title: String, bytes: Int, parts: Int) {
+        let row = Registry.shared.get(id)
+        let files = (row?["files"] as? [String] ?? []).filter { FileManager.default.fileExists(atPath: $0) }
+        let bytes = files.reduce(0) { $0 + ((((try? FileManager.default.attributesOfItem(atPath: $1)[.size]) as? Int)) ?? 0) }
+        return (uploadTitle(for: row), bytes, max(1, files.count))
+    }
+
+    /// THE way an upload starts (0.3.9): the tracker and the menu line know the recording's name
+    /// and its real size before the first byte moves, and — unless the saved card is already
+    /// showing it (`card: false`) — so does the person.
+    func startUpload(_ id: String, linkedEvent: [String: Any]? = nil, card: Bool = true) {
+        guard !uploader.isUploading(id) else { return }
+        let f = uploadFacts(id)
+        uploads.started(id: id, title: f.title, bytesTotal: f.bytes, segmentsTotal: f.parts)
+        if card, auth.signedIn { banner.showUploading(title: f.title, bytesTotal: f.bytes, recordingId: id) }
+        refreshUploadLine()
+        uploader.upload(recordingId: id, linkedEvent: linkedEvent)
     }
 
     func kindName(_ k: CallKind) -> String {
@@ -561,7 +680,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         guard auth.signedIn, force || autoUpload else { return }
         for row in Registry.shared.pendingUpload(automatic: !force) {
             guard let id = row["id"] as? String, !uploader.isUploading(id) else { continue }
-            uploader.upload(recordingId: id)
+            startUpload(id)
         }
     }
 
@@ -777,12 +896,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let willUpload = autoUpload && auth.signedIn && !id.isEmpty && !keepLocal
         let path = (saved["path"] as? String).map { URL(fileURLWithPath: $0) }
         let secs = (saved["seconds"] as? Int) ?? 0
+        // The saved card IS the upload card (0.3.9): it needs the recording's id and its real
+        // size before the first tick, so the tracker is armed here, ahead of the card.
+        let facts: (title: String, bytes: Int, parts: Int) = willUpload ? uploadFacts(id) : ("", 0, 1)
+        if willUpload {
+            uploads.started(id: id, title: facts.title, bytesTotal: facts.bytes, segmentsTotal: facts.parts)
+            refreshUploadLine()
+        }
         if !auth.signedIn && !id.isEmpty {
             banner.showSignIn(title: "Recording saved (\(secs / 60)m \(secs % 60)s) — sign in to upload",
                               sub: "It is on this Mac only until you sign in to Darth Meetings.") { [weak self] in self?.auth.signIn() }
         } else {
             banner.showSaved(path ?? Paths.recordings, seconds: secs,
-                             segments: (saved["segments"] as? Int) ?? 1, uploading: willUpload, keptLocal: keepLocal)
+                             segments: (saved["segments"] as? Int) ?? 1, uploading: willUpload, keptLocal: keepLocal,
+                             uploadId: willUpload ? id : nil, uploadBytes: facts.bytes)
         }
         // `recording` must stay a boolean here — the file info goes under `saved`.
         broadcast("recording_stopped", ["saved": saved])
@@ -792,7 +919,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             return
         }
         if willUpload {
-            uploader.upload(recordingId: id)
+            startUpload(id, card: false)
         } else if keepLocal {
             rlog("recording \(id) kept on this Mac by request — not uploaded")
         } else if !auth.signedIn && !id.isEmpty {
@@ -880,6 +1007,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             "device_id": auth.deviceId,
             "share": shares.active.last?.json ?? NSNull(),
             "recordings_pending_upload": pending,
+            // The newest in-flight upload (0.3.9), so a PWA that connects mid-upload sees it.
+            "upload": uploads.wsPayload() ?? NSNull(),
             "auto_upload": autoUpload,
             "update_available": updater.available ?? api.serverLatest ?? NSNull(),
             "update_staged": updater.staged?.version ?? NSNull(),
@@ -1027,7 +1156,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         case "upload":
             guard let id = obj["recording_id"] as? String else { rlog("upload: no recording_id"); return }
             let linked = obj["linked_event"] as? [String: Any]
-            uploader.upload(recordingId: id, linkedEvent: linked)
+            startUpload(id, linkedEvent: linked)
         case "delete_recording":                        // {recording_id} → recording_deleted {recording_id, files_removed | error}
             guard let id = obj["recording_id"] as? String else { rlog("delete: no recording_id"); return }
             var reply: [String: Any] = ["type": "recording_deleted", "recording_id": id]

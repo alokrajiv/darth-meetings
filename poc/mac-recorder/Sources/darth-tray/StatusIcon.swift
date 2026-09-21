@@ -4,7 +4,7 @@ import AppKit
 /// public/icons/icon-512.png), drawn vectorially so it is crisp at 1x/2x and, as a template
 /// image, follows the menu bar's light/dark appearance.
 enum StatusIcon {
-    enum State { case idle, callDetected, recording }
+    enum State { case idle, callDetected, recording, uploading }
 
     /// Bar heights relative to the tallest, measured off the app icon.
     private static let bars: [CGFloat] = [0.38, 0.72, 1.0, 0.72, 0.38]
@@ -27,6 +27,29 @@ enum StatusIcon {
                 let r = NSRect(x: x0 + CGFloat(i) * (barW + gap), y: (rect.height - bh) / 2, width: barW, height: bh)
                 NSBezierPath(roundedRect: r, xRadius: barW / 2, yRadius: barW / 2).fill()
             }
+            if state == .uploading {
+                // 0.3.9: a small up-arrow top-right = bytes are going up right now. Same
+                // knock-out trick as the call dot so it reads against the outer bar.
+                let w: CGFloat = 5.2, h: CGFloat = 7.0
+                let box = NSRect(x: rect.width - w, y: rect.height - h, width: w, height: h)
+                NSGraphicsContext.current?.compositingOperation = .destinationOut
+                NSColor.black.setFill()
+                NSBezierPath(roundedRect: box.insetBy(dx: -1.15, dy: -1.15), xRadius: 2.2, yRadius: 2.2).fill()
+                NSGraphicsContext.current?.compositingOperation = .sourceOver
+                color.setFill()
+                let stem: CGFloat = 1.8
+                let headY = box.minY + h * 0.42
+                let arrow = NSBezierPath()
+                arrow.move(to: NSPoint(x: box.midX, y: box.maxY))
+                arrow.line(to: NSPoint(x: box.minX, y: headY))
+                arrow.line(to: NSPoint(x: box.midX - stem / 2, y: headY))
+                arrow.line(to: NSPoint(x: box.midX - stem / 2, y: box.minY))
+                arrow.line(to: NSPoint(x: box.midX + stem / 2, y: box.minY))
+                arrow.line(to: NSPoint(x: box.midX + stem / 2, y: headY))
+                arrow.line(to: NSPoint(x: box.maxX, y: headY))
+                arrow.close()
+                arrow.fill()
+            }
             if state == .callDetected {
                 // small dot top-right = "a call is live, not recording"
                 let d: CGFloat = 5
@@ -48,7 +71,7 @@ enum StatusIcon {
     /// Debug: write 4x PNG previews (DARTH_TRAY_RENDER_ICONS=<dir>).
     static func renderPreviews(to dir: String) {
         try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
-        for (name, st) in [("idle", State.idle), ("call", .callDetected), ("recording", .recording)] {
+        for (name, st) in [("idle", State.idle), ("call", .callDetected), ("recording", .recording), ("uploading", .uploading)] {
             let img = image(st)
             let scale: CGFloat = 4
             let px = NSSize(width: img.size.width * scale, height: img.size.height * scale)

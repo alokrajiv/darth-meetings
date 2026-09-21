@@ -6,6 +6,7 @@ import {
   getForUser,
   mergeGmeetContextForUser,
   setRecordedAtForUser,
+  setUploadPartBytesForUser,
   updateUploadProgress,
 } from '@/db-ops/transcripts';
 import { autoShareToInternalInvitees } from '@/lib/server/auto-share';
@@ -15,6 +16,7 @@ import { deleteAudioFile, deleteAudioFilesByPrefix } from '@/lib/server/audio-st
 import { concatMediaSmart, probeDurationSec } from '@/lib/server/media-concat';
 import { IngestError, ingestLocalAudio } from '@/lib/server/ingest';
 import type { GmeetAttendee, GmeetContext, StoredTranscript } from '@/lib/format';
+import type { RecorderMatch } from '@/lib/recorder';
 import type { DarthUser } from '@/lib/auth/session';
 import type { SpeechModel } from '@/lib/aai-language';
 
@@ -102,6 +104,11 @@ export interface MultiParams {
   index: number;
   total: number;
   comment?: string;
+  /** Sum of every part's size, declared once by the client at open
+   * (docs/recorder-upload-ux.md P2). Stored on the group row as
+   * `uploadGroup.bytesTotal` + `upload_bytes_total` so the listing's "x of y"
+   * is about the whole recording instead of part 1. */
+  groupBytes?: number;
 }
 
 /** Validate multi-file single-meeting group params. `undefined` = not a
@@ -111,6 +118,7 @@ export function parseMultiParams(raw: {
   index?: string | number | null;
   total?: string | number | null;
   comment?: string | null;
+  groupBytes?: string | number | null;
 }): MultiParams | null | undefined {
   const present =
     (raw.group !== undefined && raw.group !== null && raw.group !== '') ||
@@ -129,7 +137,100 @@ export function parseMultiParams(raw: {
     index <= total;
   if (!ok) return null;
   const comment = raw.comment?.trim().slice(0, 500) || undefined;
-  return { group, index, total, comment };
+  // Optional: the whole group's byte count. Present-but-nonsense is a 400
+  // (a wrong total is worse than none — the listing would lie).
+  let groupBytes: number | undefined;
+  if (raw.groupBytes !== undefined && raw.groupBytes !== null && raw.groupBytes !== '') {
+    const declared = Number(raw.groupBytes);
+    if (!Number.isSafeInteger(declared) || declared <= 0) return null;
+    groupBytes = declared;
+  }
+  return { group, index, total, comment, groupBytes };
+}
+
+/** The `uploadGroup` marker as it lives on the placeholder's gmeet_context. */
+type UploadGroupState = NonNullable<GmeetContext['uploadGroup']>;
+
+function sumPartBytes(parts: UploadGroupState['parts'] | undefined): number {
+  let sum = 0;
+  for (const p of parts ?? []) {
+    if (typeof p.bytes === 'number' && Number.isFinite(p.bytes) && p.bytes > 0) sum += p.bytes;
+  }
+  return sum;
+}
+
+/**
+ * Bytes of a multi-part upload that are already on disk: Σ `bytes` of the
+ * parts that landed. Parts still in flight — and every part of a row written
+ * by an older client — carry no `bytes` and count as 0.
+ */
+export function groupBytesBefore(
+  groupRow: { gmeet_context?: GmeetContext | null } | null | undefined
+): number {
+  return sumPartBytes(groupRow?.gmeet_context?.uploadGroup?.parts);
+}
+
+/**
+ * What `upload_bytes_received` should say for a group row: the parts already
+ * landed plus the part in flight, so the listing's number is about the whole
+ * recording (P2). Clamped to the declared total, and exactly the total once
+ * every part has landed (a declared total a few bytes off must still read
+ * 100%). `group = null` (a single-file upload) is the identity.
+ */
+export function groupProgressBytes(
+  group: UploadGroupState | null | undefined,
+  inflightBytes = 0
+): number {
+  if (!group) return inflightBytes;
+  const total =
+    typeof group.bytesTotal === 'number' && group.bytesTotal > 0 ? group.bytesTotal : null;
+  const landedParts = (group.parts ?? []).filter((p) => typeof p.bytes === 'number').length;
+  if (total !== null && inflightBytes === 0 && landedParts >= group.total) return total;
+  const value = sumPartBytes(group.parts) + inflightBytes;
+  return total !== null ? Math.min(value, total) : value;
+}
+
+/**
+ * Progress translator for one byte-delivery session: turns "bytes of THIS
+ * part received" into "bytes of the whole recording received". Reads the
+ * group row once — call it before the byte stream (the blob pull) or inside
+ * the throttled flush (the chunk route).
+ */
+export async function groupProgressAdder(
+  userId: string,
+  spec: UploadSpec
+): Promise<(bytesOfThisPart: number) => number> {
+  if (!spec.multi) return (bytes: number) => bytes;
+  const row = await findUploadGroupRow(userId, spec.multi.group).catch(() => null);
+  const group = row?.gmeet_context?.uploadGroup ?? null;
+  return (bytes: number) => groupProgressBytes(group, bytes);
+}
+
+/** P1 auto-link floor: below either number the recording stays unlinked. */
+export const RECORDER_AUTOLINK_MIN_SCORE = 0.6;
+export const RECORDER_AUTOLINK_MIN_OVERLAP = 0.5;
+
+/**
+ * Is a Darth Recorder match good enough to link the upload to that calendar
+ * occurrence without asking? (docs/recorder-upload-ux.md P1 — one meeting,
+ * one row, from the first byte.) The ONE threshold: the tray, darth-cli and
+ * every older client inherit it because the decision is server-side.
+ */
+export function recorderMatchIsConfident(
+  matched: Partial<Pick<RecorderMatch, 'event_key' | 'score' | 'overlap'>> | null | undefined
+): boolean {
+  if (!matched) return false;
+  const key = typeof matched.event_key === 'string' ? matched.event_key.trim() : '';
+  if (!key) return false;
+  const { score, overlap } = matched;
+  return (
+    typeof score === 'number' &&
+    Number.isFinite(score) &&
+    score >= RECORDER_AUTOLINK_MIN_SCORE &&
+    typeof overlap === 'number' &&
+    Number.isFinite(overlap) &&
+    overlap >= RECORDER_AUTOLINK_MIN_OVERLAP
+  );
 }
 
 /** Everything `finalizeUpload` needs — JSON-safe so a chunked session can
@@ -308,31 +409,51 @@ export async function openUpload(
   const placeholderId = `up-${uploadUuid}`;
   const tempFilename = `upload-${uploadUuid}.part`;
 
+  // Markers stamped on the fresh placeholder. `contextExtra` (re-transcribe
+  // provenance) and the group marker never co-occur — keep them exclusive as
+  // they have always been.
+  const groupMarker: Pick<GmeetContext, 'uploadGroup'> | null = multi
+    ? {
+        uploadGroup: {
+          id: multi.group,
+          total: multi.total,
+          ...(multi.groupBytes ? { bytesTotal: multi.groupBytes } : {}),
+          parts: [
+            {
+              index: 1,
+              tempFilename,
+              originalFilename: input.originalFilename ?? undefined,
+              comment: multi.comment,
+            },
+          ],
+        },
+      }
+    : null;
+  // The Darth Recorder row behind these bytes: the listing says "uploading
+  // from your Mac" and pairs the row with the tray's live progress.
+  const recorderMarker: Pick<GmeetContext, 'recorder'> | null = input.recorderRecordingId
+    ? { recorder: { recordingId: input.recorderRecordingId } }
+    : null;
+  const contextExtra = multi ? null : (input.contextExtra ?? null);
+  const placeholderContext: GmeetContext | null =
+    gmeetContext || groupMarker || recorderMarker || contextExtra
+      ? {
+          ...(gmeetContext ?? {}),
+          ...(contextExtra ?? {}),
+          ...(groupMarker ?? {}),
+          ...(recorderMarker ?? {}),
+        }
+      : null;
+
   const placeholder = await createUploadingPlaceholder(user.userId, {
     placeholderId,
     originalFilename: input.originalFilename,
     languageCode: languageCode ?? null,
     title: sourceRow?.title ?? input.linkedEvent?.title?.slice(0, 300) ?? null,
-    gmeetContext: multi
-      ? {
-          ...(gmeetContext ?? {}),
-          uploadGroup: {
-            id: multi.group,
-            total: multi.total,
-            parts: [
-              {
-                index: 1,
-                tempFilename,
-                originalFilename: input.originalFilename ?? undefined,
-                comment: multi.comment,
-              },
-            ],
-          },
-        }
-      : input.contextExtra
-        ? { ...(gmeetContext ?? {}), ...input.contextExtra }
-        : gmeetContext,
-    bytesTotal: input.bytesTotal,
+    gmeetContext: placeholderContext,
+    // A group declares the whole recording's size once (P2); a single file is
+    // its own total.
+    bytesTotal: multi?.groupBytes ?? input.bytesTotal,
     scratch,
   });
   // Same "throw them in" rule as the Meet import: internal invitees on the
@@ -424,7 +545,13 @@ export async function finalizeUpload(
       { uploadGroup: { ...group, parts } },
       { quiet: true }
     );
-    await updateUploadProgress(user.userId, groupRow.assemblyai_id, bytes).catch(() => {});
+    // P2: the listing's number is "bytes of the whole recording received",
+    // never this part's — `parts` already carries every landed part's bytes.
+    await updateUploadProgress(
+      user.userId,
+      groupRow.assemblyai_id,
+      groupProgressBytes({ ...group, parts })
+    ).catch(() => {});
 
     if (multi.index < multi.total) {
       return { status: 201, body: { transcript: groupRow } };
@@ -512,16 +639,29 @@ export async function finalizeUpload(
     }
   }
 
-  // Final progress write so viewers see 100% while the AAI re-upload leg runs.
-  await updateUploadProgress(user.userId, placeholderId, bytes).catch(() => {});
-
   if (multi) {
     // Part 1 of a multi-file group: the bytes are parked, the group marker
-    // is on the placeholder — ingest waits for the last part.
+    // is on the placeholder — ingest waits for the last part. Record this
+    // part's bytes on the group (atomically — siblings finalize in parallel)
+    // so every later progress write can add them up (P2).
+    const ctx = await setUploadPartBytesForUser(
+      user.userId,
+      placeholderId,
+      multi.index,
+      bytes
+    ).catch(() => null);
+    await updateUploadProgress(
+      user.userId,
+      placeholderId,
+      ctx?.uploadGroup ? groupProgressBytes(ctx.uploadGroup) : bytes
+    ).catch(() => {});
     const row = await getForUser(user.userId, placeholderId);
     if (!row) return { status: 404, body: { error: 'Upload placeholder vanished' } };
     return { status: 201, body: { transcript: row } };
   }
+
+  // Final progress write so viewers see 100% while the AAI re-upload leg runs.
+  await updateUploadProgress(user.userId, placeholderId, bytes).catch(() => {});
 
   // Shared tail: AAI upload (disk-streamed) → vocab-biased submit → DB row
   // (placeholder promoted in place) → rename temp file to its permanent

@@ -42,7 +42,16 @@ export interface ChunkedUploadParams {
   linkedEvent?: unknown | null;
   reportPref?: string | null;
   sourceId?: string | null;
-  multi?: { group: string; index: number; total: number; comment?: string } | null;
+  multi?: {
+    group: string;
+    index: number;
+    total: number;
+    comment?: string;
+    /** Sum of every part's size. Declared on part 1 so the listing's
+     * "x of y" is the whole recording's, not part 1's
+     * (docs/recorder-upload-ux.md P2). */
+    groupBytes?: number;
+  } | null;
   /** Temporary transcript (migration 042): out of the archive, under the
    * Temporary tab, auto-trashed after 30 days. Server ignores it when
    * `linkedEvent` is set. */

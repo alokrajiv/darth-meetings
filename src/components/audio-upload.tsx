@@ -342,6 +342,10 @@ export function AudioUpload({ onTranscriptCreated }: AudioUploadProps) {
       index: number;
       total: number;
       comment?: string;
+      /** Sum of every part's size — the server stamps it on the placeholder so
+       * the listing's "N of M bytes" is about the whole meeting, not part 1
+       * (docs/recorder-upload-ux.md P2). */
+      groupBytes?: number;
       progressFile: File;
       base: number;
       span: number;
@@ -358,7 +362,13 @@ export function AudioUpload({ onTranscriptCreated }: AudioUploadProps) {
         linkedEvent: linked,
         reportPref: pref !== 'summary' ? pref : null,
         multi: multi
-          ? { group: multi.group, index: multi.index, total: multi.total, comment: multi.comment }
+          ? {
+              group: multi.group,
+              index: multi.index,
+              total: multi.total,
+              comment: multi.comment,
+              groupBytes: multi.groupBytes,
+            }
           : null,
         scratch: temporary && !linked,
       },
@@ -447,6 +457,7 @@ export function AudioUpload({ onTranscriptCreated }: AudioUploadProps) {
           index: i + 1,
           total: files.length,
           comment: comments[i]?.trim() || undefined,
+          groupBytes: totalBytes,
           progressFile,
           base: (doneBytes / totalBytes) * 50,
           span: (file.size / totalBytes) * 50,
@@ -1067,7 +1078,10 @@ export function AudioUpload({ onTranscriptCreated }: AudioUploadProps) {
       </div>
 
       <Dialog open={isDialogOpen} onOpenChange={(o) => !o && handleCancelUpload()}>
-        <DialogContent className="rounded-xl shadow-[0_4px_16px_-2px_rgb(0_0_0/0.08),0_1px_2px_0_rgb(0_0_0/0.04)]">
+        {/* max-h + scroll: the 'pick' step grows with the Recorder list and the
+            paste lane, and a dialog taller than the viewport had no way to
+            scroll at all (2026-09-21). */}
+        <DialogContent className="max-h-[88vh] overflow-y-auto rounded-xl shadow-[0_4px_16px_-2px_rgb(0_0_0/0.08),0_1px_2px_0_rgb(0_0_0/0.04)]">
           <DialogHeader>
             <DialogTitle className="text-base font-semibold">
               {step === 'connect' && 'Connect Google Calendar first'}
@@ -1264,11 +1278,14 @@ export function AudioUpload({ onTranscriptCreated }: AudioUploadProps) {
                               The recorder uploads these itself — the file never passes through this
                               tab.
                               {prefill && selectedEvent
-                                ? ' It will be linked to the meeting above.'
+                                ? ` The recorder links it to ${selectedEvent.summary ? `“${selectedEvent.summary}”` : 'the meeting above'}.`
                                 : ''}
                             </p>
                             <RecorderRecordings
                               linkedEvent={prefill ? buildLinkedEvent() : null}
+                              pinEventId={selectedEvent?.id ?? null}
+                              showUploaded={false}
+                              limit={8}
                               onUploadStarted={(r) =>
                                 setRecorderSent(r.call?.title || r.started_at || 'the recording')
                               }

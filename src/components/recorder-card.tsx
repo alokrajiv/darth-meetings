@@ -212,7 +212,9 @@ export function RecorderCard() {
                   <Badge variant="secondary">{c.recordingsPendingUpload} to upload</Badge>
                 ) : null}
               </p>
-              <RecorderRecordings limit={6} />
+              {/* Settings is the history of this Mac: uploaded rows stay in
+                  view (the upload picker hides them behind a count instead). */}
+              <RecorderRecordings limit={6} showUploaded />
             </div>
 
             <p className="flex flex-wrap items-center gap-2 border-t pt-3 text-xs text-muted-foreground" data-recorder-version>

@@ -13,6 +13,7 @@ import {
   openUpload,
   parseMultiParams,
   parseReportPref,
+  recorderMatchIsConfident,
   sanitizeLinkedEvent,
   textDocRejection,
 } from '@/lib/server/upload-pipeline';
@@ -28,11 +29,23 @@ export const runtime = 'nodejs';
  * POST /api/uploads — open (or resume) a chunked upload session.
  *
  * Body (JSON): { fingerprint, size, filename, contentType?, languageCode?,
- *   linkedEvent?, reportPref?, sourceId?, multi?: {group,index,total,comment},
+ *   linkedEvent?, reportPref?, sourceId?,
+ *   multi?: {group,index,total,comment,groupBytes},
  *   scratch?: true (temporary transcript, migration 042 — ignored when a
  *   calendar event is linked),
  *   via?: 'blob', sha256?, coarse? (darth uploads — below),
  *   recorderRecordingId? (Darth Recorder registry row these bytes came from) }
+ *
+ * `multi.groupBytes` (optional, ≥ this part's size) is the sum of every
+ * part's size: the group row is born with it as `upload_bytes_total`, so the
+ * listing's "x of y" is about the whole recording instead of part 1
+ * (docs/recorder-upload-ux.md §2.1/2.2).
+ *
+ * `recorderRecordingId` with no `linkedEvent`/`eventRef`: when the recorder
+ * matcher already tied that recording to a calendar occurrence confidently
+ * (score ≥ 0.6, overlap ≥ 0.5) the placeholder is linked to it here — one
+ * meeting, one row, from the first byte (P1). Never a 4xx: an unresolvable
+ * match just leaves the upload unlinked.
  *
  * Same user + same fingerprint + same size while a session is still open →
  * that session comes back with the chunks already acknowledged, so the
@@ -107,10 +120,18 @@ export const POST = withAuth(async ({ user, request }) => {
   const coarse = body.coarse === true;
   // The Darth Recorder registry row (migration 041): must be the caller's own.
   let recorderRecordingId: string | null = null;
+  let recorderMatch: { key: string; score: number; overlap: number } | null = null;
   if (typeof body.recorderRecordingId === 'string' && body.recorderRecordingId) {
     const rec = await getOwnRecording(user.userId, body.recorderRecordingId).catch(() => null);
     if (!rec) return NextResponse.json({ error: 'Recorder recording not found' }, { status: 404 });
     recorderRecordingId = rec.id;
+    if (recorderMatchIsConfident(rec.matched) && rec.matched) {
+      recorderMatch = {
+        key: rec.matched.event_key,
+        score: rec.matched.score,
+        overlap: rec.matched.overlap,
+      };
+    }
   }
   const rawMulti = body.multi as Record<string, unknown> | undefined | null;
   const multi = rawMulti
@@ -119,10 +140,43 @@ export const POST = withAuth(async ({ user, request }) => {
         index: rawMulti.index as string | number | null,
         total: rawMulti.total as string | number | null,
         comment: typeof rawMulti.comment === 'string' ? rawMulti.comment : null,
+        groupBytes: rawMulti.groupBytes as string | number | null,
       })
     : undefined;
   if (multi === null) {
     return NextResponse.json({ error: 'Invalid multi-upload parameters' }, { status: 400 });
+  }
+  if (multi?.groupBytes !== undefined && multi.groupBytes < size) {
+    return NextResponse.json(
+      { error: `multi.groupBytes (${multi.groupBytes}) must be at least this part's size (${size})` },
+      { status: 400 }
+    );
+  }
+
+  // P1 — one meeting, one row, from the first byte: a Darth Recorder
+  // recording the matcher already tied to a calendar occurrence with
+  // confidence is linked here, so the placeholder is born with the event's
+  // title, date, attendees and auto-shares and the calendar row folds
+  // immediately. Only part 1 of a group carries the link (later parts land
+  // on its row). A resolver failure leaves the upload unlinked — the manual
+  // "link the calendar event" path still works — and is never a 4xx.
+  if (!linkedEvent && recorderMatch && !(multi && multi.index > 1)) {
+    const resolved = await resolveLinkedEventRef(user.userId, recorderMatch.key).catch((err) => ({
+      ok: false as const,
+      status: 500,
+      error: String(err),
+    }));
+    if (resolved.ok) {
+      linkedEvent = resolved.event;
+      console.log(
+        `[uploads] auto-linked ${recorderRecordingId} → ${recorderMatch.key} ` +
+          `(score ${recorderMatch.score}, overlap ${recorderMatch.overlap})`
+      );
+    } else {
+      console.warn(
+        `[uploads] auto-link of ${recorderRecordingId} → ${recorderMatch.key} failed: ${resolved.error}`
+      );
+    }
   }
 
   const rejected = textDocRejection(originalFilename, contentType);

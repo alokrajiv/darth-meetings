@@ -14,6 +14,42 @@ Native macOS side of Darth Meetings recording (the "Swift tray" angle from Darth
 the user switched it off in the menu (`loginItemUserChoice` in UserDefaults records an explicit choice;
 the default never overrides it). macOS may show "Darth Recorder was added as a login item" once.
 
+**0.3.9 (2026-09-21) — the tray says where the bytes are** (design: `docs/recorder-upload-ux.md`
+§0–3). Until now a 696 MB / 6-part upload showed a 12-second "Uploading to Darth Meetings…" card
+and then nothing at all, while the web read part 1's size as the whole recording's.
+
+- **Progress is about the RECORDING, never a session** (P2). `Uploader.onProgress` hands over an
+  `UploadProgress {id, segment, segmentsTotal, bytesSent, bytesTotal, pct}` — bytes of the whole
+  multi-part recording — throttled to **one callback per 500 ms per recording** (the first tick and
+  the tick that finishes a file always pass). The open body now carries `multi.groupBytes` (the sum
+  of every part's size), so the server's placeholder row is born knowing the real total.
+- **Menu line** under the status line (`uploadLine`, hidden when there is nothing to say):
+  `Uploading “Alok <> Paola – Post SG…” · 43% · 298 MB of 696 MB · part 3 of 6` while bytes move
+  (updated by `refreshUploadLine()` alone, never a full `refreshMenu()` twice a second) →
+  `Uploaded “…” — transcribing · Open transcript` (opens `PWA_URL/transcript/<id>`, kept 10 min or
+  until the next upload) → `Upload failed “…” — Retry now` (kept 35 min, re-runs the upload).
+  Title = `matched.title` → the call's window title → the started-at date, clipped to 40 chars.
+- **Menu-bar glyph** gains `StatusIcon.State.uploading`: the plain template bars with a small
+  up-arrow knocked out top-right. Precedence recording > uploading > call detected > idle;
+  `discreet` still flattens everything to the plain glyph.
+- **Banner** — the saved card IS the upload card: "Recording saved (44m 31s, 6 parts)" /
+  "Uploading to Darth Meetings — 43% · 298 MB of 696 MB", **no auto-hide**, **Show file** / OK, and
+  `updateUpload(progress:)` rewrites the sub line in place (only while that recording's card is the
+  one on screen). It ends as `showUploaded` ("Uploaded — transcribing now" / "“…” · 44m 31s ·
+  696 MB in 1m 40s", **Open** / OK, 20 s) or `showUploadFailed` ("Upload failed — retrying in
+  30 min" / the error, **Retry now** / OK, no auto-hide). An upload that did not come from a
+  recording we just saved (PWA Upload, the 30-minute retry timer, the launch drain) gets the same
+  live card via `showUploading(title:bytesTotal:recordingId:)`.
+- **ws contract** (tray 0.3.9+, older trays simply omit the new fields):
+  - `upload_progress {recording_id, segment, segments_total, bytes_sent, bytes_total, pct, title}`
+    — ≥ 500 ms apart per recording, which is the ≤ 2/s the PWA's companion client promises.
+  - `upload_done {recording_id, transcript_id, bytes_total, seconds}` (`seconds` = wall clock of
+    the whole upload). The `upload_done` event in `events.jsonl` carries `bytes` + `seconds` too.
+  - `upload_failed` unchanged.
+  - every status payload gains
+    `upload: {recording_id, title, pct, bytes_sent, bytes_total, segment, segments_total} | null`
+    for the newest in-flight upload, so a PWA that connects mid-upload sees it.
+
 **0.3.8 (2026-09-19) — delete from this Mac:** ws `delete_recording {recording_id}` →
 `recording_deleted {recording_id, files_removed | error}`. Removes the recording's files and its
 `~/Movies/Darth Recorder/<id>/` folder, keeps the registry row as `deleted` (PATCHed to the
