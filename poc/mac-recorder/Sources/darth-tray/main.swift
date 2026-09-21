@@ -4,7 +4,7 @@ import ScreenCaptureKit
 import ServiceManagement
 import RecorderCore
 
-let VERSION = "0.3.11"
+let VERSION = "0.3.12"
 let WS_PORT: UInt16 = 47800
 let PWA_URL = URL(string: "https://meetings.darth-internal.trames.io/")!
 /// Seconds between "the call ended" and an automatic stop.

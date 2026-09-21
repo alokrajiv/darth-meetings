@@ -8,6 +8,9 @@
  *     progress is about the whole recording, never the part in flight (the
  *     2026-09-21 "77% · 12.1 MB of 15 MB" on a 696 MB, 6-part upload).
  *   - `parseMultiParams` — `multi.groupBytes` validation.
+ *   - `parseUploadTracks` — the tray's `tracks: {count, mixFirst}` declaration
+ *     (0.3.12), which is what lets a recorder upload take the blob fast path
+ *     (DEC-1, docs/recordings-blob-spec.md).
  *
  * upload-pipeline.ts is a `server-only` module that pulls db-ops in: the
  * import is stubbed so these pure functions can be tested without a
@@ -21,6 +24,7 @@ const {
   groupBytesBefore,
   groupProgressBytes,
   parseMultiParams,
+  parseUploadTracks,
   recorderMatchIsConfident,
   RECORDER_AUTOLINK_MIN_OVERLAP,
   RECORDER_AUTOLINK_MIN_SCORE,
@@ -169,5 +173,36 @@ describe('parseMultiParams groupBytes', () => {
     });
     expect(parseMultiParams({ group: 'zz', index: 1, total: 2 })).toBeNull();
     expect(parseMultiParams({})).toBeUndefined();
+  });
+});
+
+describe('parseUploadTracks (the tray\'s track declaration)', () => {
+  test('absent is absent — every client but the tray, and every tray before 0.3.12', () => {
+    expect(parseUploadTracks(undefined)).toBeUndefined();
+    expect(parseUploadTracks(null)).toBeUndefined();
+  });
+
+  test('a well-formed declaration comes through as it was said', () => {
+    expect(parseUploadTracks({ count: 3, mixFirst: true })).toEqual({ count: 3, mixFirst: true });
+    expect(parseUploadTracks({ count: 2, mixFirst: false })).toEqual({ count: 2, mixFirst: false });
+    // The count is informational: a client that does not know says 0 (or nothing).
+    expect(parseUploadTracks({ mixFirst: true })).toEqual({ count: 0, mixFirst: true });
+    expect(parseUploadTracks({ count: 0, mixFirst: false })).toEqual({ count: 0, mixFirst: false });
+  });
+
+  test('junk is null (a 400), never a silently dropped promise', () => {
+    // mixFirst is the load-bearing half: it must be a real boolean.
+    expect(parseUploadTracks({ count: 3 })).toBeNull();
+    expect(parseUploadTracks({ count: 3, mixFirst: 'true' })).toBeNull();
+    expect(parseUploadTracks({ count: 3, mixFirst: 1 })).toBeNull();
+    // ...and a count that is not a plausible track count.
+    expect(parseUploadTracks({ count: -1, mixFirst: true })).toBeNull();
+    expect(parseUploadTracks({ count: 1.5, mixFirst: true })).toBeNull();
+    expect(parseUploadTracks({ count: '3', mixFirst: true })).toBeNull();
+    expect(parseUploadTracks({ count: 1e9, mixFirst: true })).toBeNull();
+    // Not an object at all.
+    expect(parseUploadTracks(true)).toBeNull();
+    expect(parseUploadTracks('mixFirst')).toBeNull();
+    expect(parseUploadTracks([{ count: 3, mixFirst: true }])).toBeNull();
   });
 });

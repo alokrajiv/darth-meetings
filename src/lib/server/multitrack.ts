@@ -11,10 +11,10 @@ const EXEC_OPTS = { timeout: 30 * 60_000, maxBuffer: 16 * 1024 * 1024 };
 /**
  * Multi-track recordings.
  *
- * Darth Recorder writes one mp4 per segment with THREE tracks: video, the
- * system audio (what the other participants said, stereo, lang `mul`) and the
- * microphone (the recording user, mono, lang `eng`) — deliberately never mixed
- * at capture so either can be used on its own later.
+ * Darth Recorder writes one mp4 per segment carrying video, the system audio
+ * (what the other participants said, stereo, lang `mul`) and the microphone
+ * (the recording user, mono, lang `eng`) as separate tracks, so either side of
+ * a call can still be used on its own later.
  *
  * Every consumer downstream reads exactly ONE audio stream: AssemblyAI takes
  * the file's default track, the browser <video> plays the default track,
@@ -23,6 +23,12 @@ const EXEC_OPTS = { timeout: 30 * 60_000, maxBuffer: 16 * 1024 * 1024 };
  * 2026-09-16 on a real Slack huddle): the transcript carried only the other
  * side — 484 words instead of 1429 — and the recording user was silent on
  * playback too.
+ *
+ * Since tray 0.3.12 the recorder writes that mix ITSELF, live, as the first
+ * audio track of every file (`LiveMix.swift`); such a file is recognised here
+ * (`isMixTrack`) and never mixed again — the mix is simply extracted for
+ * AssemblyAI. Everything below is what happens to a file that arrives without
+ * one: every recording made before 0.3.12, and any other multi-track file.
  *
  * `normalizeMultiTrack` fixes that once, at ingest, for any file with two or
  * more audio streams:
@@ -54,8 +60,24 @@ export interface AudioStreamInfo {
  * the mix back in with the raw tracks. */
 export const MIX_TRACK_TITLE = 'darth-mix';
 
+/**
+ * The same thing, said in the only way the TRAY can say it (0.3.12).
+ * `AVAssetWriter` writes neither a handler name nor a per-track title that
+ * survives into the file — both were tried, and ffprobe reports
+ * `handler_name=Core Media Audio` and no title at all (verified 2026-09-22) —
+ * but it does write `languageCode`, which is what the recorder has always
+ * abused as a track label (`mul` = system, `eng` = mic). `qaa`–`qtz` is the
+ * ISO 639-2 range RESERVED FOR LOCAL USE, so `qmx` cannot collide with a real
+ * language on a real recording. `LiveMix.languageCode` is the other end.
+ */
+export const MIX_TRACK_LANGUAGE = 'qmx';
+
 export function isMixTrack(s: AudioStreamInfo): boolean {
-  return s.handler === MIX_TRACK_TITLE || s.title === MIX_TRACK_TITLE;
+  return (
+    s.handler === MIX_TRACK_TITLE ||
+    s.title === MIX_TRACK_TITLE ||
+    s.language === MIX_TRACK_LANGUAGE
+  );
 }
 
 export async function probeAudioStreams(filename: string): Promise<AudioStreamInfo[]> {
@@ -117,8 +139,10 @@ export async function normalizeMultiTrack(tempFilename: string): Promise<MultiTr
   const mixAbs = resolveAudioPath(mixName);
   const remuxTmp = `${src}.remux.tmp`;
 
-  // Already normalised (ingest retry of a kept-failure row): the mix is
-  // track 0 — just pull it out for AssemblyAI, never mix again.
+  // The mix is already track 0 — this pass has run before (ingest retry of a
+  // kept-failure row), or the tray wrote it live (0.3.12). Just pull it out
+  // for AssemblyAI; never mix a mix back in with the raw tracks, and never
+  // touch the stored file, whose track order is already right.
   if (isMixTrack(streams[0])) {
     try {
       await execFileP(

@@ -120,6 +120,16 @@ final class Uploader: NSObject, URLSessionTaskDelegate {
             return
         }
         let sizes = files.map { (try? FileManager.default.attributesOfItem(atPath: $0.path)[.size] as? Int) ?? 0 }
+        // 0.3.12: does every segment of THIS recording carry the live mix as its first audio
+        // track? Read off the row the recording controller wrote, never assumed from the tray's
+        // version — a recording made by an older tray is still on this Mac and its files still
+        // start with the raw system track. Absent (every pre-0.3.12 row) reads as false.
+        let mixFirst = (row["mix_first"] as? Bool) ?? false
+        // How many audio tracks each segment carries — the mix, when there is one, plus the raw
+        // sources. Written by the recording controller from the writer it actually built (the
+        // microphone can be denied after the options were chosen); 0 on a row that predates it,
+        // which says "I do not know" and is exactly as informational as it sounds.
+        let audioTracks = (row["audio_tracks"] as? Int) ?? 0
         let total = sizes.reduce(0, +)
         guard total > 0 else {
             finish(id, error: "the recording is empty (0 bytes) — nothing to upload")
@@ -154,6 +164,7 @@ final class Uploader: NSObject, URLSessionTaskDelegate {
             for (i, file) in files.enumerated() {
                 let result = self.putOne(file: file, size: sizes[i], sha256: hashes[i], partHashes: hashes,
                                          recordingId: id, linkedEvent: linkedEvent,
+                                         mixFirst: mixFirst, audioTracks: audioTracks,
                                          group: group, index: i + 1, total: files.count, groupBytes: total) { sent in
                     // The web's socket comment promises ≤ 2 upload_progress a second (the 0.2.x
                     // tray sent ~40 in 3 s); the tick that finishes a file always goes through.
@@ -252,6 +263,7 @@ final class Uploader: NSObject, URLSessionTaskDelegate {
     /// `upload(recordingId:)` before the first byte.
     private func putOne(file: URL, size: Int, sha256: String, partHashes: [String],
                         recordingId: String, linkedEvent: [String: Any]?,
+                        mixFirst: Bool, audioTracks: Int,
                         group: String?, index: Int, total: Int, groupBytes: Int,
                         progress: @escaping (Int64) -> Void) -> PutResult {
         let t0 = Date()
@@ -271,6 +283,13 @@ final class Uploader: NSObject, URLSessionTaskDelegate {
                 // 0.3.11: we understand a {duplicate} answer. Without this the server keeps
                 // today's behaviour for us — it is what version-gates the whole feature.
                 "dupAware": true,
+                // 0.3.12: what the audio tracks of THIS file are. `mixFirst` is the promise
+                // that track 0 is the whole recording — the live mix (`LiveMix`) with two
+                // sources, or the only source when there is one — so the server may hand the
+                // bytes straight to AssemblyAI instead of pulling them to the VM to mix them
+                // (DEC-1 in docs/recordings-blob-spec.md). False whenever that is not certain,
+                // which sends the upload down the pull path exactly as before.
+                "tracks": ["count": audioTracks, "mixFirst": mixFirst],
             ]
             if let linkedEvent, index == 1 { body["linkedEvent"] = linkedEvent }
             if let group {

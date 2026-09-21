@@ -27,6 +27,7 @@ import { redactSasInText } from '@/lib/server/media-serve';
 import { createDownloadSas, type BlobLike } from '@/lib/server/darth-uploads';
 import { uploadsStore } from '@/lib/server/darth-uploads-store';
 import { ensureFaststart } from '@/lib/server/media-faststart';
+import { isMixTrack, normalizeMultiTrack, probeAudioStreams } from '@/lib/server/multitrack';
 import {
   attachSeriesForRow,
   createOrPromoteRow,
@@ -53,7 +54,7 @@ import {
   setLocalAudioPathForUser,
   type TranscriptRow,
 } from '@/db-ops/transcripts';
-import type { BlobCopyIntent, UploadSpec } from '@/lib/server/upload-pipeline';
+import type { BlobCopyIntent, UploadSpec, UploadTracks } from '@/lib/server/upload-pipeline';
 import type { GmeetContext } from '@/lib/format';
 
 /**
@@ -89,9 +90,10 @@ import type { GmeetContext } from '@/lib/format';
  *    placeholder promotion (`canonicalKeyOf`);
  *  - the lifecycle canary (Stage A.4) — permanent bytes never go into a
  *    container that is eating blobs.
- * And per upload: a single file (a group is stitched on the VM first), NOT a
- * Darth Recorder upload (DEC-1 / multi-track, see `blobFastPathRefusal`), a
- * verified sha256, and a known file extension.
+ * And per upload: a single file (a group is stitched on the VM first), not a
+ * Darth Recorder upload unless it declares `tracks.mixFirst` (DEC-1 /
+ * multi-track, see `blobFastPathRefusal`), a verified sha256, and a known file
+ * extension.
  *
  * SAS HYGIENE: the URL handed to AssemblyAI is a bearer credential for that
  * one blob for six hours. It is never stored (`transcripts.audio_url` is left
@@ -145,6 +147,12 @@ export interface BlobFastPathInput {
   multi: boolean;
   /** `UploadSpec.recorderRecordingId`, or the placeholder's recorder marker. */
   fromRecorder: boolean;
+  /**
+   * `UploadSpec.tracks` — what the client said its audio tracks are. Only the
+   * tray sends it; null/absent for everyone else (and for every tray before
+   * 0.3.12).
+   */
+  tracks: UploadTracks | null;
   /** The session's whole-file sha256 (a blob session always has one). */
   sha256: string | null;
   size: number;
@@ -156,22 +164,31 @@ export interface BlobFastPathInput {
  * Why this upload may NOT take the fast path, or null when it may. Pure, so
  * the rules are testable without a store, a row or an account.
  *
- * **The multi-track rule (DEC-1).** `normalizeMultiTrack` re-muxes a Darth
- * Recorder file so the MIX is track 0 before AssemblyAI ever hears it; a
- * multi-track file handed over as-is is transcribed from whichever track the
- * decoder picks — the incident of 2026-09-16, where a Slack huddle came back
- * with 484 words instead of 1429 because only the system track was heard.
- * Whether a file is multi-track cannot be known without probing the bytes, and
- * the whole point of this stage is not to have the bytes. The tray is the only
- * producer of multi-track files, and it identifies itself on every upload
- * (`recorderRecordingId` at open, or `gmeet_context.recorder`), so every
- * recorder upload takes the pull path — where the mix-down happens as it
- * always has. When the tray later declares `multiTrack: false` at open, this
- * is the one line that changes.
+ * **The multi-track rule (DEC-1).** A multi-track file handed over as-is is
+ * transcribed from whichever track the decoder picks — the incident of
+ * 2026-09-16, where a Slack huddle came back with 484 words instead of 1429
+ * because only the system track was heard. Whether a file is multi-track
+ * cannot be known without probing the bytes, and the whole point of this stage
+ * is not to have the bytes; the tray is the only producer of such files and it
+ * identifies itself on every upload (`recorderRecordingId` at open, or
+ * `gmeet_context.recorder`).
+ *
+ * So the tray has to SAY so. Since 0.3.12 it writes the mix itself, live, as
+ * audio track 0 of every file (`LiveMix.swift`) and declares
+ * `tracks: {count, mixFirst: true}` at open — per file, off the registry row
+ * the recording controller wrote, never off its own version, because older
+ * recordings are still on that Mac. With that promise there is nothing left
+ * for the VM to do to the audio and the upload may take the fast path; without
+ * it — an older tray, a recording whose mix could not hear every source, any
+ * client that says nothing — the refusal stands and the pull path mixes the
+ * file down exactly as it always has. The promise is checked once the bytes
+ * land (`fetchLocalCopy`), which is the earliest moment anyone can.
  */
 export function blobFastPathRefusal(i: BlobFastPathInput): string | null {
   if (i.multi) return 'a multi-file group is stitched on the VM first';
-  if (i.fromRecorder) return 'a Darth Recorder upload may be multi-track (DEC-1)';
+  if (i.fromRecorder && i.tracks?.mixFirst !== true) {
+    return 'a Darth Recorder upload may be multi-track and this one does not declare tracks.mixFirst (DEC-1)';
+  }
   if (!i.sha256) return 'the session has no verified sha256';
   if (!(i.size > 0)) return 'the session has no size';
   if (i.storedFilename.endsWith('.bin')) {
@@ -238,6 +255,7 @@ export async function planBlobIngest(
   const refusal = blobFastPathRefusal({
     multi: !!session.spec.multi,
     fromRecorder: !!session.spec.recorderRecordingId || !!row.gmeet_context?.recorder,
+    tracks: session.spec.tracks ?? null,
     sha256: session.sha256,
     size: session.size,
     storedFilename: filename,
@@ -648,12 +666,13 @@ async function fetchLocalCopy(p: LocalCopyInput): Promise<LocalCopyOutcome> {
   // preparation can run. Faststart FIRST and awaited, because it rewrites the
   // file in place — after which the blob is no longer these bytes.
   queueRecordingGraphSync(p.userId, p.meetingId, 'aai-from-blob/landed');
-  let remuxed = false;
+  // The declared track order, checked against the bytes at last (see verifyMixFirst).
+  let remuxed = await verifyMixFirst(p);
   const fast = await ensureFaststart(p.filename).catch((err) => ({
     status: 'error' as const,
     error: String(err),
   }));
-  if (fast.status === 'remuxed') {
+  if (fast.status === 'remuxed' || remuxed) {
     remuxed = true;
     await reArchiveAfterRemux(p).catch((err) =>
       console.warn(`[aai-from-blob] ${p.meetingId}: re-archive after the remux failed:`, err)
@@ -674,6 +693,56 @@ async function fetchLocalCopy(p: LocalCopyInput): Promise<LocalCopyOutcome> {
       (remuxed ? ' (faststart remuxed → re-archived)' : '')
   );
   return { status: 'landed', bytes, ms, remuxed };
+}
+
+/**
+ * The bytes AssemblyAI is reading, checked at last: is audio track 0 really
+ * the mix?
+ *
+ * Taking the fast path with a multi-track file rests on a CLIENT's promise
+ * (`tracks.mixFirst`, DEC-1) and this is the first moment anyone here can look
+ * at the file itself. Normally the probe says yes and there is nothing to do —
+ * the stored file's track order is already what `normalizeMultiTrack` would
+ * have produced, so the pass is SKIPPED rather than run to no effect.
+ *
+ * A no: the promise was wrong (a tray bug, a file the recorder did not write).
+ * The transcript is already being made from whichever track the decoder picked
+ * and cannot be helped from here, but the file people will play, re-transcribe
+ * and cut clips from can be, so the ordinary mix-down runs on it — which
+ * rewrites the file, exactly like a faststart remux, hence the `true` return
+ * that makes the caller re-archive. Loud, because it means a client is lying
+ * to the fast path.
+ *
+ * Never throws: ffprobe/ffmpeg trouble leaves the file as it is.
+ */
+async function verifyMixFirst(p: LocalCopyInput): Promise<boolean> {
+  let streams;
+  try {
+    streams = await probeAudioStreams(p.filename);
+  } catch (err) {
+    console.warn(`[aai-from-blob] ${p.meetingId}: could not probe the landed copy:`, err);
+    return false;
+  }
+  if (streams.length < 2) return false;
+  if (isMixTrack(streams[0])) {
+    console.log(
+      `[aai-from-blob] ${p.meetingId}: ${streams.length} audio tracks, track 0 is the mix as declared — nothing to normalise`
+    );
+    return false;
+  }
+  console.error(
+    `[aai-from-blob] ${p.meetingId}: DECLARED mixFirst but the landed file's track 0 is not the mix ` +
+      `(${streams.length} audio tracks, lang ${streams[0].language ?? '?'}) — AssemblyAI heard one track; ` +
+      `mixing the stored file down so playback and any re-transcribe are whole`
+  );
+  try {
+    const mt = await normalizeMultiTrack(p.filename);
+    if (mt.mixed) await deleteAudioFile(mt.aaiSource).catch(() => {});
+    return mt.mixed;
+  } catch (err) {
+    console.warn(`[aai-from-blob] ${p.meetingId}: the repair mix failed:`, err);
+    return false;
+  }
 }
 
 /**

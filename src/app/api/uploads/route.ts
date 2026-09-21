@@ -13,6 +13,7 @@ import {
   openUpload,
   parseMultiParams,
   parseReportPref,
+  parseUploadTracks,
   recorderMatchIsConfident,
   sanitizeLinkedEvent,
   textDocRejection,
@@ -37,7 +38,8 @@ export const runtime = 'nodejs';
  *   scratch?: true (temporary transcript, migration 042 — ignored when a
  *   calendar event is linked),
  *   via?: 'blob', sha256?, coarse? (darth uploads — below),
- *   recorderRecordingId? (Darth Recorder registry row these bytes came from) }
+ *   recorderRecordingId? (Darth Recorder registry row these bytes came from),
+ *   tracks?: {count, mixFirst} (what the file's audio tracks are — below) }
  *
  * `multi.groupBytes` (optional, ≥ this part's size) is the sum of every
  * part's size: the group row is born with it as `upload_bytes_total`, so the
@@ -68,6 +70,15 @@ export const runtime = 'nodejs';
  * session re-mints the SAS on the SAME blob (the client asks Azure for the
  * uncommitted block list itself). `coarse: true` (a phone) halves the
  * parallelism.
+ *
+ * `tracks` (Darth Recorder 0.3.12): `{count, mixFirst}` describing the file's
+ * audio tracks, frozen on the session. `mixFirst: true` is the client's
+ * promise that audio track 0 is the WHOLE recording — the tray's live mix, or
+ * the only source when there is one — which is what lets a recorder upload
+ * hand its bytes to AssemblyAI where they lie instead of being pulled to the
+ * VM and mixed there (DEC-1, docs/recordings-blob-spec.md). Absent = unknown,
+ * and nothing changes; malformed = 400, because a client that meant to make
+ * the promise should not silently lose it.
  *
  * The same file, again (MW_SAME_FILE_CHECK, docs/recordings-same-file-spec.md):
  * a client that says `dupAware: true` may get ONE other 200 answer,
@@ -132,6 +143,13 @@ export const POST = withAuth(async ({ user, request }) => {
     );
   }
   const coarse = body.coarse === true;
+  const tracks = parseUploadTracks(body.tracks);
+  if (tracks === null) {
+    return NextResponse.json(
+      { error: 'Invalid tracks (expected {count: non-negative integer, mixFirst: boolean})' },
+      { status: 400 }
+    );
+  }
   // The Darth Recorder registry row (migration 041): must be the caller's own.
   let recorderRecordingId: string | null = null;
   let recorderMatch: { key: string; score: number; overlap: number } | null = null;
@@ -296,8 +314,10 @@ export const POST = withAuth(async ({ user, request }) => {
     scratch,
     recorderRecordingId,
     // Frozen on the session: the chunk path's check runs at COMPLETE, where
-    // this request's body is long gone.
+    // this request's body is long gone. So does the track declaration, which
+    // Stage C reads at complete time.
     dupAware: wantsDuplicateAnswer(body),
+    tracks,
   });
   if (!opened.ok) return NextResponse.json({ error: opened.error }, { status: opened.status });
 

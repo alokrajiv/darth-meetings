@@ -278,6 +278,15 @@ final class RecordingController {
     private var lastVideoWriter: ObjectIdentifier?
     private var videoFramesTotal = 0
     private var videoDupTotal = 0
+    /// 0.3.12: does EVERY segment of this recording carry the live mix as its first audio
+    /// track, and did that mix really hear both sources? Set when the first writer is built
+    /// and ANDed with each segment's verdict as it closes; written to the registry as
+    /// `mix_first`, which is what the uploader declares (`tracks.mixFirst`). False the moment
+    /// one segment had no mix (a recording with a single source) or a mix that missed one.
+    private var mixFirstOK = false
+    /// 0.3.12: audio tracks per segment file — the mix (when there is one) plus the raw
+    /// sources. Declared at upload as `tracks.count`.
+    private var audioTrackCount = 0
     private var flags: [String: Bool] = [:]   // track → ok, transitions drive events/callback
     private var healthTicks = 0
     private var micDenied = false
@@ -636,6 +645,10 @@ final class RecordingController {
         rec.onWriterFailure = { [weak self] err in self?.writerFailed(err) }
         rec.onPreviewFrame = { [weak self] pb in self?.onPreviewFrame?(pb) }
         setWriter(rec)
+        // 0.3.12: with two sources the file's first audio track is the live mix; each segment's
+        // verdict is ANDed in as it closes (`closeSegment`).
+        mixFirstOK = rec.hasMix
+        audioTrackCount = tracks.count + (rec.hasMix ? 1 : 0)
         segmentIndex = 1
         segmentStart = Date()
         videoStopped = source.isAudioOnly
@@ -691,6 +704,8 @@ final class RecordingController {
         EventLog.shared.log("recording_started", [
             "recording_id": recordingId ?? "", "source": source.json, "width": w, "height": h,
             "tracks": tracks.map { $0.name }, "tracks_started": started,
+            // 0.3.12: is the live mix being written as audio track 0?
+            "mix_track": rec.hasMix,
             "system_stream": options.systemAudio ? (audioStream != nil) : NSNull(),
             "system_error": systemStreamFailed ?? NSNull(),
             "mic_stream": options.mic ? (mic != nil) : NSNull(),
@@ -834,7 +849,8 @@ final class RecordingController {
                 if let old {
                     await old.finish()
                     self.videoFramesTotal += old.videoFrames; self.videoDupTotal += old.duplicatedFrames
-                    self.closeSegment(index: oldIndex, url: old.url, started: oldStart, stats: old.stats)
+                    self.closeSegment(index: oldIndex, url: old.url, started: oldStart, stats: old.stats,
+                                      mixOK: old.mixHealthy)
                 }
                 self.persist(status: "recording")
                 EventLog.shared.log("segment_started", [
@@ -856,6 +872,8 @@ final class RecordingController {
         let bytes = segments.reduce(0) { $0 + (($1["bytes"] as? Int) ?? 0) }
         Registry.shared.update(id, [
             "status": status,
+            "mix_first": mixFirstOK,
+            "audio_tracks": audioTrackCount,
             "files": files,
             "segments": segments,
             "bytes": bytes,
@@ -866,7 +884,8 @@ final class RecordingController {
         api?.syncRecording(id)
     }
 
-    private func closeSegment(index: Int, url: URL, started: Date, stats: String) {
+    private func closeSegment(index: Int, url: URL, started: Date, stats: String, mixOK: Bool) {
+        mixFirstOK = mixFirstOK && mixOK
         let bytes = (try? FileManager.default.attributesOfItem(atPath: url.path)[.size] as? Int) ?? 0
         let secs = Int(Date().timeIntervalSince(started))
         if let i = segments.firstIndex(where: { ($0["index"] as? Int) == index }) {
@@ -1171,13 +1190,16 @@ final class RecordingController {
             if let w {
                 await w.finish()
                 self.videoFramesTotal += w.videoFrames; self.videoDupTotal += w.duplicatedFrames
-                self.closeSegment(index: lastIndex, url: w.url, started: lastStart, stats: w.stats)
+                self.closeSegment(index: lastIndex, url: w.url, started: lastStart, stats: w.stats,
+                                  mixOK: w.mixHealthy)
             }
             let secs = Int(Date().timeIntervalSince(started))
             let files = self.segments.compactMap { $0["path"] as? String }
             let bytes = self.segments.reduce(0) { $0 + (($1["bytes"] as? Int) ?? 0) }
             Registry.shared.update(id, [
                 "status": "local",
+                "mix_first": self.mixFirstOK,
+                "audio_tracks": self.audioTrackCount,
                 "ended_at": isoNow(),
                 "duration": secs,
                 "bytes": bytes,

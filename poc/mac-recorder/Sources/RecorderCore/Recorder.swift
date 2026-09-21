@@ -3,9 +3,10 @@ import ScreenCaptureKit
 import AVFoundation
 import CoreGraphics
 
-/// One audio track in the output file. Tracks are NEVER mixed at capture: system audio and
-/// the microphone are two separate AAC tracks so the transcriber (and a human) can tell the
-/// room from the person. `languageCode` is the ISO 639-2 tag written into the track header —
+/// One audio track in the output file. The SOURCES are never mixed away: system audio and the
+/// microphone keep their own AAC tracks so the room and the person can always be told apart
+/// (0.3.12 adds a mix track in FRONT of them — `LiveMix` — it does not replace them).
+/// `languageCode` is the ISO 639-2 tag written into the track header —
 /// it is what ffprobe prints in `Stream #0:N(<lang>)`, so we abuse it as a label that
 /// survives every mp4 tool (the QuickTime track-name metadata below is nicer but optional).
 public struct AudioTrackSpec {
@@ -29,15 +30,25 @@ public struct AudioTrackSpec {
 /// that `.idle` frames (SCK sends those at the frame interval when nothing changed) can
 /// re-append the previous image and keep the track at a constant fps.
 ///
-/// Audio: zero or more tracks, appended by index. Track 0 is fed by this object's own
-/// `SCStreamOutput` callback (the system-audio stream); other tracks are fed by whoever owns
-/// them through `appendAudio(_:track:)` (the mic engine). Every source timestamps against the
-/// host clock, so the tracks line up without any extra bookkeeping.
+/// Audio: zero or more SOURCE tracks, appended by source index. Source 0 is fed by this
+/// object's own `SCStreamOutput` callback (the system-audio stream); other sources are fed by
+/// whoever owns them through `appendAudio(_:track:)` (the mic engine). Every source timestamps
+/// against the host clock, so the tracks line up without any extra bookkeeping.
+///
+/// With TWO or more sources the file also gets a MIX track (0.3.12, `LiveMix`), written FIRST
+/// so that anything which reads one audio track — AssemblyAI, a `<video>` element, ffmpeg's
+/// automatic stream pick — gets the whole recording instead of one side of it. The raw sources
+/// keep their own tracks, in their own order, after it; `appendAudio(_:track:)` still takes a
+/// SOURCE index, so nothing upstream has to know the mix exists.
 public final class Recorder: NSObject, SCStreamOutput, SCStreamDelegate {
     let writer: AVAssetWriter
     /// nil for an audio-only recording (0.2.9: `.m4a`, no SCK video stream at all).
     let videoIn: AVAssetWriterInput?
     public private(set) var audioIns: [AVAssetWriterInput] = []
+    /// The mix track — file audio track 0 — when there is more than one source to mix.
+    let mixIn: AVAssetWriterInput?
+    /// Assigned once, right after `super.init()` — it needs `self` to append.
+    public private(set) var mix: LiveMix?
     public let specs: [AudioTrackSpec]
     let adaptor: AVAssetWriterInputPixelBufferAdaptor?
     public var hasVideo: Bool { videoIn != nil }
@@ -100,7 +111,27 @@ public final class Recorder: NSObject, SCStreamOutput, SCStreamDelegate {
             videoIn = nil
             adaptor = nil
         }
-        // Track order in the file: video, then the audio tracks in the order given.
+        // Track order in the file: video, the MIX (when there is more than one source to mix),
+        // then the raw sources in the order given. First is what every one-track reader takes.
+        if audioTracks.count > 1 {
+            let spec = LiveMix.trackSpec
+            let m = AVAssetWriterInput(mediaType: .audio, outputSettings: [
+                AVFormatIDKey: kAudioFormatMPEG4AAC,
+                AVSampleRateKey: spec.sampleRate,
+                AVNumberOfChannelsKey: spec.channels,
+            ])
+            m.expectsMediaDataInRealTime = true
+            // The label that survives into ffprobe — see `LiveMix.languageCode`.
+            m.languageCode = spec.languageCode
+            let name = AVMutableMetadataItem()
+            name.identifier = .quickTimeUserDataTrackName
+            name.value = spec.name as NSString
+            m.metadata = [name]
+            writer.add(m)
+            mixIn = m
+        } else {
+            mixIn = nil
+        }
         for spec in audioTracks {
             // 0.3.1: AVAssetWriterInput RAISES NSInvalidArgumentException ("Missing required key
             // AVChannelLayoutKey") for more than 2 channels without a layout. Swift cannot catch
@@ -136,6 +167,11 @@ public final class Recorder: NSObject, SCStreamOutput, SCStreamDelegate {
         audioBuffers = Array(repeating: 0, count: audioTracks.count)
         lastAudioPTS = Array(repeating: .invalid, count: audioTracks.count)
         super.init()
+        if mixIn != nil {
+            mix = LiveMix(sources: audioTracks.count) { [weak self] sb in
+                self?.appendMix(sb) ?? false
+            }
+        }
         guard writer.startWriting() else {
             throw writer.error ?? NSError(domain: "recorder", code: 1, userInfo: [NSLocalizedDescriptionKey: "startWriting failed"])
         }
@@ -158,12 +194,14 @@ public final class Recorder: NSObject, SCStreamOutput, SCStreamDelegate {
         return CMTimeCompare(pts, start) >= 0
     }
 
-    /// Append one audio buffer to `track`. Safe to call from the track's own thread; each
-    /// track must only ever be written from one thread (SCK's queue / the mic tap thread).
+    /// Append one audio buffer to SOURCE `track`. Safe to call from the track's own thread;
+    /// each source must only ever be written from one thread (SCK's queue / the mic tap
+    /// thread). The same buffer also goes to the mixer, which is thread-safe by itself.
     public func appendAudio(_ sb: CMSampleBuffer, track: Int) {
         guard writer.status == .writing, track >= 0, track < audioIns.count else { return }
         let pts = CMSampleBufferGetPresentationTimeStamp(sb)
         guard pts.isValid, ensureSession(pts) else { return }
+        mix?.accept(sb, source: track)
         let input = audioIns[track]
         if !loggedFirstAudio.contains(track) {
             loggedFirstAudio.insert(track)
@@ -179,6 +217,25 @@ public final class Recorder: NSObject, SCStreamOutput, SCStreamDelegate {
             logFailureOnce("audio track \(track) (\(specs[track].name)) append failed")
         }
     }
+
+    /// The mixer's own append (its thread is whichever source triggered the flush). `false`
+    /// means "not now" — the block stays in the accumulator and goes out with the next one,
+    /// so a busy AAC encoder costs latency rather than a hole in the mix.
+    private func appendMix(_ sb: CMSampleBuffer) -> Bool {
+        guard let mixIn, writer.status == .writing, mixIn.isReadyForMoreMediaData else { return false }
+        guard mixIn.append(sb) else {
+            logFailureOnce("mix track append failed")
+            return false
+        }
+        return true
+    }
+
+    /// Did the mix really hear everything? False when there is no mix track at all, when a
+    /// source that produced audio never reached it, or when nothing was written.
+    public var mixHealthy: Bool { mix?.healthy(raw: audioBuffers) ?? false }
+
+    /// Does this file carry the mix as its first audio track at all?
+    public var hasMix: Bool { mixIn != nil }
 
     /// One line per recorder — an append failure usually means the writer already went to
     /// .failed and every later sample is silently dropped, so the first one is the diagnosis.
@@ -245,7 +302,10 @@ public final class Recorder: NSObject, SCStreamOutput, SCStreamDelegate {
     }
 
     public func finish() async {
+        // Everything still in the accumulator belongs to THIS segment's file.
+        mix?.drain()
         videoIn?.markAsFinished()
+        mixIn?.markAsFinished()
         for a in audioIns { a.markAsFinished() }
         if writer.status == .writing { await writer.finishWriting() }
         if let e = writer.error { rlog("writer error: \(String(describing: e))") }
@@ -255,6 +315,7 @@ public final class Recorder: NSObject, SCStreamOutput, SCStreamDelegate {
     public var stats: String {
         let audio = zip(specs, audioBuffers).map { "\($0.name)=\($1)" }.joined(separator: " ")
         return "video=\(videoFrames) dup=\(duplicatedFrames) idle=\(idleFrames) dropped=\(droppedVideo)\(audio.isEmpty ? "" : " " + audio)"
+            + (mix.map { " [\($0.summary) healthy=\(mixHealthy)]" } ?? "")
     }
 }
 

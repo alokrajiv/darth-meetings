@@ -14,6 +14,50 @@ Native macOS side of Darth Meetings recording (the "Swift tray" angle from Darth
 the user switched it off in the menu (`loginItemUserChoice` in UserDefaults records an explicit choice;
 the default never overrides it). macOS may show "Darth Recorder was added as a login item" once.
 
+**0.3.12 (2026-09-22) — the tray makes the mix itself, as the first audio track.** A Darth
+Recorder file has always carried its sources unmixed — system audio as track 0, the microphone
+as track 1 — and the server mixed them at ingest (`src/lib/server/multitrack.ts`). That mix-down
+is the reason a recorder upload may not hand its bytes straight to AssemblyAI: whoever reads ONE
+audio track out of a multi-track file hears one side of the call, which on 2026-09-16 was a Slack
+huddle transcribed at 484 words instead of 1429. So every tray upload was pulled down to the VM,
+mixed, and pushed on — and the tray is the biggest user of the blob transit that exists precisely
+to keep bytes off the VM (`docs/recordings-blob-spec.md`, DEC-1).
+
+- **`LiveMix` (`Sources/RecorderCore/LiveMix.swift`).** Each source hands its buffers to the mixer
+  on its own thread; they are folded to mono, resampled to 48 kHz by linear interpolation and
+  summed into an accumulator indexed by TIME — the frame index comes from the buffer's
+  presentation timestamp, not from a running count, so the two sources line up exactly as they do
+  in the file (both timestamp against the host clock) and neither drift nor a late-starting
+  microphone can smear the mix. Whatever is more than 1 s behind the newest sample goes out in
+  100 ms blocks through a peak limiter (instant attack, ~+0.4 dB per block release, ceiling 0.95).
+  No per-track normalisation, unlike the server's dynaudnorm pair: the mic arrives conditioned
+  already (`MicConditioner`, and Apple's AGC when voice processing is on).
+- **Track order.** `Recorder` adds the mix input BEFORE the raw ones whenever there is more than
+  one source, so the file is video, mix, system, mic. The raw tracks are untouched — the point was
+  never to lose them. `appendAudio(_:track:)` still takes a SOURCE index; nothing upstream knows.
+- **`qmx`.** The mix track is labelled with the ISO 639-2 language `qmx`. `qaa`–`qtz` is the range
+  reserved for local use, so it cannot collide with a real language, and the language code is the
+  ONLY per-track label `AVAssetWriter` writes that survives into the file — `quickTimeUserDataTrackName`
+  and `commonIdentifierTitle` were both tried and ffprobe shows neither (2026-09-22). The server's
+  `isMixTrack` reads it, which is what stops the VM mixing a mix back in with the raw tracks.
+- **`tracks: {count, mixFirst}` on every upload open.** `mixFirst` is the promise that audio track
+  0 is the WHOLE recording (the live mix, or the only source when there is one), and it is what
+  lets the server hand the bytes to AssemblyAI where they lie. It is read per recording from the
+  registry row (`mix_first`, written by the recording controller from the writer it really built),
+  never from the tray's version: recordings made by an older tray are still on this Mac and their
+  files still start with the raw system track. The verdict is deliberately strict — a false yes
+  is the 484-word incident, a false no costs only the fast path — so a mix that hit an unexpected
+  sample format, had a buffer arrive more than a second late, or does not cover the whole
+  timeline its sources wrote records `mix_first: false`, and that recording uploads the old way.
+  `recording_started` gains `mix_track`, and the segment-closed log line carries the mixer's
+  counters (`mix frames=… buffers=… src0=… src1=… healthy=…`).
+- **Proof without a capture.** `recorder-poc --selftest-mix <out.m4a>` feeds two synthetic tones
+  (440 Hz "system" at 48 kHz stereo, 880 Hz "mic" at 24 kHz mono starting 0.5 s late) straight
+  into `Recorder.appendAudio` — no microphone, no screen, no permission — and writes the file.
+  Verified 2026-09-22: `qmx` stereo first, then `mul` stereo and `eng` mono; before 0.5 s the mix
+  carries the 440 Hz tone alone at amplitude 0.30, after it both at 0.30 each (peak 0.54, nothing
+  limited), and neither raw track has a trace of the other's tone.
+
 **0.3.11 (2026-09-22) — the same recording is never transcribed twice.** A retry after a
 half-failed upload, a second tray on the same Mac, a recording the user had already sent by
 hand: until now every one of those started a fresh AssemblyAI job for bytes the server already
@@ -250,7 +294,8 @@ window recording with camera off):**
 `Uploader.swift` no longer streams a whole file through `POST /api/transcripts` (nginx + one TCP
 stream over the Tailscale relay: the 1.3 GB Meet and 638 MB Teams recordings of 2026-09-18 died with
 HTTP 408 on every 30-minute retry). It now uses the same session the web app uses — `POST /api/uploads`
-(whole-file sha256 as the fingerprint, `via: "blob"`, `recorderRecordingId`, `multi` for segments) →
+(whole-file sha256 as the fingerprint, `via: "blob"`, `recorderRecordingId`, `multi` for segments,
+`dupAware` since 0.3.11 and `tracks: {count, mixFirst}` since 0.3.12) →
 bytes → `POST …/complete`. The SERVER picks the byte path: **blob** (the open reply carries a per-blob
 SAS on `darthuploads/meetings`; 4 MiB `Put Block`s straight to Azure, `parallel` at a time, `Put Block
 List`, then the VM pulls the committed blob once — `docs/darth-uploads.md`) or **chunks** (a host

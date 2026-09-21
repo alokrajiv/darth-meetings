@@ -58,6 +58,7 @@ describe('who may take the fast path', () => {
   const base = {
     multi: false,
     fromRecorder: false,
+    tracks: null,
     sha256: 'a'.repeat(64),
     size: 1234,
     storedFilename: 'abc.m4a',
@@ -67,11 +68,39 @@ describe('who may take the fast path', () => {
     expect(blobFastPathRefusal(base)).toBeNull();
   });
 
-  test('a Darth Recorder upload may NOT — it can be multi-track (DEC-1)', () => {
+  test('a Darth Recorder upload that says nothing may NOT — it can be multi-track (DEC-1)', () => {
     // The whole reason Stage C exists is not having the bytes; whether a file
     // carries a separate mic track can only be answered by probing them. The
     // tray is the only producer of such files and says so on every upload.
     expect(blobFastPathRefusal({ ...base, fromRecorder: true })).toContain('multi-track');
+  });
+
+  test('...and MAY once it declares tracks.mixFirst (tray 0.3.12)', () => {
+    // The tray writes the mix itself now, live, as audio track 0 (LiveMix),
+    // so there is nothing left for the VM to do to the audio.
+    expect(
+      blobFastPathRefusal({ ...base, fromRecorder: true, tracks: { count: 3, mixFirst: true } })
+    ).toBeNull();
+  });
+
+  test('mixFirst: false is still a refusal — an older tray, or a mix that missed a source', () => {
+    expect(
+      blobFastPathRefusal({ ...base, fromRecorder: true, tracks: { count: 2, mixFirst: false } })
+    ).toContain('mixFirst');
+    // A single-source recording says mixFirst: true (track 0 IS the whole
+    // recording); it is the promise that matters, never the count.
+    expect(
+      blobFastPathRefusal({ ...base, fromRecorder: true, tracks: { count: 1, mixFirst: true } })
+    ).toBeNull();
+  });
+
+  test('the declaration means nothing for anyone but a recorder upload', () => {
+    // Nothing else produces multi-track files, so the rule never fires for
+    // them either way — and a stray declaration cannot un-refuse a group.
+    expect(blobFastPathRefusal({ ...base, tracks: { count: 2, mixFirst: false } })).toBeNull();
+    expect(
+      blobFastPathRefusal({ ...base, multi: true, fromRecorder: true, tracks: { count: 3, mixFirst: true } })
+    ).toContain('stitched');
   });
 
   test('a part of a multi-file group may NOT — it is stitched on the VM first', () => {

@@ -253,6 +253,25 @@ export function recorderMatchIsConfident(
   );
 }
 
+/**
+ * The audio tracks of the file being uploaded, as the CLIENT describes them.
+ *
+ * Only the Darth Recorder tray sends this (0.3.12), and only `mixFirst` is
+ * load-bearing: it promises that audio track 0 is the WHOLE recording — the
+ * live mix of every source (`LiveMix.swift`), or the only source when there
+ * is one — so AssemblyAI may be handed the bytes where they lie instead of the
+ * VM pulling them down to mix them (`blobFastPathRefusal`, DEC-1). The tray
+ * says it per FILE, from the registry row the recording controller wrote, not
+ * from its own version: a recording made by an older tray is still on that Mac
+ * and its files still start with the raw system track.
+ *
+ * `count` is informational (0 = the client does not know).
+ */
+export interface UploadTracks {
+  count: number;
+  mixFirst: boolean;
+}
+
 /** Everything `finalizeUpload` needs — JSON-safe so a chunked session can
  * freeze it at open time and replay it at complete time. */
 export interface UploadSpec {
@@ -275,6 +294,12 @@ export interface UploadSpec {
    * scratch = true and promote-in-place keeps it; replayed into the
    * fresh-insert fallback when the placeholder was reaped. */
   scratch?: boolean;
+  /**
+   * What the client says the file's audio tracks are, frozen at open
+   * (Darth Recorder 0.3.12; `docs/recordings-blob-spec.md` DEC-1). Absent for
+   * every other client and for every older tray, which reads as "unknown".
+   */
+  tracks?: UploadTracks | null;
   /**
    * The client that opened this session said `dupAware: true` — it
    * understands a `{duplicate}` answer. Frozen here at open because the
@@ -340,6 +365,25 @@ export interface OpenUploadInput {
   scratch?: boolean;
   /** See `UploadSpec.dupAware`. */
   dupAware?: boolean;
+  /** See `UploadSpec.tracks`. */
+  tracks?: UploadTracks | null;
+}
+
+/**
+ * `tracks` off a request body: an object with a non-negative integer `count`
+ * and a boolean `mixFirst`, or nothing at all. Returns `undefined` when the
+ * field is absent and `null` when it is junk — the route answers 400 for the
+ * second, because a client that means to make this promise and gets the shape
+ * wrong must hear about it rather than silently lose the fast path.
+ */
+export function parseUploadTracks(raw: unknown): UploadTracks | null | undefined {
+  if (raw === undefined || raw === null) return undefined;
+  if (typeof raw !== 'object' || Array.isArray(raw)) return null;
+  const t = raw as { count?: unknown; mixFirst?: unknown };
+  if (typeof t.mixFirst !== 'boolean') return null;
+  const count = t.count === undefined ? 0 : t.count;
+  if (typeof count !== 'number' || !Number.isInteger(count) || count < 0 || count > 64) return null;
+  return { count, mixFirst: t.mixFirst };
 }
 
 const RECORDER_ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -489,6 +533,7 @@ export async function openUpload(
         recorderRecordingId: input.recorderRecordingId ?? null,
         scratch: groupRow.scratch,
         dupAware: input.dupAware,
+        tracks: input.tracks ?? null,
       },
     };
   }
@@ -584,6 +629,7 @@ export async function openUpload(
       recorderRecordingId: input.recorderRecordingId ?? null,
       scratch,
       dupAware: input.dupAware,
+      tracks: input.tracks ?? null,
     },
   };
 }

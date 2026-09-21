@@ -234,16 +234,31 @@ than after the copy as the sketch above said: the fallback needs those bytes.
 | `redactSasInText` | `src/lib/server/media-serve.ts` |
 | `MW_SCRATCH_DIR` — the stitch works on the NVMe (item 2, below) | `src/lib/server/scratch-dir.ts`, `media-concat.ts`, `upload-pipeline.ts` |
 | INFO, never drift: blob-before-local, and the Stage C counters | `scripts/recordings-verify.ts`, `scripts/media-archive-status.ts` |
-| Tests | `src/lib/server/__tests__/aai-from-blob.test.ts` (21), `tmp/media-ingest/` (71-check scratch-PG integration, real ffmpeg, AssemblyAI stubbed) |
+| The tray's half: the live mix, its `qmx` label, and the declaration at open | `poc/mac-recorder/Sources/RecorderCore/LiveMix.swift`, `Recorder.swift`, `darth-tray/Uploader.swift` |
+| `tracks` on the wire: `UploadTracks`, `parseUploadTracks`, the 400, the frozen spec | `src/lib/server/upload-pipeline.ts`, `src/app/api/uploads/route.ts` |
+| `isMixTrack` / `MIX_TRACK_LANGUAGE`, and the skip that follows from it | `src/lib/server/multitrack.ts` |
+| Tests | `src/lib/server/__tests__/aai-from-blob.test.ts` (24), `upload-group-progress.test.ts` (`parseUploadTracks`), `tmp/media-ingest/` (91-check scratch-PG integration, real ffmpeg, AssemblyAI stubbed) |
 
-**The multitrack decision: recorder uploads take the PULL path, always.** `normalizeMultiTrack` re-muxes a Darth
-Recorder file so the MIX is track 0 *before* AssemblyAI hears it; handing a multi-track file over as-is is the
-2026-09-16 incident (a Slack huddle transcribed from the system track alone — 484 words instead of 1429). Whether
-a file is multi-track cannot be known without probing the bytes, and not having the bytes is the whole point of
-this stage. The tray is the only producer of such files and it identifies itself on every upload
-(`recorderRecordingId` at open, or `gmeet_context.recorder`), so `blobFastPathRefusal` sends every recorder upload
-down the pull path. One line changes the day the tray declares `multiTrack: false` at open — that is the follow-up
-worth having, because the tray is also the biggest user of blob transit.
+**The multitrack decision: a recorder upload takes the fast path only if it says track 0 is the mix.** Handing a
+multi-track file to AssemblyAI as-is is the 2026-09-16 incident (a Slack huddle transcribed from the system track
+alone — 484 words instead of 1429), and `normalizeMultiTrack` is what prevents it by re-muxing the file so the MIX
+is track 0 *before* AssemblyAI hears it. Whether a file is multi-track cannot be known without probing the bytes,
+and not having the bytes is the whole point of this stage. The tray is the only producer of such files and it
+identifies itself on every upload (`recorderRecordingId` at open, or `gmeet_context.recorder`) — so it has to SAY
+what its tracks are, and since **0.3.12 it does**: it writes the mix itself, live, as audio track 0 of every file
+(`LiveMix.swift`, labelled with the local-use language `qmx` so `isMixTrack` recognises it) and declares
+`tracks: {count, mixFirst: true}` at open. `blobFastPathRefusal` lets a recorder upload through on that promise
+and refuses without it — an older tray, a recording whose mix could not hear every source, any client that says
+nothing — exactly as before. The declaration is per FILE (from the tray's registry row, not from its version:
+older recordings are still on that Mac), it is frozen on the session at open because Stage C runs at complete, and
+`parseUploadTracks` answers 400 to a malformed one rather than silently dropping the promise.
+
+Nothing on the VM then has to touch the audio: the stored file's track order is already what `normalizeMultiTrack`
+would have produced, so the background local copy PROBES the landed bytes and skips the pass (`verifyMixFirst`,
+logging `track 0 is the mix as declared — nothing to normalise`). That probe is also the only moment anyone can
+check a client's promise: a file whose track 0 turns out NOT to be the mix is mixed down after all — the transcript
+was already made from one track and cannot be helped, but the file people play, re-transcribe and cut clips from
+can be — and the blob is re-archived to match, on a loud `DECLARED mixFirst but the landed file…` line.
 
 **The blob-naming / adoption decision.** The blob is written at the name Stage A would choose —
 `<recording id>/<media id><.ext>` — computed BEFORE the row exists, which is possible because every id involved is
