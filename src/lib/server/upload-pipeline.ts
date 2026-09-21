@@ -24,6 +24,7 @@ import type { RecorderMatch } from '@/lib/recorder';
 import type { DarthUser } from '@/lib/auth/session';
 import type { SpeechModel } from '@/lib/aai-language';
 import type { ReportPref } from '@/lib/report-pref';
+import type { AttachToMarker } from '@/lib/clips';
 
 /**
  * The media-upload pipeline shared by the two byte-delivery routes:
@@ -314,6 +315,14 @@ export interface UploadSpec {
    * moment Stage C is over, either way. See `BlobCopyIntent`.
    */
   blobIntent?: BlobCopyIntent | null;
+  /**
+   * Phase 3b source (c): this upload JOINS an existing meeting as a clip
+   * (`docs/recordings-phase3b-combine-spec.md` §API). Already resolved
+   * against that meeting by `resolveAttachTarget` before this spec existed;
+   * carried here only so the fresh-insert fallback — the one path where the
+   * placeholder this marker was stamped on has been reaped — keeps it.
+   */
+  attachTo?: AttachToMarker | null;
 }
 
 /**
@@ -367,6 +376,13 @@ export interface OpenUploadInput {
   dupAware?: boolean;
   /** See `UploadSpec.tracks`. */
   tracks?: UploadTracks | null;
+  /**
+   * See `UploadSpec.attachTo`. Stamped on the placeholder as
+   * `gmeet_context.attachTo`, alongside the group and recorder markers rather
+   * than through `contextExtra` — a multi-part tray upload has a group marker
+   * and must be able to attach too.
+   */
+  attachTo?: AttachToMarker | null;
 }
 
 /**
@@ -534,6 +550,8 @@ export async function openUpload(
         scratch: groupRow.scratch,
         dupAware: input.dupAware,
         tracks: input.tracks ?? null,
+        // Not carried: the marker was stamped on the GROUP's row by part 1 and
+        // that row is the meeting this attaches.
       },
     };
   }
@@ -578,13 +596,21 @@ export async function openUpload(
     ? { recorder: { recordingId: input.recorderRecordingId } }
     : null;
   const contextExtra = multi ? null : (input.contextExtra ?? null);
+  // Phase 3b source (c): "these bytes are a second recording OF that meeting",
+  // resolved before this call (`resolveAttachTarget`). It rides the row rather
+  // than only the upload session because the completion hook that acts on it
+  // runs from a poll that knows nothing about either.
+  const attachMarker: Pick<GmeetContext, 'attachTo'> | null = input.attachTo
+    ? { attachTo: input.attachTo }
+    : null;
   const placeholderContext: GmeetContext | null =
-    gmeetContext || groupMarker || recorderMarker || contextExtra
+    gmeetContext || groupMarker || recorderMarker || contextExtra || attachMarker
       ? {
           ...(gmeetContext ?? {}),
           ...(contextExtra ?? {}),
           ...(groupMarker ?? {}),
           ...(recorderMarker ?? {}),
+          ...(attachMarker ?? {}),
         }
       : null;
 
@@ -630,6 +656,7 @@ export async function openUpload(
       scratch,
       dupAware: input.dupAware,
       tracks: input.tracks ?? null,
+      attachTo: input.attachTo ?? null,
     },
   };
 }
@@ -866,6 +893,13 @@ export async function finalizeUpload(
     sourceRow = access?.row ?? null;
   }
   const { gmeetContext, attendeeNames } = buildGmeetContext(spec.linkedEvent, spec.reportPref);
+  // The placeholder already carries the attach marker and is promoted in
+  // place, context intact — this is for the ONE path that inserts a fresh row
+  // instead (the sweeper reaped the placeholder mid-upload), which would
+  // otherwise land a meeting that silently forgot it was joining another one.
+  const ingestContext: GmeetContext | null = spec.attachTo
+    ? { ...(gmeetContext ?? {}), attachTo: spec.attachTo }
+    : gmeetContext;
   try {
     // Speaker names from the source import (Teams/Zoom/… labels) are exactly
     // the words AAI tends to mis-hear — feed them in as bias keyterms.
@@ -892,7 +926,7 @@ export async function finalizeUpload(
         sourceSpeakers.length > 0 || attendeeNames.length > 0
           ? [...sourceSpeakers, ...attendeeNames]
           : undefined,
-      gmeetContext,
+      gmeetContext: ingestContext,
       placeholderAssemblyaiId: placeholderId,
       speechModel: spec.speechModel,
       scratch: spec.scratch ?? false,

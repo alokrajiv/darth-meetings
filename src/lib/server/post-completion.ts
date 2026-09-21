@@ -9,6 +9,7 @@ import { resolveMeetingContent } from '@/lib/server/recordings';
 import { combineFlagOn } from '@/db-ops/clips';
 import { meetingRecordingRef } from '@/db-ops/transcriptions';
 import { rematerialiseCombinedMeetings } from '@/lib/server/clip-combine';
+import { runPendingAttach } from '@/lib/server/clip-attach';
 import { identityForUser } from '@/db-ops/transcript-activity';
 import { autoMarkerOf } from '@/lib/auto-marker';
 import { notifyUser } from '@/lib/server/darth-notify';
@@ -86,6 +87,17 @@ export function onTranscriptCompleted(
             if (ref) await rematerialiseCombinedMeetings(ref.recordingId, full.id);
           })().catch((err) =>
             console.warn('[post-completion] combined re-materialise failed:', err)
+          );
+
+          // Phase 3b source (c): this upload was opened with `attachTo` — it
+          // is a second capture OF another meeting, and now that its own
+          // transcription has landed it joins that meeting as a clip
+          // (`lib/server/clip-attach.ts`). The uploaded meeting stays an
+          // ordinary meeting either way: it is also this recording's own
+          // document. No new DM — the "Transcript ready" one below covers it,
+          // and a refusal leaves the marker with its sentence for the card.
+          await runPendingAttach(ownerUserId, full).catch((err) =>
+            console.warn('[post-completion] attach failed:', err)
           );
         }
 

@@ -53,6 +53,7 @@ import { logActivity } from '@/db-ops/transcript-activity';
 import { resolveAccess, type ResolvedAccess } from '@/db-ops/transcript-access';
 import { materialiseMeeting } from '@/lib/server/clip-materialise';
 import { combineView } from '@/lib/server/clip-combine';
+import { pendingAttachFor } from '@/lib/server/clip-attach';
 import { removeRecordingGraphForMeeting } from '@/lib/server/recording-sync';
 import { resolveLinkedEventRef } from '@/lib/server/linked-event-ref';
 import { autoShareToInternalInvitees } from '@/lib/server/auto-share';
@@ -257,6 +258,10 @@ export async function clipsView(
   // one-recording meeting is a one-entry list — with only the ADD behind
   // `MW_COMBINE` (docs/recordings-phase3b-combine-spec.md).
   const combine = await combineView(access, caller);
+  // Phase 3b source (c): uploads that named THIS meeting and have not landed
+  // yet — "A recording is being added: Upload · transcribing…". Caller-scoped
+  // in SQL and filename-free (lib/server/clip-attach.ts).
+  const pendingAttach = await pendingAttachFor(access, caller);
 
   const bounds = windowBoundsFor(state.clips, state.recordingId);
   const siblingRows = await listSiblingMeetingsForRecordings(
@@ -317,6 +322,7 @@ export async function clipsView(
     combineEnabled: combine.combineEnabled,
     canAddRecording: combine.canAddRecording,
     addBlockedReason: combine.addBlockedReason,
+    pendingAttach,
   };
 }
 

@@ -25,6 +25,8 @@ import { blobTransitFor, mintBlobTicket } from '@/lib/server/darth-uploads-store
 import { getOwnRecording } from '@/db-ops/recorder';
 import { uploadIdentityHash, wantsDuplicateAnswer, wantsForce } from '@/lib/same-file';
 import { duplicateForUpload } from '@/lib/server/same-file';
+import { resolveAttachTarget } from '@/lib/server/clip-attach';
+import { parseAttachTo, type AttachToMarker } from '@/lib/clips';
 
 export const runtime = 'nodejs';
 
@@ -39,7 +41,9 @@ export const runtime = 'nodejs';
  *   calendar event is linked),
  *   via?: 'blob', sha256?, coarse? (darth uploads — below),
  *   recorderRecordingId? (Darth Recorder registry row these bytes came from),
- *   tracks?: {count, mixFirst} (what the file's audio tracks are — below) }
+ *   tracks?: {count, mixFirst} (what the file's audio tracks are — below),
+ *   attachTo?: {meetingId, offsetMs?, textPolicy?} (join an existing meeting
+ *   as a second recording — below) }
  *
  * `multi.groupBytes` (optional, ≥ this part's size) is the sum of every
  * part's size: the group row is born with it as `upload_bytes_total`, so the
@@ -79,6 +83,18 @@ export const runtime = 'nodejs';
  * VM and mixed there (DEC-1, docs/recordings-blob-spec.md). Absent = unknown,
  * and nothing changes; malformed = 400, because a client that meant to make
  * the promise should not silently lose it.
+ *
+ * `attachTo` (Phase 3b source (c), `MW_COMBINE`,
+ * docs/recordings-phase3b-combine-spec.md §API): `{ meetingId, offsetMs?,
+ * textPolicy? }` says these bytes are a SECOND recording of a meeting that
+ * already exists. The upload runs exactly as it does without it — own
+ * recording, own transcription, own meeting document — and is added to that
+ * meeting as a clip when the transcription lands. Resolved HERE, before a
+ * byte moves (`resolveAttachTarget`): 404 for a meeting the caller cannot
+ * open, 403 read-only, 409 when it has no recording, is full, is in the trash
+ * or the flag is off, 400 for a junk offset — a person must hear "no" before
+ * they spend twenty minutes uploading, not after. A RESUMED session keeps the
+ * marker it was opened with, like every other frozen field.
  *
  * The same file, again (MW_SAME_FILE_CHECK, docs/recordings-same-file-spec.md):
  * a client that says `dupAware: true` may get ONE other 200 answer,
@@ -150,6 +166,22 @@ export const POST = withAuth(async ({ user, request }) => {
       { status: 400 }
     );
   }
+  // Phase 3b source (c): resolved against the target meeting immediately, so
+  // the refusal arrives before the bytes rather than after them.
+  const attachRequest = parseAttachTo(body.attachTo);
+  if (attachRequest === null) {
+    return NextResponse.json(
+      { error: 'Invalid attachTo (expected { meetingId, offsetMs?, textPolicy? })' },
+      { status: 400 }
+    );
+  }
+  let attachTo: AttachToMarker | null = null;
+  if (attachRequest) {
+    const resolved = await resolveAttachTarget(user, attachRequest);
+    if (!resolved.ok) return NextResponse.json(resolved.body, { status: resolved.status });
+    attachTo = resolved.marker;
+  }
+
   // The Darth Recorder registry row (migration 041): must be the caller's own.
   let recorderRecordingId: string | null = null;
   let recorderMatch: { key: string; score: number; overlap: number } | null = null;
@@ -318,6 +350,7 @@ export const POST = withAuth(async ({ user, request }) => {
     // Stage C reads at complete time.
     dupAware: wantsDuplicateAnswer(body),
     tracks,
+    attachTo,
   });
   if (!opened.ok) return NextResponse.json({ error: opened.error }, { status: opened.status });
 

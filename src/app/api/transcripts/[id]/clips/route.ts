@@ -60,9 +60,18 @@ export const GET = withAuth(async ({ user }, { params }) => {
  * even when they can see it in the candidate list. The add itself is what
  * consents to this meeting's readers playing those bytes (`scopeMediaToRow`).
  *
- * Source (c) of the spec — a fresh upload made with `?attachTo=<meeting id>`
- * — is NOT wired up here: the upload routes are being changed in parallel.
- * `uploadSessionId` therefore answers `upload-deferred` rather than pretending.
+ * Source (c) of the spec — a fresh upload that joins this meeting — is NOT
+ * this route and deliberately stays 501 here. An upload names its meeting
+ * when it STARTS (`attachTo` on `POST /api/uploads`, `?attachTo=` on
+ * `POST /api/transcripts`), which is what lets the refusal arrive before the
+ * bytes and what makes the marker survive a resume, a promotion and a
+ * restart; the clip itself is added by the completion hook
+ * (`lib/server/clip-attach.ts`). Taking an `uploadSessionId` here instead
+ * would be a race with no winner: a session that finishes between the lookup
+ * and the stamp would never see the marker and the meeting would silently
+ * stay standalone — and once it HAS finished, its recording exists and this
+ * route's ordinary `recordingId` form is the answer. So `uploadSessionId`
+ * keeps answering `upload-deferred`, in a sentence that now says where to go.
  */
 export const POST = withAuth(async ({ user, request }, { params }) => {
   const { id } = await params;

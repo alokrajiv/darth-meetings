@@ -575,3 +575,56 @@ export async function clippedMeetingsOnRecordingExcept(
   `;
   return rows.map((r) => r.transcript_id);
 }
+
+// ---------------------------------------------------------------------------
+// Phase 3b source (c) — uploads on their way INTO a meeting
+// ---------------------------------------------------------------------------
+
+/** One in-flight upload that named a meeting with `attachTo`. */
+export interface PendingAttachRow {
+  user_id: string;
+  assemblyai_id: string;
+  status: string;
+  created_at: string;
+  offset_ms: number | null;
+  text_policy: string | null;
+  /** The upload came from the Darth Recorder tray (`gmeet_context.recorder`). */
+  from_recorder: boolean;
+}
+
+/**
+ * CALLER-SCOPED — the uploads that have named `meetingId` in their
+ * `gmeet_context.attachTo` and have not been added yet.
+ *
+ * Only uploads the caller can ALREADY see are listed (their own row, or one
+ * shared with them), with the same owner-or-share predicate every other
+ * caller-scoped query here uses. The bytes have not been given to this
+ * meeting's readers yet — the CLIP is what does that, and it does not exist
+ * until the transcription lands — so a reader of the target meeting learns
+ * nothing about somebody else's upload before that
+ * (feedback_privacy_caller_scoping_gate).
+ *
+ * A marker carrying `error` is NOT pending: the attach was refused, the
+ * meeting stayed standalone and nothing is on its way.
+ */
+export async function listPendingAttachments(
+  caller: { userId: string; email: string },
+  meetingId: string
+): Promise<PendingAttachRow[]> {
+  const normEmail = caller.email.trim().toLowerCase();
+  return sql<PendingAttachRow[]>`
+    SELECT t.user_id, t.assemblyai_id, t.status, t.created_at,
+           (t.gmeet_context->'attachTo'->>'offsetMs')::float8 AS offset_ms,
+           t.gmeet_context->'attachTo'->>'textPolicy'        AS text_policy,
+           (t.gmeet_context ? 'recorder')                    AS from_recorder
+    FROM ${sql(SCHEMA)}.transcripts t
+    LEFT JOIN ${sql(SCHEMA)}.transcript_shares s
+      ON s.transcript_id = t.id AND s.shared_with_email = ${normEmail}
+    WHERE t.deleted_at IS NULL
+      AND t.gmeet_context->'attachTo'->>'meetingId' = ${meetingId}
+      AND t.gmeet_context->'attachTo'->>'error' IS NULL
+      AND (t.user_id = ${caller.userId} OR s.id IS NOT NULL)
+    ORDER BY t.created_at
+    LIMIT 10
+  `;
+}

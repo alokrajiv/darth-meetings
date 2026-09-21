@@ -7,7 +7,7 @@
 
 import type { ReportPref } from '@/lib/report-pref';
 import type { RunningTranscription } from '@/lib/transcriptions';
-import type { SplitProvenance, StoredClips } from '@/lib/clips';
+import type { AttachToMarker, SplitProvenance, StoredClips } from '@/lib/clips';
 
 /** Temporary (scratch) transcripts are moved to the trash this many days
  * after creation (migration 042). The sweeper, the listing hint and the
@@ -233,6 +233,19 @@ export interface GmeetContext {
    * correct for a split meeting: the window is on the row, so the player
    * still clamps and frame/voiceprint ms still map onto the shared file. */
   clips?: StoredClips | null;
+  /**
+   * Phase 3b source (c) (docs/recordings-phase3b-combine-spec.md §API): this
+   * upload was opened with `attachTo` — it is a second capture OF another
+   * meeting and is added to it as a clip when its transcription lands
+   * (`lib/server/clip-attach.ts`, called from the completion hook).
+   *
+   * Stamped on the placeholder at open, before a byte moves, so it survives
+   * promotion, a resumed chunked session and a restart. Cleared on success;
+   * kept with `error` when the attach was refused, which is what the card
+   * means by "could not attach: …". The uploaded meeting itself is an
+   * ordinary meeting either way — it is also its recording's own document.
+   */
+  attachTo?: AttachToMarker | null;
   /** Phase 3a: this meeting was split off another one.
    *
    * PRIVACY: `meetingId` names a meeting the reader may not be able to open,
@@ -712,6 +725,13 @@ export interface TranscriptListRow {
    * primary, a stitched multi-file upload, or a combined re-transcription.
    * 1 (or absent — legacy/v1 payloads) = single recording. */
   recording_count?: number;
+  /**
+   * v2 listing only (Phase 3b): how many DISTINCT recordings this meeting
+   * holds clips on — two captures of one meeting, as opposed to two files of
+   * one capture, which `recording_count` also counts. 1 (or absent — legacy
+   * payloads, and every server with the recordings graph off) = one capture.
+   */
+  clip_recording_count?: number;
   /** Series auto-import lifecycle: 'passed' = fully unattended (imported +
    * speakers auto-identified + report generated — the blue dot), 'gated' =
    * auto-imported but waiting on human speaker review, 'auto' = imported by

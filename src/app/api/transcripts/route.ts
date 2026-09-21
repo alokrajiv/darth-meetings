@@ -33,6 +33,8 @@ import {
   parseReportPref,
   textDocRejection,
 } from '@/lib/server/upload-pipeline';
+import { resolveAttachTarget } from '@/lib/server/clip-attach';
+import { parseAttachTo, type AttachToMarker } from '@/lib/clips';
 
 export const runtime = 'nodejs';
 // Handler wall-clock budget (only enforced on serverless hosts). Receiving a
@@ -330,6 +332,18 @@ export const GET = withAuth(async ({ user, request }) => {
  * `?scratch=1` creates a TEMPORARY transcript (migration 042): out of the
  * main listing, under the Temporary tab, auto-trashed after 30 days.
  * Ignored when the upload is pre-linked to a calendar event.
+ *
+ * `?attachTo=<meeting id>` (Phase 3b source (c), `MW_COMBINE`,
+ * docs/recordings-phase3b-combine-spec.md §API) says these bytes are a SECOND
+ * recording OF that meeting: the upload runs exactly as it does without it —
+ * own recording, own transcription, own meeting document (DEC-1) — and is
+ * added to the named meeting as a clip when its transcription lands.
+ * `?attach_offset=` (`mm:ss`, `h:mm:ss` or ms; default 0) is where it lands on
+ * that meeting's timeline — never guessed by the server — and
+ * `?attach_policy=` is `include` (default) / `gap_fill` / `exclude`. Resolved
+ * before a single byte is read: 404 for a meeting the caller cannot open, 403
+ * read-only, 409 when it has no recording of its own, is full, is in the trash
+ * or the flag is off.
  */
 export const POST = withAuth(async ({ user, request }) => {
   const contentType = request.headers.get('content-type') ?? '';
@@ -356,6 +370,32 @@ export const POST = withAuth(async ({ user, request }) => {
     request.nextUrl.searchParams.get('recorderRecordingId') ??
     request.nextUrl.searchParams.get('recorder_recording_id') ??
     request.headers.get('x-recorder-recording-id');
+
+  // Phase 3b source (c). Resolved here — before the body is touched — so a
+  // refusal costs the caller nothing, and shared by both delivery branches
+  // below.
+  const attachIdRaw = request.nextUrl.searchParams.get('attachTo');
+  const attachOffsetRaw = request.nextUrl.searchParams.get('attach_offset');
+  const attachPolicyRaw = request.nextUrl.searchParams.get('attach_policy');
+  const attachRequest = attachIdRaw
+    ? parseAttachTo({
+        meetingId: attachIdRaw,
+        ...(attachOffsetRaw !== null ? { offset: attachOffsetRaw } : {}),
+        ...(attachPolicyRaw !== null ? { textPolicy: attachPolicyRaw } : {}),
+      })
+    : undefined;
+  if (attachRequest === null) {
+    return NextResponse.json(
+      { error: 'Invalid attachTo / attach_offset / attach_policy' },
+      { status: 400 }
+    );
+  }
+  let attachTo: AttachToMarker | null = null;
+  if (attachRequest) {
+    const resolved = await resolveAttachTarget(user, attachRequest);
+    if (!resolved.ok) return NextResponse.json(resolved.body, { status: resolved.status });
+    attachTo = resolved.marker;
+  }
 
   if (contentType.includes('multipart/form-data')) {
     // Legacy path — whole body in memory. Kept only so an already-open old
@@ -389,6 +429,7 @@ export const POST = withAuth(async ({ user, request }) => {
       bytesTotal: file.size,
       recorderRecordingId,
       scratch,
+      attachTo,
     });
     if (!opened.ok) return NextResponse.json({ error: opened.error }, { status: opened.status });
     await saveAudioBytes(opened.spec.tempFilename, Buffer.from(await file.arrayBuffer()));
@@ -449,6 +490,7 @@ export const POST = withAuth(async ({ user, request }) => {
     bytesTotal,
     recorderRecordingId,
     scratch,
+    attachTo,
   });
   if (!opened.ok) return NextResponse.json({ error: opened.error }, { status: opened.status });
   const { spec } = opened;

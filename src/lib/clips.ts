@@ -1092,6 +1092,16 @@ export interface ClipsResponse {
   canAddRecording?: boolean;
   /** Why not, in the route's own sentence; null when it can. */
   addBlockedReason?: string | null;
+  /**
+   * Phase 3b source (c): uploads that named THIS meeting with `attachTo` and
+   * have not landed yet — the recording card's "A recording is being added:
+   * Upload · transcribing…". Empty for every meeting nobody is uploading to,
+   * which is all of them nearly all of the time.
+   *
+   * Caller-scoped like everything else here: only uploads the caller can
+   * already see (their own, or one shared with them) are listed.
+   */
+  pendingAttach?: PendingAttach[];
 }
 
 /** POST /api/transcripts/:id/split */
@@ -1345,7 +1355,7 @@ const COMBINE_REFUSAL_TEXT: Record<CombineRefusalCode, string> = {
   'policy-invalid': 'Choose Text, Fill gaps only, or Audio only.',
   'no-clip': 'This meeting has no recording to add to.',
   'upload-deferred':
-    'Attaching a fresh upload to this meeting is not wired up yet — upload it first, then add it from “my unlinked recordings”.',
+    'An upload joins a meeting when it STARTS, not afterwards — choose this meeting in the upload dialog, or add the recording here once it has finished.',
 };
 
 export function combineRefusal(code: CombineRefusalCode, message?: string): CombineRefusal {
@@ -1664,4 +1674,176 @@ export function nextClipOrd(clips: Array<Pick<ClipWindow, 'ord'>>): number {
 /** Distinct recordings a clip set reads — the listing's "2 recordings". */
 export function recordingCountOf(clips: Array<Pick<ClipWindow, 'recordingId'>>): number {
   return new Set(clips.map((c) => c.recordingId)).size;
+}
+
+// ---------------------------------------------------------------------------
+// Source (c) — an upload that JOINS an existing meeting (`attachTo`)
+// ---------------------------------------------------------------------------
+
+/**
+ * "These bytes are a second recording OF that meeting."
+ *
+ * Sources (a) and (b) above add a recording that already exists. Source (c)
+ * of the spec (§API) is a fresh upload: it runs as any upload does — its own
+ * recording, its own transcription, its own meeting document (DEC-1) — and is
+ * added to the NAMED meeting as a clip the moment it finishes transcribing.
+ *
+ * The request is resolved at OPEN, before a byte moves (`resolveAttachTarget`
+ * in lib/server/clip-attach.ts), and what survives is the MARKER below,
+ * stamped on the upload's placeholder as `gmeet_context.attachTo`. It has to
+ * live on the row rather than only on the upload session because the two
+ * byte-delivery routes are different code paths, a chunked upload is resumed
+ * hours later, and the completion hook that acts on it runs from a poll it
+ * knows nothing about.
+ */
+export interface AttachToRequest {
+  /** The meeting to join — the caller must be able to EDIT it. */
+  meetingId: string;
+  /** Where the upload's first millisecond lands on that meeting's timeline.
+   * Never guessed by the server (spec §"The offset"); absent = 0, i.e. "they
+   * start together". `offset` is the CLI's `mm:ss` form; ms wins. */
+  offsetMs?: number;
+  offset?: string;
+  textPolicy?: ClipTextPolicy;
+}
+
+/** `gmeet_context.attachTo` — the request, frozen on the placeholder. */
+export interface AttachToMarker {
+  meetingId: string;
+  offsetMs: number;
+  textPolicy: ClipTextPolicy;
+  /** When the upload was opened, ISO. */
+  at: string;
+  /**
+   * The uploader's email, frozen at open. The completion hook re-checks
+   * access AS THE UPLOADER (a share can be withdrawn while a 4 GB file is on
+   * its way) and there is no users table to look an id up in.
+   */
+  by?: string;
+  /**
+   * The attach was tried and refused: the meeting stays an ordinary
+   * standalone one and the card says "could not attach: …". Its presence is
+   * also what stops the hook trying again on every re-entry.
+   */
+  error?: string;
+  errorCode?: CombineRefusalCode;
+  failedAt?: string;
+}
+
+/** A meeting id as the routes accept it: our own prefixes, a minted uuid, or
+ * a legacy AssemblyAI job id. Deliberately loose — `resolveAccess` is the
+ * real gate; this only keeps junk out of a jsonb column. */
+const MEETING_ID_RE = /^[A-Za-z0-9_-]{6,200}$/;
+
+/**
+ * `attachTo` off a request body or a query string.
+ *
+ * `undefined` = absent (an ordinary upload). `null` = junk, and the route
+ * answers 400: a client that meant to attach an upload must hear that it
+ * will not be, rather than discover a standalone meeting afterwards.
+ *
+ * A bare string is the one-shot route's `?attachTo=<meeting id>`; the object
+ * form is the JSON body's.
+ */
+export function parseAttachTo(raw: unknown): AttachToRequest | null | undefined {
+  if (raw === undefined || raw === null) return undefined;
+  if (typeof raw === 'string') {
+    const id = raw.trim();
+    if (!id) return undefined;
+    return MEETING_ID_RE.test(id) ? { meetingId: id } : null;
+  }
+  if (typeof raw !== 'object' || Array.isArray(raw)) return null;
+  const r = raw as { meetingId?: unknown; offsetMs?: unknown; offset?: unknown; textPolicy?: unknown };
+  const id = typeof r.meetingId === 'string' ? r.meetingId.trim() : '';
+  if (!MEETING_ID_RE.test(id)) return null;
+  if (r.offsetMs !== undefined && typeof r.offsetMs !== 'number') return null;
+  if (r.offset !== undefined && typeof r.offset !== 'string') return null;
+  if (r.textPolicy !== undefined && !isClipTextPolicy(r.textPolicy)) return null;
+  return {
+    meetingId: id,
+    ...(r.offsetMs !== undefined ? { offsetMs: r.offsetMs } : {}),
+    ...(r.offset !== undefined ? { offset: r.offset } : {}),
+    ...(r.textPolicy !== undefined ? { textPolicy: r.textPolicy } : {}),
+  };
+}
+
+/**
+ * The offset a request asks for, in ms, or `null` when it is unreadable —
+ * the route refuses rather than silently attaching at 0, because a wrong
+ * offset is a wrong meeting timeline.
+ */
+export function attachOffsetMs(req: AttachToRequest): number | null {
+  if (req.offsetMs === undefined && req.offset === undefined) return 0;
+  const ms = req.offsetMs !== undefined ? parseTimestampMs(req.offsetMs) : parseTimestampMs(req.offset);
+  return ms;
+}
+
+/** The marker to stamp on the placeholder. `offsetMs` has already been read
+ * (and refused) by the route — see `attachOffsetMs`. */
+export function attachMarker(
+  req: AttachToRequest,
+  offsetMs: number,
+  by?: string | null,
+  now: Date = new Date()
+): AttachToMarker {
+  return {
+    meetingId: req.meetingId,
+    offsetMs,
+    // The default is `include`: a second capture of the same meeting is
+    // normally there for its WORDS. The dialog offers gap_fill / exclude.
+    textPolicy: isClipTextPolicy(req.textPolicy) ? req.textPolicy : 'include',
+    at: now.toISOString(),
+    ...(by ? { by } : {}),
+  };
+}
+
+/** The marker on a row, in any state (pending or refused), or null. */
+export function attachMarkerOf(
+  ctx: { attachTo?: unknown } | null | undefined
+): AttachToMarker | null {
+  const raw = ctx?.attachTo;
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null;
+  const m = raw as Partial<AttachToMarker>;
+  if (typeof m.meetingId !== 'string' || !MEETING_ID_RE.test(m.meetingId)) return null;
+  return {
+    meetingId: m.meetingId,
+    offsetMs: typeof m.offsetMs === 'number' && Number.isFinite(m.offsetMs) ? m.offsetMs : 0,
+    textPolicy: isClipTextPolicy(m.textPolicy) ? m.textPolicy : 'include',
+    at: typeof m.at === 'string' ? m.at : '',
+    ...(typeof m.by === 'string' ? { by: m.by } : {}),
+    ...(typeof m.error === 'string' ? { error: m.error } : {}),
+    ...(typeof m.errorCode === 'string' ? { errorCode: m.errorCode as CombineRefusalCode } : {}),
+    ...(typeof m.failedAt === 'string' ? { failedAt: m.failedAt } : {}),
+  };
+}
+
+/** A marker still waiting to be acted on: no attempt has been refused yet.
+ * A refused one stays on the row for the UI and is never retried. */
+export function pendingAttachOf(
+  ctx: { attachTo?: unknown } | null | undefined
+): AttachToMarker | null {
+  const marker = attachMarkerOf(ctx);
+  return marker && !marker.error ? marker : null;
+}
+
+/**
+ * One line for the TARGET meeting's recording card: "A recording is being
+ * added — Upload · transcribing…".
+ *
+ * Filename-free by construction (`clipSourceLabel` with no filename), because
+ * the meeting's readers have not been given these bytes yet — the clip is what
+ * consents to that, and it does not exist until the transcription lands.
+ */
+export interface PendingAttach {
+  /** "Upload", "Recorded on your Mac", "Ivan’s upload" — never a filename. */
+  sourceLabel: string;
+  /** Where it will land on this meeting's timeline. */
+  offsetMs: number;
+  textPolicy: ClipTextPolicy;
+  /** 'uploading' = the bytes are still arriving; 'transcribing' = they are at
+   * AssemblyAI; 'failed' = the upload itself failed and nothing will be added. */
+  state: 'uploading' | 'transcribing' | 'failed';
+  /** True = the CALLER is the one adding it. */
+  mine: boolean;
+  since: string;
 }

@@ -90,3 +90,87 @@ People card labels per recording → delete one meeting keeps the recording → 
 recording they do not own and were not given. Browser pass of the sheet, align step, player part switching,
 390 px. `TZ=UTC bun test`, `tsc`, `eslint`, env-less build. Acceptance on prod (Alok): rebuild SI-BL row 548 from its
 three recordings with this instead of the hand merge and compare the text.
+
+---
+
+## As built — source (c), the upload that joins a meeting (2026-09-22)
+
+The third source in §API — "a fresh upload made with `?attachTo=<meeting id>`" — is built, behind the same
+`MW_COMBINE` gate as the rest. Sources (a) and (b) were already done; this is the hook the Phase 3b server
+commit (b540e8a) left as a note, and it replaces that route's `upload-deferred` 501 for every real case.
+
+**An upload names its meeting when it STARTS.** `POST /api/uploads` takes `attachTo: { meetingId, offsetMs?,
+textPolicy? }` in the body; the one-shot `POST /api/transcripts` takes `?attachTo=<meeting id>` with
+`?attach_offset=` (`mm:ss` / `h:mm:ss` / ms) and `?attach_policy=`. Both resolve it **immediately, before a byte
+moves** (`resolveAttachTarget`), because a person who may not add to that meeting has to hear so before they
+spend twenty minutes uploading. The refusal table is the meeting half of `addPrecondition`, in the same
+sentences the sheet greys out with: 404 (a meeting the caller cannot open — the SAME sentence as one that does
+not exist, so this is not an existence oracle), 403 `read-only`, 409 `no-clip` / `too-many-clips` / `disabled`
+(flag off, or the meeting is in the trash), 400 `offset-invalid`. Nothing about the RECORDING is checked — it
+does not exist yet, so neither `already-clipped` nor `not-transcribed` can apply.
+
+What survives is the MARKER, `gmeet_context.attachTo` on the placeholder: `{ meetingId, offsetMs, textPolicy,
+at, by }`. It lives on the ROW, not only on the upload session, because the two byte-delivery routes are
+different code paths, a chunked session is resumed hours later, and the completion hook that acts on it runs
+from a poll that knows nothing about either. `by` is the uploader's email, frozen: there is no users table, and
+access is re-checked AS THEM at the end (a share can be withdrawn while a 4 GB file is in flight). It survives
+`promoteUploadingRow` (which never touches `gmeet_context`), a multi-part group (it is stamped beside the group
+marker, not through `contextExtra`, which groups drop) and the fresh-insert fallback (it rides `UploadSpec` into
+the ingest options for the one path where the placeholder was reaped).
+
+**The clip is added at completion**, from `onTranscriptCompleted`, beside the `rematerialiseCombinedMeetings`
+block and under the same `combineFlagOn()` gate: resolve this upload's own recording (`meetingRecordingRef`,
+running the dual-write once if it has not landed yet), re-check access, and call the ordinary `addClip` — same
+code path, same privacy rule, same materialise-and-roll-back. The whole upload, `fromMs: 0`, `toMs: null`, at
+the stored offset and policy; a window of it is a later edit in the sheet, never a guess here. On success the
+marker is cleared (it is an instruction, not a record — the clip list is the record), and so it is on
+`already-clipped`, which is what a re-entry after a crash between the add and the clear looks like. **No new
+DM**: the ordinary "Transcript ready" one has already gone.
+
+**A refusal is not a failure of the upload.** If `addClip` says no (the meeting filled up while the file was
+uploading, the share was withdrawn, the recording is not set up), the uploaded meeting stays a perfectly
+ordinary standalone meeting — own recording, own text, fully readable — and the marker keeps `error` +
+`errorCode` + `failedAt` so the card can say "could not attach: …". A marker with an error is no longer
+*pending*, so nothing retries it.
+
+**The target meeting's card knows.** `GET /api/transcripts/:id/clips` grew `pendingAttach: PendingAttach[]` —
+`{ sourceLabel, offsetMs, textPolicy, state: 'uploading' | 'transcribing' | 'failed', mine, since }` — the
+uploads that named THIS meeting and have not landed yet. Caller-scoped in SQL (`listPendingAttachments`: the
+caller's own row or one shared with them) and **filename-free by construction**: the meeting's readers have not
+been given those bytes yet — the clip is what consents to that — so the label is `clipSourceLabel` with no
+filename ("Upload", "Recorded on your Mac").
+
+**`POST …/clips` with `uploadSessionId` deliberately stays 501.** Stamping a marker on an in-flight session
+would be a race with no winner: a session that finishes between the lookup and the stamp would never see it and
+the meeting would silently stay standalone — and once it HAS finished, its recording exists and that route's
+ordinary `recordingId` form is the answer. The `upload-deferred` sentence now says exactly that.
+
+### Files
+
+| | |
+|---|---|
+| `src/lib/clips.ts` | `AttachToRequest` / `AttachToMarker` / `PendingAttach`, `parseAttachTo`, `attachOffsetMs`, `attachMarker`, `attachMarkerOf`, `pendingAttachOf`; `ClipsResponse.pendingAttach`; the reworded `upload-deferred` sentence. Pure. |
+| `src/lib/server/clip-attach.ts` | `resolveAttachTarget` (open), `runPendingAttach` (completion), `pendingAttachFor` (the card's line). |
+| `src/db-ops/clips.ts` | `listPendingAttachments` — caller-scoped in SQL. |
+| `src/lib/format.ts` | `GmeetContext.attachTo`. |
+| `src/lib/server/upload-pipeline.ts` | `OpenUploadInput.attachTo` / `UploadSpec.attachTo`; stamped beside the group and recorder markers; carried into the ingest context for the fresh-insert fallback. |
+| routes | `POST /api/uploads` (body `attachTo`), `POST /api/transcripts` (`?attachTo=`, `?attach_offset=`, `?attach_policy=`), `GET …/clips` (`pendingAttach`). |
+| `src/lib/server/post-completion.ts` | the call, beside `rematerialiseCombinedMeetings`. |
+
+### Verification
+
+`src/lib/__tests__/clips-attach.test.ts` (committed, pure — 21 checks) and the scratch-Postgres integration
+check in `tmp/recordings-attach/` (18 checks, own cluster on 55941, AssemblyAI never called): open → marker on
+the placeholder → survives promotion → completion adds the clip at 1:50 as `gap_fill` → the target materialises
+two recordings with namespaced labels while the upload stays standalone; the five open-time refusals; and a
+completion whose `addClip` refuses leaving a standalone meeting with `attachTo.error`. `TZ=UTC bun test`
+1043 pass / 0 fail, `tsc`, `eslint`, env-less build all clean.
+
+### Left for the UI
+
+`pendingAttach` is served but nothing renders it yet, and no upload dialog offers "add this to an existing
+meeting" — both belong to the Phase 3b UI. A meeting's free slots are counted from its CLIPS only, so N
+uploads attaching to one meeting at once can overshoot `MAX_CLIPS_PER_MEETING`; the last ones are refused at
+completion with `too-many-clips` and stay standalone, which is the documented failure path rather than a
+silent one. Reserving slots at open would need a counter nothing else reads — not worth it until someone
+actually does it.
