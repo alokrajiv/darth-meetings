@@ -16,12 +16,14 @@
  * nothing here edits it. Instead this module:
  *  - reuses `createAzureBlobStore` for the whole `BlobLike` seam (same
  *    managed-identity credential, same SAS/stat/read/write/delete), and
- *  - adds the three methods an ARCHIVE needs that a TRANSIT store never did:
- *    `putStream` (block upload with a content type + disposition),
+ *  - adds the four methods a PERMANENT store needs that a TRANSIT store never
+ *    did: `putStream` (block upload with a content type + disposition),
  *    `setMetadata` (the sha256 + kind stamp, written after the bytes because
- *    the hash is only known once the stream ends) and `properties` (size +
- *    metadata + content type, for verify-then-stamp and for adopt).
- * The in-memory fake grows the same three methods —
+ *    the hash is only known once the stream ends), `properties` (size +
+ *    metadata + content type, for verify-then-stamp and for adopt) and
+ *    `readRange` (Stage B's proxy: a byte range of a blob, so a caller that
+ *    may not be redirected can still seek).
+ * The in-memory fake grows the same four methods —
  * `__tests__/helpers/fake-media-blob.ts`.
  *
  * No `server-only`: like `darth-uploads.ts` this is a plain Node module (the
@@ -63,7 +65,7 @@ export interface MediaPutOptions {
 }
 
 /**
- * The transit seam plus the archive's three methods. Everything above it
+ * The transit seam plus the permanent store's four methods. Everything above it
  * (`media-archive.ts`) is written against this interface and is therefore
  * exercised entirely against the fake.
  */
@@ -78,6 +80,14 @@ export interface MediaBlobLike extends BlobLike {
   setMetadata(blobName: string, metadata: Record<string, string>): Promise<void>;
   /** Size + metadata + content type, or null when the blob does not exist. */
   properties(blobName: string): Promise<MediaBlobProperties | null>;
+  /**
+   * A BYTE RANGE of the blob, inclusive on both ends (`read` gives the whole
+   * thing). Stage B's fallback: a caller that must stay on the app — the
+   * offline pin, `?via=app`, darth-cli — and whose local file is gone can
+   * still be served, with seeking, by proxying the blob. Rejects when the
+   * blob does not exist.
+   */
+  readRange(blobName: string, start: number, end: number): Promise<ReadableStream<Uint8Array>>;
 }
 
 /**
@@ -113,7 +123,7 @@ export type MediaStoreDeps = {
 
 /**
  * The real store: `createAzureBlobStore` for the seam, plus a container client
- * of our own for the three extra methods. ONE credential instance is shared
+ * of our own for the four extra methods. ONE credential instance is shared
  * between them so the IMDS token is fetched and cached once.
  */
 export function createAzureMediaStore(cfg: UploadsConfig, deps: MediaStoreDeps = {}): MediaBlobLike {
@@ -151,6 +161,16 @@ export function createAzureMediaStore(cfg: UploadsConfig, deps: MediaStoreDeps =
     },
     async setMetadata(blobName, metadata) {
       await container.getBlockBlobClient(blobName).setMetadata(metadata);
+    },
+    async readRange(blobName, start, end) {
+      // `download(offset, count)` — Azure's count is a LENGTH, the seam's
+      // `end` is the last byte, as HTTP Range spells it.
+      const res = await container
+        .getBlockBlobClient(blobName)
+        .download(start, Math.max(0, end - start + 1));
+      const body = res.readableStreamBody;
+      if (!body) throw new Error(`media-store: empty download body for ${blobName}`);
+      return Readable.toWeb(body as Readable) as unknown as ReadableStream<Uint8Array>;
     },
     async properties(blobName) {
       try {

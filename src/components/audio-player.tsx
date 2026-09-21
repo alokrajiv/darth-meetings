@@ -42,6 +42,27 @@ const SEEK_STEP_SEC = 10;
 const PROBE_TIMEOUT_MS = 4000;
 
 /**
+ * "Answer from the app, don't 302 me to Blob" (DEC-3 Stage B,
+ * lib/server/media-serve.ts). The probe below sends it for two reasons:
+ * a cross-origin `fetch()` carrying a `Range` header would need a CORS
+ * preflight against the storage account, and — the one that actually
+ * matters — the probe's URL is a Cache Storage key, so it must stay spelled
+ * exactly like the pinned one. A header changes no cache key; a query
+ * parameter would have missed every pinned extract.
+ *
+ * The `<audio>` / `<video>` elements themselves cannot send headers, and do
+ * not need to: a media element's load is `no-cors`, `Range` is safelisted
+ * for it, and it follows the cross-origin redirect and seeks against Blob
+ * with no CORS rule at all.
+ */
+const VIA_APP_HEADER = { 'x-darth-media-via': 'app' } as const;
+
+/** `?via=app` — the URL form of the same thing, for the last-ditch retry. */
+function viaAppUrl(url: string): string {
+  return url.includes('?') ? `${url}&via=app` : `${url}?via=app`;
+}
+
+/**
  * The audio-only URL for a media route URL, spelled EXACTLY as
  * lib/offline/offline-urls.ts spells it (`variant=audio` first, then
  * `part=N`): the service worker matches cached media on the full
@@ -86,11 +107,21 @@ export const AudioPlayer = forwardRef<AudioPlayerHandle, AudioPlayerProps>(
     const [videoOn, setVideoOn] = useState(false);
     // Carry position/play-state across the audio<->video element swap.
     const carryRef = useRef<{ t: number; playing: boolean } | null>(null);
+    // Stage B recovery (see handleMediaError): how many times this URL has
+    // been re-requested, and whether we have fallen back to `?via=app`.
+    const reloadsRef = useRef(0);
+    const [forceViaApp, setForceViaApp] = useState(false);
     // URL the <audio> element uses: the extract when it is ready, else src.
     // null = probe in flight (element not mounted yet — a few ms).
     const [audioSrc, setAudioSrc] = useState<string | null>(() =>
       hasVideo && audioVariantUrl(src) ? null : src
     );
+
+    // A new recording (or part) starts with a clean recovery budget.
+    useEffect(() => {
+      reloadsRef.current = 0;
+      setForceViaApp(false);
+    }, [src]);
 
     useEffect(() => {
       const variant = hasVideo ? audioVariantUrl(src) : null;
@@ -103,7 +134,7 @@ export const AudioPlayer = forwardRef<AudioPlayerHandle, AudioPlayerProps>(
       const ctrl = new AbortController();
       const timer = setTimeout(() => ctrl.abort(), PROBE_TIMEOUT_MS);
       fetch(variant, {
-        headers: { Range: 'bytes=0-1' },
+        headers: { Range: 'bytes=0-1', ...VIA_APP_HEADER },
         credentials: 'same-origin',
         signal: ctrl.signal,
       })
@@ -164,7 +195,7 @@ export const AudioPlayer = forwardRef<AudioPlayerHandle, AudioPlayerProps>(
       setVideoOn((v) => !v);
     };
 
-    // After the element swap, restore where we were.
+    // After the element swap (or a `?via=app` fallback), restore where we were.
     useEffect(() => {
       const carried = carryRef.current;
       const el = mediaRef.current;
@@ -180,7 +211,68 @@ export const AudioPlayer = forwardRef<AudioPlayerHandle, AudioPlayerProps>(
       };
       if (el.readyState >= 1) apply();
       else el.addEventListener('loadedmetadata', apply, { once: true });
-    }, [videoOn]);
+    }, [videoOn, forceViaApp]);
+
+    /**
+     * A media `error`, and what DEC-3 Stage B made of it.
+     *
+     * The app answers `/api/…/audio` with a 302 to a SAS that lives 60
+     * minutes. A recording longer than that — or simply left paused — will
+     * one day ask Blob for the next byte range with a signature that has
+     * expired, and the element reports a plain network/decode error. That is
+     * recoverable and the user must not notice: re-request the SAME app URL
+     * (a fresh 302, a fresh SAS) and resume at the same second. The URL is
+     * unchanged on purpose — it is the service worker's cache key.
+     *
+     * A failure with NO progress at all is a different animal: the redirect
+     * itself did not work for this browser / worker combination. One retry
+     * with `?via=app` pins the answer to the app (local bytes, same origin,
+     * no redirect) and playback continues, slower but correct.
+     *
+     * Only when both are spent does the parent hear `onError` — which is what
+     * hides the player or falls back to part 1.
+     */
+    const handleMediaError = () => {
+      const el = mediaRef.current;
+      if (!el) {
+        onError?.();
+        return;
+      }
+      const progressed = el.readyState >= 1 || el.currentTime > 0;
+      const carried = { t: el.currentTime, playing: !el.paused && !el.ended };
+
+      if (progressed && reloadsRef.current === 0) {
+        reloadsRef.current = 1;
+        carryRef.current = carried;
+        try {
+          el.load(); // same src → new request → new 302 → new SAS
+        } catch {
+          onError?.();
+          return;
+        }
+        const apply = () => {
+          try {
+            el.currentTime = carried.t;
+          } catch {
+            /* ignore */
+          }
+          if (carried.playing) void el.play().catch(() => {});
+        };
+        carryRef.current = null;
+        if (el.readyState >= 1) apply();
+        else el.addEventListener('loadedmetadata', apply, { once: true });
+        return;
+      }
+
+      if (!forceViaApp) {
+        reloadsRef.current = 2;
+        carryRef.current = carried;
+        setForceViaApp(true);
+        return;
+      }
+
+      onError?.();
+    };
 
     // ---- Media Session -------------------------------------------------
     const applyMetadata = useCallback(() => {
@@ -307,8 +399,14 @@ export const AudioPlayer = forwardRef<AudioPlayerHandle, AudioPlayerProps>(
       onPause: () => setPlaybackState('paused'),
       onRateChange: (e: React.SyntheticEvent<HTMLMediaElement>) =>
         syncPositionState(e.target as HTMLMediaElement),
-      onError: () => onError?.(),
+      onError: handleMediaError,
     };
+
+    // What the elements actually load. `forceViaApp` is only ever set by the
+    // recovery path above; until then these are the URLs the page passed and
+    // the worker has cached.
+    const videoElementSrc = forceViaApp ? viaAppUrl(src) : src;
+    const audioElementSrc = audioSrc && forceViaApp ? viaAppUrl(audioSrc) : audioSrc;
 
     return (
       <div className="relative">
@@ -317,19 +415,19 @@ export const AudioPlayer = forwardRef<AudioPlayerHandle, AudioPlayerProps>(
             ref={(el) => {
               mediaRef.current = el;
             }}
-            src={src}
+            src={videoElementSrc}
             controls
             preload="metadata"
             playsInline
             className="max-h-[50vh] w-full rounded-md bg-black"
             {...mediaEvents}
           />
-        ) : audioSrc ? (
+        ) : audioElementSrc ? (
           <audio
             ref={(el) => {
               mediaRef.current = el;
             }}
-            src={audioSrc}
+            src={audioElementSrc}
             controls
             preload="metadata"
             className={className ?? 'w-full'}

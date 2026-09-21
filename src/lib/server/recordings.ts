@@ -40,6 +40,21 @@ import {
  * and applies no gate of its own (feedback_privacy_caller_scoping_gate).
  */
 
+/**
+ * A rebuildable extract of a playable file — today only the 64 kbps
+ * `audio_only` m4a (`lib/server/audio-only.ts`). Carried on the parent so
+ * `?variant=audio` can be answered (streamed locally, or redirected to its
+ * own blob in Stage B) without a second query.
+ */
+export interface ResolvedMediaDerivative {
+  /** `recording_media.id` of the DERIVATIVE row. */
+  mediaId: string;
+  /** Its stored name (`<stem>.m4a`, under `storage/audio-only/`). */
+  filename: string;
+  /** Its own `blob_name`; null until the archive has stamped it. */
+  blobName: string | null;
+}
+
 /** One playable file, in the numbering `/audio?part=N` already uses. */
 export interface ResolvedMedia {
   /** 1 = the canonical file ("Video 1"); 2… = the parts, in capture order. */
@@ -58,6 +73,15 @@ export interface ResolvedMedia {
    * also the ONLY place "the job did not hear this file" shows up: it never
    * takes a one-clip meeting out of compat (spec §5a). */
   transcribed: boolean;
+  /**
+   * `recording_media.blob_name` — the permanent copy in the media container
+   * (DEC-3 Stage A). null means "no blob to serve from": fallback mode (no
+   * row exists at all) or a file the archive has not stamped yet. Stage B
+   * reads this and nothing else to decide whether a redirect is possible.
+   */
+  blobName: string | null;
+  /** The `audio_only` extract of THIS file, when one has been built. */
+  audioOnly: ResolvedMediaDerivative | null;
 }
 
 /**
@@ -145,6 +169,11 @@ function mediaFromRow(row: MediaOnlyRow): ResolvedMedia[] {
       offsetMs: 0,
       durationMs,
       transcribed: true,
+      // Fallback mode reads the `transcripts` row alone, which knows nothing
+      // about the archive: there is no blob to serve and no derivative row.
+      // `?variant=audio` still works — it goes through the local extract.
+      blobName: null,
+      audioOnly: null,
     });
   }
   // The extra videos of a stop-restart Meet recording, placed by the SAME
@@ -160,6 +189,8 @@ function mediaFromRow(row: MediaOnlyRow): ResolvedMedia[] {
       offsetMs: p.offsetSec != null ? Math.round(p.offsetSec * 1000) : 0,
       durationMs: p.durationSec != null ? Math.round(p.durationSec * 1000) : null,
       transcribed: false,
+      blobName: null,
+      audioOnly: null,
     });
   }
   return media;
@@ -214,6 +245,19 @@ function mediaForRecordings(
   clipOffsetMs: Map<string, number>
 ): ResolvedMedia[] {
   const out: ResolvedMedia[] = [];
+  // Derivatives by the media they were built from. `graph.media` already
+  // holds every row of these recordings — the `audio_only` extracts included
+  // — so attaching them here costs NO extra query, which is what lets the
+  // audio route answer `?variant=audio` from the blob without a second read.
+  const derivatives = new Map<string, ResolvedMediaDerivative>();
+  for (const d of graph.media) {
+    if (d.kind !== 'audio_only' || !d.of_media_id || !d.filename) continue;
+    derivatives.set(d.of_media_id, {
+      mediaId: d.id,
+      filename: d.filename,
+      blobName: d.blob_name,
+    });
+  }
   let part = 0;
   for (const recordingId of orderedRecordingIds) {
     const mine = graph.media.filter((m) => m.recording_id === recordingId);
@@ -236,6 +280,8 @@ function mediaForRecordings(
         offsetMs: base + (m.offset_ms ?? 0),
         durationMs: m.duration_ms ?? null,
         transcribed: covered.size === 0 ? m.kind === 'canonical' : covered.has(m.id),
+        blobName: m.blob_name,
+        audioOnly: derivatives.get(m.id) ?? null,
       });
     }
   }

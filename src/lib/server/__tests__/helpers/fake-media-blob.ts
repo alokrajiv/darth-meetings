@@ -1,7 +1,8 @@
 /**
- * `FakeBlob` + the three methods the PERMANENT media store adds
+ * `FakeBlob` + the four methods the PERMANENT media store adds
  * (`src/lib/server/media-store.ts`): `putStream`, `setMetadata`,
- * `properties`. A subclass rather than an edit to `fake-blob.ts`, which is
+ * `properties` and `readRange` (Stage B's proxy path). A subclass rather
+ * than an edit to `fake-blob.ts`, which is
  * the lifted transit fake and stays in step with ../chat.
  *
  * Knobs for the archive's failure paths: `failPutAfterBytes` (a write that
@@ -86,6 +87,19 @@ export class FakeMediaBlob extends FakeBlob implements MediaBlobLike {
       contentType: b.contentType ?? null,
       metadata: this.metadata.get(blobName) ?? {},
     };
+  }
+
+  async readRange(blobName: string, start: number, end: number): Promise<ReadableStream<Uint8Array>> {
+    this.calls.push(`readRange ${blobName} ${start}-${end}`);
+    const b = this.blobs.get(blobName);
+    if (!b) throw Object.assign(new Error(`BlobNotFound: ${blobName}`), { statusCode: 404 });
+    const slice = b.bytes.subarray(start, end + 1);
+    return new ReadableStream<Uint8Array>({
+      start(c) {
+        c.enqueue(slice);
+        c.close();
+      },
+    });
   }
 
   override async delete(blobName: string): Promise<boolean> {

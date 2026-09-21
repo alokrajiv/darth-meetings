@@ -112,14 +112,90 @@ cases); it is listed in the provisioning note above so it is not forgotten, not 
 
 - `/api/transcripts/:id/audio` (and `?part=N`, `?variant=audio`): access check as today → when the resolved media
   has a `blob_name`: **302 to a read-only SAS, TTL 60 min**, `Cache-Control: private, no-store` on the redirect.
-  `<audio>/<video>` follow cross-origin redirects and Range works against Blob, so the player needs no change.
+  `<audio>/<video>` follow cross-origin redirects and Range works against Blob, so the player needs no change
+  *for playback*; it did need one for RECOVERY, since a SAS can expire mid-session (see "Stage B as built").
 - Stays on the app (streamed from the local cache, fetched from blob on a miss): requests with `?via=app`, the
-  service worker's pin downloads (a pinned URL must be stable and same-origin — `offline-urls.ts` adds `via=app`),
-  and any caller sending the `dth_` bearer (darth-cli downloads) unless it passes `?redirect=1`.
+  service worker's pin downloads (a pinned URL must be stable and same-origin — **as built this is a request
+  header, `x-darth-media-via: app`, NOT a query parameter; see "Stage B as built" for why adding one to a pinned
+  URL would have re-downloaded and broken every existing pin**), and any caller sending the `dth_` bearer
+  (darth-cli downloads) unless it passes `?redirect=1`.
 - A SAS URL is a bearer link for its lifetime: whoever gets the URL can read that one blob for ≤ 60 min. That is the
   trade for not proxying bytes; it is the same trust the upload ticket already takes. The access decision is still
   per request, caller-scoped, before the redirect. Never log the SAS query string.
 - Speed: bytes no longer cross nginx/Next on the VM or Tailscale at all — the browser talks to the storage front end.
+
+### Stage B as built — 2026-09-22
+
+Inert until `DARTH_MEDIA_ACCOUNT` exists **and** `MW_MEDIA_FROM_BLOB` is set **and** the media row has a
+`blob_name`. Any one of the three missing → the route streams from disk exactly as before, with not one extra
+query and not one call to the store (proven: `tmp/media-serve/` check 4).
+
+| Piece | File |
+|---|---|
+| `blobName` + the `audioOnly` derivative (id / filename / its own `blob_name`) on `ResolvedMedia`, attached from the graph the resolver already loaded — **no extra query** | `src/lib/server/recordings.ts` |
+| The policy: `MW_MEDIA_FROM_BLOB`, who may be redirected, which blob answers which request, the 302, `redactSas`, the Stage-D proxy with Range | `src/lib/server/media-serve.ts` |
+| The route: access check → 302 / local stream / blob proxy, and a `redactError` on every `console.*` | `src/app/api/transcripts/[id]/audio/route.ts` |
+| `readRange` added to the `MediaBlobLike` seam (the sibling module, never `darth-uploads.ts`) | `src/lib/server/media-store.ts` (+ the fake) |
+| The pin downloader sends `x-darth-media-via: app`; the URL shape is untouched | `src/lib/offline/offline-pins.ts`, `src/lib/offline/offline-urls.ts` |
+| The probe sends the same header; a media error re-requests the app URL once and resumes, then falls back to `?via=app` | `src/components/audio-player.tsx` |
+| Stage A leftovers: the stale-media DELETE, the promotion DELETE and `dropDerivativeMediaByFilename` all queue the blobs they orphan (`RETURNING blob_name` → `media_blob_deletes`, same transaction, gated on a 047 probe) | `src/db-ops/recordings.ts` |
+| Tests | `src/lib/server/__tests__/media-serve.test.ts` (21), `src/lib/__tests__/offline-urls.test.ts` (31), `tmp/media-serve/` (46-check scratch-PG integration) |
+
+**The pinned-URL decision — no `via=app` in `offline-urls.ts`.** The sketch above said this file would append
+`?via=app` to every media URL it emits. It must not: those strings ARE the Cache Storage keys. `public/sw.js`
+`media()` matches on `pathname + search` exactly; `offline-pins.ts` stores, sizes and evicts by the same string;
+`audio-player.tsx` spells `?variant=audio` identically on purpose so a pinned extract answers the player from
+cache. Re-spelling them would orphan every body already in `CACHE_MEDIA` — hundreds of MB re-downloaded per
+pinned meeting — and, worse, **break offline playback** for those pins, because the `<audio>` element still asks
+for the un-suffixed URL and the worker would miss. So the pin downloader and the probe mark themselves with a
+REQUEST HEADER, `x-darth-media-via: app`, which no cache key in the stack can see. Nothing moves: same URLs,
+same worker matching, same plan `rev` (it hashes clip/media identity, never a URL), zero re-download. `?via=app`
+still works as an explicit opt-out for anyone who wants it in a URL — it is simply not what a pin uses.
+
+**What the owner must provision** (beyond Stage A's account + container + the VM identity):
+
+- **Role: nothing new.** Minting a user-delegation SAS needs
+  `Microsoft.Storage/storageAccounts/blobServices/generateUserDelegationKey/action`, and **Storage Blob Data
+  Contributor already contains it** — as do Data Reader and Data Owner. `Storage Blob Delegator` is the role you
+  add when an identity's data access is scoped to a container/blob but it still needs the account-level
+  delegation right; Stage A assigns Contributor at **account scope**, so the key is already mintable. (The two
+  halves are independent and both required: the SAS's effective permission is the intersection of what the SAS
+  says and what the signing identity may actually do — a Delegator-only identity mints keys whose SAS grants
+  nothing.) If the assignment is ever narrowed to a container, add `Storage Blob Delegator` at account scope.
+- **CORS: not needed by anything shipped here.** A `<audio>`/`<video>` load with no `crossorigin` attribute is a
+  `no-cors` request, `Range` is CORS-safelisted for a simple byte range, and the element follows the cross-origin
+  302 and seeks against Blob with no response header from us at all. The two `fetch()` callers that WOULD have
+  needed it — the offline pin and the player's audio-only probe — never leave the origin, because they send
+  `x-darth-media-via: app`. Add a rule only if that changes; the rule to add then is:
+  `AllowedOrigins: https://meetings.darth-internal.trames.io`, `AllowedMethods: GET, HEAD`,
+  `AllowedHeaders: Range, x-ms-*`, `ExposedHeaders: Content-Length, Content-Range, Content-Type, Accept-Ranges`,
+  `MaxAgeInSeconds: 3600`.
+- Blob `Content-Type` and `Content-Disposition: inline` are already written by Stage A (`archiveMedia`), which is
+  what makes the redirect play: after a 302 the browser believes the BLOB's content type, not ours.
+
+**Live proof on the VM once the account exists** (spec's "B" line, in order):
+
+1. `DARTH_MEDIA_ACCOUNT` + `MW_MEDIA_ARCHIVE`, archive one meeting, confirm `blob_name` on its rows.
+2. `MW_MEDIA_FROM_BLOB=1`, pm2 restart. `curl -sI -b <cookie> '…/audio'` → `302`, `Location` on the media
+   account, `Cache-Control: private, no-store`. **Do not paste the Location anywhere** — it is a live credential
+   for an hour.
+3. Browser: play, seek forward and back, toggle the video on and off. Then leave it paused past the hour and
+   press play — it must resume without a reload (the player re-requests the app URL once for a fresh SAS).
+4. Phone (relay path): the same, on `?variant=audio`.
+5. Service worker: pin a meeting at `video`, confirm in devtools that the pin requests were answered `200` by
+   the app (not `302`) and that `CACHE_MEDIA` keys are unchanged from before the deploy; go offline and play.
+6. `curl -H 'Authorization: Bearer dth_…' -sI '…/audio'` → `200`; add `?redirect=1` → `302`.
+7. `pm2 logs meeting-whisperer --lines 2000 | grep -c 'sig='` → `0`.
+
+**Two things to watch on that first live run**, neither reproducible without a real account:
+
+- **Safari + service worker + a cross-origin media redirect.** Our SW intercepts every `/audio` request and, on a
+  cache miss, passes it to `fetch(request)`; with Stage B the answer becomes an opaque cross-origin response.
+  Chrome and Firefox hand that to the media element unchanged, Safari has historically been the weak one for
+  Range-over-SW. If it misbehaves, the player already self-heals (second failure → `?via=app`, local bytes); the
+  permanent fix would be to keep the SW out of the media path when nothing is cached.
+- **Clock skew.** `darth-uploads.ts` backdates `startsOn` by 5 minutes, which is what makes a freshly minted SAS
+  usable immediately; the effective window is therefore 65 minutes, not 60.
 
 ## Stage C — AssemblyAI reads the blob; the VM stops pushing bytes   flag `MW_AAI_FROM_BLOB`
 

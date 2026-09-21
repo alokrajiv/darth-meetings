@@ -146,6 +146,24 @@ async function cacheDeleteAll(name: string, urls: string[]): Promise<void> {
 
 const FETCH_OPTS: RequestInit = { credentials: 'include', cache: 'no-store' };
 
+/**
+ * Media fetches say "answer from the app" — DEC-3 Stage B's audio route
+ * otherwise 302s to a cross-origin SAS, and a pin has to be same-origin: a
+ * redirected cross-origin body is opaque, `cache.put` refuses it, and an
+ * offline copy behind a one-hour signature would be worthless anyway.
+ *
+ * It is a HEADER and not `?via=app` on purpose. These URLs are the Cache
+ * Storage keys the worker matches on (`public/sw.js` `media()`), so changing
+ * their spelling would orphan every body already pinned — a silent
+ * re-download of every saved meeting, and broken offline playback until it
+ * finished. A header is invisible to every cache key in the stack. The full
+ * argument is at the top of offline-urls.ts.
+ */
+const MEDIA_FETCH_OPTS: RequestInit = {
+  ...FETCH_OPTS,
+  headers: { 'x-darth-media-via': 'app' },
+};
+
 function landedOnLogin(res: Response): boolean {
   if (!res.redirected) return false;
   try {
@@ -309,7 +327,7 @@ function sleep(ms: number): Promise<void> {
 async function fetchAndStoreMedia(url: string): Promise<number> {
   const started = Date.now();
   for (;;) {
-    const res = await fetch(url, FETCH_OPTS);
+    const res = await fetch(url, MEDIA_FETCH_OPTS);
     if (res.status === 202) {
       await res.body?.cancel().catch(() => undefined);
       if (Date.now() - started > MEDIA_POLL_MAX_MS) throw new Error(`${url} → still preparing after 15 min`);

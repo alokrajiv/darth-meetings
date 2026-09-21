@@ -769,6 +769,9 @@ export async function applyRecordingGraph(
   let staleMediaRemoved = 0;
   // Asked before the transaction opens — see the note at its only use below.
   const has046 = await transcriptionVersionTablesExist().catch(() => false);
+  // Same reason (a missing table aborts the transaction): the stale-media
+  // DELETE below queues the blobs it orphans, and only when 047 is there.
+  const has047 = await mediaArchiveTablesExist().catch(() => false);
 
   await sql.begin(async (tx) => {
     // What these meetings pointed at BEFORE — a promotion changes the answer.
@@ -828,14 +831,38 @@ export async function applyRecordingGraph(
     // Files the row no longer describes. Derivatives are only judged when
     // the caller actually looked at the disk — an unprobed sync must not
     // delete an `audio_only` row it simply did not ask about.
-    const stale = await tx<Array<{ id: string }>>`
+    //
+    // DEC-3 Stage A.7: a row that carried a `blob_name` is the ONLY record of
+    // that blob's name. Deleting it without saying so stranded the bytes in
+    // the container for ever (the Stage A report flagged this path). The name
+    // goes into `media_blob_deletes` in the SAME transaction, so either both
+    // happen or neither; the sweeper's drain does the actual delete and
+    // retries until Azure agrees.
+    const stale = await tx<Array<{ id: string; blob_name: string | null }>>`
       DELETE FROM ${tx(SCHEMA)}.recording_media
       WHERE recording_id = ${rec.id}::uuid
         AND NOT (id = ANY(${keepMediaIds}::uuid[]))
         AND (${graph.filesProbed} OR kind IN ('canonical', 'part'))
-      RETURNING id
+      RETURNING id, blob_name
     `;
     staleMediaRemoved = stale.length;
+    const strandedBlobs = stale.filter((s) => s.blob_name !== null);
+    if (has047 && strandedBlobs.length > 0) {
+      await tx`
+        INSERT INTO ${tx(SCHEMA)}.media_blob_deletes
+        ${tx(
+          strandedBlobs.map((s) => ({
+            blob_name: s.blob_name!,
+            recording_id: rec.id,
+            media_id: s.id,
+          })) as unknown as readonly Record<string, unknown>[],
+          'blob_name',
+          'recording_id',
+          'media_id'
+        )}
+        ON CONFLICT (blob_name) DO NOTHING
+      `;
+    }
 
     const t = graph.transcription;
     await tx`
@@ -926,7 +953,30 @@ export async function applyRecordingGraph(
         continue;
       }
       await tx`DELETE FROM ${tx(SCHEMA)}.recording_transcriptions WHERE recording_id = ${priorId}::uuid`;
-      await tx`DELETE FROM ${tx(SCHEMA)}.recording_media WHERE recording_id = ${priorId}::uuid`;
+      // The promoted-away recording's blobs are orphaned by the same rule as
+      // the stale media above: the new recording has a new id, so its blob
+      // names are new too and nothing points at these any more.
+      const priorMedia = await tx<Array<{ id: string; blob_name: string | null }>>`
+        DELETE FROM ${tx(SCHEMA)}.recording_media WHERE recording_id = ${priorId}::uuid
+        RETURNING id, blob_name
+      `;
+      const priorBlobs = priorMedia.filter((m) => m.blob_name !== null);
+      if (has047 && priorBlobs.length > 0) {
+        await tx`
+          INSERT INTO ${tx(SCHEMA)}.media_blob_deletes
+          ${tx(
+            priorBlobs.map((m) => ({
+              blob_name: m.blob_name!,
+              recording_id: priorId,
+              media_id: m.id,
+            })) as unknown as readonly Record<string, unknown>[],
+            'blob_name',
+            'recording_id',
+            'media_id'
+          )}
+          ON CONFLICT (blob_name) DO NOTHING
+        `;
+      }
       await tx`DELETE FROM ${tx(SCHEMA)}.recordings WHERE id = ${priorId}::uuid`;
       migratedFrom.push(priorId);
     }
@@ -993,16 +1043,43 @@ export async function removeMeetingFromRecordingGraph(
  * INTERNAL-ONLY — the A5 derivative sweep removed these files from disk, so
  * their rows go too. Only rebuildable kinds are ever matched: a canonical or
  * a part is the recording itself and never disappears behind our back.
+ *
+ * DEC-3 Stage A.7: an archived derivative's `blob_name` dies with its row, so
+ * the name is queued for deletion first (the Stage A report flagged this path
+ * as one that could strand a blob). One transaction: the row and the queue
+ * entry are written together, and the sweeper's drain does the delete.
  */
 export async function dropDerivativeMediaByFilename(filenames: string[]): Promise<number> {
   if (filenames.length === 0) return 0;
-  const rows = await sql<Array<{ id: string }>>`
-    DELETE FROM ${sql(SCHEMA)}.recording_media
-    WHERE kind IN ('audio_only', 'faststart')
-      AND filename = ANY(${filenames})
-    RETURNING id
-  `;
-  return rows.length;
+  const has047 = await mediaArchiveTablesExist().catch(() => false);
+  let removed = 0;
+  await sql.begin(async (tx) => {
+    const rows = await tx<Array<{ id: string; recording_id: string; blob_name: string | null }>>`
+      DELETE FROM ${tx(SCHEMA)}.recording_media
+      WHERE kind IN ('audio_only', 'faststart')
+        AND filename = ANY(${filenames})
+      RETURNING id, recording_id, blob_name
+    `;
+    removed = rows.length;
+    const stranded = rows.filter((r) => r.blob_name !== null);
+    if (has047 && stranded.length > 0) {
+      await tx`
+        INSERT INTO ${tx(SCHEMA)}.media_blob_deletes
+        ${tx(
+          stranded.map((r) => ({
+            blob_name: r.blob_name!,
+            recording_id: r.recording_id,
+            media_id: r.id,
+          })) as unknown as readonly Record<string, unknown>[],
+          'blob_name',
+          'recording_id',
+          'media_id'
+        )}
+        ON CONFLICT (blob_name) DO NOTHING
+      `;
+    }
+  });
+  return removed;
 }
 
 /**
@@ -1082,6 +1159,40 @@ export async function moveRecordingOwnershipForMeeting(
 // comment on its media upsert). Migration 047 adds the two bookkeeping
 // tables used below.
 // ---------------------------------------------------------------------------
+
+// Migration 047's tables, probed once per process. `applyRecordingGraph` and
+// `dropDerivativeMediaByFilename` name `media_blob_deletes` on a path that must
+// keep working on a server deployed AHEAD of the migration — and a statement
+// naming a missing table ABORTS the whole transaction, so it cannot be wrapped
+// in a catch. A FAILED probe is not cached (a DB hiccup must not disable the
+// queue for the life of the process).
+const gRecordings = globalThis as unknown as { __mwMediaArchiveTables?: Promise<boolean> };
+
+export function mediaArchiveTablesExist(): Promise<boolean> {
+  return (gRecordings.__mwMediaArchiveTables ??= (async () => {
+    const rows = await sql<Array<{ tables: number }>>`
+      SELECT count(*)::int AS tables FROM information_schema.tables
+      WHERE table_schema = ${SCHEMA}
+        AND table_name IN ('media_blob_deletes', 'media_archive_canaries')
+    `;
+    const present = (rows[0]?.tables ?? 0) === 2;
+    if (!present) {
+      console.warn(
+        '[recordings] migrations/047 not applied — a deleted media row cannot queue its blob ' +
+          'for deletion (docs/recordings-blob-spec.md Stage A.7)'
+      );
+    }
+    return present;
+  })().catch((err) => {
+    gRecordings.__mwMediaArchiveTables = undefined;
+    throw err;
+  }));
+}
+
+/** Tests / the integration check: forget the cached 047 probe. */
+export function resetMediaArchiveTablesProbe(): void {
+  gRecordings.__mwMediaArchiveTables = undefined;
+}
 
 /**
  * INTERNAL-ONLY — the backfill queue: files we hold locally that have no blob

@@ -8,6 +8,7 @@ import {
   levelRank,
   maxLevel,
   partCount,
+  partNumbers,
   rscCacheKey,
   urlsForLevel,
   urlsToDrop,
@@ -38,6 +39,18 @@ function meeting(parts: number, opts: { hasLocal?: boolean; isVideo?: boolean; b
       })),
     },
   };
+}
+
+/** A meeting whose parts are sparse — the middle file never landed. */
+function sparse(numbers: number[]): PlanMeeting {
+  const m = meeting(numbers.length);
+  m.media.parts = numbers.map((n) => ({
+    part: n,
+    filename: `f${n}.mp4`,
+    isVideo: true,
+    bytes: null,
+  }));
+  return m;
 }
 
 describe('level ladder', () => {
@@ -105,6 +118,54 @@ describe('urlsForLevel', () => {
     expect(frames).toEqual([`${BASE}/frames/1000.jpg`, `${BASE}/frames/2500.jpg`]);
   });
 
+  // Regression, 2026-09-22: part numbers are POSITIONAL and sparse (a Meet
+  // segment whose bytes never landed keeps its number reserved). The old code
+  // counted the parts and emitted 2…n, so [1, 3] pinned a 404 at ?part=2 and
+  // never fetched ?part=3 at all.
+  test('sparse parts pin their REAL numbers', () => {
+    expect(partNumbers(sparse([1, 3]))).toEqual([1, 3]);
+    const set = urlsForLevel(ID, 'video', sparse([1, 3]));
+    expect(set.media).toEqual([
+      `${BASE}/audio?variant=audio`,
+      `${BASE}/audio?variant=audio&part=3`,
+      `${BASE}/audio`,
+      `${BASE}/audio?part=3`,
+    ]);
+    expect(set.media).not.toContain(`${BASE}/audio?part=2`);
+  });
+
+  test('a gap further out, and several gaps', () => {
+    expect(urlsForLevel(ID, 'audio', sparse([1, 2, 5])).media).toEqual([
+      `${BASE}/audio?variant=audio`,
+      `${BASE}/audio?variant=audio&part=2`,
+      `${BASE}/audio?variant=audio&part=5`,
+    ]);
+    expect(partNumbers(sparse([3, 1]))).toEqual([1, 3]); // sorted, order-independent
+  });
+
+  test('a meeting whose primary is missing pins only what it has', () => {
+    const set = urlsForLevel(ID, 'video', sparse([2, 3]));
+    expect(set.media).toEqual([
+      `${BASE}/audio?variant=audio&part=2`,
+      `${BASE}/audio?variant=audio&part=3`,
+      `${BASE}/audio?part=2`,
+      `${BASE}/audio?part=3`,
+    ]);
+  });
+
+  test('partNumbers: unknown meta → [1], no recording → []', () => {
+    expect(partNumbers(undefined)).toEqual([1]);
+    expect(partNumbers(null)).toEqual([1]);
+    expect(partNumbers(meeting(0, { hasLocal: false }))).toEqual([]);
+    expect(partNumbers(meeting(3))).toEqual([1, 2, 3]);
+    expect(partCount(meeting(3))).toBe(3); // unchanged for the callers that count
+  });
+
+  test('media urls carry no via=app — the cache keys must not move', () => {
+    const set = urlsForLevel(ID, 'video', meeting(2));
+    for (const u of set.media) expect(u).not.toContain('via=app');
+  });
+
   test('ids are URL-encoded in paths', () => {
     const set = urlsForLevel('a b/c', 'transcript');
     expect(set.pages[0]).toBe('/transcript/a%20b%2Fc');
@@ -128,6 +189,40 @@ describe('urlsToDrop', () => {
   test('upgrade drops nothing', () => {
     const d = urlsToDrop(ID, 'transcript', 'video', meeting(1));
     expect(d).toEqual({ pages: [], api: [], media: [], rsc: [] });
+  });
+
+  // Existing pins made before the sparse-parts fix could hold bodies under the
+  // positional numbers. A downgrade / unpin must evict those too, without
+  // evicting anything the new numbering still wants.
+  test('a downgrade also evicts what the OLD positional numbering cached', () => {
+    const d = urlsToDrop(ID, 'video', 'audio', sparse([1, 3]));
+    expect(d.media).toContain(`${BASE}/audio`);
+    expect(d.media).toContain(`${BASE}/audio?part=3`);
+    expect(d.media).toContain(`${BASE}/audio?part=2`); // the legacy key
+    expect(d.api).toEqual([]);
+  });
+
+  test('a downgrade never evicts a level the pin keeps', () => {
+    const d = urlsToDrop(ID, 'video', 'audio', sparse([1, 3]));
+    expect(d.media).not.toContain(`${BASE}/audio?variant=audio`);
+    expect(d.media).not.toContain(`${BASE}/audio?variant=audio&part=3`);
+    // …not even the legacy audio key, which the new pin does not hold but
+    // also does not want back.
+    expect(d.media).not.toContain(`${BASE}/audio?variant=audio&part=2`);
+  });
+
+  test('unpinning a sparse meeting clears both numberings', () => {
+    const d = urlsToDrop(ID, 'video', 'none', sparse([1, 3]));
+    for (const u of [
+      `${BASE}/audio`,
+      `${BASE}/audio?part=2`,
+      `${BASE}/audio?part=3`,
+      `${BASE}/audio?variant=audio`,
+      `${BASE}/audio?variant=audio&part=2`,
+      `${BASE}/audio?variant=audio&part=3`,
+    ]) {
+      expect(d.media).toContain(u);
+    }
   });
 });
 

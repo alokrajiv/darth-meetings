@@ -4,12 +4,25 @@ import { withAuth } from '@/lib/auth/with-auth';
 import { resolveAccess } from '@/db-ops/transcript-access';
 import { resolveAudioPath } from '@/lib/server/audio-storage';
 import { ensureAudioOnly } from '@/lib/server/audio-only';
-import { canonicalMedia, mediaPart, resolveMeetingContent } from '@/lib/server/recordings';
+import {
+  blobTargetFor,
+  mediaRedirectDecision,
+  mediaSasRedirect,
+  proxyBlobRange,
+  redactSas,
+  serveStore,
+} from '@/lib/server/media-serve';
+import {
+  canonicalMedia,
+  mediaPart,
+  resolveMeetingContent,
+  type ResolvedMedia,
+} from '@/lib/server/recordings';
 
 export const runtime = 'nodejs';
 
 /**
- * GET /api/transcripts/:id/audio[?part=N][&variant=audio]
+ * GET /api/transcripts/:id/audio[?part=N][&variant=audio][&via=app][&redirect=1]
  *
  * `?part=N` (N >= 2) serves an EXTRA file of a multi-video meeting — today
  * gmeet_context.videoParts[N-2]'s stored file (the primary video is "part 1"
@@ -35,16 +48,28 @@ export const runtime = 'nodejs';
  * audio_url row ignores it and redirects as before.
  *
  * Returns the audio for a transcript. Resolution order:
- *   1. the meeting's canonical file (bytes we hold on the VM) → stream from
- *      disk with HTTP Range support so the player can seek.
+ *   1. the meeting's canonical file (bytes we hold on the VM) →
+ *      a. DEC-3 Stage B (`MW_MEDIA_FROM_BLOB` + an archived `blob_name` + an
+ *         eligible caller): **302 to a 60-minute read-only SAS** on that one
+ *         blob, so the bytes never cross nginx/Next/Tailscale at all. The
+ *         access check below has already run; the redirect is the last thing
+ *         that happens. `?via=app`, the `x-darth-media-via: app` header (the
+ *         offline pin downloader and the player's probe) and a darth-cli
+ *         bearer without `?redirect=1` all opt out — see media-serve.ts.
+ *      b. otherwise stream from disk with HTTP Range support so the player
+ *         can seek — unchanged.
+ *      c. local file gone but the blob is there (Stage D, when `storage/`
+ *         is drained): proxy the blob through the app, with Range, rather
+ *         than 404.
  *   2. an audio_url already stored on the row → 302 (legacy rows only).
  *   3. nothing → 404.
  * There is no step that asks AssemblyAI for a URL any more (DEC-4).
  *
  * Ownership is enforced before any of the above so a user can't probe
- * another user's audio by id.
+ * another user's audio by id — and in particular NO SAS IS EVER MINTED for a
+ * caller that failed the check: the 404 below returns before the resolver.
  */
-export const GET = withAuth(async ({ user, request }, { params }) => {
+export const GET = withAuth(async ({ user, request, cliScope }, { params }) => {
   const { id } = await params;
 
   const access = await resolveAccess(user.userId, user.email, id);
@@ -57,6 +82,14 @@ export const GET = withAuth(async ({ user, request }, { params }) => {
   const audioOnly = searchParams.get('variant') === 'audio';
   const media = (await resolveMeetingContent(row)).media;
 
+  // Stage B: may THIS caller be handed a cross-origin URL at all? Decided
+  // once, from the request alone, and reused for whichever file is served.
+  const decision = mediaRedirectDecision({
+    searchParams,
+    headers: request.headers,
+    isBearer: cliScope !== undefined,
+  });
+
   // Extra file of a multi-video meeting. `?part=1` (and anything below 2, or
   // non-numeric) is not a part: it 404s exactly as videoParts[N-2] did.
   const partParam = searchParams.get('part');
@@ -66,11 +99,9 @@ export const GET = withAuth(async ({ user, request }, { params }) => {
       return NextResponse.json({ error: 'No such video part' }, { status: 404 });
     }
     try {
-      return audioOnly
-        ? await streamAudioOnly(request, part.filename)
-        : await streamLocalFile(request, resolveAudioPath(part.filename));
+      return await serveMedia(request, part, audioOnly, decision.redirect);
     } catch (err) {
-      console.error('[GET /api/transcripts/:id/audio] part stream failed:', err);
+      console.error('[GET /api/transcripts/:id/audio] part stream failed:', redactError(err));
       return NextResponse.json({ error: 'Video part unavailable' }, { status: 404 });
     }
   }
@@ -80,11 +111,9 @@ export const GET = withAuth(async ({ user, request }, { params }) => {
   const canonical = canonicalMedia(media);
   if (canonical) {
     try {
-      return audioOnly
-        ? await streamAudioOnly(request, canonical.filename)
-        : await streamLocalFile(request, resolveAudioPath(canonical.filename));
+      return await serveMedia(request, canonical, audioOnly, decision.redirect);
     } catch (err) {
-      console.error('[GET /api/transcripts/:id/audio] local stream failed:', err);
+      console.error('[GET /api/transcripts/:id/audio] local stream failed:', redactError(err));
       // Fall through to remote URL — though that's almost certainly broken
       // for AAI-backed rows; see project memory `aai_audio_url_unusable`.
     }
@@ -105,12 +134,57 @@ export const GET = withAuth(async ({ user, request }, { params }) => {
   return NextResponse.redirect(audioUrl, 302);
 });
 
+/** A local file we expected is not on this VM (Stage D's normal state). */
+const MISSING = Symbol('media file missing');
+type Missing = typeof MISSING;
+
+/**
+ * ONE file, the whole Stage B ladder: redirect if we may and there is a blob,
+ * else the local bytes, else the blob proxied through the app, else the same
+ * 404 the local stream has always answered with.
+ *
+ * With the flag off (or no blob) `store` is null, `target` is null, and what
+ * is left is the old `streamLocalFile` / `streamAudioOnly` call and the old
+ * 404 — byte for byte.
+ */
+async function serveMedia(
+  request: NextRequest,
+  media: ResolvedMedia,
+  audioOnly: boolean,
+  mayRedirect: boolean
+): Promise<Response> {
+  const store = serveStore();
+  const target = store ? blobTargetFor(media, audioOnly) : null;
+
+  if (store && target && mayRedirect) {
+    return mediaSasRedirect(store, target);
+  }
+
+  const local = audioOnly
+    ? await streamAudioOnly(request, media.filename)
+    : await streamLocalFile(request, resolveAudioPath(media.filename));
+  if (local !== MISSING) return local;
+
+  // The bytes are not on this VM. If the archive holds them, serve them.
+  if (store && target) {
+    const proxied = await proxyBlobRange(store, target, request.headers.get('range'));
+    if (proxied) return proxied;
+    console.warn(
+      `[GET /api/transcripts/:id/audio] ${target.blobName} is neither on disk nor in the archive`
+    );
+  }
+  return NextResponse.json({ error: 'Audio file missing' }, { status: 404 });
+}
+
 /**
  * `?variant=audio` for one stored file. The 202/500 bodies are `no-store`
  * so neither the browser nor the offline service worker ever keeps a
  * "preparing" answer around as if it were the media.
  */
-async function streamAudioOnly(request: NextRequest, storedFilename: string): Promise<Response> {
+async function streamAudioOnly(
+  request: NextRequest,
+  storedFilename: string
+): Promise<Response | Missing> {
   const result = await ensureAudioOnly(storedFilename);
   if (result.status === 'ready') {
     return streamLocalFile(request, result.path, result.derived ? 'audio/mp4' : undefined);
@@ -156,12 +230,15 @@ function mimeFromPath(p: string): string {
  * pins the Content-Type when the path's extension isn't the right signal
  * (the audio-only derivative is always audio/mp4 regardless of what the
  * source was called).
+ *
+ * A file that is not there answers MISSING rather than a 404 response: the
+ * caller decides whether the archive can still serve it (Stage D).
  */
 async function streamLocalFile(
   request: NextRequest,
   path: string,
   contentTypeOverride?: string
-): Promise<Response> {
+): Promise<Response | Missing> {
   const fsp = await import('node:fs/promises');
   const fs = await import('node:fs');
 
@@ -169,7 +246,7 @@ async function streamLocalFile(
   try {
     stats = await fsp.stat(path);
   } catch {
-    return NextResponse.json({ error: 'Audio file missing' }, { status: 404 });
+    return MISSING;
   }
 
   const fileSize = stats.size;
@@ -211,4 +288,14 @@ async function streamLocalFile(
       'Cache-Control': 'private, max-age=3600',
     },
   });
+}
+
+/**
+ * Anything that reaches a `console.*` here goes through this first. An Azure
+ * SDK error carries the request URL — which, once a SAS is in play, IS the
+ * credential (`?sig=…`, valid for an hour). Never let one into a log line.
+ */
+function redactError(err: unknown): string {
+  const raw = err instanceof Error ? `${err.name}: ${err.message}` : String(err);
+  return raw.replace(/https?:\/\/[^\s"']+/g, (u) => redactSas(u));
 }
