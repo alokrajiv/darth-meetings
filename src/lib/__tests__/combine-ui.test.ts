@@ -17,11 +17,15 @@ import {
   policyLabel,
   shortSourceTag,
   slotsLeftText,
+  sourceTagOfEntry,
   sourceTagsByRecording,
 } from '@/lib/combine-ui';
 import {
   alignAdvice,
   alignVerdict,
+  clipShortLabel,
+  clipSourceKindOf,
+  clipSourceLabel,
   type ClipCandidate,
   type ClipEntry,
   type PendingAttach,
@@ -44,12 +48,16 @@ function entry(over: Partial<ClipEntry> & Pick<ClipEntry, 'ord' | 'recordingId'>
     transcribed: true,
     durationMs: 600_000,
     sourceLabel: 'Upload · teams-day.m4a',
+    sourceKind: 'upload',
+    shortLabel: 'teams-day.m4a',
     ownerEmail: 'alok@trames.sg',
     ownerName: 'Alok Rajiv',
     mine: true,
     primary: false,
     recordingDurationMs: 600_000,
     recordingStartedAt: null,
+    mediaPart: null,
+    mediaParts: [],
     ...over,
   };
 }
@@ -58,14 +66,20 @@ const TEAMS = entry({
   ord: 0,
   recordingId: 'r-teams',
   sourceLabel: 'Teams recording',
+  sourceKind: 'teams',
+  shortLabel: 'Teams',
   primary: true,
   durationMs: 600_000,
   recordingDurationMs: 600_000,
+  mediaPart: 1,
+  mediaParts: [1],
 });
 const PHONE = entry({
   ord: 1,
   recordingId: 'r-phone',
   sourceLabel: 'Atira’s upload · corridor.m4a',
+  sourceKind: 'upload',
+  shortLabel: 'corridor.m4a',
   offsetMs: 110_000,
   durationMs: 300_000,
   recordingDurationMs: 300_000,
@@ -73,6 +87,8 @@ const PHONE = entry({
   mine: false,
   ownerName: 'Atira Sarat',
   ownerEmail: 'atira.sarat@trames.sg',
+  mediaPart: 2,
+  mediaParts: [2],
 });
 
 describe('shortSourceTag', () => {
@@ -104,6 +120,73 @@ describe('shortSourceTag', () => {
     expect(tags.get('r-teams')).toBe('Teams');
     expect(tags.get('r-phone')).toBe('corridor.m4a');
     expect(tags.get('nobody')).toBeUndefined();
+  });
+});
+
+describe('the served shortLabel, not a re-read of the sentence', () => {
+  test('`clipShortLabel` shortens the same FACTS `clipSourceLabel` spells out', () => {
+    const cases: Array<[Parameters<typeof clipShortLabel>[0], string, string]> = [
+      [{ sourceKind: 'teams', mine: true }, 'Teams recording', 'Teams'],
+      [
+        { sourceKind: 'teams', mine: false, ownerName: 'Atira Sarat' },
+        'Atira’s Teams recording',
+        'Atira’s Teams',
+      ],
+      [{ sourceKind: 'meet', mine: true }, 'Meet recording', 'Meet'],
+      [{ sourceKind: 'recorder', mine: true }, 'Recorded on your Mac', 'your Mac'],
+      [
+        { sourceKind: 'recorder', mine: false, ownerEmail: 'atira@trames.sg' },
+        'Recorded on atira’s Mac',
+        'atira’s Mac',
+      ],
+      [{ sourceKind: 'text', mine: true }, 'Pasted transcript', 'Pasted transcript'],
+      [{ sourceKind: 'aai-import', mine: true }, 'Imported transcription', 'Imported transcription'],
+      [
+        { sourceKind: 'upload', mine: true, originalFilename: 'corridor.m4a' },
+        'Upload · corridor.m4a',
+        'corridor.m4a',
+      ],
+      [{ sourceKind: 'upload', mine: true }, 'Upload', 'Upload'],
+      [
+        { sourceKind: 'upload', mine: false, ownerName: 'Atira Sarat' },
+        'Atira’s upload',
+        'Atira’s upload',
+      ],
+    ];
+    for (const [facts, sentence, short] of cases) {
+      expect(clipSourceLabel(facts)).toBe(sentence);
+      expect(clipShortLabel(facts)).toBe(short);
+      // …and the old reverse-parse agrees on every shape it was written for,
+      // which is what makes it a safe fallback.
+      expect(shortSourceTag(sentence)).toBe(short);
+    }
+  });
+
+  test('a name containing " · " is where the reverse-parse breaks and the facts do not', () => {
+    const facts = { sourceKind: 'recorder' as const, mine: false, ownerName: 'A · B Lim' };
+    expect(clipShortLabel(facts)).toBe('A’s Mac');
+    // The sentence is "Recorded on A’s Mac" — but a filename-bearing sentence
+    // from the same owner would be mis-split by the " · " rule, so the short
+    // form has to come from the facts.
+    expect(shortSourceTag('Atira’s upload · a · b.m4a')).toBe('a · b.m4a');
+    expect(
+      clipShortLabel({ sourceKind: 'upload', mine: false, ownerName: 'Atira', originalFilename: 'a · b.m4a' })
+    ).toBe('a · b.m4a');
+  });
+
+  test('sourceKind is narrowed, never guessed', () => {
+    expect(clipSourceKindOf('teams')).toBe('teams');
+    expect(clipSourceKindOf('aai-import')).toBe('aai-import');
+    expect(clipSourceKindOf('gopro')).toBeNull();
+    expect(clipSourceKindOf(null)).toBeNull();
+  });
+
+  test('an entry uses its shortLabel; one without falls back to the sentence', () => {
+    expect(sourceTagOfEntry(PHONE)).toBe('corridor.m4a');
+    expect(sourceTagOfEntry({ ...PHONE, shortLabel: '' })).toBe('corridor.m4a');
+    expect(
+      sourceTagOfEntry({ shortLabel: 'the phone', sourceLabel: 'Atira’s upload · corridor.m4a' })
+    ).toBe('the phone');
   });
 });
 
@@ -380,19 +463,68 @@ describe('playerParts', () => {
     expect(parts.map((p) => p.ord)).toEqual([0, 1]);
   });
 
-  test('?part=N numbering: the canonical is 1 and the next recording is 2', () => {
-    expect(playerParts([TEAMS, PHONE]).map((p) => p.part)).toEqual([1, 2]);
+  test('?part=N is the SERVED number, not a count of recordings', () => {
+    const parts = playerParts([TEAMS, PHONE]);
+    expect(parts.map((p) => p.part)).toEqual([1, 2]);
+    expect(parts.map((p) => p.parts)).toEqual([[1], [2]]);
   });
 
   test('a Meet stop/restart primary pushes the added recording past its own files', () => {
-    // videoParts.length === 2 → the primary holds parts 1, 2, 3.
-    expect(playerParts([TEAMS, PHONE], { primaryExtraFiles: 2 }).map((p) => p.part)).toEqual([1, 4]);
+    // The primary holds three files, so the phone the server numbered 4 is
+    // asked for at 4 — no `primaryExtraFiles` hint, no client arithmetic.
+    const meet = entry({ ...TEAMS, mediaPart: 1, mediaParts: [1, 2, 3] });
+    const phone = entry({ ...PHONE, mediaPart: 4, mediaParts: [4] });
+    const parts = playerParts([meet, phone]);
+    expect(parts.map((p) => p.part)).toEqual([1, 4]);
+    expect(parts[0]!.parts).toEqual([1, 2, 3]);
+  });
+
+  test('a NON-primary recording with two files: the one the client could never see', () => {
+    // Meet stopped and restarted as the SECOND recording — parts 2 and 3 —
+    // so a third capture is 4. The old derivation said 3 and played the
+    // wrong file; the server's numbering is the only thing that knows.
+    const phone = entry({ ...PHONE, mediaPart: 2, mediaParts: [2, 3] });
+    const third = entry({
+      ord: 2,
+      recordingId: 'r-mac',
+      sourceLabel: 'Recorded on your Mac',
+      sourceKind: 'recorder',
+      shortLabel: 'your Mac',
+      offsetMs: 500_000,
+      mediaPart: 4,
+      mediaParts: [4],
+    });
+    expect(playerParts([TEAMS, phone, third]).map((p) => p.part)).toEqual([1, 2, 4]);
   });
 
   test('two clips on the same recording share its part number', () => {
-    const second = entry({ ord: 2, recordingId: 'r-teams', offsetMs: 400_000, sourceLabel: 'Teams recording' });
+    const second = entry({
+      ord: 2,
+      recordingId: 'r-teams',
+      offsetMs: 400_000,
+      sourceLabel: 'Teams recording',
+      shortLabel: 'Teams',
+      mediaPart: 1,
+      mediaParts: [1],
+    });
     const parts = playerParts([TEAMS, PHONE, second]);
     expect(parts.map((p) => p.part)).toEqual([1, 2, 1]);
+  });
+
+  test('a recording with no playable file gets NO chip — never a number that 404s', () => {
+    const withheld = entry({ ...PHONE, mediaPart: null, mediaParts: [] });
+    const parts = playerParts([TEAMS, withheld]);
+    expect(parts.map((p) => p.recordingId)).toEqual(['r-teams']);
+  });
+
+  test('an entry list with no part numbers at all falls back to one file each', () => {
+    // A response cached before `mediaPart` existed. Right for every meeting
+    // whose recordings hold a single file, which is all of them today.
+    const old = [
+      entry({ ...TEAMS, mediaPart: null, mediaParts: [] }),
+      entry({ ...PHONE, mediaPart: null, mediaParts: [] }),
+    ];
+    expect(playerParts(old).map((p) => p.part)).toEqual([1, 2]);
   });
 
   test('switching part keeps the meeting time', () => {
@@ -417,6 +549,8 @@ describe('playerParts', () => {
       toMs: 120_000,
       offsetMs: 0,
       durationMs: 60_000,
+      mediaPart: 2,
+      mediaParts: [2],
     });
     const [, part] = playerParts([TEAMS, windowed]);
     expect(localMsInPart(part!, 30_000)).toBe(30_000);

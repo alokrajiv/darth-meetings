@@ -69,6 +69,19 @@ interface SpeakerPreviewDialogProps {
   ) => void;
   onPickPerson?: (person: PickerPerson) => void;
   onRequestCreatePerson?: (originalSpeaker: string, name: string) => void;
+  /**
+   * "Speaker A · phone" — which RECORDING a voice was heard on (Phase 3b,
+   * spec §"Reader and writer changes"), the same tag the transcript body and
+   * the People card put beside a name.
+   *
+   * A meeting over several recordings diarizes each one separately, so the
+   * "Speaker A" of the phone and the "Speaker A" of the video are two
+   * DIFFERENT people until somebody says otherwise — and this dialog shows
+   * surrounding turns from every recording at once, where two bare "Speaker
+   * A" badges read as one person. Null (and invisible) for the
+   * one-recording meeting, which is every meeting on prod.
+   */
+  sourceTagOf?: ((speaker: string) => string | null) | null;
 }
 
 const TOP_N_SEGMENTS = 5;
@@ -124,6 +137,7 @@ export function SpeakerPreviewDialog({
   onSave,
   onPickPerson,
   onRequestCreatePerson,
+  sourceTagOf,
 }: SpeakerPreviewDialogProps) {
   const [speaker, setSpeaker] = useState(initialSpeaker);
   const [cursor, setCursor] = useState(0);
@@ -187,6 +201,22 @@ export function SpeakerPreviewDialog({
     [speaker, speakerLabels, suggestions]
   );
   const displayName = state.status === 'unknown' ? defaultSpeakerLabel(speaker) : state.display;
+  /** The recording tag, as a chip — identical vocabulary and styling to the
+   * transcript body's and the People card's, so one voice reads the same way
+   * everywhere. Renders nothing when the meeting has one recording. */
+  const sourceChip = (raw: string) => {
+    const tag = sourceTagOf?.(raw) ?? null;
+    if (!tag) return null;
+    return (
+      <span
+        className="shrink-0 rounded border px-1 py-px text-[10px] leading-tight text-muted-foreground"
+        title={`Heard on ${tag} — each recording is diarized on its own, so this voice is named separately`}
+        data-speaker-source
+      >
+        {tag}
+      </span>
+    );
+  };
 
   // Local drafts for the editable name / description, seeded from the state
   // (so a guess is the starting point, never a blank field).
@@ -319,6 +349,7 @@ export function SpeakerPreviewDialog({
           </Button>
           <div className="flex items-center gap-2 text-sm">
             <Badge variant="default">{defaultSpeakerLabel(speaker)}</Badge>
+            {sourceChip(speaker)}
             <span className="font-medium">{displayName}</span>
             <span className="text-xs text-muted-foreground">
               {lineCount} line{lineCount === 1 ? '' : 's'}
@@ -480,10 +511,11 @@ export function SpeakerPreviewDialog({
                           : 'hover:bg-muted/50'
                       }`}
                     >
-                      <div className="flex items-baseline gap-2 text-xs text-muted-foreground mb-1">
+                      <div className="flex flex-wrap items-baseline gap-2 text-xs text-muted-foreground mb-1">
                         <Badge variant={focus ? 'default' : 'outline'} className="text-[10px]">
                           {name}
                         </Badge>
+                        {sourceChip(u.speaker)}
                         <span className="font-mono">{formatTime(u.start)}</span>
                       </div>
                       <div className={`text-sm ${focus ? 'font-medium' : ''}`}>{u.text}</div>

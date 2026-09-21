@@ -1,6 +1,8 @@
 import 'server-only';
 import {
   candidateClipForTime,
+  clipShortLabel,
+  clipSourceKindOf,
   clipSourceLabel,
   combineRefusal,
   formatDuration,
@@ -39,6 +41,11 @@ import { identitiesForUsers } from '@/db-ops/transcript-activity';
 import { logActivity } from '@/db-ops/transcript-activity';
 import { getForUser } from '@/db-ops/transcripts';
 import { materialiseMeeting, clipWindowsOf, policyOf } from '@/lib/server/clip-materialise';
+import {
+  mediaPartsByRecording,
+  resolveMeetingMedia,
+  type ResolvedMedia,
+} from '@/lib/server/recordings';
 import type { ResolvedAccess } from '@/db-ops/transcript-access';
 
 /**
@@ -121,7 +128,17 @@ function durationOfRecording(details: Map<string, ClipRecordingDetail>) {
  */
 export async function combineState(
   access: ResolvedAccess,
-  caller: { userId: string }
+  caller: { userId: string },
+  /**
+   * The meeting's playable files, when the caller has them. Given, every
+   * entry gets its `?part=N` (`mediaPart` / `mediaParts`); omitted, those two
+   * stay null / empty and the client is left to guess — which is why the two
+   * readers a PLAYER is built from (`combineView` for the GET, `mutationBody`
+   * for what a sheet edit hands back) both pass it, and the add/patch/delete
+   * pre-state, the candidate list and the notes' Sources block — none of
+   * which plays anything — do not pay for the load.
+   */
+  opts?: { media?: ResolvedMedia[] | null }
 ): Promise<CombineState> {
   const rows = await listMeetingClips(access.row.id);
   const clips = clipWindowsOf(rows);
@@ -138,6 +155,10 @@ export async function combineState(
 
   const spanMs = meetingSpanFromDurations(clips, durationOfRecording(details));
 
+  // `?part=N` per recording, canonical first — the numbering walks FILES
+  // (`mediaForRecordings`), so this is the only place it is correct.
+  const partsOf = opts?.media ? mediaPartsByRecording(opts.media) : null;
+
   const entries: ClipEntry[] = clips.map((clip) => {
     const detail = details.get(clip.recordingId) ?? null;
     const identity = detail ? (identities.get(detail.owner_user_id) ?? null) : null;
@@ -148,6 +169,14 @@ export async function combineState(
         : detail?.duration_ms != null
           ? Math.max(0, detail.duration_ms - clip.fromMs)
           : null;
+    const facts = {
+      sourceKind: detail?.source_kind ?? null,
+      mine,
+      ownerName: identity?.name ?? null,
+      ownerEmail: identity?.email ?? null,
+      originalFilename: detail?.original_filename ?? null,
+    };
+    const mediaParts = partsOf?.get(clip.recordingId) ?? [];
     return {
       ord: clip.ord,
       recordingId: clip.recordingId,
@@ -157,19 +186,17 @@ export async function combineState(
       textPolicy: clip.textPolicy ?? 'include',
       transcribed: detail?.transcribed ?? false,
       durationMs,
-      sourceLabel: clipSourceLabel({
-        sourceKind: detail?.source_kind ?? null,
-        mine,
-        ownerName: identity?.name ?? null,
-        ownerEmail: identity?.email ?? null,
-        originalFilename: detail?.original_filename ?? null,
-      }),
+      sourceLabel: clipSourceLabel(facts),
+      sourceKind: clipSourceKindOf(facts.sourceKind),
+      shortLabel: clipShortLabel(facts),
       ownerEmail: identity?.email ?? null,
       ownerName: identity?.name ?? null,
       mine,
       primary: clip.recordingId === primaryRecordingId,
       recordingDurationMs: detail?.duration_ms ?? null,
       recordingStartedAt: detail?.started_at ?? null,
+      mediaPart: mediaParts[0] ?? null,
+      mediaParts,
     };
   });
 
@@ -194,7 +221,12 @@ export async function combineView(
   canAddRecording: boolean;
   addBlockedReason: string | null;
 }> {
-  const state = await combineState(access, caller);
+  // The player asks which `?part=N` plays each clip, so this reader — and
+  // only this reader — pays for the meeting's media list (spec §UI, "parts =
+  // clips"). Resolved from the same graph `resolveMeetingContent` walks, so
+  // the number served here is the number `/audio?part=N` answers to.
+  const media = await resolveMeetingMedia(access.row);
+  const state = await combineState(access, caller, { media });
   const on = await combineEnabled();
   const blocked = addPrecondition(access, state, on);
   return {
@@ -622,7 +654,11 @@ async function mutationBody(
   // Re-read the row: `spanMs` and the entries have to describe what is there
   // NOW, not the row the request arrived with.
   const fresh = await getForUser(access.ownerUserId, access.row.assemblyai_id);
-  const state = await combineState({ ...access, row: fresh ?? access.row }, by);
+  const row = fresh ?? access.row;
+  // The sheet re-renders its part chips off this body, so the part numbers
+  // have to be the post-write ones (an add can have created media rows).
+  const media = await resolveMeetingMedia(row);
+  const state = await combineState({ ...access, row }, by, { media });
   return {
     ok: true,
     body: {

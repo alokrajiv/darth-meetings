@@ -22,10 +22,13 @@ const sql = createFakeSql(() => []);
 mock.module('server-only', () => ({}));
 mock.module('@/lib/db', () => ({ sql, default: sql }));
 
-const { scopeMediaToRow, localMsIn } = await import('@/lib/server/recordings');
+const { scopeMediaToRow, localMsIn, mediaFromGraph, mediaPartsByRecording } = await import(
+  '@/lib/server/recordings'
+);
 const { speakerNaming } = await import('@/lib/server/auto-notes');
 const { buildSourcesBlock } = await import('@/lib/server/clip-combine');
 import type { ResolvedMedia } from '@/lib/server/recordings';
+import type { MeetingRecordingGraph } from '@/db-ops/recordings';
 import type { ClipEntry } from '@/lib/clips';
 
 const R1 = '11111111-1111-4111-8111-111111111111';
@@ -109,12 +112,16 @@ describe('the Sources block the AI prompts get', () => {
     transcribed: true,
     durationMs: 17_700_000,
     sourceLabel: 'Teams recording',
+    sourceKind: 'teams',
+    shortLabel: 'Teams',
     ownerEmail: 'kawen@trames.sg',
     ownerName: 'Kawen Koh',
     mine: false,
     primary: true,
     recordingDurationMs: 17_700_000,
     recordingStartedAt: null,
+    mediaPart: 1,
+    mediaParts: [1],
     ...over,
   });
 
@@ -191,5 +198,178 @@ describe('what the AI prompts call a speaker', () => {
     const naming = speakerNaming(['Kawen Koh', 'Atira Wijaya']);
     expect(naming.namespaced).toBe(false);
     expect(naming.of('Kawen Koh')).toBe('Kawen Koh');
+  });
+});
+
+/**
+ * `?part=N` — the numbering `ClipEntry.mediaPart` is filled from.
+ *
+ * It walks playable FILES, not recordings, and the case that breaks every
+ * client-side derivation is a NON-PRIMARY recording holding more than one:
+ * a Meet call that stopped and restarted, added to a meeting that already had
+ * a capture, with a third recording after it. Counting recordings says the
+ * third is part 3; the file it would actually fetch is the Meet's second
+ * segment. Hence the number is served.
+ */
+describe('the ?part=N numbering, walked over files', () => {
+  const R3 = '33333333-3333-4333-8333-333333333333';
+
+  function graph(
+    clips: Array<{ ord: number; recording_id: string; offset_ms: number }>,
+    files: Array<{ recording_id: string; kind: 'canonical' | 'part'; ord: number; filename: string | null }>
+  ): MeetingRecordingGraph {
+    return {
+      clips: clips.map((c) => ({
+        transcript_id: 1,
+        ord: c.ord,
+        recording_id: c.recording_id,
+        transcription_id: null,
+        from_ms: 0,
+        to_ms: null,
+        offset_ms: c.offset_ms,
+        text_policy: 'include',
+        created_by: null,
+        created_at: '2026-09-22T00:00:00.000Z',
+      })),
+      recordings: [],
+      transcriptions: [],
+      media: files.map((f, i) => ({
+        id: `m${i + 1}`,
+        recording_id: f.recording_id,
+        kind: f.kind,
+        ord: f.ord,
+        offset_ms: f.kind === 'canonical' ? 0 : 600_000 * f.ord,
+        duration_ms: 600_000,
+        filename: f.filename,
+        blob_name: null,
+        bytes: null,
+        has_video: null,
+        sha256: null,
+        source_ref: null,
+        of_media_id: null,
+        created_at: '2026-09-22T00:00:00.000Z',
+      })),
+    };
+  }
+
+  const played = row({ local_audio_path: 'teams-day.mp4' });
+
+  test('one file each: recording order IS part order', () => {
+    const media = mediaFromGraph(
+      played,
+      graph(
+        [
+          { ord: 0, recording_id: R1, offset_ms: 0 },
+          { ord: 1, recording_id: R2, offset_ms: 110_000 },
+        ],
+        [
+          { recording_id: R1, kind: 'canonical', ord: 0, filename: 'teams-day.mp4' },
+          { recording_id: R2, kind: 'canonical', ord: 0, filename: 'corridor.m4a' },
+        ]
+      )
+    );
+    expect([...mediaPartsByRecording(media)]).toEqual([
+      [R1, [1]],
+      [R2, [2]],
+    ]);
+  });
+
+  test('a SECOND recording with two files takes two numbers, and the third starts at 4', () => {
+    const media = mediaFromGraph(
+      played,
+      graph(
+        [
+          { ord: 0, recording_id: R1, offset_ms: 0 },
+          { ord: 1, recording_id: R2, offset_ms: 110_000 },
+          { ord: 2, recording_id: R3, offset_ms: 500_000 },
+        ],
+        [
+          { recording_id: R1, kind: 'canonical', ord: 0, filename: 'teams-day.mp4' },
+          // Meet stopped and restarted: canonical + one stop/restart part.
+          { recording_id: R2, kind: 'canonical', ord: 0, filename: 'meet-1.mp4' },
+          { recording_id: R2, kind: 'part', ord: 1, filename: 'meet-2.mp4' },
+          { recording_id: R3, kind: 'canonical', ord: 0, filename: 'corridor.m4a' },
+        ]
+      )
+    );
+    const parts = mediaPartsByRecording(media);
+    expect(parts.get(R1)).toEqual([1]);
+    expect(parts.get(R2)).toEqual([2, 3]);
+    // The number a client that counted recordings would have got wrong (3).
+    expect(parts.get(R3)).toEqual([4]);
+    // …and the canonical of each recording is the FIRST of its parts, which
+    // is what `ClipEntry.mediaPart` takes.
+    expect(media.find((m) => m.part === 2)!.filename).toBe('meet-1.mp4');
+    expect(media.find((m) => m.part === 4)!.filename).toBe('corridor.m4a');
+  });
+
+  test('timeline order, not `ord`: a clip added later but placed first numbers first', () => {
+    const media = mediaFromGraph(
+      played,
+      graph(
+        [
+          { ord: 0, recording_id: R1, offset_ms: 900_000 },
+          { ord: 1, recording_id: R2, offset_ms: 0 },
+        ],
+        [
+          { recording_id: R1, kind: 'canonical', ord: 0, filename: 'late.mp4' },
+          { recording_id: R2, kind: 'canonical', ord: 0, filename: 'early.m4a' },
+        ]
+      )
+    );
+    expect(mediaPartsByRecording(media).get(R2)).toEqual([1]);
+    expect(mediaPartsByRecording(media).get(R1)).toEqual([2]);
+  });
+
+  test('a file whose bytes are not held RESERVES its number and gets no part', () => {
+    // `audio/route.ts` indexes `videoParts[N-2]`, so a segment fetched later
+    // must keep the number it always had.
+    const media = mediaFromGraph(
+      played,
+      graph(
+        [
+          { ord: 0, recording_id: R1, offset_ms: 0 },
+          { ord: 1, recording_id: R2, offset_ms: 110_000 },
+        ],
+        [
+          { recording_id: R1, kind: 'canonical', ord: 0, filename: 'teams-day.mp4' },
+          { recording_id: R1, kind: 'part', ord: 1, filename: null },
+          { recording_id: R2, kind: 'canonical', ord: 0, filename: 'corridor.m4a' },
+        ]
+      )
+    );
+    const parts = mediaPartsByRecording(media);
+    expect(parts.get(R1)).toEqual([1]);
+    expect(parts.get(R2)).toEqual([3]);
+  });
+
+  test('a recording the privacy scope withheld has NO part — a clip on it gets none', () => {
+    // The meeting holds no bytes of its own, so its primary recording is
+    // withheld (the Phase 1 guard) while the ADDED one is served.
+    const media = mediaFromGraph(
+      row(),
+      graph(
+        [
+          { ord: 0, recording_id: R1, offset_ms: 0 },
+          { ord: 1, recording_id: R2, offset_ms: 110_000 },
+        ],
+        [
+          { recording_id: R1, kind: 'canonical', ord: 0, filename: 'teams-day.mp4' },
+          { recording_id: R2, kind: 'canonical', ord: 0, filename: 'corridor.m4a' },
+        ]
+      )
+    );
+    const parts = mediaPartsByRecording(media);
+    expect(parts.get(R1)).toBeUndefined();
+    // …and the one that IS served keeps the number it was given, so the
+    // chip and `/audio?part=2` still agree.
+    expect(parts.get(R2)).toEqual([2]);
+  });
+
+  test('no clips at all falls back to the row’s own file', () => {
+    const media = mediaFromGraph(played, graph([], []));
+    expect(media.map((m) => m.part)).toEqual([1]);
+    // Fallback media has no recording id, so nothing can be keyed to it.
+    expect([...mediaPartsByRecording(media)]).toEqual([]);
   });
 });

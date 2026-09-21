@@ -1285,6 +1285,54 @@ export function clipSourceLabel(f: ClipSourceFacts): string {
   }
 }
 
+/** `recordings.source_kind`, narrowed — anything unrecognised is null rather
+ * than a guess, and the label functions fall back to the upload wording (the
+ * one shape that carries a filename). */
+export function clipSourceKindOf(raw: string | null | undefined): ClipSourceKind | null {
+  switch (raw) {
+    case 'recorder':
+    case 'upload':
+    case 'meet':
+    case 'teams':
+    case 'text':
+    case 'aai-import':
+      return raw;
+    default:
+      return null;
+  }
+}
+
+/**
+ * The SHORT form of `clipSourceLabel` — "Teams", "your Mac", "corridor.m4a" —
+ * the tag that rides beside a voice in the People card, beside an utterance in
+ * the transcript and on the player's part chips.
+ *
+ * Built from the same FACTS as the sentence, not from the sentence: a display
+ * shortening that re-read "Recorded on Atira’s Mac" would be a second parser
+ * of the first function's prose, and would quietly mis-shorten the day
+ * somebody's name contains " · " or ends in " recording". `shortSourceTag` in
+ * `combine-ui.ts` still does that reverse-parse, but only as the fallback for
+ * an entry that reaches the client without a `shortLabel`.
+ */
+export function clipShortLabel(f: ClipSourceFacts): string {
+  const file = (f.originalFilename ?? '').trim();
+  switch (f.sourceKind) {
+    case 'teams':
+      return f.mine ? 'Teams' : `${ownerFirstName(f)}’s Teams`;
+    case 'meet':
+      return f.mine ? 'Meet' : `${ownerFirstName(f)}’s Meet`;
+    case 'recorder':
+      return f.mine ? 'your Mac' : `${ownerFirstName(f)}’s Mac`;
+    case 'text':
+      return f.mine ? 'Pasted transcript' : `${ownerFirstName(f)}’s pasted transcript`;
+    case 'aai-import':
+      return 'Imported transcription';
+    case 'upload':
+    default:
+      return file || (f.mine ? 'Upload' : `${ownerFirstName(f)}’s upload`);
+  }
+}
+
 /** One clip of a meeting, as the sheet and the CLI see it. */
 export interface ClipEntry {
   ord: number;
@@ -1304,6 +1352,14 @@ export interface ClipEntry {
   durationMs: number | null;
   /** "Teams recording" / "Recorded on Atira’s Mac" / "Upload · corridor.m4a". */
   sourceLabel: string;
+  /** What kind of capture this recording is (`recordings.source_kind`), so the
+   * client can group or icon by it without reading the sentence. null = a
+   * value this build does not know. */
+  sourceKind: ClipSourceKind | null;
+  /** "Teams" / "your Mac" / "corridor.m4a" — `clipShortLabel` of the same
+   * facts `sourceLabel` was built from. The tag beside a voice, an utterance
+   * and a part chip; built here so nothing has to reverse-parse the sentence. */
+  shortLabel: string;
   /** The recording's owner — a clip is somebody's bytes and the list says so. */
   ownerEmail: string | null;
   ownerName: string | null;
@@ -1314,6 +1370,28 @@ export interface ClipEntry {
   primary: boolean;
   recordingDurationMs: number | null;
   recordingStartedAt: string | null;
+  /**
+   * The `?part=N` that plays this clip's recording — the CANONICAL file's
+   * number, which is what `/api/transcripts/:id/audio?part=N` serves and what
+   * the player's chip asks for. 1 is the meeting's own file, which the plain
+   * `/audio` route serves.
+   *
+   * SERVED, never derived: the numbering walks FILES, not recordings
+   * (`mediaForRecordings` in lib/server/recordings.ts gives every playable
+   * file of every recording, in meeting-timeline order, its own number), so a
+   * client that counted recordings would put a phone added to a stop/restart
+   * Meet recording — or anything after a non-primary recording that holds two
+   * files — at the wrong number.
+   *
+   * null = this recording has no playable file on this meeting: its bytes are
+   * not on the VM, or `scopeMediaToRow` withheld them. Nothing should offer a
+   * chip for it.
+   */
+  mediaPart: number | null;
+  /** Every playable file of this clip's recording, in the same numbering.
+   * `[mediaPart, …the stop/restart parts]` — first is the canonical. Empty
+   * when `mediaPart` is null. */
+  mediaParts: number[];
 }
 
 export type CombineRefusalCode =

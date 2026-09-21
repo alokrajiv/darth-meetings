@@ -70,14 +70,16 @@ export function policyLabel(policy: ClipTextPolicy): string {
 
 /**
  * The short tag that rides beside a voice or an utterance — "Teams",
- * "Atira’s Mac", "corridor.m4a".
+ * "Atira’s Mac", "corridor.m4a" — reconstructed from the SENTENCE.
  *
- * A DISPLAY shortening of `clipSourceLabel`'s sentence, not a second source of
- * truth: the People card cannot write "Speaker A · Recorded on Atira’s Mac"
- * on every row and stay readable. `ClipEntry` carries only the sentence (no
- * `sourceKind`), so this reverses the small, closed set of shapes that
- * function produces and falls back to the sentence itself for anything it does
- * not recognise — never to a guess.
+ * The FALLBACK, not the route: `ClipEntry.shortLabel` now carries the short
+ * form, built server-side by `clipShortLabel` from the same facts the sentence
+ * was built from, and `sourceTagOfEntry` below is what everything should call.
+ * This reverses the small, closed set of shapes `clipSourceLabel` produces —
+ * falling back to the sentence itself for anything it does not recognise,
+ * never to a guess — and stays for the one case that still needs it: a
+ * `ClipCandidate`, and an entry from a build (or a cached response) older than
+ * `shortLabel`.
  */
 export function shortSourceTag(sourceLabel: string): string {
   const label = (sourceLabel ?? '').trim();
@@ -95,10 +97,20 @@ export function shortSourceTag(sourceLabel: string): string {
   return label;
 }
 
+/**
+ * The tag for one clip — the server's `shortLabel` when it came with one, the
+ * reverse-parse of the sentence when it did not.
+ */
+export function sourceTagOfEntry(
+  entry: Pick<ClipEntry, 'shortLabel' | 'sourceLabel'>
+): string {
+  return (entry.shortLabel ?? '').trim() || shortSourceTag(entry.sourceLabel);
+}
+
 /** The tag for each clip's recording, keyed by recording id. */
 export function sourceTagsByRecording(entries: readonly ClipEntry[]): Map<string, string> {
   const out = new Map<string, string>();
-  for (const e of entries) out.set(e.recordingId, shortSourceTag(e.sourceLabel));
+  for (const e of entries) out.set(e.recordingId, sourceTagOfEntry(e));
   return out;
 }
 
@@ -444,15 +456,16 @@ export interface PlayerPart {
    * The `?part=N` that plays this clip's file — 1 is the canonical, which the
    * plain `/audio` route serves.
    *
-   * DERIVED, not served: `ClipEntry` does not carry it (see the note on
-   * `playerParts`). The server numbers parts by walking the recordings in
-   * timeline order and giving each one a number per playable FILE it holds
-   * (`mediaForRecordings` in lib/server/recordings.ts), so this is exact when
-   * every recording after the primary contributes one file — which is every
-   * meeting Phase 3b can build today — and `primaryExtraFiles` carries the
-   * one multi-file case the client CAN see (a Meet stop/restart primary).
+   * SERVED (`ClipEntry.mediaPart`), not derived: the numbering walks FILES,
+   * not recordings, so only the server — which holds the media rows — knows
+   * that a stop/restart recording swallowed two numbers. A clip whose
+   * recording has no playable file gets no chip at all rather than a number
+   * that 404s.
    */
   part: number;
+  /** Every playable file of this clip's recording, canonical first
+   * (`ClipEntry.mediaParts`). One entry for all but a stop/restart capture. */
+  parts: number[];
   /** "Teams" / "corridor.m4a" — the chip's face. */
   label: string;
   /** Where this part starts on the MEETING timeline. */
@@ -469,40 +482,50 @@ export interface PlayerPart {
  * source — and NOT offered at all for a one-recording meeting, which keeps
  * today's single-file player exactly as it is.
  *
- * `primaryExtraFiles` is how many EXTRA files the meeting's first recording
- * holds beyond its canonical — `gmeet_context.videoParts.length`, the Meet
- * stop/restart case, which the page already knows. It exists because
- * `ClipEntry` does not carry its file's `?part=N` and the numbering walks
- * files, not recordings; without it a phone added to a two-video Meet
- * recording would be asked for at the wrong number. (The remaining gap — a
- * SECOND multi-file recording — cannot be seen from here at all and is listed
- * in the hand-off: the honest fix is a `mediaPart` on `ClipEntry`.)
+ * The number each chip asks for is the SERVED `mediaPart`
+ * (`combineView` → `mediaPartsByRecording`), because the `?part=N` numbering
+ * walks playable FILES: a Meet recording that stopped and restarted holds two
+ * of them, so a client counting recordings would send the phone that came
+ * after it to the wrong file. A clip with no `mediaPart` has no playable file
+ * on this meeting (bytes not held, or `scopeMediaToRow` withheld them) and is
+ * dropped rather than given a number that 404s.
+ *
+ * The one fallback: when NOT ONE entry carries a `mediaPart` — a response
+ * cached by the service worker from a build before this field — the old
+ * one-file-per-recording derivation is used, which is right for every meeting
+ * whose recordings each hold a single file.
  */
-export function playerParts(
-  entries: readonly ClipEntry[] | null | undefined,
-  opts?: { primaryExtraFiles?: number }
-): PlayerPart[] {
+export function playerParts(entries: readonly ClipEntry[] | null | undefined): PlayerPart[] {
   if (!entries || new Set(entries.map((e) => e.recordingId)).size < 2) return [];
-  const extra = Math.max(0, Math.round(opts?.primaryExtraFiles ?? 0));
   const ordered = [...entries].sort((a, b) => a.offsetMs - b.offsetMs || a.ord - b.ord);
-  const partOfRecording = new Map<string, number>();
-  let next = 1;
-  for (const e of ordered) {
-    if (partOfRecording.has(e.recordingId)) continue;
-    partOfRecording.set(e.recordingId, next);
-    next += partOfRecording.size === 1 ? 1 + extra : 1;
+  const served = ordered.some((e) => e.mediaPart != null);
+
+  const derived = new Map<string, number>();
+  if (!served) {
+    for (const e of ordered) {
+      if (!derived.has(e.recordingId)) derived.set(e.recordingId, derived.size + 1);
+    }
   }
-  return ordered.map((e) => ({
-    ord: e.ord,
-    recordingId: e.recordingId,
-    part: partOfRecording.get(e.recordingId)!,
-    label: shortSourceTag(e.sourceLabel),
-    offsetMs: e.offsetMs,
-    fromMs: e.fromMs,
-    toMs: e.toMs,
-    primary: e.primary,
-    policy: e.textPolicy,
-  }));
+
+  const out: PlayerPart[] = [];
+  for (const e of ordered) {
+    const parts = served ? (e.mediaParts ?? []) : [derived.get(e.recordingId)!];
+    const part = served ? e.mediaPart : (parts[0] ?? null);
+    if (part == null) continue;
+    out.push({
+      ord: e.ord,
+      recordingId: e.recordingId,
+      part,
+      parts: parts.length > 0 ? parts : [part],
+      label: sourceTagOfEntry(e),
+      offsetMs: e.offsetMs,
+      fromMs: e.fromMs,
+      toMs: e.toMs,
+      primary: e.primary,
+      policy: e.textPolicy,
+    });
+  }
+  return out;
 }
 
 /**

@@ -174,3 +174,42 @@ uploads attaching to one meeting at once can overshoot `MAX_CLIPS_PER_MEETING`; 
 completion with `too-many-clips` and stay standalone, which is the documented failure path rather than a
 silent one. Reserving slots at open would need a counter nothing else reads — not worth it until someone
 actually does it.
+
+---
+
+## As built — the three loose ends of the UI pass (2026-09-22)
+
+**1. `ClipEntry.mediaPart` / `mediaParts` — the player stops guessing.** The `?part=N` numbering walks playable
+FILES, not recordings (`mediaForRecordings`): a Meet recording that stopped and restarted holds two of them, so
+anything placed after it is one number further along. `playerParts` used to count recordings and take a
+`primaryExtraFiles` hint for the one multi-file case the page could see (`gmeet_context.videoParts` on the
+PRIMARY); a non-primary recording with two files was invisible to it and sent the next chip at the wrong file.
+So the number is now SERVED. `mediaFromGraph` / `resolveMeetingMedia` / `mediaPartsByRecording`
+(lib/server/recordings.ts) are the media half of the content resolver — the same walk, the same
+`scopeMediaToRow`, without paying for `resolveClips` over every payload — and `combineState` takes the resolved
+list as an option, filled by the two readers a player is built from (`combineView` for the GET, `mutationBody`
+for what a sheet edit hands back) and by nothing else. A clip whose recording has no playable file (bytes not
+held, or the scope withheld them) gets `mediaPart: null` and NO chip, rather than a number that 404s.
+`primaryExtraFiles` is gone. The one fallback kept: an entry list where nothing carries a `mediaPart` — a
+response the service worker cached from an older build — falls back to the old one-file-per-recording
+derivation.
+
+**2. `sourceKind` + `shortLabel` — the short tag comes from the facts.** `shortSourceTag` re-read
+`clipSourceLabel`'s sentence to get "Teams" out of "Atira's Teams recording"; a name containing " · " or ending
+in " recording" would have been mis-split. `clipShortLabel` (lib/clips.ts) shortens the SAME facts the sentence
+is built from, `clipSourceKindOf` narrows `recordings.source_kind`, and both ride on every `ClipEntry`.
+`sourceTagOfEntry` in combine-ui.ts prefers the served `shortLabel`; `shortSourceTag` stays as its fallback (and
+for `ClipCandidate`, which has no short form). `sourceLabel` is unchanged.
+
+**3. The speaker dialog tags its turns.** `SpeakerPreviewDialog` shows surrounding turns from EVERY recording at
+once, where two bare "Speaker A" badges read as one person — and on a combined meeting they are two different
+people, because each recording is diarized on its own. It now takes the `sourceTagOf` the People card already
+had and puts the same chip the transcript body uses beside the speaker selector and beside every turn. Invisible
+for a one-recording meeting, which is every meeting on prod.
+
+Checks: `src/lib/server/__tests__/clip-combine-media.test.ts` (the numbering, over graphs — a non-primary
+recording with two files, a reserved number for bytes not held, timeline order, the withheld recording),
+`src/lib/__tests__/combine-ui.test.ts` (`playerParts` off the served number, the no-chip and cached-response
+paths, `clipShortLabel` against `clipSourceLabel` for all six kinds), and `tmp/recordings-combine/mediapart.check.ts`
+(scratch Postgres, the real `clipsView`: 1/2 → primary gains a file → 1/3 → the phone gains one → [1,2] and
+[3,4], and the phone's own meeting still numbers from 1).

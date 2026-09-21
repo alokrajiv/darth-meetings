@@ -330,6 +330,7 @@ export function PeopleCard({
           onSave={onSave}
           onPickPerson={onPickPerson}
           onRequestCreatePerson={onRequestCreatePerson}
+          sourceTagOf={sourceTagOf}
         />
       )}
     </>

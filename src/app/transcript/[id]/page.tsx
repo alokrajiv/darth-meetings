@@ -1106,10 +1106,7 @@ function TranscriptDetailInner({ transcriptId }: { transcriptId: string }) {
   // part, labelled by source. `playerParts` is empty for every other meeting,
   // so the block below is inert on prod and the videoParts switcher above
   // stays exactly what it is.
-  const clipParts = useMemo(
-    () => playerParts(clipEntries, { primaryExtraFiles: videoParts.length }),
-    [clipEntries, videoParts.length]
-  );
+  const clipParts = useMemo(() => playerParts(clipEntries), [clipEntries]);
   const [activeClipOrd, setActiveClipOrd] = useState<number | null>(null);
   const activeClip: PlayerPart | null =
     clipParts.find((p) => p.ord === activeClipOrd) ??

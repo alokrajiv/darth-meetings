@@ -371,6 +371,77 @@ function placeRecordings(
 }
 
 /**
+ * The MEDIA half of `resolveMeetingContent`, for the readers that need the
+ * `?part=N` numbering and nothing else — the clip list, which has to tell the
+ * player which part plays each clip (`ClipEntry.mediaPart`).
+ *
+ * One function so the numbering has ONE definition: walk the recordings in
+ * meeting-timeline order, number every playable FILE of each, then apply the
+ * privacy scope. A caller that counted recordings instead would be right only
+ * while every recording holds exactly one file.
+ *
+ * Pure — the graph is already loaded. An empty graph falls back to the row's
+ * own columns, exactly as `resolveMeetingContent` does.
+ */
+export function mediaFromGraph(row: MediaOnlyRow, graph: MeetingRecordingGraph): ResolvedMedia[] {
+  if (graph.clips.length === 0) return mediaFromRow(row);
+  const clips = [...graph.clips].sort((a, b) =>
+    compareClipsOnTimeline(
+      { offsetMs: a.offset_ms, ord: a.ord },
+      { offsetMs: b.offset_ms, ord: b.ord }
+    )
+  );
+  const { orderedRecordingIds, clipOffsetMs, windows } = placeRecordings(clips);
+  return scopeMediaToRow(
+    row,
+    mediaForRecordings(orderedRecordingIds, graph, clipOffsetMs, windows),
+    orderedRecordingIds[0] ?? null
+  );
+}
+
+/**
+ * `mediaFromGraph`, loading the graph itself — the media list without paying
+ * for `resolveClips` over every recording's payload.
+ *
+ * `GET /api/transcripts/:id/clips` uses this (through `combineView`) so the
+ * clip list can carry each clip's part number. It is deliberately NOT folded
+ * into `combineState`: the add/patch/delete paths ask for that state too and
+ * have no use for media.
+ */
+export async function resolveMeetingMedia(
+  row: MediaOnlyRow,
+  graph?: MeetingRecordingGraph
+): Promise<ResolvedMedia[]> {
+  if (!recordingsEnabled()) return mediaFromRow(row);
+  try {
+    return mediaFromGraph(row, graph ?? (await loadMeetingRecordingGraph(row.id)));
+  } catch (err) {
+    // Same rule as the content resolver: the tables may not exist yet, and a
+    // meeting must never 500 over that.
+    console.error('[recordings] media load failed, falling back:', err);
+    return mediaFromRow(row);
+  }
+}
+
+/**
+ * `recordingId` → its playable parts, canonical first — the shape a clip list
+ * indexes to fill `ClipEntry.mediaPart` / `mediaParts`.
+ *
+ * Numbering is already done (`part`), so this only groups; a recording whose
+ * bytes are not held, or which the scope withheld, is simply absent.
+ */
+export function mediaPartsByRecording(media: ResolvedMedia[]): Map<string, number[]> {
+  const out = new Map<string, number[]>();
+  for (const m of [...media].sort((a, b) => a.part - b.part)) {
+    if (!m.recordingId) continue;
+    const parts = out.get(m.recordingId);
+    if (parts) parts.push(m.part);
+    else out.set(m.recordingId, [m.part]);
+  }
+  return out;
+}
+
+/**
  * Resolve one meeting's content and media.
  *
  * `graph` lets a caller that already loaded the rows (a listing, the diff
@@ -400,15 +471,15 @@ export async function resolveMeetingContent(
   }
 
   // Meeting-timeline order: `offset_ms` first, `ord` only as the tie-break
-  // (§5a). The media numbering below follows the same order, so "part 2" is
-  // the second thing that happens in the meeting, not the second row added.
+  // (§5a). `mediaFromGraph` sorts the same way, so "part 2" is the second
+  // thing that happens in the meeting, not the second row added.
   const clips = [...loaded.clips].sort((a, b) =>
     compareClipsOnTimeline(
       { offsetMs: a.offset_ms, ord: a.ord },
       { offsetMs: b.offset_ms, ord: b.ord }
     )
   );
-  const { orderedRecordingIds, clipOffsetMs, windows } = placeRecordings(clips);
+  const { orderedRecordingIds } = placeRecordings(clips);
 
   const resolvable: ResolvableClip[] = clips.map((c) => {
     const transcription = activeTranscriptionFor(loaded, c.recording_id, c.transcription_id);
@@ -432,11 +503,8 @@ export async function resolveMeetingContent(
     completedAt: row.completed_at,
   });
 
-  const media = scopeMediaToRow(
-    row,
-    mediaForRecordings(orderedRecordingIds, loaded, clipOffsetMs, windows),
-    orderedRecordingIds[0] ?? null
-  );
+  // One definition of the numbering, shared with the clip list's `mediaPart`.
+  const media = mediaFromGraph(row, loaded);
 
   return {
     content: resolved.content,
@@ -558,21 +626,7 @@ export async function resolveMediaForMeetings(
       out.set(row.id, mediaFromRow(row));
       continue;
     }
-    const clips = [...graph.clips].sort((a, b) =>
-      compareClipsOnTimeline(
-        { offsetMs: a.offset_ms, ord: a.ord },
-        { offsetMs: b.offset_ms, ord: b.ord }
-      )
-    );
-    const { orderedRecordingIds, clipOffsetMs, windows } = placeRecordings(clips);
-    out.set(
-      row.id,
-      scopeMediaToRow(
-        row,
-        mediaForRecordings(orderedRecordingIds, graph, clipOffsetMs, windows),
-        orderedRecordingIds[0] ?? null
-      )
-    );
+    out.set(row.id, mediaFromGraph(row, graph));
   }
   return out;
 }
