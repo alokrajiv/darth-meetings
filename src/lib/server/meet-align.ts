@@ -3,11 +3,8 @@ import {
   getForUser as getMappingsForUser,
   setSuggestionsForUser,
 } from '@/db-ops/speaker-mappings';
-import type {
-  MeetUtterance,
-  SpeakerSuggestionMap,
-  TranscriptResponse,
-} from '@/lib/format';
+import type { MeetUtterance, SpeakerSuggestionMap, TranscriptResponse } from '@/lib/format';
+import { computeMeetAlignment, type AlignmentVote } from '@/lib/meet-align-vote';
 
 /**
  * Meet ↔ AAI speaker alignment.
@@ -23,9 +20,11 @@ import type {
  * module stays pure over the two utterance lists — it has no business
  * knowing which recordings they came from.
  *
- * Overlap voting: for each AAI speaker, sum the overlap duration against
- * each Meet name's speech windows. A decisive winner (share of voted time
- * >= 60%, >= 20s of overlap) names that speaker.
+ * Overlap voting lives in `lib/meet-align-vote.ts`, which also explains why
+ * each Meet window is weighted by its character density instead of counting
+ * for its full duration: the windows are caption flushes or interpolated
+ * Doc blocks, not turns. A decisive winner (share of voted time >= 60%,
+ * >= 20 s of density-weighted overlap) names that speaker.
  *
  * Pooled-room detection: Meet attributes per DEVICE, so five people on one
  * meeting-room mic are a single Meet name. If one Meet name decisively wins
@@ -37,54 +36,8 @@ import type {
 const MIN_SHARE = 0.6;
 const MIN_OVERLAP_MS = 20_000;
 
-export interface AlignmentVote {
-  name: string;
-  share: number;
-  overlapMs: number;
-}
-
-export function computeMeetAlignment(
-  aaiUtterances: Array<{ speaker: string; start: number; end: number }>,
-  meetUtterances: MeetUtterance[]
-): Map<string, AlignmentVote> {
-  const meet = [...meetUtterances].sort((a, b) => a.start - b.start);
-  const votes = new Map<string, Map<string, number>>();
-
-  let mi = 0;
-  const aai = [...aaiUtterances].sort((a, b) => a.start - b.start);
-  for (const u of aai) {
-    // advance to the first meet utterance that could overlap
-    while (mi < meet.length && meet[mi]!.end <= u.start) mi++;
-    for (let j = mi; j < meet.length && meet[j]!.start < u.end; j++) {
-      const m = meet[j]!;
-      const overlap = Math.min(u.end, m.end) - Math.max(u.start, m.start);
-      if (overlap <= 0) continue;
-      let perName = votes.get(u.speaker);
-      if (!perName) {
-        perName = new Map();
-        votes.set(u.speaker, perName);
-      }
-      perName.set(m.speaker, (perName.get(m.speaker) ?? 0) + overlap);
-    }
-  }
-
-  const result = new Map<string, AlignmentVote>();
-  for (const [speaker, perName] of votes) {
-    let total = 0;
-    let topName = '';
-    let topMs = 0;
-    for (const [name, ms] of perName) {
-      total += ms;
-      if (ms > topMs) {
-        topMs = ms;
-        topName = name;
-      }
-    }
-    if (total === 0 || !topName) continue;
-    result.set(speaker, { name: topName, share: topMs / total, overlapMs: topMs });
-  }
-  return result;
-}
+export { computeMeetAlignment };
+export type { AlignmentVote };
 
 /**
  * Run the alignment and merge decisive results into the transcript's
@@ -149,7 +102,7 @@ export async function suggestSpeakersFromMeet(
       name: vote.name,
       confidence: Math.round(vote.share * 100) / 100,
       source: 'context',
-      evidence: `${Math.round(vote.share * 100)}% of this speaker's time overlaps ${vote.name}'s speech in the Google Meet transcript`,
+      evidence: `${Math.round(vote.share * 100)}% of this speaker's time lines up with ${vote.name}'s speech in the meeting's own named transcript`,
     };
     written++;
   }
