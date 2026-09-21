@@ -14,6 +14,30 @@ Native macOS side of Darth Meetings recording (the "Swift tray" angle from Darth
 the user switched it off in the menu (`loginItemUserChoice` in UserDefaults records an explicit choice;
 the default never overrides it). macOS may show "Darth Recorder was added as a login item" once.
 
+**0.3.11 (2026-09-22) — the same recording is never transcribed twice.** A retry after a
+half-failed upload, a second tray on the same Mac, a recording the user had already sent by
+hand: until now every one of those started a fresh AssemblyAI job for bytes the server already
+had (prod holds 18 (filename, owner) groups uploaded 2–4 times, and one podcast that was billed
+9,649 s for 4,182 s of audio). Server side is `docs/recordings-same-file-spec.md`
+(`MW_SAME_FILE_CHECK`); the tray's half:
+
+- **Every segment is hashed ONCE, before the first byte.** `upload(recordingId:)` streams a
+  CryptoKit SHA-256 over each file up front instead of `putOne` hashing its own file — the same
+  work, just early enough to be useful — and logs
+  `upload: <id> — hashed N file(s), B B in T ms`.
+- **`dupAware: true` on every open.** That flag is what version-gates the whole feature: a
+  server with the check on answers `{duplicate}` only to a client that says it understands the
+  answer, so an older tray keeps today's behaviour byte for byte.
+- **`multi.partSha256` on part 1** of a multi-segment recording: every segment's hash, in order.
+  The recording's identity is `sha256(part hashes joined by "\n")`, so a 6-segment 696 MB
+  recording is recognised before segment 1 moves — not after all six are on the VM.
+- **A duplicate is not an error.** The open answers HTTP 200 `{duplicate:{meetingId,…}}` with
+  nothing created; the tray stops (no further segments), writes `status: uploaded` +
+  `transcript_id` to the registry and shows the normal "Uploaded · Open transcript" card and
+  menu line. No prompt — the bytes really are up there. `upload_duplicate` in `events.jsonl`
+  records it. A group whose parts were not declared is recognised at the last segment's
+  `complete` instead, still before the AssemblyAI hand-off.
+
 **0.3.10 (2026-09-21) — the far end is not in the mic track any more.** On speakers the
 microphone also hears the other people, tens of milliseconds after the system-audio track does.
 The server's mix (`src/lib/server/multitrack.ts`: amix of the system track and the mic track,

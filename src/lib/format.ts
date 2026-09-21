@@ -389,12 +389,21 @@ export interface GmeetContext {
      * upload read "77% · 12.1 MB of 15 MB" because the placeholder's
      * `upload_bytes_total` was part 1's size). */
     bytesTotal?: number;
+    /** The whole group's part hashes, DECLARED at open of part 1
+     * (`multi.partSha256`) by a client that holds every segment up front —
+     * the tray. With it the same-file check runs before a byte moves;
+     * without it the group is checked at the last part's complete from the
+     * per-part `sha256` below (docs/recordings-same-file-spec.md). */
+    partSha256?: string[];
     parts: Array<{
       index: number;
       tempFilename: string;
       originalFilename?: string;
       comment?: string;
       bytes?: number;
+      /** sha256 of THIS part's bytes, as observed by the server: the blob
+       * session's verified hash, or the temp file streamed at complete. */
+      sha256?: string;
     }>;
   } | null;
   /** The Darth Recorder registry row (migration 041) these bytes came from,
@@ -413,7 +422,20 @@ export interface GmeetContext {
     comment?: string;
     durationSec?: number;
     offsetSec?: number;
+    /** sha256 of this part's bytes — the durable half of the group's
+     * identity (`recordings.sha256` is the hash of these, joined). */
+    sha256?: string;
   }> | null;
+  /**
+   * The bytes this meeting was uploaded from, as the same-file check knows
+   * them (docs/recordings-same-file-spec.md): `sha256` is the recording's
+   * identity — the file's own hash for a single upload, the combined hash
+   * (`sha256(part hashes joined by '\n')`) for a multi-part group, whose
+   * parts are listed in `partSha256`. This is the dual-write MIRROR of
+   * `recordings.sha256` while the `transcripts` row is the source of truth;
+   * only the upload pipeline writes it and no sync derives it.
+   */
+  upload?: { sha256?: string; partSha256?: string[] } | null;
   /** Import queued while Google was still preparing the needed artifact
    * (transcript Doc for 'transcript' mode, video file for 'video', both for
    * 'both'). Lives on a `defer-…` placeholder row (status 'waiting'); the

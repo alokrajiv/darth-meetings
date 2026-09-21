@@ -22,6 +22,8 @@ import { resolveLinkedEventRef } from '@/lib/server/linked-event-ref';
 import { SHA256_HEX_RE } from '@/lib/darth-uploads-shared';
 import { blobTransitFor, mintBlobTicket } from '@/lib/server/darth-uploads-store';
 import { getOwnRecording } from '@/db-ops/recorder';
+import { uploadIdentityHash, wantsDuplicateAnswer, wantsForce } from '@/lib/same-file';
+import { duplicateForUpload } from '@/lib/server/same-file';
 
 export const runtime = 'nodejs';
 
@@ -30,7 +32,8 @@ export const runtime = 'nodejs';
  *
  * Body (JSON): { fingerprint, size, filename, contentType?, languageCode?,
  *   linkedEvent?, reportPref?, sourceId?,
- *   multi?: {group,index,total,comment,groupBytes},
+ *   multi?: {group,index,total,comment,groupBytes,partSha256},
+ *   dupAware?: true, force?: true (same-file check — below),
  *   scratch?: true (temporary transcript, migration 042 — ignored when a
  *   calendar event is linked),
  *   via?: 'blob', sha256?, coarse? (darth uploads — below),
@@ -65,6 +68,17 @@ export const runtime = 'nodejs';
  * session re-mints the SAS on the SAME blob (the client asks Azure for the
  * uncommitted block list itself). `coarse: true` (a phone) halves the
  * parallelism.
+ *
+ * The same file, again (MW_SAME_FILE_CHECK, docs/recordings-same-file-spec.md):
+ * a client that says `dupAware: true` may get ONE other 200 answer,
+ * `{ duplicate: { meetingId, title, when, status, durationSec, trashed } }`,
+ * with nothing created at all — the caller already has a live recording of
+ * these exact bytes. `force: true` on the re-send goes ahead. The hash is
+ * `sha256` for a single file and `multi.partSha256` (every part, in order,
+ * declared on index 1) for a group, whose identity is
+ * `sha256(part hashes joined by '\n')`. Without a hash here the check happens
+ * at …/complete instead. A client that does not say `dupAware` never sees
+ * this answer — the tray, darth-cli and older tabs are version-gated by it.
  *
  * Reply: { id, via, chunkSize, chunkCount, received: number[], resumed,
  *   transcript, blob? }
@@ -141,6 +155,9 @@ export const POST = withAuth(async ({ user, request }) => {
         total: rawMulti.total as string | number | null,
         comment: typeof rawMulti.comment === 'string' ? rawMulti.comment : null,
         groupBytes: rawMulti.groupBytes as string | number | null,
+        // The whole recording's part hashes, declared on part 1 — see
+        // docs/recordings-same-file-spec.md.
+        partSha256: rawMulti.partSha256,
       })
     : undefined;
   if (multi === null) {
@@ -181,6 +198,33 @@ export const POST = withAuth(async ({ user, request }) => {
 
   const rejected = textDocRejection(originalFilename, contentType);
   if (rejected) return NextResponse.json({ error: rejected }, { status: 415 });
+
+  // --- The same file, again (docs/recordings-same-file-spec.md). ---
+  //
+  // The hash is known HERE for a blob-transit upload (the client always sends
+  // it), for a small web upload the browser hashed itself, and for a group
+  // whose client declared every part's hash on index 1 (the tray). So the
+  // answer costs nothing before any bytes move. Everything else is checked at
+  // complete, from the temp file, still before the AssemblyAI hand-off.
+  //
+  // A match means NOTHING is created: no placeholder, no session, no temp
+  // file — HTTP 200 with the match, and the client decides. `force: true` on
+  // the re-send skips this and today's behaviour resumes.
+  //
+  // PRIVACY: the lookup is the caller's own recordings only, and a hash that
+  // exists under a DIFFERENT owner takes the same one indexed read and
+  // produces the identical 201 below — the response the caller sees and the
+  // work the server did are the same as for a hash nobody has.
+  const openIdentity = multi
+    ? multi.index === 1 && multi.partSha256
+      ? uploadIdentityHash({ partSha256: multi.partSha256 })
+      : null
+    : uploadIdentityHash({ sha256 });
+  const duplicate = await duplicateForUpload(user.userId, openIdentity, {
+    dupAware: wantsDuplicateAnswer(body),
+    force: wantsForce(body),
+  });
+  if (duplicate) return NextResponse.json({ duplicate });
 
   // --- Resume: an open session for this exact file. ---
   const existing = await findOpenUploadSession(user.userId, fingerprint);
@@ -251,6 +295,9 @@ export const POST = withAuth(async ({ user, request }) => {
     uuid,
     scratch,
     recorderRecordingId,
+    // Frozen on the session: the chunk path's check runs at COMPLETE, where
+    // this request's body is long gone.
+    dupAware: wantsDuplicateAnswer(body),
   });
   if (!opened.ok) return NextResponse.json({ error: opened.error }, { status: opened.status });
 

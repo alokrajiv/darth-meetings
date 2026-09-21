@@ -212,6 +212,57 @@ export function queueRecordingGraphSync(
 }
 
 /**
+ * Run `fn` AFTER whatever graph sync is in flight for this meeting, and hold
+ * the next one behind it — the same serialisation `queueRecordingGraphSync`
+ * gives itself, for a writer that needs the recording row to exist first.
+ *
+ * The same-file check's hash stamp is the only caller
+ * (docs/recordings-same-file-spec.md): `recordings.sha256` is NOT derived from
+ * the `transcripts` row — `applyRecordingGraph` deliberately never names the
+ * column — so it is written here, once the ingest's own fire-and-forget sync
+ * has created the recording. Never awaited, never throws.
+ */
+export function queueAfterRecordingSync(
+  userId: string,
+  assemblyaiId: string,
+  tag: string,
+  fn: () => Promise<void>
+): void {
+  if (!recordingsWriteEnabled()) return;
+  const key = `${userId}|${assemblyaiId}`;
+  const previous = inflight.get(key);
+  const run: Promise<RecordingSyncResult> = (previous ?? Promise.resolve())
+    .catch(() => {})
+    .then(() => fn())
+    .then(() => ({ status: 'skipped', reason: tag }) as RecordingSyncResult)
+    .catch((err) => {
+      console.warn(`[recording-sync] ${tag} ${assemblyaiId} failed:`, err);
+      return { status: 'skipped', reason: 'error' } as RecordingSyncResult;
+    })
+    .finally(() => {
+      if (inflight.get(key) === run) inflight.delete(key);
+    });
+  inflight.set(key, run);
+}
+
+/**
+ * Which recording a meeting's row derives to — the same id the dual-write
+ * would mint. Exported for the hash stamp, which has to name the recording
+ * without loading the whole graph. `null` = the row is gone or is a
+ * placeholder with nothing behind it.
+ */
+export async function recordingIdForMeeting(
+  userId: string,
+  assemblyaiId: string
+): Promise<string | null> {
+  const rows = await loadGraphMeetingRows(assemblyaiId);
+  const me = rows.find((r) => r.user_id === userId);
+  if (!me || skipReason(me)) return null;
+  const owner = (isJobIdMeeting(me) ? ownerRowOf(rows) : me) ?? me;
+  return recordingIdFor(canonicalKeyOf(owner));
+}
+
+/**
  * Permanent delete: the meeting's clips go, and with them any recording that
  * has no clip left. Awaited by the delete route — a meeting the user asked
  * to destroy must not leave rows behind, and the call is already on a slow

@@ -8,8 +8,17 @@ import {
 } from '@/db-ops/upload-sessions';
 import { audioFileSize } from '@/lib/server/audio-storage';
 import { abandonUpload, finalizeUpload, groupProgressAdder } from '@/lib/server/upload-pipeline';
-import { updateUploadProgress } from '@/db-ops/transcripts';
+import { findUploadGroupRow, updateUploadProgress } from '@/db-ops/transcripts';
 import { pullBlobToTemp, uploadsStore } from '@/lib/server/darth-uploads-store';
+import {
+  duplicateForUpload,
+  identityForPart,
+  sameFileStoreEnabled,
+  sha256OfTempFile,
+} from '@/lib/server/same-file';
+import { wantsForce } from '@/lib/same-file';
+import type { UploadSessionRow } from '@/db-ops/upload-sessions';
+import type { DarthUser } from '@/lib/auth/session';
 
 export const runtime = 'nodejs';
 // The finalize tail re-uploads the file to AssemblyAI (minutes for a
@@ -17,6 +26,42 @@ export const runtime = 'nodejs';
 export const maxDuration = 900;
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/**
+ * What these bytes ARE, and whether the caller already has them
+ * (docs/recordings-same-file-spec.md, MW_SAME_FILE_CHECK).
+ *
+ * `part` is this session's own sha256 — the blob transit's verified hash,
+ * already known, or the chunk path's temp file streamed once here, ~1 s/GB
+ * and always BEFORE the AssemblyAI hand-off, so a duplicate saves the
+ * transcription. `identity` is the recording's: the file's hash for a single
+ * upload, `sha256(part hashes joined by '\n')` for a group (declared at open,
+ * or assembled from the parts that have landed once the last one arrives).
+ *
+ * PRIVACY: `duplicateForUpload` is owner-scoped; a hash another user holds
+ * does the same single indexed read and answers null, so the reply and the
+ * timing are the same as for a hash nobody has.
+ */
+async function sameFileVerdict(
+  user: DarthUser,
+  session: UploadSessionRow,
+  force: boolean
+): Promise<{ part: string | null; identity: string | null; duplicate: unknown | null }> {
+  // The part's hash is measured whenever identities are being STORED; whether
+  // a match is ANSWERED is duplicateForUpload's own gate (flag + dupAware).
+  if (!(await sameFileStoreEnabled())) return { part: null, identity: null, duplicate: null };
+  const part =
+    session.via === 'blob' ? session.sha256 : await sha256OfTempFile(session.temp_filename);
+  const groupRow = session.spec.multi
+    ? await findUploadGroupRow(user.userId, session.spec.multi.group).catch(() => null)
+    : null;
+  const identity = identityForPart(session.spec, part, groupRow?.gmeet_context);
+  const duplicate = await duplicateForUpload(user.userId, identity, {
+    dupAware: session.spec.dupAware === true,
+    force,
+  });
+  return { part, identity, duplicate };
+}
 
 /**
  * POST /api/uploads/:id/complete — every chunk is in; run the shared
@@ -36,9 +81,17 @@ const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/
  * deletes the blob, abandons the placeholder and answers 410 — the client
  * starts over). From there the same finalize tail; the blob is deleted once
  * the bytes are on disk.
+ *
+ * The same file, again (MW_SAME_FILE_CHECK, docs/recordings-same-file-spec.md):
+ * when the session was opened with `dupAware: true` and the caller already has
+ * a live recording of these exact bytes, the answer is **200**
+ * `{ duplicate: {…} }` with the session left OPEN and nothing submitted to
+ * AssemblyAI. Re-send with `{"force": true}` as the body to go ahead.
  */
 export const POST = withAuth(async ({ user, request }, { params }) => {
-  void request;
+  // The body is optional — every client but a `force` re-send sends none.
+  const body = await request.json().catch(() => null);
+  const force = wantsForce(body);
   const { id } = await params;
   if (!id || !UUID_RE.test(id)) {
     return NextResponse.json({ error: 'Invalid session id' }, { status: 400 });
@@ -89,6 +142,13 @@ export const POST = withAuth(async ({ user, request }, { params }) => {
         { status: 410 }
       );
     }
+    // The hash is already known and about to be verified by the pull, so the
+    // check happens BEFORE the session is claimed: a duplicate leaves it open
+    // and nothing has moved. (Single files and declared groups were already
+    // answered at open; this catches a group assembling its parts.)
+    const blobVerdict = await sameFileVerdict(user, session, force);
+    if (blobVerdict.duplicate) return NextResponse.json({ duplicate: blobVerdict.duplicate });
+
     if (!(await claimUploadSessionForComplete(user.userId, session.id))) {
       return NextResponse.json(
         { error: 'Upload is already being finalized', status: 'completing' },
@@ -144,7 +204,9 @@ export const POST = withAuth(async ({ user, request }, { params }) => {
       .delete(session.blob_name)
       .catch((err) => console.warn(`[uploads] blob delete after pull failed ${id} (lifecycle rule will):`, err));
     try {
-      const done = await finalizeUpload(user, session.spec, session.size);
+      const done = await finalizeUpload(user, session.spec, session.size, {
+        part: blobVerdict.part,
+      });
       if (done.status >= 200 && done.status < 300 && 'transcript' in done.body) {
         await setUploadSessionStatus(session.id, 'done', null, done.body.transcript.assemblyai_id);
       } else {
@@ -192,6 +254,13 @@ export const POST = withAuth(async ({ user, request }, { params }) => {
     );
   }
 
+  // Every chunk is in and the file is the right length: hash it ONCE, here,
+  // and answer `duplicate` before anything is claimed or submitted. The bytes
+  // are already on the VM, so what a duplicate saves on this path is the
+  // transcription — which is the expensive half.
+  const verdict = await sameFileVerdict(user, session, force);
+  if (verdict.duplicate) return NextResponse.json({ duplicate: verdict.duplicate });
+
   if (!(await claimUploadSessionForComplete(user.userId, session.id))) {
     return NextResponse.json(
       { error: 'Upload is already being finalized', status: 'completing' },
@@ -200,7 +269,7 @@ export const POST = withAuth(async ({ user, request }, { params }) => {
   }
 
   try {
-    const done = await finalizeUpload(user, session.spec, session.size);
+    const done = await finalizeUpload(user, session.spec, session.size, { part: verdict.part });
     if (done.status >= 200 && done.status < 300 && 'transcript' in done.body) {
       await setUploadSessionStatus(session.id, 'done', null, done.body.transcript.assemblyai_id);
     } else {

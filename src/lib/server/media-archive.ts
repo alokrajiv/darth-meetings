@@ -338,8 +338,18 @@ async function archiveMediaOnce(row: RecordingMediaRow): Promise<ArchiveOutcome>
 }
 
 /**
- * The stamp, plus spec Stage A.6: `recordings.sha256` IS the canonical media's
- * sha256. A derivative's hash never becomes the recording's.
+ * The stamp, plus spec Stage A.6 as reconciled with the same-file check
+ * (docs/recordings-same-file-spec.md): `recordings.sha256` is FILLED from the
+ * canonical's hash, never overwritten (`setRecordingSha256` enforces that) —
+ * the upload pipeline's value is the hash of the bytes the user handed us and
+ * is the only one their file can reproduce, while this one is the file as it
+ * sits on disk now (a video has been faststart-remuxed in place since).
+ *
+ * A DERIVED canonical — the ffmpeg concat of a stitched group — is skipped
+ * entirely: its hash is the hash of nobody's file. The group's identity is
+ * `sha256(part hashes joined by '\n')`, written by the upload pipeline, and
+ * the concat's own bytes are recorded on its `recording_media` row like every
+ * other archived file.
  */
 async function stampArchived(
   row: RecordingMediaRow,
@@ -348,7 +358,8 @@ async function stampArchived(
   bytes: number
 ): Promise<void> {
   await stampMediaArchived(row.id, { blobName, sha256, bytes });
-  if (row.kind === 'canonical') await setRecordingSha256(row.recording_id, sha256);
+  const derived = row.source_ref?.derived != null;
+  if (row.kind === 'canonical' && !derived) await setRecordingSha256(row.recording_id, sha256);
 }
 
 /** Archive every file of one recording — canonical, parts and the extracts. */

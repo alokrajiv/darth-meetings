@@ -26,6 +26,16 @@ import RecorderCore
 /// group = the recording id, index/total), exactly like the web multi-file upload, so the
 /// server stitches them into a single transcript. `recorderRecordingId` links the transcript
 /// back to `recorder_recordings` at finalise.
+///
+/// The same file, never twice (0.3.11, `docs/recordings-same-file-spec.md`): every open call
+/// says `dupAware: true` and a multi-segment recording declares `multi.partSha256` — every
+/// segment's hash, in order, on index 1 — so the server knows the whole recording's identity
+/// (`sha256(part hashes joined by "\n")`) before a byte moves. If the signed-in user already
+/// has a live recording of exactly these bytes the open answers HTTP 200
+/// `{duplicate:{meetingId,…}}` with nothing created; the tray then marks the recording
+/// `uploaded` with that meeting id and shows the normal "Uploaded · Open transcript" card. No
+/// prompt: the bytes ARE up there. The hashes are computed ONCE, before the first segment goes
+/// (they were already needed per file for the fingerprint and the blob verification).
 /// One progress tick about the WHOLE recording (0.3.9), never about one session: a
 /// 6-segment recording declares its 696 MB once and every tick says how many of those bytes
 /// are up. `segment` is the part in flight (1-based). P2 in docs/recorder-upload-ux.md.
@@ -122,12 +132,28 @@ final class Uploader: NSObject, URLSessionTaskDelegate {
         let startedAt = Date()
 
         DispatchQueue.global(qos: .utility).async {
+            // Hash every segment ONCE, up front: each one needs its own hash anyway (the
+            // session fingerprint and the blob verification), and having them all before the
+            // first open is what lets a multi-segment recording declare `multi.partSha256`
+            // and be recognised as a duplicate before any byte moves (0.3.11).
+            let hashedAt = Date()
+            var hashes: [String] = []
+            for file in files {
+                guard let h = Self.sha256(of: file) else {
+                    DispatchQueue.main.async { self.finish(id, error: "could not read \(file.lastPathComponent)", bytes: total, started: startedAt) }
+                    return
+                }
+                hashes.append(h)
+            }
+            rlog("upload: \(id) — hashed \(files.count) file(s), \(total) B in \(Int(Date().timeIntervalSince(hashedAt) * 1000)) ms")
+
             var sentBefore = 0
             var transcriptId: String?
             let group = files.count > 1 ? id.lowercased() : nil
             let throttle = ProgressThrottle()
             for (i, file) in files.enumerated() {
-                let result = self.putOne(file: file, size: sizes[i], recordingId: id, linkedEvent: linkedEvent,
+                let result = self.putOne(file: file, size: sizes[i], sha256: hashes[i], partHashes: hashes,
+                                         recordingId: id, linkedEvent: linkedEvent,
                                          group: group, index: i + 1, total: files.count, groupBytes: total) { sent in
                     // The web's socket comment promises ≤ 2 upload_progress a second (the 0.2.x
                     // tray sent ~40 in 3 s); the tick that finishes a file always goes through.
@@ -139,6 +165,16 @@ final class Uploader: NSObject, URLSessionTaskDelegate {
                 switch result {
                 case .failure(let msg):
                     DispatchQueue.main.async { self.finish(id, error: msg, bytes: total, started: startedAt) }
+                    return
+                case .duplicate(let tid):
+                    // The signed-in user already has a live recording of exactly these bytes.
+                    // Nothing was created and nothing more should go up: the recording IS
+                    // uploaded, so it takes the normal uploaded card and menu line.
+                    rlog("upload: \(id) — the server already has these bytes as \(tid); marking uploaded")
+                    EventLog.shared.log("upload_duplicate", ["recording_id": id, "transcript_id": tid,
+                                                             "segment": i + 1, "segments": files.count],
+                                        summary: "upload: \(id) — already on the server as \(tid), nothing re-sent")
+                    DispatchQueue.main.async { self.finish(id, transcriptId: tid, bytes: total, started: startedAt) }
                     return
                 case .success(let tid):
                     transcriptId = tid ?? transcriptId
@@ -170,6 +206,8 @@ final class Uploader: NSObject, URLSessionTaskDelegate {
 
     private enum PutResult {
         case success(String?)
+        /// The server already holds a live recording of these exact bytes, as this meeting.
+        case duplicate(String)
         case failure(String)
     }
 
@@ -205,18 +243,21 @@ final class Uploader: NSObject, URLSessionTaskDelegate {
         case sessionGone(String)       // 404/410 — start over with a fresh session
         case notCommitted              // complete: blob not committed (blocks raced) — re-sync
         case missingChunks             // complete: chunks missing — re-sync
+        case duplicate(String)         // 200 {duplicate} — already ours, as this meeting id
         case giveUp(String)
     }
 
     /// Synchronous (runs on a utility queue): one file through a resumable session.
-    private func putOne(file: URL, size: Int, recordingId: String, linkedEvent: [String: Any]?,
+    /// `sha256` is this file's hash and `partHashes` every segment's, both computed once in
+    /// `upload(recordingId:)` before the first byte.
+    private func putOne(file: URL, size: Int, sha256: String, partHashes: [String],
+                        recordingId: String, linkedEvent: [String: Any]?,
                         group: String?, index: Int, total: Int, groupBytes: Int,
                         progress: @escaping (Int64) -> Void) -> PutResult {
         let t0 = Date()
-        guard let sha256 = Self.sha256(of: file) else { return .failure("could not read \(file.lastPathComponent)") }
         var fingerprint = "tray:" + sha256.prefix(40)
         if let group { fingerprint += "|g:\(group):\(index)" }
-        rlog("upload: \(file.lastPathComponent) \(size) B sha256 \(sha256.prefix(12))… hashed in \(Int(Date().timeIntervalSince(t0) * 1000)) ms")
+        rlog("upload: \(file.lastPathComponent) \(size) B sha256 \(sha256.prefix(12))…")
 
         let openBody: () -> [String: Any] = {
             var body: [String: Any] = [
@@ -227,13 +268,21 @@ final class Uploader: NSObject, URLSessionTaskDelegate {
                 "via": "blob",
                 "sha256": sha256,
                 "recorderRecordingId": recordingId,
+                // 0.3.11: we understand a {duplicate} answer. Without this the server keeps
+                // today's behaviour for us — it is what version-gates the whole feature.
+                "dupAware": true,
             ]
             if let linkedEvent, index == 1 { body["linkedEvent"] = linkedEvent }
             if let group {
                 // groupBytes (0.3.9) = the sum of every part's size, so the placeholder row is
                 // born knowing the whole recording's size instead of part 1's (P2).
-                body["multi"] = ["group": group, "index": index, "total": total, "groupBytes": groupBytes,
-                                 "comment": "Darth Recorder segment \(index) of \(total)"]
+                var multi: [String: Any] = ["group": group, "index": index, "total": total,
+                                            "groupBytes": groupBytes,
+                                            "comment": "Darth Recorder segment \(index) of \(total)"]
+                // 0.3.11: the whole recording's identity, declared on part 1 — the server
+                // hashes the list and can answer "you already have this" before part 1 moves.
+                if index == 1, partHashes.count == total { multi["partSha256"] = partHashes }
+                body["multi"] = multi
             }
             return body
         }
@@ -261,6 +310,8 @@ final class Uploader: NSObject, URLSessionTaskDelegate {
                     }
                 }
                 return .failure("bytes kept going missing between send and complete")
+            } catch StepError.duplicate(let meetingId) {
+                return .duplicate(meetingId)
             } catch StepError.sessionGone(let why) where restarts < 1 {
                 restarts += 1
                 rlog("upload: \(file.lastPathComponent) session gone (\(why)) — starting over")
@@ -285,6 +336,11 @@ final class Uploader: NSObject, URLSessionTaskDelegate {
             attempt += 1
             do {
                 let (code, json) = try self.json("POST", "/api/uploads", body: body)
+                // 0.3.11: "you already have this recording" — a 200 with no session at all.
+                if (200..<300).contains(code), let dup = json?["duplicate"] as? [String: Any],
+                   let meetingId = dup["meetingId"] as? String, !meetingId.isEmpty {
+                    throw StepError.duplicate(meetingId)
+                }
                 guard (200..<300).contains(code), let j = json, let id = j["id"] as? String else {
                     let msg = (json?["error"] as? String) ?? "HTTP \(code)"
                     if code == 404 { throw StepError.giveUp(msg) }        // e.g. recorder row not ours
@@ -517,6 +573,12 @@ final class Uploader: NSObject, URLSessionTaskDelegate {
                 continue
             }
             if (200..<300).contains(code) {
+                // 0.3.11: a group whose parts were not declared at open is recognised here
+                // instead — the session stays open and nothing was sent to AssemblyAI.
+                if let dup = json?["duplicate"] as? [String: Any],
+                   let meetingId = dup["meetingId"] as? String, !meetingId.isEmpty {
+                    throw StepError.duplicate(meetingId)
+                }
                 let t = json?["transcript"] as? [String: Any]
                 return (t?["assemblyai_id"] as? String) ?? (json?["transcriptId"] as? String)
             }

@@ -1785,7 +1785,9 @@ export async function listAaiDeletePending(
 
 /**
  * Stamp one part of an in-flight multi-file upload group with the bytes that
- * landed (`uploadGroup.parts[i].bytes`). Atomic in SQL for the same reason
+ * landed (`uploadGroup.parts[i].bytes`) and, when the byte-delivery route
+ * knows it, that part's `sha256` (one term of the group's combined identity —
+ * docs/recordings-same-file-spec.md). Atomic in SQL for the same reason
  * setVideoPartStoredForUser is: several parts of one group finalize
  * concurrently and a read-modify-write of the array in JS would drop a
  * sibling's entry — which would fail the stitch. Returns the row's context
@@ -1796,7 +1798,7 @@ export async function setUploadPartBytesForUser(
   userId: string,
   assemblyaiId: string,
   index: number,
-  bytes: number
+  patch: { bytes: number; sha256?: string }
 ): Promise<GmeetContext | null> {
   const rows = await sql<Array<{ gmeet_context: GmeetContext | null }>>`
     UPDATE ${sql(SCHEMA)}.transcripts
@@ -1806,7 +1808,7 @@ export async function setUploadPartBytesForUser(
       (
         SELECT jsonb_agg(
           CASE WHEN (p->>'index')::int = ${index}
-            THEN p || ${sql.json({ bytes } as unknown as never)}
+            THEN p || ${sql.json(patch as unknown as never)}
             ELSE p
           END
           ORDER BY ord

@@ -1123,16 +1123,65 @@ export async function stampMediaArchived(
 }
 
 /**
- * INTERNAL-ONLY — spec Stage A.6: `recordings.sha256` IS the canonical media's
- * sha256 (what Phase 2's "you have already transcribed this file" check
- * reads). Written when the canonical is archived and its hash is therefore
- * known; a no-op when it already says the same thing.
+ * INTERNAL-ONLY — spec Stage A.6, RECONCILED with the same-file check
+ * (docs/recordings-same-file-spec.md): the archive may only FILL `sha256`,
+ * never change it.
+ *
+ * The two writers disagree by nature. The upload pipeline stamps the hash of
+ * the bytes the USER handed us — the thing the duplicate check has to match,
+ * because it is the only hash the user's own file can reproduce. The archive
+ * hashes the file as it is ON DISK at archive time, which for a video is the
+ * FASTSTART-REMUXED copy (`prepareMediaForPlayback` rewrites the file in
+ * place), and for a stitched group is an ffmpeg concat of the parts. Letting
+ * the archive overwrite would therefore silently break de-duplication for
+ * every video the moment it was archived.
+ *
+ * So: the per-file, Azure-verified hash lives on `recording_media.sha256`
+ * (`stampMediaArchived`), and this only fills the gap for recordings that
+ * never declared an upload hash — backfilled rows, Meet/Teams imports. The
+ * authoritative write is `setRecordingUploadSha256`.
  */
 export async function setRecordingSha256(recordingId: string, sha256: string): Promise<boolean> {
   const rows = await sql<Array<{ id: string }>>`
     UPDATE ${sql(SCHEMA)}.recordings
     SET sha256 = ${sha256}, updated_at = now()
+    WHERE id = ${recordingId}::uuid AND sha256 IS NULL
+    RETURNING id
+  `;
+  return rows.length > 0;
+}
+
+/**
+ * INTERNAL-ONLY — the upload pipeline's stamp: the identity of the bytes the
+ * user uploaded (the file's own sha256, or a group's combined hash). This one
+ * DOES overwrite, because it is the authority — see `setRecordingSha256`
+ * above for why the archive's value must not win.
+ */
+export async function setRecordingUploadSha256(
+  recordingId: string,
+  sha256: string
+): Promise<boolean> {
+  const rows = await sql<Array<{ id: string }>>`
+    UPDATE ${sql(SCHEMA)}.recordings
+    SET sha256 = ${sha256}, updated_at = now()
     WHERE id = ${recordingId}::uuid AND sha256 IS DISTINCT FROM ${sha256}
+    RETURNING id
+  `;
+  return rows.length > 0;
+}
+
+/**
+ * INTERNAL-ONLY — a PART's own sha256, as the client declared it and the
+ * upload verified it. Only `kind = 'part'` rows: a canonical's hash belongs to
+ * the archive (it is a claim about bytes Azure holds), a part row of a
+ * stitched group has no file left at all, so this is the only record of what
+ * went into the group's combined hash.
+ */
+export async function setPartMediaSha256(mediaId: string, sha256: string): Promise<boolean> {
+  const rows = await sql<Array<{ id: string }>>`
+    UPDATE ${sql(SCHEMA)}.recording_media
+    SET sha256 = ${sha256}
+    WHERE id = ${mediaId}::uuid AND kind = 'part' AND sha256 IS DISTINCT FROM ${sha256}
     RETURNING id
   `;
   return rows.length > 0;

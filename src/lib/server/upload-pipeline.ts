@@ -16,6 +16,8 @@ import { deleteAudioFile, deleteAudioFilesByPrefix } from '@/lib/server/audio-st
 import { concatMediaSmart, probeDurationSec } from '@/lib/server/media-concat';
 import { IngestError, ingestLocalAudio } from '@/lib/server/ingest';
 import { queueRecordingGraphSync } from '@/lib/server/recording-sync';
+import { stampUploadIdentity } from '@/lib/server/same-file';
+import { normalizePartSha256, normalizeSha256, partHashesInOrder, uploadIdentityHash } from '@/lib/same-file';
 import type { GmeetAttendee, GmeetContext, StoredTranscript } from '@/lib/format';
 import type { RecorderMatch } from '@/lib/recorder';
 import type { DarthUser } from '@/lib/auth/session';
@@ -111,6 +113,14 @@ export interface MultiParams {
    * `uploadGroup.bytesTotal` + `upload_bytes_total` so the listing's "x of y"
    * is about the whole recording instead of part 1. */
   groupBytes?: number;
+  /**
+   * Every part's sha256, in part order, declared once at open of part 1 by a
+   * client that holds the whole recording up front (the tray). It makes the
+   * group's identity — `sha256(part hashes joined by '\n')` — known before a
+   * byte moves, so the same-file check runs at OPEN instead of at the last
+   * part's complete (docs/recordings-same-file-spec.md).
+   */
+  partSha256?: string[];
 }
 
 /** Validate multi-file single-meeting group params. `undefined` = not a
@@ -121,6 +131,7 @@ export function parseMultiParams(raw: {
   total?: string | number | null;
   comment?: string | null;
   groupBytes?: string | number | null;
+  partSha256?: unknown;
 }): MultiParams | null | undefined {
   const present =
     (raw.group !== undefined && raw.group !== null && raw.group !== '') ||
@@ -147,7 +158,13 @@ export function parseMultiParams(raw: {
     if (!Number.isSafeInteger(declared) || declared <= 0) return null;
     groupBytes = declared;
   }
-  return { group, index, total, comment, groupBytes };
+  // Present-but-nonsense is a 400 for the same reason as `groupBytes`: an
+  // identity that is wrong is worse than an identity we do not have — it
+  // would make the duplicate check answer about a recording that is not this
+  // one. Absent is fine (the check moves to the last part's complete).
+  const partSha256 = normalizePartSha256(raw.partSha256, total);
+  if (partSha256 === null) return null;
+  return { group, index, total, comment, groupBytes, partSha256 };
 }
 
 /** The `uploadGroup` marker as it lives on the placeholder's gmeet_context. */
@@ -257,6 +274,13 @@ export interface UploadSpec {
    * scratch = true and promote-in-place keeps it; replayed into the
    * fresh-insert fallback when the placeholder was reaped. */
   scratch?: boolean;
+  /**
+   * The client that opened this session said `dupAware: true` — it
+   * understands a `{duplicate}` answer. Frozen here at open because the
+   * chunk path's check happens at COMPLETE, where the request body is not
+   * the open body any more (docs/recordings-same-file-spec.md).
+   */
+  dupAware?: boolean;
 }
 
 export interface OpenUploadInput {
@@ -282,6 +306,8 @@ export interface OpenUploadInput {
    * event is linked (linking = "this is a real meeting"; the link-event
    * route clears the flag for the same reason). */
   scratch?: boolean;
+  /** See `UploadSpec.dupAware`. */
+  dupAware?: boolean;
 }
 
 const RECORDER_ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -308,6 +334,35 @@ async function linkRecorderRecording(
   } catch (err) {
     console.warn('[upload] linking the recorder recording failed:', err);
   }
+}
+
+/**
+ * Write the group's identity (`sha256(part hashes joined by '\n')`) and its
+ * parts once the stitched meeting exists. Inert unless the same-file gates
+ * are all on; never throws (the upload has already succeeded).
+ */
+/** A single-file upload's identity IS the file's sha256. */
+async function stampSingleIdentity(
+  userId: string,
+  meetingId: string,
+  sha256: string | null
+): Promise<void> {
+  if (!sha256) return;
+  await stampUploadIdentity(userId, meetingId, { sha256 }, 'single').catch((err) =>
+    console.warn('[upload] stamping the upload identity failed:', err)
+  );
+}
+
+async function stampGroupIdentity(
+  userId: string,
+  meetingId: string,
+  identity: string | null,
+  partSha256: string[] | null
+): Promise<void> {
+  if (!identity) return;
+  await stampUploadIdentity(userId, meetingId, { sha256: identity, partSha256 }, 'group').catch(
+    (err) => console.warn('[upload] stamping the group identity failed:', err)
+  );
 }
 
 export type OpenUploadResult =
@@ -401,6 +456,7 @@ export async function openUpload(
         multi,
         recorderRecordingId: input.recorderRecordingId ?? null,
         scratch: groupRow.scratch,
+        dupAware: input.dupAware,
       },
     };
   }
@@ -425,6 +481,9 @@ export async function openUpload(
           id: multi.group,
           total: multi.total,
           ...(multi.groupBytes ? { bytesTotal: multi.groupBytes } : {}),
+          // Declared once, on part 1: the group's identity is known from here
+          // on and every part's check answers the same thing.
+          ...(multi.partSha256 ? { partSha256: multi.partSha256 } : {}),
           parts: [
             {
               index: 1,
@@ -492,6 +551,7 @@ export async function openUpload(
       speechModel: input.speechModel,
       recorderRecordingId: input.recorderRecordingId ?? null,
       scratch,
+      dupAware: input.dupAware,
     },
   };
 }
@@ -511,6 +571,17 @@ export interface FinalizeResult {
   body: { transcript: StoredTranscript } | { error: string; detail?: string };
 }
 
+/** What the byte-delivery route already knows about these bytes. */
+export interface FinalizeHashes {
+  /**
+   * sha256 of THIS part's bytes: the blob session's verified hash, or the
+   * temp file streamed at complete. It becomes the recording's identity for a
+   * single file, and one term of the combined hash for a group
+   * (docs/recordings-same-file-spec.md).
+   */
+  part?: string | null;
+}
+
 /**
  * Stage 2 — the temp file is complete on disk. Multi-file groups: park the
  * part (or stitch + ingest when it's the last one). Everything else: AAI
@@ -520,9 +591,11 @@ export interface FinalizeResult {
 export async function finalizeUpload(
   user: DarthUser,
   spec: UploadSpec,
-  bytes: number
+  bytes: number,
+  hashes: FinalizeHashes = {}
 ): Promise<FinalizeResult> {
   const { placeholderId, tempFilename, multi } = spec;
+  const partHash = normalizeSha256(hashes.part);
 
   if (multi && multi.index > 1) {
     const groupRow = await findUploadGroupRow(user.userId, multi.group);
@@ -544,6 +617,7 @@ export async function finalizeUpload(
         originalFilename: spec.originalFilename ?? undefined,
         comment: multi.comment,
         bytes,
+        ...(partHash ? { sha256: partHash } : {}),
       },
     ].sort((a, b) => a.index - b.index);
     await mergeGmeetContextForUser(
@@ -571,6 +645,16 @@ export async function finalizeUpload(
         body: { error: `Upload group incomplete (${parts.length}/${multi.total} parts)` },
       };
     }
+    // The group's identity, before anything can throw (the kept-failure path
+    // below stamps it too). The OBSERVED part hashes win over the list a
+    // client declared at open — those are the bytes that actually landed (a
+    // blob pull verifies its hash, a chunk stream is measured at complete) —
+    // and the declared list is the fallback when one part's hash was never
+    // computed (the flag was off while it landed, an older client).
+    const groupPartHashes = partHashesInOrder(parts, multi.total) ?? group.partSha256 ?? null;
+    const groupIdentity = groupPartHashes
+      ? uploadIdentityHash({ partSha256: groupPartHashes })
+      : null;
     const heartbeat = setInterval(() => {
       void updateUploadProgress(user.userId, groupRow.assemblyai_id).catch(() => {});
     }, 60_000);
@@ -586,6 +670,9 @@ export async function finalizeUpload(
           comment: p.comment,
           durationSec: durations[i] ?? undefined,
           offsetSec: Math.round(offset * 10) / 10,
+          // The durable record of what went into the group's combined hash:
+          // the temp files are about to be deleted by the stitch.
+          ...(p.sha256 ? { sha256: p.sha256 } : {}),
         };
         offset += durations[i] ?? 0;
         return entry;
@@ -625,6 +712,7 @@ export async function finalizeUpload(
         scratch: groupRow.scratch,
       });
       await linkRecorderRecording(user.userId, spec.recorderRecordingId, row.assemblyai_id);
+      await stampGroupIdentity(user.userId, row.assemblyai_id, groupIdentity, groupPartHashes);
       return { status: 201, body: { transcript: row } };
     } catch (error) {
       if (error instanceof IngestError && error.keptRow) {
@@ -632,6 +720,12 @@ export async function finalizeUpload(
         // retries the hand-off: for the client this upload succeeded.
         console.error(`[upload] ${error.stage} failed — kept for retry:`, error.causeErr);
         await linkRecorderRecording(user.userId, spec.recorderRecordingId, error.keptRow.assemblyai_id);
+        await stampGroupIdentity(
+          user.userId,
+          error.keptRow.assemblyai_id,
+          groupIdentity,
+          groupPartHashes
+        );
         return { status: 201, body: { transcript: error.keptRow } };
       }
       await deleteForUser(user.userId, groupRow.assemblyai_id).catch(() => {});
@@ -655,12 +749,12 @@ export async function finalizeUpload(
     // is on the placeholder — ingest waits for the last part. Record this
     // part's bytes on the group (atomically — siblings finalize in parallel)
     // so every later progress write can add them up (P2).
-    const ctx = await setUploadPartBytesForUser(
-      user.userId,
-      placeholderId,
-      multi.index,
-      bytes
-    ).catch(() => null);
+    const ctx = await setUploadPartBytesForUser(user.userId, placeholderId, multi.index, {
+      bytes,
+      // The part's own hash rides along atomically — the last part's complete
+      // reads them all back to build the group's identity.
+      ...(partHash ? { sha256: partHash } : {}),
+    }).catch(() => null);
     await updateUploadProgress(
       user.userId,
       placeholderId,
@@ -725,6 +819,7 @@ export async function finalizeUpload(
       );
     }
     await linkRecorderRecording(user.userId, spec.recorderRecordingId, row.assemblyai_id);
+    await stampSingleIdentity(user.userId, row.assemblyai_id, partHash);
     return { status: 201, body: { transcript: row } };
   } catch (error) {
     if (error instanceof IngestError && error.keptRow) {
@@ -732,6 +827,7 @@ export async function finalizeUpload(
       // retries the hand-off: for the client this upload succeeded.
       console.error(`[upload] ${error.stage} failed — kept for retry:`, error.causeErr);
       await linkRecorderRecording(user.userId, spec.recorderRecordingId, error.keptRow.assemblyai_id);
+      await stampSingleIdentity(user.userId, error.keptRow.assemblyai_id, partHash);
       return { status: 201, body: { transcript: error.keptRow } };
     }
     // A failed ingest that could NOT be kept leaves the placeholder stuck at

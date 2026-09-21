@@ -4,7 +4,8 @@ import type { StoredTranscript } from '@/lib/format';
 import { chunkByteRange } from '@/lib/upload-chunking';
 import { UPLOAD_BLOB_MIN_BYTES, type BlobUploadTicket } from '@/lib/darth-uploads-shared';
 import { BlobUploadError, isAbortError, uploadBlobBlocks } from '@/lib/blob-blocks';
-import { hashFile, hashingAvailable } from '@/lib/sha256';
+import { HASH_SLICE_BYTES, hashFile, hashingAvailable, sha256Factory } from '@/lib/sha256';
+import { isDuplicateAnswer, shouldHashInBrowser, type DuplicateMatch } from '@/lib/same-file';
 
 /**
  * Chunked, parallel, resumable browser upload against /api/uploads.
@@ -30,6 +31,17 @@ import { hashFile, hashingAvailable } from '@/lib/sha256';
  * resume from the uncommitted block list Azure keeps) and step 4's complete
  * makes the VM pull the committed blob once. When the host says `via:
  * 'chunks'` nothing changes. Same session, same resume key, same complete.
+ *
+ * The same file, again (2026-09-22, docs/recordings-same-file-spec.md):
+ * `uploadFileChunkedAware` sends `dupAware: true` and can resolve with
+ * `{kind:'duplicate'}` instead of a transcript — the caller already has a
+ * live recording of these exact bytes and nothing was created. A file the
+ * browser can hash quickly (≤ 200 MB, `shouldHashInBrowser`) carries its
+ * sha256 on the OPEN call so the answer arrives before any byte moves;
+ * anything bigger is hashed on the VM at complete, still before the
+ * AssemblyAI hand-off. `params.force` re-sends past the match. The old
+ * `uploadFileChunked` entry point never asks, so it never gets the answer
+ * and behaves exactly as it did.
  */
 
 export const PARALLELISM = 4;
@@ -51,6 +63,11 @@ export interface ChunkedUploadParams {
      * "x of y" is the whole recording's, not part 1's
      * (docs/recorder-upload-ux.md P2). */
     groupBytes?: number;
+    /** Every part's sha256, in part order, when the caller has hashed the
+     * whole group up front. Declared on part 1; it makes the group's
+     * identity known at open, so the same-file check happens before a byte
+     * moves (docs/recordings-same-file-spec.md). */
+    partSha256?: string[];
   } | null;
   /** Temporary transcript (migration 042): out of the archive, under the
    * Temporary tab, auto-trashed after 30 days. Server ignores it when
@@ -60,6 +77,14 @@ export interface ChunkedUploadParams {
   recorderRecordingId?: string | null;
   /** Force the chunk path even for a big file (tests / a browser without workers). */
   noBlob?: boolean;
+  /**
+   * "I understand a `{duplicate}` answer" (docs/recordings-same-file-spec.md).
+   * Set by `uploadFileChunkedAware`; the legacy `uploadFileChunked` entry
+   * point leaves it off, so its behaviour is byte-for-byte what it was.
+   */
+  dupAware?: boolean;
+  /** The user saw the match and chose "Upload anyway". */
+  force?: boolean;
 }
 
 export interface ChunkedUploadHooks {
@@ -82,6 +107,26 @@ export class UploadError extends Error {
   }
 }
 
+/**
+ * What an upload ended as. `duplicate` is only ever possible when the caller
+ * asked for it (`uploadFileChunkedAware`): the server answers it to nobody
+ * else.
+ */
+export type UploadOutcome =
+  | { kind: 'transcript'; transcript: StoredTranscript }
+  | { kind: 'duplicate'; duplicate: DuplicateMatch };
+
+/**
+ * Thrown internally the moment the server says these bytes are already a
+ * recording of this user's, so every path that can receive the answer —
+ * open, a re-open for a fresh SAS, complete — unwinds the same way.
+ */
+class DuplicateFound extends Error {
+  constructor(public readonly match: DuplicateMatch) {
+    super('duplicate');
+  }
+}
+
 interface SessionReply {
   id: string;
   /** Absent on an older server = chunks. */
@@ -100,6 +145,10 @@ interface BlobAsk {
   sha256: string;
   coarse: boolean;
 }
+
+/** Slices for the main-thread hash fallback: small enough that each tick is
+ * a few tens of ms and the `await` between them keeps the tab responsive. */
+const MAIN_THREAD_HASH_SLICE = 2 * 1024 * 1024;
 
 /** A phone / tablet pointer → the server halves the block parallelism. */
 function coarsePointer(): boolean {
@@ -186,7 +235,8 @@ async function openSession(
   fingerprint: string,
   params: ChunkedUploadParams,
   signal?: AbortSignal,
-  blob: BlobAsk | null = null
+  blob: BlobAsk | null = null,
+  sha256: string | null = null
 ): Promise<SessionReply> {
   let attempt = 0;
   for (;;) {
@@ -210,11 +260,21 @@ async function openSession(
             multi: params.multi ?? undefined,
             scratch: params.scratch ? true : undefined,
             recorderRecordingId: params.recorderRecordingId ?? undefined,
-            ...(blob ? { via: 'blob', sha256: blob.sha256, coarse: blob.coarse || undefined } : {}),
+            // The whole-file hash: required by the blob path, and what lets
+            // the same-file check answer at open instead of at complete.
+            ...(blob ?? sha256 ? { sha256: blob?.sha256 ?? sha256 } : {}),
+            ...(blob ? { via: 'blob', coarse: blob.coarse || undefined } : {}),
+            ...(params.dupAware ? { dupAware: true } : {}),
+            ...(params.force ? { force: true } : {}),
           }),
         },
         signal
       );
+      // "You already have this recording." Nothing was created; the caller
+      // shows the match and may re-send with `force`.
+      if (status >= 200 && status < 300 && isDuplicateAnswer(body)) {
+        throw new DuplicateFound(body.duplicate);
+      }
       if (status >= 200 && status < 300) return body;
       // 4xx other than 429: the request itself is wrong — don't retry.
       if (status >= 400 && status < 500 && status !== 429) {
@@ -222,7 +282,7 @@ async function openSession(
       }
       if (attempt >= 8) throw new UploadError(body?.error ?? `Upload failed (${status})`, status);
     } catch (err) {
-      if (err instanceof UploadError) throw err;
+      if (err instanceof UploadError || err instanceof DuplicateFound) throw err;
       if (signal?.aborted) throw new UploadError('Upload cancelled');
       if (attempt >= 8) throw new UploadError('Upload failed: network error');
     }
@@ -351,7 +411,8 @@ async function sendMissingChunks(
 
 async function completeSession(
   session: SessionReply,
-  hooks: ChunkedUploadHooks
+  hooks: ChunkedUploadHooks,
+  params: ChunkedUploadParams
 ): Promise<StoredTranscript> {
   const { signal } = hooks;
   hooks.onNote?.('Finalizing…');
@@ -363,6 +424,15 @@ async function completeSession(
     missing?: number[];
     notCommitted?: boolean;
   };
+  // The chunk path's same-file check runs HERE (the VM hashes the temp file),
+  // so `force` has to ride on the complete too.
+  const init: RequestInit = params.force
+    ? {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ force: true }),
+      }
+    : { method: 'POST' };
   let attempt = 0;
   for (;;) {
     attempt++;
@@ -371,9 +441,13 @@ async function completeSession(
       await waitOnline(signal);
       const { status, body } = await apiJson<Done>(
         `/api/uploads/${session.id}/complete`,
-        { method: 'POST' },
+        init,
         signal
       );
+      if (status >= 200 && status < 300 && isDuplicateAnswer(body)) {
+        // The session stays open and nothing was submitted.
+        throw new DuplicateFound(body.duplicate);
+      }
       if (status >= 200 && status < 300) {
         if (body.transcript) return body.transcript;
         if (body.transcriptId) return fetchTranscript(body.transcriptId, signal);
@@ -401,6 +475,10 @@ async function completeSession(
       }
     } catch (err) {
       if (err instanceof UploadError || err instanceof SessionGone) throw err;
+      if (err instanceof DuplicateFound) throw err;
+      // The caller re-syncs the blocks; swallowing this sent the blob path
+      // into a 20-minute poll of a session that was never going to finish.
+      if (err instanceof NotCommitted) throw err;
       if (signal?.aborted) throw new UploadError('Upload cancelled');
       lost = true; // network dropped while the server may still be finalizing
     }
@@ -452,40 +530,114 @@ async function fetchTranscript(id: string, signal?: AbortSignal): Promise<Stored
 }
 
 /**
+ * The whole-file sha256 the open call should carry, or null.
+ *
+ * A Web Worker when the browser has one (nothing on the main thread at all —
+ * `lib/sha256.ts`), otherwise a chunked main-thread read: each 2 MiB slice is
+ * `await`ed, which yields to the event loop between ticks, so the tab stays
+ * responsive. The fallback is only ever taken for files the same-file check
+ * asked about (≤ 200 MB — `shouldHashInBrowser`); a bigger file without a
+ * worker is simply not hashed here and is checked at complete instead.
+ */
+async function hashForOpen(
+  file: File,
+  hooks: ChunkedUploadHooks,
+  needBlob: boolean
+): Promise<string | null> {
+  const note = (pct: number) => hooks.onNote?.(`Preparing — reading the file… ${pct}%`);
+  try {
+    hooks.onNote?.('Preparing — reading the file…');
+    if (hashingAvailable()) return await hashFile(file, note, hooks.signal, HASH_SLICE_BYTES);
+    // The blob path REQUIRES a worker (a multi-GB main-thread hash is not an
+    // option); the duplicate check is happy with the chunked fallback.
+    if (needBlob || !shouldHashInBrowser(file.size)) return null;
+    const h = sha256Factory().create();
+    for (let start = 0; start < file.size; start += MAIN_THREAD_HASH_SLICE) {
+      if (hooks.signal?.aborted) throw new UploadError('Upload cancelled');
+      const end = Math.min(file.size, start + MAIN_THREAD_HASH_SLICE);
+      h.update(new Uint8Array(await file.slice(start, end).arrayBuffer()));
+      note(Math.floor((end / file.size) * 100));
+    }
+    return h.digest();
+  } catch (err) {
+    if (hooks.signal?.aborted || isAbortError(err)) throw new UploadError('Upload cancelled');
+    // Hashing is never load-bearing for the upload itself: without it the
+    // blob path is skipped and the duplicate check moves to complete.
+    return null;
+  } finally {
+    hooks.onNote?.(null);
+  }
+}
+
+/**
+ * Upload one file, `duplicate` answer included
+ * (docs/recordings-same-file-spec.md). Resolves with either the transcript
+ * row the server created — the promoted placeholder, or the group row for
+ * non-final parts of a multi-file group — or the live recording the caller
+ * already has of these exact bytes, in which case NOTHING was created and
+ * re-calling with `params.force = true` goes ahead.
+ *
+ * Restarts the session once if the server says it is gone (reaped while the
+ * tab sat idle for a day).
+ */
+export async function uploadFileChunkedAware(
+  file: File,
+  params: ChunkedUploadParams,
+  hooks: ChunkedUploadHooks = {}
+): Promise<UploadOutcome> {
+  try {
+    // `dupAware` is what this entry point IS; a caller may still turn it off.
+    return {
+      kind: 'transcript',
+      transcript: await runUpload(file, { dupAware: true, ...params }, hooks),
+    };
+  } catch (err) {
+    if (err instanceof DuplicateFound) return { kind: 'duplicate', duplicate: err.match };
+    throw err;
+  }
+}
+
+/**
  * Upload one file. Resolves with the transcript row the server created
  * (the promoted placeholder, or the group row for non-final parts of a
  * multi-file group). Restarts the session once if the server says it is
  * gone (reaped while the tab sat idle for a day).
+ *
+ * Never asks for — and therefore never receives — a `duplicate` answer: the
+ * server only gives one to a request carrying `dupAware`. Callers that can
+ * show the match use `uploadFileChunkedAware`.
  */
 export async function uploadFileChunked(
   file: File,
   params: ChunkedUploadParams,
   hooks: ChunkedUploadHooks = {}
 ): Promise<StoredTranscript> {
+  return runUpload(file, { ...params, dupAware: false }, hooks);
+}
+
+async function runUpload(
+  file: File,
+  params: ChunkedUploadParams,
+  hooks: ChunkedUploadHooks = {}
+): Promise<StoredTranscript> {
   const fingerprint = await fingerprintFile(file, params.multi);
-  // Big file + a browser that can hash in a worker → ask for the blob path.
-  // The hash is what the VM verifies the pulled bytes against.
+  // Two reasons to know the whole file's hash before opening:
+  //   - the blob path requires it (it is what the VM verifies the pulled
+  //     bytes against), for a file ≥ UPLOAD_BLOB_MIN_BYTES;
+  //   - the same-file check answers at OPEN when the request carries one,
+  //     which for a ≤ 200 MB file costs a chunked read and saves the whole
+  //     upload (docs/recordings-same-file-spec.md).
+  const needBlob = !params.noBlob && file.size >= UPLOAD_BLOB_MIN_BYTES;
+  const wantDupHash = !!params.dupAware && shouldHashInBrowser(file.size);
   let blobAsk: BlobAsk | null = null;
-  if (!params.noBlob && file.size >= UPLOAD_BLOB_MIN_BYTES && hashingAvailable()) {
-    try {
-      hooks.onNote?.('Preparing — reading the file…');
-      const sha256 = await hashFile(
-        file,
-        (pct) => hooks.onNote?.(`Preparing — reading the file… ${pct}%`),
-        hooks.signal
-      );
-      blobAsk = { sha256, coarse: coarsePointer() };
-    } catch (err) {
-      if (hooks.signal?.aborted || isAbortError(err)) throw new UploadError('Upload cancelled');
-      // A worker that cannot run: the chunk path is always there.
-      blobAsk = null;
-    } finally {
-      hooks.onNote?.(null);
-    }
+  let sha256: string | null = null;
+  if (needBlob || wantDupHash) {
+    sha256 = await hashForOpen(file, hooks, needBlob);
+    if (sha256 && needBlob) blobAsk = { sha256, coarse: coarsePointer() };
   }
   let restarts = 0;
   for (;;) {
-    const session = await openSession(file, fingerprint, params, hooks.signal, blobAsk);
+    const session = await openSession(file, fingerprint, params, hooks.signal, blobAsk, sha256);
     if (session.via === 'blob' && session.blob) {
       try {
         return await uploadViaBlob(file, session, fingerprint, params, blobAsk!, hooks);
@@ -512,10 +664,10 @@ export async function uploadFileChunked(
       for (let sync = 0; sync < 3; sync++) {
         await sendMissingChunks(file, session, hooks);
         try {
-          return await completeSession(session, hooks);
+          return await completeSession(session, hooks, params);
         } catch (err) {
           if (err instanceof SessionGone && err.message.startsWith('{') && sync < 2) {
-            const fresh = await openSession(file, fingerprint, params, hooks.signal);
+            const fresh = await openSession(file, fingerprint, params, hooks.signal, null, sha256);
             session.received = fresh.received;
             continue;
           }
@@ -581,7 +733,7 @@ async function uploadViaBlob(
       throw err;
     }
     try {
-      return await completeSession(session, hooks);
+      return await completeSession(session, hooks, params);
     } catch (err) {
       if (err instanceof NotCommitted && sync < 2) continue;
       if (err instanceof NotCommitted) throw new UploadError('Upload failed: the blob never committed');
