@@ -24,11 +24,13 @@ import postgres from 'postgres';
 import path from 'node:path';
 import { existsSync, statSync } from 'node:fs';
 import {
+  canonicalKeyOf,
   deriveRecordingGraph,
   desiredClipFor,
   isJobIdMeeting,
   ownerRowOf,
   recordingFilenames,
+  recordingIdFor,
   skipReason,
   type DesiredGraph,
   type GraphFileFacts,
@@ -152,6 +154,12 @@ interface ActualTranscription {
   has_payload: boolean;
   utterances: number | null;
   covers: { media?: string[]; timeline?: string } | null;
+  // Phase 2 (migration 046). NULL everywhere until a meeting is
+  // re-transcribed, and NULL on a schema where 046 has not been applied —
+  // which is why they are selected through `versionCols` below.
+  superseded_by: string | null;
+  requested: Record<string, unknown> | null;
+  annotations: number;
 }
 interface ActualClip {
   transcript_id: number;
@@ -212,6 +220,23 @@ async function main() {
     ).length > 0;
   const jobIdCol = hasJobIdColumn ? sql`t.aai_job_id` : sql`NULL::text AS aai_job_id`;
 
+  // Same tolerance for migration 046 (transcription versions, Phase 2): on a
+  // schema without it there are no versions to report and the two columns do
+  // not exist, so selecting them would be a parse error rather than a finding.
+  const has046 =
+    (
+      await sql`
+        SELECT 1 FROM information_schema.columns
+        WHERE table_schema = ${SCHEMA} AND table_name = 'recording_transcriptions'
+          AND column_name = 'requested'
+      `
+    ).length > 0;
+  const versionCols = has046
+    ? sql`requested,
+          (SELECT count(*)::int FROM ${sql(SCHEMA)}.transcription_annotations a
+            WHERE a.transcription_id = recording_transcriptions.id) AS annotations`
+    : sql`NULL::jsonb AS requested, 0 AS annotations`;
+
   const rows = await sql<GraphMeetingRow[]>`
     SELECT t.id, t.user_id, t.assemblyai_id, ${jobIdCol}, t.original_filename, t.status,
            t.created_at, t.completed_at, t.duration, t.language_code,
@@ -252,7 +277,7 @@ async function main() {
              (payload IS NOT NULL) AS has_payload,
              CASE WHEN jsonb_typeof(payload->'utterances') = 'array'
                   THEN jsonb_array_length(payload->'utterances') END AS utterances,
-             covers
+             covers, superseded_by, ${versionCols}
       FROM ${sql(SCHEMA)}.recording_transcriptions
     `,
     sql<ActualClip[]>`
@@ -300,7 +325,16 @@ async function main() {
 
     const group = byAaiId.get(row.assemblyai_id) ?? [row];
     const owner = ownerRowOf(group) ?? row;
-    const graph = deriveRecordingGraph(owner, fileFactsFor(owner));
+    // Phase 2: a meeting that has been re-transcribed reads a version whose
+    // id was minted, so the expected transcription is the recording's ACTIVE
+    // one, not the derived `txn:<rec>:0`. Exactly the input the app's
+    // dual-write passes (lib/recording-graph.ts `GraphTableFacts`) — with it
+    // the two agree by construction.
+    const derivedRecordingId = recordingIdFor(canonicalKeyOf(owner));
+    const liveActive = recById.get(derivedRecordingId)?.active_transcription_id ?? null;
+    const graph = deriveRecordingGraph(owner, fileFactsFor(owner), {
+      activeTranscriptionId: txnById.has(liveActive ?? '') ? liveActive : null,
+    });
     expectedRecordingIds.add(graph.recording.id);
 
     // ---- the clip -----------------------------------------------------
@@ -451,6 +485,29 @@ async function main() {
     }
   }
 
+  // ---- INFO: transcription versions (Phase 2) ---------------------------
+  // A recording may hold SEVERAL transcriptions: the one its meeting reads
+  // plus every other version a re-run produced. Those extras are not
+  // derivable from the `transcripts` row and must never be reported as drift
+  // — nothing above compares them, and `applyRecordingGraph` refuses to
+  // delete them. They are counted here instead, as INFO.
+  const versionInfos: string[] = [];
+  {
+    const byRecording = new Map<string, ActualTranscription[]>();
+    for (const t of transcriptions) {
+      byRecording.set(t.recording_id, [...(byRecording.get(t.recording_id) ?? []), t]);
+    }
+    const versioned = [...byRecording.values()].filter((list) => list.length > 1);
+    const extras = versioned.reduce((n, list) => n + list.length - 1, 0);
+    versionInfos.push(`recordings with >1 transcription: ${versioned.length} (${extras} extra version(s))`);
+    versionInfos.push(`  superseded                     : ${transcriptions.filter((t) => t.superseded_by).length}`);
+    versionInfos.push(`  requested by a person          : ${transcriptions.filter((t) => t.requested).length}`);
+    versionInfos.push(`  runs still processing          : ${transcriptions.filter((t) => t.status === 'processing' && t.requested).length}`);
+    versionInfos.push(`  failed runs                    : ${transcriptions.filter((t) => t.status === 'error' && t.requested).length}`);
+    versionInfos.push(`annotation sets parked           : ${transcriptions.reduce((n, t) => n + t.annotations, 0)}`);
+    if (!has046) versionInfos.push('  (migration 046 not applied on this schema)');
+  }
+
   // ---- INFO: the media archive (DEC-3 Stage A) --------------------------
   // `blob_name` / `sha256` are NOT derivable from a `transcripts` row, so a
   // disagreement between them and the row is not drift and must never be a
@@ -516,6 +573,9 @@ async function main() {
   console.log(`media rows             : ${media.length}`);
   console.log(`transcriptions         : ${transcriptions.length}`);
   console.log(`clips                  : ${clips.length}`);
+  console.log('');
+  console.log('transcription versions (INFO, never drift)');
+  for (const line of versionInfos) console.log(`  ${line}`);
   console.log('');
   console.log('media archive (INFO, never drift)');
   for (const line of infos) console.log(`  ${line}`);

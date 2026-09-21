@@ -9,7 +9,7 @@ import { getContentCached, generateAutoReport } from '@/lib/server/auto-notes';
 import { enrollFromTranscript } from '@/lib/server/voiceprint';
 import { canonicalMedia, resolveMeetingContent } from '@/lib/server/recordings';
 import { notifyUser, APP_URL } from '@/lib/server/darth-notify';
-import { dm, headlines, meetingLine } from '@/lib/server/dm-copy';
+import { dm, headlines, meetingLine, runKey } from '@/lib/server/dm-copy';
 import { autoMarkerOf, autoRecipients, autoSourceLabel } from '@/lib/auto-marker';
 import { storedReportPref } from '@/lib/report-pref';
 
@@ -44,7 +44,15 @@ function isDiarizationLabel(speaker: string): boolean {
   return /^[A-Z]{1,2}$/.test(speaker.trim()) || /^speaker\s*\d+$/i.test(speaker.trim());
 }
 
-export async function maybeAutoReview(ownerUserId: string, assemblyaiId: string): Promise<void> {
+export async function maybeAutoReview(
+  ownerUserId: string,
+  assemblyaiId: string,
+  /** Phase 2: the transcription that has just become live, when this is a
+   * re-run. It goes into the two DM dedupe keys below so the second version's
+   * "needs review" / "report ready" messages are not swallowed as duplicates
+   * of the first version's (landmine #9). */
+  transcriptionId?: string | null
+): Promise<void> {
   const row = await getForUser(ownerUserId, assemblyaiId);
   if (!row || row.status !== 'completed') return;
   const marker = autoMarkerOf(row.gmeet_context);
@@ -118,7 +126,7 @@ export async function maybeAutoReview(ownerUserId: string, assemblyaiId: string)
           `Auto-imported via ${auto.source}. What blocked the automatic pass: ${blocker}.`,
           `Confirm the names (usually 30 seconds) and the ${pref === 'later' ? 'notes' : 'summary + detailed report'} generates itself → <${url}|Review speakers>`
         ),
-        dedupeKey: `mw-needs-review:${assemblyaiId}:${to}`,
+        dedupeKey: `mw-needs-review:${assemblyaiId}${runKey(transcriptionId)}:${to}`,
       });
     }
     return;
@@ -176,7 +184,7 @@ export async function maybeAutoReview(ownerUserId: string, assemblyaiId: string)
           ...gist,
           `Auto-imported via ${auto.source}, ${applied.length > 0 ? `${applied.length} speaker${applied.length === 1 ? '' : 's'} identified by voice` : 'speakers already named'} → <${url}|Read the full notes>`
         ),
-        dedupeKey: `mw-report-ready:${assemblyaiId}:${to}`,
+        dedupeKey: `mw-report-ready:${assemblyaiId}${runKey(transcriptionId)}:${to}`,
       });
     }
   }

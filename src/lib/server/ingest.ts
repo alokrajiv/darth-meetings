@@ -140,6 +140,48 @@ async function keepFailedIngest(
   return row;
 }
 
+/**
+ * The recognition-bias hints for one submit: org + user vocab merged, plus
+ * whatever extra phrases the caller has (attendee names from the calendar
+ * event). Failures are non-fatal — we still submit, just without the bias.
+ *
+ * Shared with the Phase 2 re-run path (lib/server/transcription-runs.ts): a
+ * new transcription of the same recording must be biased exactly as the first
+ * one was, or the two versions would differ for a reason nobody asked for.
+ * The ENGLISH-only gate on `keyterms_prompt` is applied further down, in
+ * `submitTranscription`, where the language is known.
+ */
+export async function vocabForSubmit(
+  userId: string,
+  extraKeyterms?: string[]
+): Promise<{
+  keytermsPrompt: string[] | undefined;
+  customSpelling: ReturnType<typeof mergeVocabs>['custom_spelling'] | undefined;
+}> {
+  let keytermsPrompt: string[] | undefined;
+  let customSpelling: ReturnType<typeof mergeVocabs>['custom_spelling'] | undefined;
+  try {
+    const [orgVocabPayload, userVocab] = await Promise.all([
+      getOrgVocabPayload(),
+      getUserVocab(userId),
+    ]);
+    const merged = mergeVocabs(orgVocabPayload, userVocab);
+    keytermsPrompt = merged.keyterms_prompt;
+    customSpelling = merged.custom_spelling;
+  } catch (error) {
+    console.warn('[ingest] vocab merge failed (continuing without):', error);
+  }
+
+  if (extraKeyterms && extraKeyterms.length > 0) {
+    const seen = new Set((keytermsPrompt ?? []).map((t) => t.toLowerCase()));
+    const extras = extraKeyterms
+      .map((t) => t.trim())
+      .filter((t) => t.length > 1 && !seen.has(t.toLowerCase()));
+    keytermsPrompt = [...(keytermsPrompt ?? []), ...extras].slice(0, 1000);
+  }
+  return { keytermsPrompt, customSpelling };
+}
+
 export interface IngestOptions {
   originalFilename: string | null;
   languageCode?: string;
@@ -206,29 +248,7 @@ export async function ingestLocalAudio(
     if (mixFilename) await deleteAudioFile(mixFilename).catch(() => {});
   }
 
-  // Merge org + user vocab and pass to AAI as keyterms_prompt / custom_spelling.
-  // Failures are non-fatal: we still submit, just without the bias hints.
-  let keytermsPrompt: string[] | undefined;
-  let customSpelling: ReturnType<typeof mergeVocabs>['custom_spelling'] | undefined;
-  try {
-    const [orgVocabPayload, userVocab] = await Promise.all([
-      getOrgVocabPayload(),
-      getUserVocab(userId),
-    ]);
-    const merged = mergeVocabs(orgVocabPayload, userVocab);
-    keytermsPrompt = merged.keyterms_prompt;
-    customSpelling = merged.custom_spelling;
-  } catch (error) {
-    console.warn('[ingest] vocab merge failed (continuing without):', error);
-  }
-
-  if (opts.extraKeyterms && opts.extraKeyterms.length > 0) {
-    const seen = new Set((keytermsPrompt ?? []).map((t) => t.toLowerCase()));
-    const extras = opts.extraKeyterms
-      .map((t) => t.trim())
-      .filter((t) => t.length > 1 && !seen.has(t.toLowerCase()));
-    keytermsPrompt = [...(keytermsPrompt ?? []), ...extras].slice(0, 1000);
-  }
+  const { keytermsPrompt, customSpelling } = await vocabForSubmit(userId, opts.extraKeyterms);
 
   let submitted: { id: string; status: string; model: SpeechModel };
   try {

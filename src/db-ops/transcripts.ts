@@ -16,6 +16,7 @@ import {
 } from '@/db-ops/meeting-filter-sql';
 import { EMPTY_MEETING_FILTERS, type MeetingFilters } from '@/lib/server/meeting-filters';
 import { recordingCountExpr } from '@/db-ops/recordings';
+import { clearNotesStaleIfRegenerated } from '@/db-ops/transcriptions';
 import { recordingsEnabled } from '@/lib/server/recordings';
 import { AAI_STUCK_HOURS } from '@/lib/aai-job-state';
 import { aaiJobIdColumnExists, jobIdSql, mintedIdsEnabled } from '@/db-ops/aai-job-id';
@@ -1512,6 +1513,15 @@ export async function setAutoNotesForUser(
         auto_notes_at = now()
     WHERE user_id = ${userId} AND assemblyai_id = ${assemblyaiId}
   `;
+  // Phase 2: notes written from another version are marked `notesStale`;
+  // rewriting them is what clears it (never automatic, never guessed — see
+  // db-ops/transcriptions.ts). A no-op for every meeting that carries no
+  // marker, which is all of them until one is re-transcribed.
+  if (update.status === 'completed') {
+    await clearNotesStaleIfRegenerated(userId, assemblyaiId).catch((err) =>
+      console.warn('[transcripts] notesStale clear failed:', err)
+    );
+  }
   publishEvent({ kind: 'notes', assemblyaiId });
 }
 
@@ -1530,6 +1540,13 @@ export async function setAutoReportForUser(
         auto_report_at = now()
     WHERE user_id = ${userId} AND assemblyai_id = ${assemblyaiId}
   `;
+  // Same rule as the summary tier above — the marker only goes once BOTH
+  // artefacts the meeting has are newer than it.
+  if (update.status === 'completed') {
+    await clearNotesStaleIfRegenerated(userId, assemblyaiId).catch((err) =>
+      console.warn('[transcripts] notesStale clear failed:', err)
+    );
+  }
   publishEvent({ kind: 'notes', assemblyaiId });
 }
 
@@ -1736,24 +1753,32 @@ export async function listAaiDeletePending(
   return sql<
     Array<{ user_id: string; assemblyai_id: string; aai_job_id: string; utterances: number }>
   >`
-    SELECT user_id, assemblyai_id, ${job.expr} AS aai_job_id,
-           jsonb_array_length(
-             CASE WHEN jsonb_typeof(imported_content->'utterances') = 'array'
-                  THEN imported_content->'utterances' END
-           ) AS utterances
-    FROM ${sql(SCHEMA)}.transcripts
-    WHERE status = 'completed'
-      AND ${job.expr2} IS NOT NULL
-      AND NOT (COALESCE(gmeet_context, '{}'::jsonb) ? 'aai')
-      AND local_audio_path IS NOT NULL
-      AND COALESCE(
-            jsonb_array_length(
-              CASE WHEN jsonb_typeof(imported_content->'utterances') = 'array'
-                   THEN imported_content->'utterances' END
-            ), 0
-          ) > 0
-      AND COALESCE(completed_at, created_at) > now() - make_interval(hours => ${sinceHours})
-    ORDER BY COALESCE(completed_at, created_at) DESC
+    SELECT s.user_id, s.assemblyai_id, s.aai_job_id, s.utterances
+    FROM (
+      SELECT user_id, assemblyai_id, ${job.expr} AS aai_job_id,
+             gmeet_context->'aai'->>'jobId' AS stamped_job,
+             COALESCE(completed_at, created_at) AS finished_at,
+             jsonb_array_length(
+               CASE WHEN jsonb_typeof(imported_content->'utterances') = 'array'
+                    THEN imported_content->'utterances' END
+             ) AS utterances
+      FROM ${sql(SCHEMA)}.transcripts
+      WHERE status = 'completed'
+        AND local_audio_path IS NOT NULL
+        AND COALESCE(
+              jsonb_array_length(
+                CASE WHEN jsonb_typeof(imported_content->'utterances') = 'array'
+                     THEN imported_content->'utterances' END
+              ), 0
+            ) > 0
+        AND COALESCE(completed_at, created_at) > now() - make_interval(hours => ${sinceHours})
+    ) s
+    WHERE s.aai_job_id IS NOT NULL
+      -- Not "is there a stamp" but "is the stamp about THIS job": a meeting
+      -- that has been transcribed again (Phase 2) carries the previous job's
+      -- stamp, and its new job would otherwise never be deleted at AssemblyAI.
+      AND s.stamped_job IS DISTINCT FROM s.aai_job_id
+    ORDER BY s.finished_at DESC
     LIMIT ${limit}
   `;
 }

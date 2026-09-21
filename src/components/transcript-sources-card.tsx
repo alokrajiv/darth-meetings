@@ -16,6 +16,10 @@ import {
   pctLabel,
 } from '@/lib/aai-outcome';
 import { isPersonName } from '@/lib/speaker-name-kind';
+import { runningLine, versionsWorthShowing } from '@/lib/transcription-copy';
+import { RetranscribeDialog } from '@/components/retranscribe-dialog';
+import { TranscriptionVersions } from '@/components/transcription-versions';
+import type { UseTranscriptions } from '@/hooks/use-transcriptions';
 import {
   AudioWaveform,
   CheckCircle2,
@@ -24,6 +28,7 @@ import {
   FileText,
   Fingerprint,
   Loader2,
+  RefreshCw,
   Sparkles,
   Video,
 } from 'lucide-react';
@@ -34,6 +39,13 @@ interface TranscriptSourcesCardProps {
   canEdit: boolean;
   /** Offline mode: re-transcribe actions need the server — shown but inert. */
   disabled?: boolean;
+  /** Phase 2: the transcription versions of this meeting, loaded once by the
+   * page (this card renders twice — rail + phone drawer). Absent, or
+   * `versioned: false`, means the pre-Phase-2 path is in force and this card
+   * keeps its old behaviour exactly. */
+  transcriptions?: UseTranscriptions;
+  /** The reader, so their own re-runs read as "You". */
+  selfEmail?: string | null;
 }
 
 /**
@@ -48,6 +60,8 @@ export function TranscriptSourcesCard({
   suggestions,
   canEdit,
   disabled = false,
+  transcriptions,
+  selfEmail,
 }: TranscriptSourcesCardProps) {
   const [error, setError] = useState<string | null>(null);
 
@@ -240,7 +254,21 @@ export function TranscriptSourcesCard({
   const rowModel = row.speech_model ?? LEGACY_SPEECH_MODEL;
   const onOlderModel = isAaiRow && rowModel !== DEFAULT_SPEECH_MODEL;
   const retranscribed = ctx?.retranscribed ?? null;
-  const canUpgradeModel = canEdit && onOlderModel && !!row.local_audio_path && !retranscribed;
+
+  // --- Phase 2: a transcription is a VERSION of this meeting -------------
+  // (docs/recordings-phase2-spec.md). "Transcribe again" adds one instead of
+  // creating a second meeting row; the versions list switches between them.
+  // `versioned: false` = the tables/flags are absent and the server still
+  // answers the old way, so everything below stays exactly as it was.
+  const versionState = transcriptions?.data ?? null;
+  const versioned = versionState?.versioned === true;
+  const versions = versionState?.versions ?? [];
+  const runningVersion = versionState?.running ?? null;
+  const activeVersion = versions.find((v) => v.active) ?? null;
+  const [retranscribeOpen, setRetranscribeOpen] = useState(false);
+
+  const canUpgradeModel =
+    canEdit && !versioned && onOlderModel && !!row.local_audio_path && !retranscribed;
   const [upgrading, setUpgrading] = useState(false);
   const [upgradedTo, setUpgradedTo] = useState<string | null>(retranscribed?.newId ?? null);
   const upgradeModel = async () => {
@@ -277,7 +305,9 @@ export function TranscriptSourcesCard({
   // and the raw facts behind a disclosure for whoever wants them.
   const outcome = aaiOutcome(row);
   const outcomeSentence = isAaiRow ? aaiOutcomeSentence(outcome) : null;
-  const outcomeNote = isAaiRow ? aaiOutcomeNote(outcome) : null;
+  const outcomeNote = isAaiRow
+    ? aaiOutcomeNote(outcome, { canChooseLanguage: versioned && canEdit && !!row.local_audio_path })
+    : null;
   const [advancedOpen, setAdvancedOpen] = useState(false);
 
   return (
@@ -539,6 +569,59 @@ export function TranscriptSourcesCard({
             </div>
           )}
         </>
+      )}
+      {versioned && (canEdit || versionsWorthShowing(versions)) && (
+        // The slot is a fixed two lines so the running line appears into
+        // space that was already there — the rail never jumps under the
+        // reader's cursor when a re-run starts.
+        <div className={canEdit ? 'mt-2 min-h-[34px]' : 'mt-2'} data-transcription-versions>
+          {runningVersion && (
+            <p
+              className="flex items-start gap-1.5 text-[11px] leading-snug text-muted-foreground"
+              data-retranscribe-running
+            >
+              <Loader2 className="mt-0.5 h-3 w-3 shrink-0 animate-spin" />
+              <span>{runningLine(runningVersion)}</span>
+            </p>
+          )}
+          {canEdit && (
+            <button
+              type="button"
+              className="mt-1 inline-flex items-center gap-1 text-[11px] font-medium text-primary hover:underline disabled:cursor-not-allowed disabled:text-muted-foreground disabled:no-underline"
+              disabled={disabled || !!runningVersion}
+              onClick={() => setRetranscribeOpen(true)}
+              title={
+                disabled
+                  ? 'Not available offline'
+                  : runningVersion
+                    ? 'A transcription is already running on this meeting'
+                    : 'Hear this meeting again — another language or another model. Every version is kept and you can switch back'
+              }
+            >
+              <RefreshCw className="h-3 w-3" />
+              Transcribe again…
+            </button>
+          )}
+          {versionsWorthShowing(versions) && (
+            <TranscriptionVersions
+              versions={versions}
+              canEdit={canEdit}
+              disabled={disabled}
+              selfEmail={selfEmail}
+              activatingId={transcriptions?.activatingId ?? null}
+              onActivate={(id) => transcriptions!.activate(id)}
+            />
+          )}
+        </div>
+      )}
+      {versioned && transcriptions && (
+        <RetranscribeDialog
+          open={retranscribeOpen}
+          onOpenChange={setRetranscribeOpen}
+          active={activeVersion}
+          submitting={transcriptions.submitting}
+          onSubmit={transcriptions.retranscribe}
+        />
       )}
       {canUpgradeModel && !upgradedTo && (
         <Button

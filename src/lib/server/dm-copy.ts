@@ -18,6 +18,25 @@ import { APP_URL } from '@/lib/server/darth-notify';
  * is useful without opening anything.
  */
 
+/**
+ * What a DM dedupe key adds for a RE-TRANSCRIPTION (Phase 2, landmine #9).
+ *
+ * Every key that matters here embeds the MEETING id
+ * (`mw-transcript-ready:<meeting>:<email>`, `mw-needs-review:…`,
+ * `mw-report-ready:…`) and plagueis dedupes on it forever — so the second time
+ * a meeting is transcribed, the DM announcing the new version would be
+ * swallowed as a duplicate of the first one. Appending the transcription makes
+ * each VERSION its own announcement while the original run's keys stay exactly
+ * as they are (empty suffix): a meeting that is never re-run must not start
+ * sending a second DM because the key shape changed.
+ *
+ * Only the first 8 characters — the key is also a Slack-side lookup and the
+ * uuid's prefix is already unique among a meeting's handful of versions.
+ */
+export function runKey(transcriptionId: string | null | undefined): string {
+  return transcriptionId ? `:v${transcriptionId.slice(0, 8)}` : '';
+}
+
 export interface MeetingFacts {
   title?: string | null;
   /** ISO / Date of the meeting itself (recorded_at, event start). */

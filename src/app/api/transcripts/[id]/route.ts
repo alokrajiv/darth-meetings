@@ -17,6 +17,7 @@ import { deleteAudioFile } from '@/lib/server/audio-storage';
 import { dropAudioOnly } from '@/lib/server/audio-only';
 import { refreshIfPending } from '@/lib/server/transcript-sync';
 import { removeRecordingGraphForMeeting } from '@/lib/server/recording-sync';
+import { deleteAnnotationsForMeeting } from '@/db-ops/transcriptions';
 
 export const runtime = 'nodejs';
 
@@ -176,9 +177,19 @@ export const DELETE = withAuth(async ({ user, request }, { params }) => {
   if (jobId) await aaiDelete(jobId);
   await deleteSpeakerMappingsForUser(access.ownerUserId, id);
   // Before the row goes: `meeting_clips.transcript_id` has no FK (it is the
-  // int family), so an orphan clip would survive the row forever.
+  // int family), so an orphan clip would survive the row forever. Same for
+  // the annotations parked against this meeting's other transcription
+  // versions (Phase 2, migration 046) — a no-op when 046 is not applied.
+  await deleteAnnotationsForMeeting(access.row.id).catch((err) =>
+    console.warn('[DELETE /api/transcripts] parked annotations cleanup failed:', err)
+  );
   await removeRecordingGraphForMeeting(access.row.id, 'permanent-delete');
   await deleteForUser(access.ownerUserId, id);
+  // Again, after the row is gone: a fire-and-forget graph sync that was in
+  // flight can re-create the clip between the purge above and the delete. A
+  // sync that starts from here on finds no row and does nothing, so this
+  // second pass is the last word. Idempotent.
+  await removeRecordingGraphForMeeting(access.row.id, 'permanent-delete/after');
   // Each stored recording may have an audio-only derivative (offline pins);
   // drop it with the source so nothing outlives the row.
   if (access.row.local_audio_path) {

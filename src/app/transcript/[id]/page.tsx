@@ -3,6 +3,8 @@
 import { useState, useEffect, useCallback, useMemo, useRef, use } from 'react';
 import { useRouter } from 'next/navigation';
 import { useLiveEvents } from '@/hooks/use-live-events';
+import { useTranscriptions } from '@/hooks/use-transcriptions';
+import { NOTES_FROM_PREVIOUS_TRANSCRIPTION } from '@/lib/transcription-copy';
 import { formatDistanceToNow } from 'date-fns';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
@@ -631,12 +633,29 @@ function TranscriptDetailInner({ transcriptId }: { transcriptId: string }) {
     };
   }, [loadAll]);
 
+  // Transcription versions of this meeting (Phase 2). Loaded once here: the
+  // Sources card renders twice (rail + phone drawer), and the notes/report
+  // tabs need `notesStale` from the same answer. Revalidated off the SSE
+  // stream below — no second subscription, no poll of its own.
+  const transcriptions = useTranscriptions(transcriptId, {
+    enabled: offlineReady && !offline,
+    // A run finished (or someone switched version): the row, its edits and
+    // its speaker names all changed together — re-pull exactly what a
+    // collaborator's edit would.
+    onActiveChanged: () => {
+      void loadAll({ silent: true });
+      bumpActivity();
+    },
+  });
+
   // Live updates: a collaborator changed THIS transcript — silently re-pull
   // everything. Skipped while the user is mid-edit (focused form field) so a
   // reload never stomps typing; debounced so event bursts coalesce.
   useLiveEvents((e) => {
     if (e.assemblyaiId !== transcriptId) return;
     if (e.kind === 'labels') loadLabels();
+    // The versions list answers the same two events the meeting row does.
+    if (e.kind === 'status' || e.kind === 'meta') transcriptions.refresh();
     if (liveReloadTimer.current) clearTimeout(liveReloadTimer.current);
     liveReloadTimer.current = setTimeout(() => {
       const el = document.activeElement as HTMLElement | null;
@@ -2377,6 +2396,31 @@ function TranscriptDetailInner({ transcriptId }: { transcriptId: string }) {
     </div>
   );
 
+  /**
+   * Phase 2: the summary and the detailed report were written from a
+   * transcription this meeting is no longer reading. One quiet line, and the
+   * existing Generate dialog next to it — regenerating costs money, so it is
+   * always the reader's call (docs/recordings-phase2-spec.md §Flow 4).
+   */
+  const previousTranscriptionNote = transcriptions.data?.notesStale ? (
+    <div className="mb-3 flex items-center justify-between gap-2 rounded-md border bg-muted/60 px-3 py-2 text-xs">
+      <span className="text-muted-foreground">{NOTES_FROM_PREVIOUS_TRANSCRIPTION}</span>
+      {canEdit && (
+        <Button
+          variant="ghost"
+          size="sm"
+          className="h-6 shrink-0 text-[11px] text-primary hover:text-primary"
+          disabled={offline || generatingNotes || generatingReport}
+          title={offline ? OFFLINE_TITLE : undefined}
+          onClick={() => openGenerateDialog()}
+        >
+          <RefreshCw className="h-3 w-3" />
+          Regenerate
+        </Button>
+      )}
+    </div>
+  ) : null;
+
   return (
     <div>
       <AppHeader breadcrumb={{ title: headerTitle }}>
@@ -2948,6 +2992,7 @@ function TranscriptDetailInner({ transcriptId }: { transcriptId: string }) {
                     </div>
                     {summaryTab === 'report' ? (
                     <>
+                    {row.auto_report && row.auto_report_status !== 'running' && previousTranscriptionNote}
                     {reportQueued && row.auto_report_status !== 'running' && (
                       <div className="mb-3 flex items-center gap-2 rounded-md border border-amber-400/50 bg-amber-500/5 px-3 py-2 text-xs text-muted-foreground">
                         <Loader2 className="h-3.5 w-3.5 shrink-0 animate-spin text-amber-600 dark:text-amber-500" />
@@ -3072,6 +3117,7 @@ function TranscriptDetailInner({ transcriptId }: { transcriptId: string }) {
                     </>
                     ) : (
                     <>
+                    {row.auto_notes && row.auto_notes_status !== 'running' && previousTranscriptionNote}
                     {notesStale && row.auto_notes_status !== 'running' && canEdit && (
                       <div className="mb-3 flex items-center justify-between gap-2 rounded-md border bg-muted/60 px-3 py-2 text-xs">
                         <span className="text-muted-foreground">{notesStale}</span>
@@ -3559,6 +3605,8 @@ function TranscriptDetailInner({ transcriptId }: { transcriptId: string }) {
                 suggestions={speakerSuggestions}
                 canEdit={canEdit}
                 disabled={offline}
+                transcriptions={transcriptions}
+                selfEmail={currentUserEmail}
               />
               <AttachmentPanel
                 transcriptId={row.assemblyai_id}
@@ -3738,6 +3786,8 @@ function TranscriptDetailInner({ transcriptId }: { transcriptId: string }) {
                 suggestions={speakerSuggestions}
                 canEdit={canEdit}
                 disabled={offline}
+                transcriptions={transcriptions}
+                selfEmail={currentUserEmail}
               />
               <AttachmentPanel
                 transcriptId={row.assemblyai_id}

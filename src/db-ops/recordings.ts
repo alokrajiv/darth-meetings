@@ -2,6 +2,7 @@ import 'server-only';
 import { sql } from '@/lib/db';
 import { SCHEMAS } from '@/lib/constants/database';
 import { jobIdSql } from '@/db-ops/aai-job-id';
+import { transcriptionVersionTablesExist } from '@/db-ops/transcriptions';
 import type { TranscriptResponse } from '@/lib/format';
 import type { ClipTextPolicy } from '@/lib/recording-clips';
 import type { TransactionSql } from 'postgres';
@@ -225,6 +226,27 @@ export async function listRecordingsForOwner(
     ORDER BY started_at DESC NULLS LAST, created_at DESC
     LIMIT ${opts?.limit ?? 200}
   `;
+}
+
+/**
+ * INTERNAL-ONLY — the recording's active transcription id, but only when the
+ * row it names really exists.
+ *
+ * Phase 2's input to the dual-write: a meeting that has been re-transcribed
+ * reads a version whose id was MINTED, not derived, so a re-derivation must be
+ * told which one it is or it would point the recording back at the version the
+ * user switched away from and overwrite that version's payload with the
+ * current one (lib/recording-graph.ts `GraphTableFacts`). It lives here rather
+ * than in db-ops/transcriptions.ts to keep the sync's imports acyclic.
+ */
+export async function activeTranscriptionIdOf(recordingId: string): Promise<string | null> {
+  const rows = await sql<Array<{ id: string }>>`
+    SELECT t.id
+    FROM ${sql(SCHEMA)}.recordings r
+    JOIN ${sql(SCHEMA)}.recording_transcriptions t ON t.id = r.active_transcription_id
+    WHERE r.id = ${recordingId}::uuid
+  `;
+  return rows[0]?.id ?? null;
 }
 
 /** INTERNAL-ONLY — called right after a transcription completes. */
@@ -745,6 +767,8 @@ export async function applyRecordingGraph(
   const keepMediaIds = graph.media.map((m) => m.id);
   const migratedFrom: string[] = [];
   let staleMediaRemoved = 0;
+  // Asked before the transaction opens — see the note at its only use below.
+  const has046 = await transcriptionVersionTablesExist().catch(() => false);
 
   await sql.begin(async (tx) => {
     // What these meetings pointed at BEFORE — a promotion changes the answer.
@@ -870,6 +894,37 @@ export async function applyRecordingGraph(
         WHERE recording_id = ${priorId}::uuid LIMIT 1
       `;
       if (still.length > 0) continue;
+      // …unless one of its transcriptions is a VERSION (Phase 2): superseded,
+      // annotated, or deliberately requested (which covers a run still in
+      // flight). Those are somebody's history and a re-derivation of a
+      // meeting's graph must never be what destroys them. The recording stays
+      // whole; `recordings-verify` reports it as an orphan rather than this
+      // silently eating a version the user can still switch back to.
+      //
+      // The 046 half of the test is added only when 046 is there: a statement
+      // naming a missing column ABORTS the transaction, so it cannot be
+      // wrapped in a catch — the probe is asked first, out of band and cached.
+      const versioned = has046;
+      const protectedTxns = await tx<Array<{ id: string }>>`
+        SELECT id FROM ${tx(SCHEMA)}.recording_transcriptions t
+        WHERE t.recording_id = ${priorId}::uuid
+          AND (t.superseded_by IS NOT NULL
+               ${
+                 versioned
+                   ? tx`OR t.requested IS NOT NULL
+                        OR EXISTS (SELECT 1 FROM ${tx(SCHEMA)}.transcription_annotations a
+                                    WHERE a.transcription_id = t.id)`
+                   : tx``
+               })
+        LIMIT 1
+      `;
+      if (protectedTxns.length > 0) {
+        console.warn(
+          `[recordings] kept recording ${priorId}: it holds a transcription version ` +
+            '(superseded / annotated / requested) that a graph re-derivation must not delete'
+        );
+        continue;
+      }
       await tx`DELETE FROM ${tx(SCHEMA)}.recording_transcriptions WHERE recording_id = ${priorId}::uuid`;
       await tx`DELETE FROM ${tx(SCHEMA)}.recording_media WHERE recording_id = ${priorId}::uuid`;
       await tx`DELETE FROM ${tx(SCHEMA)}.recordings WHERE id = ${priorId}::uuid`;

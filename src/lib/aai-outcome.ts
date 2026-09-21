@@ -222,19 +222,28 @@ export function aaiOutcomeSentence(o: AaiOutcome): string | null {
  * Deliberately reason-specific: "your English may read as a translation"
  * and "the audio was hard to hear" are not the same warning.
  */
-export function aaiOutcomeNote(o: AaiOutcome): string | null {
+export function aaiOutcomeNote(
+  o: AaiOutcome,
+  /** True when "Transcribe again" with a chosen language is on offer (Phase 2
+   * versions) — then a wrong detection IS fixable and the note says how. */
+  opts: { canChooseLanguage?: boolean } = {}
+): string | null {
   const reason = o.reasons[0];
   if (!reason) return null;
   switch (reason) {
     case 'downgraded':
       return (
         'Mixed-language calls come out in the detected language; English stretches may read ' +
-        'as translations. Not fixable with a re-run today — see Advanced details.'
+        (opts.canChooseLanguage
+          ? 'as translations. If the call was mostly English, transcribe it again with the language set to English.'
+          : 'as translations. Not fixable with a re-run today — see Advanced details.')
       );
     case 'non-english':
       return (
         `This meeting was transcribed as one language (${languageLabel(o.languageCode)}); ` +
-        'anything said in another language may read as a translation. See Advanced details.'
+        (opts.canChooseLanguage
+          ? 'anything said in another language may read as a translation. If that is the wrong language, transcribe it again and choose the right one.'
+          : 'anything said in another language may read as a translation. See Advanced details.')
       );
     case 'low-confidence':
       return (

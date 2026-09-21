@@ -1,6 +1,7 @@
 import 'server-only';
 import { getTranscript, isAaiNotFound } from '@/lib/server/assemblyai';
-import { updateStatusForUser, type TranscriptRow } from '@/db-ops/transcripts';
+import { getForUser, updateStatusForUser, type TranscriptRow } from '@/db-ops/transcripts';
+import { pollTranscriptionRun, runPollTarget } from '@/lib/server/transcription-runs';
 import { AAI_GONE_REASON, aaiJobIdOf } from '@/lib/aai-job-state';
 import { giveUpOnAaiJob } from '@/lib/server/aai-giveup';
 import { onTranscriptCompleted } from '@/lib/server/post-completion';
@@ -10,6 +11,10 @@ import { queueRecordingGraphSync } from '@/lib/server/recording-sync';
  * If the stored row is still queued/processing, fetch the latest state from
  * AssemblyAI and persist it. Returns the (possibly updated) row. Swallows
  * upstream errors so a transient AAI hiccup doesn't break the list endpoint.
+ *
+ * Also where a Phase 2 re-transcription is observed on the detail page: a
+ * meeting with `gmeet_context.retranscribing` is polled for its OWN job first,
+ * whatever its status (docs/recordings-phase2-spec.md Flow 3).
  *
  * Three things stop the poll before it reaches AAI: a terminal status, a row
  * with no AssemblyAI job to poll (`ext-…`, `gmeet-…`, `teams-…`), a
@@ -23,6 +28,18 @@ export async function refreshIfPending(
   userId: string,
   row: TranscriptRow
 ): Promise<TranscriptRow> {
+  // Phase 2: a COMPLETED meeting can still have work in flight — a new
+  // transcription of its own recording. The row is not 'processing' (the
+  // whole point is that it stays readable), so this is checked before the
+  // status gate below. When the run lands, the row that comes back is the one
+  // carrying the NEW version.
+  const run = runPollTarget(row);
+  if (run) {
+    await pollTranscriptionRun(run);
+    const after = await getForUser(userId, row.assemblyai_id).catch(() => null);
+    if (after) return after;
+  }
+
   // 'uploading' / 'waiting' rows have a synthetic `up-…` / `defer-…` id that
   // AAI has never heard of — nothing to refresh until they're promoted.
   if (

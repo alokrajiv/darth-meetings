@@ -99,9 +99,14 @@ export async function deleteAtAaiIfSafe(
     return 'failed';
   }
   if (!row) return 'skipped';
-  if (row.gmeet_context?.aai?.deletedAt) return 'skipped';
   const jobId = aaiJobIdOf(row);
   if (!jobId) return 'skipped';
+  // The stamp names the job it settled. Phase 2 makes that distinction matter:
+  // a re-transcribed meeting carries the stamp of the PREVIOUS job, and a
+  // bare "has it been stamped?" test would leave the new job sitting at
+  // AssemblyAI forever (docs/recordings-phase2-spec.md Flow 3).
+  const stamped = row.gmeet_context?.aai;
+  if (stamped?.deletedAt && stamped.jobId === jobId) return 'skipped';
 
   const reason = unsafeReason(row, expectedUtterances);
   if (reason) {

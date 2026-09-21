@@ -53,6 +53,18 @@ export const recordingIdFor = (canonicalKey: string) =>
   uuidv5(RECORDING_NAMESPACE, `rec:${canonicalKey}`);
 export const mediaIdFor = (recordingId: string, kind: string, ord: number) =>
   uuidv5(RECORDING_NAMESPACE, `media:${recordingId}:${kind}:${ord}`);
+/**
+ * The id of the transcription a meeting was BORN with — the one the Phase 1
+ * backfill mints and the one a re-derivation targets while the meeting has
+ * never been re-transcribed.
+ *
+ * A Phase 2 RE-RUN does not derive its id: it is minted before AssemblyAI has
+ * a job to name it after (the upload leg of a multi-GB file is minutes long,
+ * and both the double-run lock and the "this run failed" line need a handle
+ * that exists throughout). Convergence is by LOOKUP instead —
+ * `GraphTableFacts.activeTranscriptionId` below — which is stronger than a
+ * derivation anyway: it cannot disagree with the table.
+ */
 export const transcriptionIdFor = (recordingId: string) =>
   uuidv5(RECORDING_NAMESPACE, `txn:${recordingId}:0`);
 
@@ -307,6 +319,23 @@ export function desiredClipFor(transcriptId: number): DesiredClip {
 }
 
 /**
+ * Facts the caller looked up that the row cannot tell us. Same idea as
+ * `GraphFileFacts`: the rules stay pure, the lookups belong to the caller.
+ */
+export interface GraphTableFacts {
+  /**
+   * The recording's CURRENT `active_transcription_id`, when it has one that
+   * really exists (Phase 2). A meeting that has been re-transcribed reads a
+   * transcription whose id is derived from the JOB, not from the recording,
+   * so without this the dual-write would re-derive `txn:<rec>:0`, set the
+   * recording's active pointer back to the version the user switched away
+   * from AND overwrite that version's payload with the current one. Absent
+   * (or null) = the derived id, which is what every un-re-run meeting has.
+   */
+  activeTranscriptionId?: string | null;
+}
+
+/**
  * Derive the recording, its files and its transcription from the meeting row
  * that OWNS them (the earliest `created_at` of a shared AssemblyAI job —
  * `ownerRowOf` below). A meeting that merely references the recording
@@ -314,7 +343,8 @@ export function desiredClipFor(transcriptId: number): DesiredClip {
  */
 export function deriveRecordingGraph(
   ownerRow: GraphMeetingRow,
-  files?: GraphFileFacts
+  files?: GraphFileFacts,
+  tables?: GraphTableFacts
 ): DesiredGraph {
   const g = ownerRow.gmeet_context;
   const canonicalKey = canonicalKeyOf(ownerRow);
@@ -455,7 +485,10 @@ export function deriveRecordingGraph(
     },
     media,
     transcription: {
-      id: transcriptionIdFor(recordingId),
+      // The version the meeting row currently describes — the recording's
+      // active one when it has been re-transcribed (Phase 2), else the id
+      // this recording's first transcription always had.
+      id: tables?.activeTranscriptionId ?? transcriptionIdFor(recordingId),
       provider: providerOf(ownerRow),
       // The job itself, wherever it is recorded — `aai_job_id` for a minted
       // meeting, the meeting id for every row born before 1b.

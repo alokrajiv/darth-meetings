@@ -2,35 +2,107 @@ import { promises as fsp } from 'node:fs';
 import { parseReportPref } from '@/lib/report-pref';
 import { NextResponse } from 'next/server';
 import { withAuth } from '@/lib/auth/with-auth';
-import { resolveAccess } from '@/db-ops/transcript-access';
+import { resolveAccess, type ResolvedAccess } from '@/db-ops/transcript-access';
 import { mergeGmeetContextForUser } from '@/db-ops/transcripts';
-import { DEFAULT_SPEECH_MODEL, LEGACY_SPEECH_MODEL } from '@/lib/aai-language';
+import { DEFAULT_SPEECH_MODEL, LEGACY_SPEECH_MODEL, type SpeechModel } from '@/lib/aai-language';
 import { audioFileSize, resolveAudioPath } from '@/lib/server/audio-storage';
 import { finalizeUpload, openUpload, type LinkedEventInput } from '@/lib/server/upload-pipeline';
+import { startTranscriptionRun } from '@/lib/server/transcription-runs';
+import type { DarthUser } from '@/lib/auth/session';
+import type { RetranscribeRequest, TranscriptionLanguageChoice } from '@/lib/transcriptions';
 
 export const runtime = 'nodejs';
 
 /**
- * POST /api/transcripts/:id/retranscribe
+ * POST /api/transcripts/:id/retranscribe — editors only.
  *
- * "Re-transcribe with the newer model": run the row's stored audio through
- * AssemblyAI again on DEFAULT_SPEECH_MODEL. Same shape as the other re-run
- * flows — a NEW row is created alongside (this one stays untouched), the
- * linked calendar event and invitee shares carry over, and the owner gets
- * the transcript_ready DM when it lands. Responds as soon as the job is
- * queued (202); the AAI upload of a multi-GB video runs in the background
- * with the placeholder's heartbeat keeping the sweeper off it.
+ * TWO behaviours, and which one runs is decided by
+ * `transcriptionVersionsEnabled()` (MW_TRANSCRIPTION_VERSIONS + 044/045/046 +
+ * MW_RECORDINGS_WRITE), never by the caller:
  *
- * Editors only. Refused when the row already ran on the current model, has
- * no stored audio, or was re-run before (the old row carries a pointer).
+ *  - **version mode** (Phase 2, docs/recordings-phase2-spec.md): a NEW
+ *    transcription of the SAME meeting's own recording. The meeting stays
+ *    `completed` and fully readable on the current version while the job runs,
+ *    every version is kept, and switching between them restores that version's
+ *    edits and speaker names. Answers `mode: 'version'`.
+ *  - **the fallback**, which is what this route has always done: open a fresh
+ *    upload that creates a SECOND meeting row alongside, carrying the linked
+ *    event and the invitee shares, and leave a pointer on the old one.
+ *    Answers `mode: 'new-row'`.
+ *
+ * The fallback keeps its own refusals (already re-run once, already on the
+ * current model) because they are what made it survivable; version mode drops
+ * both — the same model with a different language is a legitimate re-run, and
+ * there is no "once only" when versions are kept. The wire contract for both
+ * is `src/lib/transcriptions.ts`.
  */
-export const POST = withAuth(async ({ user }, { params }) => {
+
+const SPEECH_MODELS: SpeechModel[] = ['universal', 'universal-3-5-pro'];
+/** AssemblyAI language codes are 'en', 'zh', 'en_us' — never free text. */
+const LANGUAGE_RE = /^[a-z]{2}(_[a-z]{2})?$/i;
+
+function parseBody(raw: unknown): RetranscribeRequest {
+  const b = (raw ?? {}) as Record<string, unknown>;
+  const model = typeof b.speechModel === 'string' ? b.speechModel : null;
+  const lang = typeof b.languageCode === 'string' ? b.languageCode.trim() : null;
+  const reason = typeof b.reason === 'string' ? b.reason.trim().slice(0, 200) : undefined;
+  return {
+    speechModel: SPEECH_MODELS.includes(model as SpeechModel) ? (model as SpeechModel) : undefined,
+    languageCode:
+      lang === 'auto' || (lang && LANGUAGE_RE.test(lang))
+        ? (lang as TranscriptionLanguageChoice)
+        : undefined,
+    reason: reason || undefined,
+    force: b.force === true,
+  };
+}
+
+export const POST = withAuth(async ({ user, request }, { params }) => {
   const { id } = await params;
   const access = await resolveAccess(user.userId, user.email, id);
   if (!access) return NextResponse.json({ error: 'Not found' }, { status: 404 });
   if (access.access === 'read') {
     return NextResponse.json({ error: 'Read-only access' }, { status: 403 });
   }
+
+  // Every existing caller (the detail page's old button, darth-cli) posts no
+  // body at all; an unparseable one is read as "the defaults".
+  const body = parseBody(await request.json().catch(() => null));
+
+  const started = await startTranscriptionRun({
+    row: access.row,
+    ownerUserId: access.ownerUserId,
+    by: { userId: user.userId, email: user.email ?? null, name: user.name ?? null },
+    speechModel: (body.speechModel as SpeechModel | undefined) ?? DEFAULT_SPEECH_MODEL,
+    languageCode: body.languageCode ?? 'auto',
+    reason: body.reason ?? null,
+    force: body.force === true,
+  });
+
+  if (started.kind === 'started') {
+    return NextResponse.json(
+      { ok: true, mode: 'version', transcriptionId: started.transcriptionId, running: started.running },
+      { status: 202 }
+    );
+  }
+  if (started.kind === 'refused') {
+    return NextResponse.json(started.body, { status: started.status });
+  }
+  console.log(`[retranscribe] ${id}: version mode unavailable (${started.why}) — new-row fallback`);
+  return legacyRetranscribe(user, access);
+});
+
+/**
+ * TODAY's behaviour, unchanged: "re-transcribe with the newer model" as a NEW
+ * meeting row.
+ *
+ * Reached when Phase 2 cannot serve this meeting — the flag is off, the
+ * migrations are not applied, or the meeting has no clip yet (its recording
+ * graph has never been written). Everything below is the pre-Phase-2 code
+ * verbatim apart from the `mode: 'new-row'` key the shared wire contract adds,
+ * and it must stay that way: it is the rollback.
+ */
+async function legacyRetranscribe(user: DarthUser, access: ResolvedAccess): Promise<Response> {
   const row = access.row;
   const ownerId = row.user_id;
   const ctx = row.gmeet_context;
@@ -138,7 +210,7 @@ export const POST = withAuth(async ({ user }, { params }) => {
   })();
 
   return NextResponse.json(
-    { ok: true, newId: placeholder.assemblyai_id, model: DEFAULT_SPEECH_MODEL },
+    { ok: true, mode: 'new-row', newId: placeholder.assemblyai_id, model: DEFAULT_SPEECH_MODEL },
     { status: 202 }
   );
-});
+}

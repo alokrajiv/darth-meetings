@@ -6,6 +6,7 @@
  */
 
 import type { ReportPref } from '@/lib/report-pref';
+import type { RunningTranscription } from '@/lib/transcriptions';
 
 /** Temporary (scratch) transcripts are moved to the trash this many days
  * after creation (migration 042). The sweeper, the listing hint and the
@@ -133,9 +134,21 @@ export interface MeetParticipantInfo {
   latestEnd?: string;
 }
 
-/** One structured transcript entry from the Meet API (precise per-utterance
- * times, unlike the Doc's 5-minute blocks). `start`/`end` are ms relative to
- * `MeetActuals.anchorIso`. */
+/**
+ * One structured transcript entry from the Meet API. `start`/`end` are ms
+ * relative to `MeetActuals.anchorIso`.
+ *
+ * NOT a speaker turn, despite the shape — measured over 10,498 entries on
+ * 2026-09-21 these are ~30-second CAPTION-FLUSH windows (median span 26 s,
+ * p90 29 s) that are exactly contiguous per participant, so once someone's
+ * caption stream opens it tiles their whole session and different names'
+ * windows overlap each other a median 88% of the time. The entry's TEXT
+ * LENGTH is what says how much of its window that person actually filled
+ * (median 5.9 chars/s against ~15 chars/s of continuous speech). Anything
+ * that treats an entry's span as speech time must weight it by that density
+ * — see `lib/meet-align-vote.ts` and docs/eval-shared-mic-2026-09-21.md.
+ * Still far better timing than the Doc's 5-minute blocks.
+ */
 export interface MeetTranscriptEntry {
   speaker: string;
   email?: string;
@@ -185,6 +198,27 @@ export interface GmeetContext {
    * the button turns into a pointer instead of firing twice. */
   retranscribedFrom?: string;
   retranscribed?: { at: string; newId: string; model: string };
+  /** Phase 2 (docs/recordings-phase2-spec.md): a NEW transcription of this
+   * meeting's own recording is running right now. The meeting stays
+   * `completed` and fully readable on the current version while it does —
+   * this marker is the only sign of it, and it is what the pollers and the
+   * 5-minute sweeper look for (nobody may have the page open). Cleared when
+   * the run is activated or fails.
+   *
+   * `jobId` is the AssemblyAI job to poll. It never leaves the server, and it
+   * is NULL while the recording is still on its way TO AssemblyAI: the marker
+   * is claimed before the hand-off (that is what makes two simultaneous
+   * "Transcribe again" clicks impossible) and a multi-GB upload takes minutes.
+   * No poller touches a marker without one. Everything else here IS
+   * `RunningTranscription` on the wire. */
+  retranscribing?: (RunningTranscription & { jobId: string | null }) | null;
+  /** Phase 2: the summary / detailed report on this row were written from
+   * ANOTHER version of the transcript. Set when a version switch finds
+   * notes or a report, cleared when both have been regenerated since
+   * `since` (db-ops/transcriptions.ts `clearNotesStaleIfRegenerated`). They
+   * are never regenerated automatically — that costs money and they are
+   * still mostly right — so the page offers "Regenerate" instead. */
+  notesStale?: { since: string; fromTranscriptionId: string } | null;
   /** DEC-4 (docs/recordings-first-class-design.md §7): the AssemblyAI job
    * behind this row has been deleted AT AssemblyAI — our payload + the local
    * media are the only copies left, and nothing may ask AAI about `jobId`

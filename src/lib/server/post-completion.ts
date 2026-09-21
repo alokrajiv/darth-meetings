@@ -9,7 +9,7 @@ import { canonicalMedia, resolveMeetingContent } from '@/lib/server/recordings';
 import { identityForUser } from '@/db-ops/transcript-activity';
 import { autoMarkerOf } from '@/lib/auto-marker';
 import { notifyUser } from '@/lib/server/darth-notify';
-import { dm, meetingLine, openLink } from '@/lib/server/dm-copy';
+import { dm, meetingLine, openLink, runKey } from '@/lib/server/dm-copy';
 
 /**
  * Fire-and-forget work that should happen once, when a transcript first
@@ -38,7 +38,17 @@ export function onTranscriptCompleted(
   /** What the completing AAI poll returned, when the caller saw it — the
    * DEC-4 delete refuses to run unless the stored payload matches it. Absent
    * for paths that never touched AAI (text imports). */
-  observed?: { utterances: number | null }
+  observed?: {
+    utterances: number | null;
+    /**
+     * Phase 2: which TRANSCRIPTION just became live. Absent for a meeting's
+     * first (and usually only) transcription; set when a re-run was activated,
+     * and then it goes into every DM dedupe key this hook sends — landmine #9:
+     * `mw-transcript-ready:<meeting>:<email>` would otherwise silence the
+     * second "ready" DM for a meeting that has been transcribed twice.
+     */
+    transcriptionId?: string | null;
+  }
 ): void {
   setTimeout(() => {
     void (async () => {
@@ -101,8 +111,8 @@ export function onTranscriptCompleted(
         // identified with high confidence, apply the names and generate the
         // configured summary/report unattended; otherwise DM the owner to
         // come review. No-op without the gmeet_context.autoImport marker.
-        await maybeAutoReview(ownerUserId, full.assemblyai_id).catch((err) =>
-          console.warn('[post-completion] auto-review failed:', err)
+        await maybeAutoReview(ownerUserId, full.assemblyai_id, observed?.transcriptionId).catch(
+          (err) => console.warn('[post-completion] auto-review failed:', err)
         );
 
         // Hand-started work (drag-drop upload, manual import): tell the
@@ -110,7 +120,7 @@ export function onTranscriptCompleted(
         // DM. Auto paths have their own needs_review / report_ready DMs.
         // plagueis dedupes on the key, so re-entering this hook is safe.
         if (!autoMarkerOf(full.gmeet_context)) {
-          await notifyTranscriptReady(ownerUserId, full).catch((err) =>
+          await notifyTranscriptReady(ownerUserId, full, observed?.transcriptionId).catch((err) =>
             console.warn('[post-completion] ready DM failed:', err)
           );
         }
@@ -123,7 +133,8 @@ export function onTranscriptCompleted(
 
 async function notifyTranscriptReady(
   ownerUserId: string,
-  row: NonNullable<Awaited<ReturnType<typeof getForUser>>>
+  row: NonNullable<Awaited<ReturnType<typeof getForUser>>>,
+  transcriptionId?: string | null
 ): Promise<void> {
   const owner = await identityForUser(ownerUserId);
   if (!owner) return;
@@ -146,6 +157,6 @@ async function notifyTranscriptReady(
       }),
       `${how}. Speaker names are suggested where voices matched — confirm them and the notes generate → ${link}`
     ),
-    dedupeKey: `mw-transcript-ready:${row.assemblyai_id}:${owner.email}`,
+    dedupeKey: `mw-transcript-ready:${row.assemblyai_id}${runKey(transcriptionId)}:${owner.email}`,
   });
 }

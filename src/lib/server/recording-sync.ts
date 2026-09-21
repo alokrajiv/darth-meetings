@@ -3,16 +3,19 @@ import { promises as fsp } from 'node:fs';
 import { resolveAudioPath } from '@/lib/server/audio-storage';
 import { getAudioOnlyPath } from '@/lib/server/audio-only';
 import {
+  canonicalKeyOf,
   deriveRecordingGraph,
   desiredClipFor,
   isJobIdMeeting,
   ownerRowOf,
   recordingFilenames,
+  recordingIdFor,
   skipReason,
   type GraphFileFacts,
   type GraphMeetingRow,
 } from '@/lib/recording-graph';
 import {
+  activeTranscriptionIdOf,
   applyRecordingGraph,
   dropDerivativeMediaByFilename,
   loadGraphMeetingRows,
@@ -135,7 +138,15 @@ export async function syncRecordingGraphForMeeting(
   if (skipReason(owner)) return { status: 'skipped', reason: 'owner row is a placeholder' };
 
   const files = opts?.probeFiles === false ? undefined : await probeFiles(owner);
-  const graph = deriveRecordingGraph(owner, files);
+  // Which transcription the row describes is a question only the TABLE can
+  // answer once a meeting has been re-transcribed (Phase 2): the live version
+  // was minted, not derived, so re-deriving `txn:<rec>:0` here would point the
+  // recording back at the version the user switched away from and overwrite
+  // that version's payload with the current one. One indexed read.
+  const activeTranscriptionId = await activeTranscriptionIdOf(
+    recordingIdFor(canonicalKeyOf(owner))
+  ).catch(() => null);
+  const graph = deriveRecordingGraph(owner, files, { activeTranscriptionId });
 
   // The owner's own clip is written too when someone else triggered this, so
   // a shared job converges from whichever side is touched first.

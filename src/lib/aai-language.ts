@@ -42,6 +42,33 @@ export function canonicalSpeechModel(model: string | null | undefined): string |
   return model === 'universal' ? 'universal-2' : model;
 }
 
+/** The models a human may ASK for — the submit ids, never the report-back
+ * alias 'universal-2'. Newest first: the default is the first entry. */
+export const SUBMIT_SPEECH_MODELS: SpeechModel[] = ['universal-3-5-pro', 'universal'];
+
+/**
+ * The languages a human may force on a transcription ("it heard Indonesian,
+ * it was English"). `''` is auto-detection — the same empty-code convention
+ * the upload stepper uses. Trames' own languages come first; the rest are
+ * the ones AssemblyAI handles well enough to be worth offering.
+ */
+export const TRANSCRIPTION_LANGUAGE_OPTIONS: Array<{ code: string; label: string }> = [
+  { code: '', label: 'Auto-detect' },
+  { code: 'en', label: 'English' },
+  { code: 'id', label: 'Indonesian' },
+  { code: 'ms', label: 'Malay' },
+  { code: 'zh', label: 'Chinese (Mandarin)' },
+  { code: 'hi', label: 'Hindi' },
+  { code: 'ta', label: 'Tamil' },
+  { code: 'th', label: 'Thai' },
+  { code: 'vi', label: 'Vietnamese' },
+  { code: 'ja', label: 'Japanese' },
+  { code: 'ko', label: 'Korean' },
+  { code: 'es', label: 'Spanish' },
+  { code: 'fr', label: 'French' },
+  { code: 'de', label: 'German' },
+];
+
 /**
  * The `speech_models` list to submit for a given primary model: AAI reads it
  * as a preference order and falls back down it for languages the primary

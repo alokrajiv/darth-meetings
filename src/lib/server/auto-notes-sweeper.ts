@@ -12,6 +12,11 @@ import {
   softDeleteForUser,
 } from '@/db-ops/transcripts';
 import { deleteAtAaiIfSafe, deleteOnCompleteEnabled } from '@/lib/server/aai-retention';
+import {
+  listRetranscribingMeetings,
+  transcriptionVersionsEnabled,
+} from '@/db-ops/transcriptions';
+import { pollTargetFromRow, pollTranscriptionRun } from '@/lib/server/transcription-runs';
 import { AAI_STUCK_HOURS, AAI_STUCK_REASON } from '@/lib/aai-job-state';
 import { giveUpOnAaiJob } from '@/lib/server/aai-giveup';
 import { identityForUser } from '@/db-ops/transcript-activity';
@@ -32,6 +37,10 @@ import { SCRATCH_TTL_DAYS } from '@/lib/format';
  *     kill in-flight generations). Never-ran notes are NOT picked up:
  *     generation waits for a human to review speaker labels and click
  *     "confirm & generate" on the detail page, however long that takes.
+ *   - re-transcriptions in flight (Phase 2): a meeting can be COMPLETED and
+ *     still have a NEW transcription of its own recording running. Nobody
+ *     need have the page open, so this tick is the backstop — it lands the
+ *     version, or gives up on it without touching the meeting.
  *   - stuck AssemblyAI jobs (DEC-4): a job AAI accepted and has been sitting
  *     on for more than AAI_STUCK_HOURS is never coming back — flip the row to
  *     'error' with a reason a human can act on. Trashed rows included (19 of
@@ -75,6 +84,10 @@ const AAI_DELETE_PER_SWEEP = 10;
 // Give-up pass. Generous per sweep because it is a pure DB write with no
 // outbound call — the prod backlog (19 rows) drains in one tick.
 const AAI_STUCK_PER_SWEEP = 50;
+// Phase 2 re-transcriptions in flight. Serial and small: each one is an
+// outbound AssemblyAI call, and the listing poll + the detail sync already
+// pick up anything whose page is open.
+const RETRANSCRIBE_PER_SWEEP = 10;
 
 let started = false;
 
@@ -149,6 +162,21 @@ async function sweep(): Promise<void> {
     }
   } catch (err) {
     console.warn('[notes-sweeper] stuck-AAI query failed:', err);
+  }
+
+  // Phase 2: new transcriptions of a meeting's own recording. Nobody has to
+  // have the page open for one to land — this is the backstop behind the
+  // listing poll and the detail sync, and the only observer for a run whose
+  // owner closed the tab. `pollTranscriptionRun` also owns the give-up: a run
+  // AssemblyAI 404s or sits on past six hours is marked failed and the MEETING
+  // is left exactly as it was.
+  try {
+    if (await transcriptionVersionsEnabled()) {
+      const runs = await listRetranscribingMeetings(RETRANSCRIBE_PER_SWEEP);
+      for (const r of runs) await pollTranscriptionRun(pollTargetFromRow(r));
+    }
+  } catch (err) {
+    console.warn('[notes-sweeper] re-transcription poll failed:', err);
   }
 
   // DEC-4: jobs that should already be gone from AssemblyAI. deleteAtAaiIfSafe

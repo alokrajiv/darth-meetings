@@ -16,6 +16,11 @@ import { giveUpOnAaiJob } from '@/lib/server/aai-giveup';
 import { saveAudioBytes, saveAudioStreamToTemp } from '@/lib/server/audio-storage';
 import { onTranscriptCompleted } from '@/lib/server/post-completion';
 import { queueRecordingGraphSync } from '@/lib/server/recording-sync';
+import {
+  listRetranscribingVisibleToUser,
+  transcriptionVersionsEnabled,
+} from '@/db-ops/transcriptions';
+import { pollTargetFromRow, pollTranscriptionRun } from '@/lib/server/transcription-runs';
 import { parseMeetingFilters } from '@/lib/server/meeting-filters';
 import { resolveLinkedEventRef } from '@/lib/server/linked-event-ref';
 import { parseLabelFilter } from '@/lib/labels';
@@ -216,6 +221,20 @@ async function listingV2(
     await refreshPendingAgainstAai(pending);
   } catch (err) {
     console.warn('[GET /api/transcripts?v=2] pending refresh failed:', err);
+  }
+
+  // Phase 2: the same fan-out for meetings that are COMPLETED but have a new
+  // transcription of their own recording in flight. They are invisible to the
+  // query above — a re-run never moves the row's status — so they get their
+  // own caller-scoped list, and only when versions are switched on at all
+  // (the flag is an env read plus one cached probe).
+  try {
+    if (await transcriptionVersionsEnabled()) {
+      const runs = await listRetranscribingVisibleToUser(user.userId, user.email);
+      await Promise.all(runs.map((r) => pollTranscriptionRun(pollTargetFromRow(r))));
+    }
+  } catch (err) {
+    console.warn('[GET /api/transcripts?v=2] re-transcription poll failed:', err);
   }
 
   const result = await listPagedForUser(user.userId, user.email, {
