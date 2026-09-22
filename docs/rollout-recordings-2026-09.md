@@ -1,6 +1,6 @@
 # Rollout runbook — first-class recordings + "AssemblyAI keeps nothing" (September 2026)
 
-Everything below is committed on `main`; **as of 2026-09-22 14:05 SGT everything except H/I is live** (D's archive is draining) (Alok: "do the whole thing, no data loss"). Left: H once the archive has drained (+ CORS is in), I after the ffprobe of a real 0.3.12 tray recording; the AssemblyAI dashboard retention; and the first-real-use checks under E, G, J, K. With every new flag unset the app behaves as
+Everything below is committed on `main`; **as of 2026-09-22 15:50 SGT everything except I is live** (archive drained, playback from blob on) (Alok: "do the whole thing, no data loss"). Left: I after the ffprobe of a real 0.3.12 tray recording; the human playback pass for H; the AssemblyAI dashboard retention; and the first-real-use checks under E, G, J, K. With every new flag unset the app behaves as
 it does today, so the deploy itself is safe at any point; each later step is its own switch with its own rollback.
 Steps marked **ALOK** need your hands (deploys, migrations on the VM, prod writes, Azure). Keep this file current:
 tick a step with the date when it is done.
@@ -130,8 +130,16 @@ are finished within 5 min of a restart. Deploys are safe to do mid-transcription
 
 ## H. Playback from blob (DEC-3 stage B) — committed 174214d
 
-- [ ] After D has archived the media: set `MW_MEDIA_FROM_BLOB=1`, restart; play a meeting on a phone and a laptop,
+- [x] After D has archived the media: set `MW_MEDIA_FROM_BLOB=1`, restart; play a meeting on a phone and a laptop,
       seek, and check Safari (the one browser no fake could prove — the player falls back to the app path by itself).
+      **Flag on 2026-09-22 15:48 SGT** after the drain finished (817 files / 80.60 GB, 15:36 SGT) and
+      `--check-blobs --limit 1000` said 817/817. Proven: darth-cli `audio` (bearer, no `redirect=1`) still streams
+      from the app — nginx `200 78556`. **Still to observe:** the first browser play answering `302` to
+      `darthmedia.blob.core.windows.net` (a watcher tails nginx for it), then the phone / seek / Safari pass by a human.
+      **Found on the way (fixed 279e0d4, deployed 15:47 SGT):** the recording-sync hook archived each upload's
+      canonical BEFORE the faststart remux rewrote it, so five of today's blobs held pre-remux bytes (`--check-blobs`
+      caught them: blob 7–15 KB shorter than the row). A stamped row is now re-checked against the blob on every
+      hook and the media-prep sync asks for a rehash; the five rows were un-stamped and re-copied (817/817 clean).
 
 ## I. AssemblyAI reads the blob (DEC-3 stage C)
 
