@@ -279,6 +279,31 @@ export async function listOwnRecordings(
 }
 
 /**
+ * "This recording IS that occurrence" — the SQL twin of
+ * `recorderMatchIsConfident` (lib/recorder.ts), for the calendar folds
+ * below. Since 2026-09-22 17:00 SGT `matchRecording` stamps `confident` on
+ * the stored match; a row matched before that is judged on the numbers it
+ * has, with time overlap alone never enough (the 15:56 incident) — and a
+ * product mismatch never (the 17:03 one: a Slack DM call folded onto a
+ * Teams invite at score 0.3 read as "my Slack call was uploaded against
+ * the wrong meeting"). A weak match stays on the row for the record; the
+ * calendar simply does not show it.
+ */
+function matchedConfidentSql(alias: string) {
+  const m = sql.unsafe(`${alias}.matched`);
+  return sql`(
+    ${m} IS NOT NULL AND (
+      CASE WHEN ${m} ? 'confident' THEN (${m}->>'confident')::boolean
+           ELSE COALESCE((${m}->>'score')::numeric, 0) >= 0.6
+            AND COALESCE((${m}->>'overlap')::numeric, 0) >= 0.5
+            AND NOT COALESCE((${m}->>'provider_mismatch')::boolean, false)
+            AND COALESCE((${m}->>'title_score')::numeric, 0) > 0
+      END
+    )
+  )`;
+}
+
+/**
  * Recordings matched to ONE occurrence, any owner. NOT caller-scoped — the
  * route gates with callerInvolvedInOccurrence first and redacts non-owned
  * rows.
@@ -289,14 +314,15 @@ export async function recordingsForOccurrence(
   limit = 20
 ): Promise<RecorderRecordingRow[]> {
   return sql<RecorderRecordingRow[]>`
-    SELECT * FROM ${sql(SCHEMA)}.recorder_recordings
-    WHERE status <> 'deleted'
-      AND matched->>'meeting_code' = ${meetingCode}
+    SELECT * FROM ${sql(SCHEMA)}.recorder_recordings rr
+    WHERE rr.status <> 'deleted'
+      AND ${matchedConfidentSql('rr')}
+      AND rr.matched->>'meeting_code' = ${meetingCode}
       AND (
         ${instant}::timestamptz IS NULL
-        OR abs(extract(epoch FROM ((matched->>'occ_start')::timestamptz - ${instant}::timestamptz))) <= 120
+        OR abs(extract(epoch FROM ((rr.matched->>'occ_start')::timestamptz - ${instant}::timestamptz))) <= 120
       )
-    ORDER BY COALESCE(started_at, created_at) DESC
+    ORDER BY COALESCE(rr.started_at, rr.created_at) DESC
     LIMIT ${limit}
   `;
 }
@@ -341,6 +367,7 @@ export async function recordingsForOccurrences(
     JOIN ${sql(SCHEMA)}.recorder_recordings r
       ON r.matched->>'meeting_code' = o.code
      AND r.status <> 'deleted'
+     AND ${matchedConfidentSql('r')}
      AND abs(extract(epoch FROM ((r.matched->>'occ_start')::timestamptz - o.instant))) <= 120
     LEFT JOIN ${sql(SCHEMA)}.recorder_devices d ON d.device_id = r.device_id
     LEFT JOIN ${sql(SCHEMA)}.recorder_nudges n
