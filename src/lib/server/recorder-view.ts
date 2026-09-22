@@ -2,6 +2,7 @@ import 'server-only';
 import type { RecorderRecordingRow, RecordingWrite } from '@/db-ops/recorder';
 import { isRecordingStatus } from '@/db-ops/recorder';
 import type { RecorderMatch } from '@/lib/recorder';
+import { recorderMatchIsConfident } from '@/lib/recorder';
 
 /**
  * Wire shapes for /api/recorder/recordings — one place so the owner view and
@@ -29,6 +30,14 @@ export interface OwnRecordingView {
   call: unknown;
   shares: unknown;
   matched: RecorderMatch | null;
+  /**
+   * Is `matched` a CONFIDENT match — the one definition, computed here so
+   * the tray does not carry a copy of it (docs/recorder-link-confirm-spec.md
+   * D3). It decides nothing on its own any more: since D1 the server never
+   * links by itself and the tray asks the person either way; this is what
+   * lets the ask be worded "Link to 'X'?" instead of "Was this 'X'?".
+   */
+  matched_confident: boolean;
   transcript_id: string | null;
   error: string | null;
   created_at: string;
@@ -66,6 +75,7 @@ export function ownView(r: RecorderRecordingRow): OwnRecordingView {
     call: r.call ?? null,
     shares: r.shares ?? null,
     matched: r.matched ?? null,
+    matched_confident: recorderMatchIsConfident(r.matched),
     transcript_id: r.transcript_id,
     error: r.error,
     created_at: iso(r.created_at) ?? r.created_at,

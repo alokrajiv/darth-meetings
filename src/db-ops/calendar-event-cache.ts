@@ -1197,6 +1197,18 @@ export interface CalendarOverlapRow {
   event_start: string;
   event_end: string | null;
   meeting_code: string | null;
+  /**
+   * Where the invite says the call happens: `location` plus the head of
+   * `description`, joined. There is NO provider column on this table — a
+   * Teams/Zoom/Webex occurrence is only identifiable by its join URL, which
+   * lives in one of those two free-text fields (`meeting_code` is Google's
+   * Meet code, or our own `teams-…` synthetic). The matcher's provider veto
+   * (docs/recorder-link-confirm-spec.md D3) reads exactly this.
+   *
+   * Truncated on the server side: a calendar description can be tens of KB
+   * and the join link is always near the top of the invite boilerplate.
+   */
+  conference_hint: string | null;
 }
 
 /**
@@ -1213,7 +1225,9 @@ export async function listOccurrencesOverlapping(
   limit = 25
 ): Promise<CalendarOverlapRow[]> {
   return sql<CalendarOverlapRow[]>`
-    SELECT event_key, event_id, title, event_start, event_end, meeting_code
+    SELECT event_key, event_id, title, event_start, event_end, meeting_code,
+           left(COALESCE(location, '') || ' ' || COALESCE(description, ''), 2000)
+             AS conference_hint
     FROM ${sql(SCHEMA)}.calendar_event_cache
     WHERE user_id = ${userId}
       AND event_start <= ${toIso}::timestamptz + interval '30 minutes'

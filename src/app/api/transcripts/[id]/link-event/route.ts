@@ -4,6 +4,7 @@ import { resolveAccess } from '@/db-ops/transcript-access';
 import {
   getForUser,
   mergeGmeetContextForUser,
+  removeGmeetContextKeysForUser,
   setRecordedAtForUser,
   setScratchForUser,
   updateMetaForUser,
@@ -223,6 +224,14 @@ export const POST = withAuth(async ({ user, request }, { params }) => {
     }
   }
   await mergeGmeetContextForUser(access.ownerUserId, id, patch);
+  // D2: a link answers the suggestion — whichever surface did the linking,
+  // and whether or not it is the event that was suggested. Removed, not
+  // stamped: there is nothing left to offer.
+  if (access.row.gmeet_context?.suggestedEvent) {
+    await removeGmeetContextKeysForUser(access.ownerUserId, id, ['suggestedEvent']).catch((err) =>
+      console.warn('[link-event] clearing the suggestion failed (continuing):', err)
+    );
+  }
   // Temporary → permanent: linking says "this is a real meeting".
   if (access.row.scratch) {
     await setScratchForUser(access.ownerUserId, id, false);

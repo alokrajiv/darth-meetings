@@ -35,6 +35,14 @@ interface AudioPlayerProps {
   src: string;
   /** The stored file contains a video stream — offer a video toggle. */
   hasVideo?: boolean;
+  /**
+   * D6 (docs/recorder-link-confirm-spec.md): what to say INSTEAD of the
+   * video toggle when there is no video. Until 2026-09-22 the spot was
+   * simply empty, which reads as "video is broken" rather than "this call
+   * was never captured with one" — see lib/suggested-event.ts noVideoNote().
+   * Ignored when `hasVideo` is true.
+   */
+  noVideoNote?: string | null;
   /** Called every `timeupdate` with the current time in seconds. */
   onTimeUpdate?: (seconds: number) => void;
   /** Called once the media's metadata is ready — the parent uses this to
@@ -136,6 +144,7 @@ export const AudioPlayer = forwardRef<AudioPlayerHandle, AudioPlayerProps>(
     {
       src,
       hasVideo,
+      noVideoNote,
       onTimeUpdate,
       onLoadedMetadata,
       onError,
@@ -669,6 +678,11 @@ export const AudioPlayer = forwardRef<AudioPlayerHandle, AudioPlayerProps>(
           <div className={className ?? 'h-10 w-full'} aria-hidden />
         )}
         {transport}
+        {!hasVideo && noVideoNote && (
+          <p className="mt-1 text-[11px] leading-snug text-muted-foreground" data-no-video-note>
+            {noVideoNote}
+          </p>
+        )}
         {hasVideo && (
           <button
             type="button"

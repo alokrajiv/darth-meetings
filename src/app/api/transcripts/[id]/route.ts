@@ -3,12 +3,16 @@ import { NextResponse } from 'next/server';
 import { withAuth } from '@/lib/auth/with-auth';
 import {
   deleteForUser,
+  getForUser,
+  mergeGmeetContextForUser,
+  removeGmeetContextKeysForUser,
   setRecordedAtForUser,
   setScratchForUser,
   softDeleteForUser,
   touchLastAccessedForUser,
   updateMetaForUser,
 } from '@/db-ops/transcripts';
+import { removeLinkBornShares } from '@/db-ops/share-origin';
 import { deleteForUser as deleteSpeakerMappingsForUser } from '@/db-ops/speaker-mappings';
 import { resolveAccess } from '@/db-ops/transcript-access';
 import { identityForUser, logActivity } from '@/db-ops/transcript-activity';
@@ -75,11 +79,50 @@ export const GET = withAuth(async ({ user }, { params }) => {
 });
 
 /**
+ * The calendar event's own keys on `gmeet_context` — what an "unlink" takes
+ * off (D5). Everything else on the row (the recording, its clips, the
+ * transcript, the title, the date, the notes) is left exactly as it is:
+ * unlinking says "this recording is not that meeting", not "throw it away".
+ *
+ * `actuals` / `meetTranscript` go too — both were fetched FROM the linked
+ * conference and would otherwise keep claiming the row is that meeting.
+ */
+const EVENT_CONTEXT_KEYS = [
+  'eventId',
+  'eventTitle',
+  'startTime',
+  'endTime',
+  'meetingCode',
+  'recurringEventId',
+  'iCalUID',
+  'organizerEmail',
+  'attendees',
+  'provider',
+  'teams',
+  'actuals',
+  'meetTranscript',
+  'videoFileId',
+  'transcriptDocId',
+];
+
+/**
  * PATCH /api/transcripts/:id
  * Update title and/or description, the meeting date (`recordedAt`), and the
  * temporary flag (`scratch: boolean`, migration 042 — "Keep" / "Move to
  * temporary"). Editors (owner + 'edit' shares) can update; read-only shares
  * cannot.
+ *
+ * Two calendar-link actions live here too
+ * (docs/recorder-link-confirm-spec.md §3):
+ *   - `{ unlinkEvent: true }` — D5. Detach the calendar event: its keys and
+ *     attendees come off the row and the shares the link created are deleted
+ *     (stamped `origin='event-link'` since migration 048; for older rows, the
+ *     auto-share's own signature against the event's attendee list). The
+ *     recording, the title and the meeting date stay as they are, and
+ *     `gmeet_context.unlinkedBy` records who did it.
+ *   - `{ dismissSuggestedEvent: true }` — D4's "Not this". Stamps
+ *     `suggestedEvent.dismissedAt`; the strip stops offering it. The
+ *     suggestion itself is kept, so the row can still say what was guessed.
  */
 export const PATCH = withAuth(async ({ user, request }, { params }) => {
   const { id } = await params;
@@ -102,12 +145,90 @@ export const PATCH = withAuth(async ({ user, request }, { params }) => {
     return NextResponse.json({ error: 'Body must be an object' }, { status: 400 });
   }
 
-  const { title, description, recordedAt, scratch } = body as {
+  const { title, description, recordedAt, scratch, unlinkEvent, dismissSuggestedEvent } = body as {
     title?: unknown;
     description?: unknown;
     recordedAt?: unknown;
     scratch?: unknown;
+    unlinkEvent?: unknown;
+    dismissSuggestedEvent?: unknown;
   };
+
+  // D4 "Not this": the suggestion stays on the row, stamped as refused.
+  if (dismissSuggestedEvent === true) {
+    const suggested = access.row.gmeet_context?.suggestedEvent;
+    if (!suggested) {
+      return NextResponse.json({ error: 'No suggested event on this meeting' }, { status: 409 });
+    }
+    await mergeGmeetContextForUser(access.ownerUserId, id, {
+      suggestedEvent: { ...suggested, dismissedAt: new Date().toISOString() },
+    });
+    void logActivity({
+      transcriptId: access.row.id,
+      userId: user.userId,
+      email: user.email,
+      action: 'edit_meta',
+      details: { dismissedSuggestedEvent: suggested.title ?? suggested.key },
+    });
+    const after = await getForUser(access.ownerUserId, id);
+    return NextResponse.json({
+      transcript: after
+        ? { ...withoutSplitSource(after), access: access.access, owner_email: null, owner_name: null }
+        : null,
+    });
+  }
+
+  // D5 "Unlink from event".
+  if (unlinkEvent === true) {
+    const ctx = access.row.gmeet_context;
+    if (!ctx?.eventId && !ctx?.meetingCode && !ctx?.eventTitle) {
+      return NextResponse.json(
+        { error: 'This meeting is not linked to a calendar event' },
+        { status: 409 }
+      );
+    }
+    // Read the attendees BEFORE the keys go — they are how link-born shares
+    // are recognised on a row linked before migration 048.
+    const attendeeEmails = (ctx.attendees ?? [])
+      .map((a) => (typeof a?.email === 'string' ? a.email : ''))
+      .filter(Boolean);
+    const sharesRemoved = await removeLinkBornShares(
+      access.row.id,
+      access.ownerUserId,
+      attendeeEmails
+    ).catch((err) => {
+      console.warn('[unlink] share removal failed (continuing):', err);
+      return [] as string[];
+    });
+    await removeGmeetContextKeysForUser(access.ownerUserId, id, EVENT_CONTEXT_KEYS, {
+      unlinkedBy: {
+        at: new Date().toISOString(),
+        userId: user.userId,
+        email: user.email,
+        eventId: ctx.eventId ?? null,
+        eventTitle: ctx.eventTitle ?? null,
+        meetingCode: ctx.meetingCode ?? null,
+        ...(sharesRemoved.length > 0 ? { sharesRemoved } : {}),
+      },
+    });
+    void logActivity({
+      transcriptId: access.row.id,
+      userId: user.userId,
+      email: user.email,
+      action: 'edit_meta',
+      details: {
+        unlinkedEvent: ctx.eventTitle ?? ctx.eventId ?? true,
+        sharesRemoved: sharesRemoved.length,
+      },
+    });
+    const after = await getForUser(access.ownerUserId, id);
+    return NextResponse.json({
+      transcript: after
+        ? { ...withoutSplitSource(after), access: access.access, owner_email: null, owner_name: null }
+        : null,
+      sharesRemoved,
+    });
+  }
 
   if (scratch !== undefined && typeof scratch !== 'boolean') {
     return NextResponse.json({ error: 'scratch must be a boolean' }, { status: 400 });

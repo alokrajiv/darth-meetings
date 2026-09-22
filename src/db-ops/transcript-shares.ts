@@ -4,6 +4,7 @@ import { SCHEMAS } from '@/lib/constants/database';
 import { publishEvent } from '@/lib/server/event-bus';
 import { moveRecordingOwnershipForMeeting } from '@/db-ops/recordings';
 import { recordingsWriteEnabled } from '@/lib/server/recording-sync';
+import { shareOriginColumnExists, type ShareOrigin } from '@/db-ops/share-origin';
 import type { TranscriptShare } from '@/lib/format';
 
 // CRUD for transcript_shares. Everything here assumes the caller has already
@@ -70,17 +71,27 @@ export interface AddShareInput {
   sharedWithName: string | null;
   sharedWithPplId: number | null;
   access: 'edit' | 'read';
+  /**
+   * Why this share exists (migration 048). Only `'event-link'` is written:
+   * a share created because a calendar event was attached, which "Unlink
+   * from event" undoes. Omitted = a human's own share. Silently dropped when
+   * the column is not there yet (db-ops/share-origin.ts).
+   */
+  origin?: ShareOrigin;
 }
 
 export async function addShare(input: AddShareInput): Promise<TranscriptShareRow> {
+  const stampOrigin = input.origin ? await shareOriginColumnExists().catch(() => false) : false;
   const rows = await sql<TranscriptShareRow[]>`
     INSERT INTO ${sql(SCHEMA)}.transcript_shares (
       transcript_id, owner_user_id, shared_by_user_id,
       shared_with_email, shared_with_name, shared_with_ppl_id, access
+      ${stampOrigin ? sql`, origin` : sql``}
     ) VALUES (
       ${input.transcriptId}, ${input.ownerUserId}, ${input.sharedByUserId},
       ${normEmail(input.sharedWithEmail)}, ${input.sharedWithName},
       ${input.sharedWithPplId}, ${input.access}
+      ${stampOrigin ? sql`, ${input.origin!}` : sql``}
     )
     ON CONFLICT (transcript_id, shared_with_email) DO UPDATE
       SET access = EXCLUDED.access,

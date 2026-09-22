@@ -42,6 +42,8 @@ import { partForMeetingTime, storedVideoParts } from '@/lib/part-offsets';
 import { AttachmentPanel } from '@/components/attachment-panel';
 import { ShareDialog } from '@/components/share-dialog';
 import { LinkEventDialog } from '@/components/link-event-dialog';
+import { SuggestedEventStrip } from '@/components/suggested-event-strip';
+import { noVideoNote } from '@/lib/suggested-event';
 import { AddPersonDialog } from '@/components/add-person-dialog';
 import { ActivityBar } from '@/components/activity-bar';
 import { TranscriptOutline } from '@/components/transcript-outline';
@@ -341,6 +343,19 @@ function TranscriptDetailInner({ transcriptId }: { transcriptId: string }) {
       setSummaryTab(t);
     }
   }, []);
+  // D4 (docs/recorder-link-confirm-spec.md): the tray's "Not this" answer
+  // sends the person straight here with ?link=1 — the picker opens on
+  // arrival so connecting the recording to its meeting is one step, not a
+  // hunt through the ⋯ menu. The flag is consumed (stripped from the URL) so
+  // a reload does not reopen it.
+  useEffect(() => {
+    if (new URLSearchParams(window.location.search).get('link') !== '1') return;
+    setLinkEventOpen(true);
+    const url = new URL(window.location.href);
+    url.searchParams.delete('link');
+    window.history.replaceState({}, '', url.toString());
+  }, []);
+
   const selectSummaryTab = useCallback((tab: 'summary' | 'report') => {
     tabExplicit.current = true;
     setSummaryTab(tab);
@@ -2265,6 +2280,12 @@ function TranscriptDetailInner({ transcriptId }: { transcriptId: string }) {
   const headerWhen = whenInput ? whenLine(whenInput) : 'Unknown date';
   const headerWhenFromCalendar = !!whenInput && usesEventRange(whenInput);
   const hasCalendarEvent = !!row.gmeet_context?.eventId;
+  // D2: the match the server did NOT apply. Owners and editors see it (they
+  // are the ones who can answer it); a read-only share never does, and it is
+  // gone the moment the row is linked or the guess is refused.
+  const suggestedEvent = row.gmeet_context?.suggestedEvent ?? null;
+  const showSuggestedEvent =
+    !!suggestedEvent && !suggestedEvent.dismissedAt && !hasCalendarEvent && canEdit && !offline;
   const organizerEmail = row.gmeet_context?.organizerEmail ?? null;
   const organizerAttendee = organizerEmail
     ? row.gmeet_context?.attendees?.find((a) => a.email.toLowerCase() === organizerEmail.toLowerCase())
@@ -2338,6 +2359,56 @@ function TranscriptDetailInner({ transcriptId }: { transcriptId: string }) {
       router.push('/');
     } catch (err) {
       alert('Failed to delete: ' + (err instanceof Error ? err.message : 'Unknown error'));
+    }
+  };
+
+  /**
+   * D5 — "Unlink from event…". The event's keys and attendees come off the
+   * row and the shares the LINK created go with them (stamped
+   * `origin='event-link'` since migration 048; on a row linked before that,
+   * the auto-share's own signature against the event's attendees). The
+   * recording, the transcript, the title and the meeting date are left
+   * exactly as they are.
+   *
+   * The confirm names the people who will lose access, because that is the
+   * half nobody sees otherwise — and it was the harm in the 2026-09-22
+   * incident: 8 invitees got edit access to a private Slack huddle.
+   */
+  const handleUnlinkEvent = async () => {
+    const ctx = row.gmeet_context;
+    const eventName = ctx?.eventTitle?.trim() || 'this calendar event';
+    const attendeeCount = new Set(
+      (ctx?.attendees ?? []).map((a) => (a.email || '').toLowerCase()).filter(Boolean)
+    ).size;
+    const warning =
+      attendeeCount > 0
+        ? `\n\nAnyone who was shared in BECAUSE of the link (up to ${attendeeCount} invitee${attendeeCount === 1 ? '' : 's'}) loses access. Shares you made yourself stay.`
+        : '';
+    if (
+      !confirm(
+        `Unlink this meeting from “${eventName}”?\n\nThe recording, the transcript, the title and the date stay. The event, its attendees and the notes fetched from it come off.${warning}`
+      )
+    )
+      return;
+    try {
+      const res = await fetch(`/api/transcripts/${row.assemblyai_id}`, {
+        method: 'PATCH',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ unlinkEvent: true }),
+      });
+      if (!res.ok) throw new Error(await res.text().catch(() => `Unlink failed (${res.status})`));
+      const { sharesRemoved } = (await res.json()) as { sharesRemoved?: string[] };
+      await loadAll({ silent: true });
+      void refreshShareSuggestions();
+      bumpActivity();
+      if (sharesRemoved && sharesRemoved.length > 0) {
+        alert(
+          `Unlinked. ${sharesRemoved.length} share${sharesRemoved.length === 1 ? '' : 's'} created by the link ${sharesRemoved.length === 1 ? 'was' : 'were'} removed:\n` +
+            sharesRemoved.join('\n')
+        );
+      }
+    } catch (err) {
+      alert('Failed to unlink: ' + (err instanceof Error ? err.message : 'Unknown error'));
     }
   };
 
@@ -2494,6 +2565,23 @@ function TranscriptDetailInner({ transcriptId }: { transcriptId: string }) {
           >
             <CalendarSearch className="h-4 w-4 text-muted-foreground" />
             {row.gmeet_context?.eventId ? 'Re-link calendar event' : 'Link calendar event'}
+          </Button>
+        )}
+        {canEdit && hasCalendarEvent && (
+          <Button
+            variant="ghost"
+            size="sm"
+            className="h-8 w-full justify-start gap-2 text-[13px]"
+            disabled={offline}
+            onClick={() => void handleUnlinkEvent()}
+            title={
+              offline
+                ? OFFLINE_TITLE
+                : 'Detach the calendar event — its attendees and the shares the link created come off. The recording, the transcript, the title and the date stay.'
+            }
+          >
+            <CalendarX2 className="h-4 w-4 text-muted-foreground" />
+            Unlink from event…
           </Button>
         )}
         <Button
@@ -3124,6 +3212,24 @@ function TranscriptDetailInner({ transcriptId }: { transcriptId: string }) {
               </span>
             )}
           </div>
+          {showSuggestedEvent && suggestedEvent && (
+            <div className="mt-2">
+              <SuggestedEventStrip
+                transcriptId={transcriptId}
+                suggested={suggestedEvent}
+                onPickAnother={() => setLinkEventOpen(true)}
+                onChanged={(what) => {
+                  void loadAll({ silent: true });
+                  bumpActivity();
+                  if (what === 'linked') {
+                    void refreshShareSuggestions();
+                    if (row?.auto_notes || row?.auto_report)
+                      markAiStale('calendar', 'the linked calendar event (attendees, title, time)');
+                  }
+                }}
+              />
+            </div>
+          )}
         </div>
 
         <div className="lg:grid lg:grid-cols-[minmax(0,1fr)_300px] lg:gap-8">
@@ -3240,6 +3346,11 @@ function TranscriptDetailInner({ transcriptId }: { transcriptId: string }) {
                       : activePart === 1
                         ? hasLocalVideo
                         : VIDEO_EXT_RE.test(activePartInfo?.filename ?? ''))
+                  }
+                  // D6: only a tray recording can say WHY there is no video —
+                  // it is the one source that knows which app the call was in.
+                  noVideoNote={
+                    row.gmeet_context?.recorder ? noVideoNote(row.gmeet_context.recorder) : null
                   }
                   window={
                     activeClip

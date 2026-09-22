@@ -479,6 +479,18 @@ export async function listPagedForUser(
                     OR t.gmeet_context->>'meetingCode' IS NOT NULL THEN 'gmeet'
              END AS provider,
              (t.gmeet_context->>'eventId') IS NOT NULL AS has_event,
+             -- D2 (docs/recorder-link-confirm-spec.md): the calendar
+             -- occurrence the matcher GUESSED for a Darth Recorder upload,
+             -- which nothing has acted on. Only while the row is unlinked and
+             -- the guess is neither dismissed nor answered; the row-level
+             -- privacy gate (only the people who can act on it see it) is in
+             -- the outer SELECT, where __access is resolved.
+             CASE
+               WHEN jsonb_typeof(t.gmeet_context->'suggestedEvent') = 'object'
+                    AND (t.gmeet_context->'suggestedEvent'->>'dismissedAt') IS NULL
+                    AND (t.gmeet_context->>'eventId') IS NULL
+               THEN t.gmeet_context->'suggestedEvent'
+             END AS suggested_event,
              t.gmeet_context->'deferredImport'->>'mode' AS deferred_mode,
              COALESCE(t.gmeet_context->'deferredImport'->>'error',
                       t.gmeet_context->'ingestFailure'->>'message') AS deferred_error,
@@ -601,6 +613,10 @@ export async function listPagedForUser(
            b.upload_parts_done, b.upload_parts_total, b.recorder_recording_id,
            b.split_off,
            b.provider, b.has_event, b.deferred_mode, b.deferred_error,
+           -- Owners and editors only: the suggestion names an occurrence from
+           -- the OWNER's own calendar, and a read-only sharer can neither
+           -- link nor dismiss it.
+           CASE WHEN b.__access IN ('owner', 'edit') THEN b.suggested_event END AS suggested_event,
            b.recording_count, b.clip_recording_count, b.auto_state,
            -- Evaluated for the page's rows only (t is joined below for both
            -- branches) — base is materialized for day_counts, so anything
@@ -1708,6 +1724,34 @@ export async function updateMetaForUser(
   `;
   if (rows[0]) publishEvent({ kind: 'meta', assemblyaiId });
   return rows[0] ?? null;
+}
+
+/**
+ * Remove keys from `gmeet_context` and merge a patch in, in ONE statement.
+ *
+ * `mergeGmeetContextForUser` cannot do the first half: `||` with a JSON null
+ * leaves the key sitting there as `null`, and "unlink this meeting from its
+ * calendar event" (docs/recorder-link-confirm-spec.md D5) has to make the
+ * event keys GONE — every reader in the app asks `gmeet_context ? 'eventId'`
+ * or reads `->>'meetingCode'`, and a null-valued key answers differently in
+ * each. The patch is applied AFTER the removal, so a caller can drop the
+ * event and stamp its provenance in the same write.
+ */
+export async function removeGmeetContextKeysForUser(
+  userId: string,
+  assemblyaiId: string,
+  keys: string[],
+  patch: Partial<GmeetContext> = {}
+): Promise<void> {
+  if (keys.length === 0 && Object.keys(patch).length === 0) return;
+  await sql`
+    UPDATE ${sql(SCHEMA)}.transcripts
+    SET gmeet_context =
+      (COALESCE(gmeet_context, '{}'::jsonb) - ${keys}::text[])
+      || ${sql.json(patch as unknown as never)}
+    WHERE user_id = ${userId} AND assemblyai_id = ${assemblyaiId}
+  `;
+  publishEvent({ kind: 'meta', assemblyaiId });
 }
 
 /** Set (or clear) when the meeting actually happened. */

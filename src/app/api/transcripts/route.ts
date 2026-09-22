@@ -25,6 +25,7 @@ import {
   parseLinkedEventHeader,
   parseMultiParams,
   parseReportPref,
+  recorderOpenFacts,
   textDocRejection,
 } from '@/lib/server/upload-pipeline';
 import { resolveAttachTarget } from '@/lib/server/clip-attach';
@@ -255,6 +256,12 @@ export const POST = withAuth(async ({ user, request }) => {
     request.nextUrl.searchParams.get('recorder_recording_id') ??
     request.headers.get('x-recorder-recording-id');
 
+  // D1 + D2 (docs/recorder-link-confirm-spec.md): the same birth facts and
+  // the same un-applied suggestion the chunked route uses, so darth-cli and
+  // an older tray behave like the current one. Unknown / someone else's id
+  // simply yields nothing extra here — this route has never validated it.
+  const recorderFacts = await recorderOpenFacts(user.userId, recorderRecordingId);
+
   // Phase 3b source (c). Resolved here — before the body is touched — so a
   // refusal costs the caller nothing, and shared by both delivery branches
   // below.
@@ -314,6 +321,8 @@ export const POST = withAuth(async ({ user, request }) => {
       recorderRecordingId,
       scratch,
       attachTo,
+      recorderBirth: recorderFacts?.recorderBirth ?? null,
+      suggestedEvent: recorderFacts?.suggestedEvent ?? null,
     });
     if (!opened.ok) return NextResponse.json({ error: opened.error }, { status: opened.status });
     await saveAudioBytes(opened.spec.tempFilename, Buffer.from(await file.arrayBuffer()));
@@ -375,6 +384,10 @@ export const POST = withAuth(async ({ user, request }) => {
     recorderRecordingId,
     scratch,
     attachTo,
+    recorderBirth: recorderFacts?.recorderBirth ?? null,
+    // Only part 1 of a group carries the suggestion — later parts land on
+    // its row, which already has it.
+    suggestedEvent: multi && multi.index > 1 ? null : (recorderFacts?.suggestedEvent ?? null),
   });
   if (!opened.ok) return NextResponse.json({ error: opened.error }, { status: opened.status });
   const { spec } = opened;

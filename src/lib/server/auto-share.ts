@@ -1,5 +1,6 @@
 import 'server-only';
 import { addShare } from '@/db-ops/transcript-shares';
+import type { ShareOrigin } from '@/db-ops/share-origin';
 
 // Invitees on these domains get the transcript shared to them automatically
 // ("throw them in"): everyone on the invite could have fetched the artifacts
@@ -12,7 +13,18 @@ export async function autoShareToInternalInvitees(
   transcriptId: number,
   ownerUserId: string,
   ownerEmail: string,
-  candidates: Array<{ email: string; name?: string | null }>
+  candidates: Array<{ email: string; name?: string | null }>,
+  opts: {
+    /**
+     * Stamp these shares as created BY the calendar link (migration 048), so
+     * "Unlink from event" can take exactly them back off again
+     * (docs/recorder-link-confirm-spec.md D5). Passed by the upload path,
+     * which is the one that shares an invite's people onto a recording the
+     * moment it is linked. A share that already existed keeps its own
+     * origin — a human's share never becomes link-born.
+     */
+    origin?: ShareOrigin;
+  } = {}
 ): Promise<number> {
   const self = ownerEmail.trim().toLowerCase();
   let shared = 0;
@@ -29,6 +41,7 @@ export async function autoShareToInternalInvitees(
         sharedWithName: a.name ?? null,
         sharedWithPplId: null,
         access: 'edit',
+        ...(opts.origin ? { origin: opts.origin } : {}),
       });
       shared++;
     } catch (err) {

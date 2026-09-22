@@ -50,6 +50,7 @@ import {
 import { PersonChip } from '@/components/person-chip';
 import { RowMenu, type RowMenuSection } from '@/components/row-menu';
 import { RecordingStrip, SourceGlyph } from '@/components/recording-strip';
+import { SuggestedEventStrip } from '@/components/suggested-event-strip';
 import { RecordingsSurface, useUnlinkedRecordings } from '@/components/recordings-surface';
 import { LinkEventDialog } from '@/components/link-event-dialog';
 import { isBareRecording, meetingTitleOf } from '@/lib/meeting-title';
@@ -2124,6 +2125,22 @@ export function TranscriptTable({
                   </div>
                 ) : null;
               })()}
+              {/* D2/D4 (docs/recorder-link-confirm-spec.md): a Darth Recorder
+                  recording the matcher tied to a calendar occurrence — which
+                  the server deliberately did NOT act on. One line, two
+                  explicit answers. The server already limited this field to
+                  callers who can act on the row; `access` is checked again
+                  here because the row is also rendered from cached payloads
+                  offline. */}
+              {!trashed && !blocked && t.access !== 'read' && t.suggested_event &&
+                !t.suggested_event.dismissedAt && (
+                  <SuggestedEventStrip
+                    compact
+                    transcriptId={t.assemblyai_id}
+                    suggested={t.suggested_event}
+                    onChanged={() => void fetchArchiveRef.current('silent')}
+                  />
+                )}
             </div>
           </div>
           </div>

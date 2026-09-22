@@ -14,15 +14,16 @@ import {
   parseMultiParams,
   parseReportPref,
   parseUploadTracks,
-  recorderMatchIsConfident,
+  recorderOpenFacts,
   sanitizeLinkedEvent,
   textDocRejection,
+  type RecorderOpenFacts,
 } from '@/lib/server/upload-pipeline';
+import type { SuggestedEvent } from '@/lib/format';
 import { MAX_UPLOAD_BYTES, chunkPlanFor } from '@/lib/upload-chunking';
 import { resolveLinkedEventRef } from '@/lib/server/linked-event-ref';
 import { SHA256_HEX_RE } from '@/lib/darth-uploads-shared';
 import { blobTransitFor, mintBlobTicket } from '@/lib/server/darth-uploads-store';
-import { getOwnRecording } from '@/db-ops/recorder';
 import { uploadIdentityHash, wantsDuplicateAnswer, wantsForce } from '@/lib/same-file';
 import { duplicateForUpload } from '@/lib/server/same-file';
 import { resolveAttachTarget } from '@/lib/server/clip-attach';
@@ -184,18 +185,17 @@ export const POST = withAuth(async ({ user, request }) => {
 
   // The Darth Recorder registry row (migration 041): must be the caller's own.
   let recorderRecordingId: string | null = null;
-  let recorderMatch: { key: string; score: number; overlap: number } | null = null;
+  // D2: the match, kept as a SUGGESTION. D1 removed the auto-link that used
+  // to turn it into `linkedEvent` here.
+  let suggestedEvent: SuggestedEvent | null = null;
+  let recorderBirth: RecorderOpenFacts['recorderBirth'] | null = null;
   if (typeof body.recorderRecordingId === 'string' && body.recorderRecordingId) {
-    const rec = await getOwnRecording(user.userId, body.recorderRecordingId).catch(() => null);
-    if (!rec) return NextResponse.json({ error: 'Recorder recording not found' }, { status: 404 });
-    recorderRecordingId = rec.id;
-    if (recorderMatchIsConfident(rec.matched) && rec.matched) {
-      recorderMatch = {
-        key: rec.matched.event_key,
-        score: rec.matched.score,
-        overlap: rec.matched.overlap,
-      };
-    }
+    // D1: the recording is born as the CALL, not as some meeting.
+    const facts = await recorderOpenFacts(user.userId, body.recorderRecordingId);
+    if (!facts) return NextResponse.json({ error: 'Recorder recording not found' }, { status: 404 });
+    recorderRecordingId = facts.id;
+    recorderBirth = facts.recorderBirth;
+    suggestedEvent = facts.suggestedEvent;
   }
   const rawMulti = body.multi as Record<string, unknown> | undefined | null;
   const multi = rawMulti
@@ -220,31 +220,16 @@ export const POST = withAuth(async ({ user, request }) => {
     );
   }
 
-  // P1 — one meeting, one row, from the first byte: a Darth Recorder
-  // recording the matcher already tied to a calendar occurrence with
-  // confidence is linked here, so the placeholder is born with the event's
-  // title, date, attendees and auto-shares and the calendar row folds
-  // immediately. Only part 1 of a group carries the link (later parts land
-  // on its row). A resolver failure leaves the upload unlinked — the manual
-  // "link the calendar event" path still works — and is never a 4xx.
-  if (!linkedEvent && recorderMatch && !(multi && multi.index > 1)) {
-    const resolved = await resolveLinkedEventRef(user.userId, recorderMatch.key).catch((err) => ({
-      ok: false as const,
-      status: 500,
-      error: String(err),
-    }));
-    if (resolved.ok) {
-      linkedEvent = resolved.event;
-      console.log(
-        `[uploads] auto-linked ${recorderRecordingId} → ${recorderMatch.key} ` +
-          `(score ${recorderMatch.score}, overlap ${recorderMatch.overlap})`
-      );
-    } else {
-      console.warn(
-        `[uploads] auto-link of ${recorderRecordingId} → ${recorderMatch.key} failed: ${resolved.error}`
-      );
-    }
-  }
+  // D1 (docs/recorder-link-confirm-spec.md) — THE SERVER NEVER LINKS BY
+  // ITSELF. Until 2026-09-22 a confident recorder match was resolved into
+  // `linkedEvent` right here, and the placeholder was born with that event's
+  // title, date, attendees and auto-shares: a private Slack huddle went out
+  // to 8 people with edit access because the clocks overlapped. Linking is a
+  // user action now — the tray asks before it uploads, the web asks on the
+  // row — and the match survives only as `suggestedEvent` (D2), which
+  // nothing acts on. A group carries the suggestion on part 1 only; later
+  // parts land on its row.
+  if (linkedEvent || (multi && multi.index > 1)) suggestedEvent = null;
 
   const rejected = textDocRejection(originalFilename, contentType);
   if (rejected) return NextResponse.json({ error: rejected }, { status: 415 });
@@ -351,6 +336,8 @@ export const POST = withAuth(async ({ user, request }) => {
     dupAware: wantsDuplicateAnswer(body),
     tracks,
     attachTo,
+    suggestedEvent,
+    recorderBirth,
   });
   if (!opened.ok) return NextResponse.json({ error: opened.error }, { status: opened.status });
 
@@ -392,6 +379,10 @@ export const POST = withAuth(async ({ user, request }) => {
       resumed: false,
       transcript: opened.placeholder,
       ...(blob ? { blob } : {}),
+      // §3 of the contract: the match the server did NOT apply. The tray
+      // shows it as "Link to '<title>'? [Link] [Not this]"; `linkedEvent` in
+      // this answer is only ever the caller's own explicit link.
+      ...(suggestedEvent ? { suggestedEvent } : {}),
     },
     { status: 201 }
   );

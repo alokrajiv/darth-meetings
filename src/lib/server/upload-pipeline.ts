@@ -10,7 +10,10 @@ import {
   updateUploadProgress,
 } from '@/db-ops/transcripts';
 import { autoShareToInternalInvitees } from '@/lib/server/auto-share';
-import { linkRecordingTranscript } from '@/db-ops/recorder';
+import { SHARE_ORIGIN_EVENT_LINK } from '@/db-ops/share-origin';
+import { getOwnRecording, linkRecordingTranscript } from '@/db-ops/recorder';
+import { recorderCallTitle } from '@/lib/recorder';
+import { suggestedEventFromMatch } from '@/lib/server/recorder-match';
 import { resolveAccess } from '@/db-ops/transcript-access';
 import { deleteAudioFile, deleteAudioFilesByPrefix } from '@/lib/server/audio-storage';
 import { concatMediaSmart, probeDurationSec } from '@/lib/server/media-concat';
@@ -19,8 +22,7 @@ import { BlobIngestFailed, ingestBlobAudio, type BlobIngestSource } from '@/lib/
 import { queueRecordingGraphSync } from '@/lib/server/recording-sync';
 import { stampUploadIdentity } from '@/lib/server/same-file';
 import { normalizePartSha256, normalizeSha256, partHashesInOrder, uploadIdentityHash } from '@/lib/same-file';
-import type { GmeetAttendee, GmeetContext, StoredTranscript } from '@/lib/format';
-import type { RecorderMatch } from '@/lib/recorder';
+import type { GmeetAttendee, GmeetContext, StoredTranscript, SuggestedEvent } from '@/lib/format';
 import type { DarthUser } from '@/lib/auth/session';
 import type { SpeechModel } from '@/lib/aai-language';
 import type { ReportPref } from '@/lib/report-pref';
@@ -227,32 +229,55 @@ export async function groupProgressAdder(
   return (bytes: number) => groupProgressBytes(group, bytes);
 }
 
-/** P1 auto-link floor: below either number the recording stays unlinked. */
-export const RECORDER_AUTOLINK_MIN_SCORE = 0.6;
-export const RECORDER_AUTOLINK_MIN_OVERLAP = 0.5;
+export interface RecorderOpenFacts {
+  /** The registry row's own id — the caller stamps THIS, not what it was
+   * handed (a uuid may arrive in a different case). */
+  id: string;
+  recorderBirth: NonNullable<OpenUploadInput['recorderBirth']>;
+  suggestedEvent: SuggestedEvent | null;
+}
 
 /**
- * Is a Darth Recorder match good enough to link the upload to that calendar
- * occurrence without asking? (docs/recorder-upload-ux.md P1 — one meeting,
- * one row, from the first byte.) The ONE threshold: the tray, darth-cli and
- * every older client inherit it because the decision is server-side.
+ * What the registry row says about a Darth Recorder upload at OPEN time
+ * (docs/recorder-link-confirm-spec.md D1 + D2): the call's own name and
+ * start — which is what the meeting is born as — and the calendar occurrence
+ * the matcher guessed, as a suggestion nothing acts on.
+ *
+ * Both upload routes go through here so `POST /api/transcripts` (darth-cli,
+ * older trays) and `POST /api/uploads` (the tray since 0.3.x) cannot drift.
+ * Returns null when the id is not the caller's own recording — the caller
+ * decides whether that is a 404 (the chunked route) or simply nothing extra
+ * (the one-shot route, which has never validated it here).
  */
-export function recorderMatchIsConfident(
-  matched: Partial<Pick<RecorderMatch, 'event_key' | 'score' | 'overlap'>> | null | undefined
-): boolean {
-  if (!matched) return false;
-  const key = typeof matched.event_key === 'string' ? matched.event_key.trim() : '';
-  if (!key) return false;
-  const { score, overlap } = matched;
-  return (
-    typeof score === 'number' &&
-    Number.isFinite(score) &&
-    score >= RECORDER_AUTOLINK_MIN_SCORE &&
-    typeof overlap === 'number' &&
-    Number.isFinite(overlap) &&
-    overlap >= RECORDER_AUTOLINK_MIN_OVERLAP
-  );
+export async function recorderOpenFacts(
+  userId: string,
+  recorderRecordingId: string | null | undefined
+): Promise<RecorderOpenFacts | null> {
+  if (!recorderRecordingId) return null;
+  const rec = await getOwnRecording(userId, recorderRecordingId).catch(() => null);
+  if (!rec) return null;
+  return {
+    id: rec.id,
+    recorderBirth: {
+      title: recorderCallTitle(rec.call),
+      startedAt: rec.started_at ? new Date(rec.started_at).toISOString() : null,
+      app: typeof rec.call?.app === 'string' ? rec.call.app.slice(0, 60) : null,
+      kind: typeof rec.call?.kind === 'string' ? rec.call.kind.slice(0, 30) : null,
+    },
+    suggestedEvent: suggestedEventFromMatch(rec.matched, rec.call),
+  };
 }
+
+/**
+ * The ONE confidence definition lives in @/lib/recorder (pure, client-safe,
+ * next to the match shape it reads) and is re-exported here because every
+ * caller in the upload path has always imported it from this module.
+ */
+export {
+  recorderMatchIsConfident,
+  RECORDER_AUTOLINK_MIN_OVERLAP,
+  RECORDER_AUTOLINK_MIN_SCORE,
+} from '@/lib/recorder';
 
 /**
  * The audio tracks of the file being uploaded, as the CLIENT describes them.
@@ -383,6 +408,28 @@ export interface OpenUploadInput {
    * and must be able to attach too.
    */
   attachTo?: AttachToMarker | null;
+  /**
+   * D2 (docs/recorder-link-confirm-spec.md): the calendar occurrence this
+   * Darth Recorder recording MIGHT be of, stamped on the placeholder as
+   * `gmeet_context.suggestedEvent`. A suggestion and nothing else — it never
+   * becomes a title, a date, an attendee or a share. Ignored when the caller
+   * linked an event explicitly (there is nothing left to suggest) and for
+   * parts 2..N of a group (the marker belongs to the group's row).
+   */
+  suggestedEvent?: SuggestedEvent | null;
+  /**
+   * D1: what an UNLINKED Darth Recorder upload is born as — the call's own
+   * title (cleaned of the app suffix) and the moment the tray started
+   * recording. Both are the lowest-priority fallbacks: a re-transcribe
+   * source row wins, and an explicit `linkedEvent` wins over both.
+   */
+  recorderBirth?: {
+    title?: string | null;
+    startedAt?: string | null;
+    /** The call's app + kind, stamped on the row's recorder marker. */
+    app?: string | null;
+    kind?: string | null;
+  } | null;
 }
 
 /**
@@ -593,7 +640,13 @@ export async function openUpload(
   // The Darth Recorder row behind these bytes: the listing says "uploading
   // from your Mac" and pairs the row with the tray's live progress.
   const recorderMarker: Pick<GmeetContext, 'recorder'> | null = input.recorderRecordingId
-    ? { recorder: { recordingId: input.recorderRecordingId } }
+    ? {
+        recorder: {
+          recordingId: input.recorderRecordingId,
+          ...(input.recorderBirth?.app ? { app: input.recorderBirth.app } : {}),
+          ...(input.recorderBirth?.kind ? { kind: input.recorderBirth.kind } : {}),
+        },
+      }
     : null;
   const contextExtra = multi ? null : (input.contextExtra ?? null);
   // Phase 3b source (c): "these bytes are a second recording OF that meeting",
@@ -603,14 +656,23 @@ export async function openUpload(
   const attachMarker: Pick<GmeetContext, 'attachTo'> | null = input.attachTo
     ? { attachTo: input.attachTo }
     : null;
+  // D2: the match, as a suggestion. Never alongside a real link.
+  const suggestionMarker: Pick<GmeetContext, 'suggestedEvent'> | null =
+    !input.linkedEvent && input.suggestedEvent ? { suggestedEvent: input.suggestedEvent } : null;
   const placeholderContext: GmeetContext | null =
-    gmeetContext || groupMarker || recorderMarker || contextExtra || attachMarker
+    gmeetContext ||
+    groupMarker ||
+    recorderMarker ||
+    contextExtra ||
+    attachMarker ||
+    suggestionMarker
       ? {
           ...(gmeetContext ?? {}),
           ...(contextExtra ?? {}),
           ...(groupMarker ?? {}),
           ...(recorderMarker ?? {}),
           ...(attachMarker ?? {}),
+          ...(suggestionMarker ?? {}),
         }
       : null;
 
@@ -618,7 +680,13 @@ export async function openUpload(
     placeholderId,
     originalFilename: input.originalFilename,
     languageCode: languageCode ?? null,
-    title: sourceRow?.title ?? input.linkedEvent?.title?.slice(0, 300) ?? null,
+    // D1: an unlinked recorder upload is born with the CALL's own name, not
+    // with some meeting's.
+    title:
+      sourceRow?.title ??
+      input.linkedEvent?.title?.slice(0, 300) ??
+      input.recorderBirth?.title?.slice(0, 300) ??
+      null,
     gmeetContext: placeholderContext,
     // A group declares the whole recording's size once (P2); a single file is
     // its own total.
@@ -627,12 +695,18 @@ export async function openUpload(
   });
   // Same "throw them in" rule as the Meet import: internal invitees on the
   // linked event can see (and follow) the upload from the moment it starts.
+  // These shares exist BECAUSE of the link, and are stamped as such so
+  // "Unlink from event" takes exactly them back (D5, migration 048). Since
+  // D1 there are only attendees here when a human said "link it".
   if (attendees.length > 0) {
-    await autoShareToInternalInvitees(placeholder.id, user.userId, user.email, attendees).catch(
-      (err) => console.warn('[upload] auto-share failed:', err)
-    );
+    await autoShareToInternalInvitees(placeholder.id, user.userId, user.email, attendees, {
+      origin: SHARE_ORIGIN_EVENT_LINK,
+    }).catch((err) => console.warn('[upload] auto-share failed:', err));
   }
-  const earlyRecordedAt = sourceRow?.recorded_at ?? input.linkedEvent?.startTime;
+  // D1: …and with the moment the tray started recording as its date, so an
+  // unlinked recording still lands on the right day in the listing.
+  const earlyRecordedAt =
+    sourceRow?.recorded_at ?? input.linkedEvent?.startTime ?? input.recorderBirth?.startedAt;
   if (earlyRecordedAt) {
     await setRecordedAtForUser(user.userId, placeholderId, new Date(earlyRecordedAt)).catch(
       () => {}

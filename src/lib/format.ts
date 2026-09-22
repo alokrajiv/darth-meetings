@@ -8,6 +8,7 @@
 import type { ReportPref } from '@/lib/report-pref';
 import type { RunningTranscription } from '@/lib/transcriptions';
 import type { AttachToMarker, SplitProvenance, StoredClips } from '@/lib/clips';
+import type { ConferenceProvider } from '@/lib/recorder';
 
 /** Temporary (scratch) transcripts are moved to the trash this many days
  * after creation (migration 042). The sweeper, the listing hint and the
@@ -190,6 +191,42 @@ export interface MeetActuals {
  * cross-referencing against AAI's acoustic diarization. `actuals` is the
  * Meet API snapshot (participants, segment times, transcript entries).
  */
+/**
+ * "This recording LOOKS like that meeting" — the Darth Recorder match, kept
+ * as a suggestion instead of being applied (docs/recorder-link-confirm-spec.md
+ * D2, after the 2026-09-22 incident where a Slack huddle was auto-linked to a
+ * Meet invite and auto-shared with 8 people).
+ *
+ * Written on the placeholder at upload open (part 1 only) when the tray sent
+ * a `recorderRecordingId` whose row carries a match and the caller did NOT
+ * link an event. NOTHING acts on it: no title, no date, no attendees, no
+ * shares. It is removed when the row is linked (any path) and stamped with
+ * `dismissedAt` when the user says "Not this".
+ *
+ * PRIVACY: it names an occurrence from the OWNER's own calendar cache, so it
+ * is only ever rendered to the owner (the listing projection and the detail
+ * page both gate on that).
+ */
+export interface SuggestedEvent {
+  /** The event key the link flow takes ('<eventId>|<startIso>'). */
+  key: string;
+  eventId: string | null;
+  title: string | null;
+  startIso: string;
+  endIso: string | null;
+  /** The occurrence's conferencing product, when the invite says. */
+  provider: ConferenceProvider | null;
+  meetingCode: string | null;
+  score: number;
+  overlap: number;
+  titleScore: number;
+  /** What the tray said the call was — 'slack' next to a 'meet' event is
+   * exactly the mismatch the human must see before saying yes. */
+  callKind: string | null;
+  /** Set by `PATCH :id {dismissSuggestedEvent:true}` ("Not this"). */
+  dismissedAt?: string;
+}
+
 export interface GmeetContext {
   /** Which conferencing product the source meeting ran on. Absent or
    * 'gmeet' = Google Meet (backward compat with every pre-Teams row). */
@@ -443,7 +480,16 @@ export interface GmeetContext {
    * stamped at upload open so the listing can say "uploading from your Mac"
    * and pair the row with the tray's live progress over the companion
    * socket. `recorder_recordings.transcript_id` is the reverse link. */
-  recorder?: { recordingId: string } | null;
+  recorder?: {
+    recordingId: string;
+    /** What the tray said the call was, frozen at upload open: the app's own
+     * name ("Slack", "Microsoft Teams") and CallDetector's kind. Read by the
+     * player's "no video" note (D6) and by the Recording card, so neither
+     * has to go back to the registry. Absent on rows uploaded before
+     * 2026-09-22 and on uploads that are not a tray recording. */
+    app?: string | null;
+    kind?: string | null;
+  } | null;
   /** The stitched-media map of a multi-file upload: one entry per source
    * file in stitch order, with the user's per-file comment. `offsetSec` is
    * where the file starts on the combined timeline. Fed into the AI prompts
@@ -630,6 +676,22 @@ export interface GmeetContext {
      * from before 2026-09-21 may carry the retired 'summary'. */
     generated?: ReportPref | 'summary' | null;
   } | null;
+  /** D2: the calendar occurrence this recording MIGHT be of. A suggestion
+   * and nothing else — see `SuggestedEvent`. */
+  suggestedEvent?: SuggestedEvent | null;
+  /** D5: the row was unlinked from its calendar event by a human. Kept as
+   * provenance (the repair of the 2026-09-22 incident wrote it by hand). */
+  unlinkedBy?: {
+    at: string;
+    userId: string;
+    email: string;
+    /** The event that was removed, for the record. */
+    eventId?: string | null;
+    eventTitle?: string | null;
+    meetingCode?: string | null;
+    /** Emails whose share the unlink removed. */
+    sharesRemoved?: string[];
+  } | null;
   /** Stamped by the notes sweeper when a temporary (scratch) row's 30 days
    * ran out and the owner was DM'd about the auto-trash — one DM per row,
    * ever (the plagueis dedupe key is the belt, this marker the braces). */
@@ -694,6 +756,11 @@ export interface TranscriptListRow {
   /** gmeet_context.recorder.recordingId (v2 listing only): the Darth
    * Recorder registry row behind this upload, null for everything else. */
   recorder_recording_id?: string | null;
+  /** D2 (v2 listing only): the calendar occurrence this recording MIGHT be
+   * of — a guess nothing has acted on. Present only while the row is
+   * unlinked and the guess is undismissed, and only for callers who can
+   * answer it (owner / editor). See `SuggestedEvent`. */
+  suggested_event?: SuggestedEvent | null;
   /** Phase 3a (v2 listing only): this meeting is a WINDOW of a longer
    * recording — it was split off another meeting
    * (`gmeet_context.splitFrom`). A boolean and nothing more: which meeting

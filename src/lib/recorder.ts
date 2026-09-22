@@ -7,6 +7,85 @@
  * src/lib/companion/companion-client.ts (Stream S2).
  */
 
+/**
+ * The conferencing product behind a call or a calendar occurrence, as far as
+ * we can tell. `null` = unknown, which never vetoes anything (D3).
+ *
+ * The call side comes from the tray's `call.kind` (CallDetector.CallKind);
+ * the occurrence side is derived from the invite (Meet code, Teams/Zoom/Webex
+ * join URL) — see `occurrenceProvider()` in lib/server/recorder-match.ts.
+ */
+export type ConferenceProvider =
+  | 'meet'
+  | 'teams'
+  | 'zoom'
+  | 'slack'
+  | 'webex'
+  | 'facetime'
+  | 'whatsapp'
+  | 'discord';
+
+const CALL_KIND_PROVIDERS = new Set<string>([
+  'meet', 'teams', 'zoom', 'slack', 'webex', 'facetime', 'whatsapp', 'discord',
+]);
+
+/**
+ * The tray's `call.kind` as a provider, or null when it tells us nothing:
+ * 'browser' (a browser window whose title named no product) and 'other' are
+ * "unknown", NOT "something else" — they must never veto a match.
+ */
+export function callProvider(
+  call: { kind?: unknown } | null | undefined
+): ConferenceProvider | null {
+  const kind = typeof call?.kind === 'string' ? call.kind.trim().toLowerCase() : '';
+  return CALL_KIND_PROVIDERS.has(kind) ? (kind as ConferenceProvider) : null;
+}
+
+/** Product names the tray appends to a window title, longest first. */
+const APP_SUFFIXES = [
+  'microsoft teams',
+  'google chrome',
+  'google meet',
+  'slack',
+  'zoom workplace',
+  'zoom',
+  'webex',
+  'discord',
+  'whatsapp',
+  'facetime',
+  'safari',
+  'arc',
+  'firefox',
+  'microsoft edge',
+];
+
+/**
+ * The call's OWN title, cleaned of the app suffix — the name an unlinked
+ * recording is born with (D1): `"Swaralee (DM) - Slack"` → `"Swaralee (DM)"`,
+ * `"MSC Contract review | Microsoft Teams"` → `"MSC Contract review"`.
+ * Returns null when nothing usable is left (an empty title, or a title that
+ * was only the app name) so the caller falls back to the filename.
+ */
+export function recorderCallTitle(
+  call: { title?: unknown; app?: unknown } | null | undefined
+): string | null {
+  const raw = typeof call?.title === 'string' ? call.title.trim() : '';
+  if (!raw) return null;
+  let out = raw;
+  // One pass is enough in practice ("… - Slack", "… | Microsoft Teams"), but
+  // a browser title can carry two ("Meet - abc | Google Chrome").
+  for (let i = 0; i < 2; i++) {
+    const cut = /^(.*\S)\s*[|\u2013\u2014-]\s*([^|\u2013\u2014-]+)$/.exec(out);
+    if (!cut) break;
+    const tail = cut[2]!.trim().toLowerCase();
+    if (!APP_SUFFIXES.includes(tail)) break;
+    out = cut[1]!.trim();
+  }
+  const app = typeof call?.app === 'string' ? call.app.trim().toLowerCase() : '';
+  if (!out || out.toLowerCase() === app || APP_SUFFIXES.includes(out.toLowerCase())) return null;
+  return out.slice(0, 300);
+}
+
 /** One calendar occurrence a recording could belong to. */
 export interface RecorderMatchCandidate {
   event_key: string;
@@ -14,6 +93,9 @@ export interface RecorderMatchCandidate {
   meeting_code: string | null;
   /** UTC ISO of the occurrence start — the instant every other surface keys on. */
   occ_start: string;
+  /** UTC ISO of the occurrence end, when the invite has one. Absent on rows
+   * matched before 2026-09-22. */
+  occ_end?: string | null;
   title: string | null;
   /** 0..1 — how much of the shorter of (recording, event) they share. */
   overlap: number;
@@ -21,6 +103,13 @@ export interface RecorderMatchCandidate {
   title_score: number;
   /** 0..1 — the blended score the best-match decision uses. */
   score: number;
+  /** The occurrence's own conferencing product, when the invite says
+   * (D3). Absent on rows matched before 2026-09-22. */
+  provider?: ConferenceProvider | null;
+  /** The call and the occurrence are known to be DIFFERENT products (a Slack
+   * huddle against a Google Meet invite) — `score` is capped for it and it
+   * can never be confident. */
+  provider_mismatch?: boolean;
 }
 
 /** What `matchRecording()` stores on `recorder_recordings.matched`. */
@@ -28,6 +117,61 @@ export interface RecorderMatch extends RecorderMatchCandidate {
   /** Up to 3 runners-up, best first — why this one won. */
   candidates: RecorderMatchCandidate[];
   matched_at: string;
+  /** What the TRAY said this call was (`call.kind` → provider), when it is
+   * one we know. The other half of the D3 veto. */
+  call_provider?: ConferenceProvider | null;
+}
+
+/** The confidence floor: below either number the match is weak. */
+export const RECORDER_AUTOLINK_MIN_SCORE = 0.6;
+export const RECORDER_AUTOLINK_MIN_OVERLAP = 0.5;
+
+/**
+ * Is a Darth Recorder match a CONFIDENT one — "this recording really is that
+ * meeting"? The ONE definition: the tray, darth-cli and every older client
+ * inherit it because it is computed server-side.
+ *
+ * Since docs/recorder-link-confirm-spec.md D1 nothing links on the strength
+ * of it any more — linking is a user action on either surface. It still
+ * decides how the suggestion is worded and ordered, and the tray reads the
+ * match it is computed from.
+ *
+ * D3 raised the bar after the 2026-09-22 incident, where a Slack huddle
+ * scored exactly 0.7 on a Google Meet invite purely because the clocks
+ * overlapped (overlap 1 × 0.7 + title 0 × 0.3):
+ *   - time overlap ALONE is never confidence — the title must agree at all,
+ *     or the two must at least be the same product;
+ *   - a known product mismatch is never confidence, whatever the numbers
+ *     (the matcher also caps such a candidate at PROVIDER_MISMATCH_CAP).
+ */
+export function recorderMatchIsConfident(
+  matched:
+    | Partial<
+        Pick<
+          RecorderMatch,
+          'event_key' | 'score' | 'overlap' | 'title_score' | 'provider' | 'call_provider'
+        >
+      >
+    | null
+    | undefined
+): boolean {
+  if (!matched) return false;
+  const key = typeof matched.event_key === 'string' ? matched.event_key.trim() : '';
+  if (!key) return false;
+  const { score, overlap, title_score: titleScore, provider, call_provider: callProv } = matched;
+  const numbersClear =
+    typeof score === 'number' &&
+    Number.isFinite(score) &&
+    score >= RECORDER_AUTOLINK_MIN_SCORE &&
+    typeof overlap === 'number' &&
+    Number.isFinite(overlap) &&
+    overlap >= RECORDER_AUTOLINK_MIN_OVERLAP;
+  if (!numbersClear) return false;
+  // Known-and-different products: never.
+  if (provider && callProv && provider !== callProv) return false;
+  const titleAgrees = typeof titleScore === 'number' && Number.isFinite(titleScore) && titleScore > 0;
+  const sameProvider = !!provider && !!callProv && provider === callProv;
+  return titleAgrees || sameProvider;
 }
 
 /** Recording summary a calendar listing row carries (redacted for non-owners:
