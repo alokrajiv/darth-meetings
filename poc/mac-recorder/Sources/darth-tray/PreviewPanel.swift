@@ -13,7 +13,7 @@ final class PreviewPanel: NSObject, NSWindowDelegate {
     static let width: CGFloat = 340
     private var panel: NSPanel?
     private let image = NSImageView()
-    private let placeholder = NSTextField(labelWithString: "audio only")
+    private let placeholder = NSTextField(labelWithString: "audio only — add a video source with ⚙")
     private let systemBar = LevelBar(name: "system")
     private let micBar = LevelBar(name: "mic")
     /// 0.3.2: the last 10 s of each track as a scrolling envelope, 20 ms per point.
@@ -31,6 +31,8 @@ final class PreviewPanel: NSObject, NSWindowDelegate {
     var onSetAuto: (() -> Void)?
     var onRedetect: (() -> Void)?
     var onPickSource: ((RecordingController.Source, String) -> Void)?
+    /// 0.3.15: "Audio only" — drop the video source (or keep an audio-only recording as it is).
+    var onPickAudioOnly: (() -> Void)?
     /// What the gear menu shows: the current source label, the mode ("auto" | "manual"), the
     /// call's pids (its windows listed first) and whether this recording has video at all.
     var sourceInfo: (() -> (current: String, mode: String, callPids: [pid_t], audioOnly: Bool))?
@@ -176,7 +178,7 @@ final class PreviewPanel: NSObject, NSWindowDelegate {
         gear.isBordered = false
         gear.contentTintColor = .secondaryLabelColor
         gear.target = self; gear.action = #selector(gearTapped)
-        gear.toolTip = "Which window is being recorded — auto, re-detect, or pick one"
+        gear.toolTip = "What is being recorded — pick a window or display, add video to an audio-only recording, or drop back to audio"
         gear.translatesAutoresizingMaskIntoConstraints = false
 
         let stack = NSStackView(views: [thumb, systemBar, systemStrip, micBar, micStrip])
@@ -214,51 +216,24 @@ final class PreviewPanel: NSObject, NSWindowDelegate {
 
     @objc private func closeTapped() { close(remember: true); onClosed?() }
 
-    /// The gear menu (0.3.6): current source, Auto / Re-detect, then every display and window
-    /// the Record… dialog would offer (call windows first).
+    /// The gear menu (0.3.6, rebuilt on `SourceMenu` in 0.3.15): the head line, Auto /
+    /// Re-detect when there is a video source, then every display and window the Record…
+    /// dialog would offer (call windows first) and "Audio only". On an audio-only recording
+    /// the same list is offered as "Add video" instead of nothing at all.
     @objc private func gearTapped() {
         guard let info = sourceInfo?() else { return }
+        let i = SourceMenu.Info(current: info.current, mode: info.mode, callPids: info.callPids, audioOnly: info.audioOnly)
+        gear.toolTip = SourceMenu.headline(i)
         let m = NSMenu()
-        let head = NSMenuItem(title: info.audioOnly ? "Audio-only recording (no video source)" : "Recording: \(info.current)", action: nil, keyEquivalent: "")
-        head.isEnabled = false
-        m.addItem(head)
-        if info.audioOnly {
-            gear.menu = m
-            m.popUp(positioning: nil, at: NSPoint(x: 0, y: gear.bounds.height + 4), in: gear)
-            return
-        }
-        let auto = NSMenuItem(title: "Auto — follow the call window", action: #selector(autoTapped), keyEquivalent: "")
-        auto.target = self; auto.state = info.mode == "auto" ? .on : .off
-        m.addItem(auto)
-        let re = NSMenuItem(title: "Re-detect the window now", action: #selector(redetectTapped), keyEquivalent: "")
-        re.target = self
-        m.addItem(re)
-        m.addItem(.separator())
-        let pick = NSMenuItem(title: "Record this instead:", action: nil, keyEquivalent: "")
-        pick.isEnabled = false
-        m.addItem(pick)
-        let src = RecordDialog.sources(callPids: info.callPids)
-        pickable = []
-        for e in src.displays + Array(src.windows.prefix(18)) {
-            let item = NSMenuItem(title: e.title, action: #selector(pickTapped(_:)), keyEquivalent: "")
-            item.target = self
-            item.tag = pickable.count
-            item.state = e.title == info.current ? .on : .off
-            pickable.append(e)
-            m.addItem(item)
-        }
+        menu.onSetAuto = { [weak self] in self?.onSetAuto?() }
+        menu.onRedetect = { [weak self] in self?.onRedetect?() }
+        menu.onPickSource = { [weak self] s, t in self?.onPickSource?(s, t) }
+        menu.onPickAudioOnly = { [weak self] in self?.onPickAudioOnly?() }
+        menu.build(into: m, info: i)
         gear.menu = m
         m.popUp(positioning: nil, at: NSPoint(x: 0, y: gear.bounds.height + 4), in: gear)
     }
-    private var pickable: [RecordDialog.SourceEntry] = []
-    @objc private func autoTapped() { EventLog.shared.log("preview_click", ["button": "auto"]); onSetAuto?() }
-    @objc private func redetectTapped() { EventLog.shared.log("preview_click", ["button": "redetect"]); onRedetect?() }
-    @objc private func pickTapped(_ sender: NSMenuItem) {
-        guard sender.tag < pickable.count else { return }
-        let e = pickable[sender.tag]
-        EventLog.shared.log("preview_click", ["button": "pick", "source": e.source.json, "title": e.title])
-        onPickSource?(e.source, e.title)
-    }
+    private let menu = SourceMenu(origin: "preview")
 }
 
 /// One level bar: −60…0 dBFS, fill green when audible / grey when quiet / red when the track is

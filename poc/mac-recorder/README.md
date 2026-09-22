@@ -14,6 +14,51 @@ Native macOS side of Darth Meetings recording (the "Swift tray" angle from Darth
 the user switched it off in the menu (`loginItemUserChoice` in UserDefaults records an explicit choice;
 the default never overrides it). macOS may show "Darth Recorder was added as a login item" once.
 
+**0.3.15 (2026-09-22) — an audio-only recording can be given a video source, from either menu.**
+Alok, on a Slack huddle where somebody was sharing a screen, 18:33 SGT: the preview's gear said
+*"Audio-only recording (no video source)"* and offered nothing — *"why can't I update source?
+what's the point else"*. A Slack huddle is `.audioOnly` by profile (`RecordingController.profile(for:)`),
+and until now that was the end of the story for the rest of the recording.
+
+- **The per-app profile is only the DEFAULT.** The gear menu now shows the same source list on an
+  audio-only recording, headed **"Add video — record this:"** (displays, then the call's windows,
+  then everything else), plus an **"Audio only"** entry at the bottom with a tick on the current
+  state. Picking a display or window calls `switchSource`, which rolls a new part **with** video on
+  exactly the path a share flip uses — the audio tracks carry straight on (mix + system + mic), the
+  part is `<base> part<N>.mp4` next to the `.m4a`. Picking "Audio only" on a video recording rolls
+  the other way. The person's pick owns the source for the rest of the recording (`sourceMode = "manual"`).
+- **Reachable without the preview panel.** The tray menu has a **Video source** submenu with the
+  same items (`SourceMenu` builds both), greyed as *"Video source — not recording"* when there is
+  nothing to change. It is built when it opens, so the window list is never older than the click.
+- **The head line is never a dead end**: *"Audio only — add a video source below"* / *"Recording:
+  <source>"*, and the gear's tooltip says the same.
+- **Privacy.** A pick is the only thing that ever gives a recording a video source; nothing here
+  auto-captures a screen (a Slack share is not even visible to the share detector). And because such
+  a recording only has video by request, when that window goes away it falls back to **audio**, never
+  to a display nobody chose — both in the window-gone hold (`holdElapsed`) and when a share ends.
+- **Two things the E2E caught** (2026-09-22, four parts audio→window→audio→window against a
+  throwaway TextEdit window): `segmentURL` read the extension off `currentSource`, which
+  `rollSegment` has not moved yet — so every part after a switch was named for the part before
+  it (a window part called `.m4a`). It now takes the source it is being built for. And a
+  recording that starts audio-only has no `pinnedSize`, so a second video part would have been
+  encoded at whatever size that source happened to be; the first video part pins it
+  (`part2` and `part4` both probed 1312×844).
+- **Mixed parts and the server.** One recording can now hold an `.m4a` part and an `.mp4` part. The
+  files are right and each part's facts are right (`tracks: {count, mixFirst}` is per-recording and
+  unchanged across parts; `contentType` follows each file's extension). **The server's stitch is
+  not**: `concatMediaSmart` (`src/lib/server/media-concat.ts:227-252`) sees the stream signatures
+  differ, skips the `-c copy` fast path, and the re-encode branch decides `allVideo` from every
+  input (`:150`) — so one audio-only part makes the whole concat `v=0` (`:156`) and writes an
+  `.m4a`. ffmpeg exits 0; the video is dropped and nothing says so. The audio is whole (track 0 is
+  the live mix), so the transcript is right. There is no "upload the parts separately" route —
+  `gmeet_context.videoParts` is written only by the Meet importers and no upload field selects it.
+  So the tray uploads as before and **says so**: `upload_mixed_parts` in the event log, `mixed_parts`
+  on the registry row, and a banner — *"The video part stays on this Mac"*. The server fix belongs
+  in `concatMediaReencodeToTemp`: when `anyVideo && !allVideo`, synthesize black video for the
+  audio-only parts (`-f lavfi -i color=…` sized to the video parts) and use `v=1` + `.mp4`; or do
+  what `docs/recordings-first-class-design.md:206-210, 256-258` already commits to and stop
+  concatenating at all.
+
 **0.3.13 (2026-09-22) — linking a recording to a meeting is the USER's action.** The server's
 matcher (`recorder-match.ts`) scores every recording against the calendar occurrences it overlaps,
 and `POST /api/uploads` used to turn a confident match into a LINK all by itself. On 2026-09-22 a

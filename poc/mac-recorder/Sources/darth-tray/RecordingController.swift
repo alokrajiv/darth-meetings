@@ -42,6 +42,16 @@ final class RecordingController {
             }
         }
         var isAudioOnly: Bool { if case .audio = self { return true }; return false }
+        /// Identity for "is this the source we are already on?" — a dictionary's `description`
+        /// has no stable key order, so comparing `json` could call two identical sources
+        /// different and roll a pointless segment (0.3.15).
+        var key: String {
+            switch self {
+            case .window(let id, _): return "w\(id)"
+            case .display(let id): return "d\(id)"
+            case .audio: return "audio"
+            }
+        }
     }
 
     /// How a detected call is captured (0.2.9). Voice-only calls have no window worth a video
@@ -247,6 +257,11 @@ final class RecordingController {
     /// parameters differ. A differently-shaped source (a shared display after a call window)
     /// is letterboxed into it by SCK (`scalesToFit`).
     private var pinnedSize: (w: Int, h: Int)?
+    /// 0.3.15: did this recording ask for video when it started? False for an audio-only
+    /// profile (a Slack huddle, a WhatsApp voice call) or "video off" from the Record… dialog.
+    /// The person can still add a video source mid-recording — but when THAT source goes away,
+    /// such a recording falls back to audio, never to a display nobody asked to be captured.
+    private var videoByDefault = true
     private var errorRolls = 0
     private var resolveTimer: Timer?
     private var shares: [[String: Any]] = []
@@ -458,6 +473,7 @@ final class RecordingController {
         let profile: CaptureProfile? = call.map { Self.profile(for: $0).0 }
         if let call { profileReason = Self.profile(for: call).1 }
         let wantVideo = options.video ?? (profile != .audioOnly)
+        videoByDefault = wantVideo
         if !wantVideo {
             source = .audio
             if options.video == false { profileReason = "video off by request" }
@@ -613,7 +629,7 @@ final class RecordingController {
         }
         let tracks = audioTracks(micFormat: micFormat)
         currentSource = source
-        let url = segmentURL(1)
+        let url = segmentURL(1, for: source)
         let rec: Recorder
         let displayID: CGDirectDisplayID
         var w = 0, h = 0
@@ -725,9 +741,14 @@ final class RecordingController {
 
     // MARK: sources
 
-    private func segmentURL(_ index: Int) -> URL {
-        let ext = (currentSource?.isAudioOnly ?? (options.video == false)) ? "m4a" : "mp4"
-        return (dir ?? Paths.recordings).appendingPathComponent("\(base) part\(index).\(ext)")
+    /// The file for part `index` — named for the source it is ABOUT to carry, not the one the
+    /// recording is leaving. 0.3.15: `rollSegment` builds the URL before it moves
+    /// `currentSource`, so reading the extension off `currentSource` gave every part after an
+    /// audio↔video switch the previous part's extension (a window part called `.m4a`). The
+    /// writer was always right; the name, the upload's `contentType` and "is this group mixed?"
+    /// were not.
+    private func segmentURL(_ index: Int, for source: Source) -> URL {
+        return (dir ?? Paths.recordings).appendingPathComponent("\(base) part\(index).\(source.isAudioOnly ? "m4a" : "mp4")")
     }
 
     @MainActor
@@ -811,7 +832,7 @@ final class RecordingController {
             do {
                 let tracks = self.audioTracks(micFormat: self.mic?.format)
                 let index = oldIndex + 1
-                let url = self.segmentURL(index)
+                let url = self.segmentURL(index, for: source)
                 let rec: Recorder
                 var newStream: SCStream?
                 var w = 0, h = 0
@@ -820,6 +841,10 @@ final class RecordingController {
                 } else {
                     let (filter, _) = try await Self.filter(for: source)
                     (w, h) = self.pinnedSize ?? CaptureSession.pixelSize(of: filter)
+                    // A recording that STARTED audio-only has no pinned size yet: the first
+                    // video part sets it, so every later video part keeps the same pixel size
+                    // (the server's `-c copy` stitch refuses inputs that differ).
+                    if self.pinnedSize == nil { self.pinnedSize = (w, h) }
                     rec = try catchingObjC { try Recorder(url: url, width: w, height: h, fps: self.fps, audioTracks: tracks) }
                     rec.onStop = { [weak self] err in
                         DispatchQueue.main.async { self?.videoStreamFailed(err) }
@@ -963,7 +988,7 @@ final class RecordingController {
                                 summary: "record: share by \(share.appName ?? share.appBundle) NOT captured — audio-only recording")
             if !shareNoticeShown {
                 shareNoticeShown = true
-                onNotice?("Screen share not captured", "This call is recorded as audio only.")
+                onNotice?("Screen share not captured", "This call records audio only — pick a video source in the recorder menu to capture it.")
             }
             return
         }
@@ -984,6 +1009,12 @@ final class RecordingController {
             shares[i]["ended_at"] = isoNow()
         }
         guard currentSource?.isAudioOnly != true, related(share) else { return }
+        // 0.3.15: an audio-only-by-default recording only has video because the person picked
+        // the shared window. The share is over — go back to audio, not to somebody's desktop.
+        if !videoByDefault {
+            rollSegment(to: .audio, reason: "share ended, audio-only recording")
+            return
+        }
         // Back to the call window (re-resolved: it may have moved while the share was up).
         guard let call, call.pid > 0 else {
             if let f = call?.windowFrame { rollSegment(to: .display(WindowPicker.display(containing: f)), reason: "share ended") }
@@ -1047,17 +1078,35 @@ final class RecordingController {
         return "now recording \"\(w.title)\""
     }
 
-    /// The person picked a source (preview gear / PWA): roll onto it and stop following the
-    /// call window (the picker's re-resolve keeps checking the window still exists).
+    /// The person picked a source (preview gear / tray menu / PWA): roll onto it and stop
+    /// following the call window (the picker's re-resolve keeps checking the window still
+    /// exists).
+    ///
+    /// 0.3.15: this is also how an AUDIO-ONLY recording gains video. The per-app capture
+    /// profile (`profile(for:)`) is only ever the DEFAULT — once the person picks, their pick
+    /// owns the rest of the recording. Picking a display / window on an audio-only recording
+    /// closes the `.m4a` part and opens an `.mp4` one on the same part-rotation path a share
+    /// flip uses (the audio tracks carry on unchanged: mix + system + mic); picking `.audio`
+    /// on a video recording rotates back to an audio-only part. Nothing here happens without
+    /// an explicit pick.
     func switchSource(to source: Source, title: String, how: String = "manual") -> String {
-        guard state == .recording, currentSource?.isAudioOnly != true else { return "not recording video" }
-        if let cur = currentSource, cur.json.description == source.json.description { return "already recording \(title)" }
+        guard state == .recording else { return "not recording" }
+        if let cur = currentSource, cur.key == source.key {
+            return source.isAudioOnly ? "already recording audio only" : "already recording \(title)"
+        }
         let from: Any = currentSource?.json ?? NSNull()
+        let wasAudioOnly = currentSource?.isAudioOnly == true
+        // A pending window-gone hold belongs to the source we are leaving: if it fired after
+        // this switch it would roll onto a display nobody picked.
+        if holdTimer != nil { holdTimer?.invalidate(); holdTimer = nil; pendingVideoFailure = false }
         sourceMode = "manual"
         rollSegment(to: source, reason: "\(how): \(title)")
-        EventLog.shared.log("source_switch", ["recording_id": recordingId ?? "", "how": how, "from": from, "to": source.json, "title": title],
-                            summary: "record: source switched by \(how) → \(source.label)")
-        return "now recording \(title)"
+        EventLog.shared.log("source_switch", [
+            "recording_id": recordingId ?? "", "how": how, "from": from, "to": source.json, "title": title,
+            "from_audio_only": wasAudioOnly, "to_audio_only": source.isAudioOnly,
+        ], summary: "record: source switched by \(how) → \(source.label)\(wasAudioOnly && !source.isAudioOnly ? " (video added to an audio-only recording)" : "")")
+        if source.isAudioOnly { return "now recording audio only" }
+        return wasAudioOnly ? "video added — now recording \(title)" : "now recording \(title)"
     }
 
     // MARK: window-gone hold
@@ -1114,6 +1163,11 @@ final class RecordingController {
         if let call, call.pid > 0, let w = WindowPicker.pick(kind: call.kind, pid: call.pid).window,
            case .window(let oldId, _)? = currentSource, w.id != oldId {
             target = .window(w.id, w.title)
+        } else if !videoByDefault {
+            // 0.3.15: this recording had video only because the person picked a source, and
+            // that source is gone. Falling back to a display would capture a screen nobody
+            // asked for — go back to audio instead.
+            target = .audio
         } else {
             let display = lastWindowFrame.map { WindowPicker.display(containing: $0) }
                 ?? call?.windowFrame.map { WindowPicker.display(containing: $0) } ?? CGMainDisplayID()
@@ -1123,7 +1177,9 @@ final class RecordingController {
             "recording_id": recordingId ?? "", "outcome": "fallback", "reason": holdReason,
             "target": target.json, "attempt": errorRolls,
         ], summary: "record: window gone and the call is still live — falling back to \(target.label)")
-        onError?("The window we were recording went away — recording \(target.label) instead.")
+        onError?(target.isAudioOnly
+                 ? "The window you picked went away — back to audio only."
+                 : "The window we were recording went away — recording \(target.label) instead.")
         rollSegment(to: target, reason: "window gone, call still live (\(holdReason))")
     }
 

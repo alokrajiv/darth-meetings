@@ -4,7 +4,7 @@ import ScreenCaptureKit
 import ServiceManagement
 import RecorderCore
 
-let VERSION = "0.3.14"
+let VERSION = "0.3.15"
 let WS_PORT: UInt16 = 47800
 let PWA_URL = URL(string: "https://meetings.darth-internal.trames.io/")!
 /// Seconds between "the call ended" and an automatic stop.
@@ -20,6 +20,8 @@ let LINK_ASK_LIFE: TimeInterval = 60
 /// computed `matched`) before its bytes start moving. The link can only be declared on
 /// part 1, so the question has to be asked before the first byte.
 let LINK_MATCH_GRACE: TimeInterval = 2
+/// The one disabled line the "Video source" submenu holds when there is nothing to change.
+let NOT_RECORDING = "Not recording"
 
 /// Menu-bar app "Darth Recorder".
 ///
@@ -111,6 +113,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     var linkAsks: [String: Timer] = [:]
     let stopItem = NSMenuItem(title: "Stop recording", action: #selector(stopFromMenu), keyEquivalent: "s")
     let previewItem = NSMenuItem(title: "Show preview", action: #selector(togglePreview), keyEquivalent: "p")
+    /// 0.3.15: the same source menu as the preview's gear, reachable without the preview panel.
+    /// Greyed ("Not recording") when there is nothing to change.
+    let sourceItem = NSMenuItem(title: "Video source", action: nil, keyEquivalent: "")
+    let sourceSubmenu = NSMenu(title: "Video source")
+    let traySourceMenu = SourceMenu(origin: "tray")
     let bannerItem = NSMenuItem(title: "Show banner", action: #selector(toggleBanner), keyEquivalent: "b")
     let discreetItem = NSMenuItem(title: "Discreet menu bar icon (no red while recording)", action: #selector(toggleDiscreet), keyEquivalent: "")
     let autoHideItem = NSMenuItem(title: "Hide the recording banner after 10 s", action: #selector(toggleBannerAutoHide), keyEquivalent: "")
@@ -255,11 +262,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             let out = self.recorder.redetectSource(how: "redetect")
             self.banner.showMessage(title: "Window re-detected", sub: out, accent: .info, stoppable: true, near: self.recordingFrame, autoHide: 6)
         }
-        preview.onPickSource = { [weak self] source, title in
+        preview.onPickSource = { [weak self] source, title in self?.pickSource(source, title: title, how: "preview") }
+        preview.onPickAudioOnly = { [weak self] in self?.pickSource(.audio, title: "audio only", how: "preview") }
+        // The tray's "Video source" submenu drives exactly the same three actions (0.3.15).
+        sourceSubmenu.delegate = self
+        sourceItem.submenu = sourceSubmenu
+        traySourceMenu.onSetAuto = { [weak self] in
             guard let self else { return }
-            let out = self.recorder.switchSource(to: source, title: title)
-            self.banner.showMessage(title: "Recording source changed", sub: out, accent: .info, stoppable: true, near: self.recordingFrame, autoHide: 6)
+            let out = self.recorder.redetectSource(how: "auto")
+            self.banner.showMessage(title: "Following the call window", sub: out, accent: .info, stoppable: true, near: self.recordingFrame, autoHide: 6)
         }
+        traySourceMenu.onRedetect = { [weak self] in
+            guard let self else { return }
+            let out = self.recorder.redetectSource(how: "redetect")
+            self.banner.showMessage(title: "Window re-detected", sub: out, accent: .info, stoppable: true, near: self.recordingFrame, autoHide: 6)
+        }
+        traySourceMenu.onPickSource = { [weak self] source, title in self?.pickSource(source, title: title, how: "tray") }
+        traySourceMenu.onPickAudioOnly = { [weak self] in self?.pickSource(.audio, title: "audio only", how: "tray") }
 
         uploader.onProgress = { [weak self] p in
             guard let self else { return }
@@ -271,6 +290,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 "recording_id": p.id, "segment": p.segment, "segments_total": p.segmentsTotal,
                 "bytes_sent": p.bytesSent, "bytes_total": p.bytesTotal, "pct": p.pct, "title": title,
             ])
+        }
+        uploader.onMixedParts = { [weak self] id, audioParts, videoParts in
+            guard let self else { return }
+            // 0.3.15: said out loud, because the server would otherwise drop the video without
+            // a word. The files themselves are all on this Mac and all correct.
+            rlog("upload: \(id) mixes \(audioParts) audio-only and \(videoParts) video part(s)")
+            self.banner.showMessage(title: "The video part stays on this Mac",
+                                    sub: "This recording began as audio only, so the uploaded meeting is audio. The video you added is in Movies › Darth Recorder.",
+                                    accent: .warning, autoHide: 12)
         }
         uploader.onDone = { [weak self] id, tid, bytes, seconds in
             guard let self else { return }
@@ -500,6 +528,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         displayItem.target = self; m.addItem(displayItem)
         stopItem.target = self; m.addItem(stopItem)
         previewItem.target = self; m.addItem(previewItem)
+        m.addItem(sourceItem)
         bannerItem.target = self; m.addItem(bannerItem)
         m.addItem(.separator())
         authItem.target = self; m.addItem(authItem)
@@ -551,6 +580,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         previewItem.title = preview.isOpen ? "Hide preview" : "Show preview"
         bannerItem.isHidden = !recording
         bannerItem.title = banner.isVisible ? "Hide banner" : "Show banner"
+        // 0.3.15: always listed, greyed when there is nothing to change. The submenu is
+        // rebuilt when it opens (menuNeedsUpdate) so the window list is never older than the
+        // click — but it also has to hold the right thing BEFORE that, because a submenu with
+        // no enabled item in it is what greys its parent out.
+        sourceItem.title = recording
+            ? (recorder.currentSource?.isAudioOnly == true ? "Video source: audio only" : "Video source: \(sourceTitle())")
+            : "Video source — not recording"
+        sourceItem.isEnabled = recording
+        syncSourceSubmenu(recording: recording)
         discreetItem.state = discreet ? .on : .off
         autoHideItem.state = bannerAutoHide ? .on : .off
         micProcessingItem.state = micVoiceProcessing ? .on : .off
@@ -1339,6 +1377,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 broadcast("source_changed", ["outcome": recorder.switchSource(to: .window(CGWindowID(wid), title), title: title, how: "pwa")])
             } else if let did = obj["display_id"] as? Int {
                 broadcast("source_changed", ["outcome": recorder.switchSource(to: .display(CGDirectDisplayID(did)), title: "display \(did)", how: "pwa")])
+            } else if (obj["audio"] as? Bool) == true {
+                // 0.3.15: back to (or stay on) audio only — the same entry the menus offer.
+                broadcast("source_changed", ["outcome": recorder.switchSource(to: .audio, title: "audio only", how: "pwa")])
             }
         case "set_mic_processing": if let v = obj["enabled"] as? Bool { micVoiceProcessing = v }
         case "mic_echo_probe":                               // {seconds?, processing?} → mic_echo_probe_result
@@ -1471,6 +1512,69 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let call = DetectedCall(id: "sim-\(Int(Date().timeIntervalSince1970))", pid: pid, appName: name,
                                 bundleId: bundleOverride ?? bundle, kind: k, title: titleOverride ?? title, windowFrame: frame, startedAt: Date())
         detector.inject(call)
+    }
+
+    // MARK: source control (0.3.15)
+
+    /// What the live recording is pointed at, for the menu titles.
+    func sourceTitle() -> String {
+        switch recorder.currentSource {
+        case .window(_, let t)?: return t
+        case .display(let d)?: return "Display \(d)"
+        default: return "audio only"
+        }
+    }
+
+    /// The one place a pick from any surface (preview gear, tray submenu) becomes a switch.
+    /// A pick is the ONLY thing that ever gives a recording a video source.
+    func pickSource(_ source: RecordingController.Source, title: String, how: String) {
+        let wasAudioOnly = recorder.currentSource?.isAudioOnly == true
+        let out = recorder.switchSource(to: source, title: title, how: how)
+        let head = source.isAudioOnly ? "Video source removed"
+            : (wasAudioOnly ? "Video source added" : "Recording source changed")
+        banner.showMessage(title: head, sub: out, accent: .info, stoppable: true, near: recordingFrame, autoHide: 6)
+        broadcast("source_changed", ["outcome": out])
+        refreshMenu()
+    }
+}
+
+/// The tray's "Video source" submenu is built when it opens, so its window list is never
+/// older than the click (0.3.15).
+extension AppDelegate: NSMenuDelegate {
+    func menuNeedsUpdate(_ menu: NSMenu) {
+        guard menu === sourceSubmenu else { return }
+        fillSourceSubmenu()
+    }
+
+    /// Keep the submenu's CONTENT in step with the recording state without enumerating every
+    /// window on screen each time the tray menu is touched: only a flip between "recording"
+    /// and "not recording" rebuilds here, and `menuNeedsUpdate` refreshes the list for real
+    /// the moment the submenu opens.
+    func syncSourceSubmenu(recording: Bool) {
+        let showsNotRecording = sourceSubmenu.items.first?.title == NOT_RECORDING
+        if !recording {
+            guard !showsNotRecording || sourceSubmenu.items.count != 1 else { return }
+            sourceSubmenu.removeAllItems()
+            let none = NSMenuItem(title: NOT_RECORDING, action: nil, keyEquivalent: "")
+            none.isEnabled = false
+            sourceSubmenu.addItem(none)
+        } else if sourceSubmenu.items.isEmpty || showsNotRecording {
+            fillSourceSubmenu()
+        }
+    }
+
+    private func fillSourceSubmenu() {
+        sourceSubmenu.removeAllItems()
+        guard recorder.isRecording else {
+            let none = NSMenuItem(title: NOT_RECORDING, action: nil, keyEquivalent: "")
+            none.isEnabled = false
+            sourceSubmenu.addItem(none)
+            return
+        }
+        let info = SourceMenu.Info(current: sourceTitle(), mode: recorder.sourceMode,
+                                   callPids: recorder.call.map { [$0.pid] } ?? [],
+                                   audioOnly: recorder.currentSource?.isAudioOnly ?? true)
+        traySourceMenu.build(into: sourceSubmenu, info: info)
     }
 }
 
