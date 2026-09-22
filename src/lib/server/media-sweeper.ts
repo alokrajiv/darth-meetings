@@ -76,8 +76,27 @@ const STALE_TMP_MS = 2 * 60 * 60 * 1000;
  */
 const ARCHIVE_MAX_BYTES_PER_TICK = 2 * 1024 * 1024 * 1024;
 const ARCHIVE_MAX_FILES_PER_TICK = 5;
-/** Candidates read per tick; the extra ones absorb rows whose file is gone. */
-const ARCHIVE_SCAN_PER_TICK = 50;
+/**
+ * Both caps can be raised from the env for a one-off drain — the VM-to-Blob
+ * pipe does ~40 MB/s in-region, so the 80 GB backfill is ~35 min of copying
+ * when it is not throttled to 5 files per 5 minutes (2026-09-22: at the
+ * default caps the file cap dominated and the drain would have taken 13 h).
+ * Read per tick, so a `pm2 restart --update-env` is all it takes; unset =
+ * the polite defaults above. A long tick still yields to a person: the pass
+ * re-checks `archiveShouldYield` every ARCHIVE_YIELD_CHECK_EVERY files.
+ */
+const ARCHIVE_FILES_PER_TICK_ENV = 'MW_ARCHIVE_FILES_PER_TICK';
+const ARCHIVE_GB_PER_TICK_ENV = 'MW_ARCHIVE_GB_PER_TICK';
+const ARCHIVE_YIELD_CHECK_EVERY = 10;
+function archiveCaps(): { maxFiles: number; maxBytes: number; scan: number } {
+  const files = Number.parseInt(process.env[ARCHIVE_FILES_PER_TICK_ENV] ?? '', 10);
+  const gb = Number.parseFloat(process.env[ARCHIVE_GB_PER_TICK_ENV] ?? '');
+  const maxFiles = Number.isFinite(files) && files > 0 ? files : ARCHIVE_MAX_FILES_PER_TICK;
+  const maxBytes =
+    Number.isFinite(gb) && gb > 0 ? Math.round(gb * 1024 * 1024 * 1024) : ARCHIVE_MAX_BYTES_PER_TICK;
+  // Candidates read per tick; the extra ones absorb rows whose file is gone.
+  return { maxFiles, maxBytes, scan: Math.max(50, maxFiles + 25) };
+}
 /** Blobs whose rows are already gone, retried per tick. */
 const ARCHIVE_DELETE_PER_TICK = 25;
 /** Stage C local copies fetched per tick — a whole recording each. */
@@ -302,8 +321,8 @@ async function sweepOrphanDerivatives(): Promise<void> {
  * DEC-3 Stage A.3 — the archive backfill. Media rows we hold locally and have
  * no blob for, oldest capture first, paced so the copy never competes with
  * something a person is waiting for: the whole pass is skipped while an ingest
- * or an AI run is in flight, and it stops at ARCHIVE_MAX_BYTES_PER_TICK /
- * ARCHIVE_MAX_FILES_PER_TICK.
+ * or an AI run is in flight, and it stops at the per-tick caps (`archiveCaps`:
+ * the polite defaults, or the env overrides for a drain).
  *
  * One line per tick in the pm2 log; `scripts/media-archive-status.ts` has the
  * totals. Inert (not one query) unless DARTH_MEDIA_ACCOUNT and
@@ -317,7 +336,8 @@ async function archiveBackfillPass(): Promise<void> {
     return;
   }
 
-  const candidates = await listMediaToArchive(ARCHIVE_SCAN_PER_TICK);
+  const caps = archiveCaps();
+  const candidates = await listMediaToArchive(caps.scan);
   if (candidates.length === 0) {
     await drainPendingBlobDeletes(ARCHIVE_DELETE_PER_TICK);
     return;
@@ -328,9 +348,15 @@ async function archiveBackfillPass(): Promise<void> {
   let noFile = 0;
   let failed = 0;
   const report: string[] = [];
-  const caps = { maxFiles: ARCHIVE_MAX_FILES_PER_TICK, maxBytes: ARCHIVE_MAX_BYTES_PER_TICK };
   for (const row of candidates) {
     if (archiveBudgetVerdict({ files, bytes }, 0, caps) === 'stop') break;
+    if (files > 0 && files % ARCHIVE_YIELD_CHECK_EVERY === 0) {
+      const now = await archiveShouldYield();
+      if (now) {
+        report.push(`paused — ${now}`);
+        break;
+      }
+    }
     const abs = localMediaPath(row);
     const st = abs ? await fsp.stat(abs).catch(() => null) : null;
     if (!st?.isFile() || st.size === 0) {
