@@ -1,6 +1,6 @@
 # Rollout runbook — first-class recordings + "AssemblyAI keeps nothing" (September 2026)
 
-Everything below is committed on `main`; **as of 2026-09-22 13:40 SGT everything except D/H/I is live** (Alok: "do the whole thing, no data loss"). Left: the Azure media account (D, script `deploy/azure-create-media-account.sh`), then H and I; the AssemblyAI dashboard retention; and the first-real-use checks under E, G, J, K. With every new flag unset the app behaves as
+Everything below is committed on `main`; **as of 2026-09-22 14:05 SGT everything except H/I is live** (D's archive is draining) (Alok: "do the whole thing, no data loss"). Left: H once the archive has drained (+ CORS is in), I after the ffprobe of a real 0.3.12 tray recording; the AssemblyAI dashboard retention; and the first-real-use checks under E, G, J, K. With every new flag unset the app behaves as
 it does today, so the deploy itself is safe at any point; each later step is its own switch with its own rollback.
 Steps marked **ALOK** need your hands (deploys, migrations on the VM, prod writes, Azure). Keep this file current:
 tick a step with the date when it is done.
@@ -73,15 +73,18 @@ Flags live in `~/apps/meeting-whisperer/.env.local` on the VM; every one is read
 
 ## D. Media archive to Azure Blob (DEC-3 stage A)
 
-- [ ] **ALOK** create the media account — **`./deploy/azure-create-media-account.sh` does all of it** (the agent's `az`
+- [x] **ALOK** create the media account — **`./deploy/azure-create-media-account.sh` does all of it** (**Alok ran it
+      2026-09-22 ~13:50 SGT**: account, soft delete 14 d, VM role in; CORS via `deploy/azure-media-account-cors.sh`
+      ~14:00 SGT; container `meetings-media` created from the VM with its identity 13:58 SGT) (the agent's `az`
       calls were refused by the auto-mode classifier as permission grants, 2026-09-22) — NOT in `darthuploads`, whose `expire-uploads` rule deletes every blob in
       every container a day after its last write. Settings in `docs/recordings-blob-spec.md` ("Stage A as built"):
       `darthmedia`, `prod-internal-rg`, southeastasia, Standard_LRS, no shared keys, no public blob access, NO
       lifecycle policy, blob soft-delete 14 d, container `meetings-media`, role Storage Blob Data Contributor for
       the VM `darth-p01`'s system-assigned identity.
-- [ ] **ALOK** ~~apply `migrations/047_media_archive.sql`~~ (applied 13:15 SGT); set `DARTH_MEDIA_ACCOUNT=darthmedia`,
+- [x] **ALOK** ~~apply `migrations/047_media_archive.sql`~~ (applied 13:15 SGT); set `DARTH_MEDIA_ACCOUNT=darthmedia`,
       `DARTH_MEDIA_CONTAINER=meetings-media`, restart; `scripts/media-archive-status.ts` says `0 archived / N pending`.
-- [ ] **ALOK** set `MW_MEDIA_ARCHIVE=1`, restart. ~80 GB backfills at ≤ 2 GB per 5-minute tick, pausing while
+- [x] **ALOK** set `MW_MEDIA_ARCHIVE=1`, restart. **Done 14:03 SGT** (one restart for all three: status said
+      `0 archived / 807 pending / 79.74 GB`, canary none yet). ~80 GB backfills at ≤ 2 GB per 5-minute tick, pausing while
       uploads or AI runs are active. Local files are never deleted by this stage.
 - [ ] `scripts/media-archive-status.ts --check-blobs` clean; after 36 h the canary says `CANARY OK`.
 
