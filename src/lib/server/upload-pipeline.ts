@@ -70,6 +70,23 @@ export function sanitizeLinkedEvent(parsed: unknown): LinkedEventInput | null {
   return ev;
 }
 
+/**
+ * The event KEY of a `linkedEvent` payload that carries nothing but a key
+ * (`{ key: "<meetingCode>|<startIso>" }` — the Darth Recorder after Link is
+ * tapped, docs/recorder-link-confirm-spec.md §3). Null for a real event
+ * payload (anything with an id, a meetingCode or a title) and for no payload.
+ */
+export function linkedEventKeyOnly(raw: unknown): string | null {
+  if (!raw || typeof raw !== 'object') return null;
+  const e = raw as Record<string, unknown>;
+  const key = typeof e.key === 'string' ? e.key.trim() : '';
+  if (!key) return null;
+  const hasEvent = ['id', 'meetingCode', 'title', 'iCalUID'].some(
+    (k) => typeof e[k] === 'string' && (e[k] as string).trim().length > 0
+  );
+  return hasEvent ? null : key;
+}
+
 /** `x-linked-event` header: URI-encoded JSON (the body is the raw file). */
 export function parseLinkedEventHeader(raw: string | null): LinkedEventInput | null {
   if (!raw) return null;

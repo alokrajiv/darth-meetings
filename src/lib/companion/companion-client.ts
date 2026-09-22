@@ -135,8 +135,10 @@ export type CompanionEvent =
 export type CompanionState = {
   /** A tray answered at least once during this page's life. */
   connected: boolean;
-  /** This browser has connected to a tray at some point (localStorage) — i.e. it is installed here. */
+  /** This browser has connected to a tray within SEEN_MAX_AGE_MS (localStorage) — i.e. it is installed here. */
   everSeen: boolean;
+  /** When that last happened (ms epoch), for "last seen …" copy. */
+  lastSeenAt: number | null;
   version: string | null;
   /** 'legacy' = pre-0.2.0 snapshot (no sign-in / registry fields); 'v2' once any 0.2.0 field shows up. */
   protocol: 'legacy' | 'v2';
@@ -199,11 +201,43 @@ export function companionPlatformSupported(): boolean {
   return /mac/i.test(p);
 }
 const SEEN_KEY = 'darth-companion-seen';
+/**
+ * How long "installed here" is believed without the tray ever connecting.
+ * The flag used to be a plain '1' that lived forever, so an uninstalled
+ * recorder kept the page saying "installed · not running" and hid the
+ * download (Alok, 2026-09-22). It now stores the last connect time; past
+ * this age the page treats the Mac as having no recorder again.
+ */
+export const SEEN_MAX_AGE_MS = 14 * 24 * 60 * 60 * 1000;
+
+/** Read the flag: the last time a tray connected on this browser, or null. */
+export function readSeenAt(now = Date.now()): number | null {
+  try {
+    const raw = localStorage.getItem(SEEN_KEY);
+    if (!raw) return null;
+    if (raw === '1') return now; // legacy flag: believed once more, then rewritten as a time
+    const t = Date.parse(raw);
+    return Number.isFinite(t) ? t : null;
+  } catch {
+    return null;
+  }
+}
+
+/** "Not installed any more" — forget this Mac so the install copy shows again. */
+export function forgetCompanionInstall(): void {
+  try {
+    localStorage.removeItem(SEEN_KEY);
+  } catch {
+    /* ignore */
+  }
+  getCompanion().forget();
+}
 const MAX_COLD_ATTEMPTS = 5;
 
 const initial: CompanionState = {
   connected: false,
   everSeen: false,
+  lastSeenAt: null,
   version: null,
   protocol: 'legacy',
   screenPermission: null,
@@ -392,13 +426,9 @@ class CompanionClient {
   private ensureStarted() {
     if (this.started || typeof window === 'undefined') return;
     this.started = true;
-    let seen = false;
-    try {
-      seen = localStorage.getItem(SEEN_KEY) === '1';
-    } catch {
-      /* ignore */
-    }
-    if (seen) this.set({ everSeen: true });
+    const seenAt = readSeenAt();
+    const seen = seenAt !== null && Date.now() - seenAt < SEEN_MAX_AGE_MS;
+    if (seen) this.set({ everSeen: true, lastSeenAt: seenAt });
     if (!seen && !companionPlatformSupported()) return; // Windows/Linux: stay silent
     this.connect();
   }
@@ -420,6 +450,11 @@ class CompanionClient {
     for (const l of this.listeners) l(this.state);
   }
 
+  /** The page no longer believes a recorder is installed here (see forgetCompanionInstall). */
+  forget() {
+    this.set({ everSeen: false, lastSeenAt: null });
+  }
+
   private connect() {
     let ws: WebSocket;
     try {
@@ -431,12 +466,13 @@ class CompanionClient {
     this.ws = ws;
     ws.onopen = () => {
       this.attempts = 0;
+      const nowIso = new Date().toISOString();
       try {
-        localStorage.setItem(SEEN_KEY, '1');
+        localStorage.setItem(SEEN_KEY, nowIso);
       } catch {
         /* private mode */
       }
-      this.set({ everSeen: true });
+      this.set({ everSeen: true, lastSeenAt: Date.parse(nowIso) });
     };
     ws.onmessage = (e) => {
       let m: Record<string, unknown>;
@@ -613,12 +649,8 @@ class CompanionClient {
   private scheduleReconnect() {
     if (this.timer) return;
     this.attempts += 1;
-    let seen = false;
-    try {
-      seen = localStorage.getItem(SEEN_KEY) === '1';
-    } catch {
-      /* ignore */
-    }
+    const seenAt = readSeenAt();
+    const seen = seenAt !== null && Date.now() - seenAt < SEEN_MAX_AGE_MS;
     if (!seen && this.attempts > MAX_COLD_ATTEMPTS) return; // no helper on this machine; stop spamming the console
     const delay = seen ? 30_000 : Math.min(60_000, 2_000 * 2 ** (this.attempts - 1));
     this.timer = setTimeout(() => {

@@ -18,6 +18,7 @@ import {
   sanitizeLinkedEvent,
   textDocRejection,
   type RecorderOpenFacts,
+  linkedEventKeyOnly,
 } from '@/lib/server/upload-pipeline';
 import type { SuggestedEvent } from '@/lib/format';
 import { MAX_UPLOAD_BYTES, chunkPlanFor } from '@/lib/upload-chunking';
@@ -141,8 +142,16 @@ export const POST = withAuth(async ({ user, request }) => {
   // the caller's own calendar cache; `linkedEvent` = the web stepper's whole
   // event. The ref wins when both are present.
   let linkedEvent = sanitizeLinkedEvent(body.linkedEvent);
-  if (typeof body.eventRef === 'string' && body.eventRef.trim()) {
-    const resolved = await resolveLinkedEventRef(user.userId, body.eventRef);
+  // A link that is ONLY a key — `{ key }`, what the Darth Recorder sends after
+  // the person tapped Link on its card (docs/recorder-link-confirm-spec.md
+  // §3) — is a ref, not an event: resolve it the way `eventRef` is, or it
+  // would land as a truthy-but-empty event that links nothing and still
+  // clears the suggestion. An explicit `eventRef` still wins.
+  const keyOnlyRef = linkedEventKeyOnly(body.linkedEvent);
+  const eventRef =
+    typeof body.eventRef === 'string' && body.eventRef.trim() ? body.eventRef : keyOnlyRef;
+  if (eventRef) {
+    const resolved = await resolveLinkedEventRef(user.userId, eventRef);
     if (!resolved.ok) {
       return NextResponse.json({ error: resolved.error }, { status: resolved.status });
     }

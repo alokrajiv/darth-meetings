@@ -22,6 +22,7 @@ import {
   getCompanion,
   shareLabel,
   useCompanion,
+  forgetCompanionInstall,
 } from '@/lib/companion/companion-client';
 import { RecorderRecordings } from '@/components/recorder-recordings';
 
@@ -41,6 +42,17 @@ import { RecorderRecordings } from '@/components/recorder-recordings';
  * Distribution is the shared CLI host on the Tailnet — see
  * poc/mac-recorder/README.md. Windows helper does not exist yet.
  */
+
+/** "3 days ago" / "just now" for the last time a tray connected on this browser. */
+function lastSeenLabel(at: number | null): string {
+  if (at === null) return 'a while ago';
+  const mins = Math.max(0, Math.round((Date.now() - at) / 60_000));
+  if (mins < 2) return 'just now';
+  if (mins < 60) return `${mins} min ago`;
+  const hours = Math.round(mins / 60);
+  if (hours < 48) return `${hours} h ago`;
+  return `${Math.round(hours / 24)} days ago`;
+}
 
 export const RECORDER_INSTALL_CMD = 'curl -fsSL https://cli.darth-internal.trames.io/setup-darth-recorder.sh | bash';
 const RECORDER_DIST_URL = 'https://cli.darth-internal.trames.io/darth-recorder/version.json';
@@ -234,9 +246,29 @@ export function RecorderCard() {
         ) : (
           <div className="space-y-2" data-recorder-install>
             {c.everSeen ? (
-              <p>
-                It is installed on this Mac but not running. Open it from Spotlight (⌘ Space, “Darth Recorder”) or:
-              </p>
+              <>
+                <p>
+                  It was last connected here {lastSeenLabel(c.lastSeenAt)} and is not running now. Open it from
+                  Spotlight (⌘ Space, “Darth Recorder”) — or, if it was removed, install it again:
+                </p>
+                <div className="flex flex-wrap items-center gap-2">
+                  <Button size="sm" variant="outline" asChild>
+                    <a href={RECORDER_DMG_URL} data-recorder-download>
+                      <Download className="mr-1.5 h-3.5 w-3.5" /> Download for Mac
+                    </a>
+                  </Button>
+                  <Button
+                    size="sm"
+                    variant="ghost"
+                    className="text-xs text-muted-foreground"
+                    onClick={() => forgetCompanionInstall()}
+                    title="This page will stop saying the recorder is installed on this Mac"
+                    data-recorder-forget
+                  >
+                    Not installed any more? Forget this Mac
+                  </Button>
+                </div>
+              </>
             ) : (
               <>
                 <p>
