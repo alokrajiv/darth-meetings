@@ -284,7 +284,7 @@ export const POST = withAuth(async ({ user, request }, { params }) => {
 
     // DEC-3 Stage C: hand AssemblyAI the bytes where they already are.
     // Azure copies the transit blob into the permanent container itself and
-    // the job reads it from a 6-hour read SAS — no pull, no `files.upload`,
+    // the job reads it from a short-lived read SAS (AAI_SAS_TTL_MS) — no pull, no `files.upload`,
     // no bytes through this VM. Every way of not being eligible (flag off, no
     // account, a recorder upload, a group, a copy that failed) falls through
     // to the pull below with nothing changed; the transit blob is still there

@@ -114,12 +114,14 @@ const SCHEMA = SCHEMAS.MEETING_WHISPERER;
 export const AAI_FROM_BLOB_FLAG_ENV = 'MW_AAI_FROM_BLOB';
 
 /**
- * How long AssemblyAI may read the blob. The spec's number: "as short as the
- * longest realistic queue + processing time" — 6 h covers a multi-hour
- * recording behind a busy queue, and there is nothing to delete afterwards
- * because the SAS simply expires (DEC-4).
+ * How long AssemblyAI may read the blob. AssemblyAI fetches the file when the
+ * job is submitted (their own S3 guide signs for 30 min); Alok set 10 min on
+ * 2026-09-22 — the shorter the bearer link lives, the smaller the exposure.
+ * A fetch that misses the window fails the job at AssemblyAI, which the
+ * poller surfaces as an error with Retry (the VM holds the bytes). Nothing to
+ * delete afterwards: the SAS simply expires (DEC-4).
  */
-export const AAI_SAS_TTL_MS = 6 * 60 * 60_000;
+export const AAI_SAS_TTL_MS = 10 * 60_000;
 
 /**
  * How long the COPY may read the transit blob. Only Azure's own copy engine
