@@ -415,3 +415,129 @@ one and rides the existing flag/dual-write/diff-harness machinery.
 | F7 | `migrations/042_scratch.sql`, `src/db-ops/transcripts.ts:583, 2249-2273`, `src/app/api/transcripts/[id]/shares/route.ts`, `../cli/src/subcommands/meetings/README.md` (`list --scratch`, `upload --scratch`) |
 | F8 | `src/lib/server/account-auto-sync.ts:410-452, 558-595`, `src/lib/server/series-auto-import.ts:361`, `src/lib/server/gmeet-import-core.ts:572-1094`, `src/lib/server/teams-import-core.ts:280-589` |
 | F9 | `src/components/recording-strip.tsx:221-229` |
+
+---
+
+## As built — P1–P3 (2026-09-22, commits `7a1242b`, `68c06fe`, `4297190`)
+
+P1, P2 and P3 are shipped on `main`. Nothing from P4 onward was touched; §3–§4's surfaces, the
+share paths (P4/P5), the recordings endpoint (P6) and the model changes (P7–P9) are all still ahead.
+No migration, no deploy, no prod database was involved. Line numbers below are at `4297190`.
+
+### P1 — the calendar fold keys on the link (`7a1242b`)
+
+| Where | What it is now |
+|---|---|
+| `src/db-ops/recorder.ts:8-27` | The module header states the two reachability arms and says plainly that a match is not one of them. |
+| `src/db-ops/recorder.ts:311-315` (`RecorderCaller`) | Both folds now take `{userId, email}` — a share is keyed on the email, not the id. |
+| `src/db-ops/recorder.ts:327-357` (`linkedMeetingLateral`) | Arm (b) as a LATERAL: the meeting the recording is LINKED to (`transcripts.assemblyai_id = r.transcript_id`), when the caller owns it or holds a `transcript_shares` row on the lower-cased email, and when the MEETING'S OWN `gmeet_context.meetingCode` + `IMPORTED_OCCURRENCE_START` (±`OCCURRENCE_WINDOW_S`) say it is this occurrence. It never reads `matched`. |
+| `src/db-ops/recorder.ts:394-431` (`recordingsForOccurrences`) | `WHERE r.user_id = $caller OR linked.assemblyai_id IS NOT NULL` — arm (a) or arm (b), nothing else. The projection serves `linked.assemblyai_id AS linked_transcript_id` in place of the old `r.transcript_id`. |
+| `src/db-ops/recorder.ts:359-372` (`OccurrenceRecordingHit`) | `transcript_id` → `linked_transcript_id`. |
+| `src/app/api/calendar-meetings/route.ts:239-269` (`recorderRefOf`) | `transcriptId: hit.linked_transcript_id`. An unlinked recording — the caller's own included — hands out no meeting id, so the strip's "Open transcript" exists only where the caller can genuinely open it. |
+| `src/app/api/calendar-meetings/route.ts:108-114, 386-391` | Doc comments restated: the row carries the caller's own recording or one linked to a meeting they can open, never a colleague's unlinked one. |
+| `src/lib/recording-strip.ts:396-412` | NEW branch: `uploaded` with no linked meeting reads "Recorded on your Mac · 44m 31s · uploaded to your Recordings", no action. Without it the ref would have fallen through to the owner branch and said "not uploaded yet · Upload" about an uploaded file. |
+| `src/components/recording-strip.tsx:219-223` | The `actionHref` is unchanged in code; the comment above it records that `rec.transcriptId` is now arm (b) and only arm (b). |
+
+**Deviation (deliberate, documented in the code at `src/db-ops/recorder.ts:373-393`):** the batch fold still
+narrows candidates by the stored confident match before evaluating arm (b), so arm (b) is checked over
+confidently-matched rows only rather than over every linked recording. Doing it the other way round means a
+cross join of occurrences × recordings with a correlated EXISTS on a listing hot path. It costs nothing
+observable: the calendar layers anti-join every occurrence ANYONE has imported
+(`db-ops/imported-occurrences.ts` `importedOccurrenceAntiJoin`, used by `norecWhere` /`unimportedWhere`), so an
+occurrence whose linked meeting the caller can open is not served by these layers at all. Arm (b) is the belt
+on those braces. If P6/P7 ever serve a fold from a layer without that anti-join, the driving join must be
+rewritten.
+
+**Acceptance.** `src/db-ops/__tests__/recorder-occurrence-scope.test.ts` — 5 SQL-shape tests over the fake
+postgres tag (the arms, the meetings predicate with the lower-cased email, the lateral asking the meeting's own
+keys and never `matched`, the projection carrying only arm (b)'s id, the empty page asking nothing). The
+two-user fixture ran end to end against a **real scratch Postgres built from this repo's own migrations**
+(`bash scripts/scratch-db.sh up --dir tmp/recordings-p1 --port 55931 --db mw_p1 --schema-prefix p1test`, then
+`bun test ./tmp/recordings-p1/p1.check.ts` — 7 pass, 0 fail; `tmp/` is gitignored so the check is not
+committed):
+
+- A records the occurrence and does not upload → A's own row shows it, B's and C's are empty.
+- A uploads, does NOT link, shares that meeting with B → B's fold is empty; A's own hit carries no meeting id.
+- A links it and shares with B → B's fold has the row **with** the meeting id, attributed to A.
+- A links it and does not share → C's fold is empty; A's carries the id.
+- The share matches case-insensitively; trashing the meeting takes arm (b) with it.
+- A weak match is folded for nobody, the owner included.
+
+The Playwright pass over the norec layer for two live users named in the P1 row was **not** run (no deploy, no
+prod data): the database-level fixture above is what was proved.
+
+### P2 — the cross-user surface is gone (`68c06fe`)
+
+Removed: the `?event=` branch of `GET /api/recorder/recordings` (it now answers 400 and says why —
+`src/app/api/recorder/recordings/route.ts:42-50`); `othersView` / `OthersRecordingView` / the `RecordingView`
+union (`src/lib/server/recorder-view.ts`, header rewritten at `:7-17`); the whole
+`POST /api/recorder/recordings/:id/nudge` route file; `getRecordingAnyOwner`, `claimNudge`, `releaseNudge`,
+`lastNudgeAt`, `NUDGE_WINDOW_H` and the `recorder_nudges` LEFT JOIN on the fold; `nudgedAt` from
+`RecorderRecordingRef` and `nudged_at` from `OccurrenceRecordingHit`; `'nudge'` from `StripActionKind` and
+from `RecorderRowAction`; the "Ask X to upload" branches in `stripForRecorderRef`
+(`src/lib/recording-strip.ts:461-480`, now says who has it and offers nothing) and `recorderRowCopy`
+(`src/lib/recorder.ts:307-318`); the nudge fetch and its state in `RecorderRefStrip`
+(`src/components/recording-strip.tsx:186-230`).
+
+**The `recorder_nudges` table is untouched** — no migration, as P2 says; a later one drops it.
+
+`recordingsForOccurrence` (the single-occurrence fold, caller-scoped in P1) went with the listing it existed
+for, so its two P1 tests went with it. `?mine=1` — the only thing the Recordings surface and the tray read —
+keeps its shape byte for byte (`rows.map(ownView)`), and `ownView` is unchanged. **darth-cli never called
+any of `/api/recorder/**`** (checked `../cli/src`: no reference at all), so there is no CLI compatibility
+question; the tray only POSTs/PATCHes the registry (`poc/mac-recorder/Sources/darth-tray/Api.swift:14-15`).
+
+**Acceptance.** `src/lib/__tests__/recorder-cross-user-surface.test.ts` — 7 tests asserting the route file is
+gone, that nothing fetches `/nudge`, that `db-ops/recorder.ts` never names `recorder_nudges`, that the route
+serves `?mine=1` and answers `?event=` with a 400 rather than falling through, that only `ownView` exists, and
+that no ref carries nudge state. These are deliberately source-level: what must hold is that the code is not
+there to be called. A route-handler harness does not exist in this repo (no test mocks `withAuth`), and adding
+one would have meant a process-wide `mock.module` of `@/db-ops/recorder` — the hazard the clips test warns
+about at its head.
+
+### P3 — confident only, and a reader is told no guesses (`4297190`)
+
+| Where | What it is now |
+|---|---|
+| `src/lib/recorder.ts:143-167` (`recorderRowIsConfident`) | NEW, and the one question a surface asks: the server's `matched_confident` when the row carries it, `recorderMatchIsConfident(matched)` otherwise. Pure, so it is unit-testable and the client bundle needs no server module. |
+| `src/components/recordings-surface.tsx:67` | `OwnRecorderRecording` gained `matched_confident?: boolean` (the server has served it all along). |
+| `src/components/recordings-surface.tsx:426` (`MacCard`), `:588-592` (`BareCard`) | Both `MatchHint` call sites gated; `BareCard`'s one-click **Link to it** renders only for a confident match, and `linkSuggested` re-checks (`:505-509`). |
+| `src/components/recordings-surface.tsx:384-389` | The stale "The server links a confident calendar match at upload open (P1)" comment replaced with what is true since `6287854`. |
+| `src/lib/reader-redaction.ts` (NEW, 50 lines) | `redactForReader(row)`: for `access === 'read'`, drops `gmeet_context.suggestedEvent` entirely and reduces `gmeet_context.recorder` to `{recordingId}`. Owner/editor rows are returned **by identity**. |
+| `src/app/api/transcripts/[id]/route.ts:27, 72-79` | The GET payload goes through it. |
+
+**Deviations.** (1) §4.1 says the detail route redacts "`suggestedEvent` and `recorder`"; the task's own
+wording is "`suggestedEvent` or the recorder marker's **call details**", and that is what was built —
+`recorder.app` / `recorder.kind` go, `recorder.recordingId` stays, because a recording IS reachable through a
+meeting the caller can open and a read share is exactly that reachability (rule 3, `migrations/044` header).
+The reader loses the player's "no video, during a Slack call" sentence
+(`src/lib/suggested-event.ts:85`, rendered at `src/app/transcript/[id]/page.tsx:3321`) and nothing else.
+(2) `MatchHint` keeps its "· 82 %" score line — §3.1 lists deleting it, but that is the §3 surface rework, not
+P3. (3) One extra, in the same breath as the stale comment P3 names: the Recordings empty state said "Every
+recording belongs to a meeting … Recordings from Darth Recorder that match a calendar event land on that
+meeting directly" — the auto-link that no longer exists. Rewritten
+(`src/components/recordings-surface.tsx:212-217`).
+
+**Acceptance.** `src/lib/__tests__/recorder-row-confident.test.ts` (6) — the gate over both incident fixtures
+(the 17:03 Slack-vs-Teams 0.3 and the 15:56 clocks-alone 0.7), the server bit winning over the numbers, and a
+source check that both call sites and the two stale copies are as described. `src/lib/__tests__/reader-
+redaction.test.ts` (6) — the 17:03 row read-only ("Hypercare", the Teams code and "Slack" all absent from the
+serialised payload), a dismissed suggestion redacted too, a null context, and owner/editor identity.
+
+### Suite
+
+`bunx tsc --noEmit -p .` clean · `bunx eslint` clean on every touched file · `TZ=UTC bun test` **1156 pass, 0
+fail** across 70 files (1132 before this work: +24 committed tests, −2 that went with
+`recordingsForOccurrence`, −1 nudge test replaced) · `bun run build` green with no PG/AAI env.
+`src/db-ops/__tests__/helpers/fake-sql.ts` gained `sql.unsafe` (raw fragment, no parameter) so db-ops that
+splice a table alias into a predicate builder can be rendered at all.
+
+### Left for the next step
+
+- The owner-side suggestion strip on the caller's own calendar row (§2.3 point 4, §3.2) — P1 removes the
+  colleague-side hint and the owner's row now says "uploaded to your Recordings" with no action; the
+  "Looks like your recording … — Link · Not this" line that is meant to replace it is §3's work.
+- `recorderRowCopy` (`src/lib/recorder.ts:259-318`) has no caller outside its own test — a P9 deletion.
+- `resolveOccurrenceRef` (`src/lib/server/recorder-match.ts:270`) lost its only caller with the `?event=`
+  branch; kept because P6/P7 will want occurrence refs.
+- Everything in P4–P9, unchanged.
