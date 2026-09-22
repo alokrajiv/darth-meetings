@@ -25,7 +25,7 @@ import type { CalendarOverlapRow } from '@/db-ops/calendar-event-cache';
 
 mock.module('server-only', () => ({}));
 
-const { occurrenceProvider, scoreOccurrences, PROVIDER_MISMATCH_CAP } = await import(
+const { occurrenceProvider, scoreOccurrences, PROVIDER_MISMATCH_CAP, suggestedEventFromMatch } = await import(
   '@/lib/server/recorder-match'
 );
 const { recorderMatchIsConfident } = await import('@/lib/server/upload-pipeline');
@@ -205,6 +205,20 @@ describe('D1 — an unlinked recording is born with the CALL’s own name', () =
     );
   });
 
+  test('Slack window chrome — workspace, unread counter, tag, emoji — comes off too (the two real titles of 2026-09-22)', () => {
+    expect(
+      recorderCallTitle({ app: 'Slack', title: 'Swaralee (DM) - Trames Pte Ltd - 1 new item - Slack [Main] 🏠🔊' })
+    ).toBe('Swaralee (DM)');
+    expect(
+      recorderCallTitle({
+        app: 'Slack',
+        title: 'harshil, ivan, Swaralee, Umang (DM) - Trames Pte Ltd - 2 new items - Slack [Main] 🏠',
+      })
+    ).toBe('harshil, ivan, Swaralee, Umang (DM)');
+    // a title that is nothing but chrome → null (caller falls back to the filename)
+    expect(recorderCallTitle({ app: 'Slack', title: 'Trames Pte Ltd - 3 new items - Slack' })).toBeNull();
+  });
+
   test('a hyphenated meeting name survives (only known app names are cut)', () => {
     expect(recorderCallTitle({ title: 'Alok <> Paola - weekly' })).toBe('Alok <> Paola - weekly');
   });
@@ -213,5 +227,44 @@ describe('D1 — an unlinked recording is born with the CALL’s own name', () =
     expect(recorderCallTitle({ title: '   ' })).toBe(null);
     expect(recorderCallTitle({ title: 'Slack', app: 'Slack' })).toBe(null);
     expect(recorderCallTitle(null)).toBe(null);
+  });
+});
+
+describe('D2 — only a CONFIDENT match becomes a suggestion (17:03 SGT 2026-09-22)', () => {
+  const incidentLike = {
+    event_key: 'k|2026-09-22T16:30:00+08:00',
+    event_id: 'ev',
+    meeting_code: null,
+    occ_start: '2026-09-22T08:30:00.000Z',
+    occ_end: '2026-09-22T09:30:00.000Z',
+    title: 'Hypercare - PGLS Trames Go Live Support OKI - Perawang',
+    overlap: 1,
+    title_score: 0.143,
+    score: 0.3,
+    provider: 'teams' as const,
+    provider_mismatch: true as const,
+    candidates: [],
+    matched_at: '2026-09-22T08:58:50.000Z',
+    call_provider: 'slack' as const,
+  };
+  test('a Slack DM call offered a Teams invite at 0.3 is NOT a suggestion', () => {
+    expect(suggestedEventFromMatch(incidentLike, SLACK_CALL)).toBeNull();
+  });
+  test('time overlap alone (the 15:56 incident numbers) is NOT a suggestion either', () => {
+    expect(
+      suggestedEventFromMatch(
+        { ...incidentLike, score: 0.7, title_score: 0, provider: 'meet', provider_mismatch: undefined },
+        SLACK_CALL
+      )
+    ).toBeNull();
+  });
+  test('a confident match is', () => {
+    const s = suggestedEventFromMatch(
+      { ...incidentLike, score: 0.85, title_score: 0.5, provider: 'slack', provider_mismatch: undefined },
+      SLACK_CALL
+    );
+    expect(s).not.toBeNull();
+    expect(s!.title).toBe(incidentLike.title);
+    expect(s!.callKind).toBe('slack');
   });
 });

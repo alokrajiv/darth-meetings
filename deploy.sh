@@ -37,8 +37,12 @@ rsync "${RSYNC_FLAGS[@]}" \
 # per deploy even when the same commit is redeployed.
 BUILD_ID="$(git -C "$SRC_DIR" rev-parse --short HEAD 2>/dev/null || echo nogit)-$(date +%s)"
 echo "==> install + build on VM (BUILD_ID=$BUILD_ID)"
-ssh "$VM" "export PATH=\"\$HOME/.bun/bin:\$PATH\" BUILD_ID='$BUILD_ID' && cd '$APP_DIR' && bun install && bun run build" \
-  | tail -5
+# The build writes to a file on the VM and the tail is read after it exits:
+# piping the ssh session's stdout hung once (2026-09-22 16:39 SGT — the build
+# had finished and BUILD_ID was written, but a child kept the pipe open and
+# pm2 was never restarted). `-n` keeps ssh off our stdin as well.
+ssh -n "$VM" "export PATH=\"\$HOME/.bun/bin:\$PATH\" BUILD_ID='$BUILD_ID' && cd '$APP_DIR' \
+  && { bun install && bun run build; } > /tmp/mw-deploy-build.log 2>&1 < /dev/null; rc=\$?; tail -5 /tmp/mw-deploy-build.log; exit \$rc"
 
 echo "==> pm2 restart"
 ssh "$VM" "pm2 restart meeting-whisperer --update-env && sleep 3 && pm2 ls | grep meeting-whisperer"

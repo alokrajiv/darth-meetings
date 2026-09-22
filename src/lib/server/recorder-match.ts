@@ -6,7 +6,9 @@ import {
 } from '@/db-ops/calendar-event-cache';
 import type { CalendarOverlapRow } from '@/db-ops/calendar-event-cache';
 import type { ConferenceProvider, RecorderMatch, RecorderMatchCandidate } from '@/lib/recorder';
-import { callProvider } from '@/lib/recorder';
+import { callProvider,
+  recorderMatchIsConfident,
+} from '@/lib/recorder';
 import type { RecorderCall } from '@/db-ops/recorder';
 import type { SuggestedEvent } from '@/lib/format';
 
@@ -189,12 +191,16 @@ export function scoreOccurrences(
 
   const best = candidates[0];
   if (!best || best.score < MIN_SCORE) return null;
-  return {
+  const match: RecorderMatch = {
     ...best,
     candidates: candidates.slice(1, 4),
     matched_at: matchedAt,
     call_provider: provOfCall,
   };
+  // Stamped here so the tray (which only sees this object) asks "Link to …?"
+  // for a confident match and stays silent otherwise.
+  match.confident = recorderMatchIsConfident(match);
+  return match;
 }
 
 /**
@@ -213,6 +219,12 @@ export function suggestedEventFromMatch(
   if (!matched) return null;
   const key = typeof matched.event_key === 'string' ? matched.event_key.trim() : '';
   if (!key) return null;
+  // Only a CONFIDENT match is worth a question. 17:03 SGT 2026-09-22: a Slack
+  // DM call was offered a Teams invite at score 0.3 (provider mismatch, the
+  // only candidate) — to the person that read as the incident happening
+  // again. A weak guess stays on `recorder_recordings.matched` for the
+  // record and nowhere else; the link picker is always a click away.
+  if (!recorderMatchIsConfident(matched)) return null;
   return {
     key,
     eventId: matched.event_id ?? null,

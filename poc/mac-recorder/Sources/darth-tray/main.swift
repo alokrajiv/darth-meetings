@@ -4,7 +4,7 @@ import ScreenCaptureKit
 import ServiceManagement
 import RecorderCore
 
-let VERSION = "0.3.13"
+let VERSION = "0.3.14"
 let WS_PORT: UInt16 = 47800
 let PWA_URL = URL(string: "https://meetings.darth-internal.trames.io/")!
 /// Seconds between "the call ended" and an automatic stop.
@@ -690,6 +690,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let key = ((m["event_key"] as? String) ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
         let title = ((m["title"] as? String) ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
         guard !key.isEmpty, !title.isEmpty else { return nil }
+        // Only a CONFIDENT match earns the question (server-side bit, stamped at match time;
+        // a row matched by an older server has none and is treated as not confident). A weak
+        // guess — a Slack DM overlapping some Teams invite — is worse than no question: the
+        // person reads it as the recording being tied to the wrong meeting again.
+        guard (m["confident"] as? Bool) == true else { return nil }
         return EventSuggestion(key: key, title: title, start: (m["occ_start"] as? String).flatMap(Self.parseIso))
     }
 

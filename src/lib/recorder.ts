@@ -71,19 +71,33 @@ export function recorderCallTitle(
 ): string | null {
   const raw = typeof call?.title === 'string' ? call.title.trim() : '';
   if (!raw) return null;
-  let out = raw;
-  // One pass is enough in practice ("… - Slack", "… | Microsoft Teams"), but
-  // a browser title can carry two ("Meet - abc | Google Chrome").
-  for (let i = 0; i < 2; i++) {
-    const cut = /^(.*\S)\s*[|\u2013\u2014-]\s*([^|\u2013\u2014-]+)$/.exec(out);
-    if (!cut) break;
-    const tail = cut[2]!.trim().toLowerCase();
-    if (!APP_SUFFIXES.includes(tail)) break;
-    out = cut[1]!.trim();
-  }
+  // Window titles are " - " / " | " / " — " joined segments; the call's own
+  // name is the FIRST one and everything after it is chrome: the product
+  // ("Slack", "Microsoft Teams"), the workspace/company ("Trames Pte Ltd"),
+  // notification counts ("2 new items"), a window tag ("[Main]") and emoji.
+  // Drop trailing segments while they look like chrome; keep the rest.
+  const segs = raw.split(/\s+(?:[|\u2013\u2014-])\s+/);
+  while (segs.length > 1 && isTitleChrome(segs[segs.length - 1]!)) segs.pop();
+  let out = segs.join(' - ').trim();
+  // A lone tag/emoji tail glued without a separator ("Slack [Main] 🏠").
+  out = out.replace(/\s*\[[^\]]{0,40}\]\s*[\p{Extended_Pictographic}\s]*$/u, '').trim();
   const app = typeof call?.app === 'string' ? call.app.trim().toLowerCase() : '';
-  if (!out || out.toLowerCase() === app || APP_SUFFIXES.includes(out.toLowerCase())) return null;
+  if (!out || out.toLowerCase() === app || isTitleChrome(out)) return null;
   return out.slice(0, 300);
+}
+
+/** Is this title segment window chrome rather than the call's name? */
+function isTitleChrome(segRaw: string): boolean {
+  const seg = segRaw
+    .replace(/\[[^\]]{0,40}\]/g, '')
+    .replace(/[\p{Extended_Pictographic}\uFE0F]/gu, '')
+    .trim()
+    .toLowerCase();
+  if (!seg) return true;
+  if (APP_SUFFIXES.includes(seg)) return true;
+  if (/^\d+\s+new\s+items?$/.test(seg)) return true; // Slack's unread counter
+  if (/\b(pte\.?\s*ltd\.?|ltd\.?|inc\.?|llc|gmbh|plc|corp\.?|limited)$/.test(seg)) return true; // a company
+  return false;
 }
 
 /** One calendar occurrence a recording could belong to. */
@@ -120,6 +134,10 @@ export interface RecorderMatch extends RecorderMatchCandidate {
   /** What the TRAY said this call was (`call.kind` → provider), when it is
    * one we know. The other half of the D3 veto. */
   call_provider?: ConferenceProvider | null;
+  /** `recorderMatchIsConfident(this)` at match time — the ONE bit the tray
+   * reads before it asks "Link to …?" (rows matched before 2026-09-22 17:00
+   * SGT have no bit and are treated as not confident). */
+  confident?: boolean;
 }
 
 /** The confidence floor: below either number the match is weak. */
