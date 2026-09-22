@@ -54,8 +54,13 @@ export async function concatMediaToTemp(filenames: string[], opts: ConcatOpts = 
   // audio-only AAC — naming them .mp4 made the transcript page call them
   // "Uploaded video" and offer a video toggle (Alok 2026-08-30). The
   // re-encode path below already picks this way.
-  const firstHasVideo = filenames.length > 0 ? await hasVideo(filenames[0]!) : false;
-  const outName = `concat-${randomUUID()}.${firstHasVideo ? 'mp4' : 'm4a'}`;
+  //
+  // Asked of the SET, not of `filenames[0]`: a group whose first part is
+  // audio-only and whose later parts carry a window (Darth Recorder 0.3.15
+  // lets a video source be added mid-call) would otherwise be named `.m4a`
+  // and be treated as audio for the rest of its life (2026-09-22).
+  const anyHasVideo = (await Promise.all(filenames.map(hasVideo))).some(Boolean);
+  const outName = `concat-${randomUUID()}.${anyHasVideo ? 'mp4' : 'm4a'}`;
   const outAbs = path.join(workspace.dir, outName);
   // ffmpeg concat-demuxer list syntax: file 'path' — single quotes escaped.
   const list = filenames
@@ -115,29 +120,115 @@ export async function probeDurationSec(filename: string): Promise<number | null>
   }
 }
 
-async function hasVideo(filename: string): Promise<boolean> {
+/**
+ * What one part of a stitch actually contains. One ffprobe per file, read by
+ * both the container choice and the re-encode filter graph.
+ */
+interface PartProbe {
+  filename: string;
+  /** A real picture track — an mp4 cover-art `attached_pic` does not count. */
+  hasVideo: boolean;
+  /** How many audio streams the file carries (the tray writes mix+system+mic). */
+  audioTracks: number;
+  durationSec: number | null;
+  width: number | null;
+  height: number | null;
+  fps: number | null;
+}
+
+async function probePart(filename: string): Promise<PartProbe> {
+  const empty: PartProbe = {
+    filename,
+    hasVideo: false,
+    audioTracks: 0,
+    durationSec: null,
+    width: null,
+    height: null,
+    fps: null,
+  };
   try {
     const { stdout } = await execFileP(
       'ffprobe',
       [
         '-v', 'error',
-        '-select_streams', 'v:0',
-        '-show_entries', 'stream=codec_type',
-        '-of', 'csv=p=0',
+        '-show_entries', 'stream=codec_type,width,height,r_frame_rate:stream_disposition=attached_pic:format=duration',
+        '-of', 'json',
         resolveAudioPath(filename),
       ],
       { timeout: 30_000 }
     );
-    return stdout.trim().startsWith('video');
+    const parsed = JSON.parse(stdout) as {
+      streams?: Array<{
+        codec_type?: string;
+        width?: number;
+        height?: number;
+        r_frame_rate?: string;
+        disposition?: { attached_pic?: number };
+      }>;
+      format?: { duration?: string };
+    };
+    const streams = parsed.streams ?? [];
+    const video = streams.filter(
+      (s) => s.codec_type === 'video' && s.disposition?.attached_pic !== 1
+    );
+    const duration = Number(parsed.format?.duration ?? NaN);
+    const first = video[0];
+    return {
+      filename,
+      hasVideo: video.length > 0,
+      audioTracks: streams.filter((s) => s.codec_type === 'audio').length,
+      durationSec: Number.isFinite(duration) && duration > 0 ? duration : null,
+      width: first?.width ?? null,
+      height: first?.height ?? null,
+      fps: parseFps(first?.r_frame_rate),
+    };
   } catch {
-    return false;
+    return empty;
   }
 }
+
+/** ffprobe's `num/den` frame rate → a number, or null when it is unusable. */
+function parseFps(raw: string | undefined): number | null {
+  if (!raw) return null;
+  const [num, den] = raw.split('/');
+  const n = Number(num);
+  const d = den === undefined ? 1 : Number(den);
+  if (!Number.isFinite(n) || !Number.isFinite(d) || d === 0) return null;
+  const fps = n / d;
+  return fps > 0 && fps <= 240 ? fps : null;
+}
+
+async function hasVideo(filename: string): Promise<boolean> {
+  return (await probePart(filename)).hasVideo;
+}
+
+/** What the mixed-part stitch normalises every leg to. */
+const AUDIO_RATE = 48_000;
+const FALLBACK_W = 1280;
+const FALLBACK_H = 720;
+const FALLBACK_FPS = 30;
 
 /**
  * Re-encode concat for inputs the stream-copy demuxer can't join (mixed
  * containers/codecs — the normal case for user-uploaded files from different
- * devices). All-video inputs → h264+aac mp4; anything else → audio-only m4a.
+ * devices, and for a Darth Recorder group that gained a video source
+ * mid-call). ANY video input → h264+aac mp4; audio-only inputs → m4a.
+ *
+ * Two things this path has to get right, both learned the hard way:
+ *
+ *  - **Mixed parts keep the picture.** `part1.m4a · part2.mp4 · part3.m4a ·
+ *    part4.mp4` used to be judged by `allVideo`, so one audio-only part made
+ *    the whole output audio-only: ffmpeg exited 0, the log said the usual
+ *    "re-encoded — mixed codecs", and the window the person deliberately
+ *    added was silently discarded (found 2026-09-22). Now the audio-only
+ *    spans get BLACK video synthesised at the first video part's geometry so
+ *    the timeline still lines up with the audio.
+ *  - **Every audio track survives, in order.** The old graph mapped `[i:a:0]`
+ *    only, which threw away the mic track of any file whose mix is not track
+ *    0. Track 0 of each part stays track 0 of the output — `normalizeMultiTrack`
+ *    and `tracks.mixFirst` both depend on that — and a part with fewer tracks
+ *    than the widest one is padded with silence rather than shortening the set.
+ *
  * Slow by design (real transcode); callers should try concatMediaToTemp
  * first. Use concatMediaSmart for the try-fast-then-fall-back pair.
  */
@@ -147,17 +238,116 @@ export async function concatMediaReencodeToTemp(
 ): Promise<string> {
   const workspace = await openWorkspace(opts.scratchId);
   const n = filenames.length;
-  const allVideo = (await Promise.all(filenames.map(hasVideo))).every(Boolean);
-  const outName = allVideo ? `concat-${randomUUID()}.mp4` : `concat-${randomUUID()}.m4a`;
+  const probes = await Promise.all(filenames.map(probePart));
+  const anyVideo = probes.some((p) => p.hasVideo);
+  const allVideo = probes.every((p) => p.hasVideo);
+
+  // Black video can only be synthesised for a span whose length we know. A
+  // part with an unreadable duration is the one case where the picture still
+  // has to go — say so loudly instead of letting it vanish into the old
+  // "(re-encoded — mixed codecs)" line.
+  const unmeasured = probes.filter((p) => !p.hasVideo && p.durationSec == null);
+  if (anyVideo && !allVideo && unmeasured.length > 0) {
+    console.warn(
+      `[concat] cannot read the duration of ${unmeasured.map((p) => p.filename).join(', ')} — ` +
+        'stitching audio only; the video parts lose their picture'
+    );
+  }
+  const videoOut = anyVideo && (allVideo || unmeasured.length === 0);
+
+  // Widest track count wins; a part with fewer gets silence for the missing
+  // ones. Same duration caveat as the black video above.
+  const maxTracks = probes.reduce((m, p) => Math.max(m, p.audioTracks), 0);
+  const minTracks = probes.reduce((m, p) => Math.min(m, p.audioTracks), maxTracks);
+  const unpaddable = probes.some((p) => p.audioTracks < maxTracks && p.durationSec == null);
+  const tracks = unpaddable ? minTracks : maxTracks;
+  if (unpaddable && minTracks < maxTracks) {
+    console.warn(
+      `[concat] a part with fewer than ${maxTracks} audio tracks has no readable duration — ` +
+        `stitching ${tracks} track(s)`
+    );
+  }
+  if (!videoOut && tracks === 0) {
+    await dropScratchDir(workspace.scratch);
+    throw new Error('ffmpeg re-encode concat failed: no usable audio or video streams in the parts');
+  }
+
+  const geo = probes.find((p) => p.hasVideo && p.width && p.height);
+  const W = geo?.width ?? FALLBACK_W;
+  const H = geo?.height ?? FALLBACK_H;
+  const FPS = Math.round((geo?.fps ?? FALLBACK_FPS) * 1000) / 1000;
+
+  if (videoOut && !allVideo) {
+    const silentParts = probes.filter((p) => !p.hasVideo).length;
+    console.log(
+      `[concat] mixed parts: ${silentParts} audio-only, ${n - silentParts} video — ` +
+        'black video synthesised for the audio-only span(s)'
+    );
+  }
+
+  const outName = `concat-${randomUUID()}.${videoOut ? 'mp4' : 'm4a'}`;
   const outAbs = path.join(workspace.dir, outName);
-  const inputs = filenames.flatMap((f) => ['-i', resolveAudioPath(f)]);
-  const filter = allVideo
-    ? filenames.map((_, i) => `[${i}:v:0][${i}:a:0]`).join('') + `concat=n=${n}:v=1:a=1[v][a]`
-    : filenames.map((_, i) => `[${i}:a:0]`).join('') + `concat=n=${n}:v=0:a=1[a]`;
-  const maps = allVideo ? ['-map', '[v]', '-map', '[a]'] : ['-map', '[a]'];
-  const codecs = allVideo
-    ? ['-c:v', 'libx264', '-preset', 'veryfast', '-crf', '23', '-c:a', 'aac', '-b:a', '128k']
-    : ['-c:a', 'aac', '-b:a', '128k'];
+
+  // Real files first, then the lavfi generators, so a file's input index is
+  // simply its position in `filenames`.
+  const inputs: string[] = probes.flatMap((p) => ['-i', resolveAudioPath(p.filename)]);
+  let nextIdx = n;
+  const blackIdx = new Map<number, number>();
+  const silenceIdx = new Map<string, number>();
+  probes.forEach((p, i) => {
+    const dur = (p.durationSec ?? 0).toFixed(3);
+    if (videoOut && !p.hasVideo) {
+      inputs.push('-f', 'lavfi', '-t', dur, '-i', `color=c=black:s=${W}x${H}:r=${FPS}`);
+      blackIdx.set(i, nextIdx++);
+    }
+    for (let t = p.audioTracks; t < tracks; t++) {
+      inputs.push(
+        '-f', 'lavfi',
+        '-t', dur,
+        '-i', `anullsrc=channel_layout=stereo:sample_rate=${AUDIO_RATE}`
+      );
+      silenceIdx.set(`${i}:${t}`, nextIdx++);
+    }
+  });
+
+  // Every leg normalised to one size/SAR/fps and one sample rate/layout —
+  // the concat filter refuses segments whose streams disagree.
+  const chains: string[] = [];
+  const segments: string[] = [];
+  probes.forEach((p, i) => {
+    if (videoOut) {
+      chains.push(
+        p.hasVideo
+          ? `[${i}:v:0]scale=${W}:${H}:force_original_aspect_ratio=decrease,pad=${W}:${H}:-1:-1:color=black,setsar=1,fps=${FPS},format=yuv420p[v${i}]`
+          : `[${blackIdx.get(i)}:v:0]setsar=1,fps=${FPS},format=yuv420p[v${i}]`
+      );
+      segments.push(`[v${i}]`);
+    }
+    for (let t = 0; t < tracks; t++) {
+      const src = t < p.audioTracks ? `[${i}:a:${t}]` : `[${silenceIdx.get(`${i}:${t}`)}:a:0]`;
+      chains.push(
+        `${src}aresample=${AUDIO_RATE},aformat=sample_rates=${AUDIO_RATE}:channel_layouts=stereo[a${i}_${t}]`
+      );
+      segments.push(`[a${i}_${t}]`);
+    }
+  });
+  const outLabels =
+    (videoOut ? '[cv]' : '') + Array.from({ length: tracks }, (_, t) => `[ca${t}]`).join('');
+  const filter =
+    chains.join(';') +
+    ';' +
+    segments.join('') +
+    `concat=n=${n}:v=${videoOut ? 1 : 0}:a=${tracks}${outLabels}`;
+  const maps = [
+    ...(videoOut ? ['-map', '[cv]'] : []),
+    ...Array.from({ length: tracks }, (_, t) => ['-map', `[ca${t}]`]).flat(),
+  ];
+  const codecs = [
+    ...(videoOut
+      ? ['-c:v', 'libx264', '-preset', 'veryfast', '-crf', '23', '-pix_fmt', 'yuv420p']
+      : []),
+    ...(tracks > 0 ? ['-c:a', 'aac', '-b:a', '128k'] : []),
+  ];
   try {
     await execFileP(
       'ffmpeg',

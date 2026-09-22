@@ -65,3 +65,35 @@ Title = `matched.title` → `call.title` → the started-at date. Several upload
 - **D-B** in `docs/recordings-first-class-design.md` (Recorder uploads land as bare recordings, no AAI until claimed) — Alok's decision, untouched; P1 is compatible with it.
 - Live progress PATCHed to the server so a *phone* sees percentages during a blob upload (the server only sees bytes at `complete`); today it sees "part N of M".
 - Fewer segments per share flip (a re-share of the same window within seconds could reuse the segment).
+
+## 6. Mixed parts in one group — the stitch (added 2026-09-22)
+
+Tray 0.3.15 lets a person give an audio-only recording a video source mid-call, so a group's parts
+are no longer all of one kind: `part1.m4a · part2.mp4 · part3.m4a · part4.mp4` is a normal upload now.
+
+What that costs the server side: `concatMediaSmart` sees the differing stream signatures, skips the
+`-c copy` fast path (right) and re-encodes — and the re-encode branch used to decide `v=0`/`v=1` on
+`allVideo`, so ONE audio-only part made the whole stitch audio-only, named `.m4a`. ffmpeg exited 0,
+the log printed the usual "(re-encoded — mixed codecs)", the transcript was correct (track 0 is the
+live mix) and the screen the person had deliberately added never reached the meeting. Found
+2026-09-22 19:05 SGT by the tray builder, verified end to end.
+
+`src/lib/server/media-concat.ts` now decides on `anyVideo`:
+
+- **Audio-only spans get black video.** `-f lavfi -t <probed duration> -i color=c=black:s=WxH:r=FPS`
+  per audio-only part, W×H×FPS taken from the first video part; every video leg is normalised
+  (`scale`+`pad`+`setsar=1`+`fps`) so the concat filter accepts the segments. Output is `.mp4`.
+  One log line: `[concat] mixed parts: N audio-only, M video — black video synthesised for the
+  audio-only span(s)`. If an audio-only part's duration is unreadable the picture still has to go,
+  and that now says so loudly instead of hiding in the generic line.
+- **Every audio track is carried, in order.** The old graph mapped `[i:a:0]` only — it dropped the
+  mic track of any file whose mix is not track 0. Each part's track *t* stays track *t* of the
+  output (what `tracks.mixFirst` and `normalizeMultiTrack` both depend on); a part with fewer
+  tracks than the widest one is padded with silence rather than shortening the set. Legs go through
+  `aresample=48000` + `aformat=…:channel_layouts=stereo`, so the mix stays the widest-and-first
+  track that ffmpeg's automatic selection picks.
+- **The fast path names its container from the SET**, not from `filenames[0]`: an audio-first group
+  whose later parts carry a window is `.mp4`, not `.m4a`.
+
+Covered by `src/lib/server/__tests__/media-concat-mixed.test.ts` — real ffmpeg on 2 s lavfi inputs,
+skipped when ffmpeg is not on PATH.
