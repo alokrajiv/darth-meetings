@@ -24,6 +24,7 @@ import { refreshIfPending } from '@/lib/server/transcript-sync';
 import { removeRecordingGraphForMeeting } from '@/lib/server/recording-sync';
 import { deleteAnnotationsForMeeting } from '@/db-ops/transcriptions';
 import { mayDeleteRecordingFiles } from '@/lib/clips';
+import { redactForReader } from '@/lib/reader-redaction';
 
 export const runtime = 'nodejs';
 
@@ -69,12 +70,12 @@ export const GET = withAuth(async ({ user }, { params }) => {
   const owner = access.access === 'owner' ? null : await identityForUser(access.ownerUserId);
 
   return NextResponse.json({
-    transcript: {
+    transcript: redactForReader({
       ...withoutSplitSource(refreshed),
       access: access.access,
       owner_email: owner?.email ?? null,
       owner_name: owner?.name ?? null,
-    },
+    }),
   });
 });
 

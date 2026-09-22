@@ -21,7 +21,7 @@ import { formatBytes, formatDuration, type TranscriptListRow, type TranscriptLis
 import { isBareRecording, meetingTitleOf, shortWhen } from '@/lib/meeting-title';
 import { stripForArchiveRow, stripForRecorderRef, type StripActionKind } from '@/lib/recording-strip';
 import type { RecorderMatch, RecorderRecordingRef } from '@/lib/recorder';
-import { RECORDING_STALE_MS } from '@/lib/recorder';
+import { recorderRowIsConfident, RECORDING_STALE_MS } from '@/lib/recorder';
 import {
   getCompanion,
   useCompanion,
@@ -61,6 +61,10 @@ export interface OwnRecorderRecording {
   segments: unknown;
   call: { title?: string; app?: string; kind?: string } | null;
   matched: RecorderMatch | null;
+  /** The server's verdict on `matched` — the ONE definition of confident
+   * (lib/server/recorder-view). Absent on a row the server matched before
+   * 2026-09-22 17:00 SGT; `recorderRowIsConfident()` below re-derives it. */
+  matched_confident?: boolean;
   transcript_id: string | null;
   error: string | null;
 }
@@ -205,11 +209,10 @@ export function RecordingsSurface({ data, disabled = false, onChanged }: Recordi
           <div className="grid h-10 w-10 place-items-center rounded-lg bg-muted">
             <Laptop className="h-5 w-5 text-muted-foreground" />
           </div>
-          <p className="mt-3 text-sm font-medium">Every recording belongs to a meeting</p>
+          <p className="mt-3 text-sm font-medium">Nothing waiting here</p>
           <p className="mt-1 max-w-md text-xs text-muted-foreground">
-            Recordings from Darth Recorder that match a calendar event land on that meeting directly.
-            Anything that could not be matched — or an upload with no title — waits here until you link
-            or name it.
+            A recording is yours and stays yours. When one looks like a meeting in your calendar it
+            says so here and you decide — nothing is linked or shared on a match alone.
           </p>
         </div>
       )}
@@ -295,7 +298,8 @@ function SectionHeading({ title, count, sub }: { title: string; count: number; s
   );
 }
 
-/** "Looks like Data scrum · 14:00 · 82 %" — the matcher's best guess. */
+/** "Looks like Data scrum · 14:00 · 82 %" — the matcher's best guess, shown
+ * only when it is a confident one, and only ever to the owner. */
 function MatchHint({ m, onLink, busy }: { m: RecorderMatch | null; onLink?: () => void; busy?: boolean }) {
   if (!m || !m.title) return null;
   const when = new Date(m.occ_start).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
@@ -380,8 +384,9 @@ function MacCard({
   const onAction = (kind: StripActionKind) => {
     setNote(null);
     if (kind === 'upload') {
-      // The server links a confident calendar match at upload open (P1) —
-      // nothing to pass from here.
+      // No linked event: the server has not linked an upload to a calendar
+      // match since 6287854, and never will — linking is the person's
+      // action, taken from the card's own suggestion or the Link dialog.
       const ok = getCompanion().upload(r.id, null);
       setNote(ok ? 'uploading…' : 'Open Darth Recorder on that Mac to upload it');
       onChanged();
@@ -418,7 +423,7 @@ function MacCard({
           </button>
         )}
       </div>
-      <MatchHint m={r.matched} />
+      <MatchHint m={recorderRowIsConfident(r) ? r.matched : null} />
       <RecordingStrip
         model={model}
         noGlyph
@@ -500,7 +505,8 @@ function BareCard({
     });
   const linkSuggested = () =>
     run('link', async () => {
-      if (!reg?.matched?.event_key) return;
+      // Belt on the braces: the button only renders for a confident match.
+      if (!recorderRowIsConfident(reg) || !reg?.matched?.event_key) return;
       const res = await fetch(`/api/transcripts/${row.assemblyai_id}/link-event`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -579,7 +585,11 @@ function BareCard({
           )}
         </div>
       </div>
-      <MatchHint m={reg?.matched ?? null} onLink={reg?.matched?.event_key && !placeholder ? linkSuggested : undefined} busy={busy === 'link'} />
+      <MatchHint
+        m={recorderRowIsConfident(reg) ? reg!.matched : null}
+        onLink={recorderRowIsConfident(reg) && reg!.matched!.event_key && !placeholder ? linkSuggested : undefined}
+        busy={busy === 'link'}
+      />
       <RecordingStrip
         model={model}
         noGlyph

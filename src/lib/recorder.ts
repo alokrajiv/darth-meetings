@@ -140,6 +140,27 @@ export interface RecorderMatch extends RecorderMatchCandidate {
   confident?: boolean;
 }
 
+/**
+ * Is a registry row's match one a surface may SHOW as a suggestion? The
+ * server's own bit when the row carries one (`matched_confident`, computed
+ * by lib/server/recorder-view from the function below), the shared
+ * definition otherwise — never the raw score.
+ *
+ * F3: until P3 the Recordings surface rendered EVERY match, however weak,
+ * with a one-click "Link to it". That is how a Slack DM was offered the
+ * Hypercare Teams invite at 0.3 on 2026-09-22 17:03, hours after the tray
+ * and the calendar strip had both been taught to ask only on confidence. A
+ * weak match stays on the row for the record; it is not a suggestion, and
+ * it is never one click from a link.
+ */
+export function recorderRowIsConfident(
+  row: { matched: RecorderMatch | null; matched_confident?: boolean } | null | undefined
+): boolean {
+  if (!row?.matched) return false;
+  if (typeof row.matched_confident === 'boolean') return row.matched_confident;
+  return recorderMatchIsConfident(row.matched);
+}
+
 /** The confidence floor: below either number the match is weak. */
 export const RECORDER_AUTOLINK_MIN_SCORE = 0.6;
 export const RECORDER_AUTOLINK_MIN_OVERLAP = 0.5;
