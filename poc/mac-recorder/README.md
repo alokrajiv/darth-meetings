@@ -14,6 +14,53 @@ Native macOS side of Darth Meetings recording (the "Swift tray" angle from Darth
 the user switched it off in the menu (`loginItemUserChoice` in UserDefaults records an explicit choice;
 the default never overrides it). macOS may show "Darth Recorder was added as a login item" once.
 
+**0.3.13 (2026-09-22) — linking a recording to a meeting is the USER's action.** The server's
+matcher (`recorder-match.ts`) scores every recording against the calendar occurrences it overlaps,
+and `POST /api/uploads` used to turn a confident match into a LINK all by itself. On 2026-09-22 a
+private Slack DM huddle (15:48, `call.kind = "slack"`) was born as the Google Meet event "Triton
+next steps!" (15:30–16:30) on time overlap alone — title score 0 — and the link auto-shared it with
+the event's 8 invitees the moment the placeholder existed. Nobody but the owner had opened it;
+the repair was by hand. The rule now (`docs/recorder-link-confirm-spec.md`): **the match is a
+suggestion, the link is an answer.**
+
+- **The card.** When a recording ends and the registry row carries a `matched` event with a key and
+  a title, the upload card becomes a question: *Link to "Triton next steps!" (15:30)?* with the
+  call's own app, clock time and window title underneath — *This recording: Slack · 15:48 ·
+  "Swaralee (DM) - Trames Pte Ltd …"* — so a Slack huddle offered a Meet event is obvious at a
+  glance. Buttons: **Link** / **Not this**. There is no × on it.
+- **Link** uploads with `linkedEvent: { key: <matched.event_key> }` on part 1 — the same explicit
+  link the web stepper sends, resolved server-side into title, date, attendees and invitee shares,
+  because a human said yes. **Not this** uploads UNLINKED and stamps the row `link_prompt:
+  "not_this"`; when the upload comes back with a transcript id the tray opens
+  `…/transcript/<id>?link=1`, the page's own "link the calendar event" picker. **No answer** —
+  card replaced, ignored, app quit — is unlinked, never linked: a 60 s deadline (`LINK_ASK_LIFE`)
+  resolves it and starts the upload. The bytes never wait longer than that, and the answer starts
+  nothing if the recording has meanwhile been sent by the menu, the PWA or a launch drain.
+- **Timing.** The link can only be declared on part 1, so the question must be asked before the
+  first byte. A row that has no `matched` yet waits `LINK_MATCH_GRACE` (2 s) for the stop PATCH's
+  answer — the server re-matches on every write — and then either asks or goes up unlinked exactly
+  as before. A recording with no match behaves as it always did.
+- **Test hook.** `{cmd:"simulate_link_card", recording_id?, event_title?, event_start?, life?,
+  real?, auto?}` over the ws port. Without `real` it only DRAWS the card (no upload, no registry
+  write) and answers `{type:"link_card_answer", answer}`; with `real: true` it runs the genuine
+  `askLink` for that row. `auto: "link" | "not_this"` presses that button 1.5 s later, so the whole
+  chain is testable without a call. Verified 2026-09-22 against a tray pointed at a fake API
+  (`DARTH_TRAY_API_URL`): Link → body carries `linkedEvent {key}`, Not this → no `linkedEvent` and
+  `link_prompt` on the row, no answer → unlinked upload at +61 s, already-uploaded row → nothing.
+- **Slack huddles and screen shares (D6).** The share watcher never saw the 15:48 huddle share
+  anything, and the unified log says why: in that whole window `replayd` created exactly ONE
+  ScreenCaptureKit stream — ours (`accessing=io.trames.darth.recorder`, `outputType=2`, audio only,
+  15:48:52 → 15:56:54). `com.tinyspeck.slackmacgap` appears in `tccd` only as the subject of its own
+  `kTCCServiceScreenCapture` PREFLIGHT queries at 15:48:42/44 (Slack asking whether it may share,
+  as it does whenever a huddle starts), never as `accessing=` on a request `com.apple.replayd` made
+  — and over 2026-09-20…22 no Slack line in `tccd`/`replayd` mentions replayd at all. So there is
+  nothing to add to the watcher (which has no per-app list anyway: it reports whatever bundle tccd
+  attributes, and only our own is suppressed). Note also that a Slack call is recorded AUDIO ONLY
+  by design (`RecordingController.profile(for:)`: `.slack → .audioOnly`), so such a recording has
+  no video whatever anyone shares. Whether a real huddle share would show up in the log is still
+  unproven — no app on this Mac used SCK in those two days: start a huddle, share a window, and
+  grep the watcher's own predicate for `Created New Stream` + the attribution line to settle it.
+
 **0.3.12 (2026-09-22) — the tray makes the mix itself, as the first audio track.** A Darth
 Recorder file has always carried its sources unmixed — system audio as track 0, the microphone
 as track 1 — and the server mixed them at ingest (`src/lib/server/multitrack.ts`). That mix-down

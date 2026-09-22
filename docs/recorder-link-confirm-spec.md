@@ -244,4 +244,107 @@ psql "$(…meeting-whisperer prod conn…)" -f migrations/048_share_origin.sql  
 
 ## As built — B
 
-(builder B appends)
+Built 2026-09-22, 16:05–16:45 SGT (tray only: `poc/mac-recorder/**` + this section). Version **0.3.13**,
+`swift build -c release --product darth-tray` clean (0 errors; the only warnings in the two files I touched are
+pre-existing lines — `main.swift:1215` `Any?`→`Any`, `Banner.swift:502/543`). **Not released**: no
+`make-app.sh --release`, no `deploy-to-dot6.sh`, nothing published to the update feed — Alok's call. The dev
+build was installed to `~/Applications` for testing and Alok's `/Applications` 0.3.12 release is running again.
+
+### D4-tray — the card, the answer, the upload
+
+- **The question** (`Sources/darth-tray/Banner.swift:272` `showLinkConfirm`, actions `:316`, handlers `:623/:627`):
+  *Link to "Triton next steps!" (15:30)?* with the call's own line underneath —
+  *This recording: Slack · 15:48 · "Swaralee (DM) - Trames Pte Ltd - 1 new item…"*. Buttons **Link** (primary) /
+  **Not this** (secondary); no × (`set(...)` hides it), so the two buttons and the deadline are the only ways out.
+  App and clock time come BEFORE the window title in that line on purpose: a call app's title is 60 characters of
+  notification noise and what makes a wrong match obvious is the app and the time.
+- **When it is asked** (`main.swift:1084`, in `recordingStopped`): `willUpload && !terminating &&
+  matchedSuggestion(id) != nil`. `matchedSuggestion` (`:687`) reads `matched.event_key` + `matched.title` off the
+  registry row — the server's own match, mirrored by every sync answer (`Api.swift:191`) — and needs both to ask.
+  A recording with no match behaves exactly as before. While the card is up the recording is NOT marked as
+  uploading (no tracker, no progress card): it is not uploading yet.
+- **The answers** (`askLink` `:724`, `answerLink` `:744`). Link → `startUpload(id, linkedEvent: ["key": key])`.
+  Not this → `Registry.update(id, ["link_prompt": "not_this"])` + an unlinked upload; when that upload comes back
+  with a transcript id (`uploader.onDone`, `main.swift:284`) the tray opens
+  `…/transcript/<id>?link=1` (`openTranscript(_:link:)` `:615`) and clears the stamp. The stamp is on the ROW,
+  not in memory, so a retry after a restart still opens the linker. No answer → `LINK_ASK_LIFE` 60 s card life +
+  a 61 s deadline timer (`main.swift:18`) → unlinked upload, silent card. The table `linkAsks` (`:111`) is keyed
+  by recording and the FIRST answer takes the entry, so Link / Not this / the deadline can never start two
+  uploads; and an answer whose recording is no longer `local`/`upload_failed` (menu "Upload … now", the PWA, a
+  launch drain got there first) starts nothing (`:752`).
+- **A match that lands late** (`startUploadAfterMatch` `:776`): the server re-matches on every write, so the stop
+  PATCH's answer often carries the match a few hundred ms after the recording is saved — and the link can only be
+  declared on part 1. A saved recording with no match yet therefore waits `LINK_MATCH_GRACE` = 2 s (`:22`) and
+  then asks or uploads unlinked. Nothing else about the upload path changed: auto-retry (30 min), the hide-able
+  card, the saved card's live progress and the launch drain are untouched (the drain and the retry timer never
+  ask — the question belongs to a recording that has just ended).
+- **The wire** (`Uploader.swift:302`, contract §3): part 1 only, after the user tapped Link, the open body carries
+  `linkedEvent: { key: <matched.event_key> }` **and `eventRef: <the same key>`**. The second field is an addition
+  I made deliberately, not a change to §3: as of A's commit 6287854 nothing server-side resolves
+  `linkedEvent.key` — `sanitizeLinkedEvent` (`src/lib/server/upload-pipeline.ts:63`) spreads it into a
+  truthy-but-empty `LinkedEventInput`, which would (a) link nothing and (b) still clear `suggestedEvent`
+  (`src/app/api/uploads/route.ts:232`), i.e. the person taps Link and loses both the link and the suggestion.
+  `eventRef` is the headless form the CLI already uses, it wins when both are present ("The ref wins", route
+  `:143-149`) and it resolves to the same occurrence, so the two can never disagree. **A (or whoever picks this
+  up): please resolve `linkedEvent.key` through `resolveLinkedEventRef` too** — then either field works and the
+  `eventRef` belt can come off.
+- **A link must never strand a recording** (`Uploader.swift:351`): if the open is refused 4xx with a message
+  mentioning the event, the tray drops the link, logs `upload_link_rejected` and re-opens WITHOUT it, so the
+  bytes go up unlinked (the web suggestion strip can still link them) instead of failing every 30 minutes forever.
+
+**Tested** (dev build via `./make-app.sh`, then `open -n … --env DARTH_TRAY_API_URL=http://127.0.0.1:8899`
+against a fake API, so not one byte of this reached prod; ws driven with a bun one-liner):
+
+| what | how | result |
+| --- | --- | --- |
+| copy + layout | `{cmd:"simulate_link_card", recording_id:<the incident row 753b7e06>}` | `Link to "Triton next steps!" (15:30)? / This recording: Slack · 15:48 · "Swaralee (DM) - Trames Pte Ltd - 1 new item…"` |
+| Link | real ask (`real:true, auto:"link"`) on a synthetic row | open body = `linkedEvent {key}` + `eventRef` + `recorderRecordingId` |
+| Not this | `real:true, auto:"not_this"` | open body has NO `linkedEvent`/`eventRef`; row carries `link_prompt: "not_this"` |
+| no answer | `real:true`, nobody clicks | `link: no_answer` at +61 s, unlinked upload |
+| already sent | real ask on an `uploaded` row | "is already uploaded — the answer starts nothing", no request |
+| unresolvable key | fake API answering 404 "No such event in your calendar cache." | link dropped, second open without it, clear failure message |
+| `?link=1` | `openTranscript` URL built in isolation | `https://meetings.darth-internal.trames.io/transcript/<id>?link=1` |
+
+The two buttons were pressed by `banner.simulateClick` (the card's own `performClick`) through the new test hook
+`{cmd:"simulate_link_card", recording_id?, event_title?, event_start?, life?, real?, auto?}` — without `real` it
+only DRAWS the card and answers `{type:"link_card_answer", answer}` (no upload, no registry write); with `real`
+it runs the genuine `askLink` for that row. Nothing was recorded, no screen was captured, no screenshot taken.
+
+### D6 — does the share watcher see a Slack huddle share? No, and there was nothing to see
+
+Unified log only (`/usr/bin/log show`, `process == "replayd" OR process == "tccd"`, 15:45–16:00 SGT 2026-09-22,
+and a 2-day sweep 09-20 → 09-22 16:10).
+
+- In that whole 15 minutes `replayd` created **exactly one** ScreenCaptureKit stream, and it was ours:
+  `AUTHREQ_ATTRIBUTION … accessing={… io.trames.darth.recorder, pid=52420}, requesting={… com.apple.replayd}` at
+  15:48:52, `SLContentFilter initWithDisplay … displayID = 0x2, shareAll = YES`, `isFullDisplayShare=1
+  outputType=2` (audio only — the recording itself), `Created New Stream … Hash=7613093917214077131`, torn down
+  15:56:54. No other `initWithClientBundleID`, no other `Created New Stream`.
+- `com.tinyspeck.slackmacgap` **is** in the log — 114 `accessing=…slackmacgap.helper` TCC lines — but never with
+  `requesting={TCCDProcess: identifier=com.apple.replayd}`, which is the only shape that says "this app is
+  sharing". Slack's only screen-capture contact is two `AUTHREQ_CTX … service=kTCCServiceScreenCapture,
+  preflight=yes, query=1` at 15:48:42 and 15:48:44 (msgID 16707.349/351 = Slack): it is ASKING whether it may
+  share, as it does whenever a huddle starts, not sharing. Over 2026-09-20 → 09-22 not one Slack line in
+  `tccd`/`replayd` mentions replayd at all, and the only SCK client on this Mac in those two days was Darth
+  Recorder (1 stream).
+- **So: nothing changed in the watcher.** There is nothing to add anyway — `ShareDetector` has no per-app list;
+  it reports whatever bundle `tccd` attributes to a replayd request and suppresses only our own
+  (`ShareDetector.swift:246`). Adding a bundle id is not a thing it can do.
+- Two facts for the D6-web copy: (1) a Slack call is recorded **audio only by design** —
+  `RecordingController.profile(for:)` maps `.slack → (.audioOnly, "Slack huddle")`
+  (`RecordingController.swift:64`) — so such a recording has no video whatever anybody shares, which is the
+  honest half of the sentence; (2) whether a REAL huddle share would show up is still **unproven**, because
+  nobody on this Mac shared a screen in those two days. To settle it: start a huddle, share a window, and grep
+  the watcher's own predicate for `Created New Stream` plus the attribution line that precedes it. Until then the
+  copy should not promise either way beyond "screen shares in Slack are not captured" (which is true regardless,
+  since the profile is audio-only).
+
+### Left / owed
+
+- The web's `?link=1` picker is A's (D4-web); the tray only opens the URL.
+- `linkedEvent.key` resolution on the server (above) — until then the `eventRef` field is what actually links.
+- Not released. When Alok wants it: `./make-app.sh --release` then `dist-scripts/deploy-to-dot6.sh`.
+- The tray asks only when a recording ENDS. A recording that goes up from the launch drain or the 30-minute
+  retry (e.g. made while signed out) never asks — it is born unlinked and the web suggestion strip is its path.
+- Registry rows now may carry the tray-private key `link_prompt` (`"not_this"`, cleared when the linker opens).
+  It is stripped from `Registry.serverBody`, like every other private key.

@@ -4,7 +4,7 @@ import ScreenCaptureKit
 import ServiceManagement
 import RecorderCore
 
-let VERSION = "0.3.12"
+let VERSION = "0.3.13"
 let WS_PORT: UInt16 = 47800
 let PWA_URL = URL(string: "https://meetings.darth-internal.trames.io/")!
 /// Seconds between "the call ended" and an automatic stop.
@@ -13,6 +13,13 @@ let STOP_GRACE: TimeInterval = 60
 /// its transcription hand-off fails (AssemblyAI down / out of credit): the bytes stay on this
 /// Mac as `upload_failed` and must go up later without anyone clicking.
 let UPLOAD_RETRY_INTERVAL: TimeInterval = 30 * 60
+/// 0.3.13 (D4): how long the "Link to <event>?" card waits for an answer before the
+/// recording goes up UNLINKED. No answer is never a link — docs/recorder-link-confirm-spec.md.
+let LINK_ASK_LIFE: TimeInterval = 60
+/// How long a saved recording waits for the stop PATCH's answer (which carries a freshly
+/// computed `matched`) before its bytes start moving. The link can only be declared on
+/// part 1, so the question has to be asked before the first byte.
+let LINK_MATCH_GRACE: TimeInterval = 2
 
 /// Menu-bar app "Darth Recorder".
 ///
@@ -98,6 +105,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         return i
     }()
     var retryTimer: Timer?
+    /// 0.3.13 (D4): recordings whose upload is waiting on a "Link to <event>?" card, and the
+    /// timer that resolves each one to "unlinked" when nobody answers. An entry is removed by
+    /// the FIRST answer, so Link / Not this / the deadline can never start two uploads.
+    var linkAsks: [String: Timer] = [:]
     let stopItem = NSMenuItem(title: "Stop recording", action: #selector(stopFromMenu), keyEquivalent: "s")
     let previewItem = NSMenuItem(title: "Show preview", action: #selector(togglePreview), keyEquivalent: "p")
     let bannerItem = NSMenuItem(title: "Show banner", action: #selector(toggleBanner), keyEquivalent: "b")
@@ -267,6 +278,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             let title = self.uploadTitle(for: row)
             let recorded = (row?["duration"] as? Int) ?? Int((row?["duration"] as? Double) ?? 0)
             self.uploads.done(id: id, transcriptId: tid, title: title)
+            // 0.3.13 (D4): the person said "Not this" when we asked about the matched event.
+            // The recording went up unlinked; now that it HAS a transcript, take them to it
+            // with the link picker open so they connect it to the right meeting themselves.
+            if (row?["link_prompt"] as? String) == "not_this" {
+                Registry.shared.update(id, ["link_prompt": NSNull()])
+                if !tid.isEmpty {
+                    rlog("link: \(id) was not that event — opening the web linker for transcript \(tid)")
+                    self.openTranscript(tid, link: true)
+                }
+            }
             self.banner.showUploaded(title: title, seconds: recorded, bytes: bytes, elapsed: seconds) { [weak self] in
                 self?.openTranscript(tid)
             }
@@ -589,10 +610,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    /// The transcript an upload became (the PWA falls back to its home page).
-    func openTranscript(_ transcriptId: String?) {
+    /// The transcript an upload became (the PWA falls back to its home page). `link: true`
+    /// adds `?link=1`, which opens the page's "link the calendar event" picker (0.3.13, D4).
+    func openTranscript(_ transcriptId: String?, link: Bool = false) {
         guard let transcriptId, !transcriptId.isEmpty else { NSWorkspace.shared.open(PWA_URL); return }
-        NSWorkspace.shared.open(PWA_URL.appendingPathComponent("transcript").appendingPathComponent(transcriptId))
+        var url = PWA_URL.appendingPathComponent("transcript").appendingPathComponent(transcriptId)
+        if link, var c = URLComponents(url: url, resolvingAgainstBaseURL: false) {
+            c.queryItems = [URLQueryItem(name: "link", value: "1")]
+            url = c.url ?? url
+        }
+        NSWorkspace.shared.open(url)
     }
 
     /// What this recording is called: the calendar event it was matched to, then the call's own
@@ -641,6 +668,136 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if card, auth.signedIn { banner.showUploading(title: f.title, bytesTotal: f.bytes, recordingId: id) }
         refreshUploadLine()
         uploader.upload(recordingId: id, linkedEvent: linkedEvent)
+    }
+
+    // MARK: link confirm (D4)
+
+    /// What the SERVER's matcher thinks a recording belongs to: a suggestion mirrored into
+    /// the registry by every sync answer (`ApiClient.syncRecording`), never a link.
+    struct EventSuggestion {
+        let key: String
+        let title: String
+        let start: Date?
+    }
+
+    /// The matched occurrence of `id`, when there is one worth asking about — it needs a key
+    /// (what an explicit link is made of) and a title (what the question shows). Everything
+    /// else about the match, its score included, stays on the server: the tray asks the
+    /// person, it does not second-guess the matcher.
+    func matchedSuggestion(_ id: String) -> EventSuggestion? {
+        guard !id.isEmpty, let row = Registry.shared.get(id),
+              let m = row["matched"] as? [String: Any] else { return nil }
+        let key = ((m["event_key"] as? String) ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        let title = ((m["title"] as? String) ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !key.isEmpty, !title.isEmpty else { return nil }
+        return EventSuggestion(key: key, title: title, start: (m["occ_start"] as? String).flatMap(Self.parseIso))
+    }
+
+    /// The call this recording came from, in the person's own words — "This recording: Slack ·
+    /// “Swaralee (DM)” · 15:48". It sits next to the event on the link card, so a Slack huddle
+    /// offered a Google Meet event is obvious at a glance.
+    func callLine(_ id: String) -> String {
+        let row = Registry.shared.get(id)
+        let c = row?["call"] as? [String: Any]
+        var bits: [String] = []
+        if let app = (c?["app"] as? String)?.trimmingCharacters(in: .whitespaces), !app.isEmpty {
+            bits.append(app)
+        } else if let k = (c?["kind"] as? String).flatMap({ CallKind(rawValue: $0) }) {
+            bits.append(kindName(k))
+        }
+        // App and clock time first, the window title last: a call app's title can be 60
+        // characters of notification noise ("… - 1 new item - Slack [Main]"), and what makes
+        // a wrong match obvious is the app and the time, not the tail of the title.
+        if let st = row?["started_at"] as? String, let d = Self.parseIso(st) { bits.append(Self.hhmm(d)) }
+        if let t = (c?["title"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines), !t.isEmpty {
+            bits.append("“\(Self.clip(Self.stripCallPrefix(t), 44))”")
+        }
+        return bits.isEmpty ? "This recording" : "This recording: " + bits.joined(separator: " · ")
+    }
+
+    /// A window title cut down to what a one-line card can carry.
+    static func clip(_ s: String, _ max: Int) -> String {
+        s.count <= max ? s : String(s.prefix(max - 1)).trimmingCharacters(in: .whitespaces) + "…"
+    }
+
+    /// Put the question on screen and hand the upload to whoever answers first.
+    func askLink(_ id: String, suggestion s: EventSuggestion) {
+        guard linkAsks[id] == nil, !uploader.isUploading(id) else { return }
+        EventLog.shared.log("link_ask", ["recording_id": id, "event_key": s.key, "event_title": s.title,
+                                         "event_start": s.start.map(isoString) ?? NSNull()],
+                            summary: "link: asking whether \(id) is “\(s.title)”")
+        banner.showLinkConfirm(eventTitle: s.title, eventWhen: s.start.map(Self.hhmm),
+                               callLine: callLine(id), life: LINK_ASK_LIFE,
+                               onLink: { [weak self] in self?.answerLink(id, key: s.key, answer: "link") },
+                               onNotThis: { [weak self] in self?.answerLink(id, key: s.key, answer: "not_this") })
+        // The deadline is the authority: a card that is replaced, missed or ignored resolves
+        // to "unlinked" on its own, and the bytes never wait longer than this.
+        let t = Timer.scheduledTimer(withTimeInterval: LINK_ASK_LIFE + 1, repeats: false) { [weak self] _ in
+            self?.answerLink(id, key: s.key, answer: "no_answer")
+        }
+        t.tolerance = 2
+        linkAsks[id] = t
+    }
+
+    /// Link / Not this / nobody answered. Exactly one of these ever runs per recording (the
+    /// table entry is taken here), and each one starts the upload.
+    func answerLink(_ id: String, key: String, answer: String) {
+        guard let t = linkAsks.removeValue(forKey: id) else { return }
+        t.invalidate()
+        EventLog.shared.log("link_answer", ["recording_id": id, "event_key": key, "answer": answer],
+                            summary: "link: \(answer) for \(id)")
+        // Somebody sent it while the card was up (menu "Upload … now", the PWA, a launch
+        // drain) — the answer has nothing left to start, and the deadline must never push a
+        // recording that is already on its way or already there.
+        let status = (Registry.shared.get(id)?["status"] as? String) ?? "local"
+        guard status == "local" || status == "upload_failed" else {
+            rlog("link: \(id) is already \(status) — the answer starts nothing")
+            return
+        }
+        switch answer {
+        case "link":
+            // The human said yes: an explicit link the server resolves exactly as the web
+            // stepper's (title, date, attendees, invitee shares).
+            startUpload(id, linkedEvent: ["key": key], card: true)
+        case "not_this":
+            // Unlinked, and the web linker opens once the transcript exists (uploader.onDone).
+            // Written to the row, not to memory, so a retry after a restart still opens it.
+            Registry.shared.update(id, ["link_prompt": "not_this"])
+            startUpload(id, card: true)
+        default:
+            startUpload(id, card: false)
+        }
+    }
+
+    /// 0.3.13 (D4): the stop PATCH's answer carries a freshly computed `matched` and lands a
+    /// few hundred ms after the recording is saved; the question can only be asked before
+    /// part 1 opens. So a recording with no match yet waits LINK_MATCH_GRACE for one, then
+    /// either asks or goes up unlinked exactly as before.
+    func startUploadAfterMatch(_ id: String) {
+        guard auth.signedIn, !id.isEmpty else { startUpload(id, card: false); return }
+        DispatchQueue.main.asyncAfter(deadline: .now() + LINK_MATCH_GRACE) { [weak self] in
+            guard let self, !self.terminating, !self.uploader.isUploading(id),
+                  Registry.shared.get(id) != nil else { return }
+            if let s = self.matchedSuggestion(id) { self.askLink(id, suggestion: s) }
+            else { self.startUpload(id, card: false) }
+        }
+    }
+
+    /// ISO-8601 with or without fractional seconds (the server writes both shapes).
+    static func parseIso(_ s: String) -> Date? {
+        let f = ISO8601DateFormatter()
+        f.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        if let d = f.date(from: s) { return d }
+        f.formatOptions = [.withInternetDateTime]
+        return f.date(from: s)
+    }
+
+    /// Clock time in the person's own timezone — the only form a "was it this meeting?"
+    /// question can be answered in.
+    static func hhmm(_ d: Date) -> String {
+        let f = DateFormatter()
+        f.dateFormat = "HH:mm"
+        return f.string(from: d)
     }
 
     func kindName(_ k: CallKind) -> String {
@@ -921,16 +1078,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let willUpload = autoUpload && auth.signedIn && !id.isEmpty && !keepLocal
         let path = (saved["path"] as? String).map { URL(fileURLWithPath: $0) }
         let secs = (saved["seconds"] as? Int) ?? 0
+        // 0.3.13 (D4): the server has already matched this recording to a calendar
+        // occurrence — ASK before the bytes move. Linking a recording to a meeting is the
+        // user's action; the tray never declares `linkedEvent` on its own.
+        let suggestion = willUpload && !terminating ? matchedSuggestion(id) : nil
         // The saved card IS the upload card (0.3.9): it needs the recording's id and its real
-        // size before the first tick, so the tracker is armed here, ahead of the card.
-        let facts: (title: String, bytes: Int, parts: Int) = willUpload ? uploadFacts(id) : ("", 0, 1)
-        if willUpload {
+        // size before the first tick, so the tracker is armed here, ahead of the card. A
+        // recording that is about to ask is not uploading yet, so neither is its tracker.
+        let facts: (title: String, bytes: Int, parts: Int) = willUpload && suggestion == nil ? uploadFacts(id) : ("", 0, 1)
+        if willUpload, suggestion == nil {
             uploads.started(id: id, title: facts.title, bytesTotal: facts.bytes, segmentsTotal: facts.parts)
             refreshUploadLine()
         }
         if !auth.signedIn && !id.isEmpty {
             banner.showSignIn(title: "Recording saved (\(secs / 60)m \(secs % 60)s) — sign in to upload",
                               sub: "It is on this Mac only until you sign in to Darth Meetings.") { [weak self] in self?.auth.signIn() }
+        } else if let s = suggestion {
+            askLink(id, suggestion: s)
         } else {
             banner.showSaved(path ?? Paths.recordings, seconds: secs,
                              segments: (saved["segments"] as? Int) ?? 1, uploading: willUpload, keptLocal: keepLocal,
@@ -943,8 +1107,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             rlog("recording \(id) saved on the way out — uploads at next launch")
             return
         }
-        if willUpload {
-            startUpload(id, card: false)
+        if suggestion != nil {
+            // The link card owns this upload now: Link / Not this / the deadline start it.
+        } else if willUpload {
+            startUploadAfterMatch(id)
         } else if keepLocal {
             rlog("recording \(id) kept on this Mac by request — not uploaded")
         } else if !auth.signedIn && !id.isEmpty {
@@ -1207,6 +1373,42 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                                  startedAt: Date())
             shares.injectShare(info)
         case "end_simulated_share": shares.endInjectedShare(id: obj["id"] as? String)
+        case "simulate_link_card":
+            // 0.3.13 (D4) — test hook. WITHOUT `real` it only draws the "Link to <event>?"
+            // card and reports which button was pressed: no upload, no registry write. With a
+            // `recording_id` the card carries THAT recording's own call line and its matched
+            // event, so the copy can be checked against a real row.
+            let rid = (obj["recording_id"] as? String) ?? ""
+            let sug = matchedSuggestion(rid)
+            // `real: true` runs the REAL ask for that registry row (`askLink`) instead of the
+            // drawn-only card: the answer starts its upload exactly as the end of a recording
+            // would. Same power as the ws `upload` command, which the PWA already has.
+            if obj["real"] as? Bool == true, let s = sug {
+                askLink(rid, suggestion: s)
+                if let auto = obj["auto"] as? String {
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak self] in
+                        self?.banner.simulateClick(auto == "not_this" ? "secondary" : "primary")
+                    }
+                }
+                return
+            }
+            let evTitle = (obj["event_title"] as? String) ?? sug?.title ?? "Triton next steps!"
+            let evStart = (obj["event_start"] as? String).flatMap(Self.parseIso) ?? sug?.start
+            let line = rid.isEmpty ? "This recording: Slack · “a huddle” · \(Self.hhmm(Date()))" : callLine(rid)
+            let answered: (String) -> Void = { [weak self] a in
+                rlog("link card (simulated): \(a)")
+                EventLog.shared.log("link_answer_simulated", ["answer": a, "recording_id": rid, "event_title": evTitle])
+                self?.server.broadcast(["type": "link_card_answer", "answer": a, "recording_id": rid])
+            }
+            banner.showLinkConfirm(eventTitle: evTitle, eventWhen: evStart.map(Self.hhmm), callLine: line,
+                                   life: (obj["life"] as? Double) ?? LINK_ASK_LIFE,
+                                   onLink: { answered("link") }, onNotThis: { answered("not_this") })
+            // `auto: "link" | "not_this"` presses that button a moment later — the wiring test.
+            if let auto = obj["auto"] as? String {
+                DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak self] in
+                    self?.banner.simulateClick(auto == "not_this" ? "secondary" : "primary")
+                }
+            }
         case "login": if !auth.signedIn { auth.signIn() } else { broadcast("auth_changed") }
         case "logout": auth.signOut()
         case "set_auto_upload":

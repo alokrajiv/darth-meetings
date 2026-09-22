@@ -267,6 +267,14 @@ final class Uploader: NSObject, URLSessionTaskDelegate {
                         group: String?, index: Int, total: Int, groupBytes: Int,
                         progress: @escaping (Int64) -> Void) -> PutResult {
         let t0 = Date()
+        // 0.3.13 (D4): a link is only ever here because the person tapped Link on the card.
+        // It is declared BOTH ways — `linkedEvent: {key}` (the spec's contract,
+        // docs/recorder-link-confirm-spec.md §3) and `eventRef: <key>`, the headless
+        // "resolve this event from my own calendar cache" form the CLI already uses and the
+        // one the server resolves today. The ref wins server-side when both are present and
+        // resolves to the same occurrence, so the two can never disagree.
+        var linkDeclared = linkedEvent != nil
+        var linkDropped = false
         var fingerprint = "tray:" + sha256.prefix(40)
         if let group { fingerprint += "|g:\(group):\(index)" }
         rlog("upload: \(file.lastPathComponent) \(size) B sha256 \(sha256.prefix(12))…")
@@ -291,7 +299,10 @@ final class Uploader: NSObject, URLSessionTaskDelegate {
                 // which sends the upload down the pull path exactly as before.
                 "tracks": ["count": audioTracks, "mixFirst": mixFirst],
             ]
-            if let linkedEvent, index == 1 { body["linkedEvent"] = linkedEvent }
+            if let linkedEvent, index == 1, linkDeclared {
+                body["linkedEvent"] = linkedEvent
+                if let key = linkedEvent["key"] as? String, !key.isEmpty { body["eventRef"] = key }
+            }
             if let group {
                 // groupBytes (0.3.9) = the sum of every part's size, so the placeholder row is
                 // born knowing the whole recording's size instead of part 1's (P2).
@@ -337,8 +348,18 @@ final class Uploader: NSObject, URLSessionTaskDelegate {
                 continue
             } catch StepError.sessionGone(let why) {
                 return .failure("upload session expired (\(why))")
+            } catch StepError.giveUp(let why) where linkDeclared && why.localizedCaseInsensitiveContains("event") {
+                // The server would not resolve the occurrence the person picked. A recording
+                // must never be stuck behind a link: it goes up UNLINKED and the web's
+                // suggestion strip is still there to link it by hand.
+                linkDeclared = false
+                linkDropped = true
+                rlog("upload: \(file.lastPathComponent) — the server rejected the calendar link (\(why)); sending it unlinked")
+                EventLog.shared.log("upload_link_rejected", ["recording_id": recordingId, "why": why],
+                                    summary: "upload: \(recordingId) — link rejected (\(why)), uploading unlinked")
+                continue
             } catch StepError.giveUp(let why) {
-                return .failure(why)
+                return .failure(linkDropped ? "\(why) (the calendar link was dropped first)" : why)
             } catch StepError.http(let e) {
                 return .failure(e.code == 0 ? e.message : "HTTP \(e.code): \(e.message)")
             } catch {

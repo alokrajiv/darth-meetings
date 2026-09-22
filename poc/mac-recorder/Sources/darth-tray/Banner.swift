@@ -261,6 +261,41 @@ final class BannerController {
         present(compact: false, autoHideAfter: 20, near: nil)
     }
 
+    /// 0.3.13 (D4): the server's matcher thinks this recording belongs to a calendar
+    /// occurrence — ASK. Linking a recording to a meeting is the USER's action (2026-09-22:
+    /// a private Slack huddle was auto-linked to a Meet event and shared with 8 people the
+    /// moment it was born — docs/recorder-link-confirm-spec.md). [Link] sends that event with
+    /// the upload, [Not this] uploads it unlinked and takes the person to the web linker, and
+    /// a card nobody answers means unlinked — never linked. The call's own app and title sit
+    /// in the sub line, so a Slack call offered a Google Meet event is obvious at a glance.
+    /// No × on this card: the two buttons and the deadline are the only ways out.
+    func showLinkConfirm(eventTitle: String, eventWhen: String?, callLine: String, life: TimeInterval,
+                         onLink: @escaping () -> Void, onNotThis: @escaping () -> Void) {
+        tickTimer?.invalidate()
+        linkAction = onLink
+        notThisAction = onNotThis
+        set(symbol: "calendar.badge.plus", accent: .info,
+            title: "Link to “\(shorten(eventTitle, 34))”\(eventWhen.map { " (\($0))" } ?? "")?",
+            sub: shorten(callLine, 88))
+        primary.isHidden = false
+        primary.title = "Link"
+        primary.target = self; primary.action = #selector(linkTapped)
+        secondary.isHidden = false
+        secondary.title = "Not this"
+        secondary.target = self; secondary.action = #selector(notThisTapped)
+        present(compact: false, autoHideAfter: life, near: nil)
+        EventLog.shared.log("banner_shown", ["kind": "link_confirm", "event": eventTitle,
+                                             "when": eventWhen ?? NSNull(), "life_s": life,
+                                             "title": titleLabel.stringValue, "sub": subLabel.stringValue])
+        rlog("banner: link card — \(titleLabel.stringValue) / \(subLabel.stringValue)")
+    }
+
+    /// Test hook (ws `simulate_link_card` with `auto`): press one of the card's own buttons,
+    /// so the button → target/action → callback wiring is exercised without a human clicking.
+    func simulateClick(_ which: String) {
+        (which == "secondary" ? secondary : primary).performClick(nil)
+    }
+
     func hide() {
         hideTimer?.invalidate(); hideTimer = nil
         tickTimer?.invalidate(); tickTimer = nil
@@ -277,6 +312,9 @@ final class BannerController {
     private var signInAction: (() -> Void)?
     private var openAction: (() -> Void)?
     private var retryAction: (() -> Void)?
+    /// 0.3.13 (D4): the two answers to the "Link to <event>?" card.
+    private var linkAction: (() -> Void)?
+    private var notThisAction: (() -> Void)?
     /// The recording whose live upload card is on screen (0.3.9) — `set(...)` clears it, so a
     /// progress tick can never rewrite somebody else's card.
     private var currentUploadId: String?
@@ -581,6 +619,14 @@ final class BannerController {
     @objc private func retryTapped() {
         EventLog.shared.log("banner_click", ["button": "retry_upload"], summary: "banner: Retry now clicked")
         hide(); retryAction?()
+    }
+    @objc private func linkTapped() {
+        EventLog.shared.log("banner_click", ["button": "link"], summary: "banner: Link clicked")
+        hide(); linkAction?()
+    }
+    @objc private func notThisTapped() {
+        EventLog.shared.log("banner_click", ["button": "not_this"], summary: "banner: Not this clicked")
+        hide(); notThisAction?()
     }
     @objc private func signInTapped() { EventLog.shared.log("banner_click", ["action": "sign_in"]); hide(); signInAction?() }
     @objc private func showFileTapped() {
