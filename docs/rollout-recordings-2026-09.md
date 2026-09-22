@@ -134,8 +134,10 @@ are finished within 5 min of a restart. Deploys are safe to do mid-transcription
       seek, and check Safari (the one browser no fake could prove — the player falls back to the app path by itself).
       **Flag on 2026-09-22 15:48 SGT** after the drain finished (817 files / 80.60 GB, 15:36 SGT) and
       `--check-blobs --limit 1000` said 817/817. Proven: darth-cli `audio` (bearer, no `redirect=1`) still streams
-      from the app — nginx `200 78556`. **Still to observe:** the first browser play answering `302` to
-      `darthmedia.blob.core.windows.net` (a watcher tails nginx for it), then the phone / seek / Safari pass by a human.
+      from the app — nginx `200 78556`. **Observed 15:57 SGT (Alok's laptop, transcript page):** the player's
+      `GET /audio` answered `302` (to the blob SAS), and the offline pin's `GET /audio?variant=audio` — which sends
+      `x-darth-media-via: app` on purpose — streamed `200` 14.9 MB from the app. Both branches as designed.
+      Still yours: the phone / seek / Safari pass.
       **Found on the way (fixed 279e0d4, deployed 15:47 SGT):** the recording-sync hook archived each upload's
       canonical BEFORE the faststart remux rewrote it, so five of today's blobs held pre-remux bytes (`--check-blobs`
       caught them: blob 7–15 KB shorter than the row). A stamped row is now re-checked against the blob on every
