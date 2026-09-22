@@ -85,7 +85,6 @@ final class Uploader: NSObject, URLSessionTaskDelegate {
     /// and a video part), so the server's stitch will keep the audio and DROP the video.
     /// (id, audio-only parts, video parts) — the tray says so instead of letting it happen
     /// quietly. See the note in `upload(recordingId:)`.
-    var onMixedParts: ((String, Int, Int) -> Void)?
 
     static let blockTimeout: TimeInterval = 180
     /// Backoff between attempts after a failure (seconds; the last repeats) and how long one
@@ -135,21 +134,12 @@ final class Uploader: NSObject, URLSessionTaskDelegate {
         // microphone can be denied after the options were chosen); 0 on a row that predates it,
         // which says "I do not know" and is exactly as informational as it sounds.
         let audioTracks = (row["audio_tracks"] as? Int) ?? 0
-        // 0.3.15: a recording can now mix audio-only and video parts — the person added a
-        // video source to an audio-only recording (or dropped back to audio). The FILES are
-        // all correct; what is not is the server's stitch. Verified in the repo on
-        // 2026-09-22: `concatMediaSmart` (src/lib/server/media-concat.ts:227-252) probes the
-        // stream signatures, finds they differ, skips the `-c copy` fast path and re-encodes
-        // — and the re-encode branch decides `allVideo` from EVERY input
-        // (media-concat.ts:150), so one audio-only part makes the whole concat `v=0`
-        // (media-concat.ts:156) and writes an `.m4a`. ffmpeg exits 0. The video is gone and
-        // nothing says so. The audio is whole (track 0 is the live mix), so the transcript is
-        // right — but the person's picked screen is not in the meeting.
-        //
-        // There is no "upload the parts separately" route: `videoParts` is written only by the
-        // Google-Meet importers, no upload field selects it, and a multi group has exactly one
-        // outcome (concat). So the tray uploads as before and TELLS the person, and the
-        // registry row remembers it. The server fix is in the report.
+        // 0.3.15: a recording can mix audio-only and video parts — the person added a video
+        // source to an audio-only recording (or dropped back to audio). The files and each
+        // part's facts are right; the server stitches them since meetings fa9f692 (black video
+        // is synthesised over the audio-only spans, every audio track kept in order). The event
+        // + registry flag are the record of which recordings were mixed — cheap, and useful
+        // when a stitched meeting is questioned.
         let kinds = Dictionary(grouping: files) { $0.pathExtension.lowercased() == "m4a" ? "audio" : "video" }
         let audioParts = kinds["audio"]?.count ?? 0
         let videoParts = kinds["video"]?.count ?? 0
@@ -159,8 +149,7 @@ final class Uploader: NSObject, URLSessionTaskDelegate {
             EventLog.shared.log("upload_mixed_parts", [
                 "recording_id": id, "audio_parts": audioParts, "video_parts": videoParts,
                 "files": files.map { $0.lastPathComponent },
-            ], summary: "upload: \(id) has \(audioParts) audio-only and \(videoParts) video part(s) — the server stitch keeps the audio and DROPS the video; the video part stays on this Mac")
-            DispatchQueue.main.async { self.onMixedParts?(id, audioParts, videoParts) }
+            ], summary: "upload: \(id) has \(audioParts) audio-only and \(videoParts) video part(s) — stitched server-side, black video over the audio-only spans")
         }
         let total = sizes.reduce(0, +)
         guard total > 0 else {

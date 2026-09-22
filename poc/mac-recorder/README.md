@@ -45,19 +45,13 @@ and until now that was the end of the story for the rest of the recording.
   (`part2` and `part4` both probed 1312×844).
 - **Mixed parts and the server.** One recording can now hold an `.m4a` part and an `.mp4` part. The
   files are right and each part's facts are right (`tracks: {count, mixFirst}` is per-recording and
-  unchanged across parts; `contentType` follows each file's extension). **The server's stitch is
-  not**: `concatMediaSmart` (`src/lib/server/media-concat.ts:227-252`) sees the stream signatures
-  differ, skips the `-c copy` fast path, and the re-encode branch decides `allVideo` from every
-  input (`:150`) — so one audio-only part makes the whole concat `v=0` (`:156`) and writes an
-  `.m4a`. ffmpeg exits 0; the video is dropped and nothing says so. The audio is whole (track 0 is
-  the live mix), so the transcript is right. There is no "upload the parts separately" route —
-  `gmeet_context.videoParts` is written only by the Meet importers and no upload field selects it.
-  So the tray uploads as before and **says so**: `upload_mixed_parts` in the event log, `mixed_parts`
-  on the registry row, and a banner — *"The video part stays on this Mac"*. The server fix belongs
-  in `concatMediaReencodeToTemp`: when `anyVideo && !allVideo`, synthesize black video for the
-  audio-only parts (`-f lavfi -i color=…` sized to the video parts) and use `v=1` + `.mp4`; or do
-  what `docs/recordings-first-class-design.md:206-210, 256-258` already commits to and stop
-  concatenating at all.
+  unchanged across parts; `contentType` follows each file's extension). The server stitches such a
+  group since meetings `fa9f692` (2026-09-22, deployed the same evening): `concatMediaReencodeToTemp`
+  synthesises black video sized like the video parts over every audio-only span, keeps every audio
+  track in order (track 0 stays the live mix) and writes `.mp4`. Before that commit the re-encode
+  branch decided `allVideo` from every input and silently wrote an audio-only `.m4a`. The tray keeps
+  `upload_mixed_parts` in the event log and `mixed_parts` on the registry row as the record of which
+  recordings were mixed; the "video stays on this Mac" banner that 0.3.15 briefly carried is gone.
 
 **0.3.13 (2026-09-22) — linking a recording to a meeting is the USER's action.** The server's
 matcher (`recorder-match.ts`) scores every recording against the calendar occurrences it overlaps,

@@ -291,15 +291,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 "bytes_sent": p.bytesSent, "bytes_total": p.bytesTotal, "pct": p.pct, "title": title,
             ])
         }
-        uploader.onMixedParts = { [weak self] id, audioParts, videoParts in
-            guard let self else { return }
-            // 0.3.15: said out loud, because the server would otherwise drop the video without
-            // a word. The files themselves are all on this Mac and all correct.
-            rlog("upload: \(id) mixes \(audioParts) audio-only and \(videoParts) video part(s)")
-            self.banner.showMessage(title: "The video part stays on this Mac",
-                                    sub: "This recording began as audio only, so the uploaded meeting is audio. The video you added is in Movies › Darth Recorder.",
-                                    accent: .warning, autoHide: 12)
-        }
         uploader.onDone = { [weak self] id, tid, bytes, seconds in
             guard let self else { return }
             let row = Registry.shared.get(id)
