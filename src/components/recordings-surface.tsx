@@ -355,6 +355,10 @@ function MacCard({
     startedAt: r.started_at,
     durationS: r.duration_s,
     transcriptId: r.transcript_id,
+    ownTranscriptId: r.transcript_id,
+    // This surface has its own MatchHint; the calendar row is where the
+    // suggestion strip lives.
+    suggestedEvent: null,
   };
   const model = stripForRecorderRef(ref, { trayConnected: trayHasIt, fmtDuration: formatDuration });
   if (live) {

@@ -14,6 +14,7 @@ import {
   type StripActionKind,
   type StripTone,
 } from '@/lib/recording-strip';
+import { SuggestedEventStrip } from '@/components/suggested-event-strip';
 import { OFFLINE_TITLE } from '@/lib/offline/offline-types';
 
 /**
@@ -178,11 +179,13 @@ export interface RecorderRefStripProps {
   };
   /** A Teams-chat verdict this strip replaces (kept in the tooltip). */
   originalNote?: string | null;
+  /** The owner linked or dismissed the suggestion — the host refetches. */
+  onChanged?: (what: 'linked' | 'dismissed') => void;
   disabled?: boolean;
   className?: string;
 }
 
-export function RecorderRefStrip({ rec, event, originalNote, disabled = false, className }: RecorderRefStripProps) {
+export function RecorderRefStrip({ rec, event, originalNote, onChanged, disabled = false, className }: RecorderRefStripProps) {
   const companion = useCompanion();
   const [note, setNote] = useState<string | null>(null);
   const model = stripForRecorderRef(rec, {
@@ -212,19 +215,46 @@ export function RecorderRefStrip({ rec, event, originalNote, disabled = false, c
     }
   };
 
-  // `rec.transcriptId` is arm (b) and only arm (b): the server sets it only
-  // when this recording is linked to a meeting the caller can already open
-  // (P1). Before that it was built from a machine match, which handed a
+  // Two ids, two meanings. `transcriptId` is arm (b): the server sets it
+  // only when this recording is linked to a meeting the caller can already
+  // open (P1) — before that it was built from a machine match and handed a
   // private meeting's id to people who were never shared on it.
-  return (
+  // `ownTranscriptId` is arm (a) and is served to the OWNER alone: a
+  // recording is reachable by its owner whether or not anyone linked it, so
+  // "Open recording" has somewhere to go.
+  const openId = rec.transcriptId ?? (rec.mine ? rec.ownTranscriptId : null);
+
+  // The owner's own row, when the meeting still carries a live suggestion
+  // for THIS occurrence: the same strip the transcript page and the listing
+  // mount, running the same link and dismiss routes. Nothing new is
+  // implemented here — the server decides whether there is a suggestion at
+  // all, and only a confident match ever becomes one.
+  const suggestion =
+    rec.mine && rec.ownTranscriptId && rec.suggestedEvent ? (
+      <SuggestedEventStrip
+        compact
+        transcriptId={rec.ownTranscriptId}
+        suggested={rec.suggestedEvent}
+        onChanged={(what) => onChanged?.(what)}
+      />
+    ) : null;
+
+  const strip = (
     <RecordingStrip
       model={model}
       onAction={onAction}
-      actionHref={model.action?.kind === 'open' && rec.transcriptId ? `/transcript/${rec.transcriptId}` : null}
+      actionHref={model.action?.kind === 'open' && openId ? `/transcript/${openId}` : null}
       note={note}
       disabled={disabled}
       className={className}
       data={{ 'data-recorder-recording': rec.status, 'data-recorder-mine': rec.mine ? '1' : '0' }}
     />
+  );
+  if (!suggestion) return strip;
+  return (
+    <div className="flex min-w-0 flex-col gap-0.5">
+      {strip}
+      {suggestion}
+    </div>
   );
 }

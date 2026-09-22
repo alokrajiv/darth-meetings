@@ -242,11 +242,16 @@ function autoSyncOf(
  * The db-op has already applied the two reachability arms (own, or linked to
  * a meeting the caller can open), so everything here is either the caller's
  * own recording or a meeting they can already read. `transcriptId` is arm
- * (b)'s answer and nothing else: an UNLINKED recording — including the
- * caller's own — hands out no meeting id, because the row is an occurrence
- * this recording is not linked to. "Open transcript" therefore exists only
- * where the caller can genuinely open it (F1: the old code built
- * `/transcript/<id>` from a machine match, for people who were never shared).
+ * (b)'s answer and nothing else — the only meeting id a NON-OWNER is ever
+ * handed, so "Open transcript" exists only where the caller can genuinely
+ * open it (F1: the old code built `/transcript/<id>` from a machine match,
+ * for people who were never shared).
+ *
+ * `ownTranscriptId` and `suggestedEvent` are arm (a)'s half and are gated on
+ * `mine` here as well as in SQL: a recording is reachable by its OWNER,
+ * linked or not, so the owner's own row opens the recording and — when the
+ * meeting still carries a live suggestion for this occurrence — offers the
+ * Link / "Not this" pair. Nobody else sees either field.
  */
 function recorderRefOf(
   hit: OccurrenceRecordingHit | undefined,
@@ -263,6 +268,8 @@ function recorderRefOf(
     startedAt: hit.started_at == null ? null : isoOf(hit.started_at),
     durationS: hit.duration_s,
     transcriptId: hit.linked_transcript_id,
+    ownTranscriptId: mine ? hit.own_transcript_id : null,
+    suggestedEvent: mine ? hit.suggested_event : null,
   };
 }
 

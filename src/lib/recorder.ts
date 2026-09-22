@@ -1,3 +1,5 @@
+import type { SuggestedEvent } from '@/lib/format';
+
 /**
  * Darth Recorder — shapes shared by the server (routes, db-ops, matcher) and
  * the client (listing rows, recorder card). No server imports: this module is
@@ -226,9 +228,17 @@ export interface RecorderRecordingRef {
   startedAt: string | null;
   durationS: number | null;
   /** The meeting this recording is LINKED to, and only when the caller can
-   * already open it (P1). Unlinked — the caller's own included — is null:
-   * there is no meeting to open from here. */
+   * already open it (P1). Unlinked is null: there is no meeting to open
+   * from here, and for somebody ELSE's recording there never is. */
   transcriptId: string | null;
+  /** `mine` rows only: the meeting the caller's own upload produced, linked
+   * to this occurrence or not. The owner may always reach their own
+   * recording, so this is what "Open recording" opens. */
+  ownTranscriptId: string | null;
+  /** `mine` rows only: the live suggestion on that meeting when it names
+   * this occurrence — the SuggestedEventStrip's input, so the Link and
+   * "Not this" buttons run the paths that already exist. */
+  suggestedEvent: SuggestedEvent | null;
 }
 
 /** "Ben" from ben.tan@trames.sg / "Ben Tan" — possessive-friendly first name. */

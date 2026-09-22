@@ -239,6 +239,10 @@ interface CalendarEventRowProps {
   onMuteChanged?: () => void;
   /** The row's series chip was clicked — host opens its SeriesDialog. */
   onOpenSeries?: (seriesId: number) => void;
+  /** The owner linked (or dismissed) their own recording's suggestion from
+   * this row — the occurrence becomes imported, so the host refetches BOTH
+   * layers, not just the calendar ones. */
+  onRowChanged?: () => void;
   /** Offline mode / network down: row click, Import / the Add-recording
    * menu, the ⋯ actions and the series chip are inert (visible, "Not
    * available offline"). */
@@ -267,6 +271,7 @@ export function CalendarEventRow({
   onImportMeeting,
   onMuteChanged,
   onOpenSeries,
+  onRowChanged,
   disabled = false,
 }: CalendarEventRowProps) {
   const companion = useCompanion();
@@ -675,6 +680,7 @@ export function CalendarEventRow({
                   meetingCode: r.meetingCode,
                 }}
                 originalNote={chat ? teamsChatVerdictCopy(chat, { external: chatExternal }).text : null}
+                onChanged={() => onRowChanged?.()}
                 disabled={disabled}
               />
             ) : cloud ? (

@@ -72,13 +72,39 @@ describe('recordingsForOccurrences — the calendar fold', () => {
     expect(lateral).not.toContain('matched');
   });
 
-  test('the only meeting id served is arm (b)’s', async () => {
+  test('the only CROSS-USER meeting id served is arm (b)’s', async () => {
     await recordingsForOccurrences(A, [OCC]);
     const q = emitted();
     const projection = q.text.slice(0, q.text.indexOf('FROM jsonb_to_recordset'));
     expect(projection).toContain('linked.assemblyai_id AS linked_transcript_id');
     // The pre-P1 projection handed out r.transcript_id for ANY owner.
     expect(projection).not.toContain('r.transcript_id');
+  });
+
+  test('arm (a) serves the OWNER their own meeting and its live suggestion', async () => {
+    await recordingsForOccurrences(A, [OCC]);
+    const q = emitted();
+    const projection = q.text.slice(0, q.text.indexOf('FROM jsonb_to_recordset'));
+    expect(projection).toContain('own.assemblyai_id AS own_transcript_id');
+    expect(projection).toContain('own.suggested_event');
+    const own = q.text.slice(q.text.lastIndexOf('LEFT JOIN LATERAL'));
+    // Owner only, both on the registry row and on the meeting.
+    expect(own).toContain('r.user_id = $');
+    expect(own).toContain('t.user_id = $');
+    expect(own).toContain('t.deleted_at IS NULL');
+    // The suggestion is served only while it is live AND names THIS
+    // occurrence — otherwise "Not this" would act on another row's guess.
+    expect(own).toContain("(t.gmeet_context->'suggestedEvent'->>'dismissedAt') IS NULL");
+    expect(own).toContain("(t.gmeet_context->>'eventId') IS NULL");
+    expect(own).toContain("(t.gmeet_context->'suggestedEvent'->>'meetingCode') = o.code");
+  });
+
+  test('every row the fold returns is a CONFIDENT match — the gate is the join', async () => {
+    await recordingsForOccurrences(A, [OCC]);
+    const q = emitted();
+    const join = q.text.slice(q.text.indexOf('JOIN "meeting_whisperer'), q.text.indexOf('LEFT JOIN'));
+    expect(join).toContain("r.matched ? 'confident'");
+    expect(join).toContain("(r.matched->>'provider_mismatch')::boolean");
   });
 
   test('an empty page asks nothing at all', async () => {

@@ -4,6 +4,7 @@ import { SCHEMAS } from '@/lib/constants/database';
 import { OCCURRENCE_WINDOW_S } from '@/lib/meeting-evidence';
 import { IMPORTED_OCCURRENCE_START } from '@/db-ops/imported-occurrences';
 import type { RecorderMatch } from '@/lib/recorder';
+import type { SuggestedEvent } from '@/lib/format';
 
 /**
  * Darth Recorder registry (migration 041) — devices, telemetry events and
@@ -356,6 +357,53 @@ function linkedMeetingLateral(
   `;
 }
 
+/**
+ * Arm (a)'s payload: the caller's OWN recording, resolved to the meeting its
+ * upload produced and to the live suggestion sitting on that meeting.
+ *
+ * The owner may always reach their own recording — rule 1's other half — so
+ * `assemblyai_id` is served here whether or not the recording is linked to
+ * this occurrence; the fold's OTHER lateral is the one that decides what a
+ * non-owner may see. Without this the owner's own calendar row was a dead
+ * end after P1: "uploaded to your Recordings", and no way in.
+ *
+ * `suggested_event` is the meeting's own `gmeet_context.suggestedEvent` —
+ * the canonical object the Link and "Not this" paths already act on
+ * (`POST :id/link-event`, `PATCH :id {dismissSuggestedEvent}`), so the
+ * calendar row can mount the SAME SuggestedEventStrip the transcript page
+ * and the listing use. It is served only while it is live (not dismissed,
+ * the meeting not already linked) and only when it names THIS occurrence.
+ * It needs no confidence test of its own twice over: `suggestedEventFromMatch`
+ * writes one only for a confident match, and the fold's driving join already
+ * requires `matchedConfidentSql` — the SQL twin of the one definition.
+ */
+function ownMeetingLateral(
+  caller: RecorderCaller,
+  recAlias: string,
+  codeExpr: Fragment
+): Fragment {
+  const userId = sql.unsafe(`${recAlias}.user_id`);
+  const transcriptId = sql.unsafe(`${recAlias}.transcript_id`);
+  const sug = sql.unsafe(`t.gmeet_context->'suggestedEvent'`);
+  return sql`
+    SELECT t.assemblyai_id,
+           CASE
+             WHEN jsonb_typeof(${sug}) = 'object'
+              AND (${sug}->>'dismissedAt') IS NULL
+              AND (t.gmeet_context->>'eventId') IS NULL
+              AND (${sug}->>'meetingCode') = ${codeExpr}
+             THEN ${sug}
+           END AS suggested_event
+    FROM ${sql(SCHEMA)}.transcripts t
+    WHERE ${userId} = ${caller.userId}
+      AND ${transcriptId} IS NOT NULL
+      AND t.assemblyai_id = ${transcriptId}
+      AND t.user_id = ${caller.userId}
+      AND t.deleted_at IS NULL
+    LIMIT 1
+  `;
+}
+
 export interface OccurrenceRecordingHit {
   k: string;
   id: string;
@@ -364,9 +412,15 @@ export interface OccurrenceRecordingHit {
   status: string;
   started_at: string | null;
   duration_s: number | null;
-  /** Arm (b)'s answer, and the ONLY meeting id this fold may hand out: it is
-   * non-null exactly when the caller can already open that meeting. */
+  /** Arm (b)'s answer: the meeting this recording is linked to AND that the
+   * caller can open. The only meeting id a NON-OWNER may ever be handed. */
   linked_transcript_id: string | null;
+  /** Arm (a)'s: the meeting the caller's OWN upload produced, linked here or
+   * not. Null for everybody else's recordings. */
+  own_transcript_id: string | null;
+  /** The live suggestion on that own meeting, when it names this occurrence
+   * — what the Link / "Not this" buttons act on. Null for everybody else. */
+  suggested_event: SuggestedEvent | null;
   hostname: string | null;
 }
 
@@ -402,6 +456,8 @@ export async function recordingsForOccurrences(
            o.k,
            r.id, r.user_id, r.email, r.status, r.started_at, r.duration_s,
            linked.assemblyai_id AS linked_transcript_id,
+           own.assemblyai_id AS own_transcript_id,
+           own.suggested_event,
            d.hostname
     FROM jsonb_to_recordset(${sql.json(batch as unknown as never)})
          AS o(k text, code text, instant timestamptz)
@@ -414,6 +470,9 @@ export async function recordingsForOccurrences(
     LEFT JOIN LATERAL (
       ${linkedMeetingLateral(caller, 'r', sql`o.code`, sql`o.instant`)}
     ) linked ON true
+    LEFT JOIN LATERAL (
+      ${ownMeetingLateral(caller, 'r', sql`o.code`)}
+    ) own ON true
     WHERE r.user_id = ${caller.userId} OR linked.assemblyai_id IS NOT NULL
     ORDER BY o.k,
              (r.user_id = ${caller.userId}) DESC,

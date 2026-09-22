@@ -259,6 +259,8 @@ const ref = (over: Partial<RecorderRecordingRef> = {}): RecorderRecordingRef => 
   startedAt: '2026-09-21T03:02:54Z',
   durationS: 2671,
   transcriptId: null,
+  ownTranscriptId: null,
+  suggestedEvent: null,
   ...over,
 });
 
@@ -296,16 +298,39 @@ describe('stripForRecorderRef', () => {
     expect(m.state).toBe('transcribed');
     expect(m.action?.kind).toBe('open');
   });
-  // P1: a ref carries a meeting id only when the caller can open that
+  // P1: a ref carries a LINKED meeting id only when the caller can open that
   // meeting AND it is THIS occurrence. Uploaded-but-unlinked must neither
-  // offer a transcript nor fall through to "not uploaded yet · Upload".
-  test('uploaded but not linked to this occurrence → no action, no lie', () => {
-    const m = stripForRecorderRef(ref({ status: 'uploaded', transcriptId: null }), { trayConnected: true, fmtDuration, now });
+  // claim a link nor fall through to "not uploaded yet · Upload".
+  test('uploaded but not linked to this occurrence → the owner can still open it', () => {
+    const m = stripForRecorderRef(
+      ref({ status: 'uploaded', transcriptId: null, ownTranscriptId: 'aai-1' }),
+      { trayConnected: true, fmtDuration, now }
+    );
     expect(m.state).toBe('transcribed');
     expect(m.text).toBe('Recorded on your Mac · 44m 31s · uploaded to your Recordings');
     expect(m.text).not.toContain('not uploaded yet');
-    expect(m.action).toBeNull();
     expect(m.title).toContain('not linked to this meeting');
+    // A recording is reachable by its owner, linked or not — but the label
+    // never says "transcript", because no meeting claims this occurrence.
+    expect(m.action).toMatchObject({ kind: 'open', label: 'Open recording' });
+  });
+
+  test('…and with no meeting of its own, it offers nothing rather than lying', () => {
+    const m = stripForRecorderRef(
+      ref({ status: 'uploaded', transcriptId: null, ownTranscriptId: null }),
+      { trayConnected: true, fmtDuration, now }
+    );
+    expect(m.action).toBeNull();
+    expect(m.text).not.toContain('not uploaded yet');
+  });
+
+  test('somebody else’s uploaded recording is never opened by an own-id', () => {
+    // The server gates ownTranscriptId on `mine`; the strip gates it again.
+    const m = stripForRecorderRef(
+      ref({ mine: false, ownerEmail: 'kawen.koh@trames.sg', status: 'uploaded', transcriptId: null, ownTranscriptId: 'aai-1' }),
+      { trayConnected: true, fmtDuration, now }
+    );
+    expect(m.action).toBeNull();
   });
   test('recording now vs. a stale recording', () => {
     expect(stripForRecorderRef(ref({ status: 'recording' }), { trayConnected: true, fmtDuration, now }).state).toBe('recording');

@@ -532,11 +532,43 @@ fail** across 70 files (1132 before this work: +24 committed tests, −2 that we
 `src/db-ops/__tests__/helpers/fake-sql.ts` gained `sql.unsafe` (raw fragment, no parameter) so db-ops that
 splice a table alias into a predicate builder can be rendered at all.
 
+### P1 follow-up — the owner's own row is no longer a dead end (`{HASH}`)
+
+P1 left the owner's own calendar row saying "uploaded to your Recordings" with nothing to click, because
+`recorderRefOf` dropped the meeting id for every unlinked recording. A recording is reachable **by its owner**,
+linked or not, so arm (a) now serves the owner (and only the owner) two more fields. A second LATERAL,
+`ownMeetingLateral` (`src/db-ops/recorder.ts:380-425`, wired at `:459-461`), resolves the caller's OWN
+recording to the meeting its upload produced (`own_transcript_id`) and to that meeting's live
+`gmeet_context.suggestedEvent` (`suggested_event`) — served only while it is un-dismissed, only while the
+meeting is not already linked, and only when it names THIS occurrence. Both are gated on `mine` again in
+`recorderRefOf` (`src/app/api/calendar-meetings/route.ts:271-272`); a non-owner's row is byte-identical to
+before. `linked_transcript_id` is untouched and is still the only meeting id a non-owner can be handed.
+
+The strip's uploaded-but-unlinked branch (`src/lib/recording-strip.ts:400-421`) now offers **Open recording**
+— never "Open transcript", because no meeting claims this occurrence — and `RecorderRefStrip`
+(`src/components/recording-strip.tsx:225-252`) resolves the href from `transcriptId ?? (mine &&
+ownTranscriptId)`. When the suggestion is there it mounts the EXISTING `SuggestedEventStrip` under the line:
+the same component the transcript page (`page.tsx:3185`) and the listing (`transcript-table.tsx:2137`) use,
+so **Link to it** / **Not this** run `POST :id/link-event` and `PATCH :id {dismissSuggestedEvent}` with no
+logic duplicated here. `onRowChanged` (`calendar-meeting-rows.tsx:245, 683` → `transcript-table.tsx:2557`
+`silentRefetchAll`) refetches both layers afterwards, because a link moves the occurrence out of the calendar
+layer and into the archive.
+
+No confidence test was added: `suggestedEventFromMatch` (`src/lib/server/recorder-match.ts:215-241`) writes a
+suggestion **only** for a confident match, and the fold's driving join already requires `matchedConfidentSql`
+— the SQL twin of the one definition `recorderRowIsConfident` reads. Every row the fold returns is a
+confident match by construction, so the gate is the join, not a second copy of the rule.
+
+Tests: +4 committed (the owner's Open recording, the no-meeting-of-its-own case, and a non-owner never being
+opened by an own-id; plus the SQL-shape assertions for the new lateral and for the join being the confidence
+gate). The scratch-cluster check grew to **14 pass, 0 fail** — the owner reaching an unlinked recording, a
+shared reader getting arm (b) and NO own id or suggestion, the suggestion served to the owner alone,
+a **dismissed** suggestion not served, a suggestion for another occurrence never landing on this row, the
+suggestion stopping once the meeting is linked, and a recording still on the Mac having no meeting yet. Suite
+1160 pass, 0 fail.
+
 ### Left for the next step
 
-- The owner-side suggestion strip on the caller's own calendar row (§2.3 point 4, §3.2) — P1 removes the
-  colleague-side hint and the owner's row now says "uploaded to your Recordings" with no action; the
-  "Looks like your recording … — Link · Not this" line that is meant to replace it is §3's work.
 - `recorderRowCopy` (`src/lib/recorder.ts:259-318`) has no caller outside its own test — a P9 deletion.
 - `resolveOccurrenceRef` (`src/lib/server/recorder-match.ts:270`) lost its only caller with the `?event=`
   branch; kept because P6/P7 will want occurrence refs.

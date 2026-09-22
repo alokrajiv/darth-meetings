@@ -2554,6 +2554,7 @@ archiveErrorPanel
                       onImportMeeting={onImportMeeting}
                       onMuteChanged={handleMuteChanged}
                       onOpenSeries={setOpenSeriesId}
+                      onRowChanged={silentRefetchAll}
                       disabled={blocked}
                     />
                   )
