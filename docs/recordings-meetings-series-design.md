@@ -532,7 +532,7 @@ fail** across 70 files (1132 before this work: +24 committed tests, −2 that we
 `src/db-ops/__tests__/helpers/fake-sql.ts` gained `sql.unsafe` (raw fragment, no parameter) so db-ops that
 splice a table alias into a predicate builder can be rendered at all.
 
-### P1 follow-up — the owner's own row is no longer a dead end (`{HASH}`)
+### P1 follow-up — the owner's own row is no longer a dead end (`ed62476`)
 
 P1 left the owner's own calendar row saying "uploaded to your Recordings" with nothing to click, because
 `recorderRefOf` dropped the meeting id for every unlinked recording. A recording is reachable **by its owner**,
