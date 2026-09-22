@@ -390,6 +390,23 @@ export function stripForRecorderRef(rec: RecorderRecordingRef, opts: RecorderStr
       busy: false,
     };
   }
+  // Uploaded, but NOT linked to this occurrence (P1: a ref only carries a
+  // meeting id when the caller can open that meeting AND it is this
+  // occurrence). The recording is in the owner's own Recordings; saying
+  // "Open transcript" here would claim a link nobody made, and the older
+  // "not uploaded yet · Upload" fallthrough below would be a plain lie.
+  if (rec.status === 'uploaded') {
+    return {
+      source: 'mac',
+      state: 'transcribed',
+      tone: 'muted',
+      text: join([`Recorded on ${where}`, dur, rec.mine ? 'uploaded to your Recordings' : 'uploaded']),
+      title: `${base} · uploaded and transcribed, and not linked to this meeting — link it from Recordings`,
+      progress: null,
+      action: null,
+      busy: false,
+    };
+  }
   if (rec.status === 'uploading') {
     return {
       source: 'mac',

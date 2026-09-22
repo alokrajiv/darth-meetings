@@ -53,7 +53,11 @@ export const GET = withAuth(async ({ user, request }) => {
     if (!occ.involved) {
       return NextResponse.json({ recordings: [], occurrence: { code: occ.code, instant: occ.instant } });
     }
-    const rows = await recordingsForOccurrence(occ.code, occ.instant);
+    const rows = await recordingsForOccurrence(
+      { userId: user.userId, email: user.email },
+      occ.code,
+      occ.instant
+    );
     const othersIds = rows.filter((r) => r.user_id !== user.userId).map((r) => r.id);
     const nudges = await lastNudgeAt(othersIds, user.userId);
     const recordings: RecordingView[] = rows.map((r) =>

@@ -105,11 +105,12 @@ export interface CalendarMeetingRow {
    * import and keeps resolving to the transcript afterwards. Minted for
    * rows with a meeting code. */
   meetingUuid: string | null;
-  /** A Darth Recorder recording matched to this occurrence (migration 041):
-   * the caller's own Mac, or a colleague's. Existence + owner + status only
-   * for other people's recordings — local paths never leave the owner. The
-   * row renders it INSTEAD of the Teams-chat "recorded elsewhere" verdict
-   * (which moves to the tooltip). */
+  /** A Darth Recorder recording (migration 041) this caller may see on this
+   * occurrence: their OWN, or one linked to a meeting they can already open.
+   * Never a colleague's unlinked recording — a recording is reachable by its
+   * owner or through a meeting, never through a machine match. The row
+   * renders it INSTEAD of the Teams-chat "recorded elsewhere" verdict (which
+   * moves to the tooltip). */
   recorderRecording: RecorderRecordingRef | null;
   /** Account auto-sync's intent for the occurrence (unimported rows):
    * 'imported'/'queued' = the ledger claimed it, 'pending' = an enabled
@@ -235,8 +236,18 @@ function autoSyncOf(
     : null;
 }
 
-/** Recorder hit → the row's redacted reference. The caller's own recording
- * keeps its hostname; somebody else's is reduced to "who + what state". */
+/**
+ * Recorder hit → the row's reference.
+ *
+ * The db-op has already applied the two reachability arms (own, or linked to
+ * a meeting the caller can open), so everything here is either the caller's
+ * own recording or a meeting they can already read. `transcriptId` is arm
+ * (b)'s answer and nothing else: an UNLINKED recording — including the
+ * caller's own — hands out no meeting id, because the row is an occurrence
+ * this recording is not linked to. "Open transcript" therefore exists only
+ * where the caller can genuinely open it (F1: the old code built
+ * `/transcript/<id>` from a machine match, for people who were never shared).
+ */
 function recorderRefOf(
   hit: OccurrenceRecordingHit | undefined,
   callerUserId: string
@@ -251,7 +262,7 @@ function recorderRefOf(
     status: hit.status,
     startedAt: hit.started_at == null ? null : isoOf(hit.started_at),
     durationS: hit.duration_s,
-    transcriptId: hit.transcript_id,
+    transcriptId: hit.linked_transcript_id,
     nudgedAt: hit.nudged_at == null ? null : isoOf(hit.nudged_at),
   };
 }
@@ -372,11 +383,12 @@ export const GET = withAuth(async ({ user, request }) => {
       title: r.title,
     }));
   const occKeys = [...new Set(occs.map((o) => `${o.code}|${o.startIso}`))];
-  // Darth Recorder matches for the served occurrences. Every row here has
-  // already passed the layer's involvement gate (norec = the caller's own
-  // calendar rows, unimported = unimportedVisibleTo), so folding in "someone
-  // recorded this on their Mac" adds no new exposure — and the ref itself is
-  // redacted (db-ops/recorder recordingsForOccurrences).
+  // Darth Recorder recordings for the served occurrences, under the two
+  // reachability arms only: the CALLER'S OWN recording (a suggestion on
+  // their own row), or one linked to a meeting they can already open. A
+  // colleague's unlinked recording is not folded in at all — not its
+  // existence, its owner, its state, its duration nor its meeting id
+  // (db-ops/recorder, docs/recordings-meetings-series-design.md F1/P1).
   const [seriesByBase, seriesByCode, uuids, log, predicted, recorder] = await Promise.all([
     findSeriesByRecurringBaseIds(baseIds),
     findSeriesByMeetingCodes([...new Set(occs.map((o) => o.code))]),

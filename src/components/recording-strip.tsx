@@ -234,6 +234,10 @@ export function RecorderRefStrip({ rec, event, originalNote, disabled = false, c
     }
   };
 
+  // `rec.transcriptId` is arm (b) and only arm (b): the server sets it only
+  // when this recording is linked to a meeting the caller can already open
+  // (P1). Before that it was built from a machine match, which handed a
+  // private meeting's id to people who were never shared on it.
   return (
     <RecordingStrip
       model={model}

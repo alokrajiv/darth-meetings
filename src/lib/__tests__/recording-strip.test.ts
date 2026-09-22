@@ -300,6 +300,17 @@ describe('stripForRecorderRef', () => {
     expect(m.state).toBe('transcribed');
     expect(m.action?.kind).toBe('open');
   });
+  // P1: a ref carries a meeting id only when the caller can open that
+  // meeting AND it is THIS occurrence. Uploaded-but-unlinked must neither
+  // offer a transcript nor fall through to "not uploaded yet · Upload".
+  test('uploaded but not linked to this occurrence → no action, no lie', () => {
+    const m = stripForRecorderRef(ref({ status: 'uploaded', transcriptId: null }), { trayConnected: true, fmtDuration, now });
+    expect(m.state).toBe('transcribed');
+    expect(m.text).toBe('Recorded on your Mac · 44m 31s · uploaded to your Recordings');
+    expect(m.text).not.toContain('not uploaded yet');
+    expect(m.action).toBeNull();
+    expect(m.title).toContain('not linked to this meeting');
+  });
   test('recording now vs. a stale recording', () => {
     expect(stripForRecorderRef(ref({ status: 'recording' }), { trayConnected: true, fmtDuration, now }).state).toBe('recording');
     const stale = stripForRecorderRef(ref({ status: 'recording', startedAt: '2026-09-19T03:02:54Z' }), { trayConnected: true, fmtDuration, now });

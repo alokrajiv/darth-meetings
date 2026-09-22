@@ -1,22 +1,34 @@
 import 'server-only';
 import { sql } from '@/lib/db';
 import { SCHEMAS } from '@/lib/constants/database';
+import { OCCURRENCE_WINDOW_S } from '@/lib/meeting-evidence';
+import { IMPORTED_OCCURRENCE_START } from '@/db-ops/imported-occurrences';
 import type { RecorderMatch } from '@/lib/recorder';
 
 /**
  * Darth Recorder registry (migration 041) — devices, telemetry events and
  * recordings. See docs/recorder-beta-plan.md (Stream S1).
  *
- * PRIVACY: every row is owned by one darth user. Writes are owner-only by
- * construction (`user_id = caller` in the WHERE clause, never a client-sent
- * owner). The only cross-user read is "is there a recording of this
- * occurrence?", and it is gated by the caller's involvement in the
- * occurrence (callerInvolvedCodes) and redacted to existence + owner email
- * + status — local paths, window titles and segment files never leave the
- * owner (feedback_privacy_caller_scoping_gate).
+ * PRIVACY (docs/recordings-meetings-series-design.md §1, rules 1 and 3):
+ * every row is owned by one darth user and is NEVER shared. Writes are
+ * owner-only by construction (`user_id = caller` in the WHERE clause, never
+ * a client-sent owner). A recording is reachable by exactly two arms:
+ *
+ *   (a) the caller OWNS it, or
+ *   (b) it is LINKED to a meeting the caller can already open (owner or
+ *       `transcript_shares`) and that meeting is this occurrence.
+ *
+ * A machine match (`matched`) is not an arm. Until 2026-09-22 the calendar
+ * folds below joined recordings of ANY owner onto the caller's occurrences
+ * on the strength of `matched` alone (F1) — that is what put a private Slack
+ * huddle on eight invitees' rows twice in one afternoon. Involvement in an
+ * occurrence is a gate on the OCCURRENCE, not on the recording; the only
+ * gate on a recording is a meeting (feedback_privacy_caller_scoping_gate).
  */
 
 const SCHEMA = SCHEMAS.MEETING_WHISPERER;
+
+type Fragment = ReturnType<typeof sql>;
 
 export const RECORDING_STATUSES = [
   'recording',
@@ -303,18 +315,80 @@ function matchedConfidentSql(alias: string) {
   )`;
 }
 
+/** Who is asking. Both arms of the reachability rule need the email: a
+ * share is keyed on it, not on the user id. */
+export interface RecorderCaller {
+  userId: string;
+  email: string;
+}
+
 /**
- * Recordings matched to ONE occurrence, any owner. NOT caller-scoped — the
- * route gates with callerInvolvedInOccurrence first and redacts non-owned
- * rows.
+ * Arm (b) as a LATERAL: the meeting this recording is LINKED to, when the
+ * caller can open it AND that meeting is this occurrence. Yields the
+ * meeting's public id or no row.
+ *
+ * `recorder_recordings.transcript_id` holds `transcripts.assemblyai_id`.
+ * "Is this occurrence" is asked of the MEETING's own calendar keys — the
+ * link a human made — never of the recorder's `matched`, which is a guess.
+ * Visibility is the meetings predicate every other layer uses: owner, or a
+ * `transcript_shares` row on the caller's lower-cased email.
+ */
+function linkedMeetingLateral(
+  caller: RecorderCaller,
+  recAlias: string,
+  codeExpr: Fragment,
+  instantExpr: Fragment
+): Fragment {
+  const transcriptId = sql.unsafe(`${recAlias}.transcript_id`);
+  return sql`
+    SELECT t.assemblyai_id
+    FROM ${sql(SCHEMA)}.transcripts t
+    WHERE ${transcriptId} IS NOT NULL
+      AND t.assemblyai_id = ${transcriptId}
+      AND t.deleted_at IS NULL
+      AND (
+        t.user_id = ${caller.userId}
+        OR EXISTS (
+          SELECT 1 FROM ${sql(SCHEMA)}.transcript_shares s
+          WHERE s.transcript_id = t.id
+            AND LOWER(s.shared_with_email) = ${caller.email.toLowerCase()}
+        )
+      )
+      AND t.gmeet_context->>'meetingCode' = ${codeExpr}
+      AND (
+        ${instantExpr} IS NULL
+        OR abs(extract(epoch FROM (
+             ${IMPORTED_OCCURRENCE_START}::timestamptz - ${instantExpr}
+           ))) <= ${OCCURRENCE_WINDOW_S}
+      )
+    LIMIT 1
+  `;
+}
+
+/** The row plus arm (b)'s answer. `linked_transcript_id` is the ONLY meeting
+ * id these folds may hand out: it is non-null exactly when the caller can
+ * already open that meeting. */
+export type OccurrenceRecordingRow = RecorderRecordingRow & {
+  linked_transcript_id: string | null;
+};
+
+/**
+ * Recordings of ONE occurrence this caller may know about: their own (arm a)
+ * or one linked to a meeting they can open (arm b). Never "somebody's Mac
+ * recorded this" — involvement in the occurrence is not an arm (F2).
  */
 export async function recordingsForOccurrence(
+  caller: RecorderCaller,
   meetingCode: string,
   instant: string | null,
   limit = 20
-): Promise<RecorderRecordingRow[]> {
-  return sql<RecorderRecordingRow[]>`
-    SELECT * FROM ${sql(SCHEMA)}.recorder_recordings rr
+): Promise<OccurrenceRecordingRow[]> {
+  return sql<OccurrenceRecordingRow[]>`
+    SELECT rr.*, linked.assemblyai_id AS linked_transcript_id
+    FROM ${sql(SCHEMA)}.recorder_recordings rr
+    LEFT JOIN LATERAL (
+      ${linkedMeetingLateral(caller, 'rr', sql`${meetingCode}`, sql`${instant}::timestamptz`)}
+    ) linked ON true
     WHERE rr.status <> 'deleted'
       AND ${matchedConfidentSql('rr')}
       AND rr.matched->>'meeting_code' = ${meetingCode}
@@ -322,6 +396,7 @@ export async function recordingsForOccurrence(
         ${instant}::timestamptz IS NULL
         OR abs(extract(epoch FROM ((rr.matched->>'occ_start')::timestamptz - ${instant}::timestamptz))) <= 120
       )
+      AND (rr.user_id = ${caller.userId} OR linked.assemblyai_id IS NOT NULL)
     ORDER BY COALESCE(rr.started_at, rr.created_at) DESC
     LIMIT ${limit}
   `;
@@ -335,23 +410,35 @@ export interface OccurrenceRecordingHit {
   status: string;
   started_at: string | null;
   duration_s: number | null;
-  transcript_id: string | null;
+  /** Arm (b) only — see OccurrenceRecordingRow. */
+  linked_transcript_id: string | null;
   hostname: string | null;
   nudged_at: string | null;
 }
 
 /**
- * Batch form for the calendar listing: best recording per occurrence key.
- * `occs` are keys the caller is ALREADY cleared to see (the calendar layers
- * only ever serve occurrences the caller is involved in — their own cache
- * rows on norec, unimportedVisibleTo on unimported), so this adds no new
- * exposure; the route still redacts to existence + owner + status.
+ * Batch form for the calendar listing: best recording per occurrence key,
+ * under the SAME two arms.
+ *
+ * Until 2026-09-22 this joined recordings of ANY owner onto the caller's
+ * occurrences on `matched` alone and the route handed back the owner's
+ * email, the state, the duration and the meeting id of a recording the
+ * caller had no right to know existed (F1). The occurrence keys being ones
+ * the caller is cleared to SEE was never an argument about the RECORDING:
+ * the only gate on a recording is a meeting.
+ *
+ * Note on the driving join: candidates are still narrowed by the stored
+ * match, so arm (b) is evaluated over confidently-matched rows only. That
+ * costs nothing in practice — the calendar layers anti-join every occurrence
+ * ANYONE has imported (db-ops/imported-occurrences importedOccurrenceAntiJoin),
+ * so an occurrence whose linked meeting the caller can open is not served by
+ * these layers at all; arm (b) is the belt on the braces.
  *
  * Preference order per occurrence: the caller's own recording, then an
  * uploaded one, then the longest.
  */
 export async function recordingsForOccurrences(
-  caller: { userId: string },
+  caller: RecorderCaller,
   occs: Array<{ k: string; code: string; instant: string }>
 ): Promise<Map<string, OccurrenceRecordingHit>> {
   const batch = occs.filter((o) => o.code && o.instant);
@@ -360,7 +447,8 @@ export async function recordingsForOccurrences(
     SELECT DISTINCT ON (o.k)
            o.k,
            r.id, r.user_id, r.email, r.status, r.started_at, r.duration_s,
-           r.transcript_id, d.hostname,
+           linked.assemblyai_id AS linked_transcript_id,
+           d.hostname,
            n.sent_at AS nudged_at
     FROM jsonb_to_recordset(${sql.json(batch as unknown as never)})
          AS o(k text, code text, instant timestamptz)
@@ -370,8 +458,12 @@ export async function recordingsForOccurrences(
      AND ${matchedConfidentSql('r')}
      AND abs(extract(epoch FROM ((r.matched->>'occ_start')::timestamptz - o.instant))) <= 120
     LEFT JOIN ${sql(SCHEMA)}.recorder_devices d ON d.device_id = r.device_id
+    LEFT JOIN LATERAL (
+      ${linkedMeetingLateral(caller, 'r', sql`o.code`, sql`o.instant`)}
+    ) linked ON true
     LEFT JOIN ${sql(SCHEMA)}.recorder_nudges n
       ON n.recording_id = r.id AND n.requester_user_id = ${caller.userId}
+    WHERE r.user_id = ${caller.userId} OR linked.assemblyai_id IS NOT NULL
     ORDER BY o.k,
              (r.user_id = ${caller.userId}) DESC,
              (r.status = 'uploaded') DESC,

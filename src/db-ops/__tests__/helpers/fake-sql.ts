@@ -52,6 +52,9 @@ export interface FakeSql {
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   (strings: TemplateStringsArray | string, ...values: unknown[]): any;
   json: (v: unknown) => Fragment;
+  /** postgres.js `sql.unsafe` — raw text, no parameter. Used by db-ops that
+   * splice a table alias into a predicate builder. */
+  unsafe: (v: string) => Fragment;
   begin: <T>(fn: (tx: FakeSql) => Promise<T>) => Promise<T>;
   /** Every query rendered so far (fragments included), in creation order. */
   log: RenderedQuery[];
@@ -91,6 +94,7 @@ export function createFakeSql(respond: Responder): FakeSql {
     return thenable;
   }) as FakeSql;
   fake.json = (v) => ({ __frag: true, text: '$json', params: [v] });
+  fake.unsafe = (v) => ({ __frag: true, text: v, params: [] });
   fake.begin = (fn) => fn(fake);
   fake.log = log;
   fake.executed = executed;
