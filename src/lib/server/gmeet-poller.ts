@@ -18,6 +18,7 @@ import { getMeetingCacheByKeys, getTeamsResolutionByKeys } from '@/db-ops/gmeet-
 import { findImportedByTeamsMeetings } from '@/db-ops/teams-import';
 import { sweepAutoImportSeries } from '@/lib/server/series-auto-import';
 import { sweepAccountAutoSync } from '@/lib/server/account-auto-sync';
+import { FAST_LANE_MS, sweepRecentlyEnded } from '@/lib/server/gmeet-fast-lane';
 import { classifyCalendarAttachments } from '@/lib/meeting-evidence';
 import {
   isOwnTenant,
@@ -74,6 +75,10 @@ import { getMeetingCacheByMeetings } from '@/db-ops/gmeet-meeting-cache';
  * / config fixed → resolved). Serial across users; each user's sweep uses
  * only their own token; Teams artifact checks use the app-only Graph
  * credential (display/reminder metadata only — imports re-resolve fresh).
+ *
+ * TWO cadences since 2026-09-22: this full sweep every GMEET_POLL_MINUTES
+ * (30), and the FAST LANE every GMEET_FAST_LANE_MINUTES (5) — see
+ * lib/server/gmeet-fast-lane. They share the `sweeping` lock.
  */
 
 const POLL_MS = Number(process.env.GMEET_POLL_MINUTES || 30) * 60 * 1000;
@@ -698,6 +703,8 @@ async function sweepUser(account: GoogleAccountRow): Promise<void> {
 }
 
 let started = false;
+/** ONE lock for both cadences: a fast-lane pass and a full sweep must never
+ * overlap (they probe the same occurrences under the same tokens). */
 let sweeping = false;
 
 async function sweepAll(): Promise<void> {
@@ -729,14 +736,40 @@ async function sweepAll(): Promise<void> {
   }
 }
 
+/**
+ * The FAST LANE tick (lib/server/gmeet-fast-lane): re-probe only the
+ * just-ended occurrences of accounts that asked for automatic imports, so
+ * "artifacts ready" turns into "imported" in minutes instead of up to the
+ * full 30-minute cadence. Shares the sweep lock — whichever cadence is
+ * already running wins and the other tick is dropped.
+ */
+async function fastLane(): Promise<void> {
+  if (sweeping) return;
+  sweeping = true;
+  try {
+    await sweepRecentlyEnded();
+  } finally {
+    sweeping = false;
+  }
+}
+
 export function startGmeetPoller(): void {
   if (started) return;
   started = true;
-  console.log(`[gmeet-poller] armed: every ${POLL_MS / 60000}m`);
+  console.log(
+    `[gmeet-poller] armed: every ${POLL_MS / 60000}m (fast lane every ${FAST_LANE_MS / 60000}m)`
+  );
   const timer = setInterval(() => void sweepAll(), POLL_MS);
   timer.unref?.();
+  const fast = setInterval(() => void fastLane(), FAST_LANE_MS);
+  fast.unref?.();
   // First pass shortly after boot.
   setTimeout(() => void sweepAll(), 2 * 60 * 1000).unref?.();
+}
+
+/** One immediate fast-lane pass — the manual hook's twin of triggerGmeetPoll. */
+export function triggerGmeetFastLane(): Promise<void> {
+  return fastLane();
 }
 
 /** One immediate pass — used by the manual "poll now" hook in dev/testing. */

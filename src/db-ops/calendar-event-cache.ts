@@ -1237,3 +1237,110 @@ export async function listOccurrencesOverlapping(
     LIMIT ${limit}
   `;
 }
+
+// ---------------------------------------------------------------------------
+// Fast lane (lib/server/gmeet-fast-lane): "which of this account's calls
+// just ended?"
+// ---------------------------------------------------------------------------
+
+export interface RecentlyEndedOccurrenceRow {
+  /** The CALENDAR cache key, `<eventId>|<raw start>`. */
+  cal_event_key: string;
+  event_id: string;
+  /** The raw calendar dateTime string the key was built from — the poller
+   * keys reminders and artifact-cache rows by it, offset and all, so the
+   * fast lane must reuse it verbatim or it would mint a duplicate row. */
+  raw_start: string;
+  recurring_event_id: string | null;
+  ical_uid: string | null;
+  title: string | null;
+  event_start: string;
+  event_end: string | null;
+  meeting_code: string;
+  organizer_email: string | null;
+  organizer_self: boolean | null;
+  attachment_video_count: number;
+  attachment_video_file_id: string | null;
+  attachment_transcript_doc_id: string | null;
+  attachment_gemini_notes: boolean;
+  /** The conference record's end, when a probe ever captured one. */
+  conf_end: string | null;
+  /** An OPEN 'unimported' reminder of this user already names an artifact
+   * for this occurrence — nothing left for the fast lane to discover. */
+  reminded: boolean;
+}
+
+/**
+ * Google MEET occurrences of one account that ended inside the window,
+ * newest-ended first, mutes excluded. No Calendar API call: this is the
+ * rows the 30-minute sweep already persisted.
+ *
+ * "Ended" is the conference record's end when the artifact cache has one
+ * (a call that ran 30 minutes short is ready long before its calendar
+ * slot), else the calendar end, else the start.
+ */
+export async function listRecentlyEndedOccurrences(
+  userId: string,
+  opts: { endedAfter: string; endedBefore: string; limit?: number }
+): Promise<RecentlyEndedOccurrenceRow[]> {
+  // Index bound (user_id, event_start DESC) so the scan stays tiny; a
+  // meeting whose record ended inside the window started well within a day.
+  const startFloor = new Date(Date.parse(opts.endedAfter) - 26 * 3600 * 1000).toISOString();
+  const ended = sql`COALESCE(g.conf_end, c.event_end, c.event_start)`;
+  return sql<RecentlyEndedOccurrenceRow[]>`
+    SELECT c.event_key AS cal_event_key, c.event_id,
+           substr(c.event_key, position('|' in c.event_key) + 1) AS raw_start,
+           c.recurring_event_id, c.ical_uid, c.title, c.event_start, c.event_end,
+           c.meeting_code, c.organizer_email, c.organizer_self,
+           c.attachment_video_count, c.attachment_video_file_id,
+           c.attachment_transcript_doc_id, c.attachment_gemini_notes,
+           g.conf_end,
+           EXISTS (
+             SELECT 1 FROM ${sql(SCHEMA)}.gmeet_reminders r
+             WHERE r.user_id = c.user_id
+               AND r.kind = 'unimported'
+               AND r.resolved_at IS NULL
+               AND r.meeting_code = c.meeting_code
+               AND abs(extract(epoch FROM (r.event_start - c.event_start))) <= 60
+               AND (r.has_recording OR r.has_transcript)
+           ) AS reminded
+    FROM ${sql(SCHEMA)}.calendar_event_cache c
+    LEFT JOIN LATERAL (
+      SELECT m.conf_end
+      FROM ${sql(SCHEMA)}.gmeet_meeting_cache m
+      WHERE m.meeting_code = c.meeting_code
+        AND m.conf_end IS NOT NULL
+        AND abs(extract(epoch FROM (COALESCE(m.event_start, m.conf_start) - c.event_start)))
+              <= ${OCCURRENCE_WINDOW_S}
+      ORDER BY abs(extract(epoch FROM (COALESCE(m.event_start, m.conf_start) - c.event_start)))
+      LIMIT 1
+    ) g ON true
+    WHERE c.user_id = ${userId}
+      AND c.meeting_code IS NOT NULL
+      AND c.meeting_code NOT LIKE 'teams-%'
+      AND c.event_start >= ${startFloor}::timestamptz
+      AND ${ended} <= ${opts.endedBefore}::timestamptz
+      AND ${ended} >= ${opts.endedAfter}::timestamptz
+      -- Mutes exactly as the full sweep and the auto-sync candidate query
+      -- apply them: sync skips by meeting code or calendar event id,
+      -- calendar mutes by either key flavour (calendar / reminder) or series.
+      AND NOT EXISTS (
+        SELECT 1 FROM ${sql(SCHEMA)}.gmeet_sync_skips s
+        WHERE s.user_id = c.user_id
+          AND (s.event_key = c.meeting_code OR s.event_key = c.event_id)
+      )
+      AND NOT EXISTS (
+        SELECT 1 FROM ${sql(SCHEMA)}.calendar_event_mutes mu
+        WHERE mu.user_id = c.user_id
+          AND (
+            (mu.kind = 'occurrence' AND mu.value IN (
+               c.event_key,
+               c.meeting_code || '|' || substr(c.event_key, position('|' in c.event_key) + 1)
+             ))
+            OR (mu.kind = 'series' AND mu.value = COALESCE(c.recurring_event_id, c.event_id))
+          )
+      )
+    ORDER BY ${ended} DESC
+    LIMIT ${opts.limit ?? 40}
+  `;
+}

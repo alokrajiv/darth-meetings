@@ -236,3 +236,80 @@ matcher. Verified row-equivalent against prod data (all callers, both views) bef
 - `calendar_event_cache` / `gmeet_meeting_cache` still hold tz-duplicate keys for the same
   instant from different users' calendars (`+08:00` vs `+05:30`); the listing dedupes by
   instant and new probes reuse the first row within ±12h.
+
+---
+
+## Fast lane — "the call just ended, import it now" (2026-09-22)
+
+### Why
+Discovery of new Meet artifacts only ever happened in the poller's full sweep
+(`gmeet-poller.sweepAll`, every `GMEET_POLL_MINUTES` = 30, then
+`sweepAutoImportSeries()` + `sweepAccountAutoSync()`), and account auto-sync's
+only input is the `unimported` reminders that sweep writes. So the Weekly
+Tressa Review (`weo-xgvy-uxb`, 17:30–18:30 SGT, ended early) had its recording
+AND its Gemini notes on the calendar by 18:20 SGT and was still not imported —
+it was waiting for a tick, not for Google.
+
+### What it is
+A **second timer**, `GMEET_FAST_LANE_MINUTES` (default 5), running
+`sweepRecentlyEnded()` from `src/lib/server/gmeet-fast-lane.ts`. It is not a
+faster full sweep: it never lists a calendar, never touches Teams, never
+imports, and only looks at accounts that asked for automatic imports.
+
+Per pass:
+
+1. **Accounts** — pollable accounts that have account auto-sync on *for Meet*
+   (`listAutoSyncUsers`) OR enable auto-import on some series
+   (`listAutoImportEnabledSeries` → `auto_import.byUserId`). A Teams-only
+   auto-sync account with no series is skipped.
+2. **Occurrences** — `listRecentlyEndedOccurrences` reads that account's
+   **cached** calendar rows (`calendar_event_cache`, written by the 30-minute
+   sweep — no Calendar API call) whose end falls in the last **120 minutes**.
+   "End" is the conference record's `conf_end` when the artifact cache has one
+   for the same occurrence (±12h), else the calendar end: a call that ran 30
+   minutes short is ready long before its slot. Mutes are excluded exactly as
+   the full sweep and the auto-sync candidate query exclude them. The reminder
+   key is rebuilt from the raw calendar start stored inside the cache key, so
+   the fast lane writes the *same* row the full sweep would, not a tz twin.
+3. **Selection** (pure rules, `src/lib/fast-lane.ts`, unit-tested): drop
+   already-imported occurrences, ones whose open `unimported` reminder already
+   names an artifact (the full sweep found it; auto-sync consumes it in this
+   same pass), ones the auto-sync ledger already owns (`imported` / `deferred`
+   / `already`, or a claim still inside its retry cool-off — the same rule as
+   `account-auto-sync.retryable()`), ones this lane probed in the last **5
+   minutes** (in-process map keyed `<userId>|<eventKey>`; per account so two
+   accounts sharing a meeting cannot starve each other), and — for accounts
+   eligible only through the account switch — ones the switch's `scope`/`since`
+   would reject anyway. Freshest-ended first.
+4. **Probe** — the full sweep's exact per-occurrence step:
+   `probeMeetingEvidence` (same Google client, same write-back) and, when the
+   verdict is importable with a materialised artifact, the same
+   `upsertReminder({kind:'unimported', …})`.
+5. **Hand-off** — only when at least one reminder was written (otherwise the
+   two sweeps have no new input; the 30-minute pass runs them regardless):
+   `sweepAutoImportSeries()` then `sweepAccountAutoSync()`, in that order.
+
+### Budget and mutual exclusion
+`MAX_PROBES_PER_PASS` = 12, `MAX_PROBES_PER_ACCOUNT` = 6. One probe is at most
+3 Meet API calls (conference-record lookup + `/recordings` + `/transcripts`),
+and the lookup is skipped when the cache already knows the record — so the
+worst case is 36 Meet calls per 5 minutes across all accounts, and the ordinary
+case is 0 (nothing ended) to a handful. The full sweep and the fast lane share
+the poller's single `sweeping` flag: whichever is running wins, the other tick
+is dropped.
+
+### The log line
+Emitted only when a pass actually probed something:
+
+```
+[gmeet-fast-lane] 2 occurrence(s) probed, 1 reminder(s), 1 imported/deferred (5 Meet API call(s), 3 account(s))
+```
+
+`imported/deferred` is re-read from `auto_sync_log` after the two sweeps, so it
+is what auto-sync actually did with what this pass discovered. Watch the Meet
+call count here if the lane ever needs tightening.
+
+### Worst-case latency now
+Artifacts ready → reminder written: ≤ `GMEET_FAST_LANE_MINUTES` (5) + the probe
+itself, for an occurrence that ended in the last 2 hours. Older than that, or
+an account with no automatic-import switch, is unchanged: the 30-minute sweep.
