@@ -124,7 +124,7 @@ async function probeFiles(row: GraphMeetingRow): Promise<GraphFileFacts> {
 export async function syncRecordingGraphForMeeting(
   userId: string,
   assemblyaiId: string,
-  opts?: { probeFiles?: boolean }
+  opts?: { probeFiles?: boolean; archiveTag?: string }
 ): Promise<RecordingSyncResult> {
   if (!recordingsWriteEnabled()) return { status: 'off' };
 
@@ -187,7 +187,13 @@ export async function syncRecordingGraphForMeeting(
   // DEC-3 Stage A: the files this sync has just described get their permanent
   // copy in Azure Blob. Fire-and-forget and inert unless both
   // DARTH_MEDIA_ACCOUNT and MW_MEDIA_ARCHIVE are set — see media-archive.ts.
-  queueMediaArchiveForRecording(applied.recordingId, 'recording-sync');
+  // The media-prep sync follows a faststart remux that rewrote the canonical
+  // in place, so a row archived by an earlier sync is re-hashed (see
+  // archiveMedia). Every other sync only re-checks sizes.
+  const archiveTag = opts?.archiveTag ?? 'recording-sync';
+  queueMediaArchiveForRecording(applied.recordingId, archiveTag, {
+    rehash: archiveTag === 'media-prep',
+  });
 
   return {
     status: 'written',
@@ -218,7 +224,7 @@ export function queueRecordingGraphSync(
   const previous = inflight.get(key);
   const run = (previous ?? Promise.resolve())
     .catch(() => {})
-    .then(() => syncRecordingGraphForMeeting(userId, assemblyaiId))
+    .then(() => syncRecordingGraphForMeeting(userId, assemblyaiId, { archiveTag: tag }))
     .then((result) => {
       if (result.status === 'written' && result.migratedFrom.length > 0) {
         console.log(

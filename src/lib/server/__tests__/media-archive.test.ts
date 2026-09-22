@@ -279,13 +279,52 @@ describe('archiveMedia — happy path', () => {
     expect(db.recordingSha.has(row.recording_id)).toBe(false);
   });
 
-  test('an already-stamped row is a no-op', async () => {
+  test('an already-stamped row is a no-op (one HEAD, no upload)', async () => {
     const { row } = withFile();
     await archiveMedia(row as never);
-    const callsAfterFirst = store.calls.length;
+    const putsAfterFirst = store.calls.filter((c) => c.startsWith('putStream')).length;
     const again = await archiveMedia(db.media.get(row.id) as never);
     expect(again).toMatchObject({ status: 'skipped', reason: 'already archived' });
-    expect(store.calls.length).toBe(callsAfterFirst);
+    expect(store.calls.filter((c) => c.startsWith('putStream')).length).toBe(putsAfterFirst);
+  });
+
+  test('a file rewritten after the stamp (faststart remux) is archived again on the next hook', async () => {
+    const { row, bytes } = withFile();
+    const first = await archiveMedia(row as never);
+    expect(first.status).toBe('archived');
+    const blobName = mediaBlobName(row.recording_id, row.id, row.filename);
+
+    // The remux moves the moov atom: a few KB longer, different bytes.
+    const rewritten = Buffer.concat([Buffer.from(bytes), Buffer.from('moov-moved-here')]);
+    writeFileSync(localMediaPath(row as never)!, rewritten);
+
+    const again = await archiveMedia(db.media.get(row.id) as never);
+    expect(again).toMatchObject({ status: 'archived', blobName, bytes: rewritten.length, sha256: sha(rewritten) });
+    expect(Buffer.from(store.blobs.get(blobName)!.bytes)).toEqual(rewritten);
+    expect(db.media.get(row.id)!.sha256).toBe(sha(rewritten));
+    expect(db.media.get(row.id)!.bytes).toBe(rewritten.length);
+  });
+
+  test('same size, different bytes: only a rehash notices; a plain hook trusts the size', async () => {
+    const { row, bytes } = withFile();
+    await archiveMedia(row as never);
+    const blobName = mediaBlobName(row.recording_id, row.id, row.filename);
+    const flipped = Buffer.from(bytes);
+    flipped[0] = flipped[0]! ^ 0xff;
+    writeFileSync(localMediaPath(row as never)!, flipped);
+
+    expect(await archiveMedia(db.media.get(row.id) as never)).toMatchObject({
+      status: 'skipped',
+      reason: 'already archived',
+    });
+    const again = await archiveMedia(db.media.get(row.id) as never, { rehash: true });
+    expect(again).toMatchObject({ status: 'archived', sha256: sha(flipped) });
+    expect(Buffer.from(store.blobs.get(blobName)!.bytes)).toEqual(flipped);
+    // and a rehash of an unchanged file is still a no-op
+    expect(await archiveMedia(db.media.get(row.id) as never, { rehash: true })).toMatchObject({
+      status: 'skipped',
+      reason: 'already archived',
+    });
   });
 
   test('a row with no local file is skipped, not failed', async () => {

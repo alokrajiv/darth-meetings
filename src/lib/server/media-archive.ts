@@ -221,26 +221,30 @@ async function evaluateCanary(store: MediaBlobLike, now: number): Promise<Canary
  * it, and a call on an already-stamped row is a no-op that costs nothing but
  * the flag read.
  */
-export function archiveMedia(row: RecordingMediaRow): Promise<ArchiveOutcome> {
+/**
+ * `rehash`: the caller knows the file was just rewritten in place (the
+ * faststart remux in media-prep) — a stamped row is then re-hashed and
+ * re-archived if the bytes moved, even when the size did not.
+ */
+export interface ArchiveOptions {
+  rehash?: boolean;
+}
+
+export function archiveMedia(row: RecordingMediaRow, opts: ArchiveOptions = {}): Promise<ArchiveOutcome> {
   const existing = inflight.get(row.id);
   if (existing) return existing;
-  const run = archiveMediaOnce(row).finally(() => {
+  const run = archiveMediaOnce(row, opts).finally(() => {
     if (inflight.get(row.id) === run) inflight.delete(row.id);
   });
   inflight.set(row.id, run);
   return run;
 }
 
-async function archiveMediaOnce(row: RecordingMediaRow): Promise<ArchiveOutcome> {
+async function archiveMediaOnce(row: RecordingMediaRow, opts: ArchiveOptions): Promise<ArchiveOutcome> {
   const store = archiveStore();
   if (!store) return { status: 'off' };
   const mediaId = row.id;
 
-  // Already proven: `blob_name` is only ever written after the blob agreed
-  // with us about size and hash.
-  if (row.blob_name && row.sha256) {
-    return { status: 'skipped', mediaId, reason: 'already archived' };
-  }
   if (!row.filename) return { status: 'skipped', mediaId, reason: 'row names no file' };
   const abs = localMediaPath(row);
   if (!abs) return { status: 'skipped', mediaId, reason: `unsafe stored name ${row.filename}` };
@@ -249,6 +253,28 @@ async function archiveMediaOnce(row: RecordingMediaRow): Promise<ArchiveOutcome>
     return { status: 'skipped', mediaId, reason: 'no local file to archive' };
   }
   if (st.size === 0) return { status: 'skipped', mediaId, reason: 'local file is empty' };
+
+  // A stamped row is proven for the bytes that were on disk WHEN it was
+  // stamped. The file can be rewritten afterwards — the faststart remux runs
+  // seconds after the upload's first sync archived it (2026-09-22: a 350 MB
+  // upload was archived at 14:37:01 SGT and remuxed at 14:37:03; the blob
+  // held the pre-remux bytes while the row's byte count, which the sync
+  // re-derives from disk, said otherwise). So: still archived only if the
+  // blob's size still matches the file, one HEAD; and when the caller says
+  // the file was rewritten (`rehash`), the local hash decides even at equal
+  // size. Anything else falls through to a fresh upload, which overwrites.
+  if (row.blob_name && row.sha256) {
+    const blob = await store.properties(row.blob_name).catch(() => null);
+    const sizeMatches = blob !== null && blob.bytes === st.size && blob.metadata.sha256 === row.sha256;
+    if (sizeMatches && !opts.rehash) {
+      return { status: 'skipped', mediaId, reason: 'already archived' };
+    }
+    if (sizeMatches && opts.rehash) {
+      const local = await sha256OfFile(abs);
+      if (local === row.sha256) return { status: 'skipped', mediaId, reason: 'already archived' };
+    }
+    // Rewritten since the stamp (or the blob is gone): archive again below.
+  }
 
   // A gate that cannot even be evaluated (migration 047 not applied on this
   // schema) is a refusal, not a crash: the flag is on, the tables are not
@@ -363,11 +389,14 @@ async function stampArchived(
 }
 
 /** Archive every file of one recording — canonical, parts and the extracts. */
-export async function archiveRecording(recordingId: string): Promise<ArchiveOutcome[]> {
+export async function archiveRecording(
+  recordingId: string,
+  opts: ArchiveOptions = {}
+): Promise<ArchiveOutcome[]> {
   if (!archiveStore()) return [{ status: 'off' }];
   const media = await listRecordingMedia([recordingId]);
   const out: ArchiveOutcome[] = [];
-  for (const row of media) out.push(await archiveMedia(row));
+  for (const row of media) out.push(await archiveMedia(row, opts));
   return out;
 }
 
@@ -375,9 +404,13 @@ export async function archiveRecording(recordingId: string): Promise<ArchiveOutc
  * The call the writers make: fire-and-forget, never awaited, never throws. A
  * user's upload must not wait for — or fail because of — a copy to Azure.
  */
-export function queueMediaArchiveForRecording(recordingId: string, tag: string): void {
+export function queueMediaArchiveForRecording(
+  recordingId: string,
+  tag: string,
+  opts: ArchiveOptions = {}
+): void {
   if (!archiveStore()) return;
-  void archiveRecording(recordingId)
+  void archiveRecording(recordingId, opts)
     .then((outcomes) => {
       const done = outcomes.filter((o) => o.status === 'archived' || o.status === 'adopted');
       const failed = outcomes.filter((o) => o.status === 'failed');
