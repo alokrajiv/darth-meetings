@@ -95,8 +95,11 @@ are finished within 5 min of a restart. Deploys are safe to do mid-transcription
       uploads or AI runs are active. Local files are never deleted by this stage.
 - [ ] `scripts/media-archive-status.ts --check-blobs` clean; after 36 h the canary says `CANARY OK`.
       **14:50 SGT: canary `_canary/2026-09-22` written 13:50 SGT, first ticks in, `--check-blobs` 7/7 OK.** Pace is
-      the 5-files-per-tick cap (800 files ≈ 13 h), not the 2 GB one — expect the drain to finish ~04:00 SGT
-      2026-09-23; an hourly session job flips H when it does.
+      the 5-files-per-tick cap (800 files ≈ 13 h), not the 2 GB one. **Alok: "80 GB should be minutes, Azure to
+      Azure" — right: the pipe does ~40 MB/s.** 0ef4a90 makes the caps env-tunable (`MW_ARCHIVE_FILES_PER_TICK`,
+      `MW_ARCHIVE_GB_PER_TICK`, per-tick read, mid-tick yield to uploads/AI runs every 10 files); the VM runs the
+      drain at 400 files / 25 GB per tick from ~15:00 SGT — expect it done within the hour. The two env lines are
+      harmless to leave (steady state has nothing pending); an hourly session job flips H once drained.
 
 ## E. Transcription versions (Phase 2) — committed 2332967
 
