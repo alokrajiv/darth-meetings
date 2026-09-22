@@ -443,10 +443,10 @@ describe('pacing', () => {
 });
 
 describe('yielding to work people are waiting for', () => {
-  test('an ingest or an AI run in flight yields', async () => {
+  test('an upload or an AI run in flight yields', async () => {
     expect(await archiveShouldYield()).toBeNull();
     db.busy = { ingesting: true, ai: false };
-    expect(await archiveShouldYield()).toBe('an ingest is in flight');
+    expect(await archiveShouldYield()).toBe('an upload is in flight');
     db.busy = { ingesting: false, ai: true };
     expect(await archiveShouldYield()).toBe('an AI run is in flight');
   });

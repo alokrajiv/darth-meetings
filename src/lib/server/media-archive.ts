@@ -518,10 +518,14 @@ export async function drainPendingBlobDeletes(limit: number): Promise<{ deleted:
  * A.3). There is no shared "busy" flag in this app — `ai_runs` rows are only
  * written when a run FINISHES — so this reads the two signals that do exist:
  *
- *  - the DB: a row mid-upload/mid-transcription, or a notes / report /
- *    speaker-ID pass marked `running` recently. Time-bounded because those
- *    statuses get stuck when pm2 restarts mid-run (see `listNotesBacklog`) and
- *    a stuck row must not stop the archive forever.
+ *  - the DB: a row whose BYTES are still streaming in (`uploading`), or a
+ *    notes / report / speaker-ID pass marked `running` recently. A row that
+ *    is `queued` / `processing` is waiting at AssemblyAI — the VM is idle for
+ *    it — so it does not hold the archive (2026-09-22: on a workday there was
+ *    always some meeting transcribing, and the drain never got a tick).
+ *    Time-bounded because those statuses get stuck when pm2 restarts mid-run
+ *    (see `listNotesBacklog`) and a stuck row must not stop the archive
+ *    forever.
  *  - this process: an ffmpeg transcode or a faststart remux in flight
  *    (`audio-only.ts` / `media-sweeper.ts` both keep their in-flight maps on
  *    globalThis, which is also how this module is reachable from either
@@ -540,8 +544,8 @@ export async function archiveShouldYield(): Promise<string | null> {
       EXISTS (
         SELECT 1 FROM ${sql(SCHEMA)}.transcripts
         WHERE deleted_at IS NULL
-          AND status IN ('uploading', 'queued', 'processing')
-          AND created_at > now() - interval '12 hours'
+          AND status = 'uploading'
+          AND COALESCE(upload_progress_at, created_at) > now() - interval '12 hours'
       ) AS ingesting,
       EXISTS (
         SELECT 1 FROM ${sql(SCHEMA)}.transcripts
@@ -554,7 +558,7 @@ export async function archiveShouldYield(): Promise<string | null> {
       ) AS ai
   `;
   const r = rows[0];
-  if (r?.ingesting) return 'an ingest is in flight';
+  if (r?.ingesting) return 'an upload is in flight';
   if (r?.ai) return 'an AI run is in flight';
   return null;
 }
