@@ -25,14 +25,23 @@ Flags live in `~/apps/meeting-whisperer/.env.local` on the VM; every one is read
 
 ## A. Deploy + AssemblyAI keeps nothing  (no migration needed)
 
-- [ ] **ALOK** `./deploy.sh`. Ships: payload stored in the same write as `completed`, no read-backs to AssemblyAI for
+- [x] **ALOK** `./deploy.sh`. Ships: payload stored in the same write as `completed`, no read-backs to AssemblyAI for
       finished rows, a 404 is final, jobs stuck > 6 h give up with a Retry (19 trashed rows flip on the first sweep),
       the dead "import from AssemblyAI" feature removed, and all the flag-gated code below (inert).
-- [ ] Me: watch one fresh upload reach `completed` with its payload stored (`imported_content` not null at the
+      **Done 2026-09-22 12:53 SGT** (main `1da8701`, VM quiet: 0 agent processes, 0 uploads). First sweep flipped
+      exactly the 19 trashed rows (`[aai-giveup]` ×19). The one new error-log line, `[aai-job-id] column missing`,
+      is the expected notice until B applies 045.
+- [x] Me: watch one fresh upload reach `completed` with its payload stored (`imported_content` not null at the
       moment of completion) and the pm2 log clean of `[aai-retention] payload missing`.
+      **Done 2026-09-22 12:56 SGT**: darth-cli `upload --scratch` of a 9 s clip → row 927 (`806d9dcf…`) completed
+      with the full AssemblyAI payload stored (7,974 chars); zero `payload missing` lines.
 - [ ] **ALOK** set `MW_AAI_DELETE_ON_COMPLETE=1`, restart.
-- [ ] **ALOK** on the VM: `bun run scripts/aai-purge.ts` (dry run: expect ~428 ready, 35 no-media skipped — never
-      pass `--include-no-media`, those jobs are not in our account), then `--apply`.
+- [ ] **ALOK** on the VM: `bun run scripts/aai-purge.ts` (dry run: expect **443 ready, 34 no-media skipped, 0
+      incomplete** — never pass `--include-no-media`, those jobs are not in our account), then `--apply`.
+      The 2026-09-22 dry run first showed 10 "payload incomplete": all silent recordings (9 trashed test uploads +
+      one 12 s "Integration Cadence") whose stored copy is the finished response with `words: []` and
+      `utterances: null` — that is how AssemblyAI answers no speech. The script now treats that as complete; the
+      patched copy is on the VM already (sha `57381f6f…`).
 - [ ] **ALOK** shorten retention in the AssemblyAI dashboard to 24 h.
 
 ## B. Recordings tables (Phase 1)

@@ -19,8 +19,12 @@
  *                       only, nothing to re-transcribe from ever again)
  *   --limit <n>         cap the number of jobs considered (default: all)
  *
- * A job is only ever purged when our copy is provably complete: utterances
- * AND words stored, and (unless --include-no-media) the media on disk. One
+ * A job is only ever purged when our copy is provably complete: the stored
+ * payload says `status: completed`, its `words` array is present, and its
+ * `utterances` array is present unless `words` is empty (AssemblyAI answers
+ * `utterances: null` for a recording in which it heard no speech — that copy
+ * is complete, there is nothing more to fetch), and (unless
+ * --include-no-media) the media on disk. One
  * AAI job can back several rows — `UNIQUE (user_id, assemblyai_id)` — so the
  * delete happens once per job and every copy gets stamped.
  *
@@ -51,6 +55,9 @@ interface Candidate {
    * by. Equal to `assemblyai_id` for every row born before Phase 1b. */
   aai_job_id: string | null;
   status: string;
+  /** `imported_content.status` — 'completed' when the stored copy is the
+   * finished AssemblyAI response, anything else when it is a stub. */
+  payload_status: string | null;
   title: string | null;
   completed_at: string | null;
   utterances: number | null;
@@ -62,10 +69,16 @@ interface Candidate {
 
 const sql = postgres({ onnotice: () => {} });
 
+/** Largest stored count across the copies; null when NO copy stores the array. */
+function maxOrNull(values: Array<number | null>): number | null {
+  const present = values.filter((v): v is number => v !== null && v !== undefined);
+  return present.length > 0 ? Math.max(...present) : null;
+}
+
 function fmt(c: Candidate): string {
   const when = c.completed_at ? String(c.completed_at).slice(0, 10) : '????-??-??';
   const name = (c.title ?? '(untitled)').slice(0, 44);
-  return `${c.aai_job_id}  ${when}  u=${c.utterances ?? 0} w=${c.words ?? 0}  ${
+  return `${c.aai_job_id}  ${when}  u=${c.utterances ?? '-'} w=${c.words ?? '-'}  ${
     c.has_media ? 'media' : 'NO-MEDIA'
   }${c.trashed ? ' trashed' : ''}  ${name}`;
 }
@@ -86,6 +99,7 @@ async function main(): Promise<void> {
 
   const rows = await sql<Candidate[]>`
     SELECT user_id, assemblyai_id, ${jobIdExpr} AS aai_job_id, status, title,
+           imported_content->>'status' AS payload_status,
            completed_at::text AS completed_at,
            jsonb_array_length(
              CASE WHEN jsonb_typeof(imported_content->'utterances') = 'array'
@@ -126,11 +140,19 @@ async function main(): Promise<void> {
       ...head,
       has_media: copies.some((c) => c.has_media),
       stamped: copies.every((c) => c.stamped),
-      utterances: Math.max(...copies.map((c) => c.utterances ?? 0)),
-      words: Math.max(...copies.map((c) => c.words ?? 0)),
+      payload_status: copies.some((c) => c.payload_status === 'completed') ? 'completed' : head.payload_status,
+      utterances: maxOrNull(copies.map((c) => c.utterances)),
+      words: maxOrNull(copies.map((c) => c.words)),
     };
+    // null = the array is not stored at all (payload missing or truncated);
+    // 0 = stored and empty. A silent recording comes back from AssemblyAI as
+    // `words: []` + `utterances: null` — complete, nothing left to fetch.
+    const complete =
+      merged.payload_status === 'completed' &&
+      merged.words !== null &&
+      (merged.utterances !== null || merged.words === 0);
     if (merged.stamped) done.push(merged);
-    else if (!merged.utterances || !merged.words) unsafe.push(merged);
+    else if (!complete) unsafe.push(merged);
     else if (!merged.has_media) noMedia.push(merged);
     else ready.push(merged);
   }
