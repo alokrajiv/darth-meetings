@@ -15,7 +15,6 @@ import {
   type StripTone,
 } from '@/lib/recording-strip';
 import { OFFLINE_TITLE } from '@/lib/offline/offline-types';
-import { isNetworkFailure } from '@/lib/offline/offline-fetch';
 
 /**
  * The recording strip (docs/listing-ui-redesign.md §4): ONE line under a
@@ -185,39 +184,18 @@ export interface RecorderRefStripProps {
 
 export function RecorderRefStrip({ rec, event, originalNote, disabled = false, className }: RecorderRefStripProps) {
   const companion = useCompanion();
-  const [nudgedAt, setNudgedAt] = useState<string | null>(rec.nudgedAt);
   const [note, setNote] = useState<string | null>(null);
   const model = stripForRecorderRef(rec, {
     trayConnected: companion.connected,
     fmtDuration: formatDuration,
-    nudgedAt,
   });
   if (originalNote) model.title = `${model.title ?? ''} · ${originalNote}`;
 
-  const askedLabel = nudgedAt
-    ? `asked ${new Date(nudgedAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}`
-    : null;
-
+  // No "Ask <first> to upload" any more (P2): the nudge acted on somebody
+  // else's private recording, on the strength of a machine match, and the
+  // route it posted to is gone.
   const onAction = async (kind: StripActionKind) => {
     setNote(null);
-    if (kind === 'nudge') {
-      try {
-        const res = await fetch(`/api/recorder/recordings/${rec.id}/nudge`, { method: 'POST' });
-        const j = (await res.json().catch(() => ({}))) as { sent_at?: string; error?: string };
-        if (res.ok) {
-          setNudgedAt(j.sent_at ?? new Date().toISOString());
-          setNote('asked just now');
-        } else if (res.status === 429) {
-          setNudgedAt(j.sent_at ?? new Date().toISOString());
-          setNote('already asked');
-        } else {
-          setNote(j.error ?? `Could not ask (${res.status})`);
-        }
-      } catch (err) {
-        setNote(isNetworkFailure(err) ? OFFLINE_TITLE : 'Could not ask');
-      }
-      return;
-    }
     if (kind === 'upload') {
       const ok = getCompanion().upload(rec.id, {
         id: event.id,
@@ -243,7 +221,7 @@ export function RecorderRefStrip({ rec, event, originalNote, disabled = false, c
       model={model}
       onAction={onAction}
       actionHref={model.action?.kind === 'open' && rec.transcriptId ? `/transcript/${rec.transcriptId}` : null}
-      note={note ?? (model.action === null && askedLabel ? askedLabel : null)}
+      note={note}
       disabled={disabled}
       className={className}
       data={{ 'data-recorder-recording': rec.status, 'data-recorder-mine': rec.mine ? '1' : '0' }}

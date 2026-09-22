@@ -55,7 +55,6 @@ describe('recorderRowCopy for a stuck recording row', () => {
     startedAt,
     durationS: null,
     transcriptId: null,
-    nudgedAt: null,
   });
   const now = Date.parse('2026-09-19T02:00:00Z');
   test('a fresh one is "now…"', () => {

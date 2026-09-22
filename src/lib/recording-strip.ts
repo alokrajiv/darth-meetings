@@ -30,7 +30,7 @@ export type RecordingStripState =
 
 export type StripTone = 'muted' | 'busy' | 'ok' | 'warn' | 'err';
 
-export type StripActionKind = 'upload' | 'open-recorder' | 'nudge' | 'open' | 'retry' | 'import' | 'add';
+export type StripActionKind = 'upload' | 'open-recorder' | 'open' | 'retry' | 'import' | 'add';
 
 export interface StripAction {
   kind: StripActionKind;
@@ -368,8 +368,6 @@ export interface RecorderStripOptions {
   trayConnected: boolean;
   fmtDuration: (s: number) => string;
   now?: number;
-  /** When the caller last asked the owner (an ISO string) — shown instead of the button. */
-  nudgedAt?: string | null;
 }
 
 export function stripForRecorderRef(rec: RecorderRecordingRef, opts: RecorderStripOptions): RecordingStripModel {
@@ -460,18 +458,21 @@ export function stripForRecorderRef(rec: RecorderRecordingRef, opts: RecorderStr
       busy: false,
     };
   }
+  // Somebody else's recording, still on their Mac. Since P1 a ref like this
+  // only reaches a caller who can open the meeting it is linked to, and a
+  // linked recording is uploaded by definition — so this is the unreachable
+  // tail, kept honest rather than deleted. It offers NOTHING: "Ask <first> to
+  // upload" (P2) was an action on a private recording, given to whoever the
+  // matcher happened to tie to the occurrence.
   const first = recorderOwnerFirstName(rec.ownerEmail);
-  const askedAt = opts.nudgedAt ? new Date(opts.nudgedAt) : null;
   return {
     source: 'mac',
     state: failed ? 'failed' : 'on-mac',
     tone: failed ? 'err' : 'warn',
     text: join([`On ${where}`, dur, failed ? 'upload failed' : null]),
-    title: `${base} · only ${first} can upload it — asking sends them a Darth DM (once per 6 h)`,
+    title: `${base} · only ${first} can upload it`,
     progress: null,
-    action: askedAt && !Number.isNaN(askedAt.getTime())
-      ? null
-      : { kind: 'nudge', label: `Ask ${first} to upload`, title: `Send ${first} a Darth DM asking for this recording` },
+    action: null,
     busy: false,
   };
 }

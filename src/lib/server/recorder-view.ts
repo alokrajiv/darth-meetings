@@ -5,13 +5,15 @@ import type { RecorderMatch } from '@/lib/recorder';
 import { recorderMatchIsConfident } from '@/lib/recorder';
 
 /**
- * Wire shapes for /api/recorder/recordings — one place so the owner view and
- * the redacted view can never drift.
+ * Wire shape for /api/recorder/recordings — the OWNER's view, and the only
+ * one there is.
  *
- * THE RULE (feedback_privacy_caller_scoping_gate): a caller who is merely
- * involved in the occurrence learns that a recording EXISTS, who owns it and
- * what state it is in. Local file paths, segment lists, window titles, share
- * events and error strings are the owner's alone.
+ * THE RULE (docs/recordings-meetings-series-design.md rules 1 and 3): a
+ * recording belongs to one person and is never shared. It reaches anyone
+ * else only THROUGH a meeting that holds a clip on it. There is no redacted
+ * cross-user view: `othersView` (existence + owner email + state + timings +
+ * the meeting id, served to whoever the matcher tied to the occurrence) was
+ * deleted with the `?event=` listing it fed — F2, P2.
  */
 
 export const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -44,22 +46,6 @@ export interface OwnRecordingView {
   updated_at: string;
 }
 
-export interface OthersRecordingView {
-  id: string;
-  mine: false;
-  owner_email: string | null;
-  status: string;
-  started_at: string | null;
-  duration_s: number | null;
-  transcript_id: string | null;
-  /** Occurrence identity only — no title, no window text. */
-  matched: { meeting_code: string | null; occ_start: string; score: number } | null;
-  /** When THIS caller last asked the owner to upload it. */
-  nudged_at: string | null;
-}
-
-export type RecordingView = OwnRecordingView | OthersRecordingView;
-
 export function ownView(r: RecorderRecordingRow): OwnRecordingView {
   return {
     id: r.id,
@@ -80,29 +66,6 @@ export function ownView(r: RecorderRecordingRow): OwnRecordingView {
     error: r.error,
     created_at: iso(r.created_at) ?? r.created_at,
     updated_at: iso(r.updated_at) ?? r.updated_at,
-  };
-}
-
-export function othersView(
-  r: RecorderRecordingRow,
-  nudgedAt: string | null
-): OthersRecordingView {
-  return {
-    id: r.id,
-    mine: false,
-    owner_email: r.email,
-    status: r.status,
-    started_at: iso(r.started_at),
-    duration_s: r.duration_s,
-    transcript_id: r.transcript_id,
-    matched: r.matched
-      ? {
-          meeting_code: r.matched.meeting_code ?? null,
-          occ_start: r.matched.occ_start,
-          score: r.matched.score,
-        }
-      : null,
-    nudged_at: nudgedAt,
   };
 }
 

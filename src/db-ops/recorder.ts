@@ -192,8 +192,8 @@ export interface RecordingWrite {
   transcriptId?: string | null;
 }
 
-/** The owner's row, or null (never another user's — callers that need the
- * cross-user view go through `recordingsForOccurrence`). */
+/** The owner's row, or null. There is no cross-user form of this: a
+ * recording is reachable by its owner, or through a meeting. */
 export async function getOwnRecording(
   userId: string,
   id: string
@@ -201,15 +201,6 @@ export async function getOwnRecording(
   const rows = await sql<RecorderRecordingRow[]>`
     SELECT * FROM ${sql(SCHEMA)}.recorder_recordings
     WHERE id = ${id}::uuid AND user_id = ${userId}
-  `;
-  return rows[0] ?? null;
-}
-
-/** Any owner's row — for the nudge route, which gates on occurrence
- * involvement instead of ownership. */
-export async function getRecordingAnyOwner(id: string): Promise<RecorderRecordingRow | null> {
-  const rows = await sql<RecorderRecordingRow[]>`
-    SELECT * FROM ${sql(SCHEMA)}.recorder_recordings WHERE id = ${id}::uuid
   `;
   return rows[0] ?? null;
 }
@@ -365,43 +356,6 @@ function linkedMeetingLateral(
   `;
 }
 
-/** The row plus arm (b)'s answer. `linked_transcript_id` is the ONLY meeting
- * id these folds may hand out: it is non-null exactly when the caller can
- * already open that meeting. */
-export type OccurrenceRecordingRow = RecorderRecordingRow & {
-  linked_transcript_id: string | null;
-};
-
-/**
- * Recordings of ONE occurrence this caller may know about: their own (arm a)
- * or one linked to a meeting they can open (arm b). Never "somebody's Mac
- * recorded this" — involvement in the occurrence is not an arm (F2).
- */
-export async function recordingsForOccurrence(
-  caller: RecorderCaller,
-  meetingCode: string,
-  instant: string | null,
-  limit = 20
-): Promise<OccurrenceRecordingRow[]> {
-  return sql<OccurrenceRecordingRow[]>`
-    SELECT rr.*, linked.assemblyai_id AS linked_transcript_id
-    FROM ${sql(SCHEMA)}.recorder_recordings rr
-    LEFT JOIN LATERAL (
-      ${linkedMeetingLateral(caller, 'rr', sql`${meetingCode}`, sql`${instant}::timestamptz`)}
-    ) linked ON true
-    WHERE rr.status <> 'deleted'
-      AND ${matchedConfidentSql('rr')}
-      AND rr.matched->>'meeting_code' = ${meetingCode}
-      AND (
-        ${instant}::timestamptz IS NULL
-        OR abs(extract(epoch FROM ((rr.matched->>'occ_start')::timestamptz - ${instant}::timestamptz))) <= 120
-      )
-      AND (rr.user_id = ${caller.userId} OR linked.assemblyai_id IS NOT NULL)
-    ORDER BY COALESCE(rr.started_at, rr.created_at) DESC
-    LIMIT ${limit}
-  `;
-}
-
 export interface OccurrenceRecordingHit {
   k: string;
   id: string;
@@ -410,10 +364,10 @@ export interface OccurrenceRecordingHit {
   status: string;
   started_at: string | null;
   duration_s: number | null;
-  /** Arm (b) only — see OccurrenceRecordingRow. */
+  /** Arm (b)'s answer, and the ONLY meeting id this fold may hand out: it is
+   * non-null exactly when the caller can already open that meeting. */
   linked_transcript_id: string | null;
   hostname: string | null;
-  nudged_at: string | null;
 }
 
 /**
@@ -448,8 +402,7 @@ export async function recordingsForOccurrences(
            o.k,
            r.id, r.user_id, r.email, r.status, r.started_at, r.duration_s,
            linked.assemblyai_id AS linked_transcript_id,
-           d.hostname,
-           n.sent_at AS nudged_at
+           d.hostname
     FROM jsonb_to_recordset(${sql.json(batch as unknown as never)})
          AS o(k text, code text, instant timestamptz)
     JOIN ${sql(SCHEMA)}.recorder_recordings r
@@ -461,8 +414,6 @@ export async function recordingsForOccurrences(
     LEFT JOIN LATERAL (
       ${linkedMeetingLateral(caller, 'r', sql`o.code`, sql`o.instant`)}
     ) linked ON true
-    LEFT JOIN ${sql(SCHEMA)}.recorder_nudges n
-      ON n.recording_id = r.id AND n.requester_user_id = ${caller.userId}
     WHERE r.user_id = ${caller.userId} OR linked.assemblyai_id IS NOT NULL
     ORDER BY o.k,
              (r.user_id = ${caller.userId}) DESC,
@@ -502,55 +453,4 @@ export async function relinkRecordingTranscript(oldTranscriptId: string, newTran
     RETURNING id
   `;
   return rows.length;
-}
-
-// ---------------------------------------------------------------------------
-// Nudges ("Ask to upload")
-// ---------------------------------------------------------------------------
-
-export const NUDGE_WINDOW_H = 6;
-
-/** Claims the 6 h slot for (recording, requester). false = already nudged;
- * `sentAt` then says when. */
-export async function claimNudge(
-  recordingId: string,
-  requester: { userId: string; email: string }
-): Promise<{ claimed: boolean; sentAt: string }> {
-  const rows = await sql<Array<{ sent_at: string; claimed: boolean }>>`
-    INSERT INTO ${sql(SCHEMA)}.recorder_nudges (recording_id, requester_user_id, requester_email)
-    VALUES (${recordingId}::uuid, ${requester.userId}, ${requester.email})
-    ON CONFLICT (recording_id, requester_user_id) DO UPDATE
-      SET sent_at = now(), requester_email = EXCLUDED.requester_email
-      WHERE recorder_nudges.sent_at < now() - ${NUDGE_WINDOW_H} * interval '1 hour'
-    RETURNING sent_at, true AS claimed
-  `;
-  if (rows[0]) return { claimed: true, sentAt: rows[0].sent_at };
-  const prev = await sql<Array<{ sent_at: string }>>`
-    SELECT sent_at FROM ${sql(SCHEMA)}.recorder_nudges
-    WHERE recording_id = ${recordingId}::uuid AND requester_user_id = ${requester.userId}
-  `;
-  return { claimed: false, sentAt: prev[0]?.sent_at ?? new Date().toISOString() };
-}
-
-/** Undo a claim when the DM could not be built/sent. */
-export async function releaseNudge(recordingId: string, requesterUserId: string): Promise<void> {
-  await sql`
-    DELETE FROM ${sql(SCHEMA)}.recorder_nudges
-    WHERE recording_id = ${recordingId}::uuid AND requester_user_id = ${requesterUserId}
-  `;
-}
-
-/** When the requester last nudged each of these recordings (6 h window UI). */
-export async function lastNudgeAt(
-  recordingIds: string[],
-  requesterUserId: string
-): Promise<Map<string, string>> {
-  if (recordingIds.length === 0) return new Map();
-  const rows = await sql<Array<{ recording_id: string; sent_at: string }>>`
-    SELECT recording_id::text, sent_at
-    FROM ${sql(SCHEMA)}.recorder_nudges
-    WHERE requester_user_id = ${requesterUserId}
-      AND recording_id = ANY(${recordingIds}::uuid[])
-  `;
-  return new Map(rows.map((r) => [r.recording_id, r.sent_at]));
 }

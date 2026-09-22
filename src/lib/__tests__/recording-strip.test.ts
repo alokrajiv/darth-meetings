@@ -259,7 +259,6 @@ const ref = (over: Partial<RecorderRecordingRef> = {}): RecorderRecordingRef => 
   startedAt: '2026-09-21T03:02:54Z',
   durationS: 2671,
   transcriptId: null,
-  nudgedAt: null,
   ...over,
 });
 
@@ -281,19 +280,16 @@ describe('stripForRecorderRef', () => {
     expect(m.text).toBe('On your Mac · 44m 31s · upload failed');
     expect(m.action?.label).toBe('Retry upload');
   });
-  test('a colleague’s Mac → Ask <first name> to upload', () => {
+  // P2: "Ask Kawen to upload" was an action on somebody else's private
+  // recording, offered to whoever the matcher tied to the occurrence. There
+  // is nothing to offer here any more (and since P1 a ref for a colleague's
+  // recording only reaches a caller who can open the meeting it is linked
+  // to, which makes this the unreachable tail).
+  test('a colleague’s Mac → says who has it, offers nothing', () => {
     const m = stripForRecorderRef(ref({ mine: false, ownerEmail: 'kawen.koh@trames.sg' }), { trayConnected: true, fmtDuration, now });
     expect(m.text).toBe("On Kawen's Mac · 44m 31s");
-    expect(m.action).toMatchObject({ kind: 'nudge', label: 'Ask Kawen to upload' });
-  });
-  test('already asked → no action', () => {
-    const m = stripForRecorderRef(ref({ mine: false, ownerEmail: 'kawen.koh@trames.sg' }), {
-      trayConnected: true,
-      fmtDuration,
-      now,
-      nudgedAt: '2026-09-21T04:00:00Z',
-    });
     expect(m.action).toBeNull();
+    expect(m.title).not.toContain('DM');
   });
   test('uploaded → Open transcript', () => {
     const m = stripForRecorderRef(ref({ status: 'uploaded', transcriptId: 't1' }), { trayConnected: false, fmtDuration, now });

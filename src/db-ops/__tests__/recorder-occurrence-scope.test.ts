@@ -22,7 +22,7 @@ mock.module('server-only', () => ({}));
 mock.module('@/lib/db', () => ({ sql, default: sql }));
 mock.module('@/lib/plagueis-db', () => ({ plagueisSql: sql }));
 
-const { recordingsForOccurrence, recordingsForOccurrences } = await import('@/db-ops/recorder');
+const { recordingsForOccurrences } = await import('@/db-ops/recorder');
 
 const A = { userId: 'aaaaaaaa-0000-4000-8000-000000000001', email: 'Alok.Raj@trames.sg' };
 const OCC = { k: 'abc-defg-hij|2026-09-22T07:30:00.000Z', code: 'abc-defg-hij', instant: '2026-09-22T07:30:00.000Z' };
@@ -85,24 +85,5 @@ describe('recordingsForOccurrences — the calendar fold', () => {
     const out = await recordingsForOccurrences(A, []);
     expect(out.size).toBe(0);
     expect(sql.executed.length).toBe(0);
-  });
-});
-
-describe('recordingsForOccurrence — the ?event= form', () => {
-  test('carries the same two arms', async () => {
-    await recordingsForOccurrence(A, OCC.code, OCC.instant);
-    const q = emitted();
-    expect(q.text).toContain('AND (rr.user_id = $');
-    expect(q.text).toContain('OR linked.assemblyai_id IS NOT NULL)');
-    expect(q.text).toContain('LOWER(s.shared_with_email) = $');
-    expect(q.params).toContain(A.userId);
-    expect(q.params).toContain(A.email.toLowerCase());
-  });
-
-  test('a confident match is still required, and a weak one is never folded', async () => {
-    await recordingsForOccurrence(A, OCC.code, OCC.instant);
-    const q = emitted();
-    expect(q.text).toContain("rr.matched ? 'confident'");
-    expect(q.text).toContain("(rr.matched->>'provider_mismatch')::boolean");
   });
 });

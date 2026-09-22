@@ -351,7 +351,6 @@ function MacCard({
     startedAt: r.started_at,
     durationS: r.duration_s,
     transcriptId: r.transcript_id,
-    nudgedAt: null,
   };
   const model = stripForRecorderRef(ref, { trayConnected: trayHasIt, fmtDuration: formatDuration });
   if (live) {

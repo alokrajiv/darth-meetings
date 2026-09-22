@@ -204,10 +204,10 @@ export interface RecorderRecordingRef {
   status: string;
   startedAt: string | null;
   durationS: number | null;
-  /** Set once the upload finalized — link straight to the transcript. */
+  /** The meeting this recording is LINKED to, and only when the caller can
+   * already open it (P1). Unlinked — the caller's own included — is null:
+   * there is no meeting to open from here. */
   transcriptId: string | null;
-  /** When the CALLER last nudged the owner about it (6 h rate-limit window). */
-  nudgedAt: string | null;
 }
 
 /** "Ben" from ben.tan@trames.sg / "Ben Tan" — possessive-friendly first name. */
@@ -224,7 +224,7 @@ export function recorderMacLabel(rec: RecorderRecordingRef): string {
   return `${recorderOwnerFirstName(rec.ownerEmail)}'s Mac`;
 }
 
-export type RecorderRowAction = 'upload' | 'nudge' | 'open' | null;
+export type RecorderRowAction = 'upload' | 'open' | null;
 
 /** A `recording` row older than this is treated as one the tray lost, not a live call. */
 export const RECORDING_STALE_MS = 12 * 3600_000;
@@ -291,10 +291,14 @@ export function recorderRowCopy(
       title: `${base} · the file is still on this Mac — upload it to transcribe it`,
     };
   }
+  // Somebody else's recording. It reaches this caller only through a meeting
+  // they can open (P1/P2), so there is nothing for them to do with it here —
+  // and nothing to ask: "Ask X to upload" was an action on a private
+  // recording, handed out on a machine match.
   return {
     text: `Recorded on ${where}${dur}${failed ? ' · upload failed' : ''}`,
-    action: 'nudge',
-    actionLabel: 'Ask to upload',
-    title: `${base} · only ${recorderOwnerFirstName(rec.ownerEmail)} can upload it — asking sends them a Darth DM`,
+    action: null,
+    actionLabel: null,
+    title: `${base} · only ${recorderOwnerFirstName(rec.ownerEmail)} can upload it`,
   };
 }

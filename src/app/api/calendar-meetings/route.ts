@@ -263,7 +263,6 @@ function recorderRefOf(
     startedAt: hit.started_at == null ? null : isoOf(hit.started_at),
     durationS: hit.duration_s,
     transcriptId: hit.linked_transcript_id,
-    nudgedAt: hit.nudged_at == null ? null : isoOf(hit.nudged_at),
   };
 }
 

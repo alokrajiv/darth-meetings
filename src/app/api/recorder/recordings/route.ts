@@ -2,20 +2,12 @@ import { NextResponse } from 'next/server';
 import { withAuth } from '@/lib/auth/with-auth';
 import {
   getOwnRecording,
-  lastNudgeAt,
   listOwnRecordings,
   recordingOwnerOf,
-  recordingsForOccurrence,
   upsertRecording,
 } from '@/db-ops/recorder';
-import { matchForWrite, resolveOccurrenceRef } from '@/lib/server/recorder-match';
-import {
-  ownView,
-  othersView,
-  parseRecordingWrite,
-  UUID_RE,
-  type RecordingView,
-} from '@/lib/server/recorder-view';
+import { matchForWrite } from '@/lib/server/recorder-match';
+import { ownView, parseRecordingWrite, UUID_RE } from '@/lib/server/recorder-view';
 
 export const runtime = 'nodejs';
 
@@ -27,57 +19,37 @@ export const runtime = 'nodejs';
  * `matchRecording()` runs on every write and stores `matched`.
  *
  * GET ?mine=1 — the caller's own recordings (full detail, local paths and
- * all).
- * GET ?event=<ref> — recordings OF THAT OCCURRENCE the caller may know
- * about. CALLER-SCOPING GATE: the caller must be involved in the occurrence
- * (own calendar row / organizer / invitee — callerInvolvedCodes); anything
- * else answers with an empty list. Recordings that are not the caller's are
- * redacted to existence + owner email + status (no paths, no window titles)
- * — see lib/server/recorder-view.
+ * all). It is the ONLY listing this route serves.
+ *
+ * There is no `?event=` form any more (P2,
+ * docs/recordings-meetings-series-design.md F2). It listed recordings of any
+ * owner for an occurrence the caller was merely involved in, redacted to
+ * owner email + state + timings + the meeting id — an exposure of a
+ * recording outside any meeting, on the strength of a machine match.
+ * Involvement in an occurrence is a gate on the OCCURRENCE; the only gate on
+ * a recording is a meeting. A recording someone linked to a meeting the
+ * caller can open reaches them through that meeting, as it should.
  */
 
 export const GET = withAuth(async ({ user, request }) => {
   const params = request.nextUrl.searchParams;
-  const eventRef = params.get('event');
-
-  if (eventRef) {
-    const occ = await resolveOccurrenceRef({ userId: user.userId, email: user.email }, eventRef);
-    if (!occ || !occ.code) {
-      return NextResponse.json(
-        { error: 'event must be a meeting code, "<code>|<startIso>" or a calendar event key' },
-        { status: 400 }
-      );
-    }
-    // Not involved → the occurrence simply has no recordings as far as this
-    // caller is concerned. Never 403: that would confirm one exists.
-    if (!occ.involved) {
-      return NextResponse.json({ recordings: [], occurrence: { code: occ.code, instant: occ.instant } });
-    }
-    const rows = await recordingsForOccurrence(
-      { userId: user.userId, email: user.email },
-      occ.code,
-      occ.instant
-    );
-    const othersIds = rows.filter((r) => r.user_id !== user.userId).map((r) => r.id);
-    const nudges = await lastNudgeAt(othersIds, user.userId);
-    const recordings: RecordingView[] = rows.map((r) =>
-      r.user_id === user.userId ? ownView(r) : othersView(r, nudges.get(r.id) ?? null)
-    );
-    return NextResponse.json({
-      recordings,
-      occurrence: { code: occ.code, instant: occ.instant, title: occ.title },
-    });
-  }
 
   if (params.get('mine') === '1') {
     const rows = await listOwnRecordings(user.userId);
     return NextResponse.json({ recordings: rows.map(ownView) });
   }
 
-  return NextResponse.json(
-    { error: 'Expected ?mine=1 or ?event=<meeting code | occurrence key | event key>' },
-    { status: 400 }
-  );
+  if (params.get('event')) {
+    return NextResponse.json(
+      {
+        error:
+          'Recordings are not listed by occurrence. A recording is reachable by its owner (?mine=1), or through a meeting that holds a clip on it.',
+      },
+      { status: 400 }
+    );
+  }
+
+  return NextResponse.json({ error: 'Expected ?mine=1' }, { status: 400 });
 });
 
 export const POST = withAuth(async ({ user, request }) => {
