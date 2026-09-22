@@ -322,7 +322,6 @@ function TranscriptDetailInner({ transcriptId }: { transcriptId: string }) {
   const [speakerLabels, setSpeakerLabels] = useState<SpeakerLabel[]>([]);
   const [speakerSuggestions, setSpeakerSuggestions] = useState<SpeakerSuggestionMap>({});
   const [transcriptEdits, setTranscriptEdits] = useState<TranscriptEditMap>({});
-  const [generatingNotes, setGeneratingNotes] = useState(false);
   const [notesPromptOpen, setNotesPromptOpen] = useState(false);
   // One dialog, one outcome: summary + detailed report. Nothing to pre-tick
   // since 2026-09-21 — summary-only generation no longer exists.
@@ -940,56 +939,6 @@ function TranscriptDetailInner({ transcriptId }: { transcriptId: string }) {
       setGuessingSpeakers(false);
     }
   }, [transcriptId, guessingSpeakers]);
-
-  const handleGenerateNotes = useCallback(async (instructions?: string) => {
-    if (generatingNotes) return;
-    setGeneratingNotes(true);
-    try {
-      const trimmed = instructions?.trim();
-      const res = await fetch(`/api/transcripts/${transcriptId}/notes`, {
-        method: 'POST',
-        ...(trimmed
-          ? {
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({ instructions: trimmed }),
-            }
-          : {}),
-      });
-      if (res.ok) {
-        setRow((prev) =>
-          prev ? { ...prev, auto_notes_status: 'running', auto_notes_error: null } : prev
-        );
-        setStaleReasons({});
-        bumpActivity();
-      }
-    } finally {
-      setGeneratingNotes(false);
-    }
-  }, [transcriptId, generatingNotes, bumpActivity]);
-
-  /** Rebuild the quick summary by resuming the detailed-report session —
-   * the report run already verified frames/attachments, so the summary
-   * inherits all of it for near-cache-read cost. */
-  const handleTopUpSummary = useCallback(async () => {
-    if (generatingNotes) return;
-    setGeneratingNotes(true);
-    try {
-      const res = await fetch(`/api/transcripts/${transcriptId}/notes`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ fromReport: true }),
-      });
-      if (res.ok) {
-        setRow((prev) =>
-          prev ? { ...prev, auto_notes_status: 'running', auto_notes_error: null } : prev
-        );
-        setStaleReasons({});
-        bumpActivity();
-      }
-    } finally {
-      setGeneratingNotes(false);
-    }
-  }, [transcriptId, generatingNotes, bumpActivity]);
 
   // Unique speakers + line counts for the review dialog.
   const reviewSpeakers = useMemo(
@@ -2302,7 +2251,26 @@ function TranscriptDetailInner({ transcriptId }: { transcriptId: string }) {
         )
       )
     : row.speaker_count;
-  const notesGenerating = generatingNotes || row.auto_notes_status === 'running';
+  // ONE artifact, two views (lib/report-pref.ts): a generation run always
+  // writes the quick summary AND the detailed report, so the card tracks one
+  // run — never a state per tier.
+  const notesRunning =
+    row.auto_notes_status === 'running' || row.auto_report_status === 'running';
+  const notesGenerating = generatingReport || notesRunning;
+  const hasGeneratedNotes = !!row.auto_notes || !!row.auto_report;
+  /** The one failure worth showing: the report run's, else the summary distil's. */
+  const notesRunError = notesRunning
+    ? null
+    : row.auto_report_status === 'error'
+      ? row.auto_report_error || 'unknown error'
+      : row.auto_notes_status === 'error'
+        ? row.auto_notes_error || 'unknown error'
+        : null;
+  /** What the segmented control is showing — the body renders once, not per tier. */
+  const noteView =
+    summaryTab === 'report'
+      ? { body: row.auto_report, at: row.auto_report_at, stats: aiStats?.latestReport ?? null }
+      : { body: row.auto_notes, at: row.auto_notes_at, stats: aiStats?.latest ?? null };
 
   /** Soft delete: the row moves to the Trash tab (restorable) — nothing is
    * destroyed. Owner-only; navigates back to the (now row-less) list. */
@@ -2453,7 +2421,7 @@ function TranscriptDetailInner({ transcriptId }: { transcriptId: string }) {
             ) : (
               <Sparkles className="h-4 w-4 text-primary" />
             )}
-            Summary / report…
+            Summary + report…
           </Button>
         )}
         {canEdit && (content?.utterances?.length ?? 0) > 0 && (
@@ -2683,7 +2651,7 @@ function TranscriptDetailInner({ transcriptId }: { transcriptId: string }) {
           variant="ghost"
           size="sm"
           className="h-6 shrink-0 text-[11px] text-primary hover:text-primary"
-          disabled={offline || generatingNotes || generatingReport}
+          disabled={offline || notesGenerating}
           title={offline ? OFFLINE_TITLE : undefined}
           onClick={() => openGenerateDialog()}
         >
@@ -3389,9 +3357,17 @@ function TranscriptDetailInner({ transcriptId }: { transcriptId: string }) {
               </div>
             )}
 
-            {/* Summary — meeting notes generated by headless Claude on the server. */}
+            {/* Summary — ONE artifact with two views. A generation run always
+                writes both tiers (see lib/report-pref.ts): the detailed report
+                is the run, the quick summary distills from that same session.
+                So the card has one run state, one error, one Regenerate — the
+                segmented control below only switches what is SHOWN. */}
             {row.status === 'completed' &&
-              (row.auto_notes || row.auto_notes_status || canEdit) && (
+              (row.auto_notes ||
+                row.auto_report ||
+                row.auto_notes_status ||
+                row.auto_report_status ||
+                canEdit) && (
               <Card id="ai-summary" className="scroll-mt-36">
                 <CardHeader className="px-4 pt-3 pb-2">
                   <button
@@ -3411,43 +3387,14 @@ function TranscriptDetailInner({ transcriptId }: { transcriptId: string }) {
                 </CardHeader>
                 {!collapsedSections.aiSummary && (
                   <CardContent className="px-4 pb-4">
-                    <div className="mb-3 flex items-center gap-1 rounded-lg bg-muted/60 p-0.5 text-xs w-fit">
-                      {/* The richer read leads once it exists: report tab first. */}
-                      {[
-                        {
-                          key: 'report' as const,
-                          label: 'Detailed report',
-                          spinning: row.auto_report_status === 'running' || reportQueued,
-                        },
-                        { key: 'summary' as const, label: 'Summary', spinning: false },
-                      ]
-                        .sort((a) =>
-                          row.auto_report ? (a.key === 'report' ? -1 : 1) : a.key === 'summary' ? -1 : 1
-                        )
-                        .map((t) => (
-                          <button
-                            key={t.key}
-                            type="button"
-                            onClick={() => selectSummaryTab(t.key)}
-                            className={`flex items-center gap-1 rounded-md px-2.5 py-1 font-medium transition-colors ${summaryTab === t.key ? 'bg-card shadow-sm' : 'text-muted-foreground hover:text-foreground'}`}
-                          >
-                            {t.label}
-                            {t.spinning && (
-                              <RefreshCw className="h-3 w-3 animate-spin text-muted-foreground" />
-                            )}
-                          </button>
-                        ))}
-                    </div>
-                    {summaryTab === 'report' ? (
-                    <>
-                    {row.auto_report && row.auto_report_status !== 'running' && previousTranscriptionNote}
-                    {reportQueued && row.auto_report_status !== 'running' && (
+                    {hasGeneratedNotes && !notesRunning && previousTranscriptionNote}
+                    {reportQueued && !notesRunning && (
                       <div className="mb-3 flex items-center gap-2 rounded-md border border-amber-400/50 bg-amber-500/5 px-3 py-2 text-xs text-muted-foreground">
                         <Loader2 className="h-3.5 w-3.5 shrink-0 animate-spin text-amber-600 dark:text-amber-500" />
                         <span className="min-w-0 flex-1">
                           {reportScheduledAt
-                            ? `Report scheduled for ${new Date(reportScheduledAt).toLocaleString([], { dateStyle: 'medium', timeStyle: 'short' })} — it runs on its own.`
-                            : 'Video report queued — Google is still preparing the recording. It starts on its own the moment the video lands (checked every minute).'}
+                            ? `Scheduled for ${new Date(reportScheduledAt).toLocaleString([], { dateStyle: 'medium', timeStyle: 'short' })} — it runs on its own, and writes both the summary and the detailed report.`
+                            : 'Queued — Google is still preparing the recording. The run starts on its own the moment the video lands (checked every minute) and writes both tiers.'}
                         </span>
                         {access !== 'read' && (
                           <button
@@ -3465,250 +3412,166 @@ function TranscriptDetailInner({ transcriptId }: { transcriptId: string }) {
                         )}
                       </div>
                     )}
-                    {row.auto_report_status === 'running' && offline ? (
-                        <p className="py-4 text-xs text-muted-foreground">{OFFLINE_IN_PROGRESS_COPY}</p>
-                      ) : row.auto_report_status === 'running' ? (
-                        <div className="space-y-2 py-2">
-                          {['95%', '100%', '85%', '90%', '70%'].map((w, i) => (
-                            <div key={i} className="h-3 animate-pulse rounded bg-muted" style={{ width: w }} />
-                          ))}
-                          <p className="pt-1 text-xs text-muted-foreground">
-                            Writing the detailed report — high effort, so give it a few minutes.
-                            The quick summary refreshes right after, distilled from the same session.
-                          </p>
-                        </div>
-                      ) : row.auto_report ? (
-                        <>
-                          <div className="markdown-body max-w-[75ch] text-sm">
-                            <NotesMarkdown
-                              markdown={row.auto_report}
-                              transcriptId={row.assemblyai_id}
-                              onSeek={(s) => seekMeetingTime(s, { play: true })}
-                            />
-                          </div>
-                          <div className="mt-4 flex items-center gap-2 border-t pt-2.5">
-                            <Button
-                              variant="ghost"
-                              size="sm"
-                              className="h-7 text-xs"
-                              onClick={() => navigator.clipboard.writeText(row.auto_report ?? '')}
-                            >
-                              <Copy className="h-3 w-3" />
-                              Copy
-                            </Button>
-                            {canEdit && (
-                              <Button
-                                variant="ghost"
-                                size="sm"
-                                className="h-7 text-xs"
-                                disabled={offline || generatingReport}
-                                title={offline ? OFFLINE_TITLE : undefined}
-                                onClick={() => openGenerateDialog()}
-                              >
-                                <RefreshCw className="h-3 w-3" />
-                                Regenerate
-                              </Button>
-                            )}
-                            {row.auto_report_at && (
-                              <button
-                                type="button"
-                                onClick={() => setAiRunsOpen(true)}
-                                className="ml-auto cursor-pointer text-[11px] text-muted-foreground underline-offset-2 hover:underline"
-                                title="All AI runs & costs for this meeting"
-                              >
-                                generated {formatDistanceToNow(new Date(row.auto_report_at), { addSuffix: true })}
-                                {aiStats?.latestReport?.cost_usd != null &&
-                                  ` · $${Number(aiStats.latestReport.cost_usd).toFixed(2)}`}
-                                {aiStats?.latestReport?.duration_ms != null &&
-                                  ` · ${Math.round(aiStats.latestReport.duration_ms / 1000)}s`}
-                                {aiStats && aiStats.totals.runs > 1 &&
-                                  ` · Σ $${Number(aiStats.totals.cost_usd ?? 0).toFixed(2)}`}
-                              </button>
-                            )}
-                          </div>
-                        </>
-                      ) : row.auto_report_status === 'error' ? (
-                        <div className="space-y-2 text-sm">
-                          <p className="text-destructive">
-                            Report generation failed: {row.auto_report_error || 'unknown error'}
-                          </p>
-                          {canEdit && (
-                            <Button
-                              variant="outline"
-                              size="sm"
-                              disabled={offline || generatingReport}
-                              title={offline ? OFFLINE_TITLE : undefined}
-                              onClick={() => void handleGenerateReport()}
-                            >
-                              <RefreshCw className="h-3 w-3" />
-                              Retry
-                            </Button>
-                          )}
-                        </div>
-                      ) : canEdit ? (
-                        <div className="flex flex-col items-center py-6 text-center">
-                          <p className="text-sm text-muted-foreground">No detailed report yet.</p>
-                          <Button size="sm" className="mt-3" disabled={offline || generatingReport} title={offline ? OFFLINE_TITLE : undefined} onClick={() => openGenerateDialog()}>
-                            <Sparkles className="h-4 w-4" />
-                            Generate detailed report
-                          </Button>
-                          <p className="mt-2 max-w-[46ch] text-xs text-muted-foreground">
-                            A wiki-style deep dive: topic sections, tables,
-                            {hasLocalVideo || canFetchVideo ? ' screenshots from the recording,' : ''}{' '}
-                            and click-to-jump timestamp citations. Slower and pricier
-                            than the summary — worth it for dense meetings.
-                          </p>
-                        </div>
-                      ) : (
-                        <p className="py-4 text-sm text-muted-foreground">No detailed report yet.</p>
-                      )}
-                    </>
-                    ) : (
-                    <>
-                    {row.auto_notes && row.auto_notes_status !== 'running' && previousTranscriptionNote}
-                    {notesStale && row.auto_notes_status !== 'running' && canEdit && (
+                    {/* Context the AI has not seen — one nudge for the one run. */}
+                    {notesStale && !notesRunning && hasGeneratedNotes && canEdit && (
                       <div className="mb-3 flex items-center justify-between gap-2 rounded-md border bg-muted/60 px-3 py-2 text-xs">
                         <span className="text-muted-foreground">{notesStale}</span>
                         <Button
                           variant="ghost"
                           size="sm"
                           className="h-6 shrink-0 text-[11px] text-primary hover:text-primary"
-                          disabled={offline || generatingNotes}
+                          disabled={offline || notesGenerating}
                           title={offline ? OFFLINE_TITLE : undefined}
-                          onClick={() => void handleGenerateNotes()}
+                          onClick={() => openGenerateDialog()}
                         >
                           <RefreshCw className="h-3 w-3" />
-                          Rerun
+                          Regenerate…
                         </Button>
                       </div>
                     )}
-                    {/* A completed report holds more verified context (frames,
-                        docs) than this summary saw — offer the one-click
-                        distillation whenever the report is the newer artifact. */}
-                    {!notesStale &&
-                      canEdit &&
-                      row.auto_notes &&
-                      row.auto_notes_status !== 'running' &&
-                      row.auto_report &&
-                      row.auto_report_at &&
-                      (!row.auto_notes_at ||
-                        new Date(row.auto_report_at) > new Date(row.auto_notes_at)) && (
-                        <div className="mb-3 flex items-center justify-between gap-2 rounded-md border bg-muted/60 px-3 py-2 text-xs">
-                          <span className="text-muted-foreground">
-                            A newer detailed report exists — this summary can be rebuilt from
-                            everything the AI verified there
-                            {hasLocalVideo ? ' (video frames included)' : ''}.
-                          </span>
-                          <Button
-                            variant="ghost"
-                            size="sm"
-                            className="h-6 shrink-0 text-[11px] text-primary hover:text-primary"
-                            disabled={offline || generatingNotes}
-                            title={offline ? OFFLINE_TITLE : undefined}
-                            onClick={() => void handleTopUpSummary()}
-                          >
-                            <Sparkles className="h-3 w-3" />
-                            Top up summary
-                          </Button>
-                        </div>
-                      )}
-                    {row.auto_notes_status === 'running' && offline ? (
-                      <p className="py-4 text-xs text-muted-foreground">{OFFLINE_IN_PROGRESS_COPY}</p>
-                    ) : row.auto_notes_status === 'running' ? (
-                      <div className="space-y-2 py-2">
-                        {['90%', '100%', '80%', '95%', '60%'].map((w, i) => (
-                          <div
-                            key={i}
-                            className="h-3 animate-pulse rounded bg-muted"
-                            style={{ width: w }}
-                          />
-                        ))}
-                        <p className="pt-1 text-xs text-muted-foreground">
-                          Generating with Claude — usually 1–2 minutes.
-                        </p>
-                      </div>
-                    ) : row.auto_notes ? (
-                      <>
-                        <div className="markdown-body max-w-[75ch] text-sm">
-                          <NotesMarkdown
-                            markdown={row.auto_notes}
-                            transcriptId={row.assemblyai_id}
-                            onSeek={(s) => seekMeetingTime(s, { play: true })}
-                          />
-                        </div>
-                        <div className="mt-4 flex items-center gap-2 border-t pt-2.5">
-                          <Button
-                            variant="ghost"
-                            size="sm"
-                            className="h-7 text-xs"
-                            onClick={() => navigator.clipboard.writeText(row.auto_notes ?? '')}
-                          >
-                            <Copy className="h-3 w-3" />
-                            Copy
-                          </Button>
-                          {canEdit && (
-                            <Button
-                              variant="ghost"
-                              size="sm"
-                              className="h-7 text-xs"
-                              disabled={offline || generatingNotes}
-                              title={offline ? OFFLINE_TITLE : undefined}
-                              onClick={() => openGenerateDialog()}
-                            >
-                              <RefreshCw className="h-3 w-3" />
-                              Regenerate
-                            </Button>
-                          )}
-                          {canEdit && row.auto_report && (
-                            <Button
-                              variant="ghost"
-                              size="sm"
-                              className="h-7 text-xs"
-                              disabled={offline || generatingNotes}
-                              title={offline ? OFFLINE_TITLE : 'Rebuild this summary from the detailed-report session — it reuses the video frames and documents the AI already verified there'}
-                              onClick={() => void handleTopUpSummary()}
-                            >
-                              <Sparkles className="h-3 w-3" />
-                              Top up from report
-                            </Button>
-                          )}
-                          {row.auto_notes_at && (
-                            <button
-                              type="button"
-                              onClick={() => setAiRunsOpen(true)}
-                              className="ml-auto cursor-pointer text-[11px] text-muted-foreground underline-offset-2 hover:underline"
-                              title="All AI runs & costs for this meeting"
-                            >
-                              generated {formatDistanceToNow(new Date(row.auto_notes_at), { addSuffix: true })}
-                              {aiStats?.latest?.cost_usd != null &&
-                                ` · $${Number(aiStats.latest.cost_usd).toFixed(2)}`}
-                              {aiStats?.latest?.duration_ms != null &&
-                                ` · ${Math.round(aiStats.latest.duration_ms / 1000)}s`}
-                              {aiStats && aiStats.totals.runs > 1 &&
-                                ` · Σ $${Number(aiStats.totals.cost_usd ?? 0).toFixed(2)}`}
-                            </button>
-                          )}
-                        </div>
-                      </>
-                    ) : row.auto_notes_status === 'error' ? (
-                      <div className="space-y-2 text-sm">
-                        <p className="text-destructive">
-                          Notes generation failed: {row.auto_notes_error || 'unknown error'}
-                        </p>
+                    {/* ONE error state for the run — never one per tier. */}
+                    {notesRunError && (
+                      <div className="mb-3 flex items-center justify-between gap-2 rounded-md border border-destructive/40 bg-destructive/5 px-3 py-2 text-xs">
+                        <span className="min-w-0 text-destructive">
+                          Generation failed: {notesRunError}
+                        </span>
                         {canEdit && (
                           <Button
                             variant="outline"
                             size="sm"
-                            disabled={offline || generatingNotes}
+                            className="h-6 shrink-0 text-[11px]"
+                            disabled={offline || notesGenerating}
                             title={offline ? OFFLINE_TITLE : undefined}
-                            onClick={() => void handleGenerateNotes()}
+                            onClick={() => void handleGenerateReport()}
                           >
                             <RefreshCw className="h-3 w-3" />
                             Retry
                           </Button>
                         )}
                       </div>
-                    ) : canEdit ? (
+                    )}
+                    {/* ONE in-progress state for the run — never one per tier. */}
+                    {notesRunning &&
+                      (offline ? (
+                        <p className="mb-3 text-xs text-muted-foreground">{OFFLINE_IN_PROGRESS_COPY}</p>
+                      ) : (
+                        <div className="mb-3 flex items-center gap-2 rounded-md border bg-muted/60 px-3 py-2 text-xs text-muted-foreground">
+                          <Loader2 className="h-3.5 w-3.5 shrink-0 animate-spin text-primary" />
+                          <span className="min-w-0">
+                            Generating with Claude — high effort, so give it a few minutes. The
+                            summary and the detailed report land together, from the one run.
+                          </span>
+                        </div>
+                      ))}
+                    {hasGeneratedNotes ? (
+                      <>
+                        <div className="mb-3 flex items-center gap-1 rounded-lg bg-muted/60 p-0.5 text-xs w-fit">
+                          {[
+                            { key: 'summary' as const, label: 'Summary' },
+                            { key: 'report' as const, label: 'Detailed report' },
+                          ].map((t) => (
+                            <button
+                              key={t.key}
+                              type="button"
+                              aria-pressed={summaryTab === t.key}
+                              onClick={() => selectSummaryTab(t.key)}
+                              className={`rounded-md px-2.5 py-1 font-medium transition-colors ${summaryTab === t.key ? 'bg-card shadow-sm' : 'text-muted-foreground hover:text-foreground'}`}
+                            >
+                              {t.label}
+                            </button>
+                          ))}
+                        </div>
+                        {noteView.body ? (
+                          <>
+                            <div className="markdown-body max-w-[75ch] text-sm">
+                              <NotesMarkdown
+                                markdown={noteView.body}
+                                transcriptId={row.assemblyai_id}
+                                onSeek={(s) => seekMeetingTime(s, { play: true })}
+                              />
+                            </div>
+                            <div className="mt-4 flex items-center gap-2 border-t pt-2.5">
+                              <Button
+                                variant="ghost"
+                                size="sm"
+                                className="h-7 text-xs"
+                                onClick={() => navigator.clipboard.writeText(noteView.body ?? '')}
+                              >
+                                <Copy className="h-3 w-3" />
+                                Copy
+                              </Button>
+                              {canEdit && (
+                                <Button
+                                  variant="ghost"
+                                  size="sm"
+                                  className="h-7 text-xs"
+                                  disabled={offline || notesGenerating}
+                                  title={offline ? OFFLINE_TITLE : 'One run rewrites both the summary and the detailed report'}
+                                  onClick={() => openGenerateDialog()}
+                                >
+                                  <RefreshCw className="h-3 w-3" />
+                                  Regenerate…
+                                </Button>
+                              )}
+                              {noteView.at && (
+                                <button
+                                  type="button"
+                                  onClick={() => setAiRunsOpen(true)}
+                                  className="ml-auto cursor-pointer text-[11px] text-muted-foreground underline-offset-2 hover:underline"
+                                  title="All AI runs & costs for this meeting"
+                                >
+                                  generated {formatDistanceToNow(new Date(noteView.at), { addSuffix: true })}
+                                  {noteView.stats?.cost_usd != null &&
+                                    ` · $${Number(noteView.stats.cost_usd).toFixed(2)}`}
+                                  {noteView.stats?.duration_ms != null &&
+                                    ` · ${Math.round(noteView.stats.duration_ms / 1000)}s`}
+                                  {aiStats && aiStats.totals.runs > 1 &&
+                                    ` · Σ $${Number(aiStats.totals.cost_usd ?? 0).toFixed(2)}`}
+                                </button>
+                              )}
+                            </div>
+                          </>
+                        ) : (
+                          /* Legacy row: generated before both tiers came from one
+                             run. The same single action produces the pair. */
+                          <div className="flex flex-col items-center py-6 text-center">
+                            <p className="text-sm text-muted-foreground">
+                              Not generated for this meeting yet.
+                            </p>
+                            {canEdit && (
+                              <>
+                                <Button
+                                  size="sm"
+                                  className="mt-3"
+                                  disabled={offline || notesGenerating}
+                                  title={offline ? OFFLINE_TITLE : undefined}
+                                  onClick={() => openGenerateDialog()}
+                                >
+                                  <Sparkles className="h-4 w-4" />
+                                  Regenerate…
+                                </Button>
+                                <p className="mt-2 max-w-[46ch] text-xs text-muted-foreground">
+                                  One run writes both views — the quick summary and the
+                                  wiki-style detailed report
+                                  {hasLocalVideo || canFetchVideo
+                                    ? ', with screenshots from the recording'
+                                    : ''}
+                                  .
+                                </p>
+                              </>
+                            )}
+                          </div>
+                        )}
+                      </>
+                    ) : notesRunning ? (
+                      offline ? null : (
+                        <div className="space-y-2 py-2">
+                          {['95%', '100%', '85%', '90%', '70%'].map((w, i) => (
+                            <div key={i} className="h-3 animate-pulse rounded bg-muted" style={{ width: w }} />
+                          ))}
+                        </div>
+                      )
+                    ) : notesRunError ? null : canEdit ? (
                       <div className="flex flex-col items-center py-6 text-center">
                         {row.speaker_id_status === 'running' ? (
                           <>
@@ -3719,46 +3582,26 @@ function TranscriptDetailInner({ transcriptId }: { transcriptId: string }) {
                             <p className="mt-1 max-w-[46ch] text-xs text-muted-foreground">
                               The AI is working out who&apos;s who — transcript, voiceprints,
                               the people directory{hasLocalVideo ? ', video frames' : ''} — so
-                              the summary can use real names from the start.
+                              the writing can use real names from the start.
                             </p>
                             <Button
                               size="sm"
                               variant="outline"
                               className="mt-3"
-                              disabled={blocked || generatingNotes || reviewSpeakers.length === 0}
+                              disabled={blocked || notesGenerating || reviewSpeakers.length === 0}
                               title={blocked ? OFFLINE_TITLE : undefined}
                               onClick={() => setReviewOpen(true)}
                             >
                               Review speakers now
                             </Button>
                           </>
-                        ) : row.auto_report ? (
-                          <>
-                            <p className="text-sm text-muted-foreground">No summary yet.</p>
-                            <Button
-                              size="sm"
-                              className="mt-3"
-                              disabled={offline || generatingNotes}
-                              title={offline ? OFFLINE_TITLE : undefined}
-                              onClick={() => void handleTopUpSummary()}
-                            >
-                              <Sparkles className="h-4 w-4" />
-                              Summarize from the detailed report
-                            </Button>
-                            <p className="mt-2 max-w-[46ch] text-xs text-muted-foreground">
-                              The detailed report already verified this meeting&apos;s context
-                              {hasLocalVideo ? ' — video frames included' : ''} — the quick
-                              summary distills straight from that session, so it&apos;s fast
-                              and cheap.
-                            </p>
-                          </>
                         ) : (
                           <>
-                            <p className="text-sm text-muted-foreground">No summary yet.</p>
+                            <p className="text-sm text-muted-foreground">No notes yet.</p>
                             <Button
                               size="sm"
                               className="mt-3"
-                              disabled={offline || generatingNotes}
+                              disabled={offline || notesGenerating}
                               title={offline ? OFFLINE_TITLE : undefined}
                               onClick={() =>
                                 reviewSpeakers.length > 0 ? setReviewOpen(true) : openGenerateDialog()
@@ -3768,15 +3611,20 @@ function TranscriptDetailInner({ transcriptId }: { transcriptId: string }) {
                               Review speakers &amp; generate
                             </Button>
                             <p className="mt-2 max-w-[46ch] text-xs text-muted-foreground">
-                              Confirm who&apos;s who first — the summary is written with those
-                              names. Tip: attach an agenda or deck in the right panel too; it
-                              sharpens the output.
+                              One run writes both views: the quick summary and the wiki-style
+                              detailed report
+                              {hasLocalVideo || canFetchVideo
+                                ? ', with screenshots from the recording'
+                                : ''}
+                              . Confirm who&apos;s who first — those names go into the writing.
+                              Tip: attach an agenda or deck in the right panel too; it sharpens
+                              the output.
                             </p>
                           </>
                         )}
                       </div>
-                    ) : null}
-                    </>
+                    ) : (
+                      <p className="py-4 text-sm text-muted-foreground">No notes yet.</p>
                     )}
                   </CardContent>
                 )}
@@ -4215,7 +4063,7 @@ function TranscriptDetailInner({ transcriptId }: { transcriptId: string }) {
           canFetchVideo={canFetchVideo}
           videoPreparing={videoPreparing}
           videoFetching={videoFetching}
-          generating={generatingNotes || generatingReport}
+          generating={generatingReport}
           onGenerate={({ video, instructions, runAt }) => {
             setNotesPromptOpen(false);
             // Only the report fires — the quick summary auto-distills from
