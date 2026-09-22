@@ -10,6 +10,7 @@ import {
   listStuckAtAai,
   mergeGmeetContextForUser,
   softDeleteForUser,
+  listStrandedAtAai,
 } from '@/db-ops/transcripts';
 import { deleteAtAaiIfSafe, deleteOnCompleteEnabled } from '@/lib/server/aai-retention';
 import {
@@ -19,6 +20,7 @@ import {
 import { pollTargetFromRow, pollTranscriptionRun } from '@/lib/server/transcription-runs';
 import { AAI_STUCK_HOURS, AAI_STUCK_REASON } from '@/lib/aai-job-state';
 import { giveUpOnAaiJob } from '@/lib/server/aai-giveup';
+import { refreshPendingAgainstAai } from '@/lib/server/aai-pending-refresh';
 import { identityForUser } from '@/db-ops/transcript-activity';
 import {
   deleteUploadSession,
@@ -96,6 +98,10 @@ const AAI_DELETE_PER_SWEEP = 10;
 // Give-up pass. Generous per sweep because it is a pure DB write with no
 // outbound call — the prod backlog (19 rows) drains in one tick.
 const AAI_STUCK_PER_SWEEP = 50;
+/** Rows the resume pass finishes per 5-minute sweep. */
+const AAI_RESUME_PER_SWEEP = 25;
+/** When this process came up — rows older than this have no live waiter. */
+const PROCESS_STARTED_AT = new Date();
 // Phase 2 re-transcriptions in flight. Serial and small: each one is an
 // outbound AssemblyAI call, and the listing poll + the detail sync already
 // pick up anything whose page is open.
@@ -246,6 +252,31 @@ async function sweep(): Promise<void> {
     }
   } catch (err) {
     console.warn('[notes-sweeper] scratch expiry query failed:', err);
+  }
+
+  // A restart (every deploy) kills the in-process wait on any job still at
+  // AssemblyAI. Finish those rows here — same code path as the listing's
+  // refresh, so completion stores the payload, mirrors the graph and fires
+  // post-completion exactly as if a user had loaded the listing. Only rows
+  // born before THIS process started are touched: a row born in this process
+  // still has its own waiter, and polling it twice would double the
+  // post-completion work. Bounded by AAI_STUCK_HOURS like the listing.
+  try {
+    const stranded = await listStrandedAtAai(PROCESS_STARTED_AT, AAI_RESUME_PER_SWEEP);
+    if (stranded.length > 0) {
+      const before = new Map(stranded.map((r) => [r.assemblyai_id, r.status]));
+      await refreshPendingAgainstAai(stranded);
+      for (const r of stranded) {
+        const was = before.get(r.assemblyai_id);
+        if (r.status !== was) {
+          console.log(
+            `[notes-sweeper] resumed AssemblyAI job ${r.aai_job_id} (meeting ${r.assemblyai_id}): ${was} → ${r.status}`
+          );
+        }
+      }
+    }
+  } catch (err) {
+    console.warn('[notes-sweeper] resume-at-AAI pass failed:', err);
   }
 
   // DEC-4: jobs AssemblyAI accepted and never finished. No outbound call —

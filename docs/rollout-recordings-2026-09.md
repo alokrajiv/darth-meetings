@@ -46,6 +46,13 @@ Flags live in `~/apps/meeting-whisperer/.env.local` on the VM; every one is read
       failures** (the app's own sweep had already taken the other ~20 once the flag was on; 445 rows stamped).
 - [ ] **ALOK** shorten retention in the AssemblyAI dashboard to 24 h. ← the ONE thing left in A (browser only).
 
+**Found during the rollout (2026-09-22 13:50 SGT, fixed the same afternoon):** a row born between two restarts sat
+`processing` for 25 min after AssemblyAI had finished it. Block A stopped every read-back, and the only remaining
+poll was the listing's refresh, so a restart-stranded row completed only when someone loaded a listing showing it —
+or never, until the 6 h give-up. The notes-sweeper now has a resume pass (`listStrandedAtAai` + the listing's own
+`refreshPendingAgainstAai`, moved to `src/lib/server/aai-pending-refresh.ts`): rows born before the process started
+are finished within 5 min of a restart. Deploys are safe to do mid-transcription again.
+
 ## B. Recordings tables (Phase 1)
 
 - [x] **ALOK** apply `migrations/044_recordings.sql` and `migrations/045_aai_job_id.sql` (both additive; 045 stamps
@@ -123,6 +130,11 @@ Flags live in `~/apps/meeting-whisperer/.env.local` on the VM; every one is read
 ## I. AssemblyAI reads the blob (DEC-3 stage C)
 
 - [ ] Needs B (`MW_RECORDINGS_WRITE` + `MW_MINTED_IDS`) and D (the media account, `MW_MEDIA_ARCHIVE`, canary OK).
+- **WATCH when this goes on (Alok, 2026-09-22):** the read SAS AssemblyAI gets now lives **10 minutes** (was 6 h;
+      their own S3 guide signs for 30). If AssemblyAI ever fetches late, the job fails at their end and the poller
+      surfaces it as an error with Retry — grep the pm2 log for `download` / `audio_url` errors on blob-first rows in
+      the first days. If it happens even once: log it, raise the TTL (`AAI_SAS_TTL_MS` in
+      `src/lib/server/aai-from-blob.ts`), and note it in memory. Nothing is lost either way: the VM holds the bytes.
 - [ ] **ALOK** set `MW_AAI_FROM_BLOB=1`, restart. Then upload a short recording **from the web dialog** and follow
       the eight live-proof steps in `docs/recordings-blob-spec.md` ("Stage C as built"): the pm2 log must show a
       server-side copy and no AssemblyAI upload for that row, `blobFirst.landedAt` must appear within a couple of

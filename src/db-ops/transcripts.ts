@@ -1082,6 +1082,38 @@ export interface StuckAaiRow {
   gmeet_context: GmeetContext | null;
 }
 
+/**
+ * Rows still in flight at AssemblyAI whose in-process wait cannot be alive
+ * any more: their clock started BEFORE this process did, so whoever was
+ * awaiting the job died with the previous process (every deploy is a pm2
+ * restart). Without this, such a row completes only when someone loads a
+ * listing that shows it (`listPendingVisibleToUser`) — or never, until
+ * `listStuckAtAai` gives up on it after AAI_STUCK_HOURS and asks for a Retry
+ * that re-sends the recording. Same in-flight predicate as the listing's
+ * query, all owners, trashed rows excluded, oldest first. Found 2026-09-22
+ * when "AI - Daily" sat 'processing' for 25 min after AssemblyAI had finished
+ * it, because it was born between two restarts.
+ */
+export async function listStrandedAtAai(
+  processStartedAt: Date,
+  limit: number
+): Promise<PendingRefreshRow[]> {
+  const job = await jobIdSql();
+  return sql<PendingRefreshRow[]>`
+    SELECT user_id, assemblyai_id, status, created_at, completed_at,
+           duration, speaker_count, ${job.expr} AS aai_job_id
+    FROM ${sql(SCHEMA)}.transcripts
+    WHERE deleted_at IS NULL
+      AND status NOT IN ('completed', 'error', 'uploading', 'waiting')
+      AND ${job.expr2} IS NOT NULL
+      AND COALESCE(upload_progress_at, created_at) < ${processStartedAt}
+      AND COALESCE(upload_progress_at, created_at)
+            > now() - make_interval(hours => ${AAI_STUCK_HOURS})
+    ORDER BY COALESCE(upload_progress_at, created_at) ASC
+    LIMIT ${limit}
+  `;
+}
+
 export async function listStuckAtAai(hours: number, limit: number): Promise<StuckAaiRow[]> {
   const job = await jobIdSql();
   return sql<StuckAaiRow[]>`
