@@ -1,10 +1,10 @@
 'use client';
 
-import { useEffect, useMemo, useState } from 'react';
+import { useMemo } from 'react';
 import { RefreshCw } from 'lucide-react';
 import { AppHeader } from '@/components/app-header';
 import { Button } from '@/components/ui/button';
-import { RecordingsSurface, useUnlinkedRecordings } from '@/components/recordings-surface';
+import { RecordingsSurface, useRecordingsPage } from '@/components/recordings-surface';
 import { OFFLINE_TITLE, useOfflineGate } from '@/lib/offline/offline-context';
 
 /**
@@ -14,22 +14,17 @@ import { OFFLINE_TITLE, useOfflineGate } from '@/lib/offline/offline-context';
  * recording is not a kind of meeting row, and it is never shared.
  *
  * `/?tab=recordings` and `/?tab=scratch` (the old tabs) land here; the
- * latter scrolls to the Temporary section (`#temporary`).
+ * latter opens on the Temporary section (`#temporary`).
  */
 export default function RecordingsPage() {
   const { blocked } = useOfflineGate();
   const tz = useMemo(() => Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC', []);
-  const data = useUnlinkedRecordings({ enabled: !blocked, refreshKey: 0, tz, temporary: true });
-  const { loading, refresh, temporary } = data;
-
-  // #temporary: scroll once the section exists (it renders after the fetch).
-  const [scrolled, setScrolled] = useState(false);
-  useEffect(() => {
-    if (scrolled || typeof window === 'undefined' || window.location.hash !== '#temporary') return;
-    if (temporary.length === 0) return;
-    document.getElementById('temporary')?.scrollIntoView({ block: 'start' });
-    setScrolled(true);
-  }, [temporary.length, scrolled]);
+  const initialFilter = useMemo(
+    () => (typeof window !== 'undefined' && window.location.hash === '#temporary' ? 'temporary' : 'all'),
+    []
+  );
+  const data = useRecordingsPage({ enabled: !blocked, tz, initialFilter });
+  const { loading, refresh } = data;
 
   return (
     <div className="min-h-screen">

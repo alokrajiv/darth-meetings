@@ -97,6 +97,8 @@ interface UploadStatus {
   status: 'uploading' | 'transcribing' | 'completed' | 'error' | 'duplicate';
   progress: number;
   transcriptId?: string;
+  /** Design P7: the upload became a standalone RECORDING (no meeting). */
+  recordingId?: string;
   error?: string;
   /** Transient sub-status under the progress bar ("Resuming from 42%",
    * "Retrying chunk 12…"). */
@@ -353,6 +355,12 @@ export function AudioUpload({ onTranscriptCreated }: AudioUploadProps) {
   };
 
   const pollUntilDone = async (file: File, transcriptId: string) => {
+    // Design P7: an upload that named no meeting came back as a RECORDING
+    // (`rec-<id>`) — it lives on the Recordings page, not in this listing.
+    if (transcriptId.startsWith('rec-')) {
+      await pollRecordingUntilDone(file, transcriptId.slice(4));
+      return;
+    }
     // Poll /api/transcripts/:id until status is final. The server refreshes
     // against AssemblyAI on each GET.
     while (true) {
@@ -389,6 +397,25 @@ export function AudioUpload({ onTranscriptCreated }: AudioUploadProps) {
         updateUpload(file, { status: 'error', error: 'Transcription failed' });
         return;
       }
+    }
+  };
+
+  const pollRecordingUntilDone = async (file: File, recordingId: string) => {
+    while (true) {
+      await new Promise((r) => setTimeout(r, POLL_INTERVAL_MS));
+      const res = await fetch(`/api/recordings/${recordingId}`);
+      if (!res.ok) throw new Error(`Status check failed: ${res.status}`);
+      const { recording } = (await res.json()) as { recording: { status: string; status_note: string | null } };
+      if (recording.status === 'ready') {
+        updateUpload(file, { status: 'completed', progress: 100, recordingId });
+        onTranscriptCreated?.();
+        return;
+      }
+      if (recording.status === 'failed') {
+        updateUpload(file, { status: 'error', error: recording.status_note ?? 'Transcription failed' });
+        return;
+      }
+      updateUpload(file, { progress: recording.status === 'transcribing' ? 80 : 60, recordingId });
     }
   };
 
@@ -615,6 +642,9 @@ export function AudioUpload({ onTranscriptCreated }: AudioUploadProps) {
         status: 'transcribing',
         progress: 50,
         transcriptId: outcome.transcript.assemblyai_id,
+        ...(outcome.transcript.assemblyai_id.startsWith('rec-')
+          ? { recordingId: outcome.transcript.assemblyai_id.slice(4) }
+          : {}),
       });
       // Surface to the parent right away so the newly queued row shows up in
       // the list, even before it finishes transcribing.
@@ -1291,10 +1321,19 @@ export function AudioUpload({ onTranscriptCreated }: AudioUploadProps) {
                 {upload.status === 'uploading' && upload.note && (
                   <p className="mt-1 text-xs text-muted-foreground">{upload.note}</p>
                 )}
-                {upload.status === 'transcribing' && (
+                {upload.status === 'transcribing' && !upload.recordingId && (
                   <p className="mt-1 text-xs text-status-ok">
                     Upload complete — safe to close this tab. You&apos;ll get a Slack DM when the
                     transcript is ready for speaker review.
+                  </p>
+                )}
+                {upload.recordingId && upload.status !== 'error' && (
+                  <p className="mt-1 text-xs text-status-ok">
+                    Uploaded to your Recordings — only you can see it.{' '}
+                    <a className="underline" href={`/recording/${upload.recordingId}`}>
+                      Open
+                    </a>{' '}
+                    to link it to a meeting or make a meeting of it.
                   </p>
                 )}
                 {upload.status === 'error' && upload.error && (

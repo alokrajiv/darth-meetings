@@ -24,6 +24,8 @@ export const APP_NAV: readonly AppNavItem[] = [
 export function navItemActive(item: AppNavItem, pathname: string | null | undefined): boolean {
   if (!pathname) return false;
   if (item.href === '/') return pathname === '/';
+  // A single recording's page (`/recording/<id>`, design P7) belongs to Recordings.
+  if (item.key === 'recordings' && pathname.startsWith('/recording/')) return true;
   return pathname === item.href || pathname.startsWith(`${item.href}/`);
 }
 

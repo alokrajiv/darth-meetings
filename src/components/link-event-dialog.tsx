@@ -50,6 +50,12 @@ interface LinkEventDialogProps {
   open: boolean;
   onClose: () => void;
   transcriptId: string;
+  /**
+   * Design P7: link a STANDALONE recording instead of a meeting — the pick
+   * goes to `POST /api/recordings/:id/link`, which creates the meeting (no
+   * share). `transcriptId` is ignored when this is set.
+   */
+  recordingId?: string;
   /** Day to open on, ISO — usually the transcript's current date guess. */
   initialDateIso?: string | null;
   /** Called with the updated transcript row after a successful link. */
@@ -80,6 +86,7 @@ export function LinkEventDialog({
   open,
   onClose,
   transcriptId,
+  recordingId,
   initialDateIso,
   onLinked,
 }: LinkEventDialogProps) {
@@ -131,7 +138,11 @@ export function LinkEventDialog({
       // Pass the token so the server can enrich from the Meet API too
       // (participants, conference times, transcript sidecar).
       const token = await getGoogleAccessToken();
-      const res = await fetch(`/api/transcripts/${transcriptId}/link-event`, {
+      const res = await fetch(
+        recordingId
+          ? `/api/recordings/${recordingId}/link`
+          : `/api/transcripts/${transcriptId}/link-event`,
+        {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({

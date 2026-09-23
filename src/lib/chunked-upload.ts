@@ -532,6 +532,17 @@ async function pollSession(id: string, signal?: AbortSignal): Promise<SessionOut
 }
 
 async function fetchTranscript(id: string, signal?: AbortSignal): Promise<StoredTranscript> {
+  // Design P7: `rec-<id>` is a standalone RECORDING, not a meeting — there is
+  // no meeting row to load. Answer with the same minimal shape the upload
+  // routes answer with; the dialog polls the recording from here.
+  if (id.startsWith('rec-')) {
+    return {
+      assemblyai_id: id,
+      recording_id: id.slice(4),
+      born_bare: true,
+      status: 'processing',
+    } as unknown as StoredTranscript;
+  }
   const res = await fetch(`/api/transcripts/${id}`, { signal });
   if (!res.ok) throw new UploadError(`Uploaded, but loading the transcript failed (${res.status})`);
   return ((await res.json()) as { transcript: StoredTranscript }).transcript;
