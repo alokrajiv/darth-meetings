@@ -573,3 +573,96 @@ suggestion stopping once the meeting is linked, and a recording still on the Mac
 - `resolveOccurrenceRef` (`src/lib/server/recorder-match.ts:270`) lost its only caller with the `?event=`
   branch; kept because P6/P7 will want occurrence refs.
 - Everything in P4–P9, unchanged.
+
+## As built — P5/P6 UI (2026-09-23, commits `3210799`, `7eaf85a`, `2d0ba0b`)
+
+P6 and the UI half of P8, plus P5. Nothing of P7 (uploads are still born as `transcripts` rows; the
+upload pipeline is untouched) and nothing of P4. No migration, no deploy, no prod write.
+
+### P6 — the endpoint (`3210799`)
+
+`GET /api/recordings?mine=1[&unlinked=1][&temporary=1][&tz=]` (`src/app/api/recordings/route.ts`,
+logic in `src/lib/server/own-recordings.ts`). `mine=1` is required — there is no other form. Neither
+section flag = both. Response `{registry?, unlinked?, temporary?}`:
+
+| Field | Fed by (same halves as the old tabs) | Owner gate |
+|---|---|---|
+| `registry` | `listOwnRecordings` (`recorder_recordings`, `user_id = $caller`), through `ownView` | SQL + fold on `user_id` |
+| `unlinked` | `listPagedForUser(tab:'mine', 60 days / 200 rows)` filtered by `isBareRecording` | SQL `AND t.user_id = $caller` + fold on `user_id` and `access === 'owner'` |
+| `temporary` | `listPagedForUser(tab:'scratch', …)` | fold on `user_id` and `access === 'owner'` — the scratch tab is owned + shared, so this is what keeps a temporary row someone shared with you off your surface |
+
+The listing's pending-refresh fan-out runs first, for the caller's own pending rows only, so an
+in-flight upload still advances while someone watches `/recordings`. The window is the one the tab
+used (newest 60 day-buckets / ~200 rows of `mine`) — an older bare upload is not listed, as before.
+
+Tests: `src/db-ops/__tests__/own-recordings.test.ts` (9) — query parsing, the owner predicates in
+the SQL each half emits, and a two-user fixture where the fake database answers A and B with the
+same rows (both users' registry rows, B's rows shared with A for edit and read, B's temporary row
+shared with A): each sees exactly their own, and the serialised response never contains the other's
+ids.
+
+### P6 / P8 UI — the surfaces (`7eaf85a`)
+
+| Surface | What changed |
+|---|---|
+| Top nav (`src/components/app-header.tsx`, items in `src/lib/app-nav.ts`) | **Meetings · Recordings · Series**, `aria-current` on the active one (`/` for Meetings only; `/recordings*`, `/series*`). A segmented control at phone width, plain links from `sm`. Recordings and Series render disabled while offline, as Series did. At phone width the brand mark hides when the nav shows (the nav's Meetings is the same link) — 390 px was 19 px short otherwise. |
+| `/recordings` (`src/app/recordings/page.tsx`) | New page: heading + one line ("Yours alone — recordings are never shared…"), refresh button, the surface. Offline → the same "offline" panel Series shows. |
+| Recordings surface (`src/components/recordings-surface.tsx`) | One fetch (`useUnlinkedRecordings`, now on `/api/recordings`; `temporary: true` from the page). Sections **On your Macs** / **Uploaded, not in a meeting** / **Temporary** (`#temporary`, hourglass glyph, "expires in N days" on the meta line). Card actions: **Link to meeting…**, **Make a meeting** (was "Name…", Q5 — a temporary card sends `{title, scratch:false}` in one PATCH), **Keep** (temporary only, `{scratch:false}`, Q6), Open, Delete. `MatchHint` lost the raw "· 82 %" (F3). Empty state rewritten for the page ("No recordings outside a meeting … nothing is linked or shared on a match alone"). Titles: `meetingTitleOf` as before — derived title on the card, filename in the tooltip. |
+| Meetings listing (`src/components/transcript-table.tsx`) | `TabKey` is `all | mine | shared | trash`; the Recordings and Temporary tabs and their bodies are gone. The "N recordings aren't linked to a meeting yet" strip is a `<Link href="/recordings">`. `hideBare` kept for existing rows (one-release grace). Row ⋯ menu: "Move to temporary" removed; Keep remains only for a temporary row that surfaces there. Bulk bar: `scratchAction={null}`. |
+| Old URLs (`src/app/page.tsx`, `legacyTabRedirect`) | `/?tab=recordings` → `/recordings`, `/?tab=scratch` → `/recordings#temporary` (client `router.replace`; the listing never read `?tab=` before, so this is new rather than preserved). |
+| `RecordingStrip` note (`src/components/recording-strip.tsx`) | `shrink-0` → `min-w-0` + `title`: a long note ("capture never finished — …") now truncates inside its card; at phone width it had pushed `/recordings` 137 px wide. |
+
+**Unchanged on purpose (I9):** `GET /api/transcripts` legacy, `?trash=1`, `?scratch=1`, and v2
+`tab=scratch` serve exactly what they did — darth-cli's `list --scratch` keeps working.
+
+**/series (step 6).** Checked, nothing to fix: no series route, db-op or component reads
+`recorder_recordings` or any match; members are `transcripts` rows only.
+
+**Offline (step 7).** `src/lib/offline/offline-urls.ts` does not list app routes (its `'/series'` is
+a transcript API suffix, `…/:id/series`), and `/series` is not in `SHELL_PAGES`
+(`src/lib/offline/offline-sync.ts`) either — Series is "handled" offline by its nav entry being
+disabled. `/recordings` is handled the same way (`needsServer: true`), and is not precached: it
+has nothing to show without the server.
+
+### P5 — only meetings take a share (`2d0ba0b`)
+
+`sharingRefusal(row)` (`src/lib/share-gate.ts`) — a `scratch` row is refused. `POST
+/api/transcripts/:id/shares` answers **409** through it after the access check; PATCH (access level,
+owner transfer) and DELETE are untouched, so grandfathered shares on temporary rows (Q7) stay
+manageable. Transcript page: `shareHidden = sharingRefusal(row) && no collaborators` hides both
+Share buttons (menu + toolbar) — they stay while a grandfathered share exists — and the speaker-pick
+"add to access" prompt does not fire on a temporary row. The page's menu offers only "Keep (make
+permanent)" on a temporary row; "Move to temporary" is gone there too. The `PATCH {scratch:true}`
+API itself is left in place (darth-cli / scripts may call it) — only the UI stopped offering it.
+
+The P5 row's second clause — refusing "rows with no event and no human title" — was **not** built:
+the brief limited P5 to temporary rows, and today a bare upload IS a meeting row people share
+(18+ groups, §6.1). It becomes moot with P7. The read-only count of existing shared temporary rows
+was skipped per the brief.
+
+Tests: `src/lib/__tests__/recordings-surface-p6.test.ts` (13) — nav order/active/offline,
+`legacyTabRedirect`, the listing's tab type and removed tabs/menu items, the strip link, the gate,
+the route calling it on POST only, the page's Share condition, the surface reading
+`/api/recordings`, "Make a meeting"/Keep/Link copy, no raw score.
+
+### Deviations and open points
+
+- **"Link to meeting…" is calendar-only.** §3.1 also offers "an existing meeting → Add recording to
+  that meeting" (the phase 3b clip add). Not wired here; the button opens the existing
+  `LinkEventDialog`.
+- **Shared-with-you temporary rows have no web listing any more.** The old Temporary tab listed
+  owned + shared; the Recordings surface is owner-only (I2), and every meetings tab excludes
+  `scratch`. They stay reachable by link, by `darth-cli meetings list --scratch`, and they expire on
+  their own schedule. If that matters before P8 retires them, the fix is a meetings-side "Shared
+  with you · temporary" line, not the Recordings surface. **Owner decision.**
+- **Local check.** The dev server was run against the tunnelled prod schema with the background
+  pollers switched off by a temporary, uncommitted guard in `src/instrumentation.ts`, and driven
+  headless with the author's darth-cli bearer token (read scope → GET only; no action was clicked).
+  Verified: the three nav items with the right one active on `/`, `/recordings`, `/series`; the
+  meetings tabs are All/Mine/Shared/Trash; the strip reads "N recordings aren't linked to a meeting
+  yet"; `/recordings` renders all three sections; `/?tab=scratch` lands on `/recordings#temporary`;
+  `/recordings` has no horizontal scroll at 390 px. The Meetings page itself still scrolls
+  horizontally at 390 px (its header action cluster is ~560 px wide) — that predates this change,
+  as does `/series`'s. One earlier start of the dev server (~40 s, one curl of the new route) ran
+  WITHOUT that guard, so the pollers were armed against the prod schema for that window; the log
+  shows no poller activity, but it is recorded here rather than assumed away.
