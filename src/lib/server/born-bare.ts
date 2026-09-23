@@ -686,9 +686,14 @@ export async function refreshBornBare(recordingId: string): Promise<boolean> {
     });
     if (won) {
       console.log(`[born-bare] recording ${recordingId} transcribed (${aai.utterances?.length ?? 0} utterances)`);
-      await deleteAtAaiForRecording(txn.id, txn.provider_job_id, aai.utterances?.length ?? 0).catch(
-        (err) => console.warn('[born-bare] AAI delete failed:', err)
-      );
+      // DEC-4 needs our own copy of the bytes, as for a meeting (aai-retention
+      // `mediaIsSafe`): the canonical file on this disk.
+      const canonical = (await standaloneMedia(recordingId)).find((m) => m.kind === 'canonical');
+      if (canonical?.filename && (await audioFileExists(canonical.filename))) {
+        await deleteAtAaiForRecording(txn.id, txn.provider_job_id, aai.utterances?.length ?? 0).catch(
+          (err) => console.warn('[born-bare] AAI delete failed:', err)
+        );
+      }
     }
     await notifyReadyOnce((await getStandalone(recordingId)) ?? rec);
     return true;
