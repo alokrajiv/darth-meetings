@@ -4,7 +4,7 @@ import ScreenCaptureKit
 import ServiceManagement
 import RecorderCore
 
-let VERSION = "0.3.15"
+let VERSION = "0.3.16"
 let WS_PORT: UInt16 = 47800
 let PWA_URL = URL(string: "https://meetings.darth-internal.trames.io/")!
 /// Seconds between "the call ended" and an automatic stop.
@@ -87,6 +87,40 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
+    /// 0.3.16: which microphone. nil = automatic (the system default, followed as it changes);
+    /// a device UID pins one. Idle → the next recording; recording → the live capture restarts
+    /// on it now (`RecordingController.switchMicDevice`).
+    var micDeviceUID: String? {
+        get { UserDefaults.standard.string(forKey: "micDeviceUID") }
+        set {
+            if let v = newValue { UserDefaults.standard.set(v, forKey: "micDeviceUID") } else { UserDefaults.standard.removeObject(forKey: "micDeviceUID") }
+            recorder.micDeviceUID = newValue
+            refreshMenu(); broadcast("status")
+        }
+    }
+
+    /// What the microphone menus show (both surfaces, and the ws `mic_device` block).
+    func micInfo() -> MicMenu.Info {
+        MicMenu.Info(devices: AudioDevices.inputs(), selectedUID: micDeviceUID,
+                     current: recorder.isRecording ? recorder.micDeviceLabel : nil, recording: recorder.isRecording)
+    }
+
+    /// The one place a microphone pick from any surface (preview gear, tray submenu, PWA) lands.
+    func pickMic(uid: String?, name: String, how: String) {
+        micDeviceUID = uid
+        let out = recorder.switchMicDevice(uid: uid, name: name, how: how)
+        banner.showMessage(title: "Microphone", sub: out, accent: .info, stoppable: recorder.isRecording, near: recordingFrame, autoHide: 6)
+        broadcast("mic_device_changed", ["outcome": out])
+        refreshMenu()
+    }
+
+    func redetectMic(how: String) {
+        let out = recorder.redetectMic(how: how)
+        banner.showMessage(title: "Microphone", sub: out, accent: .info, stoppable: recorder.isRecording, near: recordingFrame, autoHide: 6)
+        broadcast("mic_device_changed", ["outcome": out])
+        refreshMenu()
+    }
+
     /// "Upload recordings automatically" — on by default.
     var autoUpload: Bool {
         get { UserDefaults.standard.object(forKey: "autoUpload") as? Bool ?? true }
@@ -118,6 +152,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     let sourceItem = NSMenuItem(title: "Video source", action: nil, keyEquivalent: "")
     let sourceSubmenu = NSMenu(title: "Video source")
     let traySourceMenu = SourceMenu(origin: "tray")
+    /// 0.3.16: the microphone submenu — live idle or recording (see `MicMenu`).
+    let micItem = NSMenuItem(title: "Microphone", action: nil, keyEquivalent: "")
+    let micSubmenu = NSMenu(title: "Microphone")
+    let trayMicMenu = MicMenu(origin: "tray")
     let bannerItem = NSMenuItem(title: "Show banner", action: #selector(toggleBanner), keyEquivalent: "b")
     let discreetItem = NSMenuItem(title: "Discreet menu bar icon (no red while recording)", action: #selector(toggleDiscreet), keyEquivalent: "")
     let autoHideItem = NSMenuItem(title: "Hide the recording banner after 10 s", action: #selector(toggleBannerAutoHide), keyEquivalent: "")
@@ -174,6 +212,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         recorder.api = api
         recorder.deviceId = auth.deviceId
         recorder.micVoiceProcessing = micVoiceProcessing
+        recorder.micDeviceUID = micDeviceUID
         recorder.willStopOwnStreams = { [weak self] n in for _ in 0..<n { self?.shares.expectOwnTeardown() } }
         recorder.onStarted = { [weak self] in self?.recordingStarted() }
         recorder.onSegment = { [weak self] index, reason in self?.broadcast("segment_started", ["segment": index, "reason": reason]) }
@@ -278,6 +317,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             self.banner.showMessage(title: "Window re-detected", sub: out, accent: .info, stoppable: true, near: self.recordingFrame, autoHide: 6)
         }
         traySourceMenu.onPickSource = { [weak self] source, title in self?.pickSource(source, title: title, how: "tray") }
+        // 0.3.16: the microphone — preview gear submenu + tray submenu, one landing place.
+        preview.micInfo = { [weak self] in self?.micInfo() ?? MicMenu.Info(devices: [], selectedUID: nil, current: nil, recording: false) }
+        preview.onPickMic = { [weak self] uid, name in self?.pickMic(uid: uid, name: name, how: "preview") }
+        preview.onRedetectMic = { [weak self] in self?.redetectMic(how: "preview") }
+        micSubmenu.delegate = self
+        micItem.submenu = micSubmenu
+        trayMicMenu.onPickDevice = { [weak self] uid, name in self?.pickMic(uid: uid, name: name, how: "tray") }
+        trayMicMenu.onRedetect = { [weak self] in self?.redetectMic(how: "tray") }
         traySourceMenu.onPickAudioOnly = { [weak self] in self?.pickSource(.audio, title: "audio only", how: "tray") }
 
         uploader.onProgress = { [weak self] p in
@@ -520,6 +567,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         stopItem.target = self; m.addItem(stopItem)
         previewItem.target = self; m.addItem(previewItem)
         m.addItem(sourceItem)
+        m.addItem(micItem)
         bannerItem.target = self; m.addItem(bannerItem)
         m.addItem(.separator())
         authItem.target = self; m.addItem(authItem)
@@ -580,6 +628,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             : "Video source — not recording"
         sourceItem.isEnabled = recording
         syncSourceSubmenu(recording: recording)
+        // 0.3.16: the device list is enumerated when the submenu opens (menuNeedsUpdate); the
+        // title only needs the pick + what the live mic is on.
+        micItem.title = MicMenu.itemTitle(MicMenu.Info(devices: [], selectedUID: micDeviceUID,
+                                                        current: recording ? recorder.micDeviceLabel : nil, recording: recording))
+        if micSubmenu.items.isEmpty { fillMicSubmenu() }
         discreetItem.state = discreet ? .on : .off
         autoHideItem.state = bannerAutoHide ? .on : .off
         micProcessingItem.state = micVoiceProcessing ? .on : .off
@@ -1269,6 +1322,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             // 0.3.10: `enabled` = the preference, `active` = what the last recording's mic
             // really ran with (null until a recording has had a microphone).
             "mic_processing": ["enabled": micVoiceProcessing, "active": recorder.micProcessingActive ?? NSNull()] as [String: Any],
+            // 0.3.16: the pick (`mode` auto|manual, `uid`), what the live mic is on (`current`,
+            // null when idle) and every input device to pick from.
+            "mic_device": [
+                "mode": micDeviceUID == nil ? "auto" : "manual", "uid": micDeviceUID ?? NSNull(),
+                "current": (recorder.isRecording ? recorder.micDeviceLabel : nil) ?? NSNull(),
+                "restarts": recorder.micRestarts,
+                "devices": AudioDevices.inputs().map { ["uid": $0.uid, "name": $0.name] },
+            ] as [String: Any],
             "banner_visible": banner.isVisible,
             "resources": ResourceSampler.shared.latest ?? NSNull(),
             "ts": isoNow(),
@@ -1373,6 +1434,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 broadcast("source_changed", ["outcome": recorder.switchSource(to: .audio, title: "audio only", how: "pwa")])
             }
         case "set_mic_processing": if let v = obj["enabled"] as? Bool { micVoiceProcessing = v }
+        case "set_mic_device":                               // 0.3.16: {uid} | {uid: null} = automatic
+            let uid = obj["uid"] as? String
+            let name = uid.flatMap { u in AudioDevices.inputs().first { $0.uid == u }?.name } ?? (uid ?? "Automatic")
+            pickMic(uid: uid, name: name, how: "pwa")
+        case "redetect_mic": redetectMic(how: "pwa")         // 0.3.16
         case "mic_echo_probe":                               // {seconds?, processing?} → mic_echo_probe_result
             runEchoProbe(obj)
         case "set_discreet": if let v = obj["enabled"] as? Bool { discreet = v }
@@ -1533,8 +1599,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 /// older than the click (0.3.15).
 extension AppDelegate: NSMenuDelegate {
     func menuNeedsUpdate(_ menu: NSMenu) {
+        if menu === micSubmenu { fillMicSubmenu(); return }
         guard menu === sourceSubmenu else { return }
         fillSourceSubmenu()
+    }
+
+    /// 0.3.16: rebuilt when it opens so the device list is the one CoreAudio has right now.
+    func fillMicSubmenu() {
+        micSubmenu.removeAllItems()
+        trayMicMenu.build(into: micSubmenu, info: micInfo())
     }
 
     /// Keep the submenu's CONTENT in step with the recording state without enumerating every
@@ -1572,6 +1645,9 @@ extension AppDelegate: NSMenuDelegate {
 if let dir = ProcessInfo.processInfo.environment["DARTH_TRAY_RENDER_ICONS"] {
     StatusIcon.renderPreviews(to: dir)
     exit(0)
+}
+if ProcessInfo.processInfo.environment["DARTH_TRAY_MIC_SELFTEST"] != nil {
+    MicSelfTest.run()   // 0.3.16: never returns
 }
 let app = NSApplication.shared
 app.setActivationPolicy(.accessory)

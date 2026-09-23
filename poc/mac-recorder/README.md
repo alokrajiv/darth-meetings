@@ -14,6 +14,60 @@ Native macOS side of Darth Meetings recording (the "Swift tray" angle from Darth
 the user switched it off in the menu (`loginItemUserChoice` in UserDefaults records an explicit choice;
 the default never overrides it). macOS may show "Darth Recorder was added as a login item" once.
 
+**0.3.16 (2026-09-23) — the microphone follows device changes, heals itself, and can be picked.**
+Meet "Salesforce x Trames — follow up", 11:03 SGT: the AirPods left the recording twenty seconds in
+and the mic track stayed empty for the remaining 33 minutes — 212 buffers, `mic ✗` on the health line
+from 11:07, the MacBook's own mic never asked. Alok: *"when audio device changes and shit — it doesn't
+detect … the gear icon also doesn't allow auto redetect … nor does it allow manual picking"*.
+`AVAudioEngine` follows the system default input only until the device it started on goes away;
+then it stops, and nothing in 0.3.15 noticed or started it again.
+
+- **Self-healing capture** (`MicCapture`, `AudioDevices.swift`). Three triggers restart the mic on a
+  fresh engine, counters and the writer's track untouched: the engine stopping on a configuration
+  change (`AVAudioEngineConfigurationChange`, only when it really stopped — the voice-processing unit
+  posts one ~100 ms after every start with the engine still running); CoreAudio saying the default
+  input or the device list changed and the device we want is no longer the one we are on; and a
+  1 s watchdog — no buffer for 3 s, or the engine not running (the 11:04 case had no usable
+  notification). Restarts are teardown, a 1 s gap, then start (back-to-back, the new engine comes up
+  dead or stops once more — self-test), never closer than 2 s, each logged as `mic_restarted` with
+  from/to device; a device change also shows a "Microphone changed" banner.
+- **The file format no longer depends on the device.** The mic track is 48 kHz mono whatever the
+  microphone (`MicCapture.canonicalRate`, `AVAudioConverter` in the tap when the device runs at another
+  rate — AirPods in their voice mode are 24 kHz), so a swap mid-part cannot hand the AAC input a rate
+  it was not built for.
+- **Outages are filled, not dropped.** AVAssetWriter packs audio samples back to back, so a restart's
+  silent seconds would simply vanish from the mic track and everything after them would sit early
+  against the system track (first E2E: 21.5 s of mic in a 34 s recording). The tap now writes silence
+  for any gap over 250 ms before the first buffer of the new engine (`fillGap`, ≤ 1 s pieces, logged;
+  `gaps_filled` / `gap_filled_s` in the device block). Second E2E: mic track 34.03 s of 34.07, and the
+  mix and mic tracks' per-second levels line up throughout. What a switch costs in mic audio: ~3.5–4 s
+  for a default-input change in automatic mode (CoreAudio settle 1 s + the 1 s gap + the voice-processing
+  unit's own stop), ~1.2 s for a pick or a re-detect.
+- **Microphone menu, both surfaces** (`MicMenu`): the preview's gear has a "Microphone" submenu under
+  the video sources, and the tray has its own "Microphone" item — live idle (the pick is the next
+  recording's device) or recording (the capture restarts on the pick at once). Entries: what is
+  captured right now, "Automatic — follow the system default (…)", every input device, and
+  "Re-detect the microphone now" while recording. Pref `micDeviceUID` (nil = automatic); ws
+  `set_mic_device {uid|null}` / `redetect_mic`, and `mic_device {mode, uid, current, restarts,
+  devices[]}` in `status`; `audio.mic.device` in the health block; `mic_device` on the started /
+  stopped events.
+- **A chosen microphone runs raw.** Apple's voice-processing unit takes its input from the system
+  default whatever `kAudioOutputUnitProperty_CurrentDevice` says (probed on Global/0, Global/1,
+  Input/1 and Output/0 — the hardware format never left the MacBook mic), so a pin is honoured on the
+  plain AUHAL path with echo cancellation off, and the menu says so. Automatic mode keeps voice
+  processing. A pinned device that is absent falls back to the default and is picked up when it returns.
+- **Two deadlocks found by the self-test, neither shipped.** (1) `AVAudioEngineConfigurationChange`
+  observed with `queue: .main` — NotificationCenter then waits for main, while main may be releasing
+  that engine (`dealloc` does a `dispatch_sync` onto the engine's queue, which is the one posting):
+  observed with `queue: nil` and hopped to main by hand, and old engines are released off the main
+  thread. (2) CoreAudio listener blocks on the main queue — `AudioObjectRemovePropertyListenerBlock`
+  from main waits on an in-flight delivery to main: the listener lives on a private queue.
+- **Self-test:** `DARTH_TRAY_MIC_SELFTEST=1` (voice processing) / `=raw` on the signed `.app` binary —
+  start, flip the SYSTEM default input to BlackHole and back, pin and release, kill the engine behind
+  the capture's back; PASS/FAIL table, exit 0/1, the default input restored. Both modes 8/8 on
+  2026-09-23. (The MacBook mic's format under voice processing reads 9–10 ch and BlackHole's 2–10,
+  run to run — the device is proven by the format only on the raw path.)
+
 **0.3.15 (2026-09-22) — an audio-only recording can be given a video source, from either menu.**
 Alok, on a Slack huddle where somebody was sharing a screen, 18:33 SGT: the preview's gear said
 *"Audio-only recording (no video source)"* and offered nothing — *"why can't I update source?

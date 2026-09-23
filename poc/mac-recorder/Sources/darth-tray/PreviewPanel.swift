@@ -222,18 +222,28 @@ final class PreviewPanel: NSObject, NSWindowDelegate {
     /// the same list is offered as "Add video" instead of nothing at all.
     @objc private func gearTapped() {
         guard let info = sourceInfo?() else { return }
-        let i = SourceMenu.Info(current: info.current, mode: info.mode, callPids: info.callPids, audioOnly: info.audioOnly)
+        let i = SourceMenu.Info(current: info.current, mode: info.mode, callPids: info.callPids, audioOnly: info.audioOnly,
+                                mic: micInfo?())
         gear.toolTip = SourceMenu.headline(i)
         let m = NSMenu()
         menu.onSetAuto = { [weak self] in self?.onSetAuto?() }
         menu.onRedetect = { [weak self] in self?.onRedetect?() }
         menu.onPickSource = { [weak self] s, t in self?.onPickSource?(s, t) }
         menu.onPickAudioOnly = { [weak self] in self?.onPickAudioOnly?() }
+        // 0.3.16: the microphone lives in the same gear.
+        micMenu.onPickDevice = { [weak self] uid, name in self?.onPickMic?(uid, name) }
+        micMenu.onRedetect = { [weak self] in self?.onRedetectMic?() }
+        menu.mic = micMenu
         menu.build(into: m, info: i)
         gear.menu = m
         m.popUp(positioning: nil, at: NSPoint(x: 0, y: gear.bounds.height + 4), in: gear)
     }
     private let menu = SourceMenu(origin: "preview")
+    private let micMenu = MicMenu(origin: "preview")
+    /// 0.3.16: what the gear's "Microphone" submenu shows, and where its clicks go.
+    var micInfo: (() -> MicMenu.Info)?
+    var onPickMic: ((String?, String) -> Void)?
+    var onRedetectMic: (() -> Void)?
 }
 
 /// One level bar: −60…0 dBFS, fill green when audible / grey when quiet / red when the track is

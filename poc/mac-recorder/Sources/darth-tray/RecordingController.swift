@@ -205,6 +205,10 @@ final class RecordingController {
     /// when a recording's mic starts — changing it mid-recording would mean tearing the input
     /// engine down and rolling a segment, so it takes effect on the next recording.
     var micVoiceProcessing = true
+    /// 0.3.16: the `micDeviceUID` preference (nil = automatic / system default), copied in by
+    /// the AppDelegate. Read when a recording's mic starts; a change mid-recording goes through
+    /// `switchMicDevice`, which restarts the live capture at once.
+    var micDeviceUID: String?
     /// 0.3.10: what the current (or most recent) recording's mic ACTUALLY ran with, and the
     /// format its track was built from. Kept after `mic` is released so the stopped event and
     /// the ws status can still say so.
@@ -418,6 +422,7 @@ final class RecordingController {
         if options.mic {
             var m = micMeter?.snapshot() ?? ["level_db": -120, "audible": false, "silent_s": 0, "audible_s": 0, "buffers": 0]
             m["ok"] = h.micOK ?? NSNull(); m["stream_alive"] = mic != nil
+            m["device"] = mic?.deviceJSON ?? NSNull()          // 0.3.16
             d["mic"] = m
         }
         return d
@@ -582,7 +587,8 @@ final class RecordingController {
             self.micDenied = !granted
             var micFormat: AVAudioFormat?
             if granted {
-                let m = MicCapture(voiceProcessing: self.micVoiceProcessing)
+                let m = MicCapture(voiceProcessing: self.micVoiceProcessing, deviceUID: self.micDeviceUID)
+                m.onRestarted = { [weak self] from, to, reason in self?.micRestarted(from: from, to: to, reason: reason) }
                 do {
                     try m.start()
                     micFormat = m.format
@@ -732,6 +738,7 @@ final class RecordingController {
             "mic_processing_requested": options.mic ? micVoiceProcessing : NSNull(),
             "mic_format": micFormatLabel ?? NSNull(),
             "mic_hw_format": micHardwareLabel ?? NSNull(),
+            "mic_device": mic?.deviceJSON ?? NSNull(),         // 0.3.16
             "audio_display_id": Int(displayID),
             "path": url.path, "options": options.json,
         ], summary: "record: \(recordingId ?? "") \(w)x\(h) tracks=[\(tracks.map { $0.name }.joined(separator: ","))] started=[\(started.joined(separator: ","))] \(options.summary) → \(url.lastPathComponent)")
@@ -1109,6 +1116,45 @@ final class RecordingController {
         return wasAudioOnly ? "video added — now recording \(title)" : "now recording \(title)"
     }
 
+    // MARK: 0.3.16 — microphone device
+
+    /// "MacBook Pro Microphone (default)" while a recording's mic runs; nil otherwise.
+    var micDeviceLabel: String? { mic?.deviceLabel }
+    var micDeviceName: String? { mic?.deviceName }
+    var micRestarts: Int { mic?.restarts ?? 0 }
+
+    /// The person picked a microphone (nil = automatic). Live recording → the capture restarts
+    /// on it now; idle → remembered for the next recording (the AppDelegate owns the pref).
+    func switchMicDevice(uid: String?, name: String, how: String) -> String {
+        micDeviceUID = uid
+        guard state == .recording, let m = mic else {
+            EventLog.shared.log("mic_device_pick", ["how": how, "uid": uid ?? NSNull(), "name": name, "live": false],
+                                summary: "mic: device preference → \(name) — takes effect on the next recording")
+            return "\(name) — from the next recording"
+        }
+        let out = m.switchDevice(uid: uid)
+        EventLog.shared.log("mic_device_pick", ["recording_id": recordingId ?? "", "how": how, "uid": uid ?? NSNull(), "name": name, "live": true, "outcome": out],
+                            summary: "mic: device picked by \(how) → \(name) — \(out)")
+        return "now capturing from \(out)"
+    }
+
+    /// Restart the live mic capture on whatever device is wanted right now.
+    func redetectMic(how: String) -> String {
+        guard state == .recording, let m = mic else { return "not recording" }
+        let ok = m.restart(reason: "\(how): re-detect")
+        return ok ? "restarting the microphone on \(micDeviceUID == nil ? "the system default" : "the chosen device")…" : "could not restart the microphone — see the log"
+    }
+
+    /// The capture restarted itself (device change, watchdog) — tell the person only when the
+    /// device actually changed; a same-device recovery is a log line.
+    private func micRestarted(from: String?, to: String?, reason: String) {
+        micFormatLabel = mic?.formatLabel
+        micHardwareLabel = mic?.hardwareFormatLabel
+        micProcessing = mic?.voiceProcessing
+        guard from != to, let to else { return }
+        onNotice?("Microphone changed", "Now capturing from \(to)\(from.map { " (was \($0))" } ?? "")")
+    }
+
     // MARK: window-gone hold
 
     private func beginWindowGoneHold(reason: String) {
@@ -1234,6 +1280,7 @@ final class RecordingController {
         // conditioner / format fields in `recording_stopped` had been null since 0.3.2.
         let micConditioner = mic?.conditioner.snapshot
         let micProcessingJSON = mic?.voiceProcessingJSON
+        let micDevice = mic?.deviceJSON
         let micFormat = micFormatLabel
         let micHardware = micHardwareLabel ?? mic?.hardwareFormatLabel
         mic = nil
@@ -1275,6 +1322,7 @@ final class RecordingController {
                 "mic_processing_requested": self.options.mic ? self.micVoiceProcessing : NSNull(),
                 "mic_format": micFormat ?? NSNull(),
                 "mic_hw_format": micHardware ?? NSNull(),
+                "mic_device": micDevice ?? NSNull(),           // 0.3.16: device + restarts
                 "system_buffers": sysSnap?["buffers"] ?? NSNull(), "system_peak_db": sysSnap?["peak_db"] ?? NSNull(),
                 "system_audible_s": sysSnap?["audible_s"] ?? NSNull(), "system_stream": self.options.systemAudio ? sysStreamAlive : NSNull(),
                 "system_error": self.systemStreamFailed ?? NSNull(),

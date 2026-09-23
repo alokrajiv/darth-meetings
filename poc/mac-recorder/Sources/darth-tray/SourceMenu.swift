@@ -22,7 +22,12 @@ final class SourceMenu: NSObject {
         let mode: String
         let callPids: [pid_t]
         let audioOnly: Bool
+        /// 0.3.16: when given, a "Microphone" submenu is appended (see `MicMenu`).
+        var mic: MicMenu.Info? = nil
     }
+
+    /// 0.3.16: the microphone submenu's builder + callbacks, owned by whoever owns this menu.
+    var mic: MicMenu?
 
     var onSetAuto: (() -> Void)?
     var onRedetect: (() -> Void)?
@@ -75,6 +80,16 @@ final class SourceMenu: NSObject {
         none.target = self
         none.state = info.audioOnly ? .on : .off
         m.addItem(none)
+        // 0.3.16: the microphone, from the same gear — a pick or a re-detect without leaving
+        // the preview panel.
+        if let mic, let micInfo = info.mic {
+            m.addItem(.separator())
+            let item = NSMenuItem(title: MicMenu.itemTitle(micInfo), action: nil, keyEquivalent: "")
+            let sub = NSMenu(title: "Microphone")
+            mic.build(into: sub, info: micInfo)
+            item.submenu = sub
+            m.addItem(item)
+        }
     }
 
     @objc private func autoTapped() {
