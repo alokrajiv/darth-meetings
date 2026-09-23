@@ -41,6 +41,7 @@ import { storedReportPref } from '@/lib/report-pref';
 import { partForMeetingTime, storedVideoParts } from '@/lib/part-offsets';
 import { AttachmentPanel } from '@/components/attachment-panel';
 import { ShareDialog } from '@/components/share-dialog';
+import { sharingRefusal } from '@/lib/share-gate';
 import { LinkEventDialog } from '@/components/link-event-dialog';
 import { SuggestedEventStrip } from '@/components/suggested-event-strip';
 import { noVideoNote } from '@/lib/suggested-event';
@@ -1807,6 +1808,8 @@ function TranscriptDetailInner({ transcriptId }: { transcriptId: string }) {
     (person: PickerPerson) => {
       if (!canEdit) return;
       if (!person.email) return;
+      // A temporary upload takes no new share (P5, lib/share-gate).
+      if (row && sharingRefusal(row)) return;
       const picked = person.email.toLowerCase();
       // Don't prompt for yourself — you already have access.
       if (currentUserEmail && picked === currentUserEmail) return;
@@ -1820,7 +1823,7 @@ function TranscriptDetailInner({ transcriptId }: { transcriptId: string }) {
       setSharingError(null);
     },
     // eslint-disable-next-line react-hooks/exhaustive-deps
-    [canEdit, collaboratorEmails, currentUserEmail]
+    [canEdit, collaboratorEmails, currentUserEmail, row?.scratch]
   );
 
   const handleRequestCreatePerson = useCallback(
@@ -2296,10 +2299,10 @@ function TranscriptDetailInner({ transcriptId }: { transcriptId: string }) {
     }
   };
 
-  /** Temporary flag (migration 042). false = "Keep": the row moves from
-   * the Temporary tab to the main list and the 30-day auto-trash stops.
-   * true = "Move to temporary": out of the main list, trashed automatically
-   * SCRATCH_TTL_DAYS after upload. Editors; same PATCH the listing uses. */
+  /** Temporary flag (migration 042). Only ever cleared from here ("Keep":
+   * the 30-day auto-trash stops). There is no "Move to temporary" any more —
+   * a meeting cannot become temporary (docs/recordings-meetings-series-
+   * design.md §3.2). Editors; same PATCH the Recordings surface uses. */
   const handleSetScratch = async (scratch: boolean) => {
     try {
       const res = await fetch(`/api/transcripts/${row.assemblyai_id}`, {
@@ -2315,7 +2318,11 @@ function TranscriptDetailInner({ transcriptId }: { transcriptId: string }) {
   };
   // Same rule as the listing's row toggle: never on placeholders / deferred
   // rows or in the trash.
-  const scratchToggleAllowed = canEdit && !row.deleted_at && row.status !== 'uploading' && row.status !== 'waiting';
+  const scratchToggleAllowed =
+    !!row.scratch && canEdit && !row.deleted_at && row.status !== 'uploading' && row.status !== 'waiting';
+  // Only meetings are shareable (P5): a temporary row hides Share — unless
+  // it already has shares (grandfathered, Q7), which stay manageable.
+  const shareHidden = !!sharingRefusal(row) && collaboratorEmails.size === 0;
 
   const handleTrashDelete = async () => {
     if (!confirm('Delete forever? This cannot be undone.')) return;
@@ -2552,25 +2559,27 @@ function TranscriptDetailInner({ transcriptId }: { transcriptId: string }) {
             Unlink from event…
           </Button>
         )}
-        <Button
-          variant="ghost"
-          size="sm"
-          className="h-8 w-full justify-start gap-2 text-[13px]"
-          disabled={offline}
-          onClick={() => setShareOpen(true)}
-          title={offline ? OFFLINE_TITLE : 'Share access with other people'}
-        >
-          <Users className="h-4 w-4 text-muted-foreground" />
-          Share
-          {shareSuggestionCount > 0 && (
-            <span
-              className="ml-auto rounded-full bg-primary px-1.5 py-0.5 text-[10px] font-medium leading-none text-primary-foreground"
-              title={`${shareSuggestionCount} people from this meeting aren't shared yet`}
-            >
-              {shareSuggestionCount}
-            </span>
-          )}
-        </Button>
+        {!shareHidden && (
+          <Button
+            variant="ghost"
+            size="sm"
+            className="h-8 w-full justify-start gap-2 text-[13px]"
+            disabled={offline}
+            onClick={() => setShareOpen(true)}
+            title={offline ? OFFLINE_TITLE : 'Share access with other people'}
+          >
+            <Users className="h-4 w-4 text-muted-foreground" />
+            Share
+            {shareSuggestionCount > 0 && (
+              <span
+                className="ml-auto rounded-full bg-primary px-1.5 py-0.5 text-[10px] font-medium leading-none text-primary-foreground"
+                title={`${shareSuggestionCount} people from this meeting aren't shared yet`}
+              >
+                {shareSuggestionCount}
+              </span>
+            )}
+          </Button>
+        )}
         {sourceLinks.length > 0 && (
           <>
             <div className="my-1.5 border-t" />
@@ -2600,18 +2609,12 @@ function TranscriptDetailInner({ transcriptId }: { transcriptId: string }) {
             size="sm"
             className="h-8 w-full justify-start gap-2 text-[13px] text-muted-foreground"
             disabled={offline}
-            onClick={() => void handleSetScratch(!row.scratch)}
-            title={
-              offline
-                ? OFFLINE_TITLE
-                : row.scratch
-                  ? 'Keep — make this transcript permanent (moves it to the main list)'
-                  : 'Move to temporary — out of the main list, trashed automatically after 30 days'
-            }
+            onClick={() => void handleSetScratch(false)}
+            title={offline ? OFFLINE_TITLE : 'Keep — no more auto-trash'}
             data-scratch-toggle
           >
-            {row.scratch ? <Archive className="h-4 w-4" /> : <Hourglass className="h-4 w-4" />}
-            {row.scratch ? 'Keep (make permanent)' : 'Move to temporary'}
+            <Archive className="h-4 w-4" />
+            Keep (make permanent)
           </Button>
         )}
         {access === 'owner' && !row.deleted_at && (
@@ -2705,25 +2708,27 @@ function TranscriptDetailInner({ transcriptId }: { transcriptId: string }) {
             <span className="hidden sm:inline">Edited</span>
           </button>
         </div>
-        <Button
-          size="sm"
-          disabled={offline}
-          onClick={() => setShareOpen(true)}
-          title={
-            offline
-              ? OFFLINE_TITLE
-              : shareSuggestionCount > 0
-              ? `Share — ${shareSuggestionCount} people from this meeting aren't shared yet`
-              : 'Share access with other people'
-          }
-          className="relative"
-        >
-          <Users className="h-4 w-4" />
-          <span className="hidden md:inline">Share</span>
-          {shareSuggestionCount > 0 && (
-            <span className="absolute -right-1 -top-1 h-2.5 w-2.5 rounded-full border-2 border-background bg-status-busy" />
-          )}
-        </Button>
+        {!shareHidden && (
+          <Button
+            size="sm"
+            disabled={offline}
+            onClick={() => setShareOpen(true)}
+            title={
+              offline
+                ? OFFLINE_TITLE
+                : shareSuggestionCount > 0
+                ? `Share — ${shareSuggestionCount} people from this meeting aren't shared yet`
+                : 'Share access with other people'
+            }
+            className="relative"
+          >
+            <Users className="h-4 w-4" />
+            <span className="hidden md:inline">Share</span>
+            {shareSuggestionCount > 0 && (
+              <span className="absolute -right-1 -top-1 h-2.5 w-2.5 rounded-full border-2 border-background bg-status-busy" />
+            )}
+          </Button>
+        )}
         {/* ⋯ overflow: refresh, downloads, transcript ID */}
         <div className="relative" ref={overflowMenuRef}>
           <Button

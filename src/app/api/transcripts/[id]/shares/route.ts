@@ -3,6 +3,7 @@ import { withAuth } from '@/lib/auth/with-auth';
 import { notifyUser } from '@/lib/server/darth-notify';
 import { dm, headlines, meetingLine, openLink } from '@/lib/server/dm-copy';
 import { resolveAccess } from '@/db-ops/transcript-access';
+import { sharingRefusal } from '@/lib/share-gate';
 import { identityForUser, logActivity, userIdForEmail } from '@/db-ops/transcript-activity';
 import {
   addShare,
@@ -63,6 +64,13 @@ export const POST = withAuth(async ({ user, request }, { params }) => {
   if (!canManageShares(access.access)) {
     return NextResponse.json({ error: 'Only the owner or an editor can share' }, { status: 403 });
   }
+  // Only meetings are shareable (rule 1, invariant I5 — docs/recordings-
+  // meetings-series-design.md P5). A temporary upload is a recording with an
+  // expiry, not a meeting: link it or make a meeting of it first. Shares a
+  // temporary row already has are grandfathered (Q7) — PATCH/DELETE on them
+  // still work, only a NEW share is refused.
+  const refusal = sharingRefusal(access.row);
+  if (refusal) return NextResponse.json({ error: refusal }, { status: 409 });
 
   let body: unknown;
   try {
