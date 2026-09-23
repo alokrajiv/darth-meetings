@@ -85,9 +85,8 @@ enum AudioDevices {
     }
 
     /// Point an engine's input unit (AUHAL, or the voice-processing unit once that is on) at
-    /// one device. Must happen before the engine starts. `scope`/`element` default to the
-    /// AUHAL convention (Global, 0); the voice-processing unit is probed with others (see
-    /// `MicCapture.pinMode`).
+    /// one device. Must happen before the engine starts. (Global, 0) is the AUHAL convention;
+    /// the voice-processing unit ignores it on every scope/element pair probed (2026-09-23).
     static func setDevice(_ id: AudioDeviceID, on unit: AudioUnit,
                           scope: AudioUnitScope = kAudioUnitScope_Global, element: AudioUnitElement = 0) throws {
         var v = id
