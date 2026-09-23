@@ -44,6 +44,20 @@ echo "==> install + build on VM (BUILD_ID=$BUILD_ID)"
 ssh -n "$VM" "export PATH=\"\$HOME/.bun/bin:\$PATH\" BUILD_ID='$BUILD_ID' && cd '$APP_DIR' \
   && { bun install && bun run build; } > /tmp/mw-deploy-build.log 2>&1 < /dev/null; rc=\$?; tail -5 /tmp/mw-deploy-build.log; exit \$rc"
 
+# A restart kills in-flight Agent SDK runs (a report killed this way stays
+# failed — reports are never swept). Probe AFTER the build, since a run can
+# start during it; the [k] keeps the remote shell from matching itself.
+# DEPLOY_FORCE=1 skips the wait.
+if [[ "${DEPLOY_FORCE:-}" != "1" ]]; then
+  for i in $(seq 1 60); do
+    live=$(ssh -n "$VM" "pgrep -fc 'claude-agent-sd[k]' || true")
+    [[ "$live" == "0" ]] && break
+    echo "==> $live AI run(s) live on the VM — waiting before restart ($i/60, 15 s)"
+    sleep 15
+  done
+  [[ "$live" == "0" ]] || { echo "AI runs still live after 15 min; rerun later or DEPLOY_FORCE=1" >&2; exit 1; }
+fi
+
 echo "==> pm2 restart"
 ssh "$VM" "pm2 restart meeting-whisperer --update-env && sleep 3 && pm2 ls | grep meeting-whisperer"
 
