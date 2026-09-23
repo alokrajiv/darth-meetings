@@ -742,3 +742,222 @@ meeting, owner and emails. Suite: `TZ=UTC bun test` 1240 pass; `tsc`, eslint on 
 - `recorder-recordings.tsx` sends `linkedEvent ?? r.matched` on Upload from the Settings card /
   picker: a machine match becomes a link when the person presses Upload on that row. After P4 it no
   longer shares, but it is still a link the person did not pick explicitly (rule 4). Not changed.
+
+## As built — P7/P8 (2026-09-23)
+
+Owner decision (Alok, 2026-09-23, final): recordings are personal and never shared; only meetings
+are. **P7: an upload that names no meeting is born a RECORDING, not a `transcripts` row**; it
+becomes (part of) a meeting only by its owner's Link to meeting / Make a meeting. **P8: temporary
+= a recording with an expiry.** Addition the same day: the Recordings surface paginates.
+
+Commits: `1a4eeb0` (MW_DISABLE_POLLERS), `6ad195a` (migration 049), `a1ac691` (server), `bb8b4b0`
+(UI), `be93c6c` (darth-cli source), `70961ec`, `62e43a2`, `608911b` (fixes, dead helpers). No migration applied anywhere but
+scratch clusters, no deploy, no push.
+
+### The switch
+
+`MW_RECORDINGS_BORN_BARE` (lazy; unset = today's behaviour, and not one new query on the upload
+path). It is honoured only when **`MW_RECORDINGS_WRITE` is on** and **migrations 045 + 049** are
+applied (`src/lib/server/born-bare.ts` `bornBareEnabled`, `src/db-ops/standalone-recordings.ts`
+`standaloneColumnsExist`). The write flag is required because a permanent delete of a meeting made
+from a recording must go through the graph cleanup, which keeps the recording's files.
+
+### Migration 049 (`migrations/049_recordings_born_bare.sql`)
+
+Additive, safe to apply before the code: `recordings.standalone boolean NOT NULL DEFAULT false`,
+`title`, `expires_at`, `upload_state jsonb`, `ready_notified_at`; `recorder_recordings.recording_id
+uuid` (Q9); four partial indexes. Apply on the VM (prod schema is hard-coded in the file):
+
+```bash
+psql -X -v ON_ERROR_STOP=1 -h <host> -p <port> -U <schema owner> -d meeting_whisperer \
+     -f migrations/049_recordings_born_bare.sql
+```
+
+(045 must already be there; 044 is its prerequisite.) Rollback = unset the flag; the columns can stay.
+
+### What an unlinked upload does now (flag on)
+
+| Stage | Where | What |
+|---|---|---|
+| open | `upload-pipeline.ts` `openUpload` → `born-bare.ts` `openBornBare` | `namesNoMeeting(input)` = no `linkedEvent`, no `attachTo`, no `sourceId`, no `contextExtra`. Creates `recordings` (standalone, owner = uploader, `source_kind` recorder/upload, `title` = the tray call's own title or NULL, `started_at`, `recorder_recording_id`, `expires_at` = now + 30 d for `scratch`) with the in-flight state in `upload_state`. Parts 2..N of a group find it by group id (`findStandaloneGroup`). The spec's `placeholderId` is `rec-<recording id>`. |
+| bytes | unchanged routes | `updateUploadProgress` on a `rec-` id writes the recording's heartbeat/bytes. A resumed chunk session checks the recording, not a meeting row. Stage C (AAI reads the blob) refuses it — pull path. |
+| finalize | `finalizeBornBare` / `handOff` | group parts stamped atomically, stitched on the last one; multi-track mix; the file becomes `<recording id><ext>`; AAI upload + submit (vocab bias as for meetings); one transaction writes the canonical (+ `part`) media, the transcription (`processing`, job id) and the active pointer. A failed upload/submit is KEPT (bytes stay, status failed, retried by the sweeper; 5/10/20/40 min then hourly, gives up after 72 h). Registry row: `recording_id` + `uploaded`. |
+| answer | both byte routes | `transcript: {assemblyai_id: 'rec-<id>', recording_id, born_bare: true, status, title, original_filename, created_at, expires_at, scratch}` — what the tray, the web dialog and every darth-cli read. The tray stores `rec-<id>` as its `transcript_id` (it keeps working unchanged); `/transcript/rec-<id>` → 307 `/recording/<id>` (`src/proxy.ts`), so the tray's "Open transcript" and "Not this" (`?link=1`) land on the recording page. |
+| completion | `refreshBornBare` | polled by an in-process watcher (15 s → 60 s), the owner's GETs, and the 5-minute sweep. Payload stored in the same statement that flips the status; duration + speaker count onto the recording. **One ready DM, keyed `mw-recording-ready:<recording id>:<email>`, claimed on `recordings.ready_notified_at`** — whoever sees the completion first sends it; a failed send hands the claim back (never zero times). Making a meeting later sends nothing (risk §6.1). DEC-4: with `MW_AAI_DELETE_ON_COMPLETE` the job is deleted once the payload is stored and the canonical file is on disk; the transcription is stamped. |
+| no row | — | no `transcripts` row exists: `GET /api/transcripts` (legacy and v2), `?scratch=1`, `meetings list` never see it (Q10). |
+
+Same-file check: a standalone recording with the same bytes answers the duplicate prompt with
+`meetingId: 'rec-<id>'` (owner-scoped, second query only when the meeting arm found nothing).
+
+### Routes (owner only — `src/app/api/recordings/[id]/…`)
+
+| Route | Reachability | Notes |
+|---|---|---|
+| `GET /api/recordings/:id` | owner (arm a) | `RecordingView` (`lib/server/recording-actions.ts`): status uploading/transcribing/ready/failed, suggestion only when confident and not dismissed, meetings holding it that the caller can open. |
+| `GET …/content` | owner | the payload verbatim; 202 while transcribing. |
+| `GET …/audio[?part=N][&variant=audio]` | **owner, or a caller who can open a meeting holding a clip on it** (owned, or shared to their lower-cased email; a trashed meeting only for its owner) | Range, the audio-only extract, blob proxy when local is gone. The meeting media routes are untouched. |
+| `PATCH …/:id` | owner | `{keep: true}` clears the expiry (Q6), `{title}`, `{dismissSuggestedEvent: true}`. |
+| `DELETE …/:id` | owner | files, derivatives, blobs, the AAI job, the rows. **409 while any meeting (live or trashed) holds a clip.** |
+| `POST …/link` | owner | `{event}` (the web link dialog's event), `{eventRef}` / `{eventKey}` (resolved from the caller's calendar cache) → a NEW meeting; `{meetingId, offsetMs?, textPolicy?}` → Phase 3b `addClip` on a meeting the caller owns/edits (needs `MW_COMBINE`). |
+| `POST …/make-meeting` | owner | `{title}` required. |
+
+Every route answers someone else's recording (and a junk id) exactly as a missing one: **404**,
+same body (I2).
+
+**Link / Make a meeting** (`createMeetingFromRecording`): ONE transaction — lock the recording on
+its owner, refuse `not-ready` (still transcribing) and `already-linked` (a live meeting holds it),
+INSERT the meeting (fresh uuid id, `aai_job_id` = the job, `imported_content` copied from the
+transcription **in SQL**, `local_audio_path` = the recording's canonical file, `status completed`,
+`gmeet_context` = the event context as linked uploads build it + `clips: [{ord 0, recordingId, 0,
+null, 0}]` + `fromRecording` + the DEC-4 stamp if the job is gone), INSERT the clip, clear
+`expires_at`. Then: `/m` ledger, **series auto-attach (strong keys only)**, the dual-write (the
+clips mirror makes it a BORROWER — no second recording is derived), playback prep, and the speaker
+passes via `onTranscriptCompleted(…, {silent: true})` — **no DM**. **0 shares**; the invitees land
+on `gmeet_context.attendees` for the share dialog's suggestions (P4).
+
+A standalone recording **outlives its meetings**: `removeMeetingFromRecordingGraph` and
+`applyRecordingGraph`'s promotion cleanup never delete one (it is reported "kept", so the permanent
+delete route keeps its files), and that route also never removes a file for a meeting carrying
+`fromRecording`, whatever the graph said.
+
+### P8 — the sweep (`sweepBornBare`, called from the 5-minute notes sweeper)
+
+Runs whenever 049 is applied, whatever the flag says today (recordings born while it was on must
+still finish): deletes expired standalone recordings **no meeting clips** (I6 — the SQL has
+`NOT EXISTS meeting_clips`), reaps uploads with no bytes, no open session and no heartbeat for 15
+minutes, polls jobs still at AssemblyAI (gives up after 6 h), retries kept hand-off failures, backs
+up the ready DM, and drains the DEC-4 backlog. Legacy `transcripts.scratch` rows are untouched and
+still served by `?scratch=1` until their own 30 days.
+
+### The Recordings surface, paginated (owner addition 2026-09-23)
+
+`GET /api/recordings?mine=1[&section=mac|uploaded|temporary][&q=][&regex=1][&limit=0..200][&cursor=]`
+→ `{items, next_cursor, counts: {mac, uploaded, temporary}}` (`src/lib/recordings-page.ts`,
+`src/db-ops/own-recordings-page.ts`, `src/lib/server/own-recordings.ts`). ONE newest-first list over
+three owner-scoped sources, each with its owner predicate in SQL: standalone recordings no live
+meeting holds; legacy bare uploads (the SQL twin of `hasNoRealTitle` — `BARE_TITLE_PG`) and legacy
+temporary rows (own only — a temporary row shared WITH you is not yours); Mac registry rows not yet
+represented by an upload. Order and cursor `(sort_us DESC, kind, id DESC)` with `sort_us` in integer
+microseconds (a JS Date would round and duplicate/skip at a page boundary). No day window. `limit=0`
+= counts only (the Meetings listing's "N recordings aren't linked" strip). Invalid regex → 400.
+
+UI: `/recordings` has a section filter carrying the server's counts (All · On your Macs · Uploaded
+· Temporary, short labels at phone width), a search box, infinite scroll with a Load more fallback
+(the listing's sentinel pattern), a card per kind (new `RecordingCard` for standalone ones).
+`/recording/<id>` is the recording in recording mode — player, text, diarised speakers, the
+confident suggestion (Link to it / Not this), Link to meeting…, Make a meeting, Keep, Delete; no
+share, notes, labels or series controls. The upload dialog polls a `rec-` answer on the recording
+and says "Uploaded to your Recordings — Open". `LinkEventDialog` takes `recordingId`.
+
+### darth-cli (`cli-subcommand-src/`, copied into `../cli/src/subcommands/meetings/`)
+
+A **`meetings recordings …` sub-verb family**, not a top-level `recordings` family: a new family
+needs `../cli/src/subcommands/registry.ts`, a shared tracked file other agents were editing. Verbs:
+`list [--section|--unlinked|--temporary] [--q] [--regex] [--limit] [--cursor] [--all] [--json]
+[--envelope]`, `get` (`suggested event:` only when the server sends one — it only sends confident
+ones; `expires:` only when temporary), `text` (extra: the diarised text, since the meetings `text`
+verb cannot read a recording), `audio --out`, `link <rid> <event-ref|meeting-id> [--title]
+[--offset-ms]`, `make-meeting --title`, `keep`, `rm`. `meetings upload` without `--event` prints
+"uploaded to your Recordings — <uuid>" + the link hint; `--wait` polls the recording. `meetings list`
+untouched (I9). README: the rows and the Q10 line. Ships with the next darth-cli build.
+
+### Tests
+
+- `src/lib/server/__tests__/born-bare.test.ts` (18, fake postgres): flag off = a meeting
+  placeholder and not one recordings query; on without `MW_RECORDINGS_WRITE` / without 049 =
+  ignored; on = the caller's recording, no transcripts INSERT, 30-day expiry for `scratch`; an
+  upload naming a meeting still makes one; every caller-scoped read carries the owner predicate;
+  the meeting arm uses the lower-cased email; Link is one owner-locked transaction that copies the
+  text in SQL, writes one clip and **no share**; refusals; the sweeper's I6 predicate; the view's
+  strip/title/expiry; source checks (no sharing controls on the recording page, the media route's
+  two arms, 404 never 403); the `/transcript/rec-<id>` redirect.
+- `src/db-ops/__tests__/own-recordings.test.ts` (13, rewritten for the paginated shape): query
+  parsing, cursor round-trip, owner predicates in the page SQL and every hydration, no share join,
+  no day window, `limit=0`, the two-user fold (a database that answers both users alike), the
+  next cursor, the empty page.
+- **Scratch Postgres** (`scripts/scratch-db.sh up --dir tmp/recordings-p7 --port 55947 --db mw_p7
+  --schema-prefix p7test`; `bun test ./tmp/recordings-p7/p7.check.ts`, not committed) — **17 pass**:
+  flag off → placeholder, no recording; flag on: tray upload → recording + media + transcription,
+  **no transcripts row**, `meetings list` empty; three simultaneous completions + the sweeper → **one
+  DM** with the recording key; kept failure → retried by the sweep; **Link → exactly one meeting,
+  one clip, 0 shares, `imported_content = payload` (jsonb equality) and `resolveMeetingContent`
+  byte-equal to the payload with `MW_RECORDINGS` off and on (compat)**, second link 409;
+  make-meeting title/not-ready; permanent delete of the meeting → recording and file survive and
+  come back to the list; **I2 two-user fixture through the real route handlers: B gets the same 404
+  body as for a nonexistent id on GET / content / audio / PATCH / DELETE / link / make-meeting and an
+  empty list with zero counts; after A makes a meeting and shares it read-only with B, B reaches
+  the bytes through `…/audio` (meeting arm) and the meeting's own audio route, and still 404 on
+  everything else**; P8 expired → rows + file + AAI job gone, kept and linked survive (linked one
+  forced back to expired — the clip alone protects it); delete refused while in a meeting; a
+  two-part tray group (real m4a parts, real ffmpeg stitch) → one recording with canonical + 2
+  parts, `covers.timeline = concat`; raw `POST /api/transcripts?scratch=1` → a temporary
+  recording, legacy `?scratch=1` listing unchanged; junk ids → 404 on every route; DEC-4 stamp
+  carried onto a meeting made later; **pagination: pages of 2 over the three sources → the exact
+  set, strictly newest-first, no dupes, a row 400 days old included, counts right, section filter,
+  counts-only, ILIKE and regex search, invalid regex 400, bad cursor 400, B sees none of A's**; the
+  SQL twin of `hasNoRealTitle` agrees with the JS on 22 titles.
+- **Phase-1 diff harness** (`tmp/recordings-diff`, rebuilt from a read-only `pg_dump` of the prod
+  tables into a scratch cluster, deleted afterwards): 703 meetings, 13 callers, 10 672 checks per run, MW_RECORDINGS off vs on. **0
+  per-meeting mismatches** (resolver, detail, /content, /edits, /speakers, /audio + Range + every
+  `?part=N`, offline plan incl. `rev`). 15 mismatches, all in the v2 listing, are **pre-existing**:
+  the same 15 at the base commit `3c1a42b`. Three runs were compared digest by digest (every
+  response of every check, off and on): **HEAD with MW_RECORDINGS_BORN_BARE off vs base
+  `3c1a42b`: identical except one legacy trash listing** whose two rows share a `deleted_at` (an
+  unstable ORDER BY that predates this work — the same call on the same database is byte-identical
+  in both trees); **HEAD with the flag ON vs OFF: all 21 344 digests identical.** The data dump, the
+  snapshot and both clusters were deleted afterwards.
+- Local check: `next dev` on the SCRATCH database (`PG*` → 127.0.0.1:55947, `SCHEMA_PREFIX=p7test`,
+  `MW_DISABLE_POLLERS=1`, AssemblyAI key replaced, DMs off), seeded with 55 recordings / 2 Mac rows /
+  3 legacy rows for the author's user id, driven headless (playwright-core, darth-cli bearer): the
+  list loads 50, scrolling loads the rest (60), search narrows to 9, Temporary shows 12, **no
+  horizontal scroll at 390 px** on `/recordings` or `/recording/<id>`, the recording page has no
+  share/label controls, `/transcript/rec-<id>?link=1` lands on `/recording/<id>?link=1`, audio 200 /
+  Range 206 / someone else's 404. Nothing ran against the prod schema.
+- Suite: `TZ=UTC bun test` **1262 pass, 0 fail**; `bunx tsc --noEmit -p .` clean; eslint clean on
+  touched files; `bun run build` green with no PG/AAI env in the shell.
+
+### Rollout
+
+1. Apply 049 (above). Nothing changes — the flag is off; the sweep starts asking 049's questions
+   and finds nothing.
+2. Deploy. With `MW_RECORDINGS_WRITE=1` already on (Phase 1 step 3), set
+   `MW_RECORDINGS_BORN_BARE=1` in the VM's `.env.local`, `pm2 restart`.
+3. Canary: upload a short file from the web dialog with no event → it lands in /recordings (not the
+   listing), the DM arrives once, Open plays it, Make a meeting → a meeting with the same text and 0
+   shares. Then a tray recording: "Uploaded" in the tray, "Open transcript" lands on
+   `/recording/<id>`.
+4. Ship darth-cli with the `meetings recordings` family.
+5. Rollback: unset the flag, restart. New uploads are meetings again; recordings already born stay
+   the owner's (the surface, the routes and the sweep keep serving them).
+
+### Deviations, and decisions for the owner
+
+- **Link while transcribing is refused (409 `not-ready`)** — the meeting is made from a stored
+  payload in one transaction; linking a still-processing job would need the meeting to poll the
+  same job and would risk a second DM. The tray's Link-at-upload path is unaffected (it names the
+  event at open, so the upload is a meeting from the start). *Owner:* accept, or have Link on a
+  transcribing recording queue the link for completion.
+- **Delete of a recording is refused while any meeting, trashed included, clips it** (trash must be
+  restorable). *Owner:* ok?
+- **"Link to meeting…" to an existing meeting** is the Phase 3b `addClip` (behind `MW_COMBINE`,
+  offset from the caller, default 0 — never guessed). The web card still only offers calendar
+  events; the CLI and API take `meetingId`.
+- **No faststart / audio-only extract for a standalone recording** until it becomes a meeting
+  (`prepareMediaForPlayback` is keyed on a meeting row); the recording page streams the original.
+  The permanent-blob archive IS queued (`queueMediaArchiveForRecording`).
+- **Stage C (AssemblyAI reads the blob) is not used for born-bare uploads** — they take the pull path.
+- **Speaker names on a recording**: shown as the diarised labels (A, B, …); naming happens once it
+  is a meeting (the speaker passes run at link time, without a DM).
+- **The recording page is its own light page** reusing the player, not the 3 000-line transcript
+  page in a "mode" — that page is wired to meeting APIs throughout.
+- **Mac rows on the surface** are hidden when ANY live meeting row of the owner's or a standalone
+  recording represents them (P6 hid them only behind a bare row), so a tray upload into a linked
+  meeting no longer also shows "On your Macs · uploading".
+- **The owner's own calendar row** for a born-bare tray recording says "uploaded to your
+  Recordings" with no Open action (the P1 follow-up lateral finds no meeting). Follow-up: point it
+  at `/recording/<rid>` via `recorder_recordings.recording_id`.
+- **`GET /api/recordings` changed shape** to `{items, next_cursor, counts}`; its only consumers
+  were the web surface and the listing strip (both updated). The tray reads `/api/recorder/…` only.
+- **The ready DM reuses the `transcript_ready` notification kind** (same preference toggle).
+- **An old darth-cli** that uploads without `--event` gets `rec-<id>` back; `--wait` then 404s on
+  `/api/transcripts/rec-…` until the new build ships (step 4 before step 2 avoids it).
