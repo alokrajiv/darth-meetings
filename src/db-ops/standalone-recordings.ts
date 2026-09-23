@@ -666,6 +666,7 @@ export async function keepStandalone(
   id: string,
   patch: { keep?: boolean; title?: string | null; dismissSuggestion?: boolean }
 ): Promise<boolean> {
+  if (!UUID_RE.test(id)) return false;
   const rows = await sql<Array<{ id: string }>>`
     UPDATE ${sql(SCHEMA)}.recordings
     SET expires_at = ${patch.keep ? null : sql`expires_at`},

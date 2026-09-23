@@ -330,3 +330,15 @@ describe('source-level: the recording surfaces carry no sharing controls, and th
     expect(actions).not.toMatch(/INSERT INTO[^`]*transcript_shares/);
   });
 });
+
+describe('the tray’s “Open transcript” on a recording', () => {
+  test('/transcript/rec-<id> redirects to /recording/<id> (query kept), nothing else does', async () => {
+    const { NextRequest } = await import('next/server');
+    const { proxy } = await import('@/proxy');
+    const res = await proxy(new NextRequest(`http://localhost/transcript/rec-${RID.toUpperCase()}?link=1`));
+    expect(res.status).toBe(307);
+    expect(res.headers.get('location')).toBe(`http://localhost/recording/${RID}?link=1`);
+    const other = await proxy(new NextRequest(`http://localhost/transcript/rec-not-a-uuid`)).catch(() => null);
+    expect(other?.headers.get('location') ?? '').not.toContain('/recording/');
+  });
+});
