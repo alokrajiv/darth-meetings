@@ -10,7 +10,7 @@ import {
 } from '@/components/ui/dialog';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
-import { getGoogleAccessToken, hasValidGoogleToken } from '@/lib/google-token';
+import { connectGoogle, getGoogleAccessToken, GoogleNotConnectedError } from '@/lib/google-token';
 import {
   AlertCircle,
   CalendarSearch,
@@ -92,6 +92,9 @@ export function LinkEventDialog({
 }: LinkEventDialogProps) {
   const [date, setDate] = useState<string>(() => toLocalDateInput(initialDateIso));
   const [connected, setConnected] = useState(false);
+  /** The server holds no Google link for this person — only then is
+   * "Connect Google" a real action (it runs the one-time connect flow). */
+  const [notConnected, setNotConnected] = useState(false);
   const [busy, setBusy] = useState(false);
   const [linking, setLinking] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -103,6 +106,7 @@ export function LinkEventDialog({
     try {
       const token = await getGoogleAccessToken();
       setConnected(true);
+      setNotConnected(false);
       const params = new URLSearchParams({
         timeMin: new Date(`${forDate}T00:00:00`).toISOString(),
         timeMax: new Date(`${forDate}T23:59:59.999`).toISOString(),
@@ -120,7 +124,8 @@ export function LinkEventDialog({
       const data = (await res.json()) as { items?: CalendarEventLite[] };
       setEvents((data.items ?? []).filter((e) => e.start?.dateTime));
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Failed to load calendar');
+      if (err instanceof GoogleNotConnectedError) setNotConnected(true);
+      else setError(err instanceof Error ? err.message : 'Failed to load calendar');
     } finally {
       setBusy(false);
     }
@@ -184,9 +189,11 @@ export function LinkEventDialog({
     onClose();
   };
 
-  // First open with a live token → skip the connect step and load right away.
+  // Load right away on open: the token is minted server-side from the
+  // person's stored Google link, so a fresh tab needs no click. Only a
+  // person with no link at all is shown "Connect Google".
   useEffect(() => {
-    if (open && !connected && hasValidGoogleToken()) {
+    if (open && !connected) {
       void loadEvents(date);
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -201,11 +208,17 @@ export function LinkEventDialog({
 
         {!connected ? (
           <div className="space-y-4 py-2 min-w-0">
-            <p className="text-sm text-muted-foreground">
-              Find the invite this meeting came from — its title, date, and attendees get
-              attached to the transcript, and you&apos;ll get share suggestions for the
-              people who were in it.
-            </p>
+            {busy ? (
+              <p className="flex items-center gap-2 text-sm text-muted-foreground">
+                <Loader2 className="h-4 w-4 animate-spin" /> Loading your calendar…
+              </p>
+            ) : (
+              <p className="text-sm text-muted-foreground">
+                {notConnected
+                  ? 'Connect your Google account once to pick the invite from your calendar.'
+                  : 'Find the invite this came from — its title, date, and attendees get attached, and you\u2019ll get share suggestions for the people who were in it.'}
+              </p>
+            )}
             {error && (
               <p className="text-xs text-destructive flex items-center gap-1">
                 <AlertCircle className="h-4 w-4" />
@@ -294,14 +307,16 @@ export function LinkEventDialog({
           <Button variant="ghost" onClick={handleClose} disabled={busy || linking !== null}>
             Cancel
           </Button>
-          {!connected && (
-            <Button onClick={() => void loadEvents(date)} disabled={busy}>
-              {busy ? (
-                <Loader2 className="h-4 w-4 mr-2 animate-spin" />
-              ) : (
-                <CalendarSearch className="h-4 w-4 mr-2" />
-              )}
-              Connect Google
+          {!connected && !busy && (
+            <Button
+              onClick={() =>
+                notConnected
+                  ? connectGoogle(window.location.pathname + window.location.search)
+                  : void loadEvents(date)
+              }
+            >
+              <CalendarSearch className="h-4 w-4 mr-2" />
+              {notConnected ? 'Connect Google' : 'Try again'}
             </Button>
           )}
         </DialogFooter>

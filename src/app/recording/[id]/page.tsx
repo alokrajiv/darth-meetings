@@ -84,7 +84,7 @@ export default function RecordingPage({ params }: { params: Promise<{ id: string
       const r = await load().catch(() => null);
       if (stop) return;
       if (r && (r.status === 'uploading' || r.status === 'transcribing')) {
-        timer = setTimeout(() => void tick(), 10_000);
+        timer = setTimeout(() => void tick(), 5_000);
       }
     };
     void tick();
@@ -350,6 +350,25 @@ export default function RecordingPage({ params }: { params: Promise<{ id: string
           </ol>
         ) : rec && ready ? (
           <p className="text-sm text-muted-foreground">No speech was found in this recording.</p>
+        ) : !rec && !err ? (
+          <div className="flex items-center gap-2 py-8 text-sm text-muted-foreground" data-recording-loading>
+            <Loader2 className="h-4 w-4 animate-spin" /> Loading the recording…
+          </div>
+        ) : rec && (rec.status === 'uploading' || rec.status === 'transcribing') ? (
+          <div className="flex items-start gap-3 rounded-lg border bg-muted/40 px-4 py-4 text-sm" data-recording-pending>
+            <Loader2 className="mt-0.5 h-4 w-4 shrink-0 animate-spin text-muted-foreground" />
+            <div className="space-y-1">
+              <p className="font-medium">
+                {rec.status === 'uploading' ? 'Uploading — please wait…' : 'Transcribing — please wait…'}
+              </p>
+              <p className="text-xs text-muted-foreground">
+                {rec.status === 'uploading'
+                  ? 'The transcript starts as soon as the upload finishes.'
+                  : 'Usually a minute or two; longer for a long recording.'}{' '}
+                This page updates by itself — you can leave and come back.
+              </p>
+            </div>
+          </div>
         ) : null}
 
         {rec?.in_meeting && rec.meetings[0] && (
