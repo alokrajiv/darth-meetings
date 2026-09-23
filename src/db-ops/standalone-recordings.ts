@@ -521,24 +521,6 @@ function listSelect() {
   `;
 }
 
-/**
- * CALLER-SCOPED — the owner's standalone recordings, newest first. `unlinked`
- * keeps those no live meeting holds a clip on (the Recordings surface's
- * "Uploaded, not in a meeting" + "Temporary" sections); without it, all.
- */
-export async function listStandaloneForOwner(
-  ownerUserId: string,
-  opts: { unlinkedOnly?: boolean; limit?: number } = {}
-): Promise<StandaloneListRow[]> {
-  const rows = await sql<StandaloneListRow[]>`
-    ${listSelect()}
-    WHERE r.owner_user_id = ${ownerUserId} AND r.standalone AND r.deleted_at IS NULL
-    ORDER BY COALESCE(r.started_at, r.created_at) DESC
-    LIMIT ${opts.limit ?? 200}
-  `;
-  return opts.unlinkedOnly ? rows.filter((r) => r.live_clips === 0) : rows;
-}
-
 /** CALLER-SCOPED — several of the owner's recordings by id (a page's keys). */
 export async function getStandaloneViewsForOwner(
   ownerUserId: string,

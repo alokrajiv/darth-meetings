@@ -270,20 +270,6 @@ export async function abandonBornBare(
   );
 }
 
-/** Progress while bytes stream (debounced by the caller); also the heartbeat. */
-export async function bornBareProgress(
-  userId: string,
-  recordingId: string,
-  bytesReceived?: number
-): Promise<void> {
-  await mergeStandaloneState(
-    userId,
-    recordingId,
-    bytesReceived === undefined ? {} : { bytesReceived },
-    { heartbeat: true }
-  );
-}
-
 // ---------------------------------------------------------------------------
 // Finalize
 // ---------------------------------------------------------------------------

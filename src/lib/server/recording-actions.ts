@@ -4,7 +4,6 @@ import {
   getStandaloneForOwner,
   getStandaloneViewForOwner,
   keepStandalone,
-  listStandaloneForOwner,
   meetingsHoldingRecording,
   type RecordingMeetingRef,
   type StandaloneListRow,
@@ -159,22 +158,6 @@ export async function getRecordingView(caller: Caller, id: string): Promise<Reco
   }
   const meetings = row.all_clips > 0 ? await meetingsHoldingRecording(row.id, caller) : [];
   return recordingViewOf(row, meetings);
-}
-
-/**
- * CALLER-SCOPED — the Recordings surface's born-bare half: the owner's
- * standalone recordings that no live meeting holds (unlinked, including the
- * temporary ones). Processing ones are asked about once (bounded).
- */
-export async function listRecordingViews(caller: Caller): Promise<RecordingView[]> {
-  const rows = await listStandaloneForOwner(caller.userId, { unlinkedOnly: true });
-  const pending = rows.filter((r) => r.txn_status === 'processing').slice(0, 5);
-  if (pending.length > 0) {
-    await Promise.all(pending.map((r) => refreshBornBare(r.id).catch(() => false)));
-    const fresh = await listStandaloneForOwner(caller.userId, { unlinkedOnly: true });
-    return fresh.map((r) => recordingViewOf(r));
-  }
-  return rows.map((r) => recordingViewOf(r));
 }
 
 // ---------------------------------------------------------------------------
