@@ -139,7 +139,9 @@ export function RecorderRecordings({
             upload={c.uploads[r.id]?.status === 'uploading' ? c.uploads[r.id] : null}
             compact={compact}
             onUpload={() => {
-              getCompanion().upload(r.id, linkedEvent ?? r.matched ?? null);
+              // Only an event the person picked; the server's guess (r.matched)
+              // is never a link (recorder-link-confirm-spec, rule 4).
+              getCompanion().upload(r.id, linkedEvent ?? null);
               onUploadStarted?.(r);
             }}
             onDelete={() => {

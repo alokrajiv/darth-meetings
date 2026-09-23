@@ -63,10 +63,13 @@ export function shareOriginColumnExists(): Promise<boolean> {
  *     event's attendee emails and the auto-share's own signature is matched:
  *     the owner shared them, with edit access, and no human origin. That is
  *     exactly what the pre-P4 upload link created.
- * A share someone made by hand in the Share dialog survives both arms unless
- * the person is an attendee of the event being unlinked — which is the case
- * the caller must warn about before asking for this.
+ * The unstamped arm only matches shares older than LEGACY_LINK_SHARE_CUTOFF:
+ * from then on every link-born share is stamped (048's writer was live) and,
+ * since P4, a link shares nobody — so a newer unstamped edit share to an
+ * invitee was made by a person and must survive the unlink.
  */
+export const LEGACY_LINK_SHARE_CUTOFF = '2026-09-22T10:00:00Z';
+
 export async function removeLinkBornShares(
   transcriptId: number,
   ownerUserId: string,
@@ -87,6 +90,7 @@ export async function removeLinkBornShares(
               AND shared_with_email = ANY(${emails}::text[])
               AND shared_by_user_id = ${ownerUserId}
               AND access = 'edit'
+              AND shared_at < ${LEGACY_LINK_SHARE_CUTOFF}::timestamptz
             )
           )
         RETURNING shared_with_email
@@ -99,6 +103,7 @@ export async function removeLinkBornShares(
             AND shared_with_email = ANY(${emails}::text[])
             AND shared_by_user_id = ${ownerUserId}
             AND access = 'edit'
+            AND shared_at < ${LEGACY_LINK_SHARE_CUTOFF}::timestamptz
           RETURNING shared_with_email
         `;
   if (rows.length > 0) publishEvent({ kind: 'shares' });

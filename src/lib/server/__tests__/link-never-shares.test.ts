@@ -203,5 +203,9 @@ describe('Unlink — legacy link-born shares still come off', () => {
     // The unstamped arm is still pinned to the owner + edit + these emails.
     expect(del.params).toContainEqual(['bea@trames.sg', 'chen@trames.sg']);
     expect(del.params).toContain(OWNER.userId);
+    // …and to shares older than the cutoff: a newer unstamped invitee share
+    // was made by a person (link never shares since P4) and survives.
+    expect(del.text).toContain('shared_at <');
+    expect(del.params).toContain(shareOrigin.LEGACY_LINK_SHARE_CUTOFF);
   });
 });
