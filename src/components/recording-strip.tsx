@@ -158,7 +158,13 @@ export function RecordingStrip({
             {model.action.label}
           </button>
         ) : null)}
-      {note && <span className="shrink-0 truncate text-muted-foreground">· {note}</span>}
+      {/* min-w-0, not shrink-0: a long note ("capture never finished — …")
+          truncates inside the card instead of pushing past it. */}
+      {note && (
+        <span className="min-w-0 truncate text-muted-foreground" title={note}>
+          · {note}
+        </span>
+      )}
     </div>
   );
 }

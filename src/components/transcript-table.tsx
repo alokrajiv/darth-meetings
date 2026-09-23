@@ -1,6 +1,7 @@
 'use client';
 
 import { Fragment, useState, useEffect, useCallback, useMemo, useRef } from 'react';
+import Link from 'next/link';
 import { useRouter } from 'next/navigation';
 import {
   Table,
@@ -51,7 +52,7 @@ import { PersonChip } from '@/components/person-chip';
 import { RowMenu, type RowMenuSection } from '@/components/row-menu';
 import { RecordingStrip, SourceGlyph } from '@/components/recording-strip';
 import { SuggestedEventStrip } from '@/components/suggested-event-strip';
-import { RecordingsSurface, useUnlinkedRecordings } from '@/components/recordings-surface';
+import { useUnlinkedRecordings } from '@/components/recordings-surface';
 import { LinkEventDialog } from '@/components/link-event-dialog';
 import { isBareRecording, meetingTitleOf } from '@/lib/meeting-title';
 import { provenanceTitle, sourceOfArchiveRow, stripForArchiveRow } from '@/lib/recording-strip';
@@ -106,11 +107,11 @@ interface TranscriptTableProps {
   onLabelFilter?: (f: LabelFilter | null) => void;
 }
 
-/** 'scratch' = the Temporary tab (migration 042): the caller's visible
- * temporary transcripts, which every other tab excludes. 'recordings' =
- * recordings that belong to no meeting yet (docs/listing-ui-redesign.md
- * §6) — fetched by the surface itself, never by the archive fetch. */
-type TabKey = 'all' | 'mine' | 'shared' | 'trash' | 'scratch' | 'recordings';
+/** Meetings tabs only. Recordings and Temporary are not meetings: they
+ * live on their own surface, `/recordings` (docs/recordings-meetings-series-
+ * design.md §3, P6) — the old `?tab=recordings` / `?tab=scratch` links are
+ * redirected there by the page. */
+type TabKey = 'all' | 'mine' | 'shared' | 'trash';
 
 /**
  * The merged timeline's multi-select layers. 'archive' = imported rows
@@ -465,8 +466,8 @@ export function TranscriptTable({
 
   // Row menu → "Link to a calendar event…" (one dialog for the whole table).
   const [linkRow, setLinkRow] = useState<ListRow | null>(null);
-  // Bumped on every silent refetch so the Recordings tab (and its badge)
-  // follow the same live events the archive does.
+  // Bumped on every silent refetch so the unlinked-recordings strip follows
+  // the same live events the archive does.
   const [liveTick, setLiveTick] = useState(0);
   const unlinked = useUnlinkedRecordings({ enabled: !blocked, refreshKey: liveTick, tz });
 
@@ -617,14 +618,6 @@ export function TranscriptTable({
   const fetchArchive = useCallback(
     async (mode: 'reset' | 'more' | 'silent') => {
       const gen = mode === 'reset' ? ++archiveGenRef.current : archiveGenRef.current;
-      if (tab === 'recordings') {
-        // The Recordings tab fetches its own two halves (useUnlinkedRecordings).
-        if (mode === 'reset') {
-          setLoading(false);
-          setError(null);
-        }
-        return;
-      }
       const params = new URLSearchParams({ v: '2', tab, tz });
       if (from) params.set('from', from);
       if (to) params.set('to', to);
@@ -1131,10 +1124,10 @@ export function TranscriptTable({
   };
 
   /**
-   * Temporary ⇄ permanent (migration 042). Either direction moves the row
-   * out of the tab it is on (the main tabs exclude temporary rows, the
-   * Temporary tab holds nothing else), so it is dropped locally and the
-   * silent refetch reconciles counts. Editors only — same rule as renaming.
+   * Keep (temporary → permanent, migration 042). Only reachable for a
+   * grandfathered temporary row that surfaces here; the move the other way
+   * is gone (a meeting cannot become temporary — design §3.2). The row is
+   * dropped locally and the silent refetch reconciles counts.
    */
   const handleSetScratch = async (e: React.MouseEvent | null, t: ListRow, scratch: boolean) => {
     e?.stopPropagation();
@@ -1441,24 +1434,17 @@ export function TranscriptTable({
         onSelect: () => setLinkRow(t),
       });
     }
-    if (!placeholder && !waiting && canEditRow(t)) {
-      items.push(
-        scratch
-          ? {
-              key: 'keep',
-              label: 'Keep',
-              hint: 'Make it permanent — moves it to the main list',
-              icon: <Archive />,
-              onSelect: () => handleSetScratch(null, t, false),
-            }
-          : {
-              key: 'temporary',
-              label: 'Move to temporary',
-              hint: 'Out of the main list; trashed automatically after 30 days',
-              icon: <Hourglass />,
-              onSelect: () => handleSetScratch(null, t, true),
-            }
-      );
+    // No "Move to temporary": a meeting cannot become temporary (design
+    // §3.2) — temporary is a recording with an expiry, on /recordings. A
+    // (grandfathered) temporary row reached here still offers Keep.
+    if (scratch && !placeholder && !waiting && canEditRow(t)) {
+      items.push({
+        key: 'keep',
+        label: 'Keep',
+        hint: 'Make it permanent — no more auto-trash',
+        icon: <Archive />,
+        onSelect: () => handleSetScratch(null, t, false),
+      });
     }
     if (t.status === 'error' && !t.assemblyai_id.startsWith('defer-')) {
       items.push({
@@ -1880,8 +1866,6 @@ export function TranscriptTable({
           {tabButton('all', 'All', counts?.all)}
           {tabButton('mine', 'Mine', counts?.mine)}
           {tabButton('shared', 'Shared', counts?.shared)}
-          {tabButton('scratch', 'Temporary', counts?.scratch)}
-          {tabButton('recordings', 'Recordings', unlinked.count)}
           {tabButton('trash', 'Trash', counts?.trash)}
         </div>
       )}
@@ -2183,7 +2167,8 @@ export function TranscriptTable({
   // Day groups with pre-computed headings (server guarantees day ordering —
   // pages append whole days, never splitting one across pages).
   // Bare recordings (no calendar event, no human title — lib/meeting-title)
-  // live in the Recordings tab, not in the meetings timeline. A search still
+  // live on /recordings, not in the meetings timeline (kept for existing rows
+  // until P7 stops them being transcripts rows at all). A search still
   // surfaces them: a filename search must find its file.
   const hideBare = !debouncedQ && (tab === 'all' || tab === 'mine' || tab === 'shared');
   const visibleRows = useCallback(
@@ -2399,12 +2384,6 @@ archiveErrorPanel
             'Trash is empty',
             'Deleted transcripts land here and can be restored or removed forever.'
           )
-        ) : tab === 'scratch' ? (
-          emptyState(
-            <Hourglass className="h-5 w-5 text-muted-foreground" />,
-            'No temporary transcripts',
-            'Tick "Temporary" when uploading a quick one-off. It stays out of the main list and is trashed automatically after 30 days — or keep it to make it permanent.'
-          )
         ) : tab === 'shared' ? (
           emptyState(
             <Inbox className="h-5 w-5 text-muted-foreground" />,
@@ -2596,10 +2575,9 @@ archiveErrorPanel
           </div>
         </div>
       )}
-      {tab !== 'recordings' && hideBare && unlinked.count > 0 && (
-        <button
-          type="button"
-          onClick={() => setTab('recordings')}
+      {hideBare && unlinked.count > 0 && (
+        <Link
+          href="/recordings"
           data-unlinked-banner
           className="mb-3 flex w-full items-center gap-2 rounded-lg border border-dashed px-3 py-2 text-left text-xs text-muted-foreground transition-colors hover:bg-muted/50"
         >
@@ -2608,20 +2586,10 @@ archiveErrorPanel
             {unlinked.count} recording{unlinked.count === 1 ? ' isn’t' : 's aren’t'} linked to a meeting yet
           </span>
           <span className="shrink-0 font-medium text-primary">Recordings ›</span>
-        </button>
+        </Link>
       )}
-      {tab === 'recordings' ? (
-        container(
-          <div className="p-4">
-            <RecordingsSurface data={unlinked} disabled={blocked} onChanged={silentRefetchAll} />
-          </div>
-        )
-      ) : renderMerged ? (
-        mergedBody
-      ) : (
-        archiveBody
-      )}
-      {tab !== 'recordings' && showSentinel && <div ref={sentinelRef} className="h-1" aria-hidden />}
+      {renderMerged ? mergedBody : archiveBody}
+      {showSentinel && <div ref={sentinelRef} className="h-1" aria-hidden />}
       {showLoadingMore && (
         <div className="flex items-center justify-center py-3 text-muted-foreground">
           <RefreshCw className="h-4 w-4 animate-spin" />
@@ -2665,9 +2633,9 @@ archiveErrorPanel
           void fetchArchiveRef.current('silent');
           void refreshLabelCatalog();
         }}
-        // Temporary (migration 042): the Temporary tab offers Keep, the
-        // main tabs Move to temporary; the trash has its own restore flow.
-        scratchAction={tab === 'trash' ? null : tab === 'scratch' ? 'keep' : 'temporary'}
+        // No bulk "Move to temporary" (a meeting cannot become temporary —
+        // design §3.2); Keep lives on /recordings. The trash restores.
+        scratchAction={null}
         onScratchApplied={(result) => {
           // Changed rows leave the tab they were on; the selection would
           // point at rows that are gone, so drop it and reconcile.

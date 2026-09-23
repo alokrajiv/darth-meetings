@@ -5,20 +5,22 @@ import { useRouter } from 'next/navigation';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import {
+  Archive,
   CalendarSearch,
   Check,
   ExternalLink,
+  FilePlus2,
+  Hourglass,
   Laptop,
   Link2,
   Loader2,
-  Pencil,
   RefreshCw,
   Trash2,
   Upload,
   X,
 } from 'lucide-react';
-import { formatBytes, formatDuration, type TranscriptListRow, type TranscriptListV2Response } from '@/lib/format';
-import { isBareRecording, meetingTitleOf, shortWhen } from '@/lib/meeting-title';
+import { formatBytes, formatDuration, scratchTrashDate, type TranscriptListRow } from '@/lib/format';
+import { meetingTitleOf, shortWhen } from '@/lib/meeting-title';
 import { stripForArchiveRow, stripForRecorderRef, type StripActionKind } from '@/lib/recording-strip';
 import type { RecorderMatch, RecorderRecordingRef } from '@/lib/recorder';
 import { recorderRowIsConfident, RECORDING_STALE_MS } from '@/lib/recorder';
@@ -33,18 +35,21 @@ import { OFFLINE_TITLE } from '@/lib/offline/offline-types';
 import { isNetworkFailure, offlineAwareError } from '@/lib/offline/offline-fetch';
 
 /**
- * The Recordings tab (docs/listing-ui-redesign.md §6): recordings that
- * belong to no meeting yet.
+ * The Recordings surface (docs/recordings-meetings-series-design.md §3.1):
+ * the caller's OWN recordings that belong to no meeting. Its own page,
+ * `/recordings`, a sibling of Meetings and Series in the top nav — a
+ * recording is not a kind of meeting row.
  *
- *  1. On your Macs — the caller's own Darth Recorder registry rows that
- *     are not uploaded (GET /api/recorder/recordings?mine=1).
- *  2. Uploaded, not linked to a meeting — archive rows that are BARE
- *     (no calendar event, no human title — lib/meeting-title).
+ *  1. On your Macs — own Darth Recorder registry rows not uploaded yet.
+ *  2. Uploaded, not in a meeting — own uploads with no calendar event and
+ *     no human title (lib/meeting-title `isBareRecording`).
+ *  3. Temporary — own temporary uploads (migration 042), with their expiry.
  *
- * Linking or naming a recording promotes it into the archive; it leaves
- * this tab on the next refresh. Under the first-class model (D-B) section 2
- * reads `recordings` with no segment instead of filtering transcripts —
- * the cards stay the same.
+ * All three come from ONE owner-scoped endpoint, `GET /api/recordings
+ * ?mine=1` (lib/server/own-recordings, P6) — the same halves the old tab
+ * fetched for itself, re-routed. Link to meeting… / Make a meeting / Keep
+ * move a recording out of here; under the first-class model (P7) sections
+ * 2–3 read `recordings` rows instead and the cards stay the same.
  */
 
 /** Own-registry row as /api/recorder/recordings?mine=1 serves it
@@ -78,10 +83,20 @@ export interface UnlinkedRecordings {
   registry: OwnRecorderRecording[];
   /** Registry rows still on a Mac and not represented by a bare row. */
   onMac: OwnRecorderRecording[];
+  /** Own temporary uploads — only when the hook was asked for them. */
+  temporary: TranscriptListRow[];
   loading: boolean;
   error: string | null;
+  /** Sections 1 + 2: what "N recordings aren't linked to a meeting yet" counts. */
   count: number;
   refresh: () => void;
+}
+
+/** GET /api/recordings?mine=1 (lib/server/own-recordings OwnRecordingsResponse). */
+interface OwnRecordingsWire {
+  registry?: OwnRecorderRecording[];
+  unlinked?: TranscriptListRow[];
+  temporary?: TranscriptListRow[];
 }
 
 function segmentCount(segments: unknown): number | null {
@@ -89,14 +104,22 @@ function segmentCount(segments: unknown): number | null {
 }
 
 /**
- * Fetches both halves once, on demand, and folds them: a registry row that
- * already has a bare archive row (via `transcript_id` or the row's
- * `recorder_recording_id`) is one recording, not two.
+ * Fetches the caller's own recordings once, on demand, and folds them: a
+ * registry row that already has a bare archive row (via `transcript_id` or
+ * the row's `recorder_recording_id`) is one recording, not two.
+ * `temporary: true` asks for section 3 as well (the Recordings page); the
+ * Meetings listing only needs the unlinked count.
  */
-export function useUnlinkedRecordings(opts: { enabled: boolean; refreshKey: number; tz: string }): UnlinkedRecordings {
-  const { enabled, refreshKey, tz } = opts;
+export function useUnlinkedRecordings(opts: {
+  enabled: boolean;
+  refreshKey: number;
+  tz: string;
+  temporary?: boolean;
+}): UnlinkedRecordings {
+  const { enabled, refreshKey, tz, temporary: withTemporary = false } = opts;
   const [bare, setBare] = useState<TranscriptListRow[]>([]);
   const [registry, setRegistry] = useState<OwnRecorderRecording[]>([]);
+  const [temporary, setTemporary] = useState<TranscriptListRow[]>([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [nonce, setNonce] = useState(0);
@@ -113,22 +136,18 @@ export function useUnlinkedRecordings(opts: { enabled: boolean; refreshKey: numb
     const gen = ++genRef.current;
     let live = true;
     setLoading(true);
-    const params = new URLSearchParams({ v: '2', tab: 'mine', tz, days: '60', minRows: '200' });
-    void Promise.all([
-      fetch(`/api/transcripts?${params.toString()}`, { credentials: 'include' }).then(async (res) => {
+    const params = new URLSearchParams({ mine: '1', unlinked: '1', tz });
+    if (withTemporary) params.set('temporary', '1');
+    fetch(`/api/recordings?${params.toString()}`, { credentials: 'include' })
+      .then(async (res) => {
         if (!res.ok) throw await offlineAwareError(res, `Failed to load recordings (${res.status})`);
-        return (await res.json()) as TranscriptListV2Response;
-      }),
-      fetch('/api/recorder/recordings?mine=1', { credentials: 'include' }).then(async (res) => {
-        // The registry is optional: a user without a recorder simply has none.
-        if (!res.ok) return { recordings: [] as OwnRecorderRecording[] };
-        return (await res.json()) as { recordings: OwnRecorderRecording[] };
-      }),
-    ])
-      .then(([list, reg]) => {
+        return (await res.json()) as OwnRecordingsWire;
+      })
+      .then((data) => {
         if (!live || gen !== genRef.current) return;
-        setBare(list.days.flatMap((d) => d.rows).filter((r) => isBareRecording(r)));
-        setRegistry(reg.recordings.filter((r) => r.status !== 'deleted'));
+        setBare(data.unlinked ?? []);
+        setRegistry((data.registry ?? []).filter((r) => r.status !== 'deleted'));
+        setTemporary(data.temporary ?? []);
         setError(null);
       })
       .catch((err: unknown) => {
@@ -141,7 +160,7 @@ export function useUnlinkedRecordings(opts: { enabled: boolean; refreshKey: numb
     return () => {
       live = false;
     };
-  }, [enabled, refreshKey, nonce, evKey, tz]);
+  }, [enabled, refreshKey, nonce, evKey, tz, withTemporary]);
 
   const onMac = useMemo(() => {
     const byTranscript = new Set(bare.map((b) => b.assemblyai_id));
@@ -158,6 +177,7 @@ export function useUnlinkedRecordings(opts: { enabled: boolean; refreshKey: numb
     bare,
     registry,
     onMac,
+    temporary,
     loading,
     error,
     count: bare.length + onMac.length,
@@ -175,7 +195,7 @@ export interface RecordingsSurfaceProps {
 }
 
 export function RecordingsSurface({ data, disabled = false, onChanged }: RecordingsSurfaceProps) {
-  const { bare, registry, onMac, loading, error, refresh } = data;
+  const { bare, registry, onMac, temporary, loading, error, refresh } = data;
   const companion = useCompanion();
   const tray = useCompanionRecordings(companion.connected);
   const trayIds = useMemo(() => new Set(tray.recordings.map((r) => r.id)), [tray.recordings]);
@@ -187,7 +207,8 @@ export function RecordingsSurface({ data, disabled = false, onChanged }: Recordi
     onChanged?.();
   }, [refresh, onChanged]);
 
-  const empty = !loading && !error && bare.length === 0 && onMac.length === 0;
+  const nothing = bare.length === 0 && onMac.length === 0 && temporary.length === 0;
+  const empty = !loading && !error && nothing;
 
   return (
     <div className="space-y-6" data-recordings-surface>
@@ -199,7 +220,7 @@ export function RecordingsSurface({ data, disabled = false, onChanged }: Recordi
           </Button>
         </div>
       )}
-      {loading && bare.length === 0 && onMac.length === 0 && !error && (
+      {loading && nothing && !error && (
         <div className="flex items-center justify-center py-16 text-muted-foreground">
           <RefreshCw className="h-5 w-5 animate-spin" />
         </div>
@@ -209,10 +230,11 @@ export function RecordingsSurface({ data, disabled = false, onChanged }: Recordi
           <div className="grid h-10 w-10 place-items-center rounded-lg bg-muted">
             <Laptop className="h-5 w-5 text-muted-foreground" />
           </div>
-          <p className="mt-3 text-sm font-medium">Nothing waiting here</p>
+          <p className="mt-3 text-sm font-medium">No recordings outside a meeting</p>
           <p className="mt-1 max-w-md text-xs text-muted-foreground">
-            A recording is yours and stays yours. When one looks like a meeting in your calendar it
-            says so here and you decide — nothing is linked or shared on a match alone.
+            Recordings are yours alone — nobody else sees them. A new upload waits here until you
+            link it to a meeting or make a meeting of it; when one looks like a meeting in your
+            calendar it says so and you decide. Nothing is linked or shared on a match alone.
           </p>
         </div>
       )}
@@ -248,9 +270,9 @@ export function RecordingsSurface({ data, disabled = false, onChanged }: Recordi
       {bare.length > 0 && (
         <section>
           <SectionHeading
-            title="Uploaded, not linked to a meeting"
+            title="Uploaded, not in a meeting"
             count={bare.length}
-            sub="Link the calendar event or give it a name — it then moves into the meetings list"
+            sub="Link it to a meeting, or make a meeting of it — only then can it be shared"
           />
           <div className="grid gap-2 md:grid-cols-2">
             {bare.map((row) => (
@@ -263,6 +285,30 @@ export function RecordingsSurface({ data, disabled = false, onChanged }: Recordi
                     ? companion.uploads[row.recorder_recording_id]
                     : null
                 }
+                disabled={disabled}
+                onLink={() => setLinkFor({ id: row.assemblyai_id, dateIso: row.recorded_at ?? row.created_at })}
+                onChanged={changed}
+              />
+            ))}
+          </div>
+        </section>
+      )}
+
+      {temporary.length > 0 && (
+        <section id="temporary" data-recordings-temporary>
+          <SectionHeading
+            title="Temporary"
+            count={temporary.length}
+            sub="Trashed automatically 30 days after upload — keep it, link it or make a meeting of it to hold on to it"
+          />
+          <div className="grid gap-2 md:grid-cols-2">
+            {temporary.map((row) => (
+              <BareCard
+                key={row.assemblyai_id}
+                row={row}
+                temporary
+                reg={row.recorder_recording_id ? registryById.get(row.recorder_recording_id) ?? null : null}
+                live={null}
                 disabled={disabled}
                 onLink={() => setLinkFor({ id: row.assemblyai_id, dateIso: row.recorded_at ?? row.created_at })}
                 onChanged={changed}
@@ -298,17 +344,17 @@ function SectionHeading({ title, count, sub }: { title: string; count: number; s
   );
 }
 
-/** "Looks like Data scrum · 14:00 · 82 %" — the matcher's best guess, shown
- * only when it is a confident one, and only ever to the owner. */
+/** "Looks like Data scrum · 14:00" — the matcher's best guess, shown only
+ * when it is a confident one, and only ever to the owner. No raw score: a
+ * number invites reading a weak match as "82 % sure" (design §3.1, F3). */
 function MatchHint({ m, onLink, busy }: { m: RecorderMatch | null; onLink?: () => void; busy?: boolean }) {
   if (!m || !m.title) return null;
   const when = new Date(m.occ_start).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
-  const pct = Math.round((m.score ?? 0) * 100);
   return (
     <div className="flex min-w-0 items-center gap-1.5 text-[11px] text-muted-foreground" data-match-hint>
       <CalendarSearch className="h-3 w-3 shrink-0" />
       <span className="min-w-0 truncate">
-        Looks like <span className="text-foreground/80">{m.title}</span> · {when} · {pct}%
+        Looks like <span className="text-foreground/80">{m.title}</span> · {when}
       </span>
       {onLink && (
         <button
@@ -441,8 +487,23 @@ function MacCard({
 
 // ---------------------------------------------------------------------------
 
+/** "expires in 12 days" / "expires today" for a temporary upload. */
+export function expiresInCopy(createdAt: string, now: number = Date.now()): string {
+  const ms = scratchTrashDate(createdAt).getTime() - now;
+  const days = Math.ceil(ms / 86_400_000);
+  if (days <= 0) return 'expires today';
+  return `expires in ${days} day${days === 1 ? '' : 's'}`;
+}
+
+/**
+ * One uploaded recording that is in no meeting — section 2, or section 3
+ * with `temporary`. Actions (design §3.1): Link to meeting… · Make a meeting
+ * (Q5: a name on a recording makes a standalone meeting) · Keep (temporary
+ * only: drops the expiry, it stays a recording) · Open · Delete.
+ */
 function BareCard({
   row,
+  temporary = false,
   reg,
   live,
   disabled,
@@ -450,6 +511,8 @@ function BareCard({
   onChanged,
 }: {
   row: TranscriptListRow;
+  /** A temporary upload (migration 042): shows its expiry and offers Keep. */
+  temporary?: boolean;
   reg: OwnRecorderRecording | null;
   live: { pct: number; bytesSent: number | null; bytesTotal: number | null } | null;
   disabled: boolean;
@@ -459,7 +522,7 @@ function BareCard({
   const router = useRouter();
   const [renaming, setRenaming] = useState(false);
   const [name, setName] = useState('');
-  const [busy, setBusy] = useState<'name' | 'link' | 'trash' | 'retry' | null>(null);
+  const [busy, setBusy] = useState<'name' | 'link' | 'trash' | 'retry' | 'keep' | null>(null);
   const [err, setErr] = useState<string | null>(null);
   const placeholder = row.status === 'uploading' || row.assemblyai_id.startsWith('defer-');
   const { primary, filename } = meetingTitleOf(row);
@@ -498,13 +561,27 @@ function BareCard({
     run('name', async () => {
       const t = name.trim();
       if (!t) return;
+      // A named recording IS a meeting (Q5). A temporary one stops being
+      // temporary in the same write — a meeting cannot be temporary (§3.2).
       const res = await fetch(`/api/transcripts/${row.assemblyai_id}`, {
         method: 'PATCH',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ title: t }),
+        body: JSON.stringify(temporary ? { title: t, scratch: false } : { title: t }),
       });
-      if (!res.ok) throw new Error((await res.text().catch(() => '')) || `Rename failed (${res.status})`);
+      if (!res.ok) throw new Error((await res.text().catch(() => '')) || `Could not make the meeting (${res.status})`);
       setRenaming(false);
+      onChanged();
+    });
+  const keep = () =>
+    run('keep', async () => {
+      // Keep (Q6): the expiry goes; it stays a recording (and lands in
+      // "Uploaded, not in a meeting" unless it already has a title).
+      const res = await fetch(`/api/transcripts/${row.assemblyai_id}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ scratch: false }),
+      });
+      if (!res.ok) throw new Error((await res.text().catch(() => '')) || `Keep failed (${res.status})`);
       onChanged();
     });
   const linkSuggested = () =>
@@ -541,9 +618,20 @@ function BareCard({
 
   const iconBtn = 'h-7 gap-1 px-2 text-xs';
   return (
-    <div className={cardCls()} data-recording-card="bare" data-status={row.status} data-row-id={row.assemblyai_id}>
+    <div
+      className={cardCls()}
+      data-recording-card={temporary ? 'temporary' : 'bare'}
+      data-status={row.status}
+      data-row-id={row.assemblyai_id}
+    >
       <div className="flex min-w-0 items-start gap-2">
-        <SourceGlyph source={source} className="mt-1 h-3.5 w-3.5" title={filename ?? undefined} />
+        {temporary ? (
+          <span title={filename ?? undefined} className="mt-1 shrink-0">
+            <Hourglass className="h-3.5 w-3.5 text-amber-600 dark:text-amber-500" aria-label="Temporary" />
+          </span>
+        ) : (
+          <SourceGlyph source={source} className="mt-1 h-3.5 w-3.5" title={filename ?? undefined} />
+        )}
         <div className="min-w-0 flex-1">
           {renaming ? (
             <form
@@ -560,7 +648,7 @@ function BareCard({
                 onKeyDown={(e) => {
                   if (e.key === 'Escape') setRenaming(false);
                 }}
-                placeholder="Name this meeting"
+                placeholder="Meeting title"
                 className="h-7 text-sm"
                 data-rename-input
               />
@@ -582,6 +670,7 @@ function BareCard({
                 new Date(row.recorded_at ?? row.created_at).toLocaleString([], { dateStyle: 'medium', timeStyle: 'short' }),
                 (row.recording_count ?? 1) > 1 ? `${row.recording_count} ${source === 'mac' ? 'segments' : 'parts'}` : null,
                 reg?.bytes ? formatBytes(reg.bytes) : null,
+                temporary ? expiresInCopy(row.created_at) : null,
               ]
                 .filter(Boolean)
                 .join(' · ')}
@@ -602,9 +691,17 @@ function BareCard({
       />
       {err && <p className="text-[11px] text-destructive">{err}</p>}
       <div className="flex flex-wrap items-center gap-1 pt-0.5">
-        <Button size="sm" variant="outline" className={iconBtn} disabled={disabled || placeholder} onClick={onLink} data-link-meeting>
+        <Button
+          size="sm"
+          variant="outline"
+          className={iconBtn}
+          disabled={disabled || placeholder}
+          onClick={onLink}
+          title="Link it to a calendar event — the meeting takes the invite's title, date and people"
+          data-link-meeting
+        >
           <Link2 className="h-3.5 w-3.5" />
-          Link to a meeting…
+          Link to meeting…
         </Button>
         <Button
           size="sm"
@@ -615,11 +712,26 @@ function BareCard({
             setName(row.title && !filename?.startsWith(row.title) ? row.title : '');
             setRenaming(true);
           }}
+          title="Give it a title and it becomes a meeting of its own — then it can be shared"
           data-name-meeting
         >
-          <Pencil className="h-3.5 w-3.5" />
-          Name…
+          <FilePlus2 className="h-3.5 w-3.5" />
+          Make a meeting
         </Button>
+        {temporary && (
+          <Button
+            size="sm"
+            variant="outline"
+            className={iconBtn}
+            disabled={disabled || placeholder || busy === 'keep'}
+            onClick={keep}
+            title="Keep it — no expiry; it stays one of your recordings"
+            data-keep-recording
+          >
+            {busy === 'keep' ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Archive className="h-3.5 w-3.5" />}
+            Keep
+          </Button>
+        )}
         {!placeholder && (
           <Button size="sm" variant="ghost" className={iconBtn} onClick={() => router.push(`/transcript/${row.assemblyai_id}`)}>
             <ExternalLink className="h-3.5 w-3.5" />

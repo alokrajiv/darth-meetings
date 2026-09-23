@@ -8,6 +8,7 @@ import { ThemeToggle } from '@/components/theme-toggle';
 import { OfflineChip } from '@/components/offline-chip';
 import { RecorderChip } from '@/components/recorder-chip';
 import { OFFLINE_TITLE, useOfflineGate } from '@/lib/offline/offline-context';
+import { APP_NAV, navItemActive } from '@/lib/app-nav';
 
 interface AppHeaderProps {
   /** Right-aligned actions slot. */
@@ -22,47 +23,60 @@ interface AppHeaderProps {
  */
 export function AppHeader({ children, breadcrumb }: AppHeaderProps) {
   const pathname = usePathname();
-  // The series index needs the server; the Meetings listing and the brand
-  // link stay live (cached shell → offline archive).
   const { blocked } = useOfflineGate();
   return (
     <header className="sticky top-0 z-40 h-14 border-b bg-background/85 backdrop-blur">
-      <div className="mx-auto flex h-14 max-w-[1720px] items-center gap-3 px-6">
-        <Link href="/" className="flex shrink-0 items-center gap-2">
+      <div className="mx-auto flex h-14 max-w-[1720px] items-center gap-2 px-4 sm:gap-3 sm:px-6">
+        {/* Phone with the nav showing: the mark goes (the nav's Meetings is
+            the same link) — the three-way control is the width budget. */}
+        <Link href="/" className={`${breadcrumb ? 'flex' : 'hidden sm:flex'} shrink-0 items-center gap-2`}>
           <span className="grid h-7 w-7 place-items-center rounded-md bg-primary text-primary-foreground">
             <AudioLines className="h-4 w-4" />
           </span>
           <span className="hidden text-sm font-semibold tracking-tight sm:inline">Darth Meetings</span>
         </Link>
         {!breadcrumb && (
-          <nav className="flex items-center gap-1 text-sm">
-            {[
-              { href: '/', label: 'Meetings' },
-              { href: '/series', label: 'Series' },
-            ].map((l) =>
-              l.href === '/series' && blocked ? (
-                <span
+          // Meetings · Recordings · Series (docs/recordings-meetings-series-
+          // design.md §3, Q11) — three sibling surfaces. Phone width: a
+          // segmented control; wider: plain links. Recordings and Series
+          // need the server; Meetings stays live offline (cached shell →
+          // offline archive).
+          <nav
+            aria-label="Sections"
+            data-app-nav
+            className="flex items-center gap-0.5 rounded-lg bg-muted p-0.5 text-[13px] sm:gap-1 sm:bg-transparent sm:p-0 sm:text-sm"
+          >
+            {APP_NAV.map((l) => {
+              const active = navItemActive(l, pathname);
+              const base = 'rounded-md px-2 py-1 transition-colors';
+              if (l.needsServer && blocked) {
+                return (
+                  <span
+                    key={l.href}
+                    aria-disabled="true"
+                    title={OFFLINE_TITLE}
+                    className={`${base} cursor-not-allowed text-muted-foreground/50`}
+                  >
+                    {l.label}
+                  </span>
+                );
+              }
+              return (
+                <Link
                   key={l.href}
-                  aria-disabled="true"
-                  title={OFFLINE_TITLE}
-                  className="rounded-md px-2 py-1 text-muted-foreground/50 cursor-not-allowed"
+                  href={l.href}
+                  aria-current={active ? 'page' : undefined}
+                  data-nav={l.key}
+                  className={`${base} ${
+                    active
+                      ? 'bg-background font-medium text-foreground shadow-sm sm:bg-muted sm:shadow-none'
+                      : 'text-muted-foreground hover:text-foreground'
+                  }`}
                 >
                   {l.label}
-                </span>
-              ) : (
-              <Link
-                key={l.href}
-                href={l.href}
-                className={`rounded-md px-2 py-1 transition-colors ${
-                  pathname === l.href
-                    ? 'bg-muted font-medium text-foreground'
-                    : 'text-muted-foreground hover:text-foreground'
-                }`}
-              >
-                {l.label}
-              </Link>
-              )
-            )}
+                </Link>
+              );
+            })}
           </nav>
         )}
         {breadcrumb && (

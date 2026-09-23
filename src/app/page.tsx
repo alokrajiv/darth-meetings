@@ -2,6 +2,8 @@
 
 import { useEffect, useRef, useState } from 'react';
 import Link from 'next/link';
+import { useRouter } from 'next/navigation';
+import { legacyTabRedirect } from '@/lib/app-nav';
 import { TranscriptTable } from '@/components/transcript-table';
 import { AudioUpload, requestMediaUpload } from '@/components/audio-upload';
 import { getGoogleAccessToken } from '@/lib/google-token';
@@ -49,6 +51,11 @@ function readLabelFilterFromUrl(): LabelFilter | null {
 
 
 export default function Home() {
+  const router = useRouter();
+  useEffect(() => {
+    const to = legacyTabRedirect(window.location.search);
+    if (to) router.replace(to);
+  }, [router]);
   // Offline mode swaps the network-backed listing for the on-device archive
   // and hides every control that needs the server (upload, import, reminders).
   // `ready` = the provider restored the mode from this device; until then
