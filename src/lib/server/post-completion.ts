@@ -52,6 +52,12 @@ export function onTranscriptCompleted(
      * second "ready" DM for a meeting that has been transcribed twice.
      */
     transcriptionId?: string | null;
+    /**
+     * Design P7: the meeting was just MADE from a standalone recording (Link /
+     * Make a meeting). The recording already sent the one "transcribed" DM it
+     * gets; making a meeting sends none (risk §6.1: never twice).
+     */
+    silent?: boolean;
   }
 ): void {
   setTimeout(() => {
@@ -156,7 +162,7 @@ export function onTranscriptCompleted(
         // owner it's done so they can close the tab and come back on the
         // DM. Auto paths have their own needs_review / report_ready DMs.
         // plagueis dedupes on the key, so re-entering this hook is safe.
-        if (!autoMarkerOf(full.gmeet_context)) {
+        if (!autoMarkerOf(full.gmeet_context) && !observed?.silent) {
           await notifyTranscriptReady(ownerUserId, full, observed?.transcriptionId).catch((err) =>
             console.warn('[post-completion] ready DM failed:', err)
           );

@@ -25,6 +25,17 @@ import type { DarthUser } from '@/lib/auth/session';
 import type { SpeechModel } from '@/lib/aai-language';
 import type { ReportPref } from '@/lib/report-pref';
 import type { AttachToMarker } from '@/lib/clips';
+import {
+  BORN_BARE_PREFIX,
+  abandonBornBare,
+  bornBareEnabled,
+  bornBareFlagOn,
+  bornBareWire,
+  finalizeBornBare,
+  openBornBare,
+  type BornBareTranscriptWire,
+} from '@/lib/server/born-bare';
+import { findStandaloneGroup } from '@/db-ops/standalone-recordings';
 
 /**
  * The media-upload pipeline shared by the two byte-delivery routes:
@@ -363,6 +374,14 @@ export interface UploadSpec {
    * placeholder this marker was stamped on has been reaped — keeps it.
    */
   attachTo?: AttachToMarker | null;
+  /**
+   * Design P7 (`MW_RECORDINGS_BORN_BARE`): these bytes are becoming a
+   * STANDALONE recording — no meeting row exists or will be created by the
+   * upload. `placeholderId` is then `rec-<recordingId>`, and every stage
+   * dispatches to lib/server/born-bare.ts. Absent = a meeting-born upload,
+   * exactly as before.
+   */
+  bornBare?: { recordingId: string } | null;
 }
 
 /**
@@ -520,10 +539,60 @@ async function stampGroupIdentity(
 }
 
 export type OpenUploadResult =
-  | { ok: true; spec: UploadSpec; placeholder: StoredTranscript }
+  | { ok: true; spec: UploadSpec; placeholder: StoredTranscript | BornBareTranscriptWire }
   | { ok: false; status: number; error: string };
 
-function buildGmeetContext(
+/**
+ * Design P7: does this upload name a meeting? Only an upload that names NONE
+ * — no linked event, no meeting to attach to, not a re-run of an existing
+ * meeting, no provenance to stamp on one — is born a recording.
+ */
+export function namesNoMeeting(input: OpenUploadInput): boolean {
+  return !input.linkedEvent && !input.attachTo && !input.sourceId && !input.contextExtra;
+}
+
+async function openBornBareUpload(
+  user: DarthUser,
+  input: OpenUploadInput,
+  languageCode: string | undefined
+): Promise<OpenUploadResult> {
+  const multi = input.multi ?? null;
+  const opened = await openBornBare(user, {
+    uuid: input.uuid ?? crypto.randomUUID(),
+    originalFilename: input.originalFilename,
+    languageCode,
+    speechModel: input.speechModel,
+    bytesTotal: input.bytesTotal,
+    scratch: !!input.scratch,
+    recorderRecordingId: input.recorderRecordingId ?? null,
+    recorderBirth: input.recorderBirth ?? null,
+    multi,
+  });
+  if (!opened.ok) return opened;
+  return {
+    ok: true,
+    placeholder: bornBareWire(opened.recording, 'uploading'),
+    spec: {
+      placeholderId: `${BORN_BARE_PREFIX}${opened.recordingId}`,
+      tempFilename: opened.tempFilename,
+      originalFilename: input.originalFilename,
+      languageCode,
+      linkedEvent: null,
+      reportPref: null,
+      sourceId: null,
+      multi,
+      speechModel: input.speechModel,
+      recorderRecordingId: input.recorderRecordingId ?? null,
+      scratch: !!opened.recording.expires_at,
+      dupAware: input.dupAware,
+      tracks: input.tracks ?? null,
+      attachTo: null,
+      bornBare: { recordingId: opened.recordingId },
+    },
+  };
+}
+
+export function buildGmeetContext(
   linkedEvent: LinkedEventInput | null,
   reportPref: ReportPref | null
 ): { gmeetContext: GmeetContext | null; attendees: GmeetAttendee[]; attendeeNames: string[] } {
@@ -584,6 +653,18 @@ export async function openUpload(
     if (!access) return { ok: false, status: 404, error: 'Source transcript not found' };
     sourceRow = access.row;
     languageCode = languageCode ?? sourceRow.language_code ?? undefined;
+  }
+
+  // Design P7: an upload that names no meeting is born a RECORDING. Parts
+  // 2..N follow whatever part 1 became — a group that opened as a recording
+  // is found among the caller's recordings, whatever this part carries.
+  if (multi && multi.index > 1) {
+    if (bornBareFlagOn() && (await bornBareEnabled())) {
+      const bare = await findStandaloneGroup(user.userId, multi.group).catch(() => null);
+      if (bare) return openBornBareUpload(user, input, languageCode);
+    }
+  } else if (namesNoMeeting(input) && (await bornBareEnabled())) {
+    return openBornBareUpload(user, input, languageCode);
   }
 
   if (multi && multi.index > 1) {
@@ -752,6 +833,10 @@ export async function openUpload(
 
 /** Delete what `openUpload` created when the bytes never (fully) arrived. */
 export async function abandonUpload(user: DarthUser, spec: UploadSpec): Promise<void> {
+  if (spec.bornBare) {
+    await abandonBornBare(user, spec.bornBare.recordingId, spec.tempFilename, spec.multi?.index ?? null);
+    return;
+  }
   if (spec.multi && spec.multi.index > 1) {
     await deleteAudioFile(spec.tempFilename);
     return;
@@ -762,7 +847,9 @@ export async function abandonUpload(user: DarthUser, spec: UploadSpec): Promise<
 
 export interface FinalizeResult {
   status: number;
-  body: { transcript: StoredTranscript } | { error: string; detail?: string };
+  body:
+    | { transcript: StoredTranscript | BornBareTranscriptWire }
+    | { error: string; detail?: string };
 }
 
 /** What the byte-delivery route already knows about these bytes. */
@@ -798,6 +885,24 @@ export async function finalizeUpload(
 ): Promise<FinalizeResult> {
   const { placeholderId, tempFilename, multi } = spec;
   const partHash = normalizeSha256(hashes.part);
+
+  // Design P7: a born-bare upload's tail is its own — no meeting row to
+  // stitch onto or promote (lib/server/born-bare.ts). `fromBlob` never
+  // reaches here for one (`planBlobIngest` refuses it).
+  if (spec.bornBare) {
+    return finalizeBornBare(
+      user,
+      {
+        recordingId: spec.bornBare.recordingId,
+        tempFilename,
+        originalFilename: spec.originalFilename,
+        multi,
+        recorderRecordingId: spec.recorderRecordingId ?? null,
+      },
+      bytes,
+      partHash
+    );
+  }
 
   if (multi && multi.index > 1) {
     const groupRow = await findUploadGroupRow(user.userId, multi.group);

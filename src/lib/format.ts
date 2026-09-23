@@ -296,6 +296,15 @@ export interface GmeetContext {
    * single delete succeeds. Absent = the job may or may not still be there;
    * we simply never rely on it. */
   aai?: { deletedAt: string; jobId: string } | null;
+  /**
+   * Design P7: this meeting was MADE from one of its owner's standalone
+   * recordings (Link to meeting / Make a meeting — `POST
+   * /api/recordings/:id/link|make-meeting`). Its text is that recording's
+   * transcription, verbatim; its `local_audio_path` is that recording's file,
+   * which stays the recording's (a permanent delete of the meeting never
+   * removes it — the recording goes back to its owner's Recordings).
+   */
+  fromRecording?: { recordingId: string; at: string; how: 'link' | 'make-meeting' } | null;
   /** Microsoft Teams source facts (provider === 'teams'). Artifacts are
    * fetched app-only under the ORGANIZER's AAD id — no per-user Microsoft
    * auth exists. `callId` keys the specific occurrence of a recurring

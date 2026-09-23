@@ -236,6 +236,9 @@ export async function planBlobIngest(
   session: { placeholder_id: string; sha256: string | null; size: number; spec: UploadSpec }
 ): Promise<BlobIngestPlanResult> {
   if (!aaiFromBlobFlagOn()) return { ok: false, reason: `${AAI_FROM_BLOB_FLAG_ENV} is off` };
+  // Design P7: a born-bare upload has no meeting row to promote — it takes
+  // the pull path and its own hand-off (lib/server/born-bare.ts).
+  if (session.spec.bornBare) return { ok: false, reason: 'a born-bare recording (pull path)' };
   // The archive flag too: the background fetch may faststart-remux the file
   // and must then be allowed to replace the blob, otherwise a remuxed video
   // would keep its pre-remux bytes in blob for good.

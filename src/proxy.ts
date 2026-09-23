@@ -104,6 +104,18 @@ export async function proxy(request: NextRequest) {
     return NextResponse.next();
   }
 
+  // Design P7: an upload born as a RECORDING answers with the pseudo meeting
+  // id `rec-<recording id>`, and the Darth Recorder tray (and an older
+  // darth-cli) open `/transcript/<that>`. It is a recording, not a meeting:
+  // send them to its page. The page and its API are owner-only, so the
+  // redirect says nothing a 404 would not.
+  const recPage = /^\/transcript\/rec-([0-9a-fA-F-]{36})\/?$/.exec(pathname);
+  if (recPage) {
+    const url = request.nextUrl.clone();
+    url.pathname = `/recording/${recPage[1]!.toLowerCase()}`;
+    return NextResponse.redirect(url, 307);
+  }
+
   // 1. Bearer (darth-cli dth_ / app dapp_) beats the cookie; an invalid token
   //    is a hard 401 and never falls through to cookie auth.
   const bearer = getDarthBearer(request.headers.get('authorization'));

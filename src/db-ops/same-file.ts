@@ -114,7 +114,11 @@ export async function findOwnRecordingBySha256(
     ORDER BY (t.deleted_at IS NULL) DESC, t.created_at, t.id
     LIMIT 1
   `;
-  const row = rows[0];
+  // Design P7: a STANDALONE recording (born by an unlinked upload) has no
+  // meeting to answer with. Its pseudo id `rec-<id>` is what the upload
+  // routes answered for it, so the tray marks it uploaded and "Open" lands on
+  // the recording's page. Same owner predicate; asked only once 049 exists.
+  const row = rows[0] ?? (await findOwnStandaloneBySha256(ownerUserId, sha256));
   if (!row) return null;
   return {
     meetingId: row.meeting_id,
@@ -124,4 +128,28 @@ export async function findOwnRecordingBySha256(
     durationSec: row.duration == null ? null : Number(row.duration),
     trashed: row.trashed,
   };
+}
+
+async function findOwnStandaloneBySha256(ownerUserId: string, sha256: string): Promise<MatchRow | null> {
+  const { standaloneColumnsExist } = await import('@/db-ops/standalone-recordings');
+  if (!(await standaloneColumnsExist().catch(() => false))) return null;
+  const rows = await sql<MatchRow[]>`
+    SELECT 'rec-' || r.id::text AS meeting_id,
+           r.title,
+           COALESCE(r.started_at, r.created_at) AS happened_at,
+           CASE WHEN rt.status = 'completed' THEN 'completed' ELSE 'processing' END AS status,
+           (r.duration_ms / 1000.0)::float8 AS duration,
+           false AS trashed
+    FROM ${sql(SCHEMA)}.recordings r
+    LEFT JOIN ${sql(SCHEMA)}.recording_transcriptions rt ON rt.id = r.active_transcription_id
+    WHERE r.owner_user_id = ${ownerUserId}
+      AND r.sha256 = ${sha256}
+      AND r.standalone
+      AND r.deleted_at IS NULL
+      AND r.active_transcription_id IS NOT NULL
+      AND (rt.id IS NULL OR rt.status <> 'error')
+    ORDER BY r.created_at
+    LIMIT 1
+  `;
+  return rows[0] ?? null;
 }

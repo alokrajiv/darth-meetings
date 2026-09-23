@@ -28,6 +28,8 @@ import { blobTransitFor, mintBlobTicket } from '@/lib/server/darth-uploads-store
 import { uploadIdentityHash, wantsDuplicateAnswer, wantsForce } from '@/lib/same-file';
 import { duplicateForUpload } from '@/lib/server/same-file';
 import { resolveAttachTarget } from '@/lib/server/clip-attach';
+import { bornBareWire, recordingIdFromPseudo } from '@/lib/server/born-bare';
+import { getStandaloneForOwner } from '@/db-ops/standalone-recordings';
 import { parseAttachTo, type AttachToMarker } from '@/lib/clips';
 
 export const runtime = 'nodejs';
@@ -277,14 +279,21 @@ export const POST = withAuth(async ({ user, request }) => {
     // A blob session has no temp file until the pull; a chunk session's
     // temp file is its ground truth.
     const fileBytes = isBlob ? 0 : await audioFileSize(existing.temp_filename);
-    const placeholder = await getForUser(user.userId, existing.placeholder_id);
+    // Design P7: a born-bare session's "placeholder" is `rec-<recording id>`
+    // — alive while that recording of the caller's is still waiting for its
+    // bytes (no transcription, no kept failure).
+    const bareId = recordingIdFromPseudo(existing.placeholder_id);
+    const bare = bareId ? await getStandaloneForOwner(user.userId, bareId).catch(() => null) : null;
+    const meetingRow = bareId ? null : await getForUser(user.userId, existing.placeholder_id);
+    const placeholder = bare ? bornBareWire(bare, 'uploading') : meetingRow;
+    const placeholderAlive = bareId
+      ? !!bare && !bare.active_transcription_id && !bare.upload_state?.ingestFailure
+      : meetingRow !== null && meetingRow.status === 'uploading' && meetingRow.deleted_at == null;
     const blobStore = isBlob ? blobTransitFor(existing.size) : null;
     const alive =
       existing.size === size &&
       fileBytes !== null &&
-      placeholder !== null &&
-      placeholder.status === 'uploading' &&
-      placeholder.deleted_at == null &&
+      placeholderAlive &&
       // A blob session on a host that lost its store config cannot continue.
       (!isBlob || (blobStore !== null && existing.sha256 === sha256));
     if (alive) {

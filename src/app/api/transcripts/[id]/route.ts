@@ -339,10 +339,17 @@ export const DELETE = withAuth(async ({ user, request }, { params }) => {
   // recording out from under a meeting that is still there — trashed ones
   // included, because restoring must find its audio. The files go only when
   // the RECORDING went with the clips (lib/clips.ts `mayDeleteRecordingFiles`).
-  const mayDeleteFiles = mayDeleteRecordingFiles({
-    graphApplied: cleanup.applied && after.applied,
-    recordingsKept: [...cleanup.recordingsKept, ...after.recordingsKept],
-  });
+  // Design P7: a meeting made FROM a standalone recording (Link / Make a
+  // meeting) plays that recording's canonical file under its own
+  // `local_audio_path`. The bytes are the recording owner's and go back to
+  // their Recordings — never out with the meeting, whatever the graph said
+  // (a server with MW_RECORDINGS_WRITE off would otherwise walk the row).
+  const mayDeleteFiles =
+    !access.row.gmeet_context?.fromRecording &&
+    mayDeleteRecordingFiles({
+      graphApplied: cleanup.applied && after.applied,
+      recordingsKept: [...cleanup.recordingsKept, ...after.recordingsKept],
+    });
   if (mayDeleteFiles) {
     // Each stored recording may have an audio-only derivative (offline pins);
     // drop it with the source so nothing outlives the row.

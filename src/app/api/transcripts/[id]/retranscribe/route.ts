@@ -168,7 +168,13 @@ async function legacyRetranscribe(user: DarthUser, access: ResolvedAccess): Prom
     },
   });
   if (!opened.ok) return NextResponse.json({ error: opened.error }, { status: opened.status });
-  const { spec, placeholder } = opened;
+  const { spec } = opened;
+  // A re-run names its source meeting (`sourceId`), so it is never born a
+  // standalone recording (design P7) — the placeholder is always a meeting row.
+  if (!('id' in opened.placeholder)) {
+    return NextResponse.json({ error: 'Re-transcribe did not open a meeting row' }, { status: 500 });
+  }
+  const placeholder = opened.placeholder;
 
   // A re-run of a meeting is still that meeting: whoever it is shared with
   // keeps access on the new row, with the same access level. Until P4 the

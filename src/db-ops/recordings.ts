@@ -3,6 +3,7 @@ import { sql } from '@/lib/db';
 import { SCHEMAS } from '@/lib/constants/database';
 import { jobIdSql } from '@/db-ops/aai-job-id';
 import { transcriptionVersionTablesExist } from '@/db-ops/transcriptions';
+import { standaloneColumnsExist } from '@/db-ops/standalone-recordings';
 import type { TranscriptResponse } from '@/lib/format';
 import type { ClipTextPolicy } from '@/lib/recording-clips';
 import type { TransactionSql } from 'postgres';
@@ -799,6 +800,10 @@ export async function applyRecordingGraph(
   // Same reason (a missing table aborts the transaction): the stale-media
   // DELETE below queues the blobs it orphans, and only when 047 is there.
   const has047 = await mediaArchiveTablesExist().catch(() => false);
+  // Same again for 049: a STANDALONE recording (design P7 — born by an
+  // unlinked upload, not derived from any meeting) is never "promoted away"
+  // and dropped below, whatever this meeting's clip did.
+  const has049 = await standaloneColumnsExist().catch(() => false);
 
   await sql.begin(async (tx) => {
     // What these meetings pointed at BEFORE — a promotion changes the answer.
@@ -968,6 +973,7 @@ export async function applyRecordingGraph(
         WHERE recording_id = ${priorId}::uuid LIMIT 1
       `;
       if (still.length > 0) continue;
+      if (has049 && (await isStandaloneTx(tx, priorId))) continue;
       // …unless one of its transcriptions is a VERSION (Phase 2): superseded,
       // annotated, or deliberately requested (which covers a run still in
       // flight). Those are somebody's history and a re-derivation of a
@@ -1142,6 +1148,14 @@ export async function applyMeetingClips(
   return { written: clips.length, staleClipsRemoved };
 }
 
+/** Is this recording STANDALONE (migration 049)? Only asked when 049 is there. */
+async function isStandaloneTx(tx: TransactionSql, recordingId: string): Promise<boolean> {
+  const rows = await tx<Array<{ standalone: boolean }>>`
+    SELECT standalone FROM ${tx(SCHEMA)}.recordings WHERE id = ${recordingId}::uuid
+  `;
+  return rows[0]?.standalone === true;
+}
+
 /** INTERNAL-ONLY — does this recording row exist (and is it live)? */
 export async function recordingExists(recordingId: string): Promise<boolean> {
   const rows = await sql<Array<{ id: string }>>`
@@ -1172,6 +1186,7 @@ export async function removeMeetingFromRecordingGraph(
   const removed: string[] = [];
   const kept: string[] = [];
   let clipsRemoved = 0;
+  const has049 = await standaloneColumnsExist().catch(() => false);
 
   await sql.begin(async (tx) => {
     const gone = await tx<Array<{ recording_id: string }>>`
@@ -1186,6 +1201,14 @@ export async function removeMeetingFromRecordingGraph(
         WHERE recording_id = ${recordingId}::uuid LIMIT 1
       `;
       if (still.length > 0) {
+        kept.push(recordingId);
+        continue;
+      }
+      // Design P7: a STANDALONE recording is its owner's before and after any
+      // meeting clips it. Losing its last clip hands it back to their
+      // Recordings — its rows AND its files stay (the caller keeps the files
+      // of every recording reported as kept).
+      if (has049 && (await isStandaloneTx(tx, recordingId))) {
         kept.push(recordingId);
         continue;
       }

@@ -858,6 +858,23 @@ async function trackMeeting(
   }
 }
 
+/**
+ * A meeting row was inserted by a writer that could not go through
+ * `createForUser` (design P7: Link / Make a meeting insert the row, its clip
+ * and the recording's expiry in ONE transaction — db-ops/standalone-recordings
+ * `createMeetingFromRecording`). Does what `createForUser` does after its
+ * INSERT: tell open listings, and give the meeting its stable `/m/<uuid>`.
+ */
+export async function announceMeetingInserted(
+  assemblyaiId: string,
+  ctx: GmeetContext | null | undefined,
+  title: string | null | undefined,
+  userId: string
+): Promise<void> {
+  publishEvent({ kind: 'created', assemblyaiId });
+  await trackMeeting(assemblyaiId, ctx, title, userId);
+}
+
 export async function createForUser(
   userId: string,
   data: TranscriptInsert
@@ -1245,6 +1262,19 @@ export async function updateUploadProgress(
   placeholderId: string,
   bytesReceived?: number
 ): Promise<void> {
+  // Design P7: a born-bare upload's "placeholder" is `rec-<recording id>` —
+  // its progress and heartbeat live on the recording (owner-scoped the same
+  // way), not on a meeting row it does not have.
+  if (placeholderId.startsWith('rec-')) {
+    const { mergeStandaloneState } = await import('@/db-ops/standalone-recordings');
+    await mergeStandaloneState(
+      userId,
+      placeholderId.slice(4),
+      bytesReceived === undefined ? {} : { bytesReceived },
+      { heartbeat: true }
+    );
+    return;
+  }
   await sql`
     UPDATE ${sql(SCHEMA)}.transcripts
     SET upload_bytes_received = COALESCE(${bytesReceived ?? null}, upload_bytes_received),

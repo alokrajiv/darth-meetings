@@ -352,6 +352,16 @@ async function sweep(): Promise<void> {
     console.warn('[notes-sweeper] upload-session sweep failed:', err);
   }
 
+  // Design P7/P8: standalone recordings — temporary ones past their expiry,
+  // stalled uploads, jobs still at AssemblyAI, kept hand-off failures, the
+  // one ready DM. A no-op until migration 049 is applied; never throws.
+  try {
+    const { sweepBornBare } = await import('@/lib/server/born-bare');
+    await sweepBornBare();
+  } catch (err) {
+    console.warn('[notes-sweeper] standalone-recording sweep failed:', err);
+  }
+
   try {
     const idBacklog = await listSpeakerIdBacklog(GRACE_MINUTES, STUCK_MINUTES, MAX_PER_SWEEP);
     if (idBacklog.length > 0) {

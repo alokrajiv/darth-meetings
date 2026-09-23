@@ -15,6 +15,19 @@ const RECORDER_NAME_RE = /^\d{4}-\d{2}-\d{2} \d{2}\.\d{2}\.\d{2}\b/;
 /** "New Recording 3", "Voice 042", "Recording (2)" — phone/voice-memo defaults. */
 const DEFAULT_MEMO_RE = /^(new recording|recording|voice memo|voice|audio|untitled)(\s*[\d(),-]*)?$/i;
 
+/**
+ * The SQL twins of the three patterns above, for the Recordings surface's
+ * paginated query (db-ops/own-recordings-page.ts), which has to decide
+ * "bare" in Postgres to page over it. POSIX ARE takes the JS sources as they
+ * are, except JS's `\b`, which is ARE's `\y`. A test runs both over the same
+ * titles against a real Postgres.
+ */
+export const BARE_TITLE_PG = {
+  fileExt: FILE_EXT_RE.source,
+  recorderName: RECORDER_NAME_RE.source.replace(/\\b/g, '\\y'),
+  defaultMemo: DEFAULT_MEMO_RE.source,
+} as const;
+
 /** Does this title read as a file, not as a meeting? */
 export function looksLikeFilename(title: string | null | undefined): boolean {
   const t = (title ?? '').trim();
