@@ -105,13 +105,23 @@ export interface CalendarListParams {
   q?: string;
   iCalUID?: string;
   maxPages?: number;
+  /** Calendar to read — default `primary`. Any other id (a colleague's
+   * email, a group calendar id) is read LIVE for display only: the caller
+   * must never persist those rows (calendar_event_cache has no calendar
+   * column). `calendar.events.readonly` covers events.list on every
+   * calendar the person can see; enumerating them (calendarList) does not. */
+  calendarId?: string;
+  /** Filled from the first page for a non-primary calendar: Google's
+   * `accessRole` for the caller on that calendar (`freeBusyReader` →
+   * time blocks only, `reader`/`writer`/`owner` → full details). */
+  meta?: { accessRole?: string };
 }
 
 /**
- * Raw Calendar API listing (primary calendar, single instances, cancelled
- * dropped). Throws CalendarListError on a non-OK FIRST page so callers can
- * surface "Google session expired" vs silently showing an empty day; later
- * page failures return what was collected.
+ * Raw Calendar API listing (primary calendar unless `calendarId`, single
+ * instances, cancelled dropped). Throws CalendarListError on a non-OK FIRST
+ * page so callers can surface "Google session expired" vs silently showing
+ * an empty day; later page failures return what was collected.
  */
 export async function listCalendarEvents(
   token: string,
@@ -120,6 +130,11 @@ export async function listCalendarEvents(
   const out: DiscoveredEvent[] = [];
   let pageToken: string | undefined;
   const maxPages = params.maxPages ?? 4;
+  const calendarId = params.calendarId && params.calendarId !== 'primary' ? params.calendarId : null;
+  // The primary request stays byte-identical; another calendar also asks
+  // for accessRole (free/busy vs full details).
+  const fields = calendarId ? `accessRole,${CAL_FIELDS}` : CAL_FIELDS;
+  const calPath = calendarId ? encodeURIComponent(calendarId) : 'primary';
   for (let p = 0; p < maxPages; p++) {
     const q = new URLSearchParams({
       timeMin: params.timeMin,
@@ -127,7 +142,7 @@ export async function listCalendarEvents(
       singleEvents: 'true',
       orderBy: 'startTime',
       maxResults: '250',
-      fields: CAL_FIELDS,
+      fields,
     });
     if (params.q) q.set('q', params.q);
     if (params.iCalUID) {
@@ -135,7 +150,7 @@ export async function listCalendarEvents(
       q.delete('orderBy');
     }
     if (pageToken) q.set('pageToken', pageToken);
-    const res = await fetch(`${CAL_API}/calendars/primary/events?${q}`, {
+    const res = await fetch(`${CAL_API}/calendars/${calPath}/events?${q}`, {
       headers: { Authorization: `Bearer ${token}` },
     });
     if (!res.ok) {
@@ -145,7 +160,9 @@ export async function listCalendarEvents(
     const j = (await res.json()) as {
       items?: Array<DiscoveredEvent & { status?: string }>;
       nextPageToken?: string;
+      accessRole?: string;
     };
+    if (p === 0 && params.meta && j.accessRole) params.meta.accessRole = j.accessRole;
     for (const e of j.items ?? []) {
       if (!e.id || e.status === 'cancelled') continue;
       out.push(e);

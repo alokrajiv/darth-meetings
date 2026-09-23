@@ -56,7 +56,7 @@ READ
                                   exists at Google/Microsoft but nobody imported
                                   it (default); norec = your past calendar
                                   events that left no artifacts at all
-  calendar --view all [--from D] [--to D] [--details] [--cached] [FILTERS except --speaker]
+  calendar --view all [--from D] [--to D] [--details] [--cached] [--calendar <email|id>]... [FILTERS except --speaker]
                                   Your FULL calendar as an agenda: every timed
                                   event (past + upcoming, imported or not,
                                   with or without a meeting link). Re-reads the
@@ -73,7 +73,12 @@ READ
                                   url / Google Calendar link / invite text /
                                   key (the exact event key for 'upload
                                   --event' and 'link') under each row. --json
-                                  has it all always
+                                  has it all always.
+                                  --calendar alice@trames.sg also reads a
+                                  calendar shared with you (repeatable or
+                                  comma list, max 5); the person's email is
+                                  the id; needs at least free/busy sharing.
+                                  Their rows are tagged cal:<name>
   audio <id> [--out <file>]       Download the recording (default ./<id>.<ext>)
   frame <id> <ts> [--out <file>]  Grab a video frame at a timestamp (ms, mm:ss or
                                   hh:mm:ss) as jpeg — only transcripts imported
@@ -344,6 +349,10 @@ month's calls were recorded / imported": imported rows end with "→ <id>"
 ready), plus the provider evidence, organiser, attendee count, series.
 --details adds location, attendee emails + RSVP, the stable /m link, the
 Google Calendar link and the invite text; --json has every field always.
+'--calendar alice@trames.sg' (repeatable, max 5) also reads a calendar
+shared with the human — the person's email is the id; it needs at least
+free/busy sharing (free/busy rows show "(busy)" with no title or people),
+and the rows are tagged cal:alice; the footer says which calendars answered.
 
 ## Someone hands you a recording ("here's the audio, do your thing")
 
@@ -879,6 +888,8 @@ function fmtLocalDateTime(iso: string, tz: string): string {
 /** Short status word for a full-calendar (`--view all`) row: what the
  * archive / provider hold for it, or that it hasn't happened yet. */
 function calendarAllStatus(e: any): string {
+  // Another person's calendar: no import / evidence lookups are made for it.
+  if (e.calendar) return e.upcoming ? "upcoming" : "past(shared-cal)";
   if (e.imported) {
     const st = e.imported.status && e.imported.status !== "completed" ? `(${e.imported.status})` : "";
     return e.imported.accessible ? `imported${st}` : `imported(no-access)${st}`;
@@ -1513,13 +1524,34 @@ async function waitForUpload(ctx: Ctx, startId: string, capMin: number, say: (l:
   return null;
 }
 
-async function calendarAll(ctx: Ctx, flags: Record<string, string | boolean>): Promise<number> {
+/** Every value of a repeatable `--name v` / `--name=v` flag, in order (the
+ * shared parseArgs keeps only the last), comma lists split. */
+function allFlagValues(argv: string[], name: string): string[] {
+  const out: string[] = [];
+  for (let i = 0; i < argv.length; i++) {
+    const a = argv[i];
+    if (a === "--") break;
+    let v: string | undefined;
+    if (a === `--${name}`) { const n = argv[i + 1]; if (n !== undefined && !n.startsWith("--")) { v = n; i++; } }
+    else if (a.startsWith(`--${name}=`)) v = a.slice(name.length + 3);
+    if (v !== undefined) out.push(...v.split(",").map(x => x.trim()).filter(Boolean));
+  }
+  return out;
+}
+
+const MAX_SHARED_CALENDARS = 5;
+
+async function calendarAll(ctx: Ctx, flags: Record<string, string | boolean>, calendars: string[] = []): Promise<number> {
   const fr = readFilterFlags(ctx, flags, ["participant", "organizer", "provider", "q", "from", "to"]);
   if (!fr.ok) { console.error(fr.error); return 1; }
+  if (flags.calendar === true) { console.error("--calendar needs a value (the person's email, e.g. --calendar alice@trames.sg)"); return 1; }
+  const cals = [...new Set(calendars)];
+  if (cals.length > MAX_SHARED_CALENDARS) { console.error(`--calendar: at most ${MAX_SHARED_CALENDARS} calendars per call (got ${cals.length})`); return 1; }
   const q = new URLSearchParams(fr.params);
   const tz = localTz(ctx);
   q.set("tz", tz);
   if (flags.cached === true) q.set("sync", "0");
+  for (const c of cals) q.append("calendar", c);
   const data = await ctx.expectJson<any>(ctx.api("meetings", `/api/calendar/events?${q.toString()}`));
   const details = flags.details === true;
   ctx.print(data, () => {
@@ -1529,8 +1561,15 @@ async function calendarAll(ctx: Ctx, flags: Record<string, string | boolean>): P
     } else if (sync?.error) {
       console.error(`note: ${sync.error}`);
     }
+    for (const err of sync?.errors ?? []) console.error(`note: ${err}`);
+    const calLine = (data.calendars ?? []).length
+      ? `calendars: ${data.calendars.map((c: any) => c.ok
+          ? `${c.id} ok (${c.fetched}${c.access ? `, ${c.access === "freeBusy" ? "free/busy only" : "full details"}` : ""})`
+          : `${c.id} FAILED (${String(c.error || "").replace(`${c.id}: `, "")})`).join(" · ")}`
+      : "";
     if (!events.length) {
       console.log(`No calendar events between ${range.from} and ${range.to} (tz ${tz}).`);
+      if (calLine) console.log(calLine);
       return;
     }
     let lastDay = "";
@@ -1541,7 +1580,7 @@ async function calendarAll(ctx: Ctx, flags: Record<string, string | boolean>): P
         console.log(`\n${e.day} ${dow}`);
       }
       const time = fmtLocalDateTime(e.start, tz).slice(11);
-      const who = e.organizerSelf ? "me" : (e.organizerEmail || "?");
+      const who = e.organizerSelf && !e.calendar ? "me" : (e.organizerEmail || (e.calendarAccess === "freeBusy" ? "-" : "?"));
       const cols = [
         `  ${time}`,
         fmtMins(e.durationSecs).padStart(5),
@@ -1549,7 +1588,7 @@ async function calendarAll(ctx: Ctx, flags: Record<string, string | boolean>): P
         calendarAllStatus(e).padEnd(22),
         `${e.attendeeCount ?? 0} att`.padStart(7),
         who.padEnd(28),
-        e.title || "(untitled)",
+        e.title || (e.calendarAccess === "freeBusy" ? "(busy)" : "(untitled)"),
       ];
       const imp = e.imported;
       const ai = imp?.accessible
@@ -1557,6 +1596,7 @@ async function calendarAll(ctx: Ctx, flags: Record<string, string | boolean>): P
            imp.report === "ready" ? "report" : imp.report === "running" ? "report…" : null].filter(Boolean).join("+")
         : "";
       const tail = [
+        e.calendar ? `cal:${String(e.calendar).split("@")[0]}` : null,
         e.meetingCode ? `[${e.meetingCode}]` : null,
         imp?.accessible ? `→ ${imp.id}${ai ? ` (${ai})` : ""}` : null,
         imp && !imp.accessible && imp.ownerEmail ? `owner ${imp.ownerEmail}` : null,
@@ -1580,6 +1620,7 @@ async function calendarAll(ctx: Ctx, flags: Record<string, string | boolean>): P
     }
     const src = sync?.ran ? `live from Google (${sync.fetched} fetched) + cache` : "server cache only";
     console.log(`\n${counts.total} event(s) ${range.from} → ${range.to} (tz ${tz}): ${counts.past} past, ${counts.upcoming} upcoming · ${counts.imported} imported, ${counts.withEvidence} with a recording/transcript at the provider · ${src}${data.truncated ? " · TRUNCATED at 5000 rows — narrow --from/--to" : ""}`);
+    if (calLine) console.log(calLine);
   });
   return 0;
 }
@@ -2276,8 +2317,8 @@ const meetings: Subcommand = {
 
       case "calendar": {
         const view = str(flags.view) || "unimported";
-        if (view === "all" || view === "full") return calendarAll(ctx, flags);
-        for (const f of ["cached", "details"]) if (flags[f] !== undefined) { console.error(`--${f} only applies to --view all`); return 1; }
+        if (view === "all" || view === "full") return calendarAll(ctx, flags, allFlagValues(argv, "calendar"));
+        for (const f of ["cached", "details", "calendar"]) if (flags[f] !== undefined) { console.error(`--${f} only applies to --view all`); return 1; }
         if (view !== "unimported" && view !== "norec") { console.error("--view must be unimported, norec or all"); return 1; }
         const fr = readFilterFlags(ctx, flags, ["participant", "organizer", "provider", "q", "from", "to"]);
         if (!fr.ok) { console.error(fr.error); return 1; }

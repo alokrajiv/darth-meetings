@@ -3,7 +3,21 @@ import { withAuth } from '@/lib/auth/with-auth';
 import { getGoogleAccount } from '@/db-ops/google-accounts';
 import { listCalendarWindow, type CalendarWindowRow } from '@/db-ops/calendar-event-cache';
 import { getServerAccessToken, invalidateServerToken } from '@/lib/server/google-oauth';
-import { CalendarListError, syncCalendarWindow } from '@/lib/server/meeting-discovery';
+import {
+  CalendarListError,
+  isCacheableEvent,
+  listCalendarEvents,
+  syncCalendarWindow,
+  toCalendarUpsert,
+} from '@/lib/server/meeting-discovery';
+import {
+  calendarAccessOf,
+  dayIn,
+  matchesCalendarFilters,
+  parseCalendarIds,
+  sharedCalendarError,
+  sharedCalendarRow,
+} from '@/lib/server/shared-calendar';
 import { parseMeetingFilters } from '@/lib/server/meeting-filters';
 import { findSeriesByMeetingCodes, findSeriesByRecurringBaseIds, type SeriesKeyHit } from '@/db-ops/series';
 import { ensureMeetingsForOccurrences } from '@/db-ops/meetings';
@@ -40,6 +54,14 @@ export const runtime = 'nodejs';
  * attachments) and the caller's mute. Same people/provider/q filters as the
  * other listing surfaces (lib/server/meeting-filters). Display-only: no
  * tokens, no file ids.
+ *
+ * `calendar=<id>` (repeatable / comma list, ≤ 5): also read a calendar
+ * SHARED with the caller — a colleague's email is their calendar id. Those
+ * rows are listed live under the caller's token every call (also with
+ * sync=0 — there is no cache for them), never persisted
+ * (lib/server/shared-calendar), carry `calendar` + `calendarAccess`, and go
+ * through the same filters. A calendar Google refuses lands in
+ * `sync.errors` and `calendars[]` — the rest of the answer still serves.
  */
 
 const DAY_RE = /^\d{4}-\d{2}-\d{2}$/;
@@ -101,6 +123,12 @@ export interface CalendarEventRow {
     notes: 'ready' | 'running' | 'error' | 'none';
     report: 'ready' | 'running' | 'error' | 'none';
   } | null;
+  /** Only on rows from another calendar (`?calendar=`): its id. Absent on
+   * the caller's own rows. */
+  calendar?: string;
+  /** Only on rows from another calendar: `freeBusy` = the share shows time
+   * blocks only (no title / people), `reader` = full details. */
+  calendarAccess?: 'reader' | 'freeBusy';
 }
 
 export interface CalendarEventsResponse {
@@ -109,7 +137,11 @@ export interface CalendarEventsResponse {
   counts: { total: number; past: number; upcoming: number; imported: number; withEvidence: number };
   truncated: boolean;
   connected: boolean;
-  sync: { ran: boolean; fetched: number | null; error: string | null };
+  /** `error` = the caller's own calendar sync (unchanged); `errors` = one
+   * plain line per `?calendar=` that failed. */
+  sync: { ran: boolean; fetched: number | null; error: string | null; errors: string[] };
+  /** One entry per requested `?calendar=` id (empty when none asked). */
+  calendars: Array<{ id: string; ok: boolean; fetched: number | null; access?: 'reader' | 'freeBusy'; error?: string }>;
 }
 
 function safeTz(raw: string | null): string {
@@ -120,15 +152,6 @@ function safeTz(raw: string | null): string {
   } catch {
     return 'UTC';
   }
-}
-
-/** Local calendar day (YYYY-MM-DD) of an instant in tz. */
-function dayIn(d: Date, tz: string): string {
-  const parts = new Intl.DateTimeFormat('en-CA', {
-    timeZone: tz, year: 'numeric', month: '2-digit', day: '2-digit',
-  }).formatToParts(d);
-  const g = (t: string) => parts.find((p) => p.type === t)?.value ?? '';
-  return `${g('year')}-${g('month')}-${g('day')}`;
 }
 
 /** Midnight of a YYYY-MM-DD day in tz, as an instant. Two-pass: read the
@@ -241,15 +264,19 @@ export const GET = withAuth(async ({ user, request }) => {
   }
   const parsed = parseMeetingFilters(sp);
   if (!parsed.ok) return NextResponse.json({ error: parsed.error }, { status: 400 });
+  const cals = parseCalendarIds(sp, user.email);
+  if (!cals.ok) return NextResponse.json({ error: cals.error }, { status: 400 });
 
   const fromIso = midnightIn(from, tz).toISOString();
   const toIso = midnightIn(addDays(to, 1), tz).toISOString();
   const wantSync = sp.get('sync') !== '0';
 
   const account = await getGoogleAccount(user.userId);
-  const sync: CalendarEventsResponse['sync'] = { ran: false, fetched: null, error: null };
+  const sync: CalendarEventsResponse['sync'] = { ran: false, fetched: null, error: null, errors: [] };
+  const calendars: CalendarEventsResponse['calendars'] = [];
+  const needToken = !!account && (wantSync || cals.ids.length > 0);
+  const minted = needToken ? await getServerAccessToken(user.userId) : null;
   if (wantSync && account) {
-    const minted = await getServerAccessToken(user.userId);
     if (!minted) {
       sync.error = account.status === 'revoked'
         ? 'Google access was revoked — reconnect Google in Settings.'
@@ -273,11 +300,46 @@ export const GET = withAuth(async ({ user, request }) => {
     }
   }
 
+  // Other people's calendars: live, display-only, in parallel.
+  const nowForShared = Date.now();
+  const shared = await Promise.all(
+    cals.ids.map(async (id): Promise<CalendarEventRow[]> => {
+      if (!minted) {
+        const why = !account ? 'Google is not connected' : 'could not mint a Google token';
+        calendars.push({ id, ok: false, fetched: null, error: `${id}: ${why}` });
+        sync.errors.push(`${id}: ${why}`);
+        return [];
+      }
+      try {
+        const meta: { accessRole?: string } = {};
+        const evs = await listCalendarEvents(minted.token, {
+          timeMin: fromIso, timeMax: toIso, maxPages: 4, calendarId: id, meta,
+        });
+        const ups = evs.filter(isCacheableEvent).map(toCalendarUpsert);
+        const access = calendarAccessOf(meta.accessRole, ups);
+        calendars.push({ id, ok: true, fetched: ups.length, ...(access ? { access } : {}) });
+        return ups
+          .map((u) => sharedCalendarRow(u, id, access, tz, nowForShared))
+          .filter((r) => matchesCalendarFilters(r, parsed.filters));
+      } catch (err) {
+        // A network failure on one shared calendar must not 500 the answer.
+        const status = err instanceof CalendarListError ? err.status : 0;
+        if (status === 401) invalidateServerToken(user.userId);
+        const msg = status ? sharedCalendarError(id, status) : `${id}: Google unreachable`;
+        calendars.push({ id, ok: false, fetched: null, error: msg });
+        sync.errors.push(msg);
+        return [];
+      }
+    })
+  );
+  // Promise.all resolves in any order for the pushes — keep the asked order.
+  calendars.sort((a, b) => cals.ids.indexOf(a.id) - cals.ids.indexOf(b.id));
+
   const rows = await listCalendarWindow(
     { userId: user.userId, email: user.email },
     { fromIso, toIso, filters: parsed.filters, limit: ROW_CAP + 1 }
   );
-  const truncated = rows.length > ROW_CAP;
+  let truncated = rows.length > ROW_CAP;
   const served = rows.slice(0, ROW_CAP);
   // Batched extras, same lookups the listing route does per page.
   const occs = served
@@ -298,7 +360,17 @@ export const GET = withAuth(async ({ user, request }) => {
     findSeriesByMeetingCodes([...new Set(occs.map((o) => o.code))]),
   ]);
   const now = Date.now();
-  const events = served.map((r) => toRow(r, tz, now, { uuids, seriesByBase, seriesByCode }));
+  let events = served.map((r) => toRow(r, tz, now, { uuids, seriesByBase, seriesByCode }));
+  const extra = shared.flat();
+  if (extra.length > 0) {
+    events = [...events, ...extra].sort((a, b) =>
+      a.start < b.start ? -1 : a.start > b.start ? 1 : a.key < b.key ? -1 : a.key > b.key ? 1 : 0
+    );
+    if (events.length > ROW_CAP) {
+      events = events.slice(0, ROW_CAP);
+      truncated = true;
+    }
+  }
   const body: CalendarEventsResponse = {
     range: { from, to, tz },
     events,
@@ -312,6 +384,7 @@ export const GET = withAuth(async ({ user, request }) => {
     truncated,
     connected: !!account,
     sync,
+    calendars,
   };
   return NextResponse.json(body);
 });
