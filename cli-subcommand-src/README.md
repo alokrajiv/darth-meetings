@@ -41,12 +41,48 @@ back) and the calling agent brings the intelligence with its own tokens.
 | `label-create <path> [--color #rrggbb]` | `POST /api/labels {path, color?}` → prints `created …` or `exists …` |
 | `label-rename <label> <newName>` | resolve → `PATCH /api/labels/:id {name}`; prints every rewritten sub-label path from `updated[]` |
 | `label-mv <label> <newParent\|/>` | resolve both → `PATCH /api/labels/:id {parentId: id\|null}` (server 409s cycles / dup names / depth > 6) |
+| `recordings list [--section mac\|uploaded\|temporary \| --unlinked \| --temporary] [--q T] [--regex] [--limit N] [--cursor C] [--all] [--json] [--envelope]` | `GET /api/recordings?mine=1&tz=…[&section=…\|&unlinked=1][&q=][&regex=1]&limit=N[&cursor=]` → `{items,next_cursor,counts:{mac,uploaded,temporary}}`. `--unlinked` = `unlinked=1` (mac + uploaded), `--temporary` = `section=temporary`; the three are mutually exclusive. One page (limit 50, max 200) unless `--all`, which follows `next_cursor` to null (pages of 200 unless `--limit`; a repeated cursor stops the loop). Human: counts header, one line per item — kind `recording` → its uuid, kind `meeting` → the row's `assemblyai_id` + "(legacy meeting row)", kind `registry` → the Recorder id + "(on your Mac — upload from the tray)"; `expires <date>` on temporary rows (legacy scratch rows: `expires_at` else `created_at`+30 d); `more: --cursor <c>` when there is a next page. `--json` = the items array (all pages under `--all`); `--envelope` (implies JSON) = `{items,next_cursor,counts,truncated: next_cursor!==null}`, the tasks-list envelope convention |
+| `recordings get <rid>` | `GET /api/recordings/:id` → `{recording}`; human view prints `expires:` only when temporary, `in meeting:` per meeting, `suggested event: … (link with: … recordings link <rid> '<key>')` only when the server sent `suggested_event` (confident ones only). `--json` = the RecordingView |
+| `recordings text <rid>` | `GET /api/recordings/:id/content` → `[mm:ss] Speaker X: …` from `utterances` (flat `text` fallback); 202 `{pending}` → exit 1 "still transcribing". `--json` = the content payload |
+| `recordings audio <rid> [--out F]` | `GET /api/recordings/:id/audio`, streamed to the file (`Bun.write(out, res)`); default `./rec-<rid>.<ext>` from the content type |
+| `recordings link <rid> <ref> [--title T] [--offset-ms N]` | `POST /api/recordings/:id/link` — ref with `\|`, a Meet code `^[a-z]{3}-[a-z]{4}-[a-z]{3}$` or `teams-…` → `{eventRef[,title]}` (201 `{meeting:{id,title},recordingId,shares:0}`); anything else = a meeting id → `{meetingId[,offsetMs]}` (adds the recording to a meeting the caller owns/edits). 409 `not-ready` / `already-linked` surfaced by code. Prints `linked → meeting <id> — 0 shares …` |
+| `recordings make-meeting <rid> --title T` | `POST /api/recordings/:id/make-meeting {title}` → 201 `{meeting:{id,title},recordingId,shares:0}`; no `--title` → exit 1 |
+| `recordings keep <rid>` | `PATCH /api/recordings/:id {keep:true}` → `{recording}` (expiry removed; still a recording) |
+| `recordings rm <rid>` | `DELETE /api/recordings/:id` → `{ok,deleted}`; 409 `in-meeting` printed as a refusal (exit 1) |
 | `label-rm <label> [--cascade]` | resolve → `DELETE /api/labels/:id[?cascade=1]`; the CLI refuses locally (exit 1) when the label has sub-labels and `--cascade` is absent (the server 409s too) |
+
+`recordings` is a sub-verb family of `meetings`, not a top-level darth-cli
+family (a new family would need the shared, generated
+`../cli/src/subcommands/registry.ts`). It has its own help page
+(`darth-cli meetings recordings`). Every route is owner-only (anything not
+the caller's is a 404); write verbs call `ctx.requireWrite()` first (read-only
+token → exit 4) and print the server's 403 as `Forbidden: …` otherwise.
+Recordings are private and never shared — link one or make a meeting, then
+share the meeting.
+
+**Q10:** New uploads without `--event` are recordings, not meetings, once the
+server's `MW_RECORDINGS_BORN_BARE` is on — they no longer appear in
+`meetings list`; find them with `meetings recordings list`. The `list` shape
+is unchanged; only the set of rows is. (`upload` then prints `uploaded to your
+Recordings — <uuid>` + the `recordings link` hint; `--title` goes to `PATCH
+/api/recordings/:id {title}`; `--wait` polls `GET /api/recordings/:id` until
+`ready`/`failed` and skips the speakers step; `--json` = `{recording_id,
+pseudo_id,status,born_bare,title,original_filename,created_at,expires_at,
+temporary,recording}` — the meeting-answer JSON shape is untouched. A session
+poll / ledger answer of only `transcriptId: 'rec-…'` is resolved via `GET
+/api/recordings/:id`. `list --scratch` serves legacy temporary rows only.)
 
 ## IDs, files and flags
 
-- `<id>` is `assemblyai_id` from `list` (`teams-…`, `gmeet-…`, `ext-…`, or a
-  bare AAI uuid) — the same id as the web URL `/transcript/<id>`.
+- `<id>` is `assemblyai_id` from `list` — the meeting's OPAQUE public id
+  (`teams-…`, `gmeet-…`, `ext-…`, `up-…`, `defer-…`, or an unprefixed uuid
+  for an ordinary upload; since Phase 1b it is NOT the AssemblyAI job id, and
+  nothing but the prefix may be read out of it) — the same id as the web URL
+  `/transcript/<id>`.
+- `<rid>` (the `recordings` family) is a recording uuid; `rec-<uuid>` (the
+  pseudo id a born-bare upload answers with) is accepted everywhere and the
+  prefix stripped. Recording ids are NOT meeting ids — the meeting verbs never
+  take them, and the CLI never calls `/api/transcripts/rec-…`.
 - `calendar` rows carry no transcript id (they are NOT in the archive); the
   `[meeting-code]` tail (`teams-…` / Meet code) is printed for cross-reference.
 - `calendar --view all` rows carry `key` (`<eventId>|<startIso>`) — the exact

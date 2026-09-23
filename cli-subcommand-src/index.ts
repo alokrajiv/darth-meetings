@@ -32,7 +32,10 @@ READ
                                   'upload --scratch' rows; hidden from the
                                   archive, trashed 30 days after creation
                                   unless kept in the web UI or linked. No
-                                  other filters (legacy shape)
+                                  other filters (legacy shape). Serves
+                                  LEGACY temporary rows only: new temporary
+                                  uploads are recordings → 'recordings list
+                                  --temporary'
   get <id>                        One transcript's metadata + AI-notes/report status
                                   ('scratch: yes' marks a temporary row)
   text <id>                       Full transcript as "[mm:ss] Speaker: …" lines
@@ -106,6 +109,15 @@ READ
   offline prefs                   Your offline auto-pin counts (transcripts /
                                   audio / video) with defaults and caps
 
+RECORDINGS (yours only, never shared — see 'darth-cli meetings recordings')
+  recordings list|get|text|audio|link|make-meeting|keep|rm
+                                  Your private recordings that belong to no
+                                  meeting (unlinked uploads, temporary ones,
+                                  Darth Recorder files still on a Mac). A
+                                  recording is never shared: link it to an
+                                  event or make a meeting of it, then share
+                                  the MEETING
+
 LABELS (org-wide, hierarchical 'Customers/LP Global/QBR', many per transcript;
 <label> = a path, case-insensitive, or '#<id>' from 'labels')
   label <id> <label>              Add a label to a transcript — missing path
@@ -140,7 +152,11 @@ WRITE (needs read+write for meetings)
                                   invitees become share suggestions);
                                   without it the row is unlinked and you can
                                   'link' it later — same single transcription
-                                  run either way. --scratch = temporary: kept
+                                  run either way. (Once the server runs
+                                  born-bare uploads, an upload without
+                                  --event is a private RECORDING instead:
+                                  it prints the recording id, is not in
+                                  'list', and you 'recordings link' it.) --scratch = temporary: kept
                                   out of everyone's main archive ('list
                                   --scratch' / the web UI's Temporary tab)
                                   and trashed 30 days after creation unless
@@ -276,7 +292,8 @@ here (server-side, your backend Google link; Teams runs app-only).
 If the server is unreachable, the user is probably off the company VPN/
 tailnet — say so and wait; don't retry-loop.
 
-Per-subcommand --help is not a thing — this page is the whole reference.
+Per-subcommand --help is not a thing — this page is the whole reference
+(except 'darth-cli meetings recordings', which has its own page).
 `;
 
 const SKILL = `# darth meetings — agent workflow guide
@@ -426,6 +443,25 @@ main archive ('list --scratch' / the web UI's Temporary tab) and is trashed
 30 days after creation unless a human keeps it in the web UI or you 'link'
 it to a calendar event. Same transcription, same 'text' / 'speakers' /
 'set-notes' afterwards — only the shelf life differs.
+
+## Recordings (private, never shared)
+
+Once the server runs born-bare uploads, 'upload' WITHOUT --event makes a
+private RECORDING, not a meeting: it prints 'uploaded to your Recordings —
+<uuid>', it is not in 'list', and the meeting verbs (get/text/speakers/
+set-*) do not take its id. Steps 2-4 above then read:
+
+    darth-cli meetings upload ./call.m4a --wait     # → recording <uuid>
+    darth-cli meetings recordings text <uuid>       # skim it
+    darth-cli meetings recordings get <uuid>        # + a confident calendar suggestion, if any
+    darth-cli meetings recordings link <uuid> 'evt123|2026-09-15T06:00:00.000Z'   # → a meeting
+    darth-cli meetings recordings make-meeting <uuid> --title "Ad-hoc call"      # no event
+
+Linking / make-meeting prints the new MEETING id — from there the normal
+verbs apply (speakers, set-speakers, set-notes, …). A recording is never
+shared; the owner shares the meeting from the web UI. 'recordings list'
+shows everything still private (--temporary / --unlinked; --json
+--envelope pages like the tasks list).
 
 ## Labels (org-wide taxonomy, many per meeting)
 
@@ -1439,6 +1475,19 @@ async function uploadResumable(ctx: Ctx, file: string, name: string, size: numbe
 
 async function resolveDone(ctx: Ctx, done: { transcript?: any; transcriptId?: string }): Promise<{ transcript: any }> {
   if (done.transcript) return { transcript: done.transcript };
+  if (done.transcriptId?.startsWith("rec-")) {
+    // Born-bare upload: the session poll only carries 'rec-<uuid>' — a
+    // recording, not a meetings row (never GET /api/transcripts/rec-…).
+    const rid = done.transcriptId.slice(4);
+    const g = await ctx.expectJson<{ recording: any }>(ctx.api("meetings", `/api/recordings/${rid}`));
+    const v = g.recording ?? {};
+    return {
+      transcript: {
+        assemblyai_id: done.transcriptId, recording_id: rid, born_bare: true, status: v.status, title: v.title ?? null,
+        original_filename: v.original_filename ?? null, created_at: v.created_at ?? null, expires_at: v.expires_at ?? null, scratch: v.temporary === true,
+      },
+    };
+  }
   const g = await ctx.expectJson<{ transcript: any }>(ctx.api("meetings", `/api/transcripts/${done.transcriptId}`));
   return { transcript: g.transcript };
 }
@@ -1639,6 +1688,360 @@ function calendarEvidence(r: any): { evidence: string; importable: boolean } {
   return { evidence: r.hasMeet === false && !r.meetingCode ? "no-meet-link" : "none", importable: false };
 }
 
+// ---------------------------------------------------------------------------
+// Recordings — the caller's OWN recordings that belong to no meeting
+// (docs/recordings-meetings-series-design.md). A sub-verb family under
+// `meetings` (not a top-level darth-cli family: that would need the shared
+// cli registry). Owner-only on the server — anything not yours is a 404.
+// Recordings are never shared; link one to a calendar event or make a
+// meeting of it, then share the MEETING.
+// ---------------------------------------------------------------------------
+
+const RECORDINGS_HELP = `darth-cli meetings recordings — your private recordings (not meetings yet)
+
+A recording is an upload (or a Darth Recorder file) that belongs to no
+meeting. It is PRIVATE to you and is never shared: link it to a calendar
+event or make a meeting of it, then share the MEETING (web UI). Once the
+server runs born-bare uploads, 'meetings upload' without --event lands
+here instead of in 'meetings list'.
+
+  recordings list [--section mac|uploaded|temporary | --unlinked | --temporary]
+                  [--q <text>] [--regex] [--limit N] [--cursor C] [--all]
+                  [--json] [--envelope]
+                                  Newest first. --unlinked = on your Macs +
+                                  uploaded; --temporary = temporary only.
+                                  One page (default 50, max 200) unless --all
+                                  (follows next_cursor to the end). --json =
+                                  the items array; --envelope (implies JSON)
+                                  = {items,next_cursor,counts,truncated}.
+                                  Legacy bare uploads show their meeting id
+                                  ("legacy meeting row" — the other meetings
+                                  verbs take it); Mac rows can only be
+                                  uploaded from the tray
+  recordings get <rid>            One recording: status, size, expiry (when
+                                  temporary), the meetings using it, and a
+                                  confident calendar suggestion if any
+  recordings text <rid>           Its transcript as "[mm:ss] Speaker X: …"
+                                  (diarization labels — names are set once
+                                  it is a meeting)
+  recordings audio <rid> [--out <file>]
+                                  Download the media (default ./rec-<rid>.<ext>)
+WRITE (needs read+write for meetings)
+  recordings link <rid> <meeting-code|event-key|meeting-id> [--title T] [--offset-ms N]
+                                  Meeting code / '<eventId>|<startIso>' key /
+                                  teams-… ref → makes the meeting for that
+                                  calendar occurrence; anything else = the id
+                                  of a meeting you own or edit → adds the
+                                  recording to it (--offset-ms places it).
+                                  Linking shares NOBODY
+  recordings make-meeting <rid> --title "…"
+                                  A meeting of its own (no calendar event)
+  recordings keep <rid>           Remove the expiry of a temporary recording
+                                  (it stays a private recording)
+  recordings rm <rid>             Delete it (refused while a meeting uses it)
+
+<rid> = the recording uuid; 'rec-<uuid>' is accepted too.`;
+
+/** 'rec-<uuid>' | '<uuid>' → '<uuid>'. */
+function recId(raw: string): string {
+  return raw.trim().replace(/^rec-/i, "");
+}
+
+/** Meet code, exact event key or Teams ref → event; anything else → meeting id. */
+function isEventRef(ref: string): boolean {
+  return ref.includes("|") || /^[a-z]{3}-[a-z]{4}-[a-z]{3}$/.test(ref) || ref.startsWith("teams-");
+}
+
+function fmtDay(iso: string | null | undefined, tz: string): string {
+  if (!iso) return "?";
+  return fmtLocalDateTime(iso, tz).slice(0, 10);
+}
+
+/** The id a list item is addressed by + its printable line. */
+function recordingItemLine(item: any, tz: string): { id: string; line: string } {
+  const when = (iso: string | null | undefined) => (iso ? fmtLocalDateTime(iso, tz) : "?");
+  if (item.kind === "recording") {
+    const r = item.recording ?? {};
+    const at = r.started_at || r.created_at;
+    const title = r.title || `Recording · ${when(at)}`;
+    const exp = r.temporary && r.expires_at ? `  expires ${fmtDay(r.expires_at, tz)}` : "";
+    const inMtg = r.in_meeting ? "  (in a meeting)" : "";
+    return { id: r.id, line: `${r.id}  ${when(at)}  ${fmtDuration(r.duration_sec ?? null).padStart(7)}  ${String(r.status).padEnd(12)}  ${title}${inMtg}${exp}` };
+  }
+  if (item.kind === "meeting") {
+    const t = item.row ?? {};
+    const at = t.recorded_at || t.created_at;
+    const title = t.title || t.original_filename || `Recording · ${when(at)}`;
+    let exp = "";
+    if (item.section === "temporary") {
+      const e = t.expires_at || (t.created_at ? new Date(Date.parse(t.created_at) + 30 * 86400_000).toISOString() : null);
+      if (e) exp = `  expires ${fmtDay(e, tz)}`;
+    }
+    return { id: t.assemblyai_id, line: `${t.assemblyai_id}  ${when(at)}  ${fmtDuration(t.duration ?? null).padStart(7)}  ${String(t.status).padEnd(12)}  ${title}  (legacy meeting row)${exp}` };
+  }
+  const g = item.registry ?? {};
+  const title = g.call?.title || `Recording · ${when(g.started_at)}`;
+  return { id: g.id, line: `${g.id}  ${when(g.started_at)}  ${fmtDuration(g.duration_s ?? null).padStart(7)}  ${String(g.status).padEnd(12)}  ${title}  (on your Mac — upload from the tray)` };
+}
+
+function printRecordingView(v: any, tz: string): void {
+  const when = (iso: string | null | undefined) => (iso ? fmtLocalDateTime(iso, tz) : "?");
+  console.log(`id:         ${v.id}  (${v.pseudo_id ?? `rec-${v.id}`})`);
+  console.log(`title:      ${v.title || `Recording · ${when(v.started_at || v.created_at)}`}`);
+  console.log(`status:     ${v.status}${v.status_note ? ` — ${v.status_note}` : ""}`);
+  if (v.upload && v.status === "uploading") console.log(`upload:     ${fmtMB(v.upload.bytes_received ?? 0)} of ${fmtMB(v.upload.bytes_total ?? 0)} MB`);
+  console.log(`recorded:   ${when(v.started_at)}  (uploaded ${when(v.created_at)})`);
+  console.log(`duration:   ${fmtDuration(v.duration_sec ?? null)}  speakers: ${v.speaker_count ?? "?"}  language: ${v.language_code ?? "?"}`);
+  const media = [
+    v.source_kind,
+    v.original_filename,
+    v.bytes != null ? `${fmtMB(v.bytes)} MB` : null,
+    v.has_video ? "video" : "audio",
+    v.part_count > 1 ? `${v.part_count} parts` : null,
+  ].filter(Boolean).join(" · ");
+  console.log(`media:      ${media}`);
+  if (v.temporary && v.expires_at) console.log(`expires:    ${fmtDay(v.expires_at, tz)}  (keep with: darth-cli meetings recordings keep ${v.id})`);
+  for (const m of v.meetings ?? []) console.log(`in meeting: ${m.id} ${m.title || "(untitled)"}${m.trashed ? "  [trashed]" : ""}`);
+  const s = v.suggested_event;
+  if (s) console.log(`suggested event: ${s.title || "(untitled)"} · ${when(s.startIso)}  (link with: darth-cli meetings recordings link ${v.id} '${s.key}')`);
+  if (!v.in_meeting) console.log("private to you, not shared — 'recordings link' / 'recordings make-meeting', then share the meeting");
+}
+
+/** Non-2xx on a recordings write → a readable line; returns the exit code. */
+function recordingWriteError(verb: string, status: number, data: any): number {
+  const msg = data?.error ?? `HTTP ${status}`;
+  if (status === 401) console.error(`Unauthorized: ${msg}\nYour token may be expired/revoked — run: darth-cli login`);
+  else if (status === 403) console.error(`Forbidden: ${msg}\nWrite commands need a read+write token for meetings — re-run 'darth-cli login' and pick Read + write.`);
+  else if (status === 404) console.error(`${verb} failed: no such recording of yours (${msg}).`);
+  else if (status === 409 && data?.code === "not-ready") console.error(`${verb} failed: still transcribing (${msg}) — try again once 'recordings get' says ready.`);
+  else if (status === 409 && data?.code === "already-linked") console.error(`${verb} failed: already in a meeting (${msg}).`);
+  else if (status === 409 && data?.code === "in-meeting") console.error(`${verb} refused: a meeting uses this recording (${msg}) — it goes with the meeting.`);
+  else console.error(`${verb} failed (HTTP ${status}): ${msg}${data?.code ? ` [${data.code}]` : ""}`);
+  return status === 401 ? 3 : 1;
+}
+
+async function recordingRequest(ctx: Ctx, path: string, init: RequestInit): Promise<{ ok: boolean; status: number; data: any }> {
+  const res = await ctx.api("meetings", path, init);
+  const data = await readJsonSafe(res);
+  return { ok: res.ok, status: res.status, data };
+}
+
+/** Download to a file, streamed (recordings can be multi-GB video). */
+async function downloadStreamed(ctx: Ctx, path: string, outFile: string | undefined, fallbackName: string): Promise<number> {
+  const res = await ctx.api("meetings", path);
+  if (!res.ok) {
+    const text = await res.text();
+    let msg = text.slice(0, 300);
+    try { msg = JSON.parse(text).error || msg; } catch {}
+    console.error(`Error (HTTP ${res.status}): ${msg}`);
+    return res.status === 401 ? 3 : 1;
+  }
+  const type = (res.headers.get("content-type") || "").split(";")[0]!.trim();
+  const out = outFile || `${fallbackName}.${EXT_BY_TYPE[type] || "bin"}`;
+  const B: any = (globalThis as any).Bun;
+  const bytes: number = B?.write ? await B.write(out, res) : (writeFileSync(out, Buffer.from(await res.arrayBuffer())), statSync(out).size);
+  console.log(`${out}  (${bytes} bytes, ${type || "unknown type"})`);
+  return 0;
+}
+
+/** Upload answered with a recording (born bare): its uuid, else null. */
+function bornBareId(t: any, fallbackId?: string): string | null {
+  const pid = String(t?.assemblyai_id ?? fallbackId ?? "");
+  if (t?.recording_id && (t.born_bare === true || pid.startsWith("rec-"))) return String(t.recording_id);
+  if (pid.startsWith("rec-")) return pid.slice(4);
+  return null;
+}
+
+/** Poll GET /api/recordings/:id until ready/failed. Null on failure/timeout. */
+async function waitForRecording(ctx: Ctx, rid: string, capMin: number, say: (l: string) => void): Promise<any | null> {
+  const deadline = Date.now() + capMin * 60_000;
+  say(`Waiting for transcription (up to ${capMin} min, poll 10s)…`);
+  while (Date.now() < deadline) {
+    await sleep(10_000);
+    const res = await ctx.api("meetings", `/api/recordings/${rid}`);
+    if (res.status === 404) { console.error(`Recording ${rid} vanished — check the web app.`); return null; }
+    const j = await readJsonSafe(res);
+    const v = j?.recording;
+    if (!res.ok || !v) continue;
+    if (v.status === "failed") { console.error(`Transcription failed: ${v.status_note ?? "see the web app"}`); return null; }
+    if (v.status === "ready") return v;
+  }
+  console.error(`Still transcribing after ${capMin} min — it keeps running server-side; check later with 'darth-cli meetings recordings get ${rid}'.`);
+  return null;
+}
+
+async function recordingsCmd(ctx: Ctx, flags: Record<string, string | boolean>, pos: string[]): Promise<number> {
+  liftBoolFlags(pos, flags, ["all", "envelope", "unlinked", "temporary", "regex"]);
+  const [sub, ...args] = pos;
+  if (!sub || sub === "help" || flags.help === true) { console.log(RECORDINGS_HELP); return 0; }
+  const tz = localTz(ctx);
+  const needRid = (usage: string): string | null => {
+    if (!args[0]) { console.error(`usage: darth-cli meetings recordings ${usage}`); return null; }
+    return recId(args[0]);
+  };
+
+  switch (sub) {
+    case "list":
+    case "ls": {
+      const section = str(flags.section);
+      const picks = [section ? "--section" : null, flags.unlinked === true ? "--unlinked" : null, flags.temporary === true ? "--temporary" : null].filter(Boolean);
+      if (picks.length > 1) { console.error(`pick one of ${picks.join(", ")}`); return 1; }
+      if (flags.section !== undefined && !["mac", "uploaded", "temporary"].includes(section ?? "")) { console.error("--section must be mac, uploaded or temporary"); return 1; }
+      const q = new URLSearchParams({ mine: "1", tz });
+      if (section) q.set("section", section);
+      else if (flags.unlinked === true) q.set("unlinked", "1");
+      else if (flags.temporary === true) q.set("section", "temporary");
+      const text = str(flags.q);
+      if (flags.q !== undefined && !text?.trim()) { console.error("--q needs a value"); return 1; }
+      if (text) q.set("q", text.trim());
+      if (flags.regex === true) {
+        if (!text) { console.error("--regex needs --q <pattern>"); return 1; }
+        q.set("regex", "1");
+      }
+      let limit: number | null = null;
+      if (flags.limit !== undefined) {
+        const raw = str(flags.limit) ?? "";
+        if (!/^\d+$/.test(raw) || Number(raw) > 200) { console.error("--limit must be a whole number 0..200"); return 1; }
+        limit = Number(raw);
+      }
+      const drainAll = flags.all === true;
+      if (drainAll && limit === 0) { console.error("--all with --limit 0 would never advance"); return 1; }
+      q.set("limit", String(limit ?? (drainAll ? 200 : 50)));
+      let cursor = str(flags.cursor) ?? null;
+      if (flags.cursor !== undefined && !cursor) { console.error("--cursor needs a value"); return 1; }
+      const items: any[] = [];
+      let counts: any = null;
+      let next: string | null = null;
+      const seen = new Set<string>();
+      for (let page = 0; page < 1000; page++) {
+        const pq = new URLSearchParams(q);
+        if (cursor) pq.set("cursor", cursor);
+        const data = await ctx.expectJson<{ items: any[]; next_cursor: string | null; counts: any }>(ctx.api("meetings", `/api/recordings?${pq}`));
+        if (counts === null) counts = data.counts;
+        items.push(...(data.items ?? []));
+        next = data.next_cursor ?? null;
+        if (!drainAll || !next || seen.has(next)) break;
+        seen.add(next);
+        cursor = next;
+      }
+      if (drainAll && next && seen.has(next)) next = null; // server repeated a cursor — stop, don't loop
+      const envelope = flags.envelope === true;
+      if (envelope) { console.log(JSON.stringify({ items, next_cursor: next, counts, truncated: next !== null }, null, 2)); return 0; }
+      ctx.print(items, () => {
+        const c = counts ?? {};
+        console.log(`${c.mac ?? 0} on your Macs · ${c.uploaded ?? 0} uploaded · ${c.temporary ?? 0} temporary`);
+        if (!items.length) console.log("No recordings here — private recordings appear once you upload without --event (or the Darth Recorder saves one).");
+        for (const it of items) console.log(recordingItemLine(it, tz).line);
+        if (next) console.log(`more: --cursor ${next}`);
+      });
+      return 0;
+    }
+
+    case "get": {
+      const rid = needRid("get <rid>");
+      if (!rid) return 1;
+      const data = await ctx.expectJson<{ recording: any }>(ctx.api("meetings", `/api/recordings/${rid}`));
+      ctx.print(data.recording, () => printRecordingView(data.recording, tz));
+      return 0;
+    }
+
+    case "text": {
+      const rid = needRid("text <rid>");
+      if (!rid) return 1;
+      const res = await ctx.api("meetings", `/api/recordings/${rid}/content`);
+      if (res.status === 202) { console.error(`${rid} is still transcribing — try again later ('recordings get ${rid}' shows the status).`); return 1; }
+      const data = await ctx.expectJson<any>(res);
+      const content = data.content ?? data;
+      if (ctx.json) { console.log(JSON.stringify(content, null, 2)); return 0; }
+      const utterances: any[] = content.utterances || [];
+      console.log(utterances.length
+        ? utterances.map((u) => `[${fmtMs(u.start)}] Speaker ${u.speaker}: ${u.text}`).join("\n")
+        : content.text || "(empty transcript)");
+      return 0;
+    }
+
+    case "audio": {
+      const rid = needRid("audio <rid> [--out <file>]");
+      if (!rid) return 1;
+      return downloadStreamed(ctx, `/api/recordings/${rid}/audio`, str(flags.out), `rec-${rid}`);
+    }
+
+    case "link": {
+      const rid = args[0] ? recId(args[0]) : null;
+      const ref = args[1];
+      if (!rid || !ref) { console.error("usage: darth-cli meetings recordings link <rid> <meeting-code|event-key|meeting-id> [--title T] [--offset-ms N]"); return 1; }
+      ctx.requireWrite();
+      const body: Record<string, unknown> = {};
+      if (isEventRef(ref)) {
+        body.eventRef = ref;
+        const title = str(flags.title);
+        if (title) body.title = title;
+        if (flags["offset-ms"] !== undefined) { console.error("--offset-ms only applies when linking to an existing meeting id"); return 1; }
+      } else {
+        body.meetingId = ref;
+        if (flags.title !== undefined) { console.error("--title only applies when linking to a calendar event (the meeting keeps its own title)"); return 1; }
+        if (flags["offset-ms"] !== undefined) {
+          const raw = str(flags["offset-ms"]) ?? "";
+          if (!/^-?\d+$/.test(raw)) { console.error("--offset-ms must be a whole number of milliseconds"); return 1; }
+          body.offsetMs = Number(raw);
+        }
+      }
+      const r = await recordingRequest(ctx, `/api/recordings/${rid}/link`, { method: "POST", body: JSON.stringify(body) });
+      if (!r.ok) {
+        const code = recordingWriteError("link", r.status, r.data);
+        if (r.status === 404 && isEventRef(ref)) console.error("Tip: 'darth-cli meetings calendar --view all --json' lists your events with their [meeting-code] and exact 'key'; a meeting code resolves to its latest PAST occurrence — use the key for an older one.");
+        return code;
+      }
+      const mid = r.data?.meeting?.id ?? r.data?.meetingId ?? (isEventRef(ref) ? "?" : ref);
+      ctx.print(r.data, () => {
+        console.log(`linked → meeting ${mid}${r.data?.meeting?.title ? ` "${r.data.meeting.title}"` : ""} — ${r.data?.shares ?? 0} shares (share it from the meeting when you want to)`);
+        if (mid !== "?") console.log(`Web: ${webBase(ctx)}/transcript/${mid}`);
+      });
+      return 0;
+    }
+
+    case "make-meeting": {
+      const rid = args[0] ? recId(args[0]) : null;
+      const title = str(flags.title)?.trim();
+      if (!rid || !title) { console.error('usage: darth-cli meetings recordings make-meeting <rid> --title "…"   (title required)'); return 1; }
+      ctx.requireWrite();
+      const r = await recordingRequest(ctx, `/api/recordings/${rid}/make-meeting`, { method: "POST", body: JSON.stringify({ title }) });
+      if (!r.ok) return recordingWriteError("make-meeting", r.status, r.data);
+      const m = r.data?.meeting ?? {};
+      ctx.print(r.data, () => {
+        console.log(`meeting ${m.id ?? "?"} "${m.title ?? title}" made from recording ${rid} — ${r.data?.shares ?? 0} shares (share it from the meeting when you want to)`);
+        if (m.id) console.log(`Web: ${webBase(ctx)}/transcript/${m.id}`);
+      });
+      return 0;
+    }
+
+    case "keep": {
+      const rid = needRid("keep <rid>");
+      if (!rid) return 1;
+      ctx.requireWrite();
+      const r = await recordingRequest(ctx, `/api/recordings/${rid}`, { method: "PATCH", body: JSON.stringify({ keep: true }) });
+      if (!r.ok) return recordingWriteError("keep", r.status, r.data);
+      ctx.print(r.data, () => console.log(`kept ${rid} — no expiry any more; it stays a private recording`));
+      return 0;
+    }
+
+    case "rm": {
+      const rid = needRid("rm <rid>");
+      if (!rid) return 1;
+      ctx.requireWrite();
+      const r = await recordingRequest(ctx, `/api/recordings/${rid}`, { method: "DELETE" });
+      if (!r.ok) return recordingWriteError("rm", r.status, r.data);
+      ctx.print(r.data, () => console.log(r.data?.deleted === false ? `${rid}: nothing deleted` : `deleted recording ${rid}`));
+      return 0;
+    }
+
+    default:
+      console.error(`Unknown recordings command: ${sub}\n`);
+      console.log(RECORDINGS_HELP);
+      return 1;
+  }
+}
+
 const meetings: Subcommand = {
   name: "meetings",
   summary: "Meeting transcripts, notes & recordings (darth-meetings)",
@@ -1647,6 +2050,7 @@ const meetings: Subcommand = {
     const { pos, flags } = parseArgs(argv);
     liftBoolFlags(pos, flags, ["cascade", "exact", "cached", "details", "wait", "clear", "scratch", "resume", CONSENT_FLAG]);
     const [, cmd, ...args] = pos.length && pos[0] === "meetings" ? pos : ["", ...pos];
+    if (cmd === "recordings") return recordingsCmd(ctx, flags, args);
     if (!cmd || flags.help === true) { console.log(HELP); return 0; }
 
     switch (cmd) {
@@ -2447,6 +2851,35 @@ const meetings: Subcommand = {
         // placeholder so the printout has a status like the 201 path.
         let t: any = data.transcript;
         let id: string = t?.assemblyai_id ?? data.assemblyaiId;
+        const rid = bornBareId(t, id);
+        if (rid) {
+          // Born bare (server flag MW_RECORDINGS_BORN_BARE): no event → a
+          // private RECORDING, not a meetings row. Nothing is shared; the
+          // meetings verbs (get/text/speakers) do not apply until it is linked.
+          const title = str(flags.title);
+          if (title) {
+            const r = await recordingRequest(ctx, `/api/recordings/${rid}`, { method: "PATCH", body: JSON.stringify({ title }) });
+            if (!r.ok) return recordingWriteError("set title", r.status, r.data);
+            t = { ...t, title };
+          }
+          say(`uploaded to your Recordings — ${rid}  "${t?.title ?? t?.original_filename ?? name}"  status: ${t?.status ?? "?"}  (private to you, not shared)`);
+          if (t?.expires_at || t?.scratch === true) say(`temporary: expires ${t?.expires_at ? fmtDay(t.expires_at, localTz(ctx)) : "in 30 days"} unless kept ('darth-cli meetings recordings keep ${rid}') or linked`);
+          say(`link with: darth-cli meetings recordings link ${rid} <event-ref>`);
+          let view: any = null;
+          if (flags.wait === true && t?.status !== "ready") {
+            view = await waitForRecording(ctx, rid, capMin, say);
+            if (!view) return 1;
+            say(`Transcribed: ${rid}  (${fmtDuration(view.duration_sec ?? null)}, ${view.speaker_count ?? "?"} speakers) — read it with 'darth-cli meetings recordings text ${rid}'`);
+            if (view.suggested_event) say(`suggested event: ${view.suggested_event.title || "(untitled)"} · ${fmtLocalDateTime(view.suggested_event.startIso, localTz(ctx))}  (link with: darth-cli meetings recordings link ${rid} '${view.suggested_event.key}')`);
+          }
+          ctx.print({
+            recording_id: rid, pseudo_id: `rec-${rid}`, status: view?.status ?? t?.status ?? null, born_bare: true,
+            title: view?.title ?? t?.title ?? null, original_filename: t?.original_filename ?? null, created_at: t?.created_at ?? null,
+            expires_at: view?.expires_at ?? t?.expires_at ?? null, temporary: view ? view.temporary === true : (t?.scratch === true || !!t?.expires_at),
+            recording: view,
+          }, () => {});
+          return 0;
+        }
         if (!t && id) {
           const g: any = await ctx.expectJson<{ transcript: any }>(ctx.api("meetings", `/api/transcripts/${id}`));
           t = g.transcript;
