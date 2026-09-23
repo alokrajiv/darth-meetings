@@ -584,8 +584,8 @@ export function SplitClipDialog({
                   </button>
                 )}
                 <p className="border-t px-2 py-1 text-[11px] text-muted-foreground">
-                  Linking shares the new meeting with the people invited, as an upload linked to
-                  that invite would.
+                  Linking doesn&apos;t share the new meeting with anyone — the people invited
+                  show up as suggestions when you share it.
                 </p>
               </div>
             )}

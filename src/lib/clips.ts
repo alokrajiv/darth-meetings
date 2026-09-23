@@ -1114,8 +1114,8 @@ export interface SplitRequest {
   to?: string;
   title?: string;
   /** A calendar reference — `<eventId>|<startIso>` or a meeting code, exactly
-   * what `link-event` accepts. Links the new meeting and auto-shares to the
-   * invitees, as an upload linked to that event would. */
+   * what `link-event` accepts. Links the new meeting; shares nobody (linking
+   * never shares — design P4). The invitees become share suggestions. */
   eventRef?: string;
   /** Leave the source untouched and let both meetings use the window (D-D). */
   keepInBoth?: boolean;
@@ -1138,7 +1138,8 @@ export interface SplitOk {
     /** True = the source now carries the "part of this was split off" marker. */
     notesStale: boolean;
   };
-  /** Set when `eventRef` was given and resolved. */
+  /** Set when `eventRef` was given and resolved. `attendees` is the event's
+   * invitee count — people it SUGGESTS sharing with, not people shared. */
   linkedEvent?: { title: string | null; startTime: string | null; attendees: number };
 }
 

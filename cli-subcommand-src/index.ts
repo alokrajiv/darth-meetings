@@ -136,7 +136,8 @@ WRITE (needs read+write for meetings)
                                   like .vtt/.txt/.docx go through the text
                                   importer) and transcribe it. --event links
                                   it to a calendar event up front (title,
-                                  date, attendees, auto-share to invitees);
+                                  date, attendees; linking shares nobody —
+                                  invitees become share suggestions);
                                   without it the row is unlinked and you can
                                   'link' it later — same single transcription
                                   run either way. --scratch = temporary: kept
@@ -362,7 +363,8 @@ first, decide what it belongs to afterwards. Linking later is a metadata
 write (date, title, attendees, share suggestions) — nothing is re-run.
 
     # 1. If you ALREADY know the event, link up front (best case: title,
-    #    date, attendees + auto-share to the invitees all land at once):
+    #    date, attendees + share suggestions all land at once; linking
+    #    never shares — the owner shares from the web UI when they choose):
     darth-cli meetings calendar --view all --from 2026-09-15 --to 2026-09-15 --json
     darth-cli meetings upload ./call.m4a --event abc-defg-hij --wait
     darth-cli meetings upload ./call.m4a --event 'evt123|2026-09-15T06:00:00.000Z' --wait

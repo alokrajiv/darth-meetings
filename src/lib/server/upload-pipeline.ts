@@ -9,8 +9,6 @@ import {
   setUploadPartBytesForUser,
   updateUploadProgress,
 } from '@/db-ops/transcripts';
-import { autoShareToInternalInvitees } from '@/lib/server/auto-share';
-import { SHARE_ORIGIN_EVENT_LINK } from '@/db-ops/share-origin';
 import { getOwnRecording, linkRecordingTranscript } from '@/db-ops/recorder';
 import { recorderCallTitle } from '@/lib/recorder';
 import { suggestedEventFromMatch } from '@/lib/server/recorder-match';
@@ -620,13 +618,13 @@ export async function openUpload(
     };
   }
 
-  const { gmeetContext, attendees } = buildGmeetContext(input.linkedEvent, input.reportPref);
+  const { gmeetContext } = buildGmeetContext(input.linkedEvent, input.reportPref);
   const scratch = !!input.scratch && !input.linkedEvent;
 
-  // Create the row BEFORE the bytes so the upload is visible in the listing
-  // (owner + auto-shared invitees) from the first byte. The temp filename
-  // shares the placeholder's uuid so the stale-upload sweeper can find and
-  // delete the file when reaping an orphaned row.
+  // Create the row BEFORE the bytes so the upload is visible in the owner's
+  // listing from the first byte. The temp filename shares the placeholder's
+  // uuid so the stale-upload sweeper can find and delete the file when
+  // reaping an orphaned row.
   const uploadUuid = input.uuid ?? crypto.randomUUID();
   const placeholderId = `up-${uploadUuid}`;
   const tempFilename = `upload-${uploadUuid}.part`;
@@ -710,17 +708,17 @@ export async function openUpload(
     bytesTotal: multi?.groupBytes ?? input.bytesTotal,
     scratch,
   });
-  // Same "throw them in" rule as the Meet import: internal invitees on the
-  // linked event can see (and follow) the upload from the moment it starts.
-  // These shares exist BECAUSE of the link, and are stamped as such so
-  // "Unlink from event" takes exactly them back (D5, migration 048). Since
-  // D1 there are only attendees here when a human said "link it".
-  if (attendees.length > 0) {
-    await autoShareToInternalInvitees(placeholder.id, user.userId, user.email, attendees, {
-      origin: SHARE_ORIGIN_EVENT_LINK,
-    }).catch((err) => console.warn('[upload] auto-share failed:', err));
-  }
-  // D1: …and with the moment the tray started recording as its date, so an
+  // NO SHARES HERE (design P4, owner 2026-09-23): linking a recording to a
+  // calendar occurrence never shares — only meetings carry shares, and sharing
+  // is a separate act the person takes. The linked event's invitees land in
+  // gmeet_context.attendees above, which is what the share dialog's
+  // "Suggested from this meeting" (GET …/share-suggestions) offers them from.
+  // Until 2026-09-23 this shared with every internal invitee, with edit
+  // access, the moment an upload opened linked (tray Link, web stepper,
+  // calendar-row Upload, darth-cli --event). Cloud imports still share —
+  // that arm is `shareCloudImportWithInternalInvitees` (lib/server/auto-share).
+  // D1: the placeholder is born with the moment the tray started recording
+  // as its date (after the title above), so an
   // unlinked recording still lands on the right day in the listing.
   const earlyRecordedAt =
     sourceRow?.recorded_at ?? input.linkedEvent?.startTime ?? input.recorderBirth?.startedAt;

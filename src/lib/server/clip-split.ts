@@ -56,7 +56,6 @@ import { combineView } from '@/lib/server/clip-combine';
 import { pendingAttachFor } from '@/lib/server/clip-attach';
 import { removeRecordingGraphForMeeting } from '@/lib/server/recording-sync';
 import { resolveLinkedEventRef } from '@/lib/server/linked-event-ref';
-import { autoShareToInternalInvitees } from '@/lib/server/auto-share';
 import { registerPeopleFromMeeting } from '@/lib/server/import-helpers';
 import { autoAttachSeries } from '@/lib/server/series-attach';
 import type { GmeetAttendee, GmeetContext, StoredTranscript } from '@/lib/format';
@@ -567,17 +566,11 @@ export async function splitMeeting(input: SplitInput): Promise<ClipOpResult<Spli
     }
   }
 
-  // Shares are NOT copied (spec): the only people who get the new meeting are
-  // its owner and whoever the calendar link brings in.
+  // Shares are NOT copied (spec), and the calendar link brings nobody in
+  // either (design P4, owner 2026-09-23): linking never shares. The new
+  // meeting is its owner's alone; the event's invitees are in its context,
+  // so the share dialog suggests them.
   if (linked && attendees.length > 0) {
-    // The count is not reported: the response says how many people the EVENT
-    // brings in, which is the sentence the dialog shows.
-    await autoShareToInternalInvitees(
-      created.id,
-      access.ownerUserId,
-      by.email,
-      attendees
-    );
     await registerPeopleFromMeeting(
       attendees.map((a) => ({ email: a.email, name: a.name })),
       by.userId

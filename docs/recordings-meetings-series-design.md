@@ -666,3 +666,79 @@ the route calling it on POST only, the page's Share condition, the surface readi
   as does `/series`'s. One earlier start of the dev server (~40 s, one curl of the new route) ran
   WITHOUT that guard, so the pollers were armed against the prod schema for that window; the log
   shows no poller activity, but it is recorded here rather than assumed away.
+
+## As built — P4 (2026-09-23)
+
+Owner decision (Alok, 2026-09-23): recordings are never shared; only meetings carry shares, and
+sharing is a meeting action the person takes. **Linking a recording to a calendar occurrence never
+creates shares** — §6.2 Q2 answered "No — link never shares"; Q8 answered "keep the cloud-import arm".
+
+### What changed
+
+- `src/lib/server/auto-share.ts` — `autoShareToInternalInvitees` is gone. The one share helper is
+  now `shareCloudImportWithInternalInvitees('cloud-import', …)`: a name and a spelled-out `arm`
+  argument that say it is the Q8 arm, with the rule in its doc comment, so a link path cannot reach
+  it by accident. It no longer takes an `origin` (import shares were never link-born).
+  `ingestParsedUtterances`' `shareList` option is renamed `cloudImportShareList` for the same reason.
+- `src/lib/server/upload-pipeline.ts` (`openUpload`, the old 713-720 block) — the link-at-upload
+  share is removed. The invitees still land in `gmeet_context.attendees`, which is what
+  `GET …/share-suggestions` reads, so the linked meeting's share dialog lists them.
+- `src/lib/server/clip-split.ts` — split-to-an-event no longer shares the new meeting with the
+  event's invitees (people are still registered; the invitees are suggestions).
+- `src/app/api/transcripts/[id]/retranscribe/route.ts` (the `new-row` fallback, not version
+  mode) — it used to get its shares indirectly, by passing the source's event as `linkedEvent`.
+  With that gone, the new row now copies the **source meeting's own shares** (same access; an
+  `event-link` stamp is kept so Unlink still works on the re-run). This is narrower than before:
+  invitees the owner had removed are no longer re-added.
+- Share dialog (`src/components/share-dialog.tsx`) — the "Suggested — people in this meeting"
+  box gains **"Share with all N (read)"**: the one-step, read-only ask Q2 describes. The transcript
+  page already shows the prompt ("Share — N people from this meeting aren't shared yet" + count
+  badge on Share), driven by the same endpoint, so no new page UI was added.
+- Copy: upload stepper link step ("It doesn't share anything: the invitees show up as
+  suggestions…"), split dialog, the calendar row's recorder Upload tooltip
+  (`src/lib/recording-strip.ts`), `SplitRequest.eventRef` doc, darth-cli `meetings upload --event`
+  help and the "someone hands you a recording" skill text (`cli-subcommand-src/index.ts` — ships
+  with the next darth-cli build). The tray (`poc/mac-recorder/**`) was not touched; its plain
+  "Link" is already right.
+- Unchanged on purpose: `removeLinkBornShares` / migration 048 rows — Unlink still takes existing
+  link-born shares off; no rows were touched.
+
+### Every share writer, keep or remove
+
+| Caller | Path | Verdict |
+|---|---|---|
+| `upload-pipeline.ts` `openUpload` | tray Link (key resolved server-side, 34ec859), web stepper, calendar-row Upload, `darth-cli upload --event`, `?source_id=` uploads | **Removed** — user link |
+| `clip-split.ts` split with `eventRef` | split dialog / `darth-cli` split | **Removed** — user link |
+| retranscribe `new-row` fallback (via `openUpload`) | re-run of an existing meeting | **Replaced** by copying the source's shares |
+| `link-event` route (retro-link), `PATCH /api/transcripts/:id` | retro-link / unlink | Never shared; unchanged |
+| `import-text` (`ingestParsedUtterances` without a share list) | text import linked to an event | Never shared; unchanged |
+| `gmeet-import-core.ts` ×4 + `ingestParsedUtterances` (quick mode) | Meet import: manual, series auto-import, account auto-sync | **Keep** — Q8 cloud-import arm |
+| `teams-import-core.ts` ×3 + `ingestParsedUtterances` | Teams import | **Keep** — Q8 |
+| `account-auto-sync.ts` `queueAwaitingRecording` + `ensureSharedWith` (watchers) | account auto-sync / series auto-import | **Keep** — Q8, the person opted in |
+| `gmeet/join`, `teams/join` | caller joins an existing import they were invited to | **Keep** — self-share onto a cloud import |
+| `shares` route POST, `transferOwnership` | human share / ownership transfer | **Keep** |
+
+### Tests
+
+`src/lib/server/__tests__/link-never-shares.test.ts` (fake postgres tag): `openUpload` with a
+linked occurrence carrying 8 internal invitees (+ the owner and an external guest) runs no
+`transcript_shares` query at all and still stores all attendees on the placeholder; an unlinked
+upload shares nobody; the cloud-import arm writes exactly 8 edit shares with no origin;
+`removeLinkBornShares` still deletes `origin = 'event-link'` + the pre-048 signature, scoped to the
+meeting, owner and emails. Suite: `TZ=UTC bun test` 1240 pass; `tsc`, eslint on touched files and
+`bun run build` (no PG/AAI env) green.
+
+### Open for the owner
+
+- **Unlink's pre-048 arm can now take a human share.** `removeLinkBornShares` also deletes
+  unstamped rows that look like the old auto-share (owner-made, *edit*, an invitee's email). After
+  P4 every invitee share is a human's; if the owner adds an invitee as **editor** and later unlinks,
+  that share goes too. "Share with all N" defaults to *read*, which survives. A date cutoff on that
+  arm (`shared_at` before the P4 deploy) would close it — not done here (it changes what Unlink
+  deletes).
+- The page's Unlink confirmation still says "Anyone who was shared in BECAUSE of the link (up to N
+  invitees) loses access" — true for old links, "up to" covers new ones (0). The page is the other
+  builder's file this round; soften when convenient.
+- `recorder-recordings.tsx` sends `linkedEvent ?? r.matched` on Upload from the Settings card /
+  picker: a machine match becomes a link when the person presses Upload on that row. After P4 it no
+  longer shares, but it is still a link the person did not pick explicitly (rule 4). Not changed.

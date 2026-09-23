@@ -5,7 +5,7 @@ import {
   type TranscriptRow,
 } from '@/db-ops/transcripts';
 import { autoNameSpeakers, registerPeopleFromMeeting } from '@/lib/server/import-helpers';
-import { autoShareToInternalInvitees } from '@/lib/server/auto-share';
+import { shareCloudImportWithInternalInvitees } from '@/lib/server/auto-share';
 import { autoAttachSeries } from '@/lib/server/series-attach';
 import { onTranscriptCompleted } from '@/lib/server/post-completion';
 import { queueRecordingGraphSync } from '@/lib/server/recording-sync';
@@ -38,8 +38,12 @@ export interface IngestParsedOptions {
   attendees?: GmeetAttendee[];
   /** People who actually joined (Meet API) — same purpose. */
   participants?: MeetParticipantInfo[];
-  /** Auto-share targets + people registration; omitted/empty skips both. */
-  shareList?: Array<{ email: string; name?: string | null }>;
+  /**
+   * CLOUD IMPORTS ONLY (Meet/Teams): the invitees the new meeting is shared
+   * with + registered as people; omitted/empty skips both. A text import
+   * linked to an event never passes this — linking never shares (design P4).
+   */
+  cloudImportShareList?: Array<{ email: string; name?: string | null }>;
   /** Prefix for warn logs, e.g. '[gmeet/import]'. */
   logTag?: string;
   /** Temporary transcript (migration 042) — import-text only. */
@@ -101,7 +105,7 @@ export async function ingestParsedUtterances(
     gmeetContext = null,
     attendees = [],
     participants,
-    shareList = [],
+    cloudImportShareList: shareList = [],
     logTag = '[ingest-parsed]',
     scratch = false,
   } = opts;
@@ -150,7 +154,13 @@ export async function ingestParsedUtterances(
 
   let autoShared = 0;
   if (shareList.length > 0) {
-    autoShared = await autoShareToInternalInvitees(row.id, user.userId, user.email, shareList);
+    autoShared = await shareCloudImportWithInternalInvitees(
+      'cloud-import',
+      row.id,
+      user.userId,
+      user.email,
+      shareList
+    );
     await registerPeopleFromMeeting(shareList, user.userId);
   }
 

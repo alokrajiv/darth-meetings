@@ -460,7 +460,7 @@ export function stripForRecorderRef(rec: RecorderRecordingRef, opts: RecorderStr
       title: `${base} · the file is still on this Mac — upload it to transcribe it`,
       progress: null,
       action: opts.trayConnected
-        ? { kind: 'upload', label: failed ? 'Retry upload' : 'Upload', title: 'Upload it from this Mac now — it transcribes itself' }
+        ? { kind: 'upload', label: failed ? 'Retry upload' : 'Upload', title: 'Upload it from this Mac and link it to this meeting — it transcribes itself. Nobody else gets access until you share it' }
         : { kind: 'open-recorder', label: 'Open Darth Recorder', title: 'Darth Recorder is not connected to this page; open the tray on the Mac that holds the file' },
       busy: false,
     };

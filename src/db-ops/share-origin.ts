@@ -7,9 +7,12 @@ import { publishEvent } from '@/lib/server/event-bus';
  * `transcript_shares.origin` (migration 048) — why a share exists, and the
  * probe that keeps the code working before the migration is applied.
  *
- * Only one value is written today: `'event-link'`, a share that exists ONLY
- * because a calendar event was attached to the meeting (the auto-share to
- * internal invitees). "Unlink from event" deletes exactly those
+ * One value exists: `'event-link'`, a share that exists ONLY because a
+ * calendar event was attached to the meeting (the auto-share to internal
+ * invitees an upload link made until 2026-09-23). Since design P4 linking
+ * never shares, so no NEW link-born share is written (a retranscribe re-run
+ * copies an existing one's stamp); the rows already out there keep theirs,
+ * and "Unlink from event" still deletes exactly those
  * (docs/recorder-link-confirm-spec.md D5) — a share a human made in the
  * Share dialog carries no origin and is never touched.
  *
@@ -59,7 +62,7 @@ export function shareOriginColumnExists(): Promise<boolean> {
  *   - for a row linked BEFORE the stamp existed, the caller passes the
  *     event's attendee emails and the auto-share's own signature is matched:
  *     the owner shared them, with edit access, and no human origin. That is
- *     exactly what `autoShareToInternalInvitees` creates.
+ *     exactly what the pre-P4 upload link created.
  * A share someone made by hand in the Share dialog survives both arms unless
  * the person is an attendee of the event being unlinked — which is the case
  * the caller must warn about before asking for this.

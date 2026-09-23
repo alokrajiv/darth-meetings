@@ -1809,8 +1809,8 @@ export function AudioUpload({ onTranscriptCreated }: AudioUploadProps) {
             <div className="min-w-0 space-y-3 py-2">
               <p className="text-xs text-muted-foreground">
                 Linking pulls in the meeting&apos;s title, time and invitees — speaker
-                name-guessing and the summary get real context, and colleagues browsing
-                the archive see it as the meeting it was.
+                name-guessing and the summary get real context. It doesn&apos;t share
+                anything: the invitees show up as suggestions when you choose to share.
               </p>
               {googleOk === false ? (
                 <div className="space-y-2.5 rounded-md border bg-muted/40 p-3">

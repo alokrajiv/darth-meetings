@@ -4,6 +4,8 @@ import { NextResponse } from 'next/server';
 import { withAuth } from '@/lib/auth/with-auth';
 import { resolveAccess, type ResolvedAccess } from '@/db-ops/transcript-access';
 import { mergeGmeetContextForUser } from '@/db-ops/transcripts';
+import { addShare, listByTranscript } from '@/db-ops/transcript-shares';
+import { SHARE_ORIGIN_EVENT_LINK } from '@/db-ops/share-origin';
 import { DEFAULT_SPEECH_MODEL, LEGACY_SPEECH_MODEL, type SpeechModel } from '@/lib/aai-language';
 import { audioFileSize, resolveAudioPath } from '@/lib/server/audio-storage';
 import { finalizeUpload, openUpload, type LinkedEventInput } from '@/lib/server/upload-pipeline';
@@ -131,7 +133,8 @@ async function legacyRetranscribe(user: DarthUser, access: ResolvedAccess): Prom
   }
 
   // Carry the meeting identity so the new row lands in the same series /
-  // calendar slot and the same invitees are auto-shared.
+  // calendar slot. The event link shares nobody (design P4) — the new row
+  // gets the SOURCE meeting's own shares instead, just below.
   const linkedEvent: LinkedEventInput | null = ctx?.eventId
     ? {
         id: ctx.eventId,
@@ -166,6 +169,14 @@ async function legacyRetranscribe(user: DarthUser, access: ResolvedAccess): Prom
   });
   if (!opened.ok) return NextResponse.json({ error: opened.error }, { status: opened.status });
   const { spec, placeholder } = opened;
+
+  // A re-run of a meeting is still that meeting: whoever it is shared with
+  // keeps access on the new row, with the same access level. Until P4 the
+  // linked event did this indirectly (and re-shared invitees the owner had
+  // removed); now it is the source's own share list, nothing more.
+  await carryShares(row.id, placeholder.id, ownerId).catch((err) =>
+    console.warn(`[retranscribe] ${row.assemblyai_id}: carrying shares failed:`, err)
+  );
 
   // The bytes are already on disk: hard-link them under the temp name the
   // pipeline expects (falls back to a copy on filesystems without links).
@@ -213,4 +224,23 @@ async function legacyRetranscribe(user: DarthUser, access: ResolvedAccess): Prom
     { ok: true, mode: 'new-row', newId: placeholder.assemblyai_id, model: DEFAULT_SPEECH_MODEL },
     { status: 202 }
   );
+}
+
+/** Copy one meeting's shares onto its re-run (same owner, same access; a
+ * link-born share stays link-born so "Unlink from event" still takes it). */
+async function carryShares(fromId: number, toId: number, ownerUserId: string): Promise<void> {
+  const shares = await listByTranscript(fromId);
+  for (const s of shares) {
+    const origin = (s as { origin?: string | null }).origin;
+    await addShare({
+      transcriptId: toId,
+      ownerUserId,
+      sharedByUserId: s.shared_by_user_id,
+      sharedWithEmail: s.shared_with_email,
+      sharedWithName: s.shared_with_name,
+      sharedWithPplId: s.shared_with_ppl_id,
+      access: s.access,
+      ...(origin === SHARE_ORIGIN_EVENT_LINK ? { origin: SHARE_ORIGIN_EVENT_LINK } : {}),
+    });
+  }
 }

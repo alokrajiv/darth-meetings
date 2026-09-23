@@ -10,7 +10,7 @@ import {
   setRecordedAtForUser,
 } from '@/db-ops/transcripts';
 import { noteEmptyTranscriptDoc } from '@/db-ops/empty-transcripts';
-import { autoShareToInternalInvitees } from '@/lib/server/auto-share';
+import { shareCloudImportWithInternalInvitees } from '@/lib/server/auto-share';
 import { findImportedByMeetingCodes } from '@/db-ops/gmeet-sync';
 import { OCCURRENCE_WINDOW_MS } from '@/lib/meeting-evidence';
 import { registerPeopleFromMeeting } from '@/lib/server/import-helpers';
@@ -569,7 +569,8 @@ export async function executeGmeetImport(
       });
       // Same visibility rule as live uploads: invitees see the queued row
       // immediately, not only once the import lands.
-      const autoShared = await autoShareToInternalInvitees(
+      const autoShared = await shareCloudImportWithInternalInvitees(
+        'cloud-import',
         placeholder.id,
         user.userId,
         user.email,
@@ -663,7 +664,8 @@ export async function executeGmeetImport(
           },
         },
       });
-      const autoShared = await autoShareToInternalInvitees(
+      const autoShared = await shareCloudImportWithInternalInvitees(
+        'cloud-import',
         placeholder.id,
         user.userId,
         user.email,
@@ -775,7 +777,8 @@ export async function executeGmeetImport(
         },
       },
     });
-    const autoShared = await autoShareToInternalInvitees(
+    const autoShared = await shareCloudImportWithInternalInvitees(
+      'cloud-import',
       placeholder.id,
       user.userId,
       user.email,
@@ -919,7 +922,7 @@ export async function executeGmeetImport(
         gmeetContext: { ...baseContext, meetTranscript: parsed },
         attendees,
         participants: actuals?.participants,
-        shareList,
+        cloudImportShareList: shareList,
         logTag: '[gmeet/import]',
       }
     );
@@ -1091,7 +1094,8 @@ export async function executeGmeetImport(
         () => {}
       );
     }
-    const autoShared = await autoShareToInternalInvitees(
+    const autoShared = await shareCloudImportWithInternalInvitees(
+      'cloud-import',
       row.id,
       user.userId,
       user.email,

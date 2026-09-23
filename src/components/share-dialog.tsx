@@ -155,6 +155,32 @@ export function ShareDialog({
     }
   };
 
+  // "Share with the N invitees?" in one step, read-only (design P4 / Q2):
+  // linking a recording to an occurrence shares nobody, so after a link this
+  // is how the owner brings the invitees in. Read is the default for the ask;
+  // anyone can be promoted to editor from the list below.
+  const handleAddAllSuggestions = async () => {
+    setAddingSuggestion('*');
+    setError(null);
+    const failed: string[] = [];
+    try {
+      for (const s of suggestions) {
+        const res = await fetch(`/api/transcripts/${transcriptId}/shares`, {
+          method: 'POST',
+          credentials: 'include',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ email: s.email, name: s.name, access: 'read' }),
+        }).catch(() => null);
+        if (!res?.ok) failed.push(s.email);
+      }
+      if (failed.length > 0) setError(`Couldn't share with ${failed.join(', ')}`);
+      await loadShares();
+      await loadSuggestions();
+    } finally {
+      setAddingSuggestion(null);
+    }
+  };
+
   const handleAccessChange = async (email: string, access: 'edit' | 'read') => {
     try {
       setError(null);
@@ -266,9 +292,25 @@ export function ShareDialog({
 
             {suggestions.length > 0 && (
               <div className="rounded-md border border-primary/25 bg-accent/40 p-2.5">
-                <p className="mb-1.5 text-[11px] font-semibold uppercase tracking-wider text-accent-foreground">
-                  Suggested — people in this meeting
-                </p>
+                <div className="mb-1.5 flex items-center gap-2">
+                  <p className="flex-1 text-[11px] font-semibold uppercase tracking-wider text-accent-foreground">
+                    Suggested — people in this meeting
+                  </p>
+                  {suggestions.length > 1 && (
+                    <Button
+                      size="sm"
+                      variant="outline"
+                      className="h-6 shrink-0 border-primary/30 px-2 text-xs text-primary hover:bg-accent"
+                      disabled={addingSuggestion !== null}
+                      onClick={() => void handleAddAllSuggestions()}
+                      data-share-all-suggestions
+                    >
+                      {addingSuggestion === '*'
+                        ? 'Sharing…'
+                        : `Share with all ${suggestions.length} (read)`}
+                    </Button>
+                  )}
+                </div>
                 <div className="flex flex-col gap-1">
                   {suggestions.map((s) => (
                     <div key={s.email} className="flex items-center gap-2 text-sm">
