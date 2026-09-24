@@ -139,22 +139,28 @@ export function SpeakerReviewDialog({
                     disabled={submitting}
                   />
                 </div>
-                <div className="mt-1 flex items-center gap-1.5 pl-[18px] text-[11px] text-muted-foreground">
+                <div className="mt-1 flex min-w-0 items-start gap-1.5 pl-[18px] text-[11px] text-muted-foreground">
                   {confirmed ? (
                     <>
-                      <Check className="h-3 w-3 shrink-0 text-primary" />
+                      <Check className="mt-px h-3 w-3 shrink-0 text-primary" />
                       confirmed earlier
                     </>
                   ) : suggestion ? (
                     suggestion.source === 'voice' ? (
                       <>
-                        <Mic className="h-3 w-3 shrink-0" />
-                        {Math.round(suggestion.confidence * 100)}% voice match — hint, not proof
+                        <Mic className="mt-px h-3 w-3 shrink-0" />
+                        <span
+                          className="line-clamp-2 min-w-0 flex-1 break-words"
+                          title={suggestion.evidence || undefined}
+                        >
+                          {Math.round(suggestion.confidence * 100)}% voice match — hint, not proof
+                          {suggestion.evidence ? `; the transcript agrees — ${suggestion.evidence}` : ''}
+                        </span>
                       </>
                     ) : (
                       <>
-                        <Sparkles className="h-3 w-3 shrink-0" />
-                        <span className="truncate" title={suggestion.evidence}>
+                        <Sparkles className="mt-px h-3 w-3 shrink-0" />
+                        <span className="line-clamp-2 min-w-0 flex-1 break-words" title={suggestion.evidence}>
                           {suggestion.evidence || 'guessed from context'}
                         </span>
                       </>
@@ -196,7 +202,9 @@ export function SpeakerReviewDialog({
               ? 'Saving…'
               : allConfirmed
                 ? 'Looks right — generate'
-                : `Confirm ${filledCount}/${speakers.length} & generate`}
+                : identifying
+                  ? 'Confirm anyway · AI still guessing'
+                  : `Confirm ${filledCount}/${speakers.length} & generate`}
           </Button>
         </DialogFooter>
       </DialogContent>

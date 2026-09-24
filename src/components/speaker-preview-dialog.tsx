@@ -319,7 +319,11 @@ export function SpeakerPreviewDialog({
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent className="max-w-3xl sm:max-w-3xl">
+      {/* grid-cols-[minmax(0,1fr)]: DialogContent is a CSS grid whose implicit
+          column is `auto` — sized by its widest child's min-content — so one
+          unbreakable line (a long evidence caption) used to widen the track past
+          max-w-3xl. A 0-min track keeps every child inside the box. */}
+      <DialogContent className="max-w-3xl grid-cols-[minmax(0,1fr)] sm:max-w-3xl">
         <DialogHeader>
           <DialogTitle className="flex items-center gap-2">
             <Headphones className="h-4 w-4" />
@@ -347,11 +351,11 @@ export function SpeakerPreviewDialog({
           >
             <ChevronLeft className="h-4 w-4" />
           </Button>
-          <div className="flex items-center gap-2 text-sm">
+          <div className="flex min-w-0 items-center gap-2 text-sm">
             <Badge variant="default">{defaultSpeakerLabel(speaker)}</Badge>
             {sourceChip(speaker)}
-            <span className="font-medium">{displayName}</span>
-            <span className="text-xs text-muted-foreground">
+            <span className="min-w-0 truncate font-medium">{displayName}</span>
+            <span className="shrink-0 text-xs text-muted-foreground">
               {lineCount} line{lineCount === 1 ? '' : 's'}
             </span>
           </div>
@@ -368,8 +372,8 @@ export function SpeakerPreviewDialog({
 
         {/* Inline name + description editing */}
         {canEdit && (
-          <div className="grid gap-2 sm:grid-cols-[1fr_2fr]">
-            <div>
+          <div className="grid min-w-0 gap-2 sm:grid-cols-[minmax(0,1fr)_minmax(0,2fr)]">
+            <div className="min-w-0">
               {editingName ? (
                 <UserPicker
                   mode="freeform"
@@ -420,7 +424,7 @@ export function SpeakerPreviewDialog({
                   </button>
                 </div>
               )}
-              <div className="mt-1.5 flex items-center gap-1.5 text-[11px] text-muted-foreground">
+              <div className="mt-1.5 flex min-w-0 items-start gap-1.5 text-[11px] text-muted-foreground">
                 {state.status === 'guess' ? (
                   guessIcon(state.suggestion?.source)
                 ) : state.status === 'confirmed' ? (
@@ -428,13 +432,13 @@ export function SpeakerPreviewDialog({
                 ) : state.status === 'group' ? (
                   <MicOff className="h-3 w-3 shrink-0" />
                 ) : null}
-                <span className="min-w-0 truncate" title={state.suggestion?.evidence}>
+                <span className="line-clamp-2 min-w-0 flex-1 break-words" title={state.caption}>
                   {state.caption}
                 </span>
                 {state.status === 'guess' && !editingName && (
                   <Button
                     size="sm"
-                    className="ml-auto h-6 shrink-0 px-2 text-[11px]"
+                    className="ml-auto h-6 shrink-0 self-start px-2 text-[11px]"
                     onClick={confirmGuess}
                     data-speaker-confirm-guess
                   >
@@ -448,6 +452,7 @@ export function SpeakerPreviewDialog({
               value={descDraft}
               placeholder="Context (role, voice, who they are — optional)"
               rows={2}
+              className="min-w-0"
               onChange={(e) => setDescDraft(e.target.value)}
               onBlur={commitDesc}
             />

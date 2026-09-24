@@ -1696,6 +1696,31 @@ export async function setSpeakerIdForUser(
   publishEvent({ kind: 'notes', assemblyaiId });
 }
 
+/**
+ * The post-completion hook's one-shot claim on the speaker-name passes:
+ * NULL -> 'running' in one statement, so exactly one of the requests that
+ * observe a completion runs the voiceprint + Meet-align + ID passes (the
+ * rest see a row that is no longer NULL and skip them). Flipping to
+ * 'running' this early is also what makes the page poll and the review
+ * dialog show "the AI is still identifying" during the voiceprint window,
+ * not only once the ID pass itself starts. True iff this call claimed it.
+ */
+export async function claimSpeakerId(userId: string, assemblyaiId: string): Promise<boolean> {
+  const rows = await sql`
+    UPDATE ${sql(SCHEMA)}.transcripts
+    SET speaker_id_status = 'running',
+        speaker_id_error = NULL,
+        speaker_id_at = now()
+    WHERE user_id = ${userId}
+      AND assemblyai_id = ${assemblyaiId}
+      AND speaker_id_status IS NULL
+    RETURNING 1
+  `;
+  if (rows.length === 0) return false;
+  publishEvent({ kind: 'notes', assemblyaiId });
+  return true;
+}
+
 export async function setAutoSegmentsForUser(
   userId: string,
   assemblyaiId: string,

@@ -92,10 +92,13 @@ export function speakerNameState(
   };
 }
 
-/** "guessed — 85% voice match, a hint not proof" / "guessed from the transcript — …evidence…". */
+/** "guessed — 85% voice match, a hint not proof[; the transcript agrees — …]" / "guessed from the transcript — …evidence…". */
 export function guessCaption(s: SpeakerSuggestion): string {
   if (s.source === 'voice' || (!s.source && s.confidence > 0 && !s.evidence)) {
-    return `guessed — ${Math.round(s.confidence * 100)}% voice match, a hint not proof`;
+    const base = `guessed — ${Math.round(s.confidence * 100)}% voice match, a hint not proof`;
+    // The ID pass agreed with the voice match and left its reasoning here.
+    const agreed = s.source === 'voice' ? (s.evidence ?? '').trim() : '';
+    return agreed ? `${base}; the transcript agrees — ${agreed}` : base;
   }
   const evidence = (s.evidence ?? '').trim();
   return evidence ? `guessed from the transcript — ${evidence}` : 'guessed from the transcript';

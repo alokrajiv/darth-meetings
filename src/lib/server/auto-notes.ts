@@ -11,6 +11,8 @@ import { getServerAccessToken } from '@/lib/server/google-oauth';
 import { fetchRecordingFromDrive, fetchRecordingFromTeams } from '@/lib/server/recording-fetch';
 import { findPeopleByEmails, searchPeople, type Person } from '@/db-ops/people';
 import { combineFlagOn } from '@/db-ops/clips';
+import { mergeIdPassGuesses } from '@/lib/speaker-id-merge';
+import { personNameKey } from '@/lib/person-identity';
 import { splitSpeakerLabel } from '@/lib/recording-clips';
 import {
   getForUser,
@@ -807,17 +809,34 @@ const SPEAKER_ID_PROMPT = `You are identifying the diarized speakers of a meetin
 Evidence, strongest first:
 - Transcript text: self-introductions, being addressed by name right before/after a turn ("thanks, Priya" / "Priya, can you…"), sign-offs, first-person claims that match a role in the people directory below.
 - The participant/people directory below: the true roster and spellings — speakers are almost always on it.
-- The search_people tool: the full company directory. Verify each name you intend to propose — a transcript often garbles names ("Blissy" for a person the directory spells differently), so search for likely variants and propose the CANONICAL directory spelling. A guess with no directory match may still be right (external guests) — propose it, but say so in the evidence and lower the confidence.
+- The search_people tool: the full company directory. Verify each name you intend to propose — a transcript often garbles names ("Blissy" for a person the directory spells differently), so search for likely variants and propose the CANONICAL directory person — written as their DISPLAY name ("Karnica Katiyar"), never an email local-part or login handle ("karnica.katiyar"). Where the tool prints a "display name", copy that. A guess with no directory match may still be right (external guests) — propose it, but say so in the evidence and lower the confidence.
 - Voiceprint hints below: weak signals to corroborate or reject, NOT ground truth — sub-70% matches are frequently wrong. Overrule them when text or video contradicts.
 - Video frames (when a grab_frames tool is available): the recording may show Meet name tiles, caption bylines, or a presenter's name on screen. YOU decide whether looking will help and how many frames are worth it (usually a handful). IMPORTANT: name tiles show who was IN the call, not which diarized voice is which — a meeting-room device shares one mic among several people. Use tiles for roster and exact spellings; bind a tile to a specific speaker letter only when the transcript supports the mapping (e.g. the named presenter is clearly the one narrating the demo).
 
 Output a single JSON object and NOTHING else:
 {"A": {"name": "Full Name", "confidence": 0.85, "evidence": "short concrete justification (quote, tile, hint corroboration)"}}
 - Keys are raw speaker letters — only ones NOT already confirmed by a human.
+- "name" is a display name: capitalised words separated by spaces, as a person would write it — never a login/handle with dots or underscores.
 - confidence is your own honest 0-1 estimate; include shaky guesses with low confidence rather than omitting them, but NEVER invent a name that appears nowhere in the evidence.
 - Omit speakers you have nothing for; output {} if none.
 
 `;
+
+/**
+ * The display form of a directory name that is really a login handle —
+ * "karnica.​katiyar" (the directory keeps some with a zero-width space) ->
+ * "Karnica Katiyar". Null when the name already looks like a display name
+ * (has a space, or no dot/underscore). The speaker-ID pass must propose the
+ * display form: a login spelling confirmed in the review dialog enrolls a
+ * second voiceprint for the same person.
+ */
+function loginDisplayName(name: string): string | null {
+  const bare = name.replace(/[\u200B-\u200D\u2060\uFEFF]/g, '').trim();
+  if (/\s/.test(bare) || !/[._]/.test(bare)) return null;
+  const key = personNameKey(bare);
+  if (!key) return null;
+  return key.replace(/(^| )(\p{L})/gu, (_m, sp: string, c: string) => sp + c.toUpperCase());
+}
 
 /**
  * In-process MCP server exposing the company people directory to the
@@ -830,7 +849,7 @@ function buildPeopleTools() {
     tools: [
       tool(
         'search_people',
-        'Search the company people directory by name fragment or email. Returns canonical name, email, team, and role for up to 8 matches. Use it to verify a name you intend to propose and to get its exact spelling.',
+        'Search the company people directory by name fragment or email. Returns name, email, team, and role for up to 8 matches — and, when the directory only holds a login handle ("karnica.katiyar"), the display name to propose instead. Use it to verify a name you intend to propose and to get its exact spelling.',
         {
           query: z.string().min(1).describe('Name fragment or email to look up'),
         },
@@ -841,10 +860,10 @@ function buildPeopleTools() {
               people.length === 0
                 ? `No directory matches for "${query}".`
                 : people
-                    .map(
-                      (p) =>
-                        `- ${p.name}${p.email ? ` <${p.email}>` : ''}${p.team ? ` — team: ${p.team}` : ''}${p.role ? `, role: ${p.role}` : ''}`
-                    )
+                    .map((p) => {
+                      const display = loginDisplayName(p.name);
+                      return `- ${p.name}${display ? ` (display name: ${display})` : ''}${p.email ? ` <${p.email}>` : ''}${p.team ? ` — team: ${p.team}` : ''}${p.role ? `, role: ${p.role}` : ''}`;
+                    })
                     .join('\n');
             return { content: [{ type: 'text' as const, text }] };
           } catch (err) {
@@ -903,6 +922,12 @@ export async function identifySpeakers(
   opts: {
     /** re-run even if a prior pass completed/stuck — sweeper recovery + manual retrigger */
     force?: boolean;
+    /**
+     * The caller (post-completion) already flipped speaker_id_status
+     * NULL -> 'running' with `claimSpeakerId` and owns this run, so a
+     * 'running' row is expected here rather than a reason to skip.
+     */
+    claimed?: boolean;
     triggeredBy?: { userId: string; email: string };
   } = {}
 ): Promise<void> {
@@ -911,11 +936,12 @@ export async function identifySpeakers(
 
   const row = await getForUser(ownerUserId, assemblyaiId);
   if (!row || row.status !== 'completed') return;
-  // Post-completion fires on every observing request — only the first run
-  // (or an explicit force) does the expensive pass. Errored passes also wait
-  // for a human (the "Guess names" button forces a retry) so a persistent
-  // failure can't burn tokens on every page view.
-  if (!opts.force && row.speaker_id_status != null) return;
+  // Only a caller that owns the run gets through: post-completion after
+  // winning `claimSpeakerId` (claimed — the row already reads 'running'), or
+  // an explicit force (sweeper recovery, "Guess names", link-event re-guess).
+  // Errored passes wait for a human (the "Guess names" button forces a
+  // retry) so a persistent failure can't burn tokens on every page view.
+  if (!opts.force && !opts.claimed) return;
 
   inFlight.add(key);
   try {
@@ -1010,28 +1036,12 @@ export async function identifySpeakers(
     // so a confident disagreement may override a weak voice match — but a
     // human-confirmed label is never touched.
     const current = (await getMappingsForUser(ownerUserId, assemblyaiId))?.suggestions ?? suggestions;
-    const merged: SpeakerSuggestionMap = { ...current };
-    let added = 0;
-    for (const [key, g] of Object.entries(guessed)) {
-      const sp = naming.resolve(key);
-      const name = typeof g?.name === 'string' ? g.name.trim().slice(0, 80) : '';
-      if (!sp || !name || named.has(sp) || !allSpeakers.has(sp)) continue;
-      const confidence = Math.max(0, Math.min(1, typeof g?.confidence === 'number' ? g.confidence : 0));
-      const existing = merged[sp];
-      if (existing?.source === 'voice') {
-        if (existing.name.trim().toLowerCase() === name.toLowerCase()) continue; // agreement — keep the voice badge
-        if (confidence < 0.7) continue; // not confident enough to overrule a voiceprint
-      }
-      merged[sp] = {
-        name,
-        confidence,
-        source: 'context',
-        via: 'id',
-        evidence: typeof g?.evidence === 'string' ? g.evidence.slice(0, 300) : undefined,
-      };
-      added++;
-    }
-    if (added > 0) await setSuggestionsForUser(ownerUserId, assemblyaiId, merged);
+    const { merged, added, changed } = mergeIdPassGuesses(current, guessed ?? {}, {
+      resolve: (k) => naming.resolve(k),
+      named,
+      allSpeakers,
+    });
+    if (changed) await setSuggestionsForUser(ownerUserId, assemblyaiId, merged);
 
     console.log(
       `[speaker-id] ${assemblyaiId}: identified ${added}/${unnamed.length} unnamed speaker(s) in ${Math.round((Date.now() - started) / 1000)}s` +

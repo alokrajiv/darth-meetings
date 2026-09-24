@@ -1,5 +1,5 @@
 import 'server-only';
-import { getForUser } from '@/db-ops/transcripts';
+import { claimSpeakerId, getForUser } from '@/db-ops/transcripts';
 import { getContentCached, identifySpeakers } from '@/lib/server/auto-notes';
 import { deleteAtAaiIfSafe } from '@/lib/server/aai-retention';
 import { maybeAutoReview } from '@/lib/server/auto-review';
@@ -19,9 +19,15 @@ import { dm, meetingLine, openLink, runKey } from '@/lib/server/dm-copy';
  * Fire-and-forget work that should happen once, when a transcript first
  * transitions to `completed`:
  *   0. delete the job at AssemblyAI once our copy is proven safe (DEC-4)
- *   1. voiceprint-match the diarized speakers and store name suggestions
- *   2. Meet↔AAI timeline alignment votes ('both'-mode imports)
- *   3. the speaker-identification AI pass (text + hints + video frames)
+ *   1. claim the speaker-name passes (speaker_id_status NULL -> 'running',
+ *      one atomic UPDATE — `claimSpeakerId`); steps 2-5 run only for the
+ *      request that won the claim
+ *   2. voiceprint-match the diarized speakers and store name suggestions
+ *   3. Meet↔AAI timeline alignment votes ('both'-mode imports)
+ *   4. the speaker-identification AI pass (text + hints + video frames)
+ *   5. auto-review for series-auto-imported rows
+ * The ready DM (and, with the combine flag, re-materialise/attach) run on
+ * every entry; they are deduped/idempotent on their own.
  * Notes are NOT generated here: they wait for a human to review the
  * suggested speaker labels ("confirm & generate" on the detail page).
  *
@@ -32,9 +38,17 @@ import { dm, meetingLine, openLink, runKey } from '@/lib/server/dm-copy';
  * inside a request (detail GET / listing GET polling AAI), so this is called
  * from those code paths and must never throw or block the response.
  *
- * Idempotence: the ID pass is guarded by speaker_id_status + an in-flight
- * set; suggestions are cheap and just overwrite. All no-op harmlessly if
- * re-triggered.
+ * Idempotence: the hook re-fires on every request that observes the
+ * completion, so the speaker passes are gated on the claim — the first
+ * entry flips speaker_id_status to 'running' and runs them, every later
+ * entry sees a non-NULL status and skips them (no second voiceprint pass
+ * queued behind the sidecar). Claiming BEFORE the voiceprint pass also means
+ * the page sees 'running' for the whole window, so it polls and the review
+ * dialog says the AI is still guessing. identifySpeakers writes the terminal
+ * 'completed'/'error'; if the process dies in between, the row stays
+ * 'running' and the notes-sweeper's stuck path re-runs it with force.
+ * A re-transcription into a new diarization space clears the status
+ * (transcriptions plan), so the hook can claim again.
  */
 export function onTranscriptCompleted(
   ownerUserId: string,
@@ -75,6 +89,14 @@ export function onTranscriptCompleted(
           (err) => console.warn('[post-completion] AAI delete failed:', err)
         );
 
+        // Step 1: only the entry that flips speaker_id_status NULL -> 'running'
+        // runs the speaker passes below. A failed claim (DB hiccup) leaves the
+        // row NULL, which the notes-sweeper picks up after its grace window.
+        const claimed = await claimSpeakerId(ownerUserId, assemblyaiId).catch((err) => {
+          console.warn('[post-completion] speaker-id claim failed:', err);
+          return false;
+        });
+
         // The payload and the media, from the DB through the resolver —
         // completion is the payload's only writer now.
         const [content, resolved] = await Promise.all([
@@ -107,56 +129,58 @@ export function onTranscriptCompleted(
           );
         }
 
-        // Voiceprint speaker suggestions (fast, seconds). AI notes are NOT
-        // auto-generated any more — the user triggers them from the detail
-        // page, so they can attach context (decks, pasted docs) first and
-        // review the transcript before spending the tokens.
-        await suggestSpeakersForTranscript(
-          ownerUserId,
-          full.assemblyai_id,
-          resolved.media /* every file: a combined meeting embeds each recording's voices from ITS OWN file (mediaForSpeaker) */,
-          content
-        ).catch((err) => console.warn('[post-completion] suggest failed:', err));
-
-        // Meet↔AAI alignment: when the import kept the Google Meet transcript
-        // as a sidecar ('both' mode), name diarized speakers by timeline
-        // overlap against Meet's named utterances. Runs after voiceprints —
-        // voice matches outrank overlap votes in the merge.
-        const meetT = full.gmeet_context?.meetTranscript;
-        if (
-          meetT?.utterances?.length &&
-          content?.utterances?.length &&
-          !full.assemblyai_id.startsWith('gmeet-')
-        ) {
-          await suggestSpeakersFromMeet(
+        if (claimed) {
+          // Voiceprint speaker suggestions (fast, seconds). AI notes are NOT
+          // auto-generated any more — the user triggers them from the detail
+          // page, so they can attach context (decks, pasted docs) first and
+          // review the transcript before spending the tokens.
+          await suggestSpeakersForTranscript(
             ownerUserId,
             full.assemblyai_id,
-            content,
-            meetT.utterances,
-            // The media, for the pooled-room release valve: when the rule is
-            // about to drop a name because it spans two diarized speakers,
-            // it can cut a few seconds of that name's own dense speech and
-            // ask the ECAPA sidecar whether it is one voice after all
-            // (lib/meet-align-valve.ts). Off unless
-            // MW_MEET_ALIGN_VOICE_VALVE is set; capped at 3 checks, ~2 s of
-            // CPU each, audio only, nothing enrolled.
-            { media: resolved.media, gmeetContext: full.gmeet_context ?? null }
-          ).catch((err) => console.warn('[post-completion] meet-align failed:', err));
+            resolved.media /* every file: a combined meeting embeds each recording's voices from ITS OWN file (mediaForSpeaker) */,
+            content
+          ).catch((err) => console.warn('[post-completion] suggest failed:', err));
+
+          // Meet↔AAI alignment: when the import kept the Google Meet transcript
+          // as a sidecar ('both' mode), name diarized speakers by timeline
+          // overlap against Meet's named utterances. Runs after voiceprints —
+          // voice matches outrank overlap votes in the merge.
+          const meetT = full.gmeet_context?.meetTranscript;
+          if (
+            meetT?.utterances?.length &&
+            content?.utterances?.length &&
+            !full.assemblyai_id.startsWith('gmeet-')
+          ) {
+            await suggestSpeakersFromMeet(
+              ownerUserId,
+              full.assemblyai_id,
+              content,
+              meetT.utterances,
+              // The media, for the pooled-room release valve: when the rule is
+              // about to drop a name because it spans two diarized speakers,
+              // it can cut a few seconds of that name's own dense speech and
+              // ask the ECAPA sidecar whether it is one voice after all
+              // (lib/meet-align-valve.ts). Off unless
+              // MW_MEET_ALIGN_VOICE_VALVE is set; capped at 3 checks, ~2 s of
+              // CPU each, audio only, nothing enrolled.
+              { media: resolved.media, gmeetContext: full.gmeet_context ?? null }
+            ).catch((err) => console.warn('[post-completion] meet-align failed:', err));
+          }
+
+          // Speaker-identification AI pass, AFTER the cheap passes so it can
+          // weigh their hints. `claimed` tells it the row's 'running' is ours.
+          await identifySpeakers(ownerUserId, full.assemblyai_id, { claimed: true }).catch((err) =>
+            console.warn('[post-completion] speaker-id failed:', err)
+          );
+
+          // Series-auto-imported rows only: when every speaker that matters is
+          // identified with high confidence, apply the names and generate the
+          // configured summary/report unattended; otherwise DM the owner to
+          // come review. No-op without the gmeet_context.autoImport marker.
+          await maybeAutoReview(ownerUserId, full.assemblyai_id, observed?.transcriptionId).catch(
+            (err) => console.warn('[post-completion] auto-review failed:', err)
+          );
         }
-
-        // Speaker-identification AI pass, AFTER the cheap passes so it can
-        // weigh their hints. Guarded by speaker_id_status — runs once.
-        await identifySpeakers(ownerUserId, full.assemblyai_id).catch((err) =>
-          console.warn('[post-completion] speaker-id failed:', err)
-        );
-
-        // Series-auto-imported rows only: when every speaker that matters is
-        // identified with high confidence, apply the names and generate the
-        // configured summary/report unattended; otherwise DM the owner to
-        // come review. No-op without the gmeet_context.autoImport marker.
-        await maybeAutoReview(ownerUserId, full.assemblyai_id, observed?.transcriptionId).catch(
-          (err) => console.warn('[post-completion] auto-review failed:', err)
-        );
 
         // Hand-started work (drag-drop upload, manual import): tell the
         // owner it's done so they can close the tab and come back on the

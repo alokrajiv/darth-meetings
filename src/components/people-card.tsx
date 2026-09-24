@@ -359,11 +359,14 @@ function VoiceRow({
 }) {
   const evidenceTitle =
     s.status === 'guess'
-      ? s.suggestion?.evidence
-        ? `Evidence: ${s.suggestion.evidence}`
-        : s.suggestion
-          ? `${Math.round(s.suggestion.confidence * 100)}% voice match — a hint, not proof`
-          : undefined
+      ? s.suggestion?.source === 'voice'
+        ? `${Math.round(s.suggestion.confidence * 100)}% voice match — a hint, not proof` +
+          (s.suggestion.evidence ? `; the transcript agrees — ${s.suggestion.evidence}` : '')
+        : s.suggestion?.evidence
+          ? `Evidence: ${s.suggestion.evidence}`
+          : s.suggestion
+            ? `${Math.round(s.suggestion.confidence * 100)}% voice match — a hint, not proof`
+            : undefined
       : s.status === 'group'
         ? `Labelled “${s.name}” — a shared mic, not a person`
         : s.description || (canEdit ? 'Double-click to edit' : undefined);
