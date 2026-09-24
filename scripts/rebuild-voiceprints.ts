@@ -98,6 +98,7 @@ interface WalkStats {
   skippedGroup: number;
   skippedNoContent: number;
   skippedNoMedia: number;
+  skippedTranscriptOnly: number;
   skippedMissingFile: number;
   skippedNoSegment: number;
   skippedDuplicateAudio: number;
@@ -106,7 +107,7 @@ interface WalkStats {
 
 function emptyStats(): WalkStats {
   return {
-    labels: 0, embedded: 0, cacheHits: 0, skippedGroup: 0, skippedNoContent: 0, skippedNoMedia: 0,
+    labels: 0, embedded: 0, cacheHits: 0, skippedGroup: 0, skippedNoContent: 0, skippedNoMedia: 0, skippedTranscriptOnly: 0,
     skippedMissingFile: 0, skippedNoSegment: 0, skippedDuplicateAudio: 0, failed: 0,
   };
 }
@@ -130,7 +131,7 @@ function buildReport(allBefore: OldRow[], after: AggregatedIdentity[], stats: Wa
   out.push('== walk ==');
   out.push(
     `labels ${stats.labels} · embedded ${stats.embedded} (cache hits ${stats.cacheHits}) · ` +
-      `skipped: group ${stats.skippedGroup}, no content ${stats.skippedNoContent}, no media ${stats.skippedNoMedia}, ` +
+      `skipped: group ${stats.skippedGroup}, no content ${stats.skippedNoContent}, no media ${stats.skippedNoMedia}, transcript-only import ${stats.skippedTranscriptOnly}, ` +
       `file missing ${stats.skippedMissingFile}, no ≥1.5s segment ${stats.skippedNoSegment}, ` +
       `duplicate audio ${stats.skippedDuplicateAudio}, embed failed ${stats.failed}`
   );
@@ -285,8 +286,11 @@ const refs = await sql<MappingRef[]>`
     AND t.deleted_at IS NULL
     AND jsonb_typeof(m.speaker_labels) = 'array'
     AND jsonb_array_length(m.speaker_labels) > 0
-  ORDER BY t.created_at ASC, t.id ASC
+  ORDER BY t.created_at DESC, t.id DESC
 `;
+// Newest first so a `--limit N` smoke test walks meetings that HAVE audio —
+// the oldest rows are Meet-transcript-only imports (`gmeet-…` ids, no file),
+// and a 2026-09-24 `--limit 50` dry run read as "no media ×50" because of it.
 
 const eligible = refs.flatMap((r) =>
   (r.speaker_labels ?? [])
@@ -325,7 +329,12 @@ for (const item of eligible) {
     const { content, media } = loaded.content;
     if (!content?.utterances?.length) { stats.skippedNoContent++; continue; }
     const from = mediaForSpeaker(media, item.speaker);
-    if (!from) { stats.skippedNoMedia++; continue; }
+    if (!from) {
+      // Meet/Teams transcript-only imports carry names but no audio: expected, not a fault.
+      if (item.ref.assemblyai_id.startsWith('gmeet-') || item.ref.assemblyai_id.startsWith('teams-')) stats.skippedTranscriptOnly++;
+      else stats.skippedNoMedia++;
+      continue;
+    }
     const audioPath = audioPathFor(from);
     if (!audioPath || !existsSync(audioPath)) { stats.skippedMissingFile++; continue; }
 
