@@ -1,8 +1,10 @@
 import 'server-only';
 import {
+  pruneCalendarEventsNotSeen,
   upsertCalendarEvents,
   type CalendarEventUpsert,
 } from '@/db-ops/calendar-event-cache';
+import { listingCoversWindow } from '@/lib/calendar-listing';
 import {
   getMeetingCacheByKeys,
   getMeetingCacheByMeetings,
@@ -115,6 +117,10 @@ export interface CalendarListParams {
    * `accessRole` for the caller on that calendar (`freeBusyReader` →
    * time blocks only, `reader`/`writer`/`owner` → full details). */
   meta?: { accessRole?: string };
+  /** Filled by the listing: whether it stopped early (page cap with a
+   * nextPageToken left, or a later page failed). Feeds the prune gate
+   * (lib/calendar-listing listingCoversWindow). */
+  outcome?: { truncated: boolean; pageFailed: boolean };
 }
 
 /**
@@ -135,6 +141,10 @@ export async function listCalendarEvents(
   // for accessRole (free/busy vs full details).
   const fields = calendarId ? `accessRole,${CAL_FIELDS}` : CAL_FIELDS;
   const calPath = calendarId ? encodeURIComponent(calendarId) : 'primary';
+  if (params.outcome) {
+    params.outcome.truncated = false;
+    params.outcome.pageFailed = false;
+  }
   for (let p = 0; p < maxPages; p++) {
     const q = new URLSearchParams({
       timeMin: params.timeMin,
@@ -155,6 +165,7 @@ export async function listCalendarEvents(
     });
     if (!res.ok) {
       if (p === 0) throw new CalendarListError(res.status);
+      if (params.outcome) params.outcome.pageFailed = true;
       break;
     }
     const j = (await res.json()) as {
@@ -169,6 +180,8 @@ export async function listCalendarEvents(
     }
     pageToken = j.nextPageToken;
     if (!pageToken) break;
+    // Page cap reached with more pages on Google's side: partial window.
+    if (p === maxPages - 1 && params.outcome) params.outcome.truncated = true;
   }
   return out;
 }
@@ -269,35 +282,75 @@ export function toCalendarUpsert(e: DiscoveredEvent): CalendarEventUpsert {
 }
 
 /** Write calendar events into the caller's per-user cache. Never throws — a
- * cache write failure must not break discovery. */
+ * cache write failure must not break discovery. Returns the written event
+ * keys, or null when the write failed (the sweep then must not prune). */
 export async function persistCalendarEvents(
   userId: string,
   events: readonly DiscoveredEvent[]
-): Promise<void> {
+): Promise<string[] | null> {
   try {
-    await upsertCalendarEvents(userId, events.filter(isCacheableEvent).map(toCalendarUpsert));
+    const ups = events.filter(isCacheableEvent).map(toCalendarUpsert);
+    await upsertCalendarEvents(userId, ups);
+    return ups.map((u) => u.eventKey);
   } catch (err) {
     console.warn('[discovery] calendar cache write failed for', userId, err);
+    return null;
   }
 }
 
 /**
- * Calendar window for one user: fetch + write back. Used by the poller
- * (−7d→+24h), the dialog day/sync views (via /api/calendar/discover) and
- * anything else that wants "what's on the calendar" — there is no other
- * Calendar listing path.
+ * Calendar window for one user: fetch + write back + prune. Used by the
+ * poller (−7d→+24h, and the 60-day Teams backfill), the calendar page
+ * (/api/calendar/events), the dialog day/sync views (/api/calendar/discover)
+ * and anything else that wants "what's on the calendar" — there is no other
+ * Calendar listing path that persists.
+ *
+ * Prune: a moved or cancelled occurrence gets a NEW `<eventId>|<startIso>`
+ * key (or none), and the old row used to linger forever — the listing
+ * showed the meeting at its old time too. When the listing provably covered
+ * the whole window (every page, no failed page, unfiltered primary
+ * calendar — listingCoversWindow) and the write-back succeeded, rows in the
+ * window that this sweep did not return are deleted. `sweepStartedAt` is
+ * taken BEFORE the listing so a concurrent sweep's fresh rows survive.
+ * Never prunes on a listing error (that throws before reaching here).
  */
 export async function syncCalendarWindow(
   userId: string,
   token: string,
-  window: { from: string; to: string; maxPages?: number }
+  window: { from: string; to: string; maxPages?: number },
+  opts: { label?: string } = {}
 ): Promise<DiscoveredEvent[]> {
+  const sweepStartedAt = new Date();
+  const outcome = { truncated: false, pageFailed: false };
   const events = await listCalendarEvents(token, {
     timeMin: window.from,
     timeMax: window.to,
     maxPages: window.maxPages,
+    outcome,
   });
-  await persistCalendarEvents(userId, events);
+  const writtenKeys = await persistCalendarEvents(userId, events);
+  if (writtenKeys && listingCoversWindow(outcome)) {
+    try {
+      const removed = await pruneCalendarEventsNotSeen(
+        userId,
+        new Date(window.from),
+        new Date(window.to),
+        sweepStartedAt,
+        writtenKeys
+      );
+      if (removed > 0) {
+        console.log(
+          `[discovery] calendar prune ${opts.label ?? userId}: removed ${removed} moved/cancelled row(s) in ${window.from}..${window.to}`
+        );
+      }
+    } catch (err) {
+      console.warn('[discovery] calendar prune failed for', opts.label ?? userId, err);
+    }
+  } else if (writtenKeys && (outcome.truncated || outcome.pageFailed)) {
+    console.debug(
+      `[discovery] calendar prune skipped for ${opts.label ?? userId}: listing ${outcome.truncated ? 'truncated' : 'partial'} in ${window.from}..${window.to}`
+    );
+  }
   return events;
 }
 
@@ -754,13 +807,15 @@ export interface DiscoverWindowResult {
 export async function discoverWindow(
   userId: string,
   token: string,
-  opts: { from: string; to: string; meetOnly?: boolean; maxPages?: number }
+  opts: { from: string; to: string; meetOnly?: boolean; maxPages?: number; label?: string }
 ): Promise<DiscoverWindowResult> {
+  // meetOnly filters the RETURNED rows only — the listing itself is
+  // unfiltered, so the sweep's prune gate is unaffected.
   const events = await syncCalendarWindow(userId, token, {
     from: opts.from,
     to: opts.to,
     maxPages: opts.maxPages,
-  });
+  }, { label: opts.label });
   const rows: DiscoveredRow[] = events
     // Meetings only — all-day events have no dateTime.
     .filter((e) => e.start?.dateTime)

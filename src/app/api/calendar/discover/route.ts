@@ -49,6 +49,7 @@ export const GET = withAuth(async ({ user, request }) => {
       from: new Date(fromMs).toISOString(),
       to: new Date(toMs).toISOString(),
       meetOnly: sp.get('meetOnly') === '1',
+      label: user.email,
     });
     const body: DiscoverWindowResponse = {
       rows: result.rows,

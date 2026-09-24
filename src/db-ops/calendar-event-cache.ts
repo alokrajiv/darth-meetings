@@ -114,6 +114,49 @@ export async function upsertCalendarEvents(
 }
 
 /**
+ * Delete this user's cached rows in [windowStart, windowEnd) that the sweep
+ * which started at `sweepStartedAt` did not see — events moved out of their
+ * slot (new start = new key) or cancelled/deleted. Only call after a listing
+ * that covered the WHOLE window (meeting-discovery syncCalendarWindow gates
+ * this). Returns the number of rows removed.
+ *
+ * Window = Google's own events.list semantics (start < timeMax AND
+ * end > timeMin), restricted to rows that START inside the window: a row
+ * starting before windowStart may belong to a longer event another window
+ * owns. The `end > windowStart` arm keeps a zero-length event sitting
+ * exactly on windowStart (Google does not return it for this window).
+ *
+ * Belt and braces against app↔DB clock skew: `last_seen_at` is the DB's
+ * now() while `sweepStartedAt` is the app clock, so the keys this sweep
+ * just wrote are excluded explicitly — a skewed clock can never delete the
+ * sweep's own rows; it can at worst delete a concurrent sweep's fresh row,
+ * which that calendar's next sweep writes back.
+ *
+ * Nothing references these rows by foreign key: mutes (calendar_event_mutes
+ * 'occurrence' value = event_key), gmeet_sync_skips and gmeet_reminders are
+ * soft string matches that simply stop matching for a moved occurrence.
+ */
+export async function pruneCalendarEventsNotSeen(
+  userId: string,
+  windowStart: Date,
+  windowEnd: Date,
+  sweepStartedAt: Date,
+  keepKeys: readonly string[] = []
+): Promise<number> {
+  if (!(windowStart < windowEnd)) return 0;
+  const res = await sql`
+    DELETE FROM ${sql(SCHEMA)}.calendar_event_cache
+    WHERE user_id = ${userId}
+      AND event_start >= ${windowStart}
+      AND event_start <  ${windowEnd}
+      AND COALESCE(event_end, event_start) > ${windowStart}
+      AND last_seen_at < ${sweepStartedAt}
+      AND NOT (event_key = ANY(${keepKeys as string[]}::text[]))
+  `;
+  return res.count;
+}
+
+/**
  * The caller's own cached calendar row for a Meet occurrence → its classified
  * attachments (the poller persists them per event, migration 026). Lets a
  * probe that arrives without the live event (listing "Check…", API callers)

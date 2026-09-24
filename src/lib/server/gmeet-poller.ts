@@ -468,7 +468,7 @@ async function sweepTeamsChatForUser(
         from: new Date(now - CHAT_BACKFILL_DAYS * 86_400_000).toISOString(),
         to: new Date(now - LOOKBACK_DAYS * 86_400_000).toISOString(),
         maxPages: 20,
-      });
+      }, { label: caller.email });
       backfill = await sweepTeamsChatEvents(
         caller,
         chatCandidatesOf(bfEvents, mutedKeys, now),
@@ -522,7 +522,7 @@ async function sweepUser(account: GoogleAccountRow): Promise<void> {
     syncCalendarWindow(userId, token, {
       from: new Date(Date.now() - LOOKBACK_DAYS * 86_400_000).toISOString(),
       to: new Date(Date.now() + LOOKAHEAD_H * 3_600_000).toISOString(),
-    }).catch((err: unknown) => {
+    }, { label: account.user_email }).catch((err: unknown) => {
       if (err instanceof CalendarListError) {
         calendarFailed = err;
         return [];

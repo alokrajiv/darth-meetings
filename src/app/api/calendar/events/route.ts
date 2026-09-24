@@ -284,7 +284,7 @@ export const GET = withAuth(async ({ user, request }) => {
     } else {
       try {
         // 250 events per page; 8 pages cover a busy year.
-        const events = await syncCalendarWindow(user.userId, minted.token, { from: fromIso, to: toIso, maxPages: 8 });
+        const events = await syncCalendarWindow(user.userId, minted.token, { from: fromIso, to: toIso, maxPages: 8 }, { label: user.email });
         sync.ran = true;
         sync.fetched = events.length;
       } catch (err) {
