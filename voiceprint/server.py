@@ -52,7 +52,8 @@ MODEL_DIR = os.environ.get(
 # long segments add latency without accuracy. 3s..20s is the sweet spot.
 MIN_SEGMENT_MS = 1000
 MAX_SEGMENT_MS = 20000
-MAX_SEGMENTS = 8
+# 12, not 8: the app now picks by a ~90 s speech budget (lib/voiceprint-math.ts).
+MAX_SEGMENTS = 12
 
 _model = None
 _model_lock = threading.Lock()

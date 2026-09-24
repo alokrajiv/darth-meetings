@@ -27,6 +27,12 @@ import type {
  */
 
 import { isGroupLabel } from '@/lib/speaker-name-kind';
+import { samePerson } from '@/lib/person-identity';
+import {
+  formatVerdict,
+  pickSpeechByBudget,
+  type SpeakerVerdict,
+} from '@/lib/voiceprint-math';
 
 const SIDECAR_URL = process.env.MW_VOICEPRINT_URL || 'http://127.0.0.1:3004';
 
@@ -42,20 +48,11 @@ const THRESHOLD = Number(process.env.MW_VOICEPRINT_THRESHOLD || '0.5');
 /** Require the best match to beat the runner-up by this margin (ambiguity guard). */
 const MARGIN = 0.05;
 
-/**
- * Free-text naming created duplicate identities ("Ivan" vs "Ivan Seow",
- * "Kawen" vs "Kawen Koh", "LiXuan" vs "Li Xuan"). The margin guard must not
- * treat two spellings of the same human as competing candidates — that
- * suppressed a 0.81 match because the duplicate scored 0.77.
- */
-function sameIdentity(a: string, b: string): boolean {
-  const na = a.trim().toLowerCase();
-  const nb = b.trim().toLowerCase();
-  if (na === nb) return true;
-  if (na.replace(/\s+/g, '') === nb.replace(/\s+/g, '')) return true; // "LiXuan" / "Li Xuan"
-  if (na.startsWith(nb) || nb.startsWith(na)) return true; // "ivan seow" / "ivan"
-  return na.split(/\s+/)[0] === nb.split(/\s+/)[0]; // same first name
-}
+// Free-text naming created duplicate identities ("Ivan" / "Ivan Seow",
+// "karnica.katiyar" / "Karnica Katiyar"). The margin guard must not treat two
+// spellings of one human as rival candidates — `samePerson`
+// (lib/person-identity.ts) is that rule; it also lets two rows sharing a
+// personNameKey coexist until scripts/rebuild-voiceprints.ts folds them.
 
 interface Segment {
   start_ms: number;
@@ -107,8 +104,10 @@ export function mediaForSpeaker(media: VoiceprintMedia, speaker: string): Resolv
 
 /**
  * Pick the best utterances for a speaker: longest first (more speech = more
- * stable embedding), capped at 6 segments. The sidecar further caps each
- * segment at 20s.
+ * stable embedding) until ~90 s of speech or 12 segments
+ * (`pickSpeechByBudget`, lib/voiceprint-math.ts). The sidecar further caps
+ * each segment at 20s. `seconds` is the speech actually sent — enrolment
+ * weights the sample by it.
  *
  * Utterance times are MEETING time; the sidecar slices a FILE. `media` is
  * what the resolver says that file is, so its `offsetMs` converts between
@@ -117,21 +116,23 @@ export function mediaForSpeaker(media: VoiceprintMedia, speaker: string): Resolv
  * being assumed). In a combined meeting the file is the SPEAKER's recording,
  * so `localMsIn` maps through that clip's placement, not the primary's.
  */
-function pickSegments(
+export function pickSegments(
   content: TranscriptResponse,
   speaker: string,
   media: ResolvedMedia
-): Segment[] {
-  const utterances = (content.utterances ?? []).filter(
-    (u) => u.speaker === speaker && u.end - u.start >= 1500
-  );
-  return utterances
-    .sort((a, b) => (b.end - b.start) - (a.end - a.start))
-    .slice(0, 6)
-    .map((u) => ({ start_ms: localMsIn(media, u.start), end_ms: localMsIn(media, u.end) }));
+): { segments: Segment[]; seconds: number; longestMs: number } {
+  const picked = pickSpeechByBudget(content.utterances ?? [], speaker);
+  return {
+    segments: picked.utterances.map((u) => ({
+      start_ms: localMsIn(media, u.start),
+      end_ms: localMsIn(media, u.end),
+    })),
+    seconds: picked.seconds,
+    longestMs: picked.longestMs,
+  };
 }
 
-async function embedViaSidecar(
+export async function embedViaSidecar(
   audioPath: string,
   segments: Segment[]
 ): Promise<number[] | null> {
@@ -163,7 +164,7 @@ function cosine(a: number[], b: number[]): number {
   return dot / (Math.sqrt(na) * Math.sqrt(nb) || 1);
 }
 
-function audioPathFor(media: ResolvedMedia | null): string | null {
+export function audioPathFor(media: ResolvedMedia | null): string | null {
   if (!media) return null;
   try {
     return resolveAudioPath(media.filename);
@@ -203,11 +204,13 @@ export async function enrollFromTranscript(
       const from = mediaForSpeaker(media, label.originalSpeaker);
       const audioPath = audioPathFor(from);
       if (!audioPath || !from) continue;
-      const segments = pickSegments(content, label.originalSpeaker, from);
+      const { segments, seconds } = pickSegments(content, label.originalSpeaker, from);
       const embedding = await embedViaSidecar(audioPath, segments);
       if (embedding) {
-        await enrollSample(name, embedding);
-        console.log(`[voiceprint] enrolled sample for "${name}" (speaker ${label.originalSpeaker})`);
+        await enrollSample(name, embedding, seconds);
+        console.log(
+          `[voiceprint] enrolled sample for "${name}" (speaker ${label.originalSpeaker}, ${seconds.toFixed(0)}s)`
+        );
       }
     } catch (err) {
       console.warn(`[voiceprint] enroll failed for "${name}":`, err);
@@ -236,27 +239,46 @@ export async function suggestSpeakersForTranscript(
 
   const speakers = [...new Set(content.utterances.map((u) => u.speaker))];
   const suggestions: SpeakerSuggestionMap = {};
+  const verdicts: string[] = [];
 
   for (const speaker of speakers) {
+    let verdict: SpeakerVerdict = { kind: 'error' };
     try {
       // Each recording's snippets come out of ITS file. A label with no
       // prefix is a single-recording meeting and resolves to the canonical,
       // exactly as before.
       const from = mediaForSpeaker(media, speaker);
       const audioPath = audioPathFor(from);
-      if (!audioPath || !from) continue;
-      const segments = pickSegments(content, speaker, from);
+      if (!audioPath || !from) {
+        verdict = { kind: 'no-media' };
+        continue;
+      }
+      const { segments, longestMs } = pickSegments(content, speaker, from);
+      if (segments.length === 0) {
+        verdict = { kind: 'no-segment', longestMs };
+        continue;
+      }
       const embedding = await embedViaSidecar(audioPath, segments);
-      if (!embedding) continue;
+      if (!embedding) {
+        verdict = { kind: 'no-segment', longestMs };
+        continue;
+      }
 
       const scored = voiceprints
         .map((vp) => ({ name: vp.name, score: cosine(embedding, vp.embedding) }))
         .sort((a, b) => b.score - a.score);
 
       const best = scored[0]!;
-      // Runner-up for the margin check = best-scoring *distinct person*.
-      const second = scored.find((s) => !sameIdentity(s.name, best.name));
-      if (best.score >= THRESHOLD && (!second || best.score - second.score >= MARGIN)) {
+      // Runner-up for the margin check = best-scoring *distinct person*. Two
+      // rows of one human (legacy name_key spellings awaiting the rebuild)
+      // are `samePerson` and never compete.
+      const second = scored.find((s) => !samePerson(s.name, best.name));
+      if (best.score < THRESHOLD) {
+        verdict = { kind: 'below-threshold', best };
+      } else if (second && best.score - second.score < MARGIN) {
+        verdict = { kind: 'margin', best, second };
+      } else {
+        verdict = { kind: 'match', name: best.name, score: best.score };
         suggestions[speaker] = {
           name: best.name,
           confidence: Math.round(best.score * 100) / 100,
@@ -265,8 +287,11 @@ export async function suggestSpeakersForTranscript(
       }
     } catch (err) {
       console.warn(`[voiceprint] suggest failed for speaker ${speaker}:`, err);
+    } finally {
+      verdicts.push(formatVerdict(speaker, verdict));
     }
   }
+  console.log(`[voiceprint] ${assemblyaiId} verdicts: ${verdicts.join(' · ')}`);
 
   // Preserve context-source suggestions (from Claude's transcript reading)
   // for speakers the voice pass has no opinion on; voice wins on overlap.
