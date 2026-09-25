@@ -2,6 +2,7 @@ import AppKit
 import AVFoundation
 import ScreenCaptureKit
 import RecorderCore
+import TrayLogic
 
 /// One recording = one id, one folder, N segments, three tracks per segment.
 ///
@@ -369,6 +370,7 @@ final class RecordingController {
             if wid != lastVideoWriter || n != lastVideoCount { lastVideoAt = now }
             lastVideoWriter = wid; lastVideoCount = n
         }
+        micDeadTick()
         let h = health()
         for (track, ok) in [("video", h.videoOK), ("system", h.systemOK), ("mic", h.micOK)] {
             guard let ok else { continue }
@@ -412,7 +414,9 @@ final class RecordingController {
             else { h.systemOK = true }
         }
         if options.mic {
-            if let m = mic { h.micOK = audioMute.mic ? true : m.meter.secondsSinceAudible < Self.MIC_SILENT_S } else { h.micOK = false }
+            if let m = mic {
+                h.micOK = audioMute.mic ? true : (micDead.condition == nil && m.meter.secondsSinceAudible < Self.MIC_SILENT_S)
+            } else { h.micOK = false }
         }
         return h
     }
@@ -423,7 +427,7 @@ final class RecordingController {
         var parts: [String] = []
         func tick(_ ok: Bool?) -> String { ok == nil ? "–" : (ok! ? "✓" : "✗") }
         if currentSource?.isAudioOnly != true { parts.append("video \(tick(h.videoOK))") }
-        if options.mic { parts.append(audioMute.mic ? "mic off" : "mic \(tick(h.micOK))") }
+        if options.mic { parts.append(audioMute.mic ? "mic off" : (micDead.condition != nil ? "mic ✗ DEAD" : "mic \(tick(h.micOK))")) }
         if options.systemAudio {
             // Quiet system audio outside a call is neutral, not a fault.
             let quiet = audioStream != nil && !(call != nil && !callOver) && !systemMeter.audible
@@ -460,6 +464,7 @@ final class RecordingController {
             m["device"] = mic?.deviceJSON ?? NSNull()          // 0.3.16
             m["muted"] = audioMute.mic                         // 0.3.17
             d["mic"] = m
+            d["mic_dead"] = micDeadJSON()                      // 0.3.18
         }
         return d
     }
@@ -750,6 +755,7 @@ final class RecordingController {
         errorRolls = 0
         lastVideoAt = Date()
         healthTimer?.invalidate()
+        resetMicDead()
         healthTimer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in self?.healthTick() }
         healthTimer?.tolerance = 0.2
         if case .window(let id, _) = source { lastWindowFrame = ShareDetector.windowFrame(id) }
@@ -1190,8 +1196,115 @@ final class RecordingController {
         micFormatLabel = mic?.formatLabel
         micHardwareLabel = mic?.hardwareFormatLabel
         micProcessing = mic?.voiceProcessing
+        // 0.3.18: a dead-mic fallback / re-detect already has its own banner that must stay up.
+        if micDeadOwnsRestart { micDeadOwnsRestart = false; return }
         guard from != to, let to else { return }
         onNotice?("Microphone changed", "Now capturing from \(to)\(from.map { " (was \($0))" } ?? "")")
+    }
+
+    // MARK: dead microphone (0.3.18)
+    //
+    // 2026-09-25 16:05 SGT: the mic was hand-switched to "Microsoft Teams Audio" (a loopback
+    // driver) and a 48-minute call recorded digital silence on the mic track while the other
+    // side was audible throughout. The decision is `MicDeadDetector` (TrayLogic, unit-tested);
+    // this feeds it once a second from the health tick and hands a detection to the app
+    // (`onMicDead`), which owns the pick and the banner.
+
+    private var micDead = MicDeadDetector()
+    private var micDeadSystemAudibleSeen = 0
+    /// Set just before a dead-mic fallback / re-detect restarts the capture: the "Microphone
+    /// changed" notice of that restart would replace the banner that must stay up.
+    private var micDeadOwnsRestart = false
+    /// What the app did about the last detection ("fallback" | "redetect" | "told"), for status.
+    private(set) var micDeadLastAction: String?
+    private var micDeadLastDevice: String?
+    /// Main queue: (detection, the device it happened on).
+    var onMicDead: ((MicDeadDetector.Detection, String?) -> Void)?
+
+    private func resetMicDead() {
+        micDead = MicDeadDetector()
+        micDeadSystemAudibleSeen = systemMeter.audibleSeconds
+        micDeadLastAction = nil; micDeadLastDevice = nil; micDeadOwnsRestart = false
+        _ = mic?.takeTickStats()
+    }
+
+    private func micDeadTick() {
+        let stats = mic?.takeTickStats() ?? (buffers: 0, peakDb: -120, rmsDb: -120)
+        let sysSeen = systemMeter.audibleSeconds
+        let systemAudible = sysSeen != micDeadSystemAudibleSeen
+        micDeadSystemAudibleSeen = sysSeen
+        let k = MicDeadDetector.Tick(
+            t: ProcessInfo.processInfo.systemUptime, active: options.mic && mic != nil, muted: audioMute.mic,
+            micRestarts: mic?.restarts ?? 0, micBuffers: stats.buffers, micPeakDb: stats.peakDb, micRmsDb: stats.rmsDb,
+            systemLive: systemAudioLive && audioStream != nil, systemAudible: systemAudible)
+        guard let d = micDead.tick(k) else { return }
+        let device = mic?.deviceName
+        micDeadLastDevice = device
+        EventLog.shared.log("mic_dead_detected", [
+            "recording_id": recordingId ?? "", "reason": d.reason.rawValue, "device": device ?? NSNull(),
+            "device_label": mic?.deviceLabel ?? NSNull(), "mode": micDeviceUID == nil ? "auto" : "manual",
+            "silent_s": d.silentSeconds, "system_audible_s": d.systemAudibleSeconds, "follow_up": d.followUp,
+            "simulated": mic?.simulatedDead?.rawValue ?? NSNull(),
+            "at_s": Int(Date().timeIntervalSince(startedAt ?? Date())),
+        ], summary: "mic: DEAD\(d.followUp ? " (still, after a re-detect)" : "") — \(d.reason.rawValue) on \(device ?? "?") for \(d.silentSeconds) s, system audible \(d.systemAudibleSeconds) s of the last minute")
+        onMicDead?(d, device)
+    }
+
+    /// The dead mic was a manual pick: back to Automatic (the app has already cleared the pref).
+    /// Returns the device the capture is moving to.
+    func micDeadFallback(from: String?) -> String {
+        guard state == .recording, mic != nil else { return "not recording" }
+        micDeadOwnsRestart = true
+        let to = AudioDevices.defaultInputID.flatMap { AudioDevices.name(of: $0) } ?? "the system default"
+        let out = switchMicDevice(uid: nil, name: "Automatic", how: "mic_dead")
+        // A restart that fails never reports back — do not let the flag eat a later, real notice.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 10) { [weak self] in self?.micDeadOwnsRestart = false }
+        micDeadLastAction = "fallback"
+        EventLog.shared.log("mic_dead_fallback", ["recording_id": recordingId ?? "", "from": from ?? NSNull(), "to": to, "outcome": out],
+                            summary: "mic: dead mic \(from ?? "?") → Automatic (\(to))")
+        return to
+    }
+
+    /// The dead mic was already Automatic: restart it on whatever the default is now, and look
+    /// again in 30 s.
+    func micDeadRedetect() -> String {
+        guard state == .recording, mic != nil else { return "not recording" }
+        micDeadOwnsRestart = true
+        let out = redetectMic(how: "mic_dead")
+        // A restart that fails never reports back — do not let the flag eat a later, real notice.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 10) { [weak self] in self?.micDeadOwnsRestart = false }
+        micDead.armFollowUp(at: ProcessInfo.processInfo.systemUptime)
+        micDeadLastAction = "redetect"
+        EventLog.shared.log("mic_dead_redetect", ["recording_id": recordingId ?? "", "device": micDeadLastDevice ?? NSNull(), "outcome": out])
+        return out
+    }
+
+    func micDeadTold() { micDeadLastAction = "told" }
+
+    /// ws `simulate_mic_dead {mode: "zero"|"quiet"|"low"|null}`.
+    func simulateMicDead(_ mode: String?) -> String {
+        guard state == .recording, let m = mic else { return "not recording with a microphone" }
+        guard mode == nil || MicCapture.SimulatedDead(rawValue: mode!) != nil else { return "unknown mode \(mode!)" }
+        m.simulatedDead = mode.flatMap { MicCapture.SimulatedDead(rawValue: $0) }
+        rlog("TEST — simulate_mic_dead \(mode ?? "off")")
+        EventLog.shared.log("test_simulate_mic_dead", ["recording_id": recordingId ?? "", "mode": mode ?? NSNull()])
+        return "simulated dead mic: \(mode ?? "off")"
+    }
+
+    func micDeadJSON() -> [String: Any] {
+        let c = micDead.condition
+        var d: [String: Any] = [
+            "active": c != nil, "reason": c?.reason.rawValue ?? NSNull(), "silent_s": c?.silentSeconds ?? 0,
+            "system_audible_s": c?.systemAudibleSeconds ?? 0, "detections": micDead.detections,
+            "follow_up_pending": micDead.followUpPending, "last_action": micDeadLastAction ?? NSNull(),
+            "simulated": mic?.simulatedDead?.rawValue ?? NSNull(),
+        ]
+        if let last = micDead.lastDetection, let at = micDead.lastDetectedAt {
+            d["last"] = ["reason": last.reason.rawValue, "silent_s": last.silentSeconds, "system_audible_s": last.systemAudibleSeconds,
+                         "follow_up": last.followUp, "device": micDeadLastDevice ?? NSNull(),
+                         "ago_s": Int(ProcessInfo.processInfo.systemUptime - at)] as [String: Any]
+        }
+        return d
     }
 
     // MARK: window-gone hold

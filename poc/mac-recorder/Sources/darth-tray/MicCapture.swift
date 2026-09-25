@@ -111,6 +111,13 @@ final class MicCapture {
     /// them early, exactly the 0.3.16 gap problem) and the live mix simply hears nothing from
     /// this side. Read on the tap thread; a plain Bool flip is fine for a mute switch.
     var muted = false
+    /// 0.3.18 test hook (ws `simulate_mic_dead`): make this capture look like a dead device
+    /// WITHOUT the user-facing mute — "zero" hands out digital silence (the Teams Audio
+    /// loopback of 2026-09-25), "quiet" −110 dBFS noise (a device with nothing on it), "low"
+    /// −80 dBFS noise (alive by the digital-silence rule, never audible — the quiet rule's
+    /// input). nil = the real microphone. The file gets what the meter gets.
+    enum SimulatedDead: String { case zero, quiet, low }
+    var simulatedDead: SimulatedDead?
     private(set) var buffersSeen = 0
     private(set) var peak: Float = 0
     /// Level meter (0.2.6): window RMS, audible flag, seconds since audible. Measures the
@@ -151,6 +158,26 @@ final class MicCapture {
         get { bufferLock.lock(); defer { bufferLock.unlock() }; return lastBufferAtLocked }
         set { bufferLock.lock(); lastBufferAtLocked = newValue; bufferLock.unlock() }
     }
+    // 0.3.18: per-health-tick stats for the dead-mic detector — buffers and the loudest
+    // sample / buffer RMS since the previous `takeTickStats()`. Tap thread writes, main reads.
+    private var tickBuffers = 0
+    private var tickPeak: Float = 0
+    private var tickRms: Float = 0
+    private func noteTick(peak p: Float, rms r: Float) {
+        bufferLock.lock()
+        tickBuffers += 1
+        if p > tickPeak { tickPeak = p }
+        if r > tickRms { tickRms = r }
+        bufferLock.unlock()
+    }
+    /// (buffers, peak dBFS, rms dBFS) since the last call, and reset.
+    func takeTickStats() -> (buffers: Int, peakDb: Float, rmsDb: Float) {
+        bufferLock.lock(); defer { bufferLock.unlock() }
+        let out = (tickBuffers, LevelMeter.db(tickPeak), LevelMeter.db(tickRms))
+        tickBuffers = 0; tickPeak = 0; tickRms = 0
+        return out
+    }
+
     /// Main queue, after every successful restart: (from device, to device, reason).
     var onRestarted: ((String?, String?, String) -> Void)?
 
@@ -386,9 +413,23 @@ final class MicCapture {
                 // preview strip should show while the mic is off.
                 for c in 0..<Int(buf.format.channelCount) { chans[c].update(repeating: 0, count: Int(buf.frameLength)) }
             }
+            if !self.muted, let sim = self.simulatedDead, let chans = buf.floatChannelData {
+                let n = Int(buf.frameLength)
+                for c in 0..<Int(buf.format.channelCount) {
+                    switch sim {
+                    case .zero: chans[c].update(repeating: 0, count: n)
+                    // Uniform noise of amplitude a has RMS a/√3: −110 dB RMS → a ≈ 5.5e-6 (peak ≈ −105 dB).
+                    case .quiet: for i in 0..<n { chans[c][i] = Float.random(in: -5.5e-6...5.5e-6) }
+                    case .low: for i in 0..<n { chans[c][i] = Float.random(in: -1e-4...1e-4) }
+                    }
+                }
+            }
             if let m = LevelMeter.measure(buf) {
                 self.peak = max(self.peak, m.peak)
                 self.meter.note(peak: m.peak, rms: m.rms)
+                self.noteTick(peak: m.peak, rms: m.rms)
+            } else {
+                self.noteTick(peak: 0, rms: 0)
             }
             if self.buffersSeen == 1 {
                 rlog("mic: first buffer \(Int(Date().timeIntervalSince(self.startedAt) * 1000)) ms after start — \(fmt(raw.format)), \(raw.frameLength) frames\(converter == nil ? "" : " → \(buf.frameLength) @ \(Int(Self.canonicalRate)) Hz")")

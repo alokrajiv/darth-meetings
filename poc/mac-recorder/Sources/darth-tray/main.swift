@@ -3,8 +3,9 @@ import CoreGraphics
 import ScreenCaptureKit
 import ServiceManagement
 import RecorderCore
+import TrayLogic
 
-let VERSION = "0.3.17"
+let VERSION = "0.3.18"
 let WS_PORT: UInt16 = 47800
 let PWA_URL = URL(string: "https://meetings.darth-internal.trames.io/")!
 /// Seconds between "the call ended" and an automatic stop.
@@ -126,6 +127,41 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let out = recorder.redetectMic(how: how)
         banner.showMessage(title: "Microphone", sub: out, accent: .info, stoppable: recorder.isRecording, near: recordingFrame, autoHide: 6)
         broadcast("mic_device_changed", ["outcome": out])
+        refreshMenu()
+    }
+
+    /// 0.3.18: the recording's microphone is dead (`MicDeadDetector`). A banner that STAYS
+    /// (the 2026-09-25 Teams call's only signal was "mic ✗" in one that hid itself after 10 s),
+    /// and: a manual pick falls back to Automatic; Automatic is re-detected once and, if still
+    /// dead 30 s later, the person is told to pick a microphone.
+    func micDead(_ d: MicDeadDetector.Detection, device: String?) {
+        guard recorder.isRecording else { return }
+        let name = device ?? "The microphone"
+        // The banner's sub is one truncating line: what, then what we did, then the health line.
+        let what = d.reason == .digitalSilence
+            ? "\(name): pure digital silence for \(d.silentSeconds) s"
+            : "\(name): nothing for \(d.silentSeconds) s while the call was audible"
+        let title: String
+        let action: String
+        if d.followUp {
+            title = "Microphone is still silent — pick one in the tray menu"
+            action = "re-detecting did not help; pick a microphone (tray ▸ Microphone)"
+            recorder.micDeadTold()
+        } else if micDeviceUID != nil {
+            title = "Microphone is silent — switched to Automatic"
+            micDeviceUID = nil                                   // the pref: back to Automatic
+            let to = recorder.micDeadFallback(from: device)
+            action = "now recording from \(to)"
+        } else {
+            title = "Microphone is silent"
+            _ = recorder.micDeadRedetect()
+            action = "re-detecting the microphone; if it stays silent, pick one in the tray menu"
+        }
+        let sub = "\(what) — \(action) · \(recorder.healthLine())"
+        rlog("mic: dead-mic banner — \(title) / \(sub)")
+        banner.showMessage(title: title, sub: sub, accent: .recording, stoppable: true, near: recordingFrame, autoHide: nil)
+        broadcast("mic_dead", ["reason": d.reason.rawValue, "device": device ?? NSNull(), "silent_s": d.silentSeconds,
+                               "system_audible_s": d.systemAudibleSeconds, "follow_up": d.followUp, "title": title, "sub": sub])
         refreshMenu()
     }
 
@@ -273,6 +309,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             self?.banner.showMessage(title: "Recording problem", sub: msg, stoppable: self?.recorder.isRecording ?? false)
         }
         recorder.onTrackHealth = { [weak self] track, ok in self?.trackHealthChanged(track, ok: ok) }
+        recorder.onMicDead = { [weak self] d, device in self?.micDead(d, device: device) }
         recorder.onNotice = { [weak self] title, sub in
             self?.banner.showMessage(title: title, sub: sub, accent: .warning, stoppable: true, near: self?.recordingFrame)
         }
@@ -1522,6 +1559,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             let name = uid.flatMap { u in AudioDevices.inputs().first { $0.uid == u }?.name } ?? (uid ?? "Automatic")
             pickMic(uid: uid, name: name, how: "pwa")
         case "redetect_mic": redetectMic(how: "pwa")         // 0.3.16
+        case "simulate_mic_dead":                            // 0.3.18 test hook: {mode: "zero"|"quiet"|"low"|null}
+            broadcast("mic_dead_simulated", ["outcome": recorder.simulateMicDead(obj["mode"] as? String)])
         case "set_audio_tracks":                             // 0.3.17: {system?: bool, mic?: bool}
             if let v = obj["system"] as? Bool { setAudioTrack("system", on: v, how: "pwa") }
             if let v = obj["mic"] as? Bool { setAudioTrack("mic", on: v, how: "pwa") }
