@@ -78,6 +78,7 @@ final class RecordDialog: NSObject, NSWindowDelegate {
     /// Open the panel (or bring the open one to the front). `completion` runs once, on the
     /// main queue: the options on Start, nil on Cancel / close.
     func present(callPids: [pid_t], signedIn: Bool, autoUpload: Bool, videoDefault: Bool = true,
+                 systemAudioDefault: Bool = true, micDefault: Bool = true,
                  completion: @escaping (RecordingController.RecordOptions?) -> Void) {
         if let panel {
             NSApp.activate(ignoringOtherApps: true)
@@ -124,10 +125,11 @@ final class RecordDialog: NSObject, NSWindowDelegate {
         videoBox.state = videoDefault ? .on : .off
         popup.isEnabled = videoDefault
         self.videoBox = videoBox
+        // 0.3.17: the tray's "Audio (next recording)" ticks are the defaults here.
         let sysBox = NSButton(checkboxWithTitle: "System audio (what the others say)", target: nil, action: nil)
-        sysBox.state = .on
+        sysBox.state = systemAudioDefault ? .on : .off
         let micBox = NSButton(checkboxWithTitle: "Microphone (your side)", target: nil, action: nil)
-        micBox.state = .on
+        micBox.state = micDefault ? .on : .off
         let upBox = NSButton(checkboxWithTitle: "Upload to Darth Meetings when it stops", target: nil, action: nil)
         upBox.state = (signedIn && autoUpload) ? .on : .off
         upBox.isEnabled = signedIn

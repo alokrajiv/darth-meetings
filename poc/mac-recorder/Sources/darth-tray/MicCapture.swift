@@ -106,6 +106,11 @@ final class MicCapture {
     private(set) var convertDropped = 0
     /// Called on the tap's own thread.
     var onBuffer: ((CMSampleBuffer) -> Void)?
+    /// 0.3.17: when set, every buffer handed on is zeroed first — the track keeps its timeline
+    /// (the writer packs audio back to back, so DROPPING buffers would shift everything after
+    /// them early, exactly the 0.3.16 gap problem) and the live mix simply hears nothing from
+    /// this side. Read on the tap thread; a plain Bool flip is fine for a mute switch.
+    var muted = false
     private(set) var buffersSeen = 0
     private(set) var peak: Float = 0
     /// Level meter (0.2.6): window RMS, audible flag, seconds since audible. Measures the
@@ -375,6 +380,11 @@ final class MicCapture {
                     return
                 }
                 buf = out
+            }
+            if self.muted, let chans = buf.floatChannelData {
+                // Silence in place — the meter then reads silence too, which is what the
+                // preview strip should show while the mic is off.
+                for c in 0..<Int(buf.format.channelCount) { chans[c].update(repeating: 0, count: Int(buf.frameLength)) }
             }
             if let m = LevelMeter.measure(buf) {
                 self.peak = max(self.peak, m.peak)

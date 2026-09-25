@@ -105,6 +105,39 @@ final class RecordingController {
     private(set) var recordingId: String?
     private(set) var options = RecordOptions()
 
+    /// 0.3.17: per-track mute for the running recording (AudioMenu). Both false at every start.
+    struct AudioMute: Equatable { var system = false; var mic = false }
+    private(set) var audioMute = AudioMute()
+    /// True when the running recording captures the track and it is not muted.
+    var systemAudioLive: Bool { options.systemAudio && !audioMute.system }
+    var micLive: Bool { options.mic && !audioMute.mic }
+
+    /// Mute / unmute a track of the RUNNING recording: silence is written in its place (the
+    /// timeline and the live mix keep going), nothing is rolled. Returns the line for the
+    /// banner. A track the recording was started without cannot be added here.
+    func setAudioMuted(track: String, muted: Bool, how: String) -> String {
+        guard state == .recording else { return "Not recording" }
+        switch track {
+        case "system":
+            guard options.systemAudio else { return "This recording was started without system audio — it cannot be added mid-way" }
+            guard audioMute.system != muted else { return "System audio is already \(muted ? "off" : "on")" }
+            audioMute.system = muted
+            audioForwarder.muted = muted
+        case "mic":
+            guard options.mic else { return "This recording was started without a microphone — it cannot be added mid-way" }
+            guard audioMute.mic != muted else { return "Microphone is already \(muted ? "off" : "on")" }
+            audioMute.mic = muted
+            mic?.muted = muted
+        default:
+            return "Unknown track \(track)"
+        }
+        let at = Int(Date().timeIntervalSince(startedAt ?? Date()))
+        let line = "\(track == "system" ? "System audio" : "Microphone") \(muted ? "off — silence is being recorded on that track" : "back on") (\(how), \(at)s in)"
+        rlog("record: \(line)")
+        EventLog.shared.log("audio_mute_change", ["recording_id": recordingId ?? "", "track": track, "muted": muted, "how": how, "at_s": at])
+        return line
+    }
+
     // MARK: start timeouts (0.2.8)
     /// Every awaited start step (shareable content, filter, stream start) races this deadline.
     /// 2026-09-16 21:23 SGT: SCK never called back for a WhatsApp voice-call window, `state`
@@ -374,11 +407,12 @@ final class RecordingController {
         }
         if options.systemAudio {
             if audioStream == nil { h.systemOK = false }
+            else if audioMute.system { h.systemOK = true }          // 0.3.17: silent on purpose
             else if call != nil && !callOver { h.systemOK = systemMeter.secondsSinceAudible < Self.SYSTEM_SILENT_S }
             else { h.systemOK = true }
         }
         if options.mic {
-            if let m = mic { h.micOK = m.meter.secondsSinceAudible < Self.MIC_SILENT_S } else { h.micOK = false }
+            if let m = mic { h.micOK = audioMute.mic ? true : m.meter.secondsSinceAudible < Self.MIC_SILENT_S } else { h.micOK = false }
         }
         return h
     }
@@ -389,11 +423,11 @@ final class RecordingController {
         var parts: [String] = []
         func tick(_ ok: Bool?) -> String { ok == nil ? "–" : (ok! ? "✓" : "✗") }
         if currentSource?.isAudioOnly != true { parts.append("video \(tick(h.videoOK))") }
-        if options.mic { parts.append("mic \(tick(h.micOK))") }
+        if options.mic { parts.append(audioMute.mic ? "mic off" : "mic \(tick(h.micOK))") }
         if options.systemAudio {
             // Quiet system audio outside a call is neutral, not a fault.
             let quiet = audioStream != nil && !(call != nil && !callOver) && !systemMeter.audible
-            parts.append(quiet ? "system ·" : "system \(tick(h.systemOK))")
+            parts.append(audioMute.system ? "system off" : (quiet ? "system ·" : "system \(tick(h.systemOK))"))
         }
         return parts.joined(separator: " · ")
     }
@@ -417,12 +451,14 @@ final class RecordingController {
         if options.systemAudio {
             var s = systemMeter.snapshot(); s["ok"] = h.systemOK ?? NSNull(); s["stream_alive"] = audioStream != nil
             if let e = systemStreamFailed { s["error"] = e }
+            s["muted"] = audioMute.system                      // 0.3.17
             d["system"] = s
         }
         if options.mic {
             var m = micMeter?.snapshot() ?? ["level_db": -120, "audible": false, "silent_s": 0, "audible_s": 0, "buffers": 0]
             m["ok"] = h.micOK ?? NSNull(); m["stream_alive"] = mic != nil
             m["device"] = mic?.deviceJSON ?? NSNull()          // 0.3.16
+            m["muted"] = audioMute.mic                         // 0.3.17
             d["mic"] = m
         }
         return d
@@ -451,6 +487,8 @@ final class RecordingController {
         state = .starting
         self.call = call
         self.options = options
+        audioMute = AudioMute()
+        audioForwarder.muted = false
         let id = UUID().uuidString.lowercased()
         recordingId = id
         let now = Date()
@@ -592,6 +630,7 @@ final class RecordingController {
                 do {
                     try m.start()
                     micFormat = m.format
+                    m.muted = self.audioMute.mic
                     self.mic = m
                     self.micActive = true
                     // 0.3.10: the format AFTER voice processing had its say — that is what the
@@ -1361,6 +1400,18 @@ final class RecordingController {
 final class AudioForwarder: NSObject, SCStreamOutput, SCStreamDelegate {
     let queue = DispatchQueue(label: "recorder.system-audio")
     var sink: ((CMSampleBuffer) -> Void)?
+    /// 0.3.17: zero every buffer before the meter and the sink — see `MicCapture.muted`.
+    var muted = false
+    private var silenceFailed = 0
+
+    /// Overwrite the sample data with zeros, in place. SCK hands us the buffer to consume;
+    /// the writer and the live mix are its only readers after this.
+    static func silence(_ sb: CMSampleBuffer) -> Bool {
+        guard let bb = CMSampleBufferGetDataBuffer(sb) else { return false }
+        let n = CMBlockBufferGetDataLength(bb)
+        guard n > 0 else { return true }
+        return CMBlockBufferFillDataBytes(with: 0, blockBuffer: bb, offsetIntoDestination: 0, dataLength: n) == noErr
+    }
     /// Main-queue-agnostic; the controller hops to main.
     var onStopped: ((Error) -> Void)?
     private(set) var meter = LevelMeter()
@@ -1374,6 +1425,11 @@ final class AudioForwarder: NSObject, SCStreamOutput, SCStreamDelegate {
     func stream(_ stream: SCStream, didOutputSampleBuffer sb: CMSampleBuffer, of type: SCStreamOutputType) {
         guard type == .audio, sb.isValid else { return }
         buffers += 1
+        if muted, !Self.silence(sb) {
+            silenceFailed += 1
+            if silenceFailed == 1 { rlog("record: could not silence a system audio buffer — dropping it instead while muted") }
+            return
+        }
         if let m = LevelMeter.measure(sb) {
             meter.note(peak: m.peak, rms: m.rms)
         } else {

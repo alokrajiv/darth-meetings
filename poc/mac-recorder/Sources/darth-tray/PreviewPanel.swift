@@ -223,7 +223,7 @@ final class PreviewPanel: NSObject, NSWindowDelegate {
     @objc private func gearTapped() {
         guard let info = sourceInfo?() else { return }
         let i = SourceMenu.Info(current: info.current, mode: info.mode, callPids: info.callPids, audioOnly: info.audioOnly,
-                                mic: micInfo?())
+                                mic: micInfo?(), audio: audioInfo?())
         gear.toolTip = SourceMenu.headline(i)
         let m = NSMenu()
         menu.onSetAuto = { [weak self] in self?.onSetAuto?() }
@@ -234,16 +234,23 @@ final class PreviewPanel: NSObject, NSWindowDelegate {
         micMenu.onPickDevice = { [weak self] uid, name in self?.onPickMic?(uid, name) }
         micMenu.onRedetect = { [weak self] in self?.onRedetectMic?() }
         menu.mic = micMenu
+        // 0.3.17: the audio tracks live in the same gear.
+        audioMenu.onToggle = { [weak self] track, on in self?.onToggleAudio?(track, on) }
+        menu.audio = audioMenu
         menu.build(into: m, info: i)
         gear.menu = m
         m.popUp(positioning: nil, at: NSPoint(x: 0, y: gear.bounds.height + 4), in: gear)
     }
     private let menu = SourceMenu(origin: "preview")
     private let micMenu = MicMenu(origin: "preview")
+    private let audioMenu = AudioMenu(origin: "preview")
     /// 0.3.16: what the gear's "Microphone" submenu shows, and where its clicks go.
     var micInfo: (() -> MicMenu.Info)?
     var onPickMic: ((String?, String) -> Void)?
     var onRedetectMic: (() -> Void)?
+    /// 0.3.17: what the gear's "Audio" submenu shows, and where its toggles go.
+    var audioInfo: (() -> AudioMenu.Info)?
+    var onToggleAudio: ((String, Bool) -> Void)?
 }
 
 /// One level bar: −60…0 dBFS, fill green when audible / grey when quiet / red when the track is

@@ -4,7 +4,7 @@ import ScreenCaptureKit
 import ServiceManagement
 import RecorderCore
 
-let VERSION = "0.3.16"
+let VERSION = "0.3.17"
 let WS_PORT: UInt16 = 47800
 let PWA_URL = URL(string: "https://meetings.darth-internal.trames.io/")!
 /// Seconds between "the call ended" and an automatic stop.
@@ -121,6 +121,39 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         refreshMenu()
     }
 
+    // MARK: audio tracks (0.3.17)
+
+    /// What the NEXT recording starts with when it is started from the banner / menu / dialog.
+    /// Deliberately not persisted, and reset to both-on the moment a recording starts: a
+    /// one-off "no microphone" must never silently outlive the recording it was meant for.
+    var nextAudio = (system: true, mic: true)
+
+    /// What the audio menus show (both surfaces, and the ws `audio_tracks` block).
+    func audioInfo() -> AudioMenu.Info {
+        if recorder.isRecording {
+            return AudioMenu.Info(systemOn: recorder.systemAudioLive, micOn: recorder.micLive,
+                                  systemInRecording: recorder.options.systemAudio, micInRecording: recorder.options.mic,
+                                  recording: true)
+        }
+        return AudioMenu.Info(systemOn: nextAudio.system, micOn: nextAudio.mic, systemInRecording: true, micInRecording: true, recording: false)
+    }
+
+    /// The one place an audio-track toggle from any surface (preview gear, tray submenu, PWA)
+    /// lands: recording → mute/unmute that track now; idle → the next recording's defaults.
+    func setAudioTrack(_ track: String, on: Bool, how: String) {
+        if recorder.isRecording {
+            let out = recorder.setAudioMuted(track: track, muted: !on, how: how)
+            banner.showMessage(title: track == "system" ? "System audio" : "Microphone", sub: out, accent: on ? .info : .warning,
+                               stoppable: true, near: recordingFrame, autoHide: 6)
+            broadcast("audio_tracks_changed", ["track": track, "on": on, "outcome": out])
+        } else {
+            if track == "system" { nextAudio.system = on } else if track == "mic" { nextAudio.mic = on }
+            EventLog.shared.log("next_audio_change", ["track": track, "on": on, "how": how])
+            broadcast("status")
+        }
+        refreshMenu()
+    }
+
     /// "Upload recordings automatically" — on by default.
     var autoUpload: Bool {
         get { UserDefaults.standard.object(forKey: "autoUpload") as? Bool ?? true }
@@ -156,6 +189,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     let micItem = NSMenuItem(title: "Microphone", action: nil, keyEquivalent: "")
     let micSubmenu = NSMenu(title: "Microphone")
     let trayMicMenu = MicMenu(origin: "tray")
+    /// 0.3.17: which audio tracks — mute the mic or the other side mid-recording, or set what
+    /// the next recording starts with (see `AudioMenu`).
+    let audioItem = NSMenuItem(title: "Audio", action: nil, keyEquivalent: "")
+    let audioSubmenu = NSMenu(title: "Audio")
+    let trayAudioMenu = AudioMenu(origin: "tray")
     let bannerItem = NSMenuItem(title: "Show banner", action: #selector(toggleBanner), keyEquivalent: "b")
     let discreetItem = NSMenuItem(title: "Discreet menu bar icon (no red while recording)", action: #selector(toggleDiscreet), keyEquivalent: "")
     let autoHideItem = NSMenuItem(title: "Hide the recording banner after 10 s", action: #selector(toggleBannerAutoHide), keyEquivalent: "")
@@ -325,6 +363,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         micItem.submenu = micSubmenu
         trayMicMenu.onPickDevice = { [weak self] uid, name in self?.pickMic(uid: uid, name: name, how: "tray") }
         trayMicMenu.onRedetect = { [weak self] in self?.redetectMic(how: "tray") }
+        // 0.3.17: the audio tracks — preview gear submenu + tray submenu, one landing place.
+        preview.audioInfo = { [weak self] in
+            self?.audioInfo() ?? AudioMenu.Info(systemOn: true, micOn: true, systemInRecording: true, micInRecording: true, recording: false)
+        }
+        preview.onToggleAudio = { [weak self] track, on in self?.setAudioTrack(track, on: on, how: "preview") }
+        audioSubmenu.delegate = self
+        audioItem.submenu = audioSubmenu
+        trayAudioMenu.onToggle = { [weak self] track, on in self?.setAudioTrack(track, on: on, how: "tray") }
         traySourceMenu.onPickAudioOnly = { [weak self] in self?.pickSource(.audio, title: "audio only", how: "tray") }
 
         uploader.onProgress = { [weak self] p in
@@ -568,6 +614,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         previewItem.target = self; m.addItem(previewItem)
         m.addItem(sourceItem)
         m.addItem(micItem)
+        m.addItem(audioItem)
         bannerItem.target = self; m.addItem(bannerItem)
         m.addItem(.separator())
         authItem.target = self; m.addItem(authItem)
@@ -633,6 +680,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         micItem.title = MicMenu.itemTitle(MicMenu.Info(devices: [], selectedUID: micDeviceUID,
                                                         current: recording ? recorder.micDeviceLabel : nil, recording: recording))
         if micSubmenu.items.isEmpty { fillMicSubmenu() }
+        // 0.3.17: the title carries the state; the submenu is rebuilt when it opens.
+        audioItem.title = AudioMenu.itemTitle(audioInfo())
+        if audioSubmenu.items.isEmpty { fillAudioSubmenu() }
         discreetItem.state = discreet ? .on : .off
         autoHideItem.state = bannerAutoHide ? .on : .off
         micProcessingItem.state = micVoiceProcessing ? .on : .off
@@ -993,7 +1043,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         let pids = detector.active.values.sorted { $0.startedAt < $1.startedAt }.map { $0.pid }.filter { $0 > 0 }
         let videoDefault = detector.active.values.sorted { $0.startedAt < $1.startedAt }.first.map { RecordingController.profile(for: $0).0 != .audioOnly } ?? true
-        RecordDialog.shared.present(callPids: pids, signedIn: auth.signedIn, autoUpload: autoUpload, videoDefault: videoDefault) { [weak self] options in
+        RecordDialog.shared.present(callPids: pids, signedIn: auth.signedIn, autoUpload: autoUpload, videoDefault: videoDefault,
+                                    systemAudioDefault: nextAudio.system, micDefault: nextAudio.mic) { [weak self] options in
             guard let self, let options else { return }
             self.startRecording(for: self.detector.active.values.first, options: options)
         }
@@ -1061,10 +1112,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func startRecording(for call: DetectedCall?, displayOverride: CGDirectDisplayID? = nil) {
         var o = RecordingController.RecordOptions()
         if let d = displayOverride { o.source = .display(d) }
+        // 0.3.17: the tray's "Audio (next recording)" ticks.
+        o.systemAudio = nextAudio.system
+        o.mic = nextAudio.mic
         startRecording(for: call, options: o)
     }
 
     func startRecording(for call: DetectedCall?, options: RecordingController.RecordOptions) {
+        // 0.3.17: a one-off "next recording without X" is spent the moment it is used (or the
+        // dialog was opened with it as the default) — never carried into a later recording.
+        if nextAudio != (true, true) {
+            EventLog.shared.log("next_audio_reset", ["system": nextAudio.system, "mic": nextAudio.mic])
+            nextAudio = (true, true)
+        }
         if recorder.state == .starting {
             // Record clicked again while the first start is still pending: cancel it and start
             // over (a wedged SCK start used to swallow every later click, 2026-09-16).
@@ -1324,6 +1384,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             "mic_processing": ["enabled": micVoiceProcessing, "active": recorder.micProcessingActive ?? NSNull()] as [String: Any],
             // 0.3.16: the pick (`mode` auto|manual, `uid`), what the live mic is on (`current`,
             // null when idle) and every input device to pick from.
+            // 0.3.17: per-track on/off — the running recording's (with `in_recording` = the
+            // track exists in its file) or, idle, what the next recording starts with.
+            "audio_tracks": {
+                let i = audioInfo()
+                return ["recording": i.recording,
+                        "system": ["on": i.systemOn, "in_recording": i.systemInRecording],
+                        "mic": ["on": i.micOn, "in_recording": i.micInRecording],
+                        "summary": AudioMenu.summary(i)] as [String: Any]
+            }(),
             "mic_device": [
                 "mode": micDeviceUID == nil ? "auto" : "manual", "uid": micDeviceUID ?? NSNull(),
                 "current": (recorder.isRecording ? recorder.micDeviceLabel : nil) ?? NSNull(),
@@ -1439,6 +1508,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             let name = uid.flatMap { u in AudioDevices.inputs().first { $0.uid == u }?.name } ?? (uid ?? "Automatic")
             pickMic(uid: uid, name: name, how: "pwa")
         case "redetect_mic": redetectMic(how: "pwa")         // 0.3.16
+        case "set_audio_tracks":                             // 0.3.17: {system?: bool, mic?: bool}
+            if let v = obj["system"] as? Bool { setAudioTrack("system", on: v, how: "pwa") }
+            if let v = obj["mic"] as? Bool { setAudioTrack("mic", on: v, how: "pwa") }
         case "mic_echo_probe":                               // {seconds?, processing?} → mic_echo_probe_result
             runEchoProbe(obj)
         case "set_discreet": if let v = obj["enabled"] as? Bool { discreet = v }
@@ -1600,8 +1672,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 extension AppDelegate: NSMenuDelegate {
     func menuNeedsUpdate(_ menu: NSMenu) {
         if menu === micSubmenu { fillMicSubmenu(); return }
+        if menu === audioSubmenu { fillAudioSubmenu(); return }
         guard menu === sourceSubmenu else { return }
         fillSourceSubmenu()
+    }
+
+    /// 0.3.17: rebuilt when it opens so the ticks are the live state.
+    func fillAudioSubmenu() {
+        audioSubmenu.removeAllItems()
+        trayAudioMenu.build(into: audioSubmenu, info: audioInfo())
     }
 
     /// 0.3.16: rebuilt when it opens so the device list is the one CoreAudio has right now.

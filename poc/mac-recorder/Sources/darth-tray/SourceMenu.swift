@@ -24,10 +24,14 @@ final class SourceMenu: NSObject {
         let audioOnly: Bool
         /// 0.3.16: when given, a "Microphone" submenu is appended (see `MicMenu`).
         var mic: MicMenu.Info? = nil
+        /// 0.3.17: when given, an "Audio" submenu (which tracks) is appended (see `AudioMenu`).
+        var audio: AudioMenu.Info? = nil
     }
 
     /// 0.3.16: the microphone submenu's builder + callbacks, owned by whoever owns this menu.
     var mic: MicMenu?
+    /// 0.3.17: the audio-tracks submenu's builder + callbacks, owned by whoever owns this menu.
+    var audio: AudioMenu?
 
     var onSetAuto: (() -> Void)?
     var onRedetect: (() -> Void)?
@@ -87,6 +91,15 @@ final class SourceMenu: NSObject {
             let item = NSMenuItem(title: MicMenu.itemTitle(micInfo), action: nil, keyEquivalent: "")
             let sub = NSMenu(title: "Microphone")
             mic.build(into: sub, info: micInfo)
+            item.submenu = sub
+            m.addItem(item)
+        }
+        // 0.3.17: which audio tracks, from the same gear — mute the mic or the other side
+        // mid-recording without leaving the preview panel.
+        if let audio, let audioInfo = info.audio {
+            let item = NSMenuItem(title: AudioMenu.itemTitle(audioInfo), action: nil, keyEquivalent: "")
+            let sub = NSMenu(title: "Audio")
+            audio.build(into: sub, info: audioInfo)
             item.submenu = sub
             m.addItem(item)
         }
