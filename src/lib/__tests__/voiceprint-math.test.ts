@@ -2,6 +2,7 @@ import { describe, expect, test } from 'bun:test';
 import {
   aggregateSamples,
   chooseDisplayName,
+  decideVoiceMatch,
   formatVerdict,
   pickSpeechByBudget,
   preferDisplayName,
@@ -9,6 +10,7 @@ import {
   storedWeight,
   weightedMerge,
 } from '@/lib/voiceprint-math';
+import { samePerson } from '@/lib/person-identity';
 
 const u = (speaker: string, secs: number, at = 0) => ({ speaker, start: at, end: at + secs * 1000 });
 
@@ -128,3 +130,48 @@ describe('resolveMarginByRoster', () => {
   });
 });
 
+
+describe('decideVoiceMatch — the invite gate (2026-09-25, transcript 980)', () => {
+  const roster = ['Alok Rajiv', 'Ivan Seow', 'PRIHATMOKO Agung', 'ADIPUTRA Dwi', 'SHE Ivan', 'CHUNG Joey', 'LI Li', 'LEE Sharon (EXT)', 'DING Wick (EXT)'];
+  const opts = { threshold: 0.5, margin: 0.05, roster, samePerson };
+  const c = (name: string, score: number) => ({ name, score });
+
+  test('the prod verdicts of row 980, re-decided', () => {
+    // A=margin(iman.sani 0.54 vs Huiyee Lim 0.51): neither invited
+    const a = decideVoiceMatch(c('iman.sani', 0.54), c('Huiyee Lim', 0.51), opts);
+    expect(a.suggestion).toBeNull();
+    expect(formatVerdict('A', a.verdict)).toBe('A=off-roster(iman.sani 0.54 vs Huiyee Lim 0.51, neither invited)');
+    // B=Yan-Simon Saragih 0.53 — not invited, weak → not surfaced
+    const b = decideVoiceMatch(c('Yan-Simon Saragih', 0.53), c('Someone Else', 0.4), opts);
+    expect(b.suggestion).toBeNull();
+    expect(formatVerdict('B', b.verdict)).toBe('B=off-roster(Yan-Simon Saragih 0.53, not invited)');
+    // C=Ivan Seow 0.91 — invited
+    const cc = decideVoiceMatch(c('Ivan Seow', 0.91), c('Ivan She', 0.3), opts);
+    expect(cc.suggestion).toEqual({ name: 'Ivan Seow', score: 0.91 });
+    // D=Hitesh Ambaliya 0.63 — not invited
+    expect(decideVoiceMatch(c('Hitesh Ambaliya', 0.63), undefined, opts).suggestion).toBeNull();
+    // E=Joey Chung 0.69 — "CHUNG Joey" on the invite
+    expect(decideVoiceMatch(c('Joey Chung', 0.69), c('X Y', 0.4), opts).suggestion).toEqual({ name: 'Joey Chung', score: 0.69 });
+  });
+
+  test('a strong match to an uninvited person survives, flagged', () => {
+    const d = decideVoiceMatch(c('Hitesh Ambaliya', 0.82), c('X Y', 0.5), opts);
+    expect(d.suggestion).toEqual({ name: 'Hitesh Ambaliya', score: 0.82, offRoster: true });
+    expect(formatVerdict('D', d.verdict)).toBe('D=Hitesh Ambaliya 0.82 ✓ (not on the invite)');
+  });
+
+  test('no informative roster (owner only / none): no gate', () => {
+    expect(decideVoiceMatch(c('Hitesh Ambaliya', 0.55), undefined, { ...opts, roster: ['Alok Rajiv'] }).suggestion).toEqual({
+      name: 'Hitesh Ambaliya',
+      score: 0.55,
+    });
+    const m = decideVoiceMatch(c('iman.sani', 0.54), c('Huiyee Lim', 0.51), { ...opts, roster: [] });
+    expect(m.verdict.kind).toBe('margin');
+  });
+
+  test('below threshold and roster tie-break keep working', () => {
+    expect(decideVoiceMatch(c('Ivan Seow', 0.45), undefined, opts).verdict.kind).toBe('below-threshold');
+    const t = decideVoiceMatch(c('Huiyee Lim', 0.62), c('Ivan Seow', 0.6), opts);
+    expect(t.suggestion).toEqual({ name: 'Ivan Seow', score: 0.6 });
+  });
+});

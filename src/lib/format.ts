@@ -907,6 +907,12 @@ export interface SpeakerSuggestion {
   /** 'id' = written by the dedicated speaker-identification pass */
   via?: 'id';
   evidence?: string;
+  /**
+   * Voice matches only: the meeting has an invite and this person is not on
+   * it — surfaced anyway because the score was high (voiceprint-math
+   * OFF_ROSTER_MIN_SCORE). The UI says "not on the invite".
+   */
+  offRoster?: boolean;
 }
 
 export type SpeakerSuggestionMap = Record<string, SpeakerSuggestion>;

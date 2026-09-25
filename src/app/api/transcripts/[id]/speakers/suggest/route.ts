@@ -12,12 +12,22 @@ export const runtime = 'nodejs';
  * Run voiceprint speaker matching on demand — the local embedding sidecar
  * (a few seconds), so this responds synchronously with the fresh suggestion
  * map. Also force-retriggers the speaker-ID AI pass in the background when
- * it previously errored or never ran (its results land via the usual
- * suggestions polling). Editors only (suggestions persist on the owner's
+ * it previously errored or never ran, or always with body { "force": true }
+ * (its results land via the usual suggestions polling; the response's
+ * `speakerIdStatus` tells the page to poll). Editors only (suggestions persist on the owner's
  * row).
  */
-export const POST = withAuth(async ({ user }, { params }) => {
+export const POST = withAuth(async ({ user, request }, { params }) => {
   const { id } = await params;
+  // { "force": true } re-runs the speaker-ID pass even when it completed
+  // before (never while one is running) — a deliberate "look again".
+  let force = false;
+  try {
+    const body = (await request.json()) as { force?: unknown };
+    force = body?.force === true;
+  } catch {
+    // no body — the button's plain POST
+  }
 
   const access = await resolveAccess(user.userId, user.email, id);
   if (!access) {
@@ -53,13 +63,18 @@ export const POST = withAuth(async ({ user }, { params }) => {
     );
     // AI pass retry: only when it isn't already running/completed — a manual
     // "Guess names" click is the recovery path for errored/skipped passes.
-    if (access.row.speaker_id_status !== 'running' && access.row.speaker_id_status !== 'completed') {
+    let speakerIdStatus = access.row.speaker_id_status;
+    if (
+      access.row.speaker_id_status !== 'running' &&
+      (force || access.row.speaker_id_status !== 'completed')
+    ) {
       void identifySpeakers(access.ownerUserId, id, {
         force: true,
         triggeredBy: { userId: user.userId, email: user.email },
       });
+      speakerIdStatus = 'running';
     }
-    return NextResponse.json({ suggestions });
+    return NextResponse.json({ suggestions, speakerIdStatus });
   } catch (err) {
     console.error('[speakers/suggest] failed:', err);
     return NextResponse.json(

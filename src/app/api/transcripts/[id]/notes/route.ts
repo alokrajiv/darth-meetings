@@ -66,7 +66,8 @@ export const POST = withAuth(async ({ user, request }, { params }) => {
       access.ownerUserId,
       id,
       resolved.media /* every file: a combined meeting embeds each recording's voices from ITS OWN file (mediaForSpeaker) */,
-      content
+      content,
+      { row: access.row } /* the invite gate needs the roster */
     );
   })().catch((err) => console.warn('[notes POST] suggest failed:', err));
 

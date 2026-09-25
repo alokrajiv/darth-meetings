@@ -207,6 +207,14 @@ export type SpeakerVerdict =
       score: number;
       /** Set when a margin tie was broken by the call roster — see `resolveMarginByRoster`. */
       rosterOver?: { name: string; score: number };
+      /** The meeting has an invite and this person is not on it (kept: the score cleared OFF_ROSTER_MIN_SCORE). */
+      offRoster?: boolean;
+    }
+  | {
+      /** A match to someone NOT on the invite, too weak to surface (`decideVoiceMatch`). */
+      kind: 'off-roster';
+      best: { name: string; score: number };
+      second?: { name: string; score: number };
     }
   | { kind: 'below-threshold'; best: { name: string; score: number } | null }
   | { kind: 'margin'; best: { name: string; score: number }; second: { name: string; score: number } }
@@ -221,7 +229,13 @@ export function formatVerdict(speaker: string, v: SpeakerVerdict): string {
     case 'match':
       return v.rosterOver
         ? `${speaker}=${v.name} ${two(v.score)} ✓ (on the call; over ${v.rosterOver.name} ${two(v.rosterOver.score)})`
-        : `${speaker}=${v.name} ${two(v.score)} ✓`;
+        : v.offRoster
+          ? `${speaker}=${v.name} ${two(v.score)} ✓ (not on the invite)`
+          : `${speaker}=${v.name} ${two(v.score)} ✓`;
+    case 'off-roster':
+      return v.second
+        ? `${speaker}=off-roster(${v.best.name} ${two(v.best.score)} vs ${v.second.name} ${two(v.second.score)}, neither invited)`
+        : `${speaker}=off-roster(${v.best.name} ${two(v.best.score)}, not invited)`;
     case 'below-threshold':
       return v.best
         ? `${speaker}=below-threshold(best ${v.best.name} ${two(v.best.score)})`
@@ -267,3 +281,97 @@ export function resolveMarginByRoster(
   return bestOn ? best : second;
 }
 
+
+/**
+ * A voice match below this is WEAK: the review UI says so, and the speaker-ID
+ * pass may overrule it at a modest confidence (lib/speaker-id-merge.ts).
+ * Observed on prod: genuine cross-meeting matches mostly score 0.7+; the two
+ * wrong guesses on transcript 980 scored 0.53 and 0.63.
+ */
+export const WEAK_VOICE_SCORE = 0.7;
+
+/**
+ * A voice match to someone who is NOT on the meeting's invite is surfaced only
+ * at or above this score. 2026-09-25, transcript 980 (a Teams call with nine
+ * invitees, mostly Danone): "Yan-Simon Saragih 0.53" and "Hitesh Ambaliya
+ * 0.63" — Trames colleagues who were not on the call — were surfaced as
+ * guesses; the invited Ivan Seow scored 0.91. An uninvited colleague who
+ * really joined still clears 0.75 when their print is any good. Tune with
+ * MW_VOICEPRINT_OFF_ROSTER_MIN.
+ */
+export const OFF_ROSTER_MIN_SCORE = 0.75;
+
+/**
+ * Is the roster worth gating on? Only when it names people BESIDES the
+ * recording owner (an invite, a call counterpart) — an ad-hoc call with no
+ * invite has a roster of one, and gating on it would reject every other voice.
+ */
+export function rosterIsInformative(roster: readonly string[]): boolean {
+  return roster.length >= 2;
+}
+
+export interface VoiceDecision {
+  verdict: SpeakerVerdict;
+  /** What to surface as the speaker's voice suggestion, or null. */
+  suggestion: { name: string; score: number; offRoster?: boolean } | null;
+}
+
+/**
+ * The whole verdict for one speaker from its scored candidates (best first,
+ * `second` = best-scoring DISTINCT person). Pure so the rules are tested:
+ *
+ *   1. below `threshold` → nothing;
+ *   2. within `margin` of the runner-up → ambiguous, unless the roster
+ *      settles it (`resolveMarginByRoster`); when NEITHER is invited on a
+ *      meeting with an invite, it reads as off-roster;
+ *   3. a clear winner who is not on an informative roster → surfaced only at
+ *      `offRosterMin` or above, flagged `offRoster`; otherwise an
+ *      'off-roster' verdict (the ID pass still sees it in the verdict line);
+ *   4. otherwise a match.
+ */
+export function decideVoiceMatch(
+  best: { name: string; score: number },
+  second: { name: string; score: number } | undefined,
+  opts: {
+    threshold: number;
+    margin: number;
+    roster: readonly string[];
+    samePerson: (a: string, b: string) => boolean;
+    offRosterMin?: number;
+  }
+): VoiceDecision {
+  const offRosterMin = opts.offRosterMin ?? OFF_ROSTER_MIN_SCORE;
+  const gate = rosterIsInformative(opts.roster);
+  const invited = (name: string) => opts.roster.some((r) => opts.samePerson(r, name));
+
+  if (best.score < opts.threshold) {
+    return { verdict: { kind: 'below-threshold', best }, suggestion: null };
+  }
+  if (second && best.score - second.score < opts.margin) {
+    const winner = resolveMarginByRoster(best, second, opts.roster, opts.samePerson);
+    if (winner && winner.score >= opts.threshold) {
+      const loser = winner === best ? second : best;
+      return {
+        verdict: { kind: 'match', name: winner.name, score: winner.score, rosterOver: loser },
+        suggestion: { name: winner.name, score: winner.score },
+      };
+    }
+    if (gate && !invited(best.name) && !invited(second.name)) {
+      return { verdict: { kind: 'off-roster', best, second }, suggestion: null };
+    }
+    return { verdict: { kind: 'margin', best, second }, suggestion: null };
+  }
+  if (gate && !invited(best.name)) {
+    if (best.score >= offRosterMin) {
+      return {
+        verdict: { kind: 'match', name: best.name, score: best.score, offRoster: true },
+        suggestion: { name: best.name, score: best.score, offRoster: true },
+      };
+    }
+    return { verdict: { kind: 'off-roster', best }, suggestion: null };
+  }
+  return {
+    verdict: { kind: 'match', name: best.name, score: best.score },
+    suggestion: { name: best.name, score: best.score },
+  };
+}

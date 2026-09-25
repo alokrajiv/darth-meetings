@@ -92,10 +92,30 @@ export function speakerNameState(
   };
 }
 
+/** Below this a voice match reads as weak (= voiceprint-math WEAK_VOICE_SCORE). */
+const WEAK_VOICE = 0.7;
+
+/** "53% voice match", "weak 53% voice match" — the short form every surface shows. */
+export function voiceMatchLabel(s: Pick<SpeakerSuggestion, 'confidence'>): string {
+  const pct = `${Math.round(s.confidence * 100)}% voice match`;
+  return s.confidence < WEAK_VOICE ? `weak ${pct}` : pct;
+}
+
+/**
+ * What to say after it: an uninvited person is the loudest caveat (the
+ * 2026-09-25 complaint — colleagues not on the call were guessed), then a
+ * weak score, then the standing "a hint not proof".
+ */
+export function voiceMatchCaveat(s: Pick<SpeakerSuggestion, 'confidence' | 'offRoster'>): string {
+  if (s.offRoster) return 'but not on the invite';
+  if (s.confidence < WEAK_VOICE) return 'often wrong';
+  return 'a hint not proof';
+}
+
 /** "guessed — 85% voice match, a hint not proof[; the transcript agrees — …]" / "guessed from the transcript — …evidence…". */
 export function guessCaption(s: SpeakerSuggestion): string {
   if (s.source === 'voice' || (!s.source && s.confidence > 0 && !s.evidence)) {
-    const base = `guessed — ${Math.round(s.confidence * 100)}% voice match, a hint not proof`;
+    const base = `guessed — ${voiceMatchLabel(s)}, ${voiceMatchCaveat(s)}`;
     // The ID pass agreed with the voice match and left its reasoning here.
     const agreed = s.source === 'voice' ? (s.evidence ?? '').trim() : '';
     return agreed ? `${base}; the transcript agrees — ${agreed}` : base;

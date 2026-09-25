@@ -1,6 +1,6 @@
 import 'server-only';
 import type { TranscriptRow } from '@/db-ops/transcripts';
-import { recorderRowForRecording, type RecorderCall } from '@/db-ops/recorder';
+import { getOwnRecording, recorderRowForRecording, type RecorderCall } from '@/db-ops/recorder';
 import { identityForUser } from '@/db-ops/transcript-activity';
 import { findPeopleByEmails } from '@/db-ops/people';
 import {
@@ -65,6 +65,17 @@ export async function recordingCallContext(row: TranscriptRow): Promise<Recordin
       console.warn('[call-context] recorder row lookup failed (continuing):', err);
     }
   }
+  // A tray upload straight into a meeting (no first-class recording link)
+  // stamps the REGISTRY row id at upload open — transcript 980, a Teams call
+  // uploaded by the tray, had no `fromRecording` and so no call context.
+  const registryId = row.gmeet_context?.recorder?.recordingId;
+  if (!call && registryId) {
+    try {
+      call = (await getOwnRecording(row.user_id, registryId))?.call ?? null;
+    } catch (err) {
+      console.warn('[call-context] recorder registry lookup failed (continuing):', err);
+    }
+  }
   const counterpart = callCounterpart(call);
 
   // Names through the directory where we have e-mails (attendees, the owner):
@@ -110,7 +121,8 @@ export function recordingContextBlock(ctx: RecordingCallContext, meetingTitle: s
   lines.push(
     `RECORDING CONTEXT: this audio was captured on ${owner}'s Mac by Darth Recorder during a ${kind}` +
       (title ? ` whose window was titled "${title}"` : '') +
-      `. ${ctx.owner.name ?? 'The owner'} is therefore one of the speakers (their microphone was recorded directly; everyone else came through the call).`
+      `. ${ctx.owner.name ?? 'The owner'} is therefore normally one of the speakers (their microphone was recorded directly; everyone else came through the call) — ` +
+      `but a muted or silent microphone happens, so do not assign the owner to a voice without evidence (addressed by name, self-introduction, their tile highlighted while that voice talks).`
   );
   if (isOneToOneCall(ctx.call.kind) && ctx.counterpart) {
     lines.push(
@@ -119,7 +131,7 @@ export function recordingContextBlock(ctx: RecordingCallContext, meetingTitle: s
         `Treat this as strong evidence; only depart from it if the transcript plainly shows a third person or a different person.`
     );
   } else if (ctx.roster.length > 1) {
-    lines.push(`People known to be on this call: ${ctx.roster.join(', ')}.`);
+    lines.push(`People known to be on this call (the invite, directory spellings where known): ${ctx.roster.join(', ')}.`);
   }
   if (meetingTitle && cleanCallTitle(meetingTitle) !== title) {
     lines.push(`The meeting is titled "${meetingTitle.trim()}".`);

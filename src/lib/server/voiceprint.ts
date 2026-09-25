@@ -29,11 +29,13 @@ import type {
 import { isGroupLabel } from '@/lib/speaker-name-kind';
 import { samePerson } from '@/lib/person-identity';
 import {
+  decideVoiceMatch,
   formatVerdict,
+  OFF_ROSTER_MIN_SCORE,
   pickSpeechByBudget,
-  resolveMarginByRoster,
   type SpeakerVerdict,
 } from '@/lib/voiceprint-math';
+import { mergeVoiceSuggestions } from '@/lib/speaker-id-merge';
 import type { TranscriptRow } from '@/db-ops/transcripts';
 import { recordingCallContext } from '@/lib/server/recording-call-context';
 
@@ -50,6 +52,9 @@ const THRESHOLD = Number(process.env.MW_VOICEPRINT_THRESHOLD || '0.5');
 
 /** Require the best match to beat the runner-up by this margin (ambiguity guard). */
 const MARGIN = 0.05;
+
+/** A match to someone not on the invite surfaces only at this score (voiceprint-math). */
+const OFF_ROSTER_MIN = Number(process.env.MW_VOICEPRINT_OFF_ROSTER_MIN || String(OFF_ROSTER_MIN_SCORE));
 
 /**
  * The verdict lines of the last voice pass per meeting, for the speaker-ID
@@ -321,32 +326,26 @@ export async function suggestSpeakersForTranscript(
       // rows of one human (legacy name_key spellings awaiting the rebuild)
       // are `samePerson` and never compete.
       const second = scored.find((s) => !samePerson(s.name, best.name));
-      if (best.score < THRESHOLD) {
-        verdict = { kind: 'below-threshold', best };
-      } else if (second && best.score - second.score < MARGIN) {
-        // Ambiguous on voice alone — unless the call roster settles it: the
-        // candidate who was on the call beats a print of someone who was not.
-        const winner = resolveMarginByRoster(best, second, roster, samePerson);
-        if (winner && winner.score >= THRESHOLD) {
-          const loser = winner === best ? second : best;
-          verdict = { kind: 'match', name: winner.name, score: winner.score, rosterOver: loser };
-          // No `evidence` here: the UI renders a voice suggestion's evidence
-          // as "the transcript agrees — …" (the ID pass's slot). The roster
-          // decision is in the verdict log line.
-          suggestions[speaker] = {
-            name: winner.name,
-            confidence: Math.round(winner.score * 100) / 100,
-            source: 'voice',
-          };
-        } else {
-          verdict = { kind: 'margin', best, second };
-        }
-      } else {
-        verdict = { kind: 'match', name: best.name, score: best.score };
+      // Threshold, margin (broken by the call roster when it can be), and the
+      // invite gate: a weak match to someone who was not invited is not
+      // surfaced (lib/voiceprint-math.ts decideVoiceMatch).
+      const decision = decideVoiceMatch(best, second, {
+        threshold: THRESHOLD,
+        margin: MARGIN,
+        roster,
+        samePerson,
+        offRosterMin: OFF_ROSTER_MIN,
+      });
+      verdict = decision.verdict;
+      if (decision.suggestion) {
+        // No `evidence` here: the UI renders a voice suggestion's evidence
+        // as "the transcript agrees — …" (the ID pass's slot). Roster
+        // decisions are in the verdict log line.
         suggestions[speaker] = {
-          name: best.name,
-          confidence: Math.round(best.score * 100) / 100,
+          name: decision.suggestion.name,
+          confidence: Math.round(decision.suggestion.score * 100) / 100,
           source: 'voice',
+          ...(decision.suggestion.offRoster ? { offRoster: true } : {}),
         };
       }
     } catch (err) {
@@ -358,13 +357,13 @@ export async function suggestSpeakersForTranscript(
   console.log(`[voiceprint] ${assemblyaiId} verdicts: ${verdicts.join(' · ')}`);
   rememberVerdicts(assemblyaiId, verdicts);
 
-  // Preserve context-source suggestions (from Claude's transcript reading)
-  // for speakers the voice pass has no opinion on; voice wins on overlap.
+  // Context-source suggestions (the ID pass, Meet alignment) survive for
+  // speakers the voice pass has no opinion on — and an ID-pass name that
+  // overruled a weak or uninvited voice match survives a voice re-run
+  // ("Guess names", notes POST) instead of being clobbered by the same weak
+  // match again (lib/speaker-id-merge.ts mergeVoiceSuggestions).
   const existing = (await getMappingsForUser(ownerUserId, assemblyaiId))?.suggestions ?? {};
-  const merged: SpeakerSuggestionMap = { ...suggestions };
-  for (const [sp, s] of Object.entries(existing)) {
-    if (!merged[sp] && s.source === 'context') merged[sp] = s;
-  }
+  const merged = mergeVoiceSuggestions(suggestions, existing);
 
   if (Object.keys(merged).length > 0) {
     await setSuggestionsForUser(ownerUserId, assemblyaiId, merged);

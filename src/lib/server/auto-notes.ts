@@ -4,7 +4,7 @@ import { z } from 'zod';
 import { tool, createSdkMcpServer } from '@anthropic-ai/claude-agent-sdk';
 import { logPayloadMissing } from '@/lib/server/aai-retention';
 import { runClaudeWithMeta, parseJsonFromClaude } from '@/lib/server/claude-agent';
-import { extractFrame, frameSourceFor, hasVideoStream } from '@/lib/server/video-frames';
+import { extractFrame, frameSourceFor, hasVideoStream, HIRES_FRAME_WIDTH } from '@/lib/server/video-frames';
 import { localMsIn, resolveMeetingContent, type ResolvedMedia } from '@/lib/server/recordings';
 import { recordAiRun, getLatestSessionId } from '@/db-ops/ai-runs';
 import { getServerAccessToken } from '@/lib/server/google-oauth';
@@ -14,7 +14,9 @@ import { recentVoiceVerdicts } from '@/lib/server/voiceprint';
 import { recordingCallContext, recordingContextBlock } from '@/lib/server/recording-call-context';
 import { combineFlagOn } from '@/db-ops/clips';
 import { mergeIdPassGuesses } from '@/lib/speaker-id-merge';
-import { personNameKey } from '@/lib/person-identity';
+import { onRoster, personNameKey } from '@/lib/person-identity';
+import { rosterIsInformative, WEAK_VOICE_SCORE } from '@/lib/voiceprint-math';
+import { clockOf, speakingMoments } from '@/lib/speaker-moments';
 import { splitSpeakerLabel } from '@/lib/recording-clips';
 import {
   getForUser,
@@ -496,58 +498,79 @@ async function frameSourceForRow(row: TranscriptRow): Promise<ResolvedMedia | nu
  * In-process MCP server exposing grab_frames over the stored recording.
  * A closure counter caps total frames per run — vision tokens are the cost
  * driver here, not ffmpeg.
+ *
+ * `purpose: 'speakers'` is the speaker-ID pass: the description talks about
+ * name tiles and the active-speaker highlight, the run cap is the caller's
+ * (scaled to the number of unnamed voices), and a `hires` flag returns
+ * 1600-px frames so tile names are legible (a 2560-px Teams window scaled to
+ * 960 px leaves ~9-px text).
  */
-function buildVideoTools(assemblyaiId: string, source: ResolvedMedia, durationMs: number | null) {
+function buildVideoTools(
+  assemblyaiId: string,
+  source: ResolvedMedia,
+  durationMs: number | null,
+  opts: { purpose?: 'report' | 'speakers'; maxPerRun?: number; stats?: { grabbed: number } } = {}
+) {
   const audioFilename = source.filename;
-  let grabbed = 0;
+  const speakers = opts.purpose === 'speakers';
+  const stats = opts.stats ?? { grabbed: 0 };
   const MAX_PER_CALL = 8;
-  const MAX_PER_RUN = 24;
+  const MAX_PER_RUN = opts.maxPerRun ?? 24;
+  const description = speakers
+    ? 'Return video frames from the meeting recording at the given millisecond timestamps (batch several at once). Use to SEE who is on the call and WHO IS TALKING: call apps highlight the active speaker\'s tile (Teams: a coloured border around the tile; Meet: a blue outline / sound bars) and label tiles with names; a screen share shows "<name> is presenting". Set hires=true to read small tile names.'
+    : 'Return video frames from the meeting recording at the given millisecond timestamps (batch several at once). Use to SEE what was on screen — slides, dashboards, documents — at moments the transcript suggests something was being shown.';
+  const shape = {
+    timestamps_ms: z
+      .array(z.number().int().min(0))
+      .min(1)
+      .max(MAX_PER_CALL)
+      .describe(`Millisecond offsets into the recording, up to ${MAX_PER_CALL} per call`),
+    ...(speakers
+      ? {
+          hires: z
+            .boolean()
+            .optional()
+            .describe(`true = ${HIRES_FRAME_WIDTH}px wide frames (legible tile names, ~3x the tokens); default 960px`),
+        }
+      : {}),
+  };
   return createSdkMcpServer({
     name: 'video',
     tools: [
-      tool(
-        'grab_frames',
-        'Return video frames from the meeting recording at the given millisecond timestamps (batch several at once). Use to SEE what was on screen — slides, dashboards, documents — at moments the transcript suggests something was being shown.',
-        {
-          timestamps_ms: z
-            .array(z.number().int().min(0))
-            .min(1)
-            .max(MAX_PER_CALL)
-            .describe(`Millisecond offsets into the recording, up to ${MAX_PER_CALL} per call`),
-        },
-        async ({ timestamps_ms }) => {
-          const content: Array<
-            | { type: 'text'; text: string }
-            | { type: 'image'; data: string; mimeType: string }
-          > = [];
-          for (const rawMs of timestamps_ms) {
-            if (grabbed >= MAX_PER_RUN) {
-              content.push({
-                type: 'text',
-                text: `(frame budget reached — ${MAX_PER_RUN} frames max per run; work with what you have)`,
-              });
-              break;
-            }
-            const ms = durationMs ? Math.min(rawMs, Math.max(0, durationMs - 1000)) : rawMs;
-            const m = Math.floor(ms / 60000);
-            const s = Math.floor((ms % 60000) / 1000);
-            try {
-              // The model asks in MEETING ms (what the transcript it is
-              // reading shows). For a meeting split off a longer recording,
-              // the file is shared and the seek is `localMsIn` — the same
-              // mapping the `frame:<ms>` it writes will be served through.
-              const abs = await extractFrame(assemblyaiId, audioFilename, localMsIn(source, ms), ms);
-              const data = await fsp.readFile(abs);
-              grabbed++;
-              content.push({ type: 'text', text: `Frame at ${m}:${String(s).padStart(2, '0')} (${ms} ms):` });
-              content.push({ type: 'image', data: data.toString('base64'), mimeType: 'image/jpeg' });
-            } catch (err) {
-              content.push({ type: 'text', text: `Frame at ${ms} ms unavailable: ${String(err).slice(0, 120)}` });
-            }
+      tool('grab_frames', description, shape, async (args: { timestamps_ms: number[]; hires?: boolean }) => {
+        const { timestamps_ms } = args;
+        const width = speakers && args.hires ? HIRES_FRAME_WIDTH : undefined;
+        const content: Array<
+          | { type: 'text'; text: string }
+          | { type: 'image'; data: string; mimeType: string }
+        > = [];
+        for (const rawMs of timestamps_ms) {
+          if (stats.grabbed >= MAX_PER_RUN) {
+            content.push({
+              type: 'text',
+              text: `(frame budget reached — ${MAX_PER_RUN} frames max per run; work with what you have)`,
+            });
+            break;
           }
-          return { content };
+          const ms = durationMs ? Math.min(rawMs, Math.max(0, durationMs - 1000)) : rawMs;
+          const m = Math.floor(ms / 60000);
+          const s = Math.floor((ms % 60000) / 1000);
+          try {
+            // The model asks in MEETING ms (what the transcript it is
+            // reading shows). For a meeting split off a longer recording,
+            // the file is shared and the seek is `localMsIn` — the same
+            // mapping the `frame:<ms>` it writes will be served through.
+            const abs = await extractFrame(assemblyaiId, audioFilename, localMsIn(source, ms), ms, width);
+            const data = await fsp.readFile(abs);
+            stats.grabbed++;
+            content.push({ type: 'text', text: `Frame at ${m}:${String(s).padStart(2, '0')} (${ms} ms):` });
+            content.push({ type: 'image', data: data.toString('base64'), mimeType: 'image/jpeg' });
+          } catch (err) {
+            content.push({ type: 'text', text: `Frame at ${ms} ms unavailable: ${String(err).slice(0, 120)}` });
+          }
         }
-      ),
+        return { content };
+      }),
     ],
   });
 }
@@ -806,18 +829,20 @@ export async function generateAutoNotes(
   }
 }
 
-const SPEAKER_ID_PROMPT = `You are identifying the diarized speakers of a meeting transcript BEFORE any summary is written. The anonymous labels (Speaker A, B, …) come from voice-level diarization; your only job is to work out who each unnamed speaker actually is, so a human can confirm your guesses and summary generation can then use real names.
+const SPEAKER_ID_PROMPT = `You are identifying the diarized speakers of a meeting transcript BEFORE any summary is written. The anonymous labels (Speaker A, B, …) come from voice-level diarization; your only job is to work out who each unnamed speaker actually is, so a human can confirm your guesses and summary generation can then use real names. The human will only glance at your answer — do the work so they do not have to.
 
 Evidence, strongest first:
-- Transcript text: self-introductions, being addressed by name right before/after a turn ("thanks, Priya" / "Priya, can you…"), sign-offs, first-person claims that match a role in the people directory below.
-- The participant/people directory below: the true roster and spellings — speakers are almost always on it.
-- The search_people tool: the full company directory. Verify each name you intend to propose — a transcript often garbles names ("Blissy" for a person the directory spells differently), so search for likely variants and propose the CANONICAL directory person — written as their DISPLAY name ("Karnica Katiyar"), never an email local-part or login handle ("karnica.katiyar"). Where the tool prints a "display name", copy that. A guess with no directory match may still be right (external guests) — propose it, but say so in the evidence and lower the confidence.
-- Voiceprint hints below: weak signals to corroborate or reject, NOT ground truth — sub-70% matches are frequently wrong. Overrule them when text or video contradicts. A "margin" verdict lists two close candidates: if the recording context or the transcript rules one out, the other is very likely right.
-- RECORDING CONTEXT (when present): the recorder's own record of the call — who owns the Mac that recorded it and, for a one-to-one call, the contact the call window was titled after. That is the strongest roster evidence there is; the two voices of a WhatsApp/FaceTime call are the owner and that contact unless the transcript plainly says otherwise.
-- Video frames (when a grab_frames tool is available): the recording may show Meet name tiles, caption bylines, or a presenter's name on screen. YOU decide whether looking will help and how many frames are worth it (usually a handful). IMPORTANT: name tiles show who was IN the call, not which diarized voice is which — a meeting-room device shares one mic among several people. Use tiles for roster and exact spellings; bind a tile to a specific speaker letter only when the transcript supports the mapping (e.g. the named presenter is clearly the one narrating the demo).
+- Transcript text — READ ALL OF IT, not just the opening: self-introductions, being addressed by name right before/after a turn ("thanks, Priya" / "Priya, can you…" / "go on, Joey"), hand-overs, sign-offs, first-person claims that match a role ("I'm from IT", "our import team"). Names in the transcript are often garbled by speech recognition ("Pau Gun" / "Bagong" for "Pak Agung") — match them to the invite list and the directory.
+- Video frames (when a grab_frames tool is available — see the VIDEO block below for exact moments to look at): call apps highlight the ACTIVE speaker's tile — Teams draws a coloured border around the tile and names every tile; Meet outlines the tile / shows sound bars. A frame a few seconds into one voice's long utterance shows whose tile is lit while that voice talks. Two or more such frames, at different times, that agree on one highlighted name bind the voice to that person — that is strong evidence (confidence 0.8-0.95). Also read "<name> is presenting" banners during screen shares against who narrates the share. Caveats: a meeting-room device shares one mic and one tile among several people; the recording owner's own tile may be missing or small; if no tile is highlighted or tiles are hidden behind a full-screen share, say the frames were inconclusive rather than guessing from them.
+- The invite list / participant directory below: the true roster and spellings — speakers are almost always on it.
+- The search_people tool: the full company directory. Verify each name you intend to propose — propose the CANONICAL directory person, written as their DISPLAY name ("Karnica Katiyar"), never an email local-part or login handle ("karnica.katiyar"). Where the tool prints a "display name", copy that. Invitees from other companies (external guests) will not be in the directory — the invite spelling is then the reference; write it as a person would ("Agung Prihatmoko", not "PRIHATMOKO Agung").
+- Voiceprint hints below: weak signals to corroborate or reject, NOT ground truth — sub-70% matches are frequently wrong. CROSS-CHECK EVERY VOICE HINT AGAINST THE INVITE: a voice match to someone who is NOT on the invite of a meeting that has one is very likely a false match (a similar-sounding colleague) — reject it unless the transcript or the frames independently confirm that person was on the call. A "margin" verdict lists two close candidates: if the recording context or the transcript rules one out, the other is very likely right; "off-roster" means the voice pass already discarded an uninvited match.
+- RECORDING CONTEXT (when present): the recorder's own record of the call — who owns the Mac that recorded it and, for a one-to-one call, the contact the call window was titled after. That is strong roster evidence; the two voices of a WhatsApp/FaceTime call are the owner and that contact unless the transcript plainly says otherwise.
+
+Method: read the whole transcript and note every name-bearing line; when you have video, grab frames at the moments given for EVERY unnamed speaker (hires=true when tile names are small) before you decide; check each candidate against the invite; then answer. Two voices can be the same person only if diarization split them — say so in the evidence if you think so.
 
 Output a single JSON object and NOTHING else:
-{"A": {"name": "Full Name", "confidence": 0.85, "evidence": "short concrete justification (quote, tile, hint corroboration)"}}
+{"A": {"name": "Full Name", "confidence": 0.85, "evidence": "short concrete justification (quote, highlighted tile at 12:46 and 31:10, hint corroboration)"}}
 - Keys are raw speaker letters — only ones NOT already confirmed by a human.
 - "name" is a display name: capitalised words separated by spaces, as a person would write it — never a login/handle with dots or underscores.
 - confidence is your own honest 0-1 estimate; include shaky guesses with low confidence rather than omitting them, but NEVER invent a name that appears nowhere in the evidence.
@@ -892,7 +917,9 @@ function buildIdPassHints(
   labels: SpeakerLabel[],
   suggestions: SpeakerSuggestionMap,
   naming?: SpeakerNaming,
-  voiceVerdicts: string[] = []
+  voiceVerdicts: string[] = [],
+  /** Who was invited (recording-call-context roster); [] = no invite known. */
+  roster: string[] = []
 ): string {
   const say = (label: string) => (naming ? naming.of(label) : speakerDisplayLabel(label));
   const lines: string[] = [];
@@ -905,7 +932,19 @@ function buildIdPassHints(
   for (const [sp, s] of Object.entries(suggestions)) {
     if (named.has(sp) || s.via === 'id') continue;
     if (s.source === 'voice') {
-      lines.push(`- Speaker ${say(sp)}: voiceprint matched "${s.name}" at ${Math.round(s.confidence * 100)}% similarity (hint only)`);
+      const pct = Math.round(s.confidence * 100);
+      const invited = rosterIsInformative(roster) ? onRoster(s.name, roster) : null;
+      const notes = [
+        s.confidence < WEAK_VOICE_SCORE ? 'WEAK' : null,
+        invited === false || s.offRoster
+          ? 'NOT on the invite — reject unless the transcript or frames confirm this person was on the call'
+          : invited
+            ? 'on the invite'
+            : null,
+      ].filter(Boolean);
+      lines.push(
+        `- Speaker ${say(sp)}: voiceprint matched "${s.name}" at ${pct}% similarity (hint only${notes.length ? `; ${notes.join('; ')}` : ''})`
+      );
     } else if (s.confidence > 0) {
       lines.push(`- Speaker ${say(sp)}: possibly "${s.name}" (${s.evidence ?? 'timeline overlap with the Meet transcript'})`);
     }
@@ -922,6 +961,43 @@ function buildIdPassHints(
   }
   if (lines.length === 0) return 'Speaker hints: none yet — work from the transcript, directory, and frames.\n\nTranscript follows:\n\n';
   return `Speaker hints gathered so far:\n${lines.join('\n')}\n\nTranscript follows:\n\n`;
+}
+
+/** Frames per unnamed speaker the ID pass is told to look at. */
+const ID_MOMENTS_PER_SPEAKER = 4;
+/** Hard cap on frames in one ID pass (≈ $0.5 of vision at most). */
+const ID_MAX_FRAMES = 36;
+
+/**
+ * The VIDEO block of the ID prompt: for each unnamed speaker, the moments it
+ * is talking (lib/speaker-moments.ts), so the model grabs frames where the
+ * active-speaker highlight answers the question instead of sampling blind.
+ */
+function buildSpeakerMomentsBlock(
+  content: TranscriptResponse,
+  unnamed: string[],
+  naming: SpeakerNaming,
+  frameBudget: number
+): string {
+  const utterances = content.utterances ?? [];
+  const lines: string[] = [];
+  for (const sp of [...unnamed].sort()) {
+    const m = speakingMoments(utterances, sp, ID_MOMENTS_PER_SPEAKER);
+    if (m.moments.length === 0) continue;
+    const talk = clockOf(m.talkMs);
+    lines.push(
+      `- Speaker ${naming.of(sp)} (${m.lines} line${m.lines === 1 ? '' : 's'}, ${talk} of speech) is talking at: ` +
+        m.moments.map((ms) => `${clockOf(ms)} (${ms} ms)`).join(', ')
+    );
+  }
+  if (lines.length === 0) return '';
+  return (
+    `VIDEO: this meeting has video and you have grab_frames (budget ${frameBudget} frames for the run). ` +
+    `Look before you answer: grab the frames below (batch them, up to 8 per call), find the highlighted / speaking tile in each and read its name; ` +
+    `use hires=true if the tile names are too small to read. Use any remaining budget for the start of the call (who joined) and screen-share moments.\n` +
+    lines.join('\n') +
+    '\n\n'
+  );
 }
 
 /**
@@ -992,11 +1068,21 @@ export async function identifySpeakers(
     const frameSource = await frameSourceForRow(row);
     const videoOk = frameSource ? await hasVideoStream(frameSource.filename) : false;
     const durationMs = (row.duration ?? content.audio_duration ?? 0) * 1000 || null;
+    // Frames: the per-speaker moments plus a few to look around — capped, as
+    // vision tokens are the cost (~700 per 960-px frame, ~2k hires).
+    const frameBudget = Math.min(ID_MAX_FRAMES, ID_MOMENTS_PER_SPEAKER * unnamed.length + 6);
+    const frameStats = { grabbed: 0 };
     const agentOpts = {
       mcpServers: {
         people: buildPeopleTools(),
         ...(videoOk
-          ? { video: buildVideoTools(assemblyaiId, frameSource!, durationMs) }
+          ? {
+              video: buildVideoTools(assemblyaiId, frameSource!, durationMs, {
+                purpose: 'speakers',
+                maxPerRun: frameBudget,
+                stats: frameStats,
+              }),
+            }
           : {}),
       },
       allowedTools: [
@@ -1008,20 +1094,23 @@ export async function identifySpeakers(
     // Whose call this was, from the recorder's own record (a WhatsApp/FaceTime
     // title names the other party) — best-effort, '' when not a tray recording.
     let recordingBlock = '';
+    let roster: string[] = [];
     try {
-      recordingBlock = recordingContextBlock(await recordingCallContext(row), row.title ?? null);
+      const callCtx = await recordingCallContext(row);
+      roster = callCtx.roster;
+      recordingBlock = recordingContextBlock(callCtx, row.title ?? null);
     } catch (err) {
       console.warn(`[speaker-id] ${assemblyaiId}: recording context failed (continuing without):`, err);
     }
 
     const prompt =
       SPEAKER_ID_PROMPT +
-      (videoOk ? 'THIS MEETING HAS VIDEO and you have the grab_frames tool.\n\n' : '') +
+      (videoOk ? buildSpeakerMomentsBlock(content, unnamed, naming, frameBudget) : '') +
       recordingBlock +
       (await buildSourcesContext(row)) +
       buildMeetCrossReference(row) +
       (await buildPeopleContext(row)) +
-      buildIdPassHints(labels, suggestions, naming, recentVoiceVerdicts(assemblyaiId)) +
+      buildIdPassHints(labels, suggestions, naming, recentVoiceVerdicts(assemblyaiId), roster) +
       buildTranscriptText(content, labels, naming);
 
     const started = Date.now();
@@ -1069,7 +1158,9 @@ export async function identifySpeakers(
 
     console.log(
       `[speaker-id] ${assemblyaiId}: identified ${added}/${unnamed.length} unnamed speaker(s) in ${Math.round((Date.now() - started) / 1000)}s` +
-        (run.meta.costUsd != null ? ` ($${run.meta.costUsd.toFixed(4)}, ${run.meta.model ?? 'model?'}${videoOk ? ', video' : ''})` : '')
+        (run.meta.costUsd != null
+          ? ` ($${run.meta.costUsd.toFixed(4)}, ${run.meta.model ?? 'model?'}${videoOk ? `, video, ${frameStats.grabbed}/${frameBudget} frames` : ''})`
+          : '')
     );
     await setSpeakerIdForUser(ownerUserId, assemblyaiId, { status: 'completed', error: null });
   } catch (err) {

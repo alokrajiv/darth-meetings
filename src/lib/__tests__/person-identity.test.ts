@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test';
-import { personNameKey, samePerson } from '@/lib/person-identity';
+import { onRoster, personNameKey, samePerson } from '@/lib/person-identity';
 
 describe('personNameKey', () => {
   test('folds login spellings and invisible characters', () => {
@@ -23,5 +23,32 @@ describe('samePerson', () => {
   test('different people', () => {
     expect(samePerson('Ankit Thakur', 'Ashey Sharma')).toBe(false);
     expect(samePerson('', 'Ivan')).toBe(false);
+  });
+});
+
+describe('samePerson — invite spellings (2026-09-25, transcript 980)', () => {
+  test('surname-first invite names and calendar decorations', () => {
+    expect(samePerson('CHUNG Joey', 'Joey Chung')).toBe(true);
+    expect(samePerson('LEE Sharon (EXT)', 'Sharon Lee')).toBe(true);
+    expect(samePerson('PRIHATMOKO Agung', 'Agung Prihatmoko')).toBe(true);
+  });
+  test('two Ivans are not one person', () => {
+    expect(samePerson('SHE Ivan', 'Ivan Seow')).toBe(false);
+  });
+});
+
+describe('onRoster', () => {
+  const roster = ['Alok Rajiv', 'Ivan Seow', 'PRIHATMOKO Agung', 'ADIPUTRA Dwi', 'SHE Ivan', 'CHUNG Joey', 'LI Li', 'LEE Sharon (EXT)', 'DING Wick (EXT)'];
+  test('invitees match in any spelling', () => {
+    expect(onRoster('Ivan Seow', roster)).toBe(true);
+    expect(onRoster('ivan.seow', roster)).toBe(true);
+    expect(onRoster('Joey Chung', roster)).toBe(true);
+  });
+  test('colleagues who were not invited are off the roster', () => {
+    expect(onRoster('Yan-Simon Saragih', roster)).toBe(false);
+    expect(onRoster('Hitesh Ambaliya', roster)).toBe(false);
+    expect(onRoster('iman.sani', roster)).toBe(false);
+    expect(onRoster('Huiyee Lim', roster)).toBe(false);
+    expect(onRoster('Anyone', [])).toBe(false);
   });
 });

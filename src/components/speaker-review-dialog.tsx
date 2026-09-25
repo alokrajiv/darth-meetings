@@ -14,7 +14,7 @@ import { Input } from '@/components/ui/input';
 import { Check, Mic, RefreshCw, Sparkles } from 'lucide-react';
 import type { SpeakerLabel, SpeakerSuggestionMap } from '@/lib/format';
 import { defaultSpeakerLabel, speakerColorVar } from '@/lib/speaker-display';
-import { speakerNameState } from '@/lib/speaker-name-state';
+import { speakerNameState, voiceMatchCaveat, voiceMatchLabel } from '@/lib/speaker-name-state';
 
 interface SpeakerReviewDialogProps {
   open: boolean;
@@ -67,12 +67,14 @@ export function SpeakerReviewDialog({
   const [submitting, setSubmitting] = useState(false);
 
   // Late-arriving suggestions (the AI pass finishing while the dialog is
-  // open) fill fields the user hasn't touched — never overwrite their edits.
+  // open) update every field the user hasn't touched — including one that
+  // was pre-filled with an earlier guess the pass has since replaced (a weak
+  // voice match overruled by the transcript + video). Never their edits.
   useEffect(() => {
     setNames((prev) => {
       const next = { ...prev };
       for (const sp of speakers) {
-        if (!dirty.has(sp) && !next[sp] && initialNames[sp]) next[sp] = initialNames[sp];
+        if (!dirty.has(sp)) next[sp] = initialNames[sp] ?? '';
       }
       return next;
     });
@@ -153,7 +155,7 @@ export function SpeakerReviewDialog({
                           className="line-clamp-2 min-w-0 flex-1 break-words"
                           title={suggestion.evidence || undefined}
                         >
-                          {Math.round(suggestion.confidence * 100)}% voice match — hint, not proof
+                          {voiceMatchLabel(suggestion)} — {voiceMatchCaveat(suggestion)}
                           {suggestion.evidence ? `; the transcript agrees — ${suggestion.evidence}` : ''}
                         </span>
                       </>

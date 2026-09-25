@@ -125,10 +125,17 @@ export function frameDir(assemblyaiId: string): string {
   return path.join(getStorageDir(), 'frames', assemblyaiId);
 }
 
-export function framePath(assemblyaiId: string, ms: number): string {
+export function framePath(assemblyaiId: string, ms: number, width: number = FRAME_WIDTH): string {
   const safeMs = Math.max(0, Math.floor(ms));
-  return path.join(frameDir(assemblyaiId), `${safeMs}.jpg`);
+  // The default width keeps its historical name — it is what `frame:<ms>`
+  // citations are served from. Other widths (the speaker-ID pass reading
+  // name tiles at 1600 px) are cached beside it.
+  const suffix = width === FRAME_WIDTH ? '' : `-w${Math.floor(width)}`;
+  return path.join(frameDir(assemblyaiId), `${safeMs}${suffix}.jpg`);
 }
+
+/** Width for reading small text in a frame (call name tiles): ~2k vision tokens. */
+export const HIRES_FRAME_WIDTH = 1600;
 
 /**
  * Extract (or reuse a cached) frame into the frame cache dir.
@@ -145,10 +152,11 @@ export async function extractFrame(
   assemblyaiId: string,
   audioFilename: string,
   fileMs: number,
-  cacheMs: number = fileMs
+  cacheMs: number = fileMs,
+  width: number = FRAME_WIDTH
 ): Promise<string> {
   const ms = fileMs;
-  const out = framePath(assemblyaiId, cacheMs);
+  const out = framePath(assemblyaiId, cacheMs, width);
   try {
     await fsp.access(out);
     return out; // cached
@@ -162,7 +170,7 @@ export async function extractFrame(
   // rather than from byte zero. scale to a fixed width, -2 keeps aspect.
   await execFileP(
     'ffmpeg',
-    ['-y', '-loglevel', 'error', '-ss', ts, '-i', src, '-frames:v', '1', '-vf', `scale=${FRAME_WIDTH}:-2`, '-q:v', '4', out],
+    ['-y', '-loglevel', 'error', '-ss', ts, '-i', src, '-frames:v', '1', '-vf', `scale=${Math.floor(width)}:-2`, '-q:v', '4', out],
     EXEC_OPTS
   );
   // ffmpeg exits 0 even when seeking past EOF produces nothing — verify.

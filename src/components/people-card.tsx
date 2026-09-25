@@ -9,7 +9,7 @@ import { ChevronDown, ChevronUp, Fingerprint, MicOff, Pencil, Sparkles, Users } 
 import type { GmeetAttendee, SpeakerLabel, SpeakerSuggestionMap } from '@/lib/format';
 import { personDisplay } from '@/lib/person-display';
 import { speakerColorVar } from '@/lib/speaker-display';
-import { countVoices, speakerNameStates, type SpeakerNameState } from '@/lib/speaker-name-state';
+import { countVoices, speakerNameStates, voiceMatchCaveat, voiceMatchLabel, type SpeakerNameState } from '@/lib/speaker-name-state';
 
 interface Utterance {
   text: string;
@@ -360,12 +360,12 @@ function VoiceRow({
   const evidenceTitle =
     s.status === 'guess'
       ? s.suggestion?.source === 'voice'
-        ? `${Math.round(s.suggestion.confidence * 100)}% voice match — a hint, not proof` +
+        ? `${voiceMatchLabel(s.suggestion)} — ${voiceMatchCaveat(s.suggestion)}` +
           (s.suggestion.evidence ? `; the transcript agrees — ${s.suggestion.evidence}` : '')
         : s.suggestion?.evidence
           ? `Evidence: ${s.suggestion.evidence}`
           : s.suggestion
-            ? `${Math.round(s.suggestion.confidence * 100)}% voice match — a hint, not proof`
+            ? `${voiceMatchLabel(s.suggestion)} — ${voiceMatchCaveat(s.suggestion)}`
             : undefined
       : s.status === 'group'
         ? `Labelled “${s.name}” — a shared mic, not a person`
@@ -416,7 +416,9 @@ function VoiceRow({
             {s.suggestion.source === 'voice' ? (
               <>
                 <Fingerprint className="h-3 w-3 shrink-0 text-primary" />
+                {s.suggestion.confidence < 0.7 ? 'weak ' : ''}
                 {Math.round(s.suggestion.confidence * 100)}% voice
+                {s.suggestion.offRoster ? ' · not invited' : ''}
               </>
             ) : (
               <>

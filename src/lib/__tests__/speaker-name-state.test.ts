@@ -1,6 +1,6 @@
 import { describe, expect, test } from 'bun:test';
 import type { SpeakerLabel, SpeakerSuggestionMap } from '../format';
-import { confirmedPersonNames, countVoices, speakerNameState, speakerNameStates } from '../speaker-name-state';
+import { confirmedPersonNames, countVoices, guessCaption, speakerNameState, speakerNameStates, voiceMatchCaveat, voiceMatchLabel } from '../speaker-name-state';
 
 // The Hypercare row (591b102e…) as it stood before Atira's last save: two
 // confirmed, one transcript guess, one voice guess, one "mixed" voice guess
@@ -77,5 +77,18 @@ describe('aggregates', () => {
     expect(confirmedPersonNames(states)).toEqual(['Atira Sarat', 'Anton']);
     const dup = speakerNameStates(['A', 'X'], [...labels, { originalSpeaker: 'X', customName: 'atira sarat', description: '' }], {});
     expect(confirmedPersonNames(dup)).toEqual(['Atira Sarat']);
+  });
+});
+
+describe('voice guesses read honestly (2026-09-25, transcript 980)', () => {
+  test('weak and uninvited voice matches say so', () => {
+    expect(guessCaption({ name: 'Yan-Simon Saragih', confidence: 0.53, source: 'voice' })).toBe(
+      'guessed — weak 53% voice match, often wrong'
+    );
+    expect(guessCaption({ name: 'Hitesh Ambaliya', confidence: 0.81, source: 'voice', offRoster: true })).toBe(
+      'guessed — 81% voice match, but not on the invite'
+    );
+    expect(voiceMatchLabel({ confidence: 0.91 })).toBe('91% voice match');
+    expect(voiceMatchCaveat({ confidence: 0.91 })).toBe('a hint not proof');
   });
 });

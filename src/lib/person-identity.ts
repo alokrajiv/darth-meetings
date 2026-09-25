@@ -23,13 +23,39 @@ export function personNameKey(name: string): string {
     .trim();
 }
 
-/** Same human under two spellings? Equal keys, spacing-only difference, prefix, or same first name. */
+/**
+ * The key a COMPARISON reads: `personNameKey` with calendar decorations gone —
+ * "(EXT)", "[Danone]" and the like. Not used for stored name_keys (those stay
+ * `personNameKey`, so enrolled rows keep their identity).
+ */
+function comparableKey(name: string): string {
+  return personNameKey(name.replace(/\([^)]*\)|\[[^\]]*\]/g, ' '));
+}
+
+/**
+ * Same human under two spellings? Equal keys, spacing-only difference, the
+ * same words in another order ("CHUNG Joey" on a Danone invite is "Joey
+ * Chung" — surname-first corporate directories), prefix, or same first name.
+ */
 export function samePerson(a: string, b: string): boolean {
-  const na = personNameKey(a);
-  const nb = personNameKey(b);
+  const na = comparableKey(a);
+  const nb = comparableKey(b);
   if (!na || !nb) return false;
   if (na === nb) return true;
   if (na.replace(/ /g, '') === nb.replace(/ /g, '')) return true; // "LiXuan" / "Li Xuan"
+  const ta = na.split(' ');
+  const tb = nb.split(' ');
+  if (ta.length > 1 && ta.length === tb.length && [...ta].sort().join(' ') === [...tb].sort().join(' ')) {
+    return true; // "chung joey" / "joey chung"
+  }
   if (na.startsWith(nb) || nb.startsWith(na)) return true; // "ivan seow" / "ivan"
-  return na.split(' ')[0] === nb.split(' ')[0]; // same first name
+  return ta[0] === tb[0]; // same first name
+}
+
+/**
+ * Is `name` one of the people on `roster` (calendar invitees, the call's
+ * counterpart, the recording owner)? `samePerson` against each entry.
+ */
+export function onRoster(name: string, roster: readonly string[]): boolean {
+  return roster.some((r) => samePerson(r, name));
 }

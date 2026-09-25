@@ -922,6 +922,34 @@ function TranscriptDetailInner({ transcriptId }: { transcriptId: string }) {
     return () => clearInterval(timer);
   }, [row?.status, transcriptId, loadAll, offline]);
 
+  // Just completed, speaker-ID pass not claimed yet: the completion hook
+  // claims it a moment AFTER the poll that saw 'completed', so the row this
+  // page loaded says NULL and the "running" poll above never starts — the
+  // review dialog then showed the voice-only guesses and never the pass's
+  // (2026-09-25, transcript 980). Watch for the claim for up to two minutes
+  // after completion; the poll above takes over once it reads 'running'.
+  useEffect(() => {
+    if (offline) return;
+    if (row?.status !== 'completed' || row?.speaker_id_status != null) return;
+    const doneAt = Date.parse(row?.completed_at ?? '');
+    if (!Number.isFinite(doneAt) || Date.now() - doneAt > 2 * 60_000) return;
+    const timer = setInterval(async () => {
+      try {
+        const res = await fetch(`/api/transcripts/${transcriptId}`);
+        if (!res.ok) return;
+        const { transcript } = (await res.json()) as { transcript: StoredTranscript };
+        if (transcript.speaker_id_status != null) {
+          setRow((prev) => (prev ? { ...prev, speaker_id_status: transcript.speaker_id_status } : prev));
+        } else if (Date.now() - doneAt > 2 * 60_000) {
+          clearInterval(timer);
+        }
+      } catch {
+        // transient — keep polling
+      }
+    }, 4000);
+    return () => clearInterval(timer);
+  }, [row?.status, row?.speaker_id_status, row?.completed_at, transcriptId, offline]);
+
   const [guessingSpeakers, setGuessingSpeakers] = useState(false);
   const handleGuessSpeakers = useCallback(async () => {
     if (guessingSpeakers) return;
@@ -931,10 +959,16 @@ function TranscriptDetailInner({ transcriptId }: { transcriptId: string }) {
         method: 'POST',
       });
       if (res.ok) {
-        const { suggestions } = (await res.json()) as {
+        const { suggestions, speakerIdStatus } = (await res.json()) as {
           suggestions: SpeakerSuggestionMap;
+          speakerIdStatus?: string | null;
         };
         setSpeakerSuggestions(suggestions);
+        // The ID pass may be running (or was just retriggered): let the
+        // suggestions poll pick up its guesses when they land.
+        if (speakerIdStatus !== undefined) {
+          setRow((prev) => (prev ? { ...prev, speaker_id_status: speakerIdStatus } : prev));
+        }
       }
     } finally {
       setGuessingSpeakers(false);
