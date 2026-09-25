@@ -14,6 +14,31 @@ Native macOS side of Darth Meetings recording (the "Swift tray" angle from Darth
 the user switched it off in the menu (`loginItemUserChoice` in UserDefaults records an explicit choice;
 the default never overrides it). macOS may show "Darth Recorder was added as a login item" once.
 
+**0.3.17 (2026-09-25) — either audio track can be switched off mid-recording; virtual inputs are never the mic.**
+Alok: the tray could switch the video source to audio-only but had no way to turn the system audio or
+the microphone off. Same day, 16:05 SGT: a 48-minute Teams call recorded digital silence on the whole mic
+track (−120 dB for 2684 s) because the mic had been hand-picked as "Microsoft Teams Audio" (Teams'
+loopback driver), and the pick persisted.
+
+- **Audio submenu** (`AudioMenu.swift`; tray, and the preview gear next to Microphone). While recording,
+  un-ticking a track MUTES it: `MicCapture.muted` / `AudioForwarder.muted` zero the buffers in place, so
+  the timeline and the live mix track stay intact, no part roll, and ticking it again resumes. Health
+  reads `mic off` / `system off` instead of a silence fault. A track the recording started without is
+  greyed (the writer's tracks are fixed). Idle, the ticks set what the NEXT recording starts with (banner
+  Record, menu Record, the Record… dialog's check boxes follow them) and reset to both-on once it starts;
+  not persisted. ws `set_audio_tracks {system?, mic?}`; `status.audio_tracks {recording, system{on,
+  in_recording}, mic{…}, summary}`; events `audio_mute_change`, `next_audio_change`, `next_audio_reset`.
+- **Virtual devices are not microphones.** `AudioDevices.Device.virtual` from
+  `kAudioDevicePropertyTransportType` (virtual or aggregate: Teams Audio, BlackHole, the VPIO/default
+  aggregates). The Microphone menus list them greyed "— virtual, no microphone"; `pickMic` refuses one
+  (menus and ws `set_mic_device`) with a banner; a persisted virtual pick is cleared at launch; status
+  `mic_device.devices[]` carries `virtual`.
+- **E2E (ws, audio-only, no upload, recordings deleted):** a muted track is exactly −inf dB. Mic muted
+  for 8 s → the `eng` track −inf for file t = 7.0–14.5 s, −35…−104 dB room floor on both sides (AirPods
+  mic, no playback). System muted → `mul` −inf over the muted window vs −28.0 / −31.2 dB `say` speech
+  before and after. Gotcha for the driver: file t = 0 is ~2 s after the `start` command, so fixed windows
+  keyed to send times straddle the edges — measure per 0.5 s.
+
 **0.3.16 (2026-09-23) — the microphone follows device changes, heals itself, and can be picked.**
 Meet "Salesforce x Trames — follow up", 11:03 SGT: the AirPods left the recording twenty seconds in
 and the mic track stayed empty for the remaining 33 minutes — 212 buffers, `mic ✗` on the health line
