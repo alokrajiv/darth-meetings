@@ -100,8 +100,13 @@ const AAI_DELETE_PER_SWEEP = 10;
 const AAI_STUCK_PER_SWEEP = 50;
 /** Rows the resume pass finishes per 5-minute sweep. */
 const AAI_RESUME_PER_SWEEP = 25;
-/** When this process came up — rows older than this have no live waiter. */
-const PROCESS_STARTED_AT = new Date();
+/**
+ * How long an in-flight row may go unobserved before the sweeper asks
+ * AssemblyAI itself. Nothing in-process waits on a job (see
+ * `listStrandedAtAai`); a short grace just lets the owner's own page do it
+ * first when they are watching.
+ */
+const AAI_RESUME_AFTER_MS = 2 * 60_000;
 // Phase 2 re-transcriptions in flight. Serial and small: each one is an
 // outbound AssemblyAI call, and the listing poll + the detail sync already
 // pick up anything whose page is open.
@@ -254,15 +259,14 @@ async function sweep(): Promise<void> {
     console.warn('[notes-sweeper] scratch expiry query failed:', err);
   }
 
-  // A restart (every deploy) kills the in-process wait on any job still at
-  // AssemblyAI. Finish those rows here — same code path as the listing's
-  // refresh, so completion stores the payload, mirrors the graph and fires
-  // post-completion exactly as if a user had loaded the listing. Only rows
-  // born before THIS process started are touched: a row born in this process
-  // still has its own waiter, and polling it twice would double the
-  // post-completion work. Bounded by AAI_STUCK_HOURS like the listing.
+  // Nothing in-process waits on a job at AssemblyAI (see `listStrandedAtAai`):
+  // a row completes when its owner's page polls it, or here. Finish every
+  // unobserved in-flight row — same code path as the listing's refresh, so
+  // completion stores the payload, mirrors the graph and fires the
+  // post-completion hook (idempotent; it claims its own work). Bounded by
+  // AAI_STUCK_HOURS like the listing.
   try {
-    const stranded = await listStrandedAtAai(PROCESS_STARTED_AT, AAI_RESUME_PER_SWEEP);
+    const stranded = await listStrandedAtAai(AAI_RESUME_AFTER_MS, AAI_RESUME_PER_SWEEP);
     if (stranded.length > 0) {
       const before = new Map(stranded.map((r) => [r.assemblyai_id, r.status]));
       await refreshPendingAgainstAai(stranded);

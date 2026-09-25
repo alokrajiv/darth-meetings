@@ -31,8 +31,11 @@ import { samePerson } from '@/lib/person-identity';
 import {
   formatVerdict,
   pickSpeechByBudget,
+  resolveMarginByRoster,
   type SpeakerVerdict,
 } from '@/lib/voiceprint-math';
+import type { TranscriptRow } from '@/db-ops/transcripts';
+import { recordingCallContext } from '@/lib/server/recording-call-context';
 
 const SIDECAR_URL = process.env.MW_VOICEPRINT_URL || 'http://127.0.0.1:3004';
 
@@ -47,6 +50,34 @@ const THRESHOLD = Number(process.env.MW_VOICEPRINT_THRESHOLD || '0.5');
 
 /** Require the best match to beat the runner-up by this margin (ambiguity guard). */
 const MARGIN = 0.05;
+
+/**
+ * The verdict lines of the last voice pass per meeting, for the speaker-ID
+ * pass that follows it in the same process (post-completion and the
+ * "Guess names" route both run voice → ID back to back). A rejected or
+ * ambiguous verdict is information the ID pass never had: transcript 973's
+ * "A=margin(Yadu N M 0.77 vs Pratiksha Mali 0.72)" would have named A with
+ * the title alone, but the pass only ever saw the ACCEPTED suggestions.
+ * Process-local and short-lived on purpose — a hint, not state.
+ */
+const recentVerdicts = new Map<string, { at: number; lines: string[] }>();
+const VERDICT_TTL_MS = 30 * 60_000;
+
+export function recentVoiceVerdicts(assemblyaiId: string): string[] {
+  const hit = recentVerdicts.get(assemblyaiId);
+  if (!hit) return [];
+  if (Date.now() - hit.at > VERDICT_TTL_MS) {
+    recentVerdicts.delete(assemblyaiId);
+    return [];
+  }
+  return hit.lines;
+}
+
+function rememberVerdicts(assemblyaiId: string, lines: string[]): void {
+  const now = Date.now();
+  for (const [k, v] of recentVerdicts) if (now - v.at > VERDICT_TTL_MS) recentVerdicts.delete(k);
+  recentVerdicts.set(assemblyaiId, { at: now, lines });
+}
 
 // Free-text naming created duplicate identities ("Ivan" / "Ivan Seow",
 // "karnica.katiyar" / "Karnica Katiyar"). The margin guard must not treat two
@@ -228,7 +259,15 @@ export async function suggestSpeakersForTranscript(
   ownerUserId: string,
   assemblyaiId: string,
   media: VoiceprintMedia,
-  content: TranscriptResponse | null
+  content: TranscriptResponse | null,
+  opts: {
+    /**
+     * The meeting row, for WHO WAS ON THE CALL: a margin tie between a
+     * candidate on the roster and one who was not is no tie
+     * (`resolveMarginByRoster`; lib/server/recording-call-context.ts).
+     */
+    row?: TranscriptRow | null;
+  } = {}
 ): Promise<SpeakerSuggestionMap> {
   if (asList(media).length === 0 || !content?.utterances?.length) return {};
 
@@ -236,6 +275,15 @@ export async function suggestSpeakersForTranscript(
   // table (deleting is a human's call) but never become a suggestion.
   const voiceprints = (await listAll()).filter((vp) => !isGroupLabel(vp.name));
   if (voiceprints.length === 0) return {};
+
+  let roster: string[] = [];
+  if (opts.row) {
+    try {
+      roster = (await recordingCallContext(opts.row)).roster;
+    } catch (err) {
+      console.warn(`[voiceprint] ${assemblyaiId}: call context failed (continuing without):`, err);
+    }
+  }
 
   const speakers = [...new Set(content.utterances.map((u) => u.speaker))];
   const suggestions: SpeakerSuggestionMap = {};
@@ -276,7 +324,23 @@ export async function suggestSpeakersForTranscript(
       if (best.score < THRESHOLD) {
         verdict = { kind: 'below-threshold', best };
       } else if (second && best.score - second.score < MARGIN) {
-        verdict = { kind: 'margin', best, second };
+        // Ambiguous on voice alone — unless the call roster settles it: the
+        // candidate who was on the call beats a print of someone who was not.
+        const winner = resolveMarginByRoster(best, second, roster, samePerson);
+        if (winner && winner.score >= THRESHOLD) {
+          const loser = winner === best ? second : best;
+          verdict = { kind: 'match', name: winner.name, score: winner.score, rosterOver: loser };
+          // No `evidence` here: the UI renders a voice suggestion's evidence
+          // as "the transcript agrees — …" (the ID pass's slot). The roster
+          // decision is in the verdict log line.
+          suggestions[speaker] = {
+            name: winner.name,
+            confidence: Math.round(winner.score * 100) / 100,
+            source: 'voice',
+          };
+        } else {
+          verdict = { kind: 'margin', best, second };
+        }
       } else {
         verdict = { kind: 'match', name: best.name, score: best.score };
         suggestions[speaker] = {
@@ -292,6 +356,7 @@ export async function suggestSpeakersForTranscript(
     }
   }
   console.log(`[voiceprint] ${assemblyaiId} verdicts: ${verdicts.join(' · ')}`);
+  rememberVerdicts(assemblyaiId, verdicts);
 
   // Preserve context-source suggestions (from Claude's transcript reading)
   // for speakers the voice pass has no opinion on; voice wins on overlap.

@@ -138,7 +138,8 @@ export function onTranscriptCompleted(
             ownerUserId,
             full.assemblyai_id,
             resolved.media /* every file: a combined meeting embeds each recording's voices from ITS OWN file (mediaForSpeaker) */,
-            content
+            content,
+            { row: full }
           ).catch((err) => console.warn('[post-completion] suggest failed:', err));
 
           // Meet↔AAI alignment: when the import kept the Google Meet transcript

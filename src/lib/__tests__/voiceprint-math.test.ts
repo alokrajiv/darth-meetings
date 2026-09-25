@@ -5,6 +5,7 @@ import {
   formatVerdict,
   pickSpeechByBudget,
   preferDisplayName,
+  resolveMarginByRoster,
   storedWeight,
   weightedMerge,
 } from '@/lib/voiceprint-math';
@@ -102,3 +103,28 @@ describe('formatVerdict', () => {
     expect(formatVerdict('D', { kind: 'no-segment', longestMs: 800 })).toBe('D=no-segment(0.8s)');
   });
 });
+
+describe('resolveMarginByRoster', () => {
+  const same = (a: string, b: string) => a.toLowerCase().split(' ')[0] === b.toLowerCase().split(' ')[0];
+  const yadu = { name: 'Yadu N M', score: 0.77 };
+  const rival = { name: 'Pratiksha Mali', score: 0.72 };
+  test('the candidate on the call wins over one who was not (transcript 973)', () => {
+    expect(resolveMarginByRoster(yadu, rival, ['Alok Rajiv', 'Yadu N M'], same)).toEqual(yadu);
+  });
+  test('the runner-up wins when only IT is on the call', () => {
+    expect(resolveMarginByRoster(yadu, rival, ['Pratiksha'], same)).toEqual(rival);
+  });
+  test('both on the roster → still ambiguous', () => {
+    expect(resolveMarginByRoster(yadu, rival, ['Yadu', 'Pratiksha Mali'], same)).toBeNull();
+  });
+  test('neither on the roster, or no roster → still ambiguous', () => {
+    expect(resolveMarginByRoster(yadu, rival, ['Ivan Seow'], same)).toBeNull();
+    expect(resolveMarginByRoster(yadu, rival, [], same)).toBeNull();
+  });
+  test('formatVerdict shows the roster decision', () => {
+    expect(formatVerdict('A', { kind: 'match', name: 'Yadu N M', score: 0.77, rosterOver: rival })).toBe(
+      'A=Yadu N M 0.77 ✓ (on the call; over Pratiksha Mali 0.72)'
+    );
+  });
+});
+

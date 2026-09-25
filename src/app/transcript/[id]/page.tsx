@@ -956,6 +956,18 @@ function TranscriptDetailInner({ transcriptId }: { transcriptId: string }) {
     }
     return counts;
   }, [content]);
+  // Speakers nobody has named yet. "Review speakers & generate" only stops at
+  // the review dialog for THESE — once every speaker carries a human-confirmed
+  // name (People card → Confirm, or a previous review) the button goes
+  // straight to the generate dialog. Asking to confirm what was just
+  // confirmed was reported as a bug on 2026-09-25.
+  const unconfirmedSpeakers = useMemo(
+    () =>
+      reviewSpeakers.filter(
+        (sp) => !speakerLabels.find((l) => l.originalSpeaker === sp)?.customName.trim()
+      ),
+    [reviewSpeakers, speakerLabels]
+  );
 
   const handleGenerateReport = useCallback(async (instructions?: string, useVideo = true, runAt?: string) => {
     if (generatingReport) return;
@@ -3609,11 +3621,11 @@ function TranscriptDetailInner({ transcriptId }: { transcriptId: string }) {
                               disabled={offline || notesGenerating}
                               title={offline ? OFFLINE_TITLE : undefined}
                               onClick={() =>
-                                reviewSpeakers.length > 0 ? setReviewOpen(true) : openGenerateDialog()
+                                unconfirmedSpeakers.length > 0 ? setReviewOpen(true) : openGenerateDialog()
                               }
                             >
                               <Sparkles className="h-4 w-4" />
-                              Review speakers &amp; generate
+                              {unconfirmedSpeakers.length > 0 ? 'Review speakers & generate' : 'Generate summary & report'}
                             </Button>
                             <p className="mt-2 max-w-[46ch] text-xs text-muted-foreground">
                               One run writes both views: the quick summary and the wiki-style

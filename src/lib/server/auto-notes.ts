@@ -10,6 +10,8 @@ import { recordAiRun, getLatestSessionId } from '@/db-ops/ai-runs';
 import { getServerAccessToken } from '@/lib/server/google-oauth';
 import { fetchRecordingFromDrive, fetchRecordingFromTeams } from '@/lib/server/recording-fetch';
 import { findPeopleByEmails, searchPeople, type Person } from '@/db-ops/people';
+import { recentVoiceVerdicts } from '@/lib/server/voiceprint';
+import { recordingCallContext, recordingContextBlock } from '@/lib/server/recording-call-context';
 import { combineFlagOn } from '@/db-ops/clips';
 import { mergeIdPassGuesses } from '@/lib/speaker-id-merge';
 import { personNameKey } from '@/lib/person-identity';
@@ -810,7 +812,8 @@ Evidence, strongest first:
 - Transcript text: self-introductions, being addressed by name right before/after a turn ("thanks, Priya" / "Priya, can you…"), sign-offs, first-person claims that match a role in the people directory below.
 - The participant/people directory below: the true roster and spellings — speakers are almost always on it.
 - The search_people tool: the full company directory. Verify each name you intend to propose — a transcript often garbles names ("Blissy" for a person the directory spells differently), so search for likely variants and propose the CANONICAL directory person — written as their DISPLAY name ("Karnica Katiyar"), never an email local-part or login handle ("karnica.katiyar"). Where the tool prints a "display name", copy that. A guess with no directory match may still be right (external guests) — propose it, but say so in the evidence and lower the confidence.
-- Voiceprint hints below: weak signals to corroborate or reject, NOT ground truth — sub-70% matches are frequently wrong. Overrule them when text or video contradicts.
+- Voiceprint hints below: weak signals to corroborate or reject, NOT ground truth — sub-70% matches are frequently wrong. Overrule them when text or video contradicts. A "margin" verdict lists two close candidates: if the recording context or the transcript rules one out, the other is very likely right.
+- RECORDING CONTEXT (when present): the recorder's own record of the call — who owns the Mac that recorded it and, for a one-to-one call, the contact the call window was titled after. That is the strongest roster evidence there is; the two voices of a WhatsApp/FaceTime call are the owner and that contact unless the transcript plainly says otherwise.
 - Video frames (when a grab_frames tool is available): the recording may show Meet name tiles, caption bylines, or a presenter's name on screen. YOU decide whether looking will help and how many frames are worth it (usually a handful). IMPORTANT: name tiles show who was IN the call, not which diarized voice is which — a meeting-room device shares one mic among several people. Use tiles for roster and exact spellings; bind a tile to a specific speaker letter only when the transcript supports the mapping (e.g. the named presenter is clearly the one narrating the demo).
 
 Output a single JSON object and NOTHING else:
@@ -888,7 +891,8 @@ function buildPeopleTools() {
 function buildIdPassHints(
   labels: SpeakerLabel[],
   suggestions: SpeakerSuggestionMap,
-  naming?: SpeakerNaming
+  naming?: SpeakerNaming,
+  voiceVerdicts: string[] = []
 ): string {
   const say = (label: string) => (naming ? naming.of(label) : speakerDisplayLabel(label));
   const lines: string[] = [];
@@ -905,6 +909,16 @@ function buildIdPassHints(
     } else if (s.confidence > 0) {
       lines.push(`- Speaker ${say(sp)}: possibly "${s.name}" (${s.evidence ?? 'timeline overlap with the Meet transcript'})`);
     }
+  }
+  // The voice pass's full verdict list, rejections included. "A=margin(Yadu
+  // N M 0.77 vs Pratiksha Mali 0.72)" is a near-answer the roster or the
+  // transcript can settle; "below-threshold" says the voice is nobody we have
+  // enrolled. Only the accepted matches used to reach this prompt.
+  if (voiceVerdicts.length > 0) {
+    lines.push(
+      `- Voiceprint pass, every verdict (cosine similarity to enrolled voices; "margin" = two prints too close to call, "below-threshold" = no enrolled voice is close): ` +
+        voiceVerdicts.join(' · ')
+    );
   }
   if (lines.length === 0) return 'Speaker hints: none yet — work from the transcript, directory, and frames.\n\nTranscript follows:\n\n';
   return `Speaker hints gathered so far:\n${lines.join('\n')}\n\nTranscript follows:\n\n`;
@@ -991,13 +1005,23 @@ export async function identifySpeakers(
       ],
     };
 
+    // Whose call this was, from the recorder's own record (a WhatsApp/FaceTime
+    // title names the other party) — best-effort, '' when not a tray recording.
+    let recordingBlock = '';
+    try {
+      recordingBlock = recordingContextBlock(await recordingCallContext(row), row.title ?? null);
+    } catch (err) {
+      console.warn(`[speaker-id] ${assemblyaiId}: recording context failed (continuing without):`, err);
+    }
+
     const prompt =
       SPEAKER_ID_PROMPT +
       (videoOk ? 'THIS MEETING HAS VIDEO and you have the grab_frames tool.\n\n' : '') +
+      recordingBlock +
       (await buildSourcesContext(row)) +
       buildMeetCrossReference(row) +
       (await buildPeopleContext(row)) +
-      buildIdPassHints(labels, suggestions, naming) +
+      buildIdPassHints(labels, suggestions, naming, recentVoiceVerdicts(assemblyaiId)) +
       buildTranscriptText(content, labels, naming);
 
     const started = Date.now();

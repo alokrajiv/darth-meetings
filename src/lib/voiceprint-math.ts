@@ -201,7 +201,13 @@ export function aggregateSamples(
 
 /** One speaker's outcome in `suggestSpeakersForTranscript`, for the log line. */
 export type SpeakerVerdict =
-  | { kind: 'match'; name: string; score: number }
+  | {
+      kind: 'match';
+      name: string;
+      score: number;
+      /** Set when a margin tie was broken by the call roster — see `resolveMarginByRoster`. */
+      rosterOver?: { name: string; score: number };
+    }
   | { kind: 'below-threshold'; best: { name: string; score: number } | null }
   | { kind: 'margin'; best: { name: string; score: number }; second: { name: string; score: number } }
   | { kind: 'no-segment'; longestMs: number }
@@ -213,7 +219,9 @@ const two = (n: number) => n.toFixed(2);
 export function formatVerdict(speaker: string, v: SpeakerVerdict): string {
   switch (v.kind) {
     case 'match':
-      return `${speaker}=${v.name} ${two(v.score)} ✓`;
+      return v.rosterOver
+        ? `${speaker}=${v.name} ${two(v.score)} ✓ (on the call; over ${v.rosterOver.name} ${two(v.rosterOver.score)})`
+        : `${speaker}=${v.name} ${two(v.score)} ✓`;
     case 'below-threshold':
       return v.best
         ? `${speaker}=below-threshold(best ${v.best.name} ${two(v.best.score)})`
@@ -228,3 +236,34 @@ export function formatVerdict(speaker: string, v: SpeakerVerdict): string {
       return `${speaker}=error`;
   }
 }
+
+/**
+ * Break a margin tie with WHO WAS ON THE CALL.
+ *
+ * The margin guard exists because two enrolled prints can score alike on one
+ * voice; when the recorder (or the calendar) says who the participants were,
+ * a candidate that is on that roster beats one that is not — the rival is
+ * a print of someone who was not in the room. Returns the winner only when
+ * EXACTLY one of the two is on the roster (both on it, or neither: still
+ * ambiguous, the caller keeps the 'margin' verdict).
+ *
+ * 2026-09-25, transcript 973: A = Yadu N M 0.77 vs "Pratiksha Mali" 0.72 on a
+ * WhatsApp call titled "Yadu N M - WhatsApp voice call". The rival print was
+ * Yadu's own voice enrolled under Pratiksha's name from Meet imports where
+ * the two share a room mic (cosine 0.87 to Yadu's print, 0.60 to the real
+ * pratiksha's) — the roster is the only signal that could tell them apart.
+ */
+export function resolveMarginByRoster(
+  best: { name: string; score: number },
+  second: { name: string; score: number },
+  roster: readonly string[],
+  samePerson: (a: string, b: string) => boolean
+): { name: string; score: number } | null {
+  if (roster.length === 0) return null;
+  const onRoster = (name: string) => roster.some((r) => samePerson(r, name));
+  const bestOn = onRoster(best.name);
+  const secondOn = onRoster(second.name);
+  if (bestOn === secondOn) return null;
+  return bestOn ? best : second;
+}
+

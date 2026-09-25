@@ -52,6 +52,8 @@ export interface AudioStreamInfo {
   language: string | null;
   title: string | null;
   handler: string | null;
+  /** The MP4 `tkhd` enabled bit (ffprobe `disposition.default`). */
+  isDefault: boolean;
 }
 
 /** Stamped on the mix track (as the MP4 handler name — the mov muxer drops a
@@ -86,7 +88,7 @@ export async function probeAudioStreams(filename: string): Promise<AudioStreamIn
     [
       '-v', 'error',
       '-select_streams', 'a',
-      '-show_entries', 'stream=index,channels,sample_rate:stream_tags=language,title,handler_name',
+      '-show_entries', 'stream=index,channels,sample_rate:stream_disposition=default:stream_tags=language,title,handler_name',
       '-of', 'json',
       resolveAudioPath(filename),
     ],
@@ -97,6 +99,7 @@ export async function probeAudioStreams(filename: string): Promise<AudioStreamIn
       index?: number;
       channels?: number;
       sample_rate?: string;
+      disposition?: { default?: number };
       tags?: { language?: string; title?: string; handler_name?: string };
     }>;
   };
@@ -107,7 +110,57 @@ export async function probeAudioStreams(filename: string): Promise<AudioStreamIn
     language: s.tags?.language ?? null,
     title: s.tags?.title ?? null,
     handler: s.tags?.handler_name ?? null,
+    isDefault: s.disposition?.default === 1,
   }));
+}
+
+/**
+ * Does the file play its raw tracks ON TOP of the mix in Safari?
+ *
+ * `AVAssetWriter` sets the `tkhd` enabled bit on every track it writes, and
+ * AVFoundation (Safari, QuickTime, the iOS player) plays EVERY enabled audio
+ * track of an MP4 at once; Chrome/Firefox (ffmpeg-style demuxers) play only
+ * the first. So a tray file — mix + system + mic, all enabled — sounds right
+ * in Chrome and doubled in Safari: the other party hears their own voice
+ * twice (mix + system track, offset by the live mixer's latency = "echo",
+ * reported 2026-09-25 on transcript 973), the owner three times. The server
+ * mix path already clears the flags; a tray-mixed file skipped that step.
+ */
+export function rawTracksEnabled(streams: AudioStreamInfo[]): boolean {
+  return streams.length >= 2 && streams.slice(1).some((s) => s.isDefault);
+}
+
+/**
+ * Clear the enabled bit on every audio track but the first (the mix), in
+ * place: a stream-copy remux (seconds, no re-encode) into `<file>.remux.tmp`
+ * then an atomic rename over the original. Video and metadata are copied.
+ * Throws on ffmpeg failure, leaving the original untouched.
+ */
+export async function keepOnlyMixEnabled(filename: string, trackCount: number): Promise<void> {
+  const src = resolveAudioPath(filename);
+  const remuxTmp = `${src}.remux.tmp`;
+  const clear = Array.from({ length: trackCount - 1 }, (_, i) => [`-disposition:a:${i + 1}`, '0']).flat();
+  try {
+    await execFileP(
+      'ffmpeg',
+      [
+        '-hide_banner', '-loglevel', 'error', '-y',
+        '-i', src,
+        '-map', '0',
+        '-c', 'copy',
+        '-disposition:a:0', 'default',
+        ...clear,
+        '-movflags', '+faststart',
+        '-f', 'mp4',
+        remuxTmp,
+      ],
+      EXEC_OPTS
+    );
+    await fsp.rename(remuxTmp, src);
+  } catch (err) {
+    await fsp.unlink(remuxTmp).catch(() => {});
+    throw new Error(`multitrack disposition remux failed: ${describe(err)}`);
+  }
 }
 
 export interface MultiTrackResult {
@@ -141,9 +194,15 @@ export async function normalizeMultiTrack(tempFilename: string): Promise<MultiTr
 
   // The mix is already track 0 — this pass has run before (ingest retry of a
   // kept-failure row), or the tray wrote it live (0.3.12). Just pull it out
-  // for AssemblyAI; never mix a mix back in with the raw tracks, and never
-  // touch the stored file, whose track order is already right.
+  // for AssemblyAI; never mix a mix back in with the raw tracks. The track
+  // ORDER is right, but a tray file's raw tracks still carry the enabled bit
+  // (`rawTracksEnabled`) — Safari would play all three — so those are
+  // cleared in place first, a copy remux that takes seconds.
   if (isMixTrack(streams[0])) {
+    if (rawTracksEnabled(streams)) {
+      await keepOnlyMixEnabled(tempFilename, streams.length);
+      console.log(`[multitrack] ${tempFilename}: cleared the enabled bit on ${streams.length - 1} raw track(s) (mix stays the only default)`);
+    }
     try {
       await execFileP(
         'ffmpeg',

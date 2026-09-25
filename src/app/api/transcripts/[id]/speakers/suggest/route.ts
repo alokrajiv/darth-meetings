@@ -48,7 +48,8 @@ export const POST = withAuth(async ({ user }, { params }) => {
       access.ownerUserId,
       id,
       resolved.media /* every file: a combined meeting embeds each recording's voices from ITS OWN file (mediaForSpeaker) */,
-      content
+      content,
+      { row: access.row }
     );
     // AI pass retry: only when it isn't already running/completed — a manual
     // "Guess names" click is the recovery path for errored/skipped passes.

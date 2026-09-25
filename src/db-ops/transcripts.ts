@@ -1116,22 +1116,27 @@ export interface StuckAaiRow {
 }
 
 /**
- * Rows still in flight at AssemblyAI whose in-process wait cannot be alive
- * any more: their clock started BEFORE this process did, so whoever was
- * awaiting the job died with the previous process (every deploy is a pm2
- * restart). Without this, such a row completes only when someone loads a
- * listing that shows it (`listPendingVisibleToUser`) — or never, until
- * `listStuckAtAai` gives up on it after AAI_STUCK_HOURS and asks for a Retry
- * that re-sends the recording. Same in-flight predicate as the listing's
- * query, all owners, trashed rows excluded, oldest first. Found 2026-09-22
- * when "AI - Daily" sat 'processing' for 25 min after AssemblyAI had finished
- * it, because it was born between two restarts.
+ * Rows still in flight at AssemblyAI that nobody is watching.
+ *
+ * There is NO in-process waiter after `submitTranscription`: a job's
+ * completion is observed only when its owner loads a listing or the detail
+ * page (`refreshPendingAgainstAai`), or here. Until 2026-09-25 this pass
+ * only took rows born BEFORE the process started (the "in-process wait died
+ * with the previous process" theory) — so a background Meet import whose
+ * owner never opened the app sat 'processing' for hours after AssemblyAI
+ * had finished it (rows 972/974/976 that day, up to 4 h; and after
+ * AAI_STUCK_HOURS the give-up pass would have flipped a FINISHED job to
+ * 'error'). Now: every in-flight row older than `olderThanMs`, all owners,
+ * trashed rows excluded, oldest first. The listing may poll the same row at
+ * the same moment — `updateStatusForUser` is idempotent and the
+ * post-completion hook claims its work atomically (`claimSpeakerId`).
  */
 export async function listStrandedAtAai(
-  processStartedAt: Date,
+  olderThanMs: number,
   limit: number
 ): Promise<PendingRefreshRow[]> {
   const job = await jobIdSql();
+  const cutoff = new Date(Date.now() - olderThanMs);
   return sql<PendingRefreshRow[]>`
     SELECT user_id, assemblyai_id, status, created_at, completed_at,
            duration, speaker_count, ${job.expr} AS aai_job_id
@@ -1139,7 +1144,7 @@ export async function listStrandedAtAai(
     WHERE deleted_at IS NULL
       AND status NOT IN ('completed', 'error', 'uploading', 'waiting')
       AND ${job.expr2} IS NOT NULL
-      AND COALESCE(upload_progress_at, created_at) < ${processStartedAt}
+      AND COALESCE(upload_progress_at, created_at) < ${cutoff}
       AND COALESCE(upload_progress_at, created_at)
             > now() - make_interval(hours => ${AAI_STUCK_HOURS})
     ORDER BY COALESCE(upload_progress_at, created_at) ASC

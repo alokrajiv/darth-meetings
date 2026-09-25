@@ -99,6 +99,8 @@ interface WalkStats {
   skippedNoContent: number;
   skippedNoMedia: number;
   skippedTranscriptOnly: number;
+  /** Meet/Teams imports WITH media: their names are the provider's device-level attribution, not a human's. */
+  skippedProviderAttributed: number;
   skippedMissingFile: number;
   skippedNoSegment: number;
   skippedDuplicateAudio: number;
@@ -107,7 +109,7 @@ interface WalkStats {
 
 function emptyStats(): WalkStats {
   return {
-    labels: 0, embedded: 0, cacheHits: 0, skippedGroup: 0, skippedNoContent: 0, skippedNoMedia: 0, skippedTranscriptOnly: 0,
+    labels: 0, embedded: 0, cacheHits: 0, skippedGroup: 0, skippedNoContent: 0, skippedNoMedia: 0, skippedTranscriptOnly: 0, skippedProviderAttributed: 0,
     skippedMissingFile: 0, skippedNoSegment: 0, skippedDuplicateAudio: 0, failed: 0,
   };
 }
@@ -131,7 +133,7 @@ function buildReport(allBefore: OldRow[], after: AggregatedIdentity[], stats: Wa
   out.push('== walk ==');
   out.push(
     `labels ${stats.labels} · embedded ${stats.embedded} (cache hits ${stats.cacheHits}) · ` +
-      `skipped: group ${stats.skippedGroup}, no content ${stats.skippedNoContent}, no media ${stats.skippedNoMedia}, transcript-only import ${stats.skippedTranscriptOnly}, ` +
+      `skipped: group ${stats.skippedGroup}, no content ${stats.skippedNoContent}, no media ${stats.skippedNoMedia}, transcript-only import ${stats.skippedTranscriptOnly}, provider-attributed import ${stats.skippedProviderAttributed}, ` +
       `file missing ${stats.skippedMissingFile}, no ≥1.5s segment ${stats.skippedNoSegment}, ` +
       `duplicate audio ${stats.skippedDuplicateAudio}, embed failed ${stats.failed}`
   );
@@ -299,6 +301,9 @@ const eligible = refs.flatMap((r) =>
 );
 console.log(`[rebuild] ${refs.length} meeting(s), ${eligible.length} named label(s), ${before.length} voiceprint row(s) now`);
 
+const isProviderAttributed = (assemblyaiId: string) =>
+  assemblyaiId.startsWith('gmeet-') || assemblyaiId.startsWith('teams-');
+
 const stats = emptyStats();
 const samples: VoiceSample[] = [];
 const spellingsSeen: string[] = [];
@@ -317,6 +322,14 @@ for (const item of eligible) {
     );
   }
   if (isGroupLabel(item.name)) { stats.skippedGroup++; continue; }
+  // A Meet/Teams import's names come from the PROVIDER's attribution, which
+  // is per device, not per voice: two people on one room mic are one name.
+  // Enrolling from it put Yadu's voice under "Pratiksha Mali" (7 DevOps
+  // Scrums, cosine 0.87 to Yadu's own print, 0.60 to the human-labelled
+  // "pratiksha") and that rival print then blocked Yadu's 0.77 match on a
+  // WhatsApp call (2026-09-25, transcript 973). Only labels a human wrote —
+  // or an auto-review passed on a fresh transcription — enrol.
+  if (isProviderAttributed(item.ref.assemblyai_id)) { stats.skippedProviderAttributed++; continue; }
   spellingsSeen.push(item.name);
 
   const tag = `${item.ref.assemblyai_id} ${item.speaker}→${cleanDisplayName(item.name)}`;

@@ -206,6 +206,27 @@ export async function getOwnRecording(
   return rows[0] ?? null;
 }
 
+/**
+ * The registry row behind a first-class RECORDING (`recordings.id`, what a
+ * meeting's `gmeet_context.fromRecording.recordingId` names), owner-scoped
+ * like every other read here. What the tray knew about the call — `call`
+ * (kind, app, window title) — is the reason to look it up: it names the
+ * other party of a WhatsApp/FaceTime call, which the speaker passes read
+ * (`lib/server/recording-call-context.ts`).
+ */
+export async function recorderRowForRecording(
+  userId: string,
+  recordingId: string
+): Promise<RecorderRecordingRow | null> {
+  const rows = await sql<RecorderRecordingRow[]>`
+    SELECT * FROM ${sql(SCHEMA)}.recorder_recordings
+    WHERE recording_id = ${recordingId}::uuid AND user_id = ${userId}
+    ORDER BY created_at DESC
+    LIMIT 1
+  `;
+  return rows[0] ?? null;
+}
+
 /** Does the id exist under another user? (409 instead of a silent no-op.) */
 export async function recordingOwnerOf(id: string): Promise<string | null> {
   const rows = await sql<Array<{ user_id: string }>>`
