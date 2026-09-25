@@ -92,3 +92,9 @@ describe('voice guesses read honestly (2026-09-25, transcript 980)', () => {
     expect(voiceMatchCaveat({ confidence: 0.91 })).toBe('a hint not proof');
   });
 });
+
+test('a weak voice match the ID pass corroborated is not called weak', () => {
+  expect(guessCaption({ name: 'Joey Chung', confidence: 0.69, source: 'voice', evidence: "tile 'CHUNG Joey' lit at 18:44" })).toBe(
+    "guessed — 69% voice match, a hint not proof; the transcript agrees — tile 'CHUNG Joey' lit at 18:44"
+  );
+});

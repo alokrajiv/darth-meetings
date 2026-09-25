@@ -416,8 +416,7 @@ function VoiceRow({
             {s.suggestion.source === 'voice' ? (
               <>
                 <Fingerprint className="h-3 w-3 shrink-0 text-primary" />
-                {s.suggestion.confidence < 0.7 ? 'weak ' : ''}
-                {Math.round(s.suggestion.confidence * 100)}% voice
+                {voiceMatchLabel(s.suggestion).replace(/ match$/, '')}
                 {s.suggestion.offRoster ? ' · not invited' : ''}
               </>
             ) : (

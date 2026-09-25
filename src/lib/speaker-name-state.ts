@@ -95,10 +95,19 @@ export function speakerNameState(
 /** Below this a voice match reads as weak (= voiceprint-math WEAK_VOICE_SCORE). */
 const WEAK_VOICE = 0.7;
 
+/**
+ * A weak score the speaker-ID pass independently corroborated (it left its
+ * agreement in `evidence` — e.g. the person's tile lit while that voice
+ * talks) is not "weak" any more; calling it so would contradict the note.
+ */
+function isWeakVoice(s: Pick<SpeakerSuggestion, 'confidence' | 'evidence'>): boolean {
+  return s.confidence < WEAK_VOICE && !(s.evidence ?? '').trim();
+}
+
 /** "53% voice match", "weak 53% voice match" — the short form every surface shows. */
-export function voiceMatchLabel(s: Pick<SpeakerSuggestion, 'confidence'>): string {
+export function voiceMatchLabel(s: Pick<SpeakerSuggestion, 'confidence' | 'evidence'>): string {
   const pct = `${Math.round(s.confidence * 100)}% voice match`;
-  return s.confidence < WEAK_VOICE ? `weak ${pct}` : pct;
+  return isWeakVoice(s) ? `weak ${pct}` : pct;
 }
 
 /**
@@ -106,9 +115,9 @@ export function voiceMatchLabel(s: Pick<SpeakerSuggestion, 'confidence'>): strin
  * 2026-09-25 complaint — colleagues not on the call were guessed), then a
  * weak score, then the standing "a hint not proof".
  */
-export function voiceMatchCaveat(s: Pick<SpeakerSuggestion, 'confidence' | 'offRoster'>): string {
+export function voiceMatchCaveat(s: Pick<SpeakerSuggestion, 'confidence' | 'offRoster' | 'evidence'>): string {
   if (s.offRoster) return 'but not on the invite';
-  if (s.confidence < WEAK_VOICE) return 'often wrong';
+  if (isWeakVoice(s)) return 'often wrong';
   return 'a hint not proof';
 }
 
