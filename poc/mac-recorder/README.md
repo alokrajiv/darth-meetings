@@ -14,6 +14,47 @@ Native macOS side of Darth Meetings recording (the "Swift tray" angle from Darth
 the user switched it off in the menu (`loginItemUserChoice` in UserDefaults records an explicit choice;
 the default never overrides it). macOS may show "Darth Recorder was added as a login item" once.
 
+**0.3.18 (2026-09-25) — a dead microphone is noticed during the recording, and acted on.**
+The 16:02 SGT Teams call (recording a9932a15…): the Microphone menu went to "LG ULTRAFINE" at 16:04 and
+to "Microsoft Teams Audio" (a loopback driver) at 16:05 — the mic track then read −120 dB / peak 0.000 for
+2684 s while the system track was audible at −10…−13 dB throughout. The only signal was "mic ✗" in a banner
+that hid itself after 10 s. 0.3.17 keeps virtual devices out of the picker; 0.3.18 is the other half.
+
+- **Detector** (`Sources/TrayLogic/MicDeadDetector.swift`, pure, `swift test` — 20 unit tests). Fed once
+  a second from the health tick with the mic's buffers / loudest sample / loudest buffer RMS since the
+  previous tick (`MicCapture.takeTickStats`) and whether the system track was audible. Dead =
+  (a) **digital silence**: buffers arriving but none peaked above −100 dBFS for 15 s (a real capsule
+  always has a floor); or (b) **silent while the call is audible**: no mic buffer above −60 dBFS RMS for
+  60 s, the system track audible ≥ 40 s of that minute, and no mic PEAK above −60 dBFS in it (our own
+  extra guard: a quiet listener still has a room, and an automatic switch away from a chosen mic is not a
+  cheap false positive). Never while the user muted the mic (0.3.17), never without a mic track (and (b)
+  never without a live system track), windows start 5 s after every mic (re)start or unmute, at most one
+  detection per 2 min.
+- **Action** (`AppDelegate.micDead`): a red banner that does NOT hide itself ("Microphone is silent …",
+  the device, what was done, the health line). A manual pick (`micDeviceUID`) falls back to Automatic
+  (the pref is cleared — the same path as "Automatic — follow the system default"); Automatic is
+  re-detected once and checked again 30 s later — still dead by (a), or nothing from the mic for 20 s while
+  the system stayed audible for ⅔ of it → "Microphone is still silent — pick one in the tray menu". After
+  that follow-up the detector holds off until the mic recovers or 10 min pass. The restart's own
+  "Microphone changed" notice is suppressed so it cannot replace the red banner. Health line reads
+  `mic ✗ DEAD` (menu status line + banner) while the condition holds.
+- **Telemetry / ws.** Events `mic_dead_detected {reason, device, device_label, mode, silent_s,
+  system_audible_s, follow_up, simulated, at_s}`, `mic_dead_fallback {from, to, outcome}`,
+  `mic_dead_redetect`; broadcast `mic_dead`; `status.audio.mic_dead {active, reason, silent_s,
+  system_audible_s, detections, follow_up_pending, last_action, simulated, last{…}}`.
+- **Test hook** `{cmd:"simulate_mic_dead", mode:"zero"|"quiet"|"low"|null}` (recording with a mic only):
+  the capture hands zeros / −110 dBFS noise / −80 dBFS noise to the meter AND the file, without the
+  user-facing mute; null = the real microphone again.
+- **E2E (ws, audio-only, no upload, all three recordings deleted):** MacBook mic pinned → zero → detected
+  `digital_silence` 15 s after the last mic restart, pick fell back to Automatic (AirPods), `mode: auto`;
+  zero kept on → second detection in Automatic exactly 120.0 s later → re-detect → follow-up "still
+  silent" 31 s later. Mic muted + zero for 25 s → nothing; unmuted → detected after 21 s. "low" −80 dBFS for
+  75 s with a silent system track → nothing; "quiet" −110 dBFS → `digital_silence` after 16.4 s. Branch (b)
+  is unit-tested only (making the system track audible would have meant playing sound on the owner's Mac).
+  Seen on the way: pinning the MacBook mic while AirPods are the default makes the raw engine stop on
+  configuration changes five times in ~12 s (0.3.16 behaviour, gap-filled) — the first detection came
+  25 s after the simulate because each restart restarts the window.
+
 **0.3.17 (2026-09-25) — either audio track can be switched off mid-recording; virtual inputs are never the mic.**
 Alok: the tray could switch the video source to audio-only but had no way to turn the system audio or
 the microphone off. Same day, 16:05 SGT: a 48-minute Teams call recorded digital silence on the whole mic
