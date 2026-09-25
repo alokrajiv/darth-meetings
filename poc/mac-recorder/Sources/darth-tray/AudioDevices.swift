@@ -15,6 +15,21 @@ enum AudioDevices {
         let id: AudioDeviceID
         let uid: String
         let name: String
+        /// 0.3.17: a loopback / aggregate device, not a microphone. "Microsoft Teams Audio"
+        /// (Teams' loopback driver), "BlackHole 2ch", the voice-processing unit's own
+        /// `CADefaultDeviceAggregate-…` — CoreAudio lists them as inputs, and picking one
+        /// records digital silence: on 2026-09-25 16:05 SGT a 48-minute Teams call lost the
+        /// owner's whole side that way (mic −120 dB for 2684 s, the pick persisted).
+        var virtual: Bool = false
+    }
+
+    /// `kAudioDevicePropertyTransportType` — virtual and aggregate devices carry no capsule.
+    static func isVirtual(_ id: AudioDeviceID) -> Bool {
+        var addr = address(kAudioDevicePropertyTransportType)
+        var t: UInt32 = 0
+        var size = UInt32(MemoryLayout<UInt32>.size)
+        guard AudioObjectGetPropertyData(id, &addr, 0, nil, &size, &t) == noErr else { return false }
+        return t == kAudioDeviceTransportTypeVirtual || t == kAudioDeviceTransportTypeAggregate
     }
 
     private static func address(_ selector: AudioObjectPropertySelector,
@@ -59,7 +74,7 @@ enum AudioDevices {
     static func inputs() -> [Device] {
         allIDs().compactMap { id in
             guard inputChannels(id) > 0, let uid = uid(of: id) else { return nil }
-            return Device(id: id, uid: uid, name: name(of: id) ?? uid)
+            return Device(id: id, uid: uid, name: name(of: id) ?? uid, virtual: isVirtual(id))
         }
     }
 

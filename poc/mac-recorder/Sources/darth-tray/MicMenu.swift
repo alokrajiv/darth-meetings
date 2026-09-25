@@ -77,8 +77,12 @@ final class MicMenu: NSObject {
             m.addItem(none)
         }
         for (i, d) in pickable.enumerated() {
-            let item = NSMenuItem(title: d.name, action: #selector(pickTapped(_:)), keyEquivalent: "")
-            item.target = self
+            // 0.3.17: loopback / aggregate devices are listed so the person sees why they
+            // are not offered, but cannot be picked — they record silence.
+            let item = NSMenuItem(title: d.virtual ? "\(d.name) — virtual, no microphone" : d.name,
+                                  action: d.virtual ? nil : #selector(pickTapped(_:)), keyEquivalent: "")
+            item.target = d.virtual ? nil : self
+            item.isEnabled = !d.virtual
             item.tag = i
             item.state = d.uid == info.selectedUID ? .on : .off
             m.addItem(item)

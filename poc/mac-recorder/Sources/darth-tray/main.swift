@@ -107,6 +107,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     /// The one place a microphone pick from any surface (preview gear, tray submenu, PWA) lands.
     func pickMic(uid: String?, name: String, how: String) {
+        // 0.3.17: a loopback / aggregate device records silence — never a pick.
+        if let uid, AudioDevices.inputs().first(where: { $0.uid == uid })?.virtual == true {
+            let out = "\(name) is a virtual device (no microphone) — not selectable; the pick stays \(micDeviceUID == nil ? "Automatic" : "as it was")"
+            rlog("mic: \(out)")
+            banner.showMessage(title: "Microphone", sub: out, accent: .warning, stoppable: recorder.isRecording, near: recordingFrame, autoHide: 8)
+            broadcast("mic_device_changed", ["outcome": out])
+            return
+        }
         micDeviceUID = uid
         let out = recorder.switchMicDevice(uid: uid, name: name, how: how)
         banner.showMessage(title: "Microphone", sub: out, accent: .info, stoppable: recorder.isRecording, near: recordingFrame, autoHide: 6)
@@ -250,6 +258,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         recorder.api = api
         recorder.deviceId = auth.deviceId
         recorder.micVoiceProcessing = micVoiceProcessing
+        // 0.3.17: a persisted pick of a virtual device (Teams' loopback driver was chosen by
+        // hand on 2026-09-25 and silenced a whole call) is cleared at launch.
+        if let uid = micDeviceUID, AudioDevices.inputs().first(where: { $0.uid == uid })?.virtual == true {
+            rlog("mic: persisted pick \(uid) is a virtual device — back to Automatic")
+            micDeviceUID = nil
+        }
         recorder.micDeviceUID = micDeviceUID
         recorder.willStopOwnStreams = { [weak self] n in for _ in 0..<n { self?.shares.expectOwnTeardown() } }
         recorder.onStarted = { [weak self] in self?.recordingStarted() }
@@ -1397,7 +1411,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 "mode": micDeviceUID == nil ? "auto" : "manual", "uid": micDeviceUID ?? NSNull(),
                 "current": (recorder.isRecording ? recorder.micDeviceLabel : nil) ?? NSNull(),
                 "restarts": recorder.micRestarts,
-                "devices": AudioDevices.inputs().map { ["uid": $0.uid, "name": $0.name] },
+                "devices": AudioDevices.inputs().map { ["uid": $0.uid, "name": $0.name, "virtual": $0.virtual] },
             ] as [String: Any],
             "banner_visible": banner.isVisible,
             "resources": ResourceSampler.shared.latest ?? NSNull(),
