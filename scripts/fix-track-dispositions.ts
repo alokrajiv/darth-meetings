@@ -19,6 +19,8 @@
  *
  *   bun --conditions=react-server scripts/fix-track-dispositions.ts            # dry run: list what would change
  *   bun --conditions=react-server scripts/fix-track-dispositions.ts --apply    # rewrite + re-archive
+ *   … --apply --skip-archive   # rewrite only (blob uploads were stalling on 2026-09-25)
+ *   … --rearchive              # then: re-archive every mix-first file whose raw tracks are now off
  *   … [--limit N] [--only <filename>]
  */
 import { readdirSync } from 'node:fs';
@@ -29,6 +31,10 @@ const limitIdx = args.indexOf('--limit');
 const LIMIT = limitIdx >= 0 ? Number(args[limitIdx + 1]) : null;
 const onlyIdx = args.indexOf('--only');
 const ONLY = onlyIdx >= 0 ? args[onlyIdx + 1]! : null;
+/** Fix the flags only; leave the blob copies for a later `--rearchive` pass. */
+const SKIP_ARCHIVE = args.includes('--skip-archive');
+/** Re-archive (rehash) every file the flag fix already touched, without probing/remuxing. */
+const REARCHIVE = args.includes('--rearchive');
 
 const { getAudioDir } = await import('@/lib/server/audio-storage');
 const { probeAudioStreams, rawTracksEnabled, keepOnlyMixEnabled, isMixTrack } = await import('@/lib/server/multitrack');
@@ -62,6 +68,13 @@ for (const name of names) {
     continue;
   }
   probed++;
+  if (REARCHIVE) {
+    // A file this fix has already rewritten: mix first, raw tracks off.
+    if (streams.length < 2 || !isMixTrack(streams[0]!) || rawTracksEnabled(streams)) continue;
+    affected++;
+    await rearchive(name);
+    continue;
+  }
   if (!rawTracksEnabled(streams)) continue;
   affected++;
   affectedNames.push(name);
@@ -87,14 +100,22 @@ for (const name of names) {
     console.warn(`[dispositions] ${name}: remux failed — ${String(err).slice(0, 300)}`);
     continue;
   }
+  if (!SKIP_ARCHIVE) await rearchive(name);
+}
+
+async function rearchive(name: string): Promise<void> {
   try {
     const rows = await sql<RecordingMediaRow[]>`
       SELECT * FROM ${sql(SCHEMAS.MEETING_WHISPERER)}.recording_media WHERE filename = ${name}
     `;
     for (const row of rows) {
+      const started = Date.now();
       const out = await archiveMedia(row, { rehash: true });
       if (out.status === 'archived') rearchived++;
-      console.log(`[dispositions] ${name}: media ${row.id} archive → ${out.status}${'reason' in out && out.reason ? ` (${out.reason})` : ''}`);
+      const why = 'reason' in out ? out.reason : 'error' in out ? out.error : '';
+      console.log(
+        `[dispositions] ${name}: media ${row.id} archive → ${out.status}${why ? ` (${why})` : ''} in ${Math.round((Date.now() - started) / 1000)}s`
+      );
     }
   } catch (err) {
     console.warn(`[dispositions] ${name}: re-archive failed — ${String(err).slice(0, 300)}`);
