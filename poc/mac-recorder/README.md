@@ -14,6 +14,21 @@ Native macOS side of Darth Meetings recording (the "Swift tray" angle from Darth
 the user switched it off in the menu (`loginItemUserChoice` in UserDefaults records an explicit choice;
 the default never overrides it). macOS may show "Darth Recorder was added as a login item" once.
 
+**0.3.19 (2026-09-30) — uploaded recordings leave the disk; a Slack huddle is not named after the DM in view.**
+- **Local copies go after upload.** 5.3 GB of already-uploaded recordings had piled up under
+  `~/Movies/Darth Recorder/` (30 rows, every one `uploaded` and sha256-checked by the server). The tray now
+  removes the files of an `uploaded` row one hour after the upload finished (`UPLOAD_LOCAL_COPY_GRACE`;
+  `Registry.purgeUploadedLocalCopies`, at launch and on the 30-min retry tick). The row keeps its status
+  and transcript id, `bytes` goes to 0 and is synced, `local_purged_at` records it, an event
+  `local_copy_purged` is shipped. Rows from before 0.3.19 have no `uploaded_at` — `ended_at` stands in,
+  so the backlog clears at the first launch. Never a live, local, failed or "keep on this Mac" row;
+  "Delete from this Mac" (0.3.8) is unchanged. A web "Retry" replays the SERVER's copy, never ours.
+- **Slack huddles: no window title.** Slack's main window is titled after the DM/channel the person is
+  looking at, not the huddle — a huddle Ameya started was born "radhika.rungta (DM)" (recording
+  6843e1e4, 13:17 SGT). The tray's link card no longer shows a title for a Slack call, and the server
+  names the recording "Slack huddle" (`recorderCallTitle`) for the person to rename. The raw title is
+  still recorded in `call.title` as evidence.
+
 **0.3.18 (2026-09-25) — a dead microphone is noticed during the recording, and acted on.**
 The 16:02 SGT Teams call (recording a9932a15…): the Microphone menu went to "LG ULTRAFINE" at 16:04 and
 to "Microsoft Teams Audio" (a loopback driver) at 16:05 — the mic track then read −120 dB / peak 0.000 for

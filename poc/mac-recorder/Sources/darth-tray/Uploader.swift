@@ -227,7 +227,8 @@ final class Uploader: NSObject, URLSessionTaskDelegate {
             EventLog.shared.log("upload_failed", ["recording_id": id, "error": error], summary: "upload: \(id) FAILED — \(error)")
             onFailed?(id, error)
         } else {
-            Registry.shared.update(id, ["status": "uploaded", "transcript_id": transcriptId ?? NSNull(), "error": NSNull()])
+            Registry.shared.update(id, ["status": "uploaded", "transcript_id": transcriptId ?? NSNull(), "error": NSNull(),
+                                        "uploaded_at": isoNow()])
             api.syncRecording(id)
             EventLog.shared.log("upload_done", ["recording_id": id, "transcript_id": transcriptId ?? "",
                                                 "bytes": bytes, "seconds": seconds],

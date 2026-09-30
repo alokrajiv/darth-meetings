@@ -135,6 +135,39 @@ final class Registry {
         return (files.count, removed)
     }
 
+    /// 0.3.19: drop the local files of `uploaded` rows whose upload finished more than `olderThan`
+    /// ago (rows from before 0.3.19 carry no `uploaded_at` — `ended_at` stands in). The row keeps
+    /// its status and transcript id, `files` empties and `bytes` goes to 0 (synced, so the server's
+    /// "on this Mac" figure is honest), `local_purged_at` records it. Live rows are never touched.
+    func purgeUploadedLocalCopies(olderThan: TimeInterval) -> [(id: String, files: Int, bytes: Int)] {
+        lock.lock(); defer { lock.unlock() }
+        let fm = FileManager.default
+        let iso = ISO8601DateFormatter()
+        var out: [(id: String, files: Int, bytes: Int)] = []
+        for i in rows.indices where (rows[i]["status"] as? String) == "uploaded" {
+            let files = (rows[i]["files"] as? [String] ?? []).filter { fm.fileExists(atPath: $0) }
+            guard !files.isEmpty, let id = rows[i]["id"] as? String else { continue }
+            let doneAt = ((rows[i]["uploaded_at"] as? String) ?? (rows[i]["ended_at"] as? String)).flatMap { iso.date(from: $0) }
+            guard let doneAt, Date().timeIntervalSince(doneAt) > olderThan else { continue }
+            var removed = 0, bytes = 0
+            for f in files {
+                bytes += Self.fileSize(f)
+                do { try fm.removeItem(atPath: f); removed += 1 } catch { rlog("purge: \(f): \(error)") }
+            }
+            let dir = Paths.recordings.appendingPathComponent(id, isDirectory: true)
+            if fm.fileExists(atPath: dir.path), (try? fm.contentsOfDirectory(atPath: dir.path))?.isEmpty == true {
+                try? fm.removeItem(at: dir)
+            }
+            rows[i]["files"] = (rows[i]["files"] as? [String] ?? []).filter { fm.fileExists(atPath: $0) }
+            rows[i]["bytes"] = (rows[i]["files"] as? [String] ?? []).reduce(0) { $0 + Self.fileSize($1) }
+            rows[i]["local_purged_at"] = isoNow()
+            rows[i]["needs_sync"] = true
+            out.append((id: id, files: removed, bytes: bytes))
+        }
+        if !out.isEmpty { saveLocked() }
+        return out
+    }
+
     /// What `list_recordings` answers (0.3.8): everything but deleted rows.
     func listed() -> [[String: Any]] {
         all().filter { ($0["status"] as? String) != "deleted" }

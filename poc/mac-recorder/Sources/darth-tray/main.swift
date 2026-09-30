@@ -5,7 +5,7 @@ import ServiceManagement
 import RecorderCore
 import TrayLogic
 
-let VERSION = "0.3.18"
+let VERSION = "0.3.19"
 let WS_PORT: UInt16 = 47800
 let PWA_URL = URL(string: "https://meetings.darth-internal.trames.io/")!
 /// Seconds between "the call ended" and an automatic stop.
@@ -14,6 +14,8 @@ let STOP_GRACE: TimeInterval = 60
 /// its transcription hand-off fails (AssemblyAI down / out of credit): the bytes stay on this
 /// Mac as `upload_failed` and must go up later without anyone clicking.
 let UPLOAD_RETRY_INTERVAL: TimeInterval = 30 * 60
+/// 0.3.19: how long an uploaded recording's bytes stay on this Mac after the upload finished.
+let UPLOAD_LOCAL_COPY_GRACE: TimeInterval = 60 * 60
 /// 0.3.13 (D4): how long the "Link to <event>?" card waits for an answer before the
 /// recording goes up UNLINKED. No answer is never a link — docs/recorder-link-confirm-spec.md.
 let LINK_ASK_LIFE: TimeInterval = 60
@@ -523,10 +525,29 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             api.syncRecording(id)
         }
         uploadPending()
+        purgeUploadedLocalCopies()
         retryTimer = Timer.scheduledTimer(withTimeInterval: UPLOAD_RETRY_INTERVAL, repeats: true) { [weak self] _ in
             self?.retryFailedUploads()
+            self?.purgeUploadedLocalCopies()
         }
         retryTimer?.tolerance = 60
+    }
+
+    /// 0.3.19: a recording the server has confirmed (sha256-checked upload, `uploaded`) does not
+    /// need its bytes on this Mac any more — 5.3 GB of them had piled up under ~/Movies by
+    /// 2026-09-30. The files go `UPLOAD_LOCAL_COPY_GRACE` after the upload finished (a re-send
+    /// from the web "Retry" is a server-side replay of ITS copy, never of ours); the row stays
+    /// `uploaded`, so the menu, the picker and the server's view are unchanged.
+    func purgeUploadedLocalCopies() {
+        let purged = Registry.shared.purgeUploadedLocalCopies(olderThan: UPLOAD_LOCAL_COPY_GRACE)
+        for p in purged {
+            EventLog.shared.log("local_copy_purged", ["recording_id": p.id, "files": p.files, "bytes": p.bytes],
+                                summary: "local copy: \(p.id) — \(p.files) file(s), \(p.bytes) bytes removed after upload")
+            api.syncRecording(p.id)
+        }
+        if !purged.isEmpty {
+            rlog("local copies purged: \(purged.count) uploaded recording(s), \(purged.reduce(0) { $0 + $1.bytes }) bytes freed")
+        }
     }
 
     /// Every UPLOAD_RETRY_INTERVAL: push `upload_failed` rows that still have bytes on disk
@@ -897,7 +918,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // characters of notification noise ("… - 1 new item - Slack [Main]"), and what makes
         // a wrong match obvious is the app and the time, not the tail of the title.
         if let st = row?["started_at"] as? String, let d = Self.parseIso(st) { bits.append(Self.hhmm(d)) }
-        if let t = (c?["title"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines), !t.isEmpty {
+        // A Slack window is titled after the DM/channel the person was LOOKING at, not the
+        // huddle (0.3.19: Ameya's huddle read “radhika.rungta (DM)”) — no title for Slack.
+        let slack = (c?["kind"] as? String) == CallKind.slack.rawValue
+        if !slack, let t = (c?["title"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines), !t.isEmpty {
             bits.append("“\(Self.clip(Self.stripCallPrefix(t), 44))”")
         }
         return bits.isEmpty ? "This recording" : "This recording: " + bits.joined(separator: " · ")
