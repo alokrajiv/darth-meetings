@@ -191,8 +191,8 @@ describe('owner-scoped SQL (I2)', () => {
   test('Link/Make a meeting: one transaction, locked on the owner, text copied in SQL, NO share written', async () => {
     respond = (q) => {
       if (q.text.includes('FOR UPDATE')) return [{ id: RID, active_transcription_id: 't1' }];
-      if (q.text.includes('payload IS NOT NULL')) {
-        return [{ status: 'completed', provider_job_id: 'job-1', provider_deleted_at: null }];
+      if (q.text.includes('FROM') && q.text.includes('recording_transcriptions') && q.text.includes('has_payload')) {
+        return [{ status: 'completed', provider_job_id: 'job-1', provider_deleted_at: null, has_payload: true }];
       }
       if (/INSERT INTO "[a-z_]+"\.transcripts/.test(q.text)) return [{ id: 77, assemblyai_id: 'm-1' }];
       return [];
@@ -205,7 +205,7 @@ describe('owner-scoped SQL (I2)', () => {
       recordedAt: null,
       gmeetContext: {},
     });
-    expect(out).toEqual({ ok: true, transcriptId: 77, assemblyaiId: 'm-1' });
+    expect(out).toEqual({ ok: true, transcriptId: 77, assemblyaiId: 'm-1', ready: true });
     const lock = sql.executed.find((q) => q.text.includes('FOR UPDATE'))!;
     expect(lock.text).toContain('owner_user_id = $');
     expect(lock.params).toContain(A.userId);
@@ -220,12 +220,39 @@ describe('owner-scoped SQL (I2)', () => {
     expect(sql.executed.some((q) => q.text.includes('transcript_shares'))).toBe(false);
   });
 
-  test('Link refuses a recording that is still transcribing, and one a live meeting already holds', async () => {
-    respond = (q) => (q.text.includes('FOR UPDATE') ? [{ id: RID, active_transcription_id: null }] : []);
-    const notReady = await standalone.createMeetingFromRecording({
+  test('Link takes a recording that is still uploading or transcribing — the meeting is born processing', async () => {
+    respond = (q) =>
+      q.text.includes('FOR UPDATE')
+        ? [{ id: RID, active_transcription_id: null }]
+        : /INSERT INTO "[a-z_]+"\.transcripts/.test(q.text)
+          ? [{ id: 78, assemblyai_id: 'm' }]
+          : [];
+    const early = await standalone.createMeetingFromRecording({
       ownerUserId: A.userId, recordingId: RID, meetingId: 'm', title: null, recordedAt: null, gmeetContext: {},
     });
-    expect(notReady).toEqual({ ok: false, code: 'not-ready' });
+    expect(early).toEqual({ ok: true, transcriptId: 78, assemblyaiId: 'm', ready: false });
+    const insert = sql.executed.find((q) => /INSERT INTO "[a-z_]+"\.transcripts/.test(q.text))!;
+    // Not ready: status 'processing', no job id and no payload (the CASE arms
+    // take `ready` = false), joined LEFT so a recording with no transcription
+    // yet (still uploading) inserts too.
+    expect(insert.text).toContain('LEFT JOIN');
+    expect(insert.params).toContain(false);
+    expect(insert.params).not.toContain(true);
+    expect(sql.executed.some((q) => q.text.includes('meeting_clips') && q.text.includes('INSERT'))).toBe(true);
+  });
+
+  test('Link refuses a recording whose transcription FAILED, and one a live meeting already holds', async () => {
+    respond = (q) =>
+      q.text.includes('FOR UPDATE')
+        ? [{ id: RID, active_transcription_id: 't-err' }]
+        : q.text.includes('recording_transcriptions')
+          ? [{ status: 'error', provider_job_id: null, provider_deleted_at: null, has_payload: false }]
+          : [];
+    const failed = await standalone.createMeetingFromRecording({
+      ownerUserId: A.userId, recordingId: RID, meetingId: 'm', title: null, recordedAt: null, gmeetContext: {},
+    });
+    expect(failed).toEqual({ ok: false, code: 'not-ready' });
+    expect(sql.executed.some((q) => /INSERT INTO "[a-z_]+"\.transcripts/.test(q.text))).toBe(false);
     respond = (q) =>
       q.text.includes('FOR UPDATE') ? [{ id: RID, active_transcription_id: 't1' }] : q.text.includes('SELECT 1 AS n') ? [{ n: 1 }] : [];
     const linked = await standalone.createMeetingFromRecording({

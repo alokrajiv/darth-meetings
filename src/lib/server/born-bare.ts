@@ -41,6 +41,7 @@ import { sniffMediaExtension } from '@/lib/server/video-frames';
 import { uploadFile, getTranscript, deleteTranscript, isAaiNotFound } from '@/lib/server/assemblyai';
 import { submitForIngest } from '@/lib/server/ingest';
 import { deleteOnCompleteEnabled } from '@/lib/server/aai-retention';
+import { settleMeetingsMadeEarly } from '@/lib/server/recording-settle';
 import { mediaIdFor, transcriptionIdFor } from '@/lib/recording-graph';
 import { AAI_GONE_REASON, AAI_STUCK_MS, AAI_STUCK_REASON } from '@/lib/aai-job-state';
 import { notifyUser, APP_URL } from '@/lib/server/darth-notify';
@@ -657,6 +658,7 @@ export async function refreshBornBare(recordingId: string): Promise<boolean> {
   } catch (error) {
     if (isAaiNotFound(error)) {
       await completeStandaloneTranscription(txn.id, { status: 'error', reason: AAI_GONE_REASON });
+      await settleEarly(recordingId, { status: 'error', reason: AAI_GONE_REASON });
       return true;
     }
     console.warn(`[born-bare] poll ${recordingId} failed:`, error);
@@ -681,21 +683,34 @@ export async function refreshBornBare(recordingId: string): Promise<boolean> {
         );
       }
     }
+    // Meetings made from this recording while it was still transcribing get
+    // their text now — after the AAI-side delete above, so the stamp travels.
+    await settleEarly(recordingId, { status: 'completed' });
     await notifyReadyOnce((await getStandalone(recordingId)) ?? rec);
     return true;
   }
   if (aai.status === 'error') {
-    await completeStandaloneTranscription(txn.id, {
-      status: 'error',
-      reason: (aai as { error?: string }).error ?? 'AssemblyAI reported an error',
-    });
+    const reason = (aai as { error?: string }).error ?? 'AssemblyAI reported an error';
+    await completeStandaloneTranscription(txn.id, { status: 'error', reason });
+    await settleEarly(recordingId, { status: 'error', reason });
     return true;
   }
   if (Date.now() - new Date(txn.created_at).getTime() > AAI_STUCK_MS) {
     await completeStandaloneTranscription(txn.id, { status: 'error', reason: AAI_STUCK_REASON });
+    await settleEarly(recordingId, { status: 'error', reason: AAI_STUCK_REASON });
     return true;
   }
   return false;
+}
+
+/** `settleMeetingsMadeEarly`, never fatal to the poll that called it. */
+async function settleEarly(
+  recordingId: string | null,
+  outcome: { status: 'completed' } | { status: 'error'; reason: string }
+): Promise<void> {
+  await settleMeetingsMadeEarly(recordingId, outcome).catch((err) =>
+    console.warn(`[born-bare] settling meetings made early from ${recordingId ?? 'any recording'} failed:`, err)
+  );
 }
 
 /**
@@ -827,6 +842,10 @@ export async function sweepBornBare(): Promise<void> {
   } catch (err) {
     console.warn('[born-bare] poll backstop failed:', err);
   }
+
+  // A meeting made early whose recording completed under a process that died
+  // before the settle — one UPDATE, matches nothing on a healthy day.
+  await settleEarly(null, { status: 'completed' });
 
   try {
     for (const r of await listStandaloneIngestRetries(5)) await retryBornBareIngest(r.id);

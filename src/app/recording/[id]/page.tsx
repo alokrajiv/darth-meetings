@@ -152,6 +152,10 @@ export default function RecordingPage({ params }: { params: Promise<{ id: string
   }
 
   const ready = rec?.status === 'ready';
+  // Link / Make a meeting are NOT gated on the upload or the transcription
+  // (Alok, 2026-09-30): the meeting is born now and its text lands when the
+  // recording's does. Only a failed transcription has nothing to hand over.
+  const linkable = !!rec && rec.status !== 'failed';
   const model = rec ? stripForRecordingView(rec, { fmtBytes: formatBytes, fmtDuration: formatDuration }) : null;
   const iconBtn = 'h-8 gap-1 px-2.5 text-xs';
 
@@ -224,7 +228,7 @@ export default function RecordingPage({ params }: { params: Promise<{ id: string
               Looks like <span className="font-medium">{rec.suggested_event.title}</span> ·{' '}
               {new Date(rec.suggested_event.startIso).toLocaleString([], { dateStyle: 'medium', timeStyle: 'short' })}
             </span>
-            {ready && (
+            {linkable && (
               <Button
                 size="sm"
                 variant="outline"
@@ -262,14 +266,14 @@ export default function RecordingPage({ params }: { params: Promise<{ id: string
 
         {rec && !rec.in_meeting && (
           <div className="flex flex-wrap items-center gap-1.5">
-            <Button size="sm" variant="outline" className={iconBtn} disabled={!ready} onClick={() => setLinkOpen(true)}>
+            <Button size="sm" variant="outline" className={iconBtn} disabled={!linkable} onClick={() => setLinkOpen(true)}>
               <Link2 className="h-3.5 w-3.5" /> Link to meeting…
             </Button>
             <Button
               size="sm"
               variant="outline"
               className={iconBtn}
-              disabled={!ready}
+              disabled={!linkable}
               onClick={() => {
                 setName(rec.title ?? '');
                 setNaming(true);
@@ -367,6 +371,11 @@ export default function RecordingPage({ params }: { params: Promise<{ id: string
                   : 'Usually a minute or two; longer for a long recording.'}{' '}
                 This page updates by itself — you can leave and come back.
               </p>
+              {!rec.in_meeting && (
+                <p className="text-xs text-muted-foreground">
+                  No need to wait: link it or make a meeting now, and the text lands there when it is done.
+                </p>
+              )}
             </div>
           </div>
         ) : null}

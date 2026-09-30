@@ -184,7 +184,7 @@ function refusalFor(code: 'not-found' | 'not-ready' | 'already-linked'): ActionR
       ok: false,
       status: 409,
       code,
-      error: 'The recording is not transcribed yet — link it once its transcript is ready.',
+      error: 'This recording\u2019s transcription failed — retry it first, then link it.',
     };
   }
   return {
@@ -230,10 +230,14 @@ async function makeMeeting(
     );
   }
   queueRecordingGraphSync(caller.userId, made.assemblyaiId, `recording-${opts.how}`);
-  prepareMediaForPlayback(caller.userId, made.assemblyaiId);
-  onTranscriptCompleted(caller.userId, made.assemblyaiId, { utterances: null, silent: true });
+  if (made.ready) {
+    prepareMediaForPlayback(caller.userId, made.assemblyaiId);
+    onTranscriptCompleted(caller.userId, made.assemblyaiId, { utterances: null, silent: true });
+  }
+  // Not ready: the meeting was born 'processing' and lib/server/recording-settle.ts
+  // runs the two calls above when the recording's transcription lands.
   console.log(
-    `[recording-actions] ${opts.how}: recording ${recordingId} → meeting ${made.assemblyaiId} (owner ${caller.userId}, 0 shares)`
+    `[recording-actions] ${opts.how}: recording ${recordingId} → meeting ${made.assemblyaiId} (owner ${caller.userId}, 0 shares${made.ready ? '' : ', text pending'})`
   );
   return {
     ok: true,

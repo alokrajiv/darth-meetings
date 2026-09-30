@@ -937,7 +937,10 @@ function RecordingCard({
   const [err, setErr] = useState<string | null>(null);
   const title = recordingDisplayTitle(r, (iso) => shortWhen(iso));
   const model = stripForRecordingView(r, { live, fmtBytes: formatBytes, fmtDuration: formatDuration });
-  const ready = r.status === 'ready';
+  // Link / Make a meeting are not gated on the upload or the transcription
+  // (2026-09-30): the meeting is born now, its text lands when the
+  // recording's does. Only a failed transcription has nothing to hand over.
+  const linkable = r.status !== 'failed';
 
   const run = async (what: NonNullable<typeof busy>, fn: () => Promise<void>) => {
     setBusy(what);
@@ -1061,7 +1064,7 @@ function RecordingCard({
             Looks like <span className="text-foreground/80">{suggestion.title}</span> ·{' '}
             {new Date(suggestion.startIso).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
           </span>
-          {ready && (
+          {linkable && (
             <button
               type="button"
               disabled={disabled || busy === 'link'}
@@ -1091,9 +1094,9 @@ function RecordingCard({
           size="sm"
           variant="outline"
           className={iconBtn}
-          disabled={disabled || !ready}
+          disabled={disabled || !linkable}
           onClick={onLink}
-          title={ready ? 'Link it to a calendar event — that makes it a meeting; nothing is shared' : 'Once it is transcribed'}
+          title={linkable ? 'Link it to a calendar event — that makes it a meeting; nothing is shared' : 'Its transcription failed — retry it first'}
           data-link-meeting
         >
           <Link2 className="h-3.5 w-3.5" />
@@ -1103,12 +1106,12 @@ function RecordingCard({
           size="sm"
           variant="outline"
           className={iconBtn}
-          disabled={disabled || !ready}
+          disabled={disabled || !linkable}
           onClick={() => {
             setName(r.title ?? '');
             setNaming(true);
           }}
-          title={ready ? 'Give it a title and it becomes a meeting of its own — then it can be shared' : 'Once it is transcribed'}
+          title={linkable ? 'Give it a title and it becomes a meeting of its own — then it can be shared' : 'Its transcription failed — retry it first'}
           data-name-meeting
         >
           <FilePlus2 className="h-3.5 w-3.5" />

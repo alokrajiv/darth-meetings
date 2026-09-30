@@ -858,7 +858,17 @@ export interface MeetingFromRecordingInput {
 }
 
 export type MeetingFromRecordingResult =
-  | { ok: true; transcriptId: number; assemblyaiId: string }
+  | {
+      ok: true;
+      transcriptId: number;
+      assemblyaiId: string;
+      /**
+       * false = the recording was still uploading / at AssemblyAI, so the
+       * meeting was born 'processing' with no text; `materialiseMeetingsMadeEarly`
+       * fills it in when the transcription lands.
+       */
+      ready: boolean;
+    }
   | { ok: false; code: 'not-found' | 'not-ready' | 'already-linked' };
 
 /**
@@ -870,7 +880,16 @@ export type MeetingFromRecordingResult =
  * The meeting's `imported_content` is copied from the transcription INSIDE
  * Postgres (jsonb to jsonb, never through JS), so its `/content` is the
  * recording's payload verbatim — compat mode (docs/recordings-phase1-spec.md
- * §3). Its `local_audio_path` is the recording's canonical file, exactly as a
+ * §3).
+ *
+ * A recording that is NOT transcribed yet (still uploading, or still at
+ * AssemblyAI) is linked all the same (Alok, 2026-09-30: "link and make
+ * meeting must not be blocked by the upload or the transcription"): the
+ * meeting row is born 'processing' with no payload and no job id — so the
+ * meeting-side AAI poller leaves it alone — and the recording's own
+ * completion fills it in (`materialiseMeetingsMadeEarly`). Only a
+ * transcription that has FAILED refuses ('not-ready'): there is nothing to
+ * hand the meeting until the recording is retried. Its `local_audio_path` is the recording's canonical file, exactly as a
  * split-off meeting borrows its source's (Phase 3a), and its
  * `gmeet_context.clips` mirror names the recording, so the dual-write treats
  * it as a BORROWER (`borrowsRecording`) and never derives a second recording
@@ -898,19 +917,23 @@ export async function createMeetingFromRecording(
     if (live.length > 0) return { ok: false, code: 'already-linked' };
     const txnId = rec[0]!.active_transcription_id;
     const txn = txnId
-      ? await tx<Array<{ status: string; provider_job_id: string | null; provider_deleted_at: string | null }>>`
-          SELECT status, provider_job_id, provider_deleted_at::text AS provider_deleted_at
+      ? await tx<
+          Array<{ status: string; provider_job_id: string | null; provider_deleted_at: string | null; has_payload: boolean }>
+        >`
+          SELECT status, provider_job_id, provider_deleted_at::text AS provider_deleted_at,
+                 (payload IS NOT NULL) AS has_payload
           FROM ${tx(SCHEMA)}.recording_transcriptions
-          WHERE id = ${txnId}::uuid AND payload IS NOT NULL
+          WHERE id = ${txnId}::uuid
         `
       : [];
-    if (txn[0]?.status !== 'completed') return { ok: false, code: 'not-ready' };
+    if (txn[0]?.status === 'error') return { ok: false, code: 'not-ready' };
+    const ready = txn[0]?.status === 'completed' && txn[0].has_payload === true;
 
     const ctx: GmeetContext = {
       ...input.gmeetContext,
       clips: [{ ord: 0, recordingId: input.recordingId, fromMs: 0, toMs: null, offsetMs: 0 }],
-      ...(txn[0].provider_job_id && txn[0].provider_deleted_at
-        ? { aai: { deletedAt: new Date(txn[0].provider_deleted_at).toISOString(), jobId: txn[0].provider_job_id } }
+      ...(ready && txn[0]!.provider_job_id && txn[0]!.provider_deleted_at
+        ? { aai: { deletedAt: new Date(txn[0]!.provider_deleted_at).toISOString(), jobId: txn[0]!.provider_job_id } }
         : {}),
     };
 
@@ -920,21 +943,23 @@ export async function createMeetingFromRecording(
         completed_at, duration, speaker_count, language_code, title, source,
         speech_model, local_audio_path, gmeet_context, imported_content, recorded_at, scratch
       )
-      SELECT ${input.ownerUserId}, ${input.meetingId}, t.provider_job_id,
-             r.upload_state->>'originalFilename', 'completed', now(),
-             t.completed_at,
-             (t.payload->>'audio_duration')::float8,
+      SELECT ${input.ownerUserId}, ${input.meetingId},
+             CASE WHEN ${ready} THEN t.provider_job_id END,
+             r.upload_state->>'originalFilename',
+             CASE WHEN ${ready} THEN 'completed' ELSE 'processing' END, now(),
+             CASE WHEN ${ready} THEN t.completed_at END,
+             CASE WHEN ${ready} THEN (t.payload->>'audio_duration')::float8 END,
              NULLIF((r.upload_state->>'speakerCount')::int, 0),
              COALESCE(t.language_code, t.payload->>'language_code'),
              ${input.title}, 'uploaded', t.speech_model,
              (SELECT m.filename FROM ${tx(SCHEMA)}.recording_media m
                WHERE m.recording_id = r.id AND m.kind = 'canonical' ORDER BY m.ord LIMIT 1),
              ${tx.json(ctx as never)},
-             t.payload,
+             CASE WHEN ${ready} THEN t.payload END,
              COALESCE(${input.recordedAt}::timestamptz, r.started_at, r.created_at),
              false
       FROM ${tx(SCHEMA)}.recordings r
-      JOIN ${tx(SCHEMA)}.recording_transcriptions t ON t.id = r.active_transcription_id
+      LEFT JOIN ${tx(SCHEMA)}.recording_transcriptions t ON t.id = r.active_transcription_id
       WHERE r.id = ${input.recordingId}::uuid
       RETURNING id, assemblyai_id
     `;
@@ -949,8 +974,87 @@ export async function createMeetingFromRecording(
       SET expires_at = NULL, updated_at = now()
       WHERE id = ${input.recordingId}::uuid
     `;
-    return { ok: true, transcriptId: row.id, assemblyaiId: row.assemblyai_id };
+    return { ok: true, transcriptId: row.id, assemblyaiId: row.assemblyai_id, ready };
   });
+}
+
+/** A meeting `createMeetingFromRecording` made before its recording was transcribed. */
+export interface MeetingMadeEarly {
+  user_id: string;
+  assemblyai_id: string;
+}
+
+/**
+ * Fill in every meeting that was made from a recording BEFORE its
+ * transcription landed — the same columns `createMeetingFromRecording`
+ * writes for a ready recording, copied inside Postgres now that the
+ * payload exists. Idempotent: a meeting is matched only while it is still
+ * 'processing' with no `imported_content`, so a second observer of the same
+ * completion updates nothing. `recordingId` null = every such meeting (the
+ * sweeper's backstop for a process that died between the two writes).
+ *
+ * Only meetings BORN from this recording qualify (`gmeet_context.fromRecording`)
+ * — a meeting that merely holds a clip of it (Phase 3b combine) has its own
+ * transcription and is re-materialised by `rematerialiseCombinedMeetings`.
+ */
+export async function materialiseMeetingsMadeEarly(recordingId: string | null): Promise<MeetingMadeEarly[]> {
+  return sql<MeetingMadeEarly[]>`
+    UPDATE ${sql(SCHEMA)}.transcripts t
+    SET status = 'completed',
+        completed_at = COALESCE(x.completed_at, now()),
+        aai_job_id = x.provider_job_id,
+        duration = (x.payload->>'audio_duration')::float8,
+        speaker_count = NULLIF((r.upload_state->>'speakerCount')::int, 0),
+        language_code = COALESCE(x.language_code, x.payload->>'language_code', t.language_code),
+        speech_model = COALESCE(x.speech_model, t.speech_model),
+        local_audio_path = COALESCE(t.local_audio_path,
+          (SELECT m.filename FROM ${sql(SCHEMA)}.recording_media m
+            WHERE m.recording_id = r.id AND m.kind = 'canonical' ORDER BY m.ord LIMIT 1)),
+        imported_content = x.payload,
+        gmeet_context = COALESCE(t.gmeet_context, '{}'::jsonb) ||
+          CASE WHEN x.provider_job_id IS NOT NULL AND x.provider_deleted_at IS NOT NULL
+               THEN jsonb_build_object('aai', jsonb_build_object('deletedAt', to_jsonb(x.provider_deleted_at), 'jobId', x.provider_job_id))
+               ELSE '{}'::jsonb END
+    FROM ${sql(SCHEMA)}.recordings r
+    JOIN ${sql(SCHEMA)}.recording_transcriptions x ON x.id = r.active_transcription_id
+    JOIN ${sql(SCHEMA)}.meeting_clips c ON c.recording_id = r.id
+    WHERE c.transcript_id = t.id
+      AND t.gmeet_context->'fromRecording'->>'recordingId' = r.id::text
+      AND t.status = 'processing' AND t.imported_content IS NULL AND t.deleted_at IS NULL
+      AND x.status = 'completed' AND x.payload IS NOT NULL
+      AND (${recordingId}::uuid IS NULL OR r.id = ${recordingId}::uuid)
+    RETURNING t.user_id, t.assemblyai_id
+  `;
+}
+
+/**
+ * The recording's transcription FAILED after a meeting was made from it:
+ * the meeting flips to 'error' carrying the same `ingestFailure` marker a
+ * lost AssemblyAI job leaves, so the listing and the detail page say why.
+ * `retryable: false` — the human retries the RECORDING, which re-runs this.
+ */
+export async function failMeetingsMadeEarly(recordingId: string, reason: string): Promise<MeetingMadeEarly[]> {
+  const now = new Date().toISOString();
+  const failure = {
+    stage: 'aai-job',
+    message: reason,
+    firstAt: now,
+    at: now,
+    attempts: 1,
+    nextAt: null,
+    retryable: false,
+    opts: { originalFilename: null },
+  };
+  return sql<MeetingMadeEarly[]>`
+    UPDATE ${sql(SCHEMA)}.transcripts t
+    SET status = 'error',
+        gmeet_context = COALESCE(t.gmeet_context, '{}'::jsonb) || ${sql.json({ ingestFailure: failure } as never)}
+    FROM ${sql(SCHEMA)}.meeting_clips c
+    WHERE c.transcript_id = t.id AND c.recording_id = ${recordingId}::uuid
+      AND t.gmeet_context->'fromRecording'->>'recordingId' = ${recordingId}
+      AND t.status = 'processing' AND t.imported_content IS NULL AND t.deleted_at IS NULL
+    RETURNING t.user_id, t.assemblyai_id
+  `;
 }
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;

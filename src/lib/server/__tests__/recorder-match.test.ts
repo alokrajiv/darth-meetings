@@ -196,7 +196,10 @@ describe('D3 rule 2 — time overlap alone is never confidence', () => {
 
 describe('D1 — an unlinked recording is born with the CALL’s own name', () => {
   test('the app suffix comes off', () => {
-    expect(recorderCallTitle(SLACK_CALL)).toBe('Swaralee (DM)');
+    // A Slack window is titled after the DM/channel in VIEW, not the huddle
+    // (2026-09-30: Ameya's huddle was born "radhika.rungta (DM)").
+    expect(recorderCallTitle(SLACK_CALL)).toBe('Slack huddle');
+    expect(recorderCallTitle({ ...SLACK_CALL, kind: 'browser' })).toBe('Swaralee (DM)');
     expect(recorderCallTitle({ title: 'MSC Contract review | Microsoft Teams' })).toBe(
       'MSC Contract review'
     );

@@ -69,10 +69,16 @@ const APP_SUFFIXES = [
  * was only the app name) so the caller falls back to the filename.
  */
 export function recorderCallTitle(
-  call: { title?: unknown; app?: unknown } | null | undefined
+  call: { title?: unknown; app?: unknown; kind?: unknown } | null | undefined
 ): string | null {
   const raw = typeof call?.title === 'string' ? call.title.trim() : '';
   if (!raw) return null;
+  // Slack's window title names the DM or channel the person happened to be
+  // LOOKING at, not the huddle (2026-09-30: a huddle Ameya started was born
+  // "radhika.rungta (DM)" — the conversation open in the main window). A
+  // huddle has no window of its own to read, so the recording is called
+  // what it is and the person names it.
+  if (typeof call?.kind === 'string' && call.kind === 'slack') return 'Slack huddle';
   // Window titles are " - " / " | " / " — " joined segments; the call's own
   // name is the FIRST one and everything after it is chrome: the product
   // ("Slack", "Microsoft Teams"), the workspace/company ("Trames Pte Ltd"),
