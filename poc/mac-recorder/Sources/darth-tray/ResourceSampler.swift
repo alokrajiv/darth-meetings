@@ -2,6 +2,7 @@ import Foundation
 import IOKit
 import IOKit.ps
 import RecorderCore
+import TrayLogic
 
 /// Resource telemetry (0.3.6) — the sampler script of 2026-09-18 built into the tray. One
 /// sample every 10 s while recording, every 60 s idle: our own CPU % (getrusage delta), memory
@@ -15,16 +16,31 @@ import RecorderCore
 /// events / hour, well under 100 KB) and `recording_stopped` carries the avg / max summary, so
 /// the table that took a laptop sampler script exists for every recording on every Mac. The
 /// latest sample is in the `status` payload (`resources`) and in the heartbeat.
+///
+/// 0.3.20: memory pressure + swap in every sample (`mem_free_mb`, `mem_active_mb`,
+/// `mem_compressed_mb`, `swapins` / `swapouts` since the previous sample, `swap_used_mb`,
+/// `mem_level_pct`, `mem_pressure` normal|warn|critical) and `low_power`. A live CALL is
+/// sampled too, recorded or not: every 30 s (`SamplerPacing`) with `recording: false`,
+/// `call_app`, `call_pid` — the laggy calls nobody recorded were exactly the ones with no
+/// numbers. All of this is machine-level (partial-OK).
+///
+/// MAIN QUEUE ONLY. Every method touches the timer and the sample state; `endRecording` used
+/// to be called from the stop's detached task while `tick` appended on main — the stop now
+/// calls it on main before it detaches (0.3.20).
 final class ResourceSampler {
     static let shared = ResourceSampler()
-    static let recordingInterval: TimeInterval = 10
-    static let idleInterval: TimeInterval = 60
+    static let recordingInterval: TimeInterval = SamplerPacing.recordingInterval
+    static let idleInterval: TimeInterval = SamplerPacing.idleInterval
 
     /// Asked when re-pacing: are we recording (→ 10 s)?
     var isRecording: () -> Bool = { false }
+    /// 0.3.20: the live call, if any (→ 30 s and logged even without a recording).
+    var callLive: () -> (app: String, pid: Int32)? = { nil }
     private var timer: Timer?
     private var lastRusage: (user: Double, sys: Double, at: Date)?
     private var lastHost: (user: UInt64, sys: UInt64, idle: UInt64, nice: UInt64)?
+    private var lastVM: VMCounters?
+    private static let host = mach_host_self()
     private(set) var latest: [String: Any]?
     private var recordingSamples: [[String: Any]] = []
     private var recordingId: String?
@@ -41,15 +57,20 @@ final class ResourceSampler {
     /// Re-pace after a recording starts or stops.
     func recordingStateChanged() { schedule() }
 
+    /// 0.3.20: re-pace after a call starts or ends (30 s while a call is live, unrecorded).
+    func callStateChanged() { schedule() }
+
     func beginRecording(id: String) {
+        assert(Thread.isMainThread, "ResourceSampler is main-queue only")
         recordingSamples = []
         recordingId = id
         tick()
         schedule()
     }
 
-    /// The avg / max over the recording's samples, for `recording_stopped`.
+    /// The avg / max over the recording's samples, for `recording_stopped`. Main queue.
     func endRecording() -> [String: Any] {
+        assert(Thread.isMainThread, "ResourceSampler is main-queue only")
         let s = recordingSamples
         recordingSamples = []
         recordingId = nil
@@ -57,21 +78,30 @@ final class ResourceSampler {
         func stat(_ key: String) -> [String: Any]? {
             let xs = s.compactMap { $0[key] as? Double }
             guard !xs.isEmpty else { return nil }
-            return ["avg": (xs.reduce(0, +) / Double(xs.count) * 10).rounded() / 10, "max": xs.max()!, "n": xs.count]
+            return ["avg": (xs.reduce(0, +) / Double(xs.count) * 10).rounded() / 10, "max": xs.max()!, "min": xs.min()!, "n": xs.count]
         }
         var out: [String: Any] = ["samples": s.count]
-        for k in ["cpu_pct", "mem_mb", "threads", "sys_cpu_pct", "gpu_pct", "cpu_temp_c", "gpu_temp_c"] {
+        for k in ["cpu_pct", "mem_mb", "threads", "sys_cpu_pct", "gpu_pct", "cpu_temp_c", "gpu_temp_c",
+                  "mem_free_mb", "mem_compressed_mb", "swap_used_mb", "mem_level_pct", "swapins", "swapouts"] {
             if let v = stat(k) { out[k] = v }
+        }
+        // Per-sample deltas: the recording's total is what says "it paged during the call".
+        for k in ["swapins", "swapouts"] {
+            let xs = s.compactMap { $0[k] as? Double }
+            if !xs.isEmpty { out["\(k)_total"] = xs.reduce(0, +) }
         }
         if let first = s.first?["battery_pct"] as? Double, let last = s.last?["battery_pct"] as? Double { out["battery_from_to"] = [first, last] }
         let thermal = s.compactMap { $0["thermal"] as? String }
         if let worst = ["critical", "serious", "fair", "nominal"].first(where: { thermal.contains($0) }) { out["thermal_worst"] = worst }
+        let pressure = s.compactMap { $0["mem_pressure"] as? String }
+        if let worst = ["critical", "warn", "normal"].first(where: { pressure.contains($0) }) { out["mem_pressure_worst"] = worst }
+        if s.contains(where: { ($0["low_power"] as? Bool) == true }) { out["low_power_seen"] = true }
         return out
     }
 
     private func schedule() {
         timer?.invalidate()
-        let iv = isRecording() ? Self.recordingInterval : Self.idleInterval
+        let iv = SamplerPacing.interval(recording: isRecording(), callLive: callLive() != nil)
         let t = Timer(timeInterval: iv, repeats: false) { [weak self] _ in
             self?.tick()
             self?.schedule()
@@ -84,10 +114,20 @@ final class ResourceSampler {
     private func tick() {
         let s = sample()
         latest = s
+        let call = callLive()
         if let id = recordingId {
             var e = s
             e["recording_id"] = id
+            e["recording"] = true
+            if let call { e["call_app"] = call.app; e["call_pid"] = Int(call.pid) }
             recordingSamples.append(s)
+            EventLog.shared.log("resource_sample", e)
+        } else if let call {
+            // 0.3.20: a live call nobody is recording still leaves its numbers behind.
+            var e = s
+            e["recording"] = false
+            e["call_app"] = call.app
+            e["call_pid"] = Int(call.pid)
             EventLog.shared.log("resource_sample", e)
         }
     }
@@ -141,6 +181,26 @@ final class ResourceSampler {
             }
             lastHost = (t.0, t.1, t.2, t.3)
         }
+
+        // 0.3.20: memory pressure + swap. Page counts and the LIFETIME swap totals from
+        // HOST_VM_INFO64 (swaps shipped as deltas since the previous sample — `VMStats`).
+        var vmi = vm_statistics64_data_t()
+        var vcount = mach_msg_type_number_t(MemoryLayout<vm_statistics64_data_t>.size / MemoryLayout<integer_t>.size)
+        let vr = withUnsafeMutablePointer(to: &vmi) {
+            $0.withMemoryRebound(to: integer_t.self, capacity: Int(vcount)) { host_statistics64(Self.host, HOST_VM_INFO64, $0, &vcount) }
+        }
+        if vr == KERN_SUCCESS {
+            let c = VMCounters(pageSize: UInt64(vm_kernel_page_size), freePages: UInt64(vmi.free_count), activePages: UInt64(vmi.active_count),
+                               compressorPages: UInt64(vmi.compressor_page_count), swapins: vmi.swapins, swapouts: vmi.swapouts)
+            for (k, v) in VMStats.fields(c, previous: lastVM) { d[k] = v }
+            lastVM = c
+        }
+        var xsw = xsw_usage()
+        var xsize = MemoryLayout<xsw_usage>.size
+        if sysctlbyname("vm.swapusage", &xsw, &xsize, nil, 0) == 0 { d["swap_used_mb"] = VMStats.megabytes(xsw.xsu_used) }
+        if let lvl = HardwareInfo.sysctlInt("kern.memorystatus_level") { d["mem_level_pct"] = Double(lvl) }
+        if let p = HardwareInfo.sysctlInt("kern.memorystatus_vm_pressure_level"), let name = VMStats.pressureName(p) { d["mem_pressure"] = name }
+        d["low_power"] = ProcessInfo.processInfo.isLowPowerModeEnabled
 
         if let gpu = Self.gpuUtilisation() { d["gpu_pct"] = gpu }
         if let b = Self.battery() { d["battery_pct"] = b.pct; d["battery_state"] = b.state }

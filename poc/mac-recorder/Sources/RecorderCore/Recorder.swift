@@ -61,8 +61,19 @@ public final class Recorder: NSObject, SCStreamOutput, SCStreamDelegate {
     private var lastAudioPTS: [CMTime] = []
     public private(set) var videoFrames = 0
     public private(set) var duplicatedFrames = 0
-    public private(set) var droppedVideo = 0
+    /// 0.3.20: the two ways a video frame is lost, split. Not ready = the encoder was still busy
+    /// with earlier frames (back-pressure: the Mac could not keep up); append failed = the writer
+    /// refused it (usually already `.failed`).
+    public private(set) var droppedVideoNotReady = 0
+    public private(set) var droppedVideoAppendFailed = 0
+    public var droppedVideo: Int { droppedVideoNotReady + droppedVideoAppendFailed }
     public private(set) var audioBuffers: [Int] = []
+    /// 0.3.20: per SOURCE track, buffers dropped because the AAC input was not ready (silent
+    /// before — a hole in that track's audio).
+    public private(set) var audioNotReady: [Int] = []
+    /// 0.3.20: times the mix track's input was busy when a block was due (the block waits for
+    /// the next flush — latency, not a hole; a high count means the encoder is falling behind).
+    public private(set) var mixBackpressure = 0
     public private(set) var idleFrames = 0
     public private(set) var streamError: Error?
     private var failureLogged = false
@@ -84,24 +95,44 @@ public final class Recorder: NSObject, SCStreamOutput, SCStreamDelegate {
         try self.init(url: url, width: 0, height: 0, fps: 0, audioTracks: audioTracks, video: false)
     }
 
-    public init(url: URL, width: Int, height: Int, fps: Int, audioTracks: [AudioTrackSpec], video: Bool = true) throws {
+    /// 0.3.20: H.264 average bit rate. Was 3 Mbps; a 5 fps screen of slides and faces does not
+    /// need it, and every byte is an upload byte. A later capture profile can pass another value
+    /// (`init(… videoBitRate:)`).
+    public static let defaultVideoBitRate = 1_500_000
+
+    /// The video writer's output settings (public so a check can build the same writer).
+    /// 0.3.20: colour pinned to Rec. 709 (primaries, transfer, matrix) — untagged files left
+    /// players to guess, and the SCK stream is configured to deliver 709 to match; a key frame
+    /// at least every 4 s as well as every 2 s of frames (whichever comes first).
+    public static func videoSettings(width: Int, height: Int, fps: Int, bitRate: Int = defaultVideoBitRate) -> [String: Any] {
+        [
+            AVVideoCodecKey: AVVideoCodecType.h264,
+            AVVideoWidthKey: width,
+            AVVideoHeightKey: height,
+            AVVideoColorPropertiesKey: [
+                AVVideoColorPrimariesKey: AVVideoColorPrimaries_ITU_R_709_2,
+                AVVideoTransferFunctionKey: AVVideoTransferFunction_ITU_R_709_2,
+                AVVideoYCbCrMatrixKey: AVVideoYCbCrMatrix_ITU_R_709_2,
+            ],
+            AVVideoCompressionPropertiesKey: [
+                AVVideoAverageBitRateKey: bitRate,
+                AVVideoExpectedSourceFrameRateKey: fps,
+                AVVideoMaxKeyFrameIntervalKey: fps * 2,
+                AVVideoMaxKeyFrameIntervalDurationKey: 4,
+                AVVideoProfileLevelKey: AVVideoProfileLevelH264HighAutoLevel,
+            ] as [String: Any],
+        ]
+    }
+
+    public init(url: URL, width: Int, height: Int, fps: Int, audioTracks: [AudioTrackSpec], video: Bool = true,
+                videoBitRate: Int = Recorder.defaultVideoBitRate) throws {
         try? FileManager.default.removeItem(at: url)
         self.url = url
         configuredSize = (width, height)
         specs = audioTracks
         writer = try AVAssetWriter(outputURL: url, fileType: video ? .mp4 : .m4a)
         if video {
-        let vs: [String: Any] = [
-            AVVideoCodecKey: AVVideoCodecType.h264,
-            AVVideoWidthKey: width,
-            AVVideoHeightKey: height,
-            AVVideoCompressionPropertiesKey: [
-                AVVideoAverageBitRateKey: 3_000_000,
-                AVVideoExpectedSourceFrameRateKey: fps,
-                AVVideoMaxKeyFrameIntervalKey: fps * 2,
-                AVVideoProfileLevelKey: AVVideoProfileLevelH264HighAutoLevel,
-            ],
-        ]
+        let vs = Self.videoSettings(width: width, height: height, fps: fps, bitRate: videoBitRate)
         let vIn = AVAssetWriterInput(mediaType: .video, outputSettings: vs)
         vIn.expectsMediaDataInRealTime = true
         adaptor = AVAssetWriterInputPixelBufferAdaptor(assetWriterInput: vIn, sourcePixelBufferAttributes: nil)
@@ -165,6 +196,7 @@ public final class Recorder: NSObject, SCStreamOutput, SCStreamDelegate {
             audioIns.append(a)
         }
         audioBuffers = Array(repeating: 0, count: audioTracks.count)
+        audioNotReady = Array(repeating: 0, count: audioTracks.count)
         lastAudioPTS = Array(repeating: .invalid, count: audioTracks.count)
         super.init()
         if mixIn != nil {
@@ -209,7 +241,7 @@ public final class Recorder: NSObject, SCStreamOutput, SCStreamDelegate {
             rlog("recorder: first \(specs[track].name) buffer — in \(asbd.map { "\(Int($0.mSampleRate))Hz x\($0.mChannelsPerFrame) fmt \($0.mFormatID)" } ?? "?"), track spec \(Int(specs[track].sampleRate))Hz x\(specs[track].channels)")
         }
         if lastAudioPTS[track].isValid, CMTimeCompare(pts, lastAudioPTS[track]) <= 0 { return }
-        guard input.isReadyForMoreMediaData else { return }
+        guard input.isReadyForMoreMediaData else { audioNotReady[track] += 1; return }
         if input.append(sb) {
             lastAudioPTS[track] = pts
             audioBuffers[track] += 1
@@ -222,7 +254,9 @@ public final class Recorder: NSObject, SCStreamOutput, SCStreamDelegate {
     /// means "not now" — the block stays in the accumulator and goes out with the next one,
     /// so a busy AAC encoder costs latency rather than a hole in the mix.
     private func appendMix(_ sb: CMSampleBuffer) -> Bool {
-        guard let mixIn, writer.status == .writing, mixIn.isReadyForMoreMediaData else { return false }
+        guard let mixIn, writer.status == .writing else { return false }
+        // Called with LiveMix's lock held, so the counter needs no lock of its own.
+        guard mixIn.isReadyForMoreMediaData else { mixBackpressure += 1; return false }
         guard mixIn.append(sb) else {
             logFailureOnce("mix track append failed")
             return false
@@ -274,7 +308,7 @@ public final class Recorder: NSObject, SCStreamOutput, SCStreamDelegate {
             }
             if lastVideoPTS.isValid, CMTimeCompare(pts, lastVideoPTS) <= 0 { return }
             guard let videoIn, let adaptor else { return }
-            guard videoIn.isReadyForMoreMediaData else { droppedVideo += 1; return }
+            guard videoIn.isReadyForMoreMediaData else { droppedVideoNotReady += 1; return }
             if adaptor.append(pixelBuffer, withPresentationTime: pts) {
                 lastVideoPTS = pts
                 if isDup { duplicatedFrames += 1 } else { videoFrames += 1; lastPixelBuffer = pixelBuffer }
@@ -283,7 +317,7 @@ public final class Recorder: NSObject, SCStreamOutput, SCStreamDelegate {
                     cb(pixelBuffer)
                 }
             } else {
-                droppedVideo += 1
+                droppedVideoAppendFailed += 1
                 logFailureOnce("video append failed")
             }
         case .audio:
@@ -314,7 +348,7 @@ public final class Recorder: NSObject, SCStreamOutput, SCStreamDelegate {
     /// Wall-clock length of what we actually wrote (first → last video/audio sample).
     public var stats: String {
         let audio = zip(specs, audioBuffers).map { "\($0.name)=\($1)" }.joined(separator: " ")
-        return "video=\(videoFrames) dup=\(duplicatedFrames) idle=\(idleFrames) dropped=\(droppedVideo)\(audio.isEmpty ? "" : " " + audio)"
+        return "video=\(videoFrames) dup=\(duplicatedFrames) idle=\(idleFrames) dropped=\(droppedVideoNotReady)+\(droppedVideoAppendFailed)\(audio.isEmpty ? "" : " " + audio)"
             + (mix.map { " [\($0.summary) healthy=\(mixHealthy)]" } ?? "")
     }
 }

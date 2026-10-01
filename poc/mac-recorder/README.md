@@ -14,6 +14,109 @@ Native macOS side of Darth Meetings recording (the "Swift tray" angle from Darth
 the user switched it off in the menu (`loginItemUserChoice` in UserDefaults records an explicit choice;
 the default never overrides it). macOS may show "Darth Recorder was added as a login item" once.
 
+**0.3.20 (2026-10-01) — diagnostics while on a call: telemetry levels, who is using the CPU/GPU, per-part capture health, "This feels laggy", unclean-exit reports.**
+Recordings lag or lose audio on some Macs and the telemetry could not say whether it was the Mac, the
+call app or our capture. And on 29 Sep 15:10 SGT Ivan's 0.3.18 went silent 35 s after a part roll onto a
+display share: four `resource_sample`s, then nothing — no `recording_stopped`, no `app_terminating`, a
+part-2 file without a moov atom, and no crash evidence from the device.
+
+- **Telemetry levels** (`TelemetryPolicy` in TrayLogic, `Telemetry.swift`): `full` (default) | `partial`,
+  UserDefaults `telemetryLevel`. Settings ▸ Telemetry ▸ Full / Partial in the tray menu, ws
+  `set_telemetry_level {level}`, `status.telemetry_level`, and EVERY event's payload carries
+  `telemetry_level` (`EventLog.log`; the server keeps only `{ts, kind, payload}`). Rich collectors ask
+  the policy BEFORE reading anything. A one-time notice (`telemetryNoticeShown`, non-modal NSAlert
+  window, `sharingType = .none`) explains it — the ONLY telemetry prompt: nothing pops up when telemetry
+  is sent or a lag report goes. Under the menu choice a greyed hint: "Partial keeps machine-level numbers
+  only — for personal Macs". Events `telemetry_notice_shown`, `telemetry_level_set {level, previous,
+  source: notice|menu|ws}`. Exact split and copy: *Telemetry levels*.
+- **Hardware identity** in `app_launched` (flat) and `status.hardware` (→ heartbeat →
+  `recorder_devices.last_status`): `hw_model`, `chip`, `ram_gb`, `cpu_cores`, `cpu_perf_cores`,
+  `cpu_eff_cores`, `cpu_perf_levels[{name, cores}]`, `gpu_cores` (IOAccelerator `gpu-core-count`).
+- **Memory pressure + swap** in every `resource_sample` (`VMStats` in TrayLogic): `mem_free_mb`,
+  `mem_active_mb`, `mem_compressed_mb` (HOST_VM_INFO64), `swapins` / `swapouts` as deltas since the
+  previous sample, `swap_used_mb` (`vm.swapusage`), `mem_level_pct` (`kern.memorystatus_level`),
+  `mem_pressure` normal|warn|critical, `low_power`. `recording_stopped.resources` adds avg/max/min of the
+  numeric ones, `swapins_total` / `swapouts_total`, `mem_pressure_worst`, `low_power_seen`.
+- **Live calls are sampled, recorded or not.** `resource_sample` every 30 s while a call is live and
+  nothing records (`recording: false`, `call_app`, `call_pid`); 10 s while recording (now with
+  `recording: true` + the call); 60 s idle, not logged (`SamplerPacing`). Race fixed on the way:
+  `ResourceSampler.endRecording()` ran on the stop's detached task while `tick` appended on main — the
+  stop now calls it on main before it detaches, and the sampler is main-queue only.
+- **`segment_closed`** for every part (roll and stop), from the part's own writer: `video`, `dup`,
+  `idle`, `dropped_not_ready` / `dropped_append_failed` (`Recorder.droppedVideo` split), per-track
+  `audio_not_ready_system` / `audio_not_ready_mic` (the encoder-busy audio drop was silent before),
+  `mix_backpressure` (mix blocks deferred because the mix input was busy — latency, not a hole),
+  `system_buffers`, `mic_buffers`, `bytes`, `seconds`, `mix_healthy`, plus the recording-lifetime
+  counters cut per part (`SegmentCounters`): `mic_gaps_filled_delta`, `mic_gap_seconds_delta`,
+  `coreaudio_overloads`; `reason` = `roll: <why>` | `stop: <why>`.
+- **CoreAudio overloads** (`AudioOverload.swift`): an in-process `kAudioDeviceProcessorOverload`
+  listener on the mic's device and the input unit's device (Apple's aggregate under voice processing),
+  re-attached on every mic restart, on a private queue. Counted per part; `audio_overload {total,
+  suppressed_since_last}` at most once per 30 s (`RateLimiter`). Never the unified log.
+- **`process_sample` every 60 s while a call or a recording is live — FULL only** (`ProcessSampler.swift`,
+  maths in `ProcessTop` with tests): `top_cpu[{name, cpu_pct, pids≤10, pid_count}]` (top 5 apps,
+  `proc_listallpids` + `proc_pid_rusage` V4, Mach ticks → ns, helpers grouped by the OUTERMOST `.app` in
+  their path), `unreadable` (other users' processes — WindowServer, coreaudiod — answer EPERM, ~343 of
+  ~1600 here), `top_gpu[{name, gpu_ms, …}]` from each AGX user client's `IOUserClientCreator` +
+  `AppUsage[].accumulatedGPUTime`, and the tagged numbers `self_cpu_pct`, `self_gpu_ms`,
+  `watcher_cpu_pct` (our `/usr/bin/log` child — never in `resource_sample.cpu_pct`), `replayd_cpu_pct`,
+  `replayd_gpu_ms`, `windowserver_gpu_ms`, `call_app_cpu_pct`, `call_app_gpu_ms`, `collect_ms`.
+  Gotcha: `IOServiceGetMatchingServices("AGXDeviceUserClient")` finds NONE (user clients are not
+  registered services); they are the IOAccelerator's children in the service plane (142 found, 2 ms).
+  Readings on a utility queue; a partial Mac never starts it, and it re-checks the level every tick.
+- **"This feels laggy"** (menu, under Show log; ws `report_lag`): `user_lag_report {how, recording,
+  recording_id?, call_app?, call_pid?, health_line?, resources}` — plus, on a full Mac,
+  `process_sample` (two readings 1 s apart, off main) and `log_excerpt` (tray.log tail) — shipped at once.
+  No banner, no dialog: the menu item reads "Lag report sent ✓" for 5 s.
+- **Window-pick diagnostics** (Alok: "many times we picked the wrong window / wrong window name"). The
+  picker's rules moved UNCHANGED into TrayLogic (`WindowPickRules`, stable rule codes, per-window
+  exclusion reasons) with fixtures of the field's bad picks: the Slack huddle recorded as "radhika.rungta
+  (DM)" while the huddle was an untitled 1728×1084 window behind it, Teams' "Calendar | Atira Sarat
+  (You)" (all-nav-tab windows → `frontmost`), Meet in a background Chrome tab. `window_candidates` (logged
+  on EVERY 5 s re-resolve — 5,600 rows for one device in two weeks) is replaced by `window_pick`, emitted
+  only at a decision: `detect`, `start`, `reresolve` (only when the picker's answer changed), `roll`
+  (share started / ended), `redetect`, `manual`, `fallback`, `simulate`. Plus `window_title_changed` for
+  the recorded window (≤ 1 per 10 s, net change). Fields and tier split: *Window-pick diagnostics*.
+- **Unclean previous exit** (`RunMarker` in TrayLogic, `UncleanExit.swift`): `running.json` in Application
+  Support is written at launch and removed in `applicationWillTerminate` (only our own pid's marker — a
+  relaunching copy's survives the old one's quit). Still there at the next launch (and that pid is not a
+  live darth-tray) → `unclean_exit {prev_pid, prev_version, prev_started_at, recordings_left_recording,
+  last_recording_id?, last_segment?, last_segment_started_at?, last_segment_source?, crash_report}` (the
+  recording = the newest row the launch reconcile found still `recording`), `crash_report {file, mtime,
+  bytes_total, head}` = the first 12 KB of our newest `darth-tray-*.ips` in ~/Library/Logs/DiagnosticReports
+  newer than the dead run's start (names matched before anything is opened — other apps' reports are never
+  read), and on a full Mac `log_excerpt {why: "unclean_exit"}` = the last 60 lines (≤ 8 KB) of tray.log
+  BEFORE this run's `starting, pid N,` line. Shipped at once. The watchdog's `exit(70)` relaunch also
+  reads as unclean (its `watchdog_relaunch` event comes first).
+- **Writer defaults** (`Recorder`): H.264 average bit rate 3 → **1.5 Mbps** (`Recorder.defaultVideoBitRate`,
+  and an `init(…, videoBitRate:)` parameter for a later profile); colour pinned to **Rec. 709**
+  (`AVVideoColorPropertiesKey` primaries / transfer / matrix) with the SCK stream on `colorSpaceName =
+  sRGB`, `colorMatrix = 709`; `AVVideoMaxKeyFrameIntervalDurationKey: 4` beside the 2 s frame count.
+  BGRA / 5 fps unchanged.
+- **Tests:** `swift test` 67 (20 + 47 new: `ProcessTopTests` 12, `VMStatsTests` 4, `SegmentCountersTests` 4,
+  `TelemetryPolicyTests` 5, `RunMarkerTests` 8, `WindowPickRulesTests` 11, `TitleChangeTrackerTests` 3).
+- **Verified on the dev build (2026-10-01 09:59–10:03 SGT, then the published 0.3.19 put back):** status
+  `telemetry_level: full`, `hardware` = Mac15,9 / Apple M3 Max / 128 GB / 16 CPU (12 P + 4 E) / 40 GPU
+  cores; the notice showed and its "Keep full telemetry" logged `telemetry_level_set {source: notice}`;
+  partial → ws `process_sample` answered `null` and `user_lag_report` carried only `resources`; full → the
+  lag report carried `process_sample` + 60 log lines. A simulated Teams call on a real pid: `resource_sample`
+  at 30 s spacing with `recording: false`, then `process_sample` at 60.3 s (`collect_ms` 47, 1584 processes,
+  343 unreadable, WindowServer 1813.7 GPU-ms/min, `watcher_cpu_pct` 7.0 for the log stream child);
+  logging stopped at `call_ended`. SIGTERM → `app_terminating`, no `unclean_exit` after; `kill -SEGV` →
+  relaunch logged `unclean_exit` + `crash_report` (`darth-tray-2026-10-01-100257.ips`, 17,815 bytes, the
+  12 KB head carries `exception`, `termination`, `faultingThread` and frames) + `log_excerpt` ending on the
+  dead run's last line, shipped within 0.2 s of launch. Writer: the same 50 noise frames through
+  `Recorder.videoSettings` at 1280×720 — old 3 Mbps 6.13 MB vs new 3.13 MB (−49 %), ffprobe
+  `bt709/bt709/bt709` on all three colour fields. Second dev run (10:10–10:11 SGT): a simulated call on a
+  real app's pid → `window_pick` `detect` + `simulate` with `candidates_scope: screen`, 30 on-screen windows
+  (25 of other apps, `call_app: false`) on full vs `call_app`, the app's 5 windows only, on partial; rule
+  `frontmost`, `untitled_call_windows` 5 (window titles are empty for this dev signature — macOS shows
+  other apps' titles only with the Screen Recording grant); `report_lag` → event shipped, no banner line in
+  tray.log.
+- **Not verified live:** `segment_closed`, `audio_overload`, `window_title_changed` and the recording-time
+  `window_pick`s (`start`, `reresolve`, `roll`, …) — the dev signature has no Screen Recording grant, and
+  `startRecording` refuses without it (audio-only included). Build + unit tests + reasoning only.
+
 **0.3.19 (2026-09-30) — uploaded recordings leave the disk; a Slack huddle is not named after the DM in view.**
 - **Local copies go after upload.** 5.3 GB of already-uploaded recordings had piled up under
   `~/Movies/Darth Recorder/` (30 rows, every one `uploaded` and sha256-checked by the server). The tray now
@@ -471,6 +574,11 @@ PWA's upload picker / Settings list has a trash button per row.
   CPU / GPU die temperatures via the SMC (smctemp's per-chip key sets, M1–M5). While recording each sample
   is a `resource_sample` event; `recording_stopped` carries `resources` = avg / max per metric, the
   battery from→to and the worst thermal state. `status` carries the latest sample (`resources`).
+  **0.3.20 extends it:** memory pressure + swap (`mem_free_mb`, `mem_active_mb`, `mem_compressed_mb`,
+  `swapins` / `swapouts` per sample, `swap_used_mb`, `mem_level_pct`, `mem_pressure`) and `low_power`
+  in every sample; `recording` true|false, `call_app`, `call_pid`; live calls sampled every 30 s without a
+  recording; `process_sample` (full only), `segment_closed`, `audio_overload`, `user_lag_report`,
+  `unclean_exit` alongside — see the 0.3.20 block and *Telemetry levels*.
 - **Preview gear** (`⚙` next to ✕): "Recording: <window>", **Auto — follow the call window**,
   **Re-detect the window now**, and **Record this instead:** every display and window the Record… dialog
   offers (call windows first). A pick rolls a new segment onto it (`source_switch` event with from / to /
@@ -764,6 +872,92 @@ source that is genuinely low (the tracker starts there). Preview snapshot of the
 - **2560 px cap.** `CaptureSession.pixelSize` caps the longest edge at 2560 px (aspect kept,
   even dimensions); every stream config already sets `scalesToFit`. A 14" display records at
   2560×1654 instead of 3456×2234 (about −40 % bytes on a busy screen; slides stay readable).
+
+## Telemetry levels (0.3.20)
+
+UserDefaults `telemetryLevel` = `full` (default; company Macs stay on it as per policy) | `partial` (a
+personal Mac, the person's choice). Changed from Settings ▸ Telemetry in the tray menu, the first-launch
+notice, or ws `set_telemetry_level {level}`. The decision is `TelemetryPolicy.allows(collector, level:)`
+(TrayLogic, unit-tested) and every collector asks it BEFORE reading anything — a partial Mac never lists
+processes or reads another app's GPU time only to drop it.
+
+| | full | partial |
+|---|---|---|
+| Our own process: CPU %, memory footprint, threads | yes | yes |
+| System-wide CPU / GPU utilisation, memory pressure, swap, thermal, die temps, battery, low power | yes | yes |
+| Hardware model + specs (`hw_model`, chip, RAM, core counts, GPU cores) | yes | yes |
+| Capture pipeline counters (`segment_closed`, `coreaudio_overloads`, `audio_overload`) | yes | yes |
+| "This feels laggy" stamp with the machine snapshot (`user_lag_report.resources`) | yes | yes |
+| Unclean previous exit + OUR OWN crash report (`unclean_exit`, `crash_report`) | yes | yes |
+| `window_pick` with the CALL APP's own windows; `window_title_changed` for the recorded window | yes | yes |
+| `window_pick` with EVERY on-screen window (owner, title, bounds, z) | yes | **no** |
+| Top processes by CPU, per-process GPU time (`process_sample`, `user_lag_report.process_sample`) | yes | **no** |
+| tray.log excerpts (`log_excerpt` — they name windows and apps) | yes | **no** |
+
+Every event's payload carries `telemetry_level`. What partial does NOT change: the recorder's working
+events (which call app was detected and its window title in `call_started`, the recording lifecycle,
+uploads) — they are how the recorder works, not diagnostics; `call_app` in `resource_sample` /
+`user_lag_report` names the same call app `call_started` already did. Nothing is ever collected from
+another app's crash reports.
+
+The menu: Settings ▸ Telemetry: Full ▸ Full ✓ / Partial, and a greyed hint under it — "Partial keeps
+machine-level numbers only — for personal Macs". `telemetry_level_set {level, previous, source:
+notice|menu|ws}` on every choice.
+
+The notice is the ONLY telemetry prompt (Alok, 2026-10-01: nothing pops up when telemetry is sent, and
+"This feels laggy" only flips its own menu title to "Lag report sent ✓" for 5 s). Shown once
+(`telemetryNoticeShown`), 3 s after launch; non-modal, never in a screen share:
+
+> **Darth Recorder now collects diagnostics while you are on a call.**
+>
+> This helps us find why recordings lag or lose audio on some Macs.
+>
+> Full telemetry (on now) also notes which apps are using CPU and GPU during a call. Company Macs stay
+> on this setting as per policy.
+>
+> If this is your personal Mac, you can switch to partial telemetry, which keeps only machine-level
+> numbers and nothing about other apps.
+>
+> You can change this at any time from the menu under Settings.
+>
+> [Keep full telemetry] (default) · [Switch to partial]
+
+Test hooks (ws): `process_sample {seconds?}` → `process_sample_result` (null on partial), `report_lag`,
+`show_telemetry_notice` (clears the flag and shows it again).
+
+## Window-pick diagnostics (0.3.20)
+
+So a bad pick can be reconstructed from the server: which windows existed, in what order, which rule
+won, and why the others lost. Titles, owners, bounds and z-order only — NEVER pixels or thumbnails.
+
+**`window_pick`** — one per decision, never per tick:
+- `how`: `detect` (call started) | `start` (recording start) | `reresolve` (the 5 s re-resolve, ONLY when
+  the picker's answer — window id + rule — changed; `previous` = the old signature; the source does not
+  follow it by itself) | `roll` (share started / share ended) | `redetect` (`detail` = auto | redetect |
+  pwa | tray …) | `manual` (a person picked a window) | `fallback` (window gone, hold elapsed) | `simulate`.
+- `rule`: `teams_meeting_title`, `teams_non_nav_teams_window`, `teams_frontmost_non_nav`,
+  `zoom_meeting_title`, `slack_huddle_title`, `whatsapp_call_title`, `meet_title`, `webex_meeting_title`,
+  `frontmost`, `no_usable_window` (the picker's), or `manual`, `share`, `share_display`,
+  `fallback_display`, `fallback_audio` (a choice that was not the picker's); `reason` = the human
+  sentence; `order_key` = front-to-back `z_index`, the first usable window the rule matches wins, never area.
+- `picked` and every entry of `candidates`: `window_id`, `title` ("" for an untitled window — included
+  with its size, the Slack huddle case), `owner`, `pid`, `bounds {x, y, w, h}`, `display_id`, `layer`,
+  `alpha`, `on_screen`, `z_index`, `call_app` (bool), and for the call app's windows `excluded` (null =
+  usable, else `layer N` | `off screen` | `too small` — the ≤ 320×240 cut).
+- `call {app, bundle_id, kind, pid}`, `call_window_count`, `untitled_call_windows` (usable ones),
+  `recording_id` (from `start` on), `detail`.
+- Tiers: **partial** → `candidates_scope: "call_app"`, the call app's own windows only (the meeting metadata
+  the tray already shipped in `window_candidates`); **full** → `candidates_scope: "screen"`, every
+  on-screen window at pick time (capped at 120; `screen_window_count` is the real number), so it shows what
+  beat what.
+
+**`window_title_changed {recording_id, window_id, old, new, at_s, segment}`** — the recorded window was
+retitled (Teams moving from "Calendar | …" to the meeting, a Chrome tab switch). At most one per 10 s, and
+always the net change since the last one logged (`TitleChangeTracker`). Both tiers (it is the recording's
+own source).
+
+Not collected: Accessibility (`ax_role` / `ax_subrole` / `ax_title`) — AX needs the Accessibility grant,
+which the tray does not ask for, so it is skipped.
 
 ## Darth Recorder (tray) — build, release, publish
 

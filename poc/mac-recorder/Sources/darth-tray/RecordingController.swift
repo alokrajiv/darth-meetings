@@ -284,6 +284,10 @@ final class RecordingController {
     private var mic: MicCapture?
     private var segmentIndex = 0
     private var segmentStart = Date()
+    /// 0.3.20: CoreAudio IO overloads on the mic's device, and the totals at the start of the
+    /// current part (see `takeSegmentCounters`).
+    private let overloads = AudioOverloadWatcher()
+    private var segmentBase = SegmentCounters.zero
     private var dir: URL?
     private var base = ""
     private var rolling = false
@@ -507,6 +511,7 @@ final class RecordingController {
         systemStreamFailed = nil; streamFailure = false; flags = [:]; healthTicks = 0; micDenied = false
         micProcessing = nil; micFormatLabel = nil; micHardwareLabel = nil
         shareNoticeShown = false; pendingVideoFailure = false; currentSource = nil; sourceMode = "auto"
+        lastPickSignature = nil; titleTracker = TitleChangeTracker(interval: 10)   // 0.3.20
         videoFramesTotal = 0; videoDupTotal = 0; lastVideoCount = -1; lastVideoWriter = nil
         audioForwarder.reset()
         let f = DateFormatter(); f.dateFormat = "yyyy-MM-dd HH.mm.ss"
@@ -529,12 +534,15 @@ final class RecordingController {
             source = chosen
         } else if let call, call.pid > 0 {
             let pick = WindowPicker.pick(kind: call.kind, pid: call.pid)
-            WindowPicker.logCandidates(phase: "record", call: call, pick: pick)
+            lastPickSignature = pick.signature
             if let w = pick.window {
                 source = .window(w.id, w.title)
+                WindowPicker.logPick(how: "start", call: call, pick: pick, recordingId: id)
             } else {
                 source = .display(call.windowFrame.map { WindowPicker.display(containing: $0) } ?? CGMainDisplayID())
                 rlog("record: no call window found — falling back to \(source.label)")
+                WindowPicker.logPick(how: "start", call: call, pick: pick, recordingId: id, detail: "no call window — \(source.label)",
+                                     rule: "fallback_display")
             }
         } else {
             source = .display(call?.windowFrame.map { WindowPicker.display(containing: $0) } ?? CGMainDisplayID())
@@ -751,6 +759,9 @@ final class RecordingController {
 
         state = .recording
 
+        overloads.reset(recordingId: recordingId ?? "")
+        attachOverloadWatcher()
+        segmentBase = liveCounters()
         ResourceSampler.shared.beginRecording(id: recordingId ?? "")
         errorRolls = 0
         lastVideoAt = Date()
@@ -835,6 +846,10 @@ final class RecordingController {
         cfg.scalesToFit = true      // letterbox a differently-shaped source into the pinned size
         cfg.minimumFrameInterval = CMTime(value: 1, timescale: CMTimeScale(fps))
         cfg.pixelFormat = kCVPixelFormatType_32BGRA
+        // 0.3.20: pin the colour pipeline to what the writer tags (Rec. 709): sRGB pixels in,
+        // the 709 matrix for any YCbCr conversion SCK does on the way.
+        cfg.colorSpaceName = CGColorSpace.sRGB
+        cfg.colorMatrix = CGDisplayStream.yCbCrMatrix_ITU_R_709_2
         cfg.showsCursor = true
         cfg.queueDepth = 6
         cfg.capturesAudio = false
@@ -907,6 +922,7 @@ final class RecordingController {
                 rec.onPreviewFrame = { [weak self] pb in self?.onPreviewFrame?(pb) }
                 // Swap: audio + mic follow the current writer, so this is the cut point.
                 self.setWriter(rec)
+                let oldCounters = self.takeSegmentCounters()
                 self.segmentIndex = index
                 self.segmentStart = Date()
                 self.currentSource = source
@@ -926,8 +942,8 @@ final class RecordingController {
                 if let old {
                     await old.finish()
                     self.videoFramesTotal += old.videoFrames; self.videoDupTotal += old.duplicatedFrames
-                    self.closeSegment(index: oldIndex, url: old.url, started: oldStart, stats: old.stats,
-                                      mixOK: old.mixHealthy)
+                    self.closeSegment(index: oldIndex, writer: old, started: oldStart, recordingId: self.recordingId ?? "",
+                                      counters: oldCounters, reason: "roll: \(reason)")
                 }
                 self.persist(status: "recording")
                 EventLog.shared.log("segment_started", [
@@ -961,8 +977,13 @@ final class RecordingController {
         api?.syncRecording(id)
     }
 
-    private func closeSegment(index: Int, url: URL, started: Date, stats: String, mixOK: Bool) {
-        mixFirstOK = mixFirstOK && mixOK
+    /// 0.3.20: called from the roll (main actor) and from the stop's detached task — it only
+    /// reads the finished writer and logs (EventLog is lock-safe); `counters` was taken at the
+    /// cut on the main queue (`takeSegmentCounters`).
+    private func closeSegment(index: Int, writer w: Recorder, started: Date, recordingId id: String,
+                              counters: SegmentCounters, reason: String) {
+        let url = w.url
+        mixFirstOK = mixFirstOK && w.mixHealthy
         let bytes = (try? FileManager.default.attributesOfItem(atPath: url.path)[.size] as? Int) ?? 0
         let secs = Int(Date().timeIntervalSince(started))
         if let i = segments.firstIndex(where: { ($0["index"] as? Int) == index }) {
@@ -970,7 +991,80 @@ final class RecordingController {
             segments[i]["seconds"] = secs
             segments[i]["ended_at"] = isoNow()
         }
-        rlog("record: segment \(index) closed — \(stats) bytes=\(bytes) \(secs)s → \(url.lastPathComponent)")
+        rlog("record: segment \(index) closed — \(w.stats) bytes=\(bytes) \(secs)s → \(url.lastPathComponent)")
+        // Per-segment capture health (partial-OK: our own pipeline's counters, nothing else).
+        func track(_ name: String) -> Int? { w.specs.firstIndex { $0.name == name } }
+        let sys = track("system"), mic = track("mic")
+        var e: [String: Any] = [
+            "recording_id": id, "segment": index, "file": url.lastPathComponent, "seconds": secs, "bytes": bytes,
+            "has_video": w.hasVideo,
+            "video": w.videoFrames, "dup": w.duplicatedFrames, "idle": w.idleFrames,
+            "dropped_not_ready": w.droppedVideoNotReady, "dropped_append_failed": w.droppedVideoAppendFailed,
+            "audio_not_ready_system": sys.map { w.audioNotReady[$0] } ?? NSNull(),
+            "audio_not_ready_mic": mic.map { w.audioNotReady[$0] } ?? NSNull(),
+            "system_buffers": sys.map { w.audioBuffers[$0] } ?? NSNull(),
+            "mic_buffers": mic.map { w.audioBuffers[$0] } ?? NSNull(),
+            "mix_backpressure": w.hasMix ? w.mixBackpressure : NSNull(),
+            "mix_healthy": w.hasMix ? w.mixHealthy : NSNull(),
+            "reason": reason,
+        ]
+        for (k, v) in counters.json { e[k] = v }
+        EventLog.shared.log("segment_closed", e)
+    }
+
+    // MARK: window-pick diagnostics (0.3.20)
+
+    /// The picker's last answer for this recording ("window id|rule"): a re-resolve logs only
+    /// when it changes.
+    private var lastPickSignature: String?
+    private var titleTracker = TitleChangeTracker(interval: 10)
+
+    /// A source chosen by something other than the picker (a share, a manual pick): the event
+    /// still carries the picker's view and the candidates, with `picked` = what was chosen.
+    private func logSourcePick(how: String, rule: String, target: Source, detail: String) {
+        let pick = call.flatMap { $0.pid > 0 ? WindowPicker.pick(kind: $0.kind, pid: $0.pid) : nil }
+            ?? WindowPicker.Pick(window: nil, candidates: [], reason: "no call app to pick for", rule: "none",
+                                 screen: WindowPicker.onScreenWindows())
+        var chosen: WindowCandidate?
+        if case .window(let wid, _) = target { chosen = pick.screen.first { $0.id == wid } }
+        WindowPicker.logPick(how: how, call: call, pick: pick, recordingId: recordingId, detail: detail, picked: .some(chosen), rule: rule)
+    }
+
+    /// The recorded window's title changed: `window_title_changed`, at most one per 10 s, the net
+    /// change since the last one logged. (The recorded window's title is already the source's
+    /// title in the recording's own events — partial-OK.)
+    private func noteTitle(id: CGWindowID, title: String) {
+        guard Telemetry.allows(.callWindows),
+              let ch = titleTracker.observe(windowId: id, title: title, now: ProcessInfo.processInfo.systemUptime) else { return }
+        EventLog.shared.log("window_title_changed", [
+            "recording_id": recordingId ?? "", "window_id": Int(id), "old": ch.old, "new": ch.new,
+            "at_s": Int(Date().timeIntervalSince(startedAt ?? Date())), "segment": segmentIndex,
+        ], summary: "record: recorded window #\(id) retitled “\(ch.old)” → “\(ch.new)”")
+    }
+
+    // MARK: per-segment counters (0.3.20)
+
+    /// Recording-lifetime totals that segments are cut out of: the mic's gap fills and the
+    /// CoreAudio overloads on its device.
+    private func liveCounters() -> SegmentCounters {
+        SegmentCounters(micGapsFilled: mic?.gapsFilled ?? 0, micGapSeconds: mic?.gapFilledSeconds ?? 0,
+                        coreaudioOverloads: overloads.count)
+    }
+
+    /// The closing part's share of the totals; the totals become the next part's baseline.
+    /// Main queue, at the cut.
+    private func takeSegmentCounters() -> SegmentCounters {
+        let now = liveCounters()
+        let d = now.delta(since: segmentBase)
+        segmentBase = now
+        return d
+    }
+
+    /// Put the overload listener on the mic's device (and the input unit's, under voice
+    /// processing). Main queue; again after every mic restart.
+    private func attachOverloadWatcher() {
+        guard let m = mic else { overloads.detach(); return }
+        overloads.watch(devices: [m.deviceID ?? AudioDevices.defaultInputID, m.unitDeviceID], label: m.deviceName ?? "microphone")
     }
 
     /// The video stream died — the recorded window was closed, the app quit, or the system
@@ -1052,6 +1146,8 @@ final class RecordingController {
         if let wid = share.windowID { source = .window(wid, share.windowTitle ?? "") }
         else if let did = share.displayID { source = .display(did) }
         guard let source else { return }
+        logSourcePick(how: "roll", rule: share.windowID != nil ? "share" : "share_display", target: source,
+                      detail: "share started (\(share.appName ?? share.appBundle))")
         rollSegment(to: source, reason: "share started (\(share.appName ?? share.appBundle))")
     }
 
@@ -1073,10 +1169,13 @@ final class RecordingController {
             return
         }
         let pick = WindowPicker.pick(kind: call.kind, pid: call.pid)
-        WindowPicker.logCandidates(phase: "share-ended", call: call, pick: pick)
+        lastPickSignature = pick.signature
         if let w = pick.window {
+            WindowPicker.logPick(how: "roll", call: call, pick: pick, recordingId: recordingId, detail: "share ended")
             rollSegment(to: .window(w.id, w.title), reason: "share ended")
         } else {
+            WindowPicker.logPick(how: "roll", call: call, pick: pick, recordingId: recordingId, detail: "share ended, no call window",
+                                 rule: "fallback_display")
             rollSegment(to: .display(CGMainDisplayID()), reason: "share ended, no call window")
         }
     }
@@ -1089,12 +1188,20 @@ final class RecordingController {
         resolveTimer?.tolerance = 1
     }
 
-    /// Every 5 s while recording: log the candidate list again (field data) and make sure the
-    /// window we are pointed at still exists.
+    /// Every 5 s while recording: make sure the window we are pointed at still exists, note a
+    /// title change of the recorded window, and — 0.3.20 — log the picker's view only when its
+    /// answer CHANGED (it used to log the whole candidate list on every tick).
     private func reresolve() {
-        guard state == .recording, currentSource?.isAudioOnly != true, let call, call.pid > 0 else { return }
+        guard state == .recording, currentSource?.isAudioOnly != true else { return }
+        if case .window(let id, _)? = currentSource, let info = ShareDetector.windowInfo(id) { noteTitle(id: id, title: info.title) }
+        guard let call, call.pid > 0 else { return }
         let pick = WindowPicker.pick(kind: call.kind, pid: call.pid)
-        WindowPicker.logCandidates(phase: "reresolve", call: call, pick: pick)
+        if pick.signature != lastPickSignature {
+            WindowPicker.logPick(how: "reresolve", call: call, pick: pick, recordingId: recordingId,
+                                 detail: "the picker's answer changed (the source only follows it on a re-detect, a share end or a fallback)",
+                                 previous: lastPickSignature ?? NSNull())
+            lastPickSignature = pick.signature
+        }
         guard case .window(let id, _)? = currentSource else { return }
         if let f = ShareDetector.windowFrame(id) { lastWindowFrame = f }
         if ShareDetector.windowInfo(id) == nil {
@@ -1112,7 +1219,8 @@ final class RecordingController {
         guard state == .recording, currentSource?.isAudioOnly != true else { return "not recording video" }
         guard let call, call.pid > 0 else { return "no call window to look for — this recording is a display / manual pick" }
         let pick = WindowPicker.pick(kind: call.kind, pid: call.pid)
-        WindowPicker.logCandidates(phase: how, call: call, pick: pick)
+        WindowPicker.logPick(how: "redetect", call: call, pick: pick, recordingId: recordingId, detail: how)
+        lastPickSignature = pick.signature
         guard let w = pick.window else {
             EventLog.shared.log("source_redetect", ["recording_id": recordingId ?? "", "how": how, "outcome": "no_window", "from": currentSource?.json ?? NSNull()],
                                 summary: "record: re-detect found no window for \(call.appName) — keeping \(currentSource?.label ?? "?")")
@@ -1152,6 +1260,7 @@ final class RecordingController {
         // this switch it would roll onto a display nobody picked.
         if holdTimer != nil { holdTimer?.invalidate(); holdTimer = nil; pendingVideoFailure = false }
         sourceMode = "manual"
+        if !source.isAudioOnly { logSourcePick(how: "manual", rule: "manual", target: source, detail: how) }
         rollSegment(to: source, reason: "\(how): \(title)")
         EventLog.shared.log("source_switch", [
             "recording_id": recordingId ?? "", "how": how, "from": from, "to": source.json, "title": title,
@@ -1196,6 +1305,8 @@ final class RecordingController {
         micFormatLabel = mic?.formatLabel
         micHardwareLabel = mic?.hardwareFormatLabel
         micProcessing = mic?.voiceProcessing
+        // 0.3.20: the overload listener follows the capture onto its new device.
+        if state == .recording { attachOverloadWatcher() }
         // 0.3.18: a dead-mic fallback / re-detect already has its own banner that must stay up.
         if micDeadOwnsRestart { micDeadOwnsRestart = false; return }
         guard from != to, let to else { return }
@@ -1358,8 +1469,8 @@ final class RecordingController {
             return
         }
         var target: Source
-        if let call, call.pid > 0, let w = WindowPicker.pick(kind: call.kind, pid: call.pid).window,
-           case .window(let oldId, _)? = currentSource, w.id != oldId {
+        let fallbackPick = call.flatMap { $0.pid > 0 ? WindowPicker.pick(kind: $0.kind, pid: $0.pid) : nil }
+        if let w = fallbackPick?.window, case .window(let oldId, _)? = currentSource, w.id != oldId {
             target = .window(w.id, w.title)
         } else if !videoByDefault {
             // 0.3.15: this recording had video only because the person picked a source, and
@@ -1370,6 +1481,14 @@ final class RecordingController {
             let display = lastWindowFrame.map { WindowPicker.display(containing: $0) }
                 ?? call?.windowFrame.map { WindowPicker.display(containing: $0) } ?? CGMainDisplayID()
             target = .display(display)
+        }
+        if let fallbackPick {
+            let rule: String? = target.isAudioOnly ? "fallback_audio" : { if case .display = target { return "fallback_display" }; return nil }()
+            var chosen: WindowCandidate?
+            if case .window(let wid, _) = target { chosen = fallbackPick.screen.first { $0.id == wid } }
+            WindowPicker.logPick(how: "fallback", call: call, pick: fallbackPick, recordingId: recordingId, detail: holdReason,
+                                 picked: .some(chosen), rule: rule)
+            lastPickSignature = fallbackPick.signature
         }
         EventLog.shared.log("window_gone_held", [
             "recording_id": recordingId ?? "", "outcome": "fallback", "reason": holdReason,
@@ -1425,6 +1544,12 @@ final class RecordingController {
         setWriter(nil)
         mic?.onBuffer = nil
         audioForwarder.sink = nil
+        // 0.3.20: the last part's mic gap fills + overloads, read while `mic` still exists;
+        // and the sampler's summary, on THIS (main) queue — calling it from the detached task
+        // below raced `tick` appending samples on main.
+        let lastCounters = takeSegmentCounters()
+        overloads.detach()
+        let resources = ResourceSampler.shared.endRecording()
         mic?.stop()
         let micBuffers = mic?.buffersSeen ?? 0
         let micPeak = mic?.peak ?? 0
@@ -1445,8 +1570,8 @@ final class RecordingController {
             if let w {
                 await w.finish()
                 self.videoFramesTotal += w.videoFrames; self.videoDupTotal += w.duplicatedFrames
-                self.closeSegment(index: lastIndex, url: w.url, started: lastStart, stats: w.stats,
-                                  mixOK: w.mixHealthy)
+                self.closeSegment(index: lastIndex, writer: w, started: lastStart, recordingId: id,
+                                  counters: lastCounters, reason: "stop: \(reason)")
             }
             let secs = Int(Date().timeIntervalSince(started))
             let files = self.segments.compactMap { $0["path"] as? String }
@@ -1480,9 +1605,10 @@ final class RecordingController {
                 "system_error": self.systemStreamFailed ?? NSNull(),
                 "video_frames": self.videoFramesTotal, "video_dup": self.videoDupTotal,
                 "health": endHealth, "health_line": endLine, "stream_failure": self.streamFailure,
-                "source_mode": self.sourceMode, "resources": ResourceSampler.shared.endRecording(),
+                "source_mode": self.sourceMode, "resources": resources,
             ], summary: "record: stopped \(id) (\(reason)) — \(self.segments.count) segment(s), \(secs)s, \(bytes) bytes, mic buffers \(micBuffers), \(endLine), video frames \(self.videoFramesTotal)")
-            if unwell {
+            // 0.3.20: tray.log names windows and apps — full telemetry only, checked before reading.
+            if unwell, Telemetry.allows(.logExcerpt) {
                 let lines = LogTail.excerpt()
                 EventLog.shared.log("log_excerpt", ["recording_id": id, "lines": lines, "why": endLine],
                                     summary: "record: shipping \(lines.count) tray.log lines — recording ended with \(endLine)\(self.streamFailure ? " and a stream failure" : "")")
