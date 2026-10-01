@@ -117,6 +117,8 @@ export interface StandaloneUploadState {
     durationSec?: number;
     offsetSec: number;
     sha256?: string;
+    /** The stitch could not read this part and left it out (see format.ts). */
+    skipped?: string;
   }> | null;
   /** The upload's identity for the same-file check (a file's or a group's hash). */
   sha256?: string | null;

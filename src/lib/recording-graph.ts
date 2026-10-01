@@ -514,6 +514,7 @@ export function deriveRecordingGraph(
       sourceRef: {
         ...(p.originalFilename ? { originalFilename: p.originalFilename } : {}),
         ...(p.comment ? { comment: p.comment } : {}),
+        ...(p.skipped ? { skipped: p.skipped } : {}),
       } as Record<string, unknown>,
     }));
   const fromCombined = Array.from({ length: combinedParts }, (_, i) => ({

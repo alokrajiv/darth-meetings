@@ -17,7 +17,7 @@
  */
 import { afterAll, beforeAll, describe, expect, mock, test } from 'bun:test';
 import { execFileSync } from 'node:child_process';
-import { mkdirSync, mkdtempSync, rmSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 
@@ -31,7 +31,9 @@ const storage = mkdtempSync(path.join(tmpdir(), 'mw-media-concat-'));
 process.env.MW_STORAGE_DIR = storage;
 const audioDir = path.join(storage, 'audio');
 
-const { concatMediaSmart, concatMediaReencodeToTemp } = await import('@/lib/server/media-concat');
+const { concatMediaSmart, concatMediaReencodeToTemp, withSkippedNotes } = await import(
+  '@/lib/server/media-concat'
+);
 
 const abs = (name: string) => path.join(audioDir, name);
 const ff = (...args: string[]) => execFileSync(ffmpeg!, ['-v', 'error', '-y', ...args]);
@@ -127,10 +129,11 @@ async function captureLogs<T>(fn: () => Promise<T>): Promise<{ result: T; lines:
 }
 
 /** Mean volume (dB) of one audio stream — how a track is told from its peers. */
-function meanVolumeOf(name: string, track: number): number {
+function meanVolumeOf(name: string, track: number, span?: { ss: number; t: number }): number {
   const proc = Bun.spawnSync([
     ffmpeg!,
     '-v', 'info',
+    ...(span ? ['-ss', String(span.ss), '-t', String(span.t)] : []),
     '-i', abs(name),
     '-map', `0:a:${track}`,
     '-af', 'volumedetect',
@@ -209,6 +212,28 @@ beforeAll(() => {
     '-c:v', 'libx264', '-pix_fmt', 'yuv420p', '-c:a', 'aac', '-shortest',
     abs('small.mp4')
   );
+  // Two same-encoding audio parts a 40 dB step apart, so the stitch ORDER is
+  // readable from the output's first and second halves.
+  for (const [name, vol] of [['loud.m4a', '1.0'], ['quiet.m4a', '0.01']] as const) {
+    ff(
+      '-f', 'lavfi', '-i', 'sine=frequency=440:duration=2:sample_rate=48000',
+      '-af', `volume=${vol}`,
+      '-c:a', 'aac',
+      abs(name)
+    );
+  }
+  // An UNFINISHED MP4 — what the tray leaves when it dies mid-segment: the
+  // header and part of the media data, but not the `moov` index AVAssetWriter
+  // (and ffmpeg without +faststart) writes LAST.
+  ff(
+    '-f', 'lavfi', '-i', 'testsrc=size=320x240:rate=5:duration=4',
+    '-f', 'lavfi', '-i', 'sine=frequency=440:duration=4',
+    '-c:v', 'libx264', '-pix_fmt', 'yuv420p', '-c:a', 'aac', '-shortest',
+    abs('whole.mp4')
+  );
+  const whole = readFileSync(abs('whole.mp4'));
+  writeFileSync(abs('unfinished.mp4'), whole.subarray(0, Math.floor(whole.length / 2)));
+  writeFileSync(abs('unfinished2.mp4'), whole.subarray(0, Math.floor(whole.length / 3)));
 });
 
 afterAll(() => {
@@ -359,4 +384,76 @@ describe.skipIf(!haveFfmpeg)('stitching parts that are not all the same kind', (
     expect(audioLabelsOf(name).map((l) => l.language)).toEqual(['qmx', 'mul', 'eng']);
     expectNear(durationOf(name), 4);
   }, 120_000);
+});
+
+describe.skipIf(!haveFfmpeg)('a part nothing can be read from (unfinished MP4)', () => {
+  test('the fixture really is unreadable: ffprobe finds no moov', () => {
+    const proc = Bun.spawnSync([ffprobe!, '-v', 'error', abs('unfinished.mp4')]);
+    expect(proc.exitCode).not.toBe(0);
+    expect(proc.stderr.toString()).toContain('moov atom not found');
+  });
+
+  test('good part + unfinished part → the good part alone, the other reported as skipped', async () => {
+    const { result: out, lines } = await captureLogs(() =>
+      concatMediaSmart(['v1.mp4', 'unfinished.mp4'])
+    );
+    // The one readable part takes a 1-part group's road: a stream-copy into a
+    // NEW file (the callers delete the part temp files afterwards).
+    expect(out.filename).not.toBe('v1.mp4');
+    expect(out.reencoded).toBe(false);
+    expect(out.filename.endsWith('.mp4')).toBe(true);
+    expectNear(durationOf(out.filename), 2);
+    const streams = streamsOf(out.filename);
+    expect(streams.filter((s) => s.codec_type === 'video').length).toBe(1);
+    expect(streams.filter((s) => s.codec_type === 'audio').length).toBe(1);
+
+    expect(out.skipped).toHaveLength(1);
+    const [s] = out.skipped;
+    expect(s!.index).toBe(1);
+    expect(s!.name).toBe('unfinished.mp4');
+    expect(s!.bytes).toBe(statSync(abs('unfinished.mp4')).size);
+    expect(s!.reason).toBe('moov atom not found');
+    expect(lines).toContain(
+      `[media-concat] part unfinished.mp4 (${s!.bytes} B) is unreadable (moov atom not found) — skipped`
+    );
+    if (process.env.MW_PRINT_CONCAT_CMD) for (const l of lines) console.log(l);
+  }, 120_000);
+
+  test('every part unfinished → the existing error, nothing produced', async () => {
+    await expect(concatMediaSmart(['unfinished.mp4', 'unfinished2.mp4'])).rejects.toThrow(
+      'ffmpeg re-encode concat failed: no usable audio or video streams in the parts'
+    );
+  }, 120_000);
+
+  test('good · unfinished · good → the two good parts, stitched in order', async () => {
+    const out = await concatMediaSmart(['loud.m4a', 'unfinished.mp4', 'quiet.m4a']);
+    expect(out.skipped.map((s) => s.index)).toEqual([1]);
+    expect(out.filename.endsWith('.m4a')).toBe(true);
+    expectNear(durationOf(out.filename), 4);
+    // Loud first, quiet second — the order survived the gap.
+    const first = meanVolumeOf(out.filename, 0, { ss: 0.2, t: 1.5 });
+    const second = meanVolumeOf(out.filename, 0, { ss: 2.3, t: 1.5 });
+    expect(first).toBeGreaterThan(second + 20);
+  }, 120_000);
+});
+
+describe('withSkippedNotes', () => {
+  test('marks only the skipped positions, by the entry’s own segment number', () => {
+    const map = [
+      { index: 1, offsetSec: 0 },
+      { index: 2, offsetSec: 1200 },
+      { index: 3, offsetSec: 1200 },
+    ];
+    const out = withSkippedNotes(map, [
+      { index: 1, name: 'upload-x.part2', bytes: 9 * 1024 * 1024, reason: 'moov atom not found' },
+    ]);
+    expect(out[0]).toEqual({ index: 1, offsetSec: 0 });
+    expect(out[1]).toEqual({
+      index: 2,
+      offsetSec: 1200,
+      skipped: 'segment 2 unreadable (9 MB) — skipped',
+    });
+    expect(out[2]).toEqual({ index: 3, offsetSec: 1200 });
+    expect(withSkippedNotes(map, [])).toEqual(map);
+  });
 });

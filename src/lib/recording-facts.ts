@@ -145,7 +145,9 @@ export function recordingFacts(row: RecordingFactsRow): RecordingFacts {
     index: p.index,
     offsetSec: typeof p.offsetSec === 'number' ? p.offsetSec : null,
     durationSec: typeof p.durationSec === 'number' ? p.durationSec : null,
-    comment: p.comment?.trim() || null,
+    // A part the stitch could not read says so first ("segment 2 unreadable
+    // (9 MB) — skipped"), then the uploader's own note if there is one.
+    comment: [p.skipped, p.comment?.trim()].filter(Boolean).join(' — ') || null,
     filename: p.originalFilename?.trim() || null,
   }));
   const segmentCount = Math.max(1, segments.length, ctx?.combinedParts ?? 0);

@@ -14,7 +14,7 @@ import { recorderCallTitle } from '@/lib/recorder';
 import { suggestedEventFromMatch } from '@/lib/server/recorder-match';
 import { resolveAccess } from '@/db-ops/transcript-access';
 import { deleteAudioFile, deleteAudioFilesByPrefix } from '@/lib/server/audio-storage';
-import { concatMediaSmart, probeDurationSec } from '@/lib/server/media-concat';
+import { concatMediaSmart, probeDurationSec, withSkippedNotes } from '@/lib/server/media-concat';
 import { IngestError, ingestLocalAudio } from '@/lib/server/ingest';
 import { BlobIngestFailed, ingestBlobAudio, type BlobIngestSource } from '@/lib/server/aai-from-blob';
 import { queueRecordingGraphSync } from '@/lib/server/recording-sync';
@@ -970,7 +970,7 @@ export async function finalizeUpload(
       const durations: Array<number | null> = [];
       for (const p of parts) durations.push(await probeDurationSec(p.tempFilename));
       let offset = 0;
-      const uploadedParts = parts.map((p, i) => {
+      const stitchMap = parts.map((p, i) => {
         const entry = {
           index: p.index,
           originalFilename: p.originalFilename,
@@ -986,13 +986,19 @@ export async function finalizeUpload(
       });
       // The stitch works on the NVMe when `MW_SCRATCH_DIR` is set (DEC-3's
       // scratch rule) and in the audio dir exactly as before when it is not.
-      const { filename: combinedTemp, reencoded } = await concatMediaSmart(
+      const { filename: combinedTemp, reencoded, skipped } = await concatMediaSmart(
         parts.map((p) => p.tempFilename),
         { scratchId: groupUuid }
       );
+      // A part nothing could be read from (an unfinished MP4) is left out of
+      // the stitch rather than failing the group; its entry says so, and the
+      // recording card's Segments list shows it.
+      const uploadedParts = withSkippedNotes(stitchMap, skipped);
+      const skippedNotes = uploadedParts.flatMap((p) => (p.skipped ? [p.skipped] : []));
       console.log(
         `[upload] stitched ${multi.total} recordings for ${groupRow.assemblyai_id}` +
-          (reencoded ? ' (re-encoded — mixed codecs)' : ' (stream-copy)')
+          (reencoded ? ' (re-encoded — mixed codecs)' : ' (stream-copy)') +
+          (skippedNotes.length > 0 ? ` — WITHOUT ${skippedNotes.join('; ')}` : '')
       );
       for (const p of parts) await deleteAudioFile(p.tempFilename);
       // Persist the stitch map on the row BEFORE ingest — the placeholder

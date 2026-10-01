@@ -148,6 +148,10 @@ interface PartProbe {
   height: number | null;
   /** Already clamped to [MIN_FPS, MAX_FPS]; null when there is no video. */
   fps: number | null;
+  /** Why ffprobe could not read the file at all (its stderr's last line). */
+  probeError?: string;
+  /** ffprobe was killed (timeout) — says nothing about the file itself. */
+  probeTimedOut?: boolean;
 }
 
 interface AudioTrackMeta {
@@ -211,9 +215,24 @@ async function probePart(filename: string): Promise<PartProbe> {
       height: first?.height ?? null,
       fps: first ? streamFps(first.avg_frame_rate, first.r_frame_rate) : null,
     };
-  } catch {
-    return empty;
+  } catch (err) {
+    const killed = !!err && typeof err === 'object' && 'killed' in err && !!err.killed;
+    return { ...empty, probeError: probeFailure(err), probeTimedOut: killed };
   }
+}
+
+/** ffprobe's own complaint, one line ("moov atom not found"), else the error. */
+function probeFailure(err: unknown): string {
+  const stderr =
+    err && typeof err === 'object' && 'stderr' in err ? String(err.stderr).trim() : '';
+  const lines = stderr
+    .split('\n')
+    .map((l) => l.replace(/^\[[^\]]*\]\s*/, '').trim())
+    .filter(Boolean);
+  // The demuxer's line names the cause; the last line is usually the generic
+  // "<path>: Invalid data found when processing input".
+  const cause = lines.find((l) => !l.includes(': Invalid data found')) ?? lines[lines.length - 1];
+  return (cause ?? String(err)).slice(0, 200);
 }
 
 /** ffprobe's `num/den` rate → a positive number, or null ("0/0", den 0, junk). */
@@ -564,6 +583,104 @@ async function probeStreamSignature(filename: string): Promise<string> {
 export async function concatMediaSmart(
   filenames: string[],
   opts: ConcatOpts = {}
+): Promise<SmartConcatResult> {
+  const { readable, skipped } = await dropUnreadableParts(filenames);
+  if (readable.length === 0) {
+    throw new Error('ffmpeg re-encode concat failed: no usable audio or video streams in the parts');
+  }
+  // One readable part left takes the same road a 1-part group always has: a
+  // uniform signature → `concatMediaToTemp`, a stream-copy remux into a NEW
+  // file (the callers delete every part's temp file after the stitch, so the
+  // part itself can never be the result).
+  return { ...(await concatReadable(readable, opts)), skipped };
+}
+
+/** A part the stitch left out, and why. */
+export interface SkippedPart {
+  /** 0-based position in the `filenames` given to `concatMediaSmart`. */
+  index: number;
+  name: string;
+  bytes: number | null;
+  reason: string;
+}
+
+export interface SmartConcatResult {
+  filename: string;
+  reencoded: boolean;
+  /** Parts that could not be read at all and are NOT in the output. */
+  skipped: SkippedPart[];
+}
+
+/**
+ * A caller's stitch map (`uploadedParts`, one entry per input in the same
+ * order) with the skipped parts marked — "segment 2 unreadable (9 MB) —
+ * skipped" — which is what the recording card's Segments list, the notes
+ * prompt and the part's `recording_media.source_ref` carry. The segment
+ * number is the entry's own (1-based) `index`, the one the person knows.
+ */
+export function withSkippedNotes<T extends { index: number }>(
+  entries: T[],
+  skipped: SkippedPart[]
+): Array<T & { skipped?: string }> {
+  const byPosition = new Map(skipped.map((s) => [s.index, s]));
+  return entries.map((e, i) => {
+    const s = byPosition.get(i);
+    return s ? { ...e, skipped: `segment ${e.index} unreadable (${formatBytes(s.bytes)}) — skipped` } : e;
+  });
+}
+
+function formatBytes(bytes: number | null): string {
+  if (bytes == null) return 'size unknown';
+  if (bytes < 1024 * 1024) return `${Math.max(1, Math.round(bytes / 1024))} KB`;
+  return `${Math.round(bytes / (1024 * 1024))} MB`;
+}
+
+/**
+ * Drop the parts nothing can be read from — no duration AND no audio or
+ * video stream — instead of failing the whole group on them.
+ *
+ * The case (2026-10-01, Ivan's recording 862a1066): the tray died 35 s into a
+ * segment roll and uploaded part 2 as an UNFINISHED MP4 — the `moov` atom
+ * (the index AVAssetWriter writes last) was never written. ffprobe says
+ * "moov atom not found"; the stitch collapsed to "0 tracks", threw, the
+ * caller deleted the upload, and the tray re-sent all 258 MB every 30 min
+ * while a perfectly good 20-minute part 1 was never transcribed.
+ *
+ * No salvage attempt: without the moov there is no sample table, so neither
+ * `ffprobe -err_detect ignore_err` nor an `ffmpeg -c copy` remux can open the
+ * file (both verified to fail with "moov atom not found"). The real fix is on
+ * the tray side (fragmented MP4).
+ */
+async function dropUnreadableParts(
+  filenames: string[]
+): Promise<{ readable: string[]; skipped: SkippedPart[] }> {
+  const probes = await Promise.all(filenames.map(probePart));
+  const readable: string[] = [];
+  const skipped: SkippedPart[] = [];
+  for (const [index, p] of probes.entries()) {
+    // A probe that timed out (a loaded VM, a huge file) proves nothing about
+    // the bytes — never drop a part for it; the stitch gets it as before.
+    if (p.hasVideo || p.audioTracks > 0 || p.durationSec != null || p.probeTimedOut) {
+      readable.push(p.filename);
+      continue;
+    }
+    const bytes = await fsp
+      .stat(resolveAudioPath(p.filename))
+      .then((s) => s.size)
+      .catch(() => null);
+    const reason = p.probeError ?? 'no audio or video stream';
+    console.warn(
+      `[media-concat] part ${p.filename} (${bytes ?? '?'} B) is unreadable (${reason}) — skipped`
+    );
+    skipped.push({ index, name: p.filename, bytes, reason });
+  }
+  return { readable, skipped };
+}
+
+/** The stitch proper, over parts already known to be readable. */
+async function concatReadable(
+  filenames: string[],
+  opts: ConcatOpts
 ): Promise<{ filename: string; reencoded: boolean }> {
   const signatures = await Promise.all(filenames.map(probeStreamSignature));
   const uniform = signatures.every((s) => s === signatures[0] && !s.startsWith('unreadable'));

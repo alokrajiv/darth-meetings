@@ -309,6 +309,7 @@ function buildUploadedPartsContext(row: TranscriptRow): string {
         : '';
     const name = p.originalFilename ? ` "${p.originalFilename}"` : '';
     const note = p.comment ? ` — user's note: ${p.comment}` : '';
+    if (p.skipped) return `- File ${p.index}${name} — unreadable, NOT in the audio${note}`;
     return `- File ${p.index}${name}${span}${note}`;
   });
   return (

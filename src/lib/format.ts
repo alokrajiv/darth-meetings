@@ -513,6 +513,10 @@ export interface GmeetContext {
     /** sha256 of this part's bytes — the durable half of the group's
      * identity (`recordings.sha256` is the hash of these, joined). */
     sha256?: string;
+    /** Set when this part could not be read at all (an unfinished MP4) and
+     * the stitch left it out: "segment 2 unreadable (9 MB) — skipped". Its
+     * span is empty — the next part's offset is the same as this one's. */
+    skipped?: string;
   }> | null;
   /**
    * The bytes this meeting was uploaded from, as the same-file check knows

@@ -35,7 +35,7 @@ import {
   resolveAudioPath,
 } from '@/lib/server/audio-storage';
 import { dropAudioOnly } from '@/lib/server/audio-only';
-import { concatMediaSmart, probeDurationSec } from '@/lib/server/media-concat';
+import { concatMediaSmart, probeDurationSec, withSkippedNotes } from '@/lib/server/media-concat';
 import { normalizeMultiTrack } from '@/lib/server/multitrack';
 import { sniffMediaExtension } from '@/lib/server/video-frames';
 import { uploadFile, getTranscript, deleteTranscript, isAaiNotFound } from '@/lib/server/assemblyai';
@@ -333,7 +333,7 @@ export async function finalizeBornBare(
       const durations: Array<number | null> = [];
       for (const p of parts) durations.push(await probeDurationSec(p.tempFilename));
       let offset = 0;
-      const uploadedParts = parts.map((p, i) => {
+      const stitchMap = parts.map((p, i) => {
         const entry = {
           index: p.index,
           ...(p.originalFilename ? { originalFilename: p.originalFilename } : {}),
@@ -345,10 +345,19 @@ export async function finalizeBornBare(
         offset += durations[i] ?? 0;
         return entry;
       });
-      const { filename: combined } = await concatMediaSmart(
+      const { filename: combined, skipped } = await concatMediaSmart(
         parts.map((p) => p.tempFilename),
         { scratchId: recordingId }
       );
+      // A part nothing could be read from (an unfinished MP4) is left out of
+      // the stitch rather than failing the group; its entry says so.
+      const uploadedParts = withSkippedNotes(stitchMap, skipped);
+      if (skipped.length > 0) {
+        console.warn(
+          `[born-bare] ${recordingId}: stitched without ` +
+            uploadedParts.flatMap((p) => (p.skipped ? [p.skipped] : [])).join('; ')
+        );
+      }
       for (const p of parts) await deleteAudioFile(p.tempFilename);
       await mergeStandaloneState(user.userId, recordingId, { uploadedParts, group: null });
       const ext = combined.slice(combined.lastIndexOf('.'));
@@ -482,6 +491,7 @@ async function handOff(
       sourceRef: {
         ...(p.originalFilename ? { originalFilename: p.originalFilename } : {}),
         ...(p.comment ? { comment: p.comment } : {}),
+        ...(p.skipped ? { skipped: p.skipped } : {}),
       },
     })),
     transcription: {
