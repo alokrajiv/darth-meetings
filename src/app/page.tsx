@@ -14,6 +14,7 @@ import { TranscriptImportDialog } from '@/components/transcript-import-dialog';
 import { AppHeader } from '@/components/app-header';
 import { SetupReviewDialog } from '@/components/setup-review-dialog';
 import { LabelRail, LABEL_RAIL_STORAGE_KEY } from '@/components/label-rail';
+import { useShellToggleSidebar } from '@/components/shell-search';
 import { Button } from '@/components/ui/button';
 import {
   Settings,
@@ -247,6 +248,9 @@ export default function Home() {
       // storage blocked — state just won't persist
     }
   };
+  // Darth desktop shell: the band's sidebar button toggles the labels rail
+  // (a no-op subscription outside the shell).
+  useShellToggleSidebar(() => toggleRail(!railCollapsed));
 
   // Close the hand-rolled Import popover on outside click / Escape.
   useEffect(() => {

@@ -49,6 +49,7 @@ import {
   X,
 } from 'lucide-react';
 import { PersonChip } from '@/components/person-chip';
+import { useShellSearch } from '@/components/shell-search';
 import { RowMenu, type RowMenuSection } from '@/components/row-menu';
 import { RecordingStrip, SourceGlyph } from '@/components/recording-strip';
 import { SuggestedEventStrip } from '@/components/suggested-event-strip';
@@ -419,6 +420,7 @@ export function TranscriptTable({
   const [query, setQuery] = useState('');
   const [debouncedQ, setDebouncedQ] = useState('');
   const searchRef = useRef<HTMLInputElement>(null);
+  const shell = useShellSearch();
   const [openSeriesId, setOpenSeriesId] = useState<number | null>(null);
 
   // Layer chips (multi-select, all on by default). Loaded client-side to
@@ -1010,6 +1012,16 @@ export function TranscriptTable({
       silentRefetchAll();
     }, 800);
   });
+
+  // Inside the desktop shell the field is the panel's second input: register
+  // it so the panel can hand typing back to it and never treats a click on
+  // it as "outside".
+  const { inDesktopShell, registerField } = shell;
+  useEffect(() => {
+    if (!inDesktopShell) return;
+    registerField(searchRef);
+    return () => registerField(null);
+  }, [inDesktopShell, registerField]);
 
   // Global `/` focuses the search input when no other field has focus.
   useEffect(() => {
@@ -1876,8 +1888,36 @@ export function TranscriptTable({
           <Search className="pointer-events-none absolute left-2.5 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-muted-foreground" />
           <Input
             ref={searchRef}
-            value={query}
-            onChange={(e) => setQuery(e.target.value)}
+            // Inside the Darth desktop shell this field feeds the shared
+            // results panel (components/shell-search) instead of filtering
+            // the listing — the same panel the shell's band search drives.
+            value={shell.inDesktopShell ? shell.query : query}
+            onChange={(e) =>
+              shell.inDesktopShell
+                ? shell.drive({ query: e.target.value, submit: false }, 'field')
+                : setQuery(e.target.value)
+            }
+            onKeyDown={
+              shell.inDesktopShell
+                ? (e) => {
+                    if (e.key === 'Enter') {
+                      e.preventDefault();
+                      shell.drive({ query: e.currentTarget.value, submit: true }, 'field');
+                    } else if (e.key === 'ArrowDown' && shell.open) {
+                      e.preventDefault();
+                      shell.focusResults();
+                    } else if (e.key === 'Escape') {
+                      e.preventDefault();
+                      shell.close();
+                    }
+                  }
+                : undefined
+            }
+            role={shell.inDesktopShell ? 'combobox' : undefined}
+            aria-expanded={shell.inDesktopShell ? shell.open : undefined}
+            aria-controls={shell.inDesktopShell && shell.open ? 'meeting-search-results' : undefined}
+            autoComplete="off"
+            data-testid="meetings-search-input"
             placeholder="Search meetings…"
             disabled={blocked}
             title={blocked ? OFFLINE_TITLE : undefined}

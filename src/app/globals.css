@@ -200,3 +200,11 @@
   color: transparent;
   animation: shimmer 2s linear infinite;
 }
+
+/* Search-result matches (desktop-shell search panel): the matched words in
+   bold foreground, no highlighter tint — the Darth Chat search look. */
+mark.search-match {
+  background: transparent;
+  color: var(--color-foreground);
+  font-weight: 600;
+}

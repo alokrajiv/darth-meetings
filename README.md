@@ -81,6 +81,39 @@ What **this** member owns / consumes:
   (`PATCH {scratch:false}`, or link it to a calendar event), and is moved to
   the trash automatically 30 days after creation (migration 042).
 
+## Darth desktop shell
+
+Meetings runs inside the Darth desktop shell (Electron, repo `darth/desktop`)
+on the same contract as Darth Chat (its SPEC §20.76):
+
+- **Detection** — the shell's UA carries `DarthDesktop/<ver>`. The root
+  layout reads the *request* UA at SSR (`src/lib/desktop-shell.ts`), sets
+  `<html data-shell="desktop" data-shell-os="mac|win|linux">` and passes
+  `inDesktopShell` to `ShellSearchProvider` — first paint already right, no
+  hydration diff. (Reading `headers()` makes every page dynamic-rendered.)
+- **Events** (shell → page only, window `CustomEvent`s, listened for only
+  inside the shell — `src/lib/shell-signals.ts`): `darth-shell:search`
+  `{query, submit}` — `submit:false` while typing (shell-debounced, `''` =
+  cleared), `submit:true` on Enter; `darth-shell:toggle-sidebar` toggles the
+  labels rail on the listing; `darth-shell:new-chat` is not applicable and
+  ignored. Nothing flows page → shell.
+- **Panel** (`src/components/shell-search.tsx`) — the Darth Chat search
+  look: one row per meeting with title, date, meta (owner · duration · where
+  it matched · labels) and a ~140-char snippet with the matched words bold.
+  Anchored just under the app header, full content width up to 720 px,
+  centred, over the page. Opens on the first non-empty query, follows typing
+  live, runs at once on Enter and moves focus into the results (↑/↓, Enter
+  opens the meeting, Esc closes and clears; a click outside closes). Never
+  two panels. Inside the shell the in-app "Search meetings…" field feeds the
+  same panel (instead of filtering the listing); outside it nothing changes.
+- **Search** — `GET /api/search?q=` (`src/lib/meeting-search.ts` +
+  `src/db-ops/meeting-search.ts`): every whitespace term must occur in the
+  title, file name, description, AI notes or transcript text (ILIKE over the
+  migration-012 trigram indexes), same visibility and `meetings` gate as the
+  listing, max 30 hits (title hits first, then newest); the snippet is cut
+  from a 400-char SQL window around the earliest term with bold ranges as
+  UTF-16 offsets into the returned text.
+
 ## Stack
 
 Next.js (App Router) + Postgres (schema `meeting_whisperer_*`) + AssemblyAI +
