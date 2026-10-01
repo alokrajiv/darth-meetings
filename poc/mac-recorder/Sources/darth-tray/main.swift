@@ -5,7 +5,7 @@ import ServiceManagement
 import RecorderCore
 import TrayLogic
 
-let VERSION = "0.3.19"
+let VERSION = "0.3.20"
 let WS_PORT: UInt16 = 47800
 let PWA_URL = URL(string: "https://meetings.darth-internal.trames.io/")!
 /// Seconds between "the call ended" and an automatic stop.
@@ -248,6 +248,33 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         i.toolTip = "Apple's echo cancellation keeps the other people's voices out of your microphone track, so a call on the speakers is not recorded twice. Takes effect on the next recording."
         return i
     }()
+    /// 0.3.20: Settings ▸ Telemetry ▸ Full / Partial — a quiet setting, never a prompt.
+    let settingsItem = NSMenuItem(title: "Settings", action: nil, keyEquivalent: "")
+    let telemetryItem = NSMenuItem(title: "Telemetry", action: nil, keyEquivalent: "")
+    let telemetryFullItem: NSMenuItem = {
+        let i = NSMenuItem(title: "Full", action: #selector(chooseTelemetryFull), keyEquivalent: "")
+        i.toolTip = "Machine-level numbers plus which apps use CPU and GPU during a call. Company Macs stay on this setting as per policy."
+        return i
+    }()
+    let telemetryPartialItem: NSMenuItem = {
+        let i = NSMenuItem(title: "Partial", action: #selector(chooseTelemetryPartial), keyEquivalent: "")
+        i.toolTip = "Machine-level numbers only — nothing about other apps."
+        return i
+    }()
+    /// The first-launch telemetry notice while it is on screen (non-modal).
+    var telemetryNotice: NSAlert?
+    /// 0.3.20: one click stamps "this is laggy" with what the Mac is doing right now.
+    static let LAG_TITLE = "This feels laggy"
+    static let LAG_SENT = "Lag report sent ✓"
+    let lagItem = NSMenuItem(title: AppDelegate.LAG_TITLE, action: #selector(reportLagFromMenu), keyEquivalent: "")
+    var lagSentTimer: Timer?
+    /// Greyed one-liner under the Telemetry choice (Alok: nothing about telemetry ever pops up —
+    /// the level is a quiet menu setting).
+    let telemetryHintItem: NSMenuItem = {
+        let i = NSMenuItem(title: "Partial keeps machine-level numbers only — for personal Macs", action: nil, keyEquivalent: "")
+        i.isEnabled = false
+        return i
+    }()
     let authItem = NSMenuItem(title: "Sign in to Darth Meetings…", action: #selector(toggleAuth), keyEquivalent: "")
     let uploadItem = NSMenuItem(title: "Upload recordings automatically", action: #selector(toggleAutoUpload), keyEquivalent: "")
     let pendingLine = NSMenuItem(title: "", action: nil, keyEquivalent: "")
@@ -261,10 +288,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if offerMoveToApplications() { return }   // relaunching from /Applications
         installSignalHandlers()
         buildMenu()
+        // 0.3.20: + the hardware identity (hw_model, chip, ram_gb, cores, gpu_cores — partial-OK).
         EventLog.shared.log("app_launched", [
             "version": VERSION, "pid": getpid(), "bundle_path": Bundle.main.bundlePath,
             "device_id": auth.deviceId, "signed_in": auth.signedIn, "os": ProcessInfo.processInfo.operatingSystemVersionString,
-        ])
+        ].merging(HardwareInfo.fields) { a, _ in a })
+        // 0.3.20: did the previous run end without quitting? (Reported after the registry
+        // reconcile below, which finds the recording it was making.) Our marker is written now.
+        let uncleanPrevious = RunGuard.launch(version: VERSION)
 
         if !CGPreflightScreenCaptureAccess() {
             rlog("screen recording not granted → requesting")
@@ -369,6 +400,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // window opts out like the banner, preview and Record… dialog do.
         statusItem.button?.window?.sharingType = .none
         ResourceSampler.shared.isRecording = { [weak self] in self?.recorder.isRecording ?? false }
+        // 0.3.20: a live call is sampled (and logged) too, recorded or not.
+        ResourceSampler.shared.callLive = { [weak self] in
+            guard let c = self?.firstCall else { return nil }
+            return (c.appName, c.pid)
+        }
         ResourceSampler.shared.start()
         banner.onHidden = { [weak self] in self?.refreshMenu() }
         preview.sourceInfo = { [weak self] in
@@ -516,13 +552,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if !auth.signedIn {
             rlog("not signed in — recordings stay local until you sign in from the menu")
         }
+        rlog("telemetry: level \(Telemetry.level.rawValue) — \(HardwareInfo.fields["hw_model"] ?? "?") \(HardwareInfo.fields["chip"] ?? "?"), \(HardwareInfo.fields["ram_gb"] ?? "?") GB, \(HardwareInfo.fields["cpu_cores"] ?? "?") CPU / \(HardwareInfo.fields["gpu_cores"] ?? "?") GPU cores")
+        // 0.3.20: the telemetry notice, once, after the launch banners have had their moment.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 3) { [weak self] in self?.showTelemetryNoticeIfNeeded() }
         // 0.3.7: rows a dead process left at 'recording' become local / upload_failed before
         // the drain below looks at them, and the server hears about it.
-        for id in Registry.shared.reconcileAfterLaunch() {
+        let reconciled = Registry.shared.reconcileAfterLaunch()
+        for id in reconciled {
             let row = Registry.shared.get(id)
             EventLog.shared.log("registry_reconciled", ["recording_id": id, "status": row?["status"] ?? NSNull(), "error": row?["error"] ?? NSNull(), "bytes": row?["bytes"] ?? 0],
                                 summary: "registry: \(id) was still 'recording' at launch → \((row?["status"] as? String) ?? "?")")
             api.syncRecording(id)
+        }
+        // 0.3.20: unclean_exit (+ our crash report, + the previous run's tray.log tail on a
+        // full Mac), shipped now rather than on the 60 s timer.
+        if let prev = uncleanPrevious {
+            RunGuard.report(prev, reconciled: reconciled)
+            api.shipEvents()
         }
         uploadPending()
         purgeUploadedLocalCopies()
@@ -592,6 +638,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             rlog("terminate: recording \(finalised ? "finalised" : "NOT finalised (5 s cap)") in \(String(format: "%.1f", Date().timeIntervalSince(started))) s")
         }
         EventLog.shared.log("app_terminating", ["recording": wasRecording, "finalised": finalised])
+        RunGuard.cleanExit()   // 0.3.20: no `unclean_exit` at the next launch
     }
 
     /// Route SIGTERM through NSApp.terminate so applicationWillTerminate runs (a raw SIGTERM
@@ -696,10 +743,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         discreetItem.target = self; m.addItem(discreetItem)
         autoHideItem.target = self; m.addItem(autoHideItem)
         micProcessingItem.target = self; m.addItem(micProcessingItem)
+        telemetryFullItem.target = self
+        telemetryPartialItem.target = self
+        let telemetryMenu = NSMenu(title: "Telemetry")
+        telemetryMenu.addItem(telemetryFullItem)
+        telemetryMenu.addItem(telemetryPartialItem)
+        telemetryItem.submenu = telemetryMenu
+        let settingsMenu = NSMenu(title: "Settings")
+        settingsMenu.addItem(telemetryItem)
+        settingsMenu.addItem(telemetryHintItem)
+        settingsItem.submenu = settingsMenu
+        m.addItem(settingsItem)
         m.addItem(.separator())
         let open = NSMenuItem(title: "Open Darth Meetings", action: #selector(openPWA), keyEquivalent: "o"); open.target = self; m.addItem(open)
         let reveal = NSMenuItem(title: "Show recordings folder", action: #selector(revealFolder), keyEquivalent: ""); reveal.target = self; m.addItem(reveal)
         let logs = NSMenuItem(title: "Show log", action: #selector(revealLog), keyEquivalent: ""); logs.target = self; m.addItem(logs)
+        lagItem.target = self; m.addItem(lagItem)
         m.addItem(.separator())
         loginItem.target = self; m.addItem(loginItem)
         versionLine.isEnabled = false; m.addItem(versionLine)
@@ -758,6 +817,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         discreetItem.state = discreet ? .on : .off
         autoHideItem.state = bannerAutoHide ? .on : .off
         micProcessingItem.state = micVoiceProcessing ? .on : .off
+        let level = Telemetry.level
+        telemetryFullItem.state = level == .full ? .on : .off
+        telemetryPartialItem.state = level == .partial ? .on : .off
+        telemetryItem.title = "Telemetry: \(level == .full ? "Full" : "Partial")"
         authItem.title = auth.signingIn ? "Signing in…" : (auth.signedIn ? "Signed in as \(auth.email ?? "?") — sign out" : "Sign in to Darth Meetings…")
         authItem.isEnabled = !auth.signingIn
         uploadItem.state = autoUpload ? .on : .off
@@ -1141,6 +1204,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func callStarted(_ call: DetectedCall) {
         updateShareWatcher()
+        ResourceSampler.shared.callStateChanged()
+        updateDiagnostics()
         refreshMenu()
         var ev = call.json
         let (profile, why) = RecordingController.profile(for: call)
@@ -1148,7 +1213,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         EventLog.shared.log("call_started", ev, summary: "call started: \(call.appName) [\(call.kind.rawValue)] \"\(call.title)\" → \(profile.rawValue) (\(why))")
         if call.pid > 0 {
             let pick = WindowPicker.pick(kind: call.kind, pid: call.pid)
-            WindowPicker.logCandidates(phase: "detect", call: call, pick: pick)
+            WindowPicker.logPick(how: "detect", call: call, pick: pick)
         }
         if !recorder.isRecording { banner.showCall(call) }
         broadcast("call_started", ["call": call.json])
@@ -1157,6 +1222,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func callEnded(_ call: DetectedCall) {
         refreshMenu()
         defer { updateShareWatcher() }
+        ResourceSampler.shared.callStateChanged()
+        updateDiagnostics()
         EventLog.shared.log("call_ended", call.json)
         broadcast("call_ended", ["call": call.json])
         if recorder.isRecording, let rc = recorder.call, rc.pid == call.pid, call.pid > 0 {
@@ -1222,6 +1289,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func recordingStarted() {
         ResourceSampler.shared.recordingStateChanged()
+        updateDiagnostics()
         updateShareWatcher()
         refreshMenu()
         systemWarned = false
@@ -1266,6 +1334,103 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     @objc func toggleBannerAutoHide() { bannerAutoHide = !bannerAutoHide }
     @objc func toggleMicProcessing() { micVoiceProcessing = !micVoiceProcessing }
 
+    // MARK: diagnostics + telemetry level (0.3.20)
+
+    /// The call the diagnostics are about: the earliest live one.
+    var firstCall: DetectedCall? { detector.active.values.sorted { $0.startedAt < $1.startedAt }.first }
+
+    /// Point the process sampler at the current call / recording, and run it only while one of
+    /// them is live on a FULL-telemetry Mac.
+    func updateDiagnostics() {
+        let call = firstCall ?? recorder.call
+        let pid = call.map { $0.pid }.flatMap { $0 > 0 ? $0 : nil }
+        ProcessSampler.shared.setContext(.init(recordingId: recorder.isRecording ? recorder.recordingId : nil,
+                                               callApp: call?.appName, callPid: pid))
+        ProcessSampler.shared.setActive(SamplerPacing.processSampling(recording: recorder.isRecording, callLive: firstCall != nil,
+                                                                      level: Telemetry.level))
+    }
+
+    @objc func chooseTelemetryFull() { setTelemetryLevel(.full, source: "menu") }
+    @objc func chooseTelemetryPartial() { setTelemetryLevel(.partial, source: "menu") }
+
+    /// The one place the level changes (menu, notice, ws). Partial stops the process sampler
+    /// at once (it also re-checks the level before every read).
+    func setTelemetryLevel(_ level: TelemetryLevel, source: String) {
+        let previous = Telemetry.level
+        Telemetry.set(level)
+        EventLog.shared.log("telemetry_level_set", ["level": level.rawValue, "previous": previous.rawValue, "source": source],
+                            summary: "telemetry: \(previous.rawValue) → \(level.rawValue) (\(source))")
+        updateDiagnostics()
+        refreshMenu()
+        broadcast("status")
+    }
+
+    /// First launch of 0.3.20+: say what is collected, ONCE, without blocking anything (a
+    /// modal alert would stop the main run loop's default-mode timers). The only telemetry
+    /// prompt there is — nothing pops up when telemetry is sent or a lag report goes.
+    func showTelemetryNoticeIfNeeded() {
+        guard !UserDefaults.standard.bool(forKey: Telemetry.noticeKey), telemetryNotice == nil else { return }
+        UserDefaults.standard.set(true, forKey: Telemetry.noticeKey)
+        let a = NSAlert()
+        a.messageText = "Darth Recorder now collects diagnostics while you are on a call."
+        a.informativeText = "This helps us find why recordings lag or lose audio on some Macs.\n\nFull telemetry (on now) also notes which apps are using CPU and GPU during a call. Company Macs stay on this setting as per policy.\n\nIf this is your personal Mac, you can switch to partial telemetry, which keeps only machine-level numbers and nothing about other apps.\n\nYou can change this at any time from the menu under Settings."
+        a.alertStyle = .informational
+        a.icon = NSApp.applicationIconImage
+        let keep = a.addButton(withTitle: "Keep full telemetry")
+        let partial = a.addButton(withTitle: "Switch to partial")
+        keep.target = self; keep.action = #selector(telemetryNoticeKeep)
+        partial.target = self; partial.action = #selector(telemetryNoticePartial)
+        a.layout()
+        let w = a.window
+        w.level = .floating
+        w.hidesOnDeactivate = false
+        w.sharingType = .none          // never part of a screen share (0.3.6)
+        w.center()
+        NSApp.activate(ignoringOtherApps: true)
+        w.makeKeyAndOrderFront(nil)
+        telemetryNotice = a
+        EventLog.shared.log("telemetry_notice_shown", ["level": Telemetry.level.rawValue], summary: "telemetry: first-launch notice shown")
+    }
+
+    @objc func telemetryNoticeKeep() { closeTelemetryNotice(); setTelemetryLevel(.full, source: "notice") }
+    @objc func telemetryNoticePartial() { closeTelemetryNotice(); setTelemetryLevel(.partial, source: "notice") }
+    func closeTelemetryNotice() {
+        telemetryNotice?.window.orderOut(nil)
+        telemetryNotice = nil
+    }
+
+    /// "This feels laggy": the machine snapshot now (partial-OK); on a full Mac also a fresh
+    /// 1 s process / GPU reading taken off the main queue and the tray.log tail. Shipped at once.
+    @objc func reportLagFromMenu() { reportLag(how: "menu") }
+
+    func reportLag(how: String) {
+        let call = firstCall ?? recorder.call
+        var e: [String: Any] = ["how": how, "recording": recorder.isRecording, "resources": ResourceSampler.shared.sample()]
+        if recorder.isRecording, let id = recorder.recordingId { e["recording_id"] = id }
+        if let c = call { e["call_app"] = c.appName; e["call_pid"] = Int(c.pid) }
+        if recorder.isRecording { e["health_line"] = recorder.healthLine() }
+        guard Telemetry.allows(.processList) else { sendLagReport(e); return }
+        ProcessSampler.shared.oneShot(seconds: 1) { [weak self] p in
+            var e = e
+            e["process_sample"] = p ?? NSNull()
+            if Telemetry.allows(.logExcerpt) { e["log_excerpt"] = LogTail.excerpt() }
+            self?.sendLagReport(e)
+        }
+    }
+
+    /// No banner, no dialog: the event goes, and the menu item reads "Lag report sent ✓" for 5 s.
+    private func sendLagReport(_ e: [String: Any]) {
+        EventLog.shared.log("user_lag_report", e, summary: "lag report (\(e["how"] ?? "?")) — telemetry \(Telemetry.level.rawValue)")
+        api.shipEvents()
+        lagItem.title = Self.LAG_SENT
+        lagSentTimer?.invalidate()
+        lagSentTimer = Timer.scheduledTimer(withTimeInterval: 5, repeats: false) { [weak self] _ in
+            self?.lagItem.title = Self.LAG_TITLE
+            self?.lagSentTimer = nil
+        }
+        broadcast("lag_report_sent", ["telemetry_level": Telemetry.level.rawValue])
+    }
+
     /// Once per recording: system audio silent past the threshold → a warning that stays until
     /// dismissed (the recording itself continues). Mic and video only change the tick + event.
     var systemWarned = false
@@ -1292,6 +1457,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func recordingStopped(_ saved: [String: Any]) {
         lastSaved = saved
         ResourceSampler.shared.recordingStateChanged()
+        updateDiagnostics()
         preview.close(remember: false)   // closes with the recording; the preference is untouched
         updateShareWatcher()
         refreshMenu()
@@ -1476,6 +1642,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             ] as [String: Any],
             "banner_visible": banner.isVisible,
             "resources": ResourceSampler.shared.latest ?? NSNull(),
+            // 0.3.20: what this Mac sends, and what it is (→ recorder_devices.last_status).
+            "telemetry_level": Telemetry.level.rawValue,
+            "hardware": HardwareInfo.fields,
             "ts": isoNow(),
         ]
         if recorder.isRecording {
@@ -1592,6 +1761,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             runEchoProbe(obj)
         case "set_discreet": if let v = obj["enabled"] as? Bool { discreet = v }
         case "set_banner_auto_hide": if let v = obj["enabled"] as? Bool { bannerAutoHide = v }
+        case "set_telemetry_level":                          // 0.3.20: {level: "full"|"partial"}
+            if let s = obj["level"] as? String, let l = TelemetryLevel(rawValue: s) { setTelemetryLevel(l, source: "ws") }
+        case "report_lag": reportLag(how: "pwa")             // 0.3.20: same as the menu's "This feels laggy"
+        case "process_sample":                               // 0.3.20 test hook: a 1 s process/GPU reading → process_sample_result
+            ProcessSampler.shared.oneShot(seconds: (obj["seconds"] as? Double) ?? 1) { [weak self] p in
+                self?.server.broadcast(["type": "process_sample_result", "sample": p ?? NSNull(), "telemetry_level": Telemetry.level.rawValue])
+            }
+        case "show_telemetry_notice":                        // 0.3.20 test hook: show the first-launch notice again
+            UserDefaults.standard.removeObject(forKey: Telemetry.noticeKey)
+            showTelemetryNoticeIfNeeded()
         case "show_banner": if recorder.isRecording { showRecordingBanner(autoHide: false) } else { banner.showMessage(title: "Darth Recorder", sub: "Not recording", accent: .info, autoHide: 5) }
         case "hide_banner": banner.hide()
         case "resources": broadcast("resources", ["sample": ResourceSampler.shared.sample()])
@@ -1708,7 +1887,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         var frame: CGRect?
         if pid > 0 {
             let pick = WindowPicker.pick(kind: k, pid: pid)
-            WindowPicker.logCandidates(phase: "simulate", call: nil, pick: pick)
+            WindowPicker.logPick(how: "simulate", call: nil, pick: pick)
             if let w = pick.window { title = w.title; frame = w.frame; name = w.owner }
             if let app = NSRunningApplication(processIdentifier: pid) {
                 name = app.localizedName ?? name

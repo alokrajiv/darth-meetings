@@ -141,14 +141,20 @@ final class LevelMeter {
 /// the server then has the context without asking the person for the file.
 enum LogTail {
     static let path = (("~/Library/Logs/DarthRecorder/tray.log") as NSString).expandingTildeInPath
-    static func excerpt(lines maxLines: Int = 60, maxBytes: Int = 8_000) -> [String] {
+    /// `before`: 0.3.20 — stop at the LAST line containing it (the current run's "starting,
+    /// pid N," line), so an unclean-exit report carries the previous run's final lines.
+    static func excerpt(lines maxLines: Int = 60, maxBytes: Int = 8_000, before: String? = nil) -> [String] {
         guard let fh = FileHandle(forReadingAtPath: path) else { return [] }
         defer { try? fh.close() }
         let size = (try? fh.seekToEnd()) ?? 0
-        let from = size > 32_000 ? size - 32_000 : 0
+        let window: UInt64 = before == nil ? 32_000 : 128_000
+        let from = size > window ? size - window : 0
         try? fh.seek(toOffset: from)
-        guard let data = try? fh.readToEnd(), let text = String(data: data, encoding: .utf8) else { return [] }
-        var out = Array(text.split(separator: "\n", omittingEmptySubsequences: true).suffix(maxLines).map(String.init))
+        guard let data = try? fh.readToEnd() else { return [] }
+        let text = String(decoding: data, as: UTF8.self)
+        var all = text.split(separator: "\n", omittingEmptySubsequences: true)
+        if let before, let i = all.lastIndex(where: { $0.contains(before) }) { all = Array(all[..<i]) }
+        var out = Array(all.suffix(maxLines).map(String.init))
         var bytes = out.reduce(0) { $0 + $1.utf8.count + 1 }
         while bytes > maxBytes, !out.isEmpty { bytes -= out.removeFirst().utf8.count + 1 }
         return out

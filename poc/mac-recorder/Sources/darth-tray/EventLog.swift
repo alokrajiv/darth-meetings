@@ -1,5 +1,6 @@
 import Foundation
 import RecorderCore
+import TrayLogic
 
 /// `~/Library/Logs/DarthRecorder/events.jsonl` — one JSON object per line
 /// (`{"ts":…,"kind":…,"payload":{…}}`), rotated at 20 MB keeping 5 old files.
@@ -32,8 +33,13 @@ final class EventLog {
 
     /// Append one event. `summary` (when given) also goes to tray.log so the human-readable
     /// log keeps its narrative without the full payload.
+    ///
+    /// 0.3.20: every payload is stamped with `telemetry_level` ("full" | "partial"). The server
+    /// keeps only `{ts, kind, payload}`, so the stamp has to live inside the payload.
     func log(_ kind: String, _ payload: [String: Any] = [:], summary: String? = nil) {
         if let summary { rlog(summary) }
+        var payload = payload
+        if payload["telemetry_level"] == nil { payload["telemetry_level"] = Telemetry.level.rawValue }
         let obj: [String: Any] = ["ts": iso.string(from: Date()), "kind": kind, "payload": payload]
         guard let data = try? JSONSerialization.data(withJSONObject: obj, options: [.sortedKeys]),
               var line = String(data: data, encoding: .utf8) else { return }
