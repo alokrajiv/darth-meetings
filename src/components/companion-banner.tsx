@@ -230,7 +230,7 @@ export function CompanionBanner() {
   if (!body && !signIn) return null;
   return (
     <div className="pointer-events-none fixed inset-x-0 top-14 z-30 px-6" data-companion-banner>
-      <div className="mx-auto max-w-[1720px]">
+      <div className="mx-auto max-w-[1400px]">
         {body}
         {signIn}
       </div>

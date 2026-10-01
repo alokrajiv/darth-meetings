@@ -1,30 +1,22 @@
 'use client';
 
 import { useEffect, useRef, useState } from 'react';
-import Link from 'next/link';
 import { useRouter } from 'next/navigation';
 import { legacyTabRedirect } from '@/lib/app-nav';
 import { TranscriptTable } from '@/components/transcript-table';
 import { AudioUpload, requestMediaUpload } from '@/components/audio-upload';
 import { getGoogleAccessToken } from '@/lib/google-token';
-import { LogoutButton } from '@/components/logout-button';
 import { GmeetImportDialog } from '@/components/gmeet-import-dialog';
 import { GmeetRemindersCard, type Reminder } from '@/components/gmeet-reminders-card';
 import { TranscriptImportDialog } from '@/components/transcript-import-dialog';
 import { AppHeader } from '@/components/app-header';
 import { SetupReviewDialog } from '@/components/setup-review-dialog';
 import { LabelRail, LABEL_RAIL_STORAGE_KEY } from '@/components/label-rail';
+import { useShellToggleSidebar } from '@/components/shell-search';
 import { Button } from '@/components/ui/button';
-import {
-  Settings,
-  Video,
-  FileText,
-  FileAudio,
-  ChevronDown,
-  CircleAlert,
-  Loader2,
-  Tag,
-} from 'lucide-react';
+import { ImportSplitButton } from '@/components/import-split-button';
+import { CircleAlert, Loader2 } from 'lucide-react';
+import { LISTING_MAX_CONTENT_PX } from '@/lib/listing-layout';
 import { labelFilterToParams, parseLabelFilter, type LabelFilter } from '@/lib/labels';
 import { OfflineArchive } from '@/components/offline-archive';
 import { OFFLINE_TITLE, useOffline, useOfflineGate } from '@/lib/offline/offline-context';
@@ -74,8 +66,6 @@ export default function Home() {
     eventStart: string | null;
   } | null>(null);
   const [textImportOpen, setTextImportOpen] = useState(false);
-  const [importMenuOpen, setImportMenuOpen] = useState(false);
-  const importMenuRef = useRef<HTMLDivElement>(null);
 
   // Meeting reminders (the poller's findings). The page owns the data: it
   // feeds the top banner (dismissable for good, localStorage), the header
@@ -247,82 +237,25 @@ export default function Home() {
       // storage blocked — state just won't persist
     }
   };
-
-  // Close the hand-rolled Import popover on outside click / Escape.
-  useEffect(() => {
-    if (!importMenuOpen) return;
-    const onPointerDown = (e: MouseEvent) => {
-      if (importMenuRef.current && !importMenuRef.current.contains(e.target as Node)) {
-        setImportMenuOpen(false);
-      }
-    };
-    const onKeyDown = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') setImportMenuOpen(false);
-    };
-    document.addEventListener('mousedown', onPointerDown);
-    document.addEventListener('keydown', onKeyDown);
-    return () => {
-      document.removeEventListener('mousedown', onPointerDown);
-      document.removeEventListener('keydown', onKeyDown);
-    };
-  }, [importMenuOpen]);
+  // Darth desktop shell: the band's sidebar button toggles the labels rail
+  // (a no-op subscription outside the shell).
+  useShellToggleSidebar(() => toggleRail(!railCollapsed));
 
   return (
     <div className="min-h-screen">
+      {/* Header (README "Darth desktop shell" → Layout rules): ONE import
+          split button, the reminders badge; AppHeader adds the offline +
+          Recorder chips and the account menu at the far right. */}
       <AppHeader>
-        <div className="relative" ref={importMenuRef}>
-          <Button
-            variant="outline"
-            size="sm"
-            onClick={() => setImportMenuOpen((o) => !o)}
-            aria-expanded={importMenuOpen}
-            aria-haspopup="menu"
-            disabled={blocked}
-            title={blocked ? OFFLINE_TITLE : undefined}
-          >
-            Import
-            <ChevronDown className="h-4 w-4" />
-          </Button>
-          {importMenuOpen && !blocked && (
-            <div
-              role="menu"
-              className="absolute right-0 top-full z-50 mt-1.5 w-64 rounded-lg border bg-popover p-1 text-popover-foreground shadow-[0_4px_16px_-2px_rgb(0_0_0/0.08),0_1px_2px_0_rgb(0_0_0/0.04)]"
-            >
-              <button
-                type="button"
-                role="menuitem"
-                className="flex w-full items-start gap-2.5 rounded-md px-3 py-2 text-left hover:bg-muted"
-                onClick={() => {
-                  setImportMenuOpen(false);
-                  setTextImportOpen(true);
-                }}
-              >
-                <FileText className="mt-0.5 h-4 w-4 shrink-0 text-muted-foreground" />
-                <span className="min-w-0">
-                  <span className="block text-sm font-medium">Transcript file</span>
-                  <span className="block text-[11px] text-muted-foreground">
-                    Teams, Zoom, VTT…
-                  </span>
-                </span>
-              </button>
-            </div>
-          )}
-        </div>
-        <Button
-          variant="outline"
-          size="sm"
-          onClick={() => requestMediaUpload()}
+        <ImportSplitButton
           disabled={blocked}
-          title={blocked ? OFFLINE_TITLE : undefined}
-        >
-          <FileAudio className="h-4 w-4" />
-          Upload media
-        </Button>
-        <Button size="sm" onClick={() => setGmeetOpen(true)} disabled={blocked} title={blocked ? OFFLINE_TITLE : undefined}>
-          <Video className="h-4 w-4" />
-          Import meeting
-        </Button>
-        <div className="h-5 w-px bg-border" />
+          disabledTitle={OFFLINE_TITLE}
+          onAction={(a) => {
+            if (a === 'import-meeting') setGmeetOpen(true);
+            else if (a === 'import-file') setTextImportOpen(true);
+            else requestMediaUpload();
+          }}
+        />
         {reminderCount > 0 && (
           <div className="relative" ref={reminderMenuRef}>
             <Button
@@ -359,16 +292,11 @@ export default function Home() {
             )}
           </div>
         )}
-        <Link href="/settings">
-          <Button variant="ghost" size="sm" className="h-8 w-8 p-0" title="Settings">
-            <Settings className="h-4 w-4" />
-            <span className="sr-only">Settings</span>
-          </Button>
-        </Link>
-        <LogoutButton />
       </AppHeader>
 
-      <main className="mx-auto max-w-[1720px] px-6 py-4">
+      {/* One layout at every width: designed for the shell's 900–1300 px
+          window, never wider than LISTING_MAX_CONTENT_PX. */}
+      <main className="mx-auto px-6 py-4" style={{ maxWidth: LISTING_MAX_CONTENT_PX }}>
         {/* Renders the page-wide drag-drop overlay, the hidden file input the
             header button clicks, and in-flight upload progress rows. Mounted in
             BOTH modes so a dropped file never navigates the tab; it gates
@@ -418,22 +346,8 @@ export default function Home() {
               labelFilter={labelFilter}
               labelFilterReady={labelReady}
               onLabelFilter={setLabelFilter}
-              toolbarExtra={
-                railCollapsed ? (
-                  <Button
-                    variant="outline"
-                    size="sm"
-                    className="h-8"
-                    title="Show the labels rail"
-                    data-label-rail-show
-                    onClick={() => toggleRail(false)}
-                  >
-                    <Tag className="h-3.5 w-3.5" />
-                    Labels
-                    {labelFilter && <span className="h-1.5 w-1.5 rounded-full bg-primary" />}
-                  </Button>
-                ) : undefined
-              }
+              labelRailOpen={!railCollapsed}
+              onToggleLabelRail={() => toggleRail(!railCollapsed)}
               onImportMeeting={(m) => {
                 // Same focus mechanism as reminder rows: open the import dialog
                 // scrolled to that meeting's day, highlighting the meeting.

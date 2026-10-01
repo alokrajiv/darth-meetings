@@ -6,6 +6,10 @@ import { OfflineProvider } from "@/lib/offline/offline-context";
 import { AppBadge } from "@/lib/offline/app-badge";
 import { OfflineBanner } from "@/components/offline-banner";
 import { CompanionBanner } from "@/components/companion-banner";
+import { headers } from "next/headers";
+import { ShellSearchProvider } from "@/components/shell-search";
+import { desktopShellOf } from "@/lib/desktop-shell";
+import { THEME_BOOT_SCRIPT } from "@/lib/listing-layout";
 
 const geistSans = Geist({
   variable: "--font-geist-sans",
@@ -36,21 +40,28 @@ export const viewport: Viewport = {
   themeColor: "#111111",
 };
 
-export default function RootLayout({
+export default async function RootLayout({
   children,
 }: Readonly<{
   children: React.ReactNode;
 }>) {
+  // Darth desktop shell (README "Darth desktop shell"): decided from the
+  // REQUEST's User-Agent (`DarthDesktop/<ver>`), so the first paint already
+  // carries <html data-shell="desktop" data-shell-os="mac|win|linux"> and the
+  // same answer reaches the client as a prop — no flash, no hydration diff.
+  const desktopShell = desktopShellOf((await headers()).get("user-agent"));
   return (
-    <html lang="en" suppressHydrationWarning>
+    <html
+      lang="en"
+      suppressHydrationWarning
+      data-shell={desktopShell?.shell}
+      data-shell-os={desktopShell?.os ?? undefined}
+    >
       <head>
-        {/* Applies the saved (or OS-preferred) theme before first paint to avoid a flash. */}
-        <script
-          dangerouslySetInnerHTML={{
-            __html:
-              "try{var t=localStorage.getItem('theme');if(t==='dark'||(!t&&matchMedia('(prefers-color-scheme: dark)').matches))document.documentElement.classList.add('dark')}catch(e){}",
-          }}
-        />
+        {/* Applies the theme before first paint to avoid a flash: in the
+            browser the saved (or OS-preferred) one; inside the Darth shell
+            prefers-color-scheme, followed live (Darth sets the theme). */}
+        <script dangerouslySetInnerHTML={{ __html: THEME_BOOT_SCRIPT }} />
       </head>
       <body
         className={`${geistSans.variable} ${geistMono.variable} antialiased`}
@@ -65,7 +76,12 @@ export default function RootLayout({
           {/* Client-only: talks to the local Darth Recorder tray (ws://127.0.0.1:47800)
               when one is installed; renders nothing otherwise. */}
           <CompanionBanner />
-          {children}
+          {/* Inside the shell the band's search drives the results panel (and
+              the in-app search field feeds the same one). Outside it this
+              adds nothing and listens to nothing. */}
+          <ShellSearchProvider inDesktopShell={desktopShell !== null}>
+            {children}
+          </ShellSearchProvider>
         </OfflineProvider>
       </body>
     </html>

@@ -81,6 +81,69 @@ What **this** member owns / consumes:
   (`PATCH {scratch:false}`, or link it to a calendar event), and is moved to
   the trash automatically 30 days after creation (migration 042).
 
+## Darth desktop shell
+
+Meetings runs inside the Darth desktop shell (Electron, repo `darth/desktop`)
+on the same contract as Darth Chat (its SPEC §20.76):
+
+- **Detection** — the shell's UA carries `DarthDesktop/<ver>`. The root
+  layout reads the *request* UA at SSR (`src/lib/desktop-shell.ts`), sets
+  `<html data-shell="desktop" data-shell-os="mac|win|linux">` and passes
+  `inDesktopShell` to `ShellSearchProvider` — first paint already right, no
+  hydration diff. (Reading `headers()` makes every page dynamic-rendered.)
+- **Events** (shell → page only, window `CustomEvent`s, listened for only
+  inside the shell — `src/lib/shell-signals.ts`): `darth-shell:search`
+  `{query, submit}` — `submit:false` while typing (shell-debounced, `''` =
+  cleared), `submit:true` on Enter; `darth-shell:toggle-sidebar` toggles the
+  labels rail on the listing; `darth-shell:new-chat` is not applicable and
+  ignored. Nothing flows page → shell.
+- **Panel** (`src/components/shell-search.tsx`) — the Darth Chat search
+  look: one row per meeting with title, date, meta (owner · duration · where
+  it matched · labels) and a ~140-char snippet with the matched words bold.
+  Anchored just under the app header, full content width up to 720 px,
+  centred, over the page. Opens on the first non-empty query, follows typing
+  live, runs at once on Enter and moves focus into the results (↑/↓, Enter
+  opens the meeting, Esc closes and clears; a click outside closes). Never
+  two panels. Inside the shell there is no in-app search field (see Layout
+  below); in the browser the field filters the listing as before.
+- **Search** — `GET /api/search?q=` (`src/lib/meeting-search.ts` +
+  `src/db-ops/meeting-search.ts`): every whitespace term must occur in the
+  title, file name, description, AI notes or transcript text (ILIKE over the
+  migration-012 trigram indexes), same visibility and `meetings` gate as the
+  listing, max 30 hits (title hits first, then newest); the snippet is cut
+  from a 400-char SQL window around the earliest term with bold ranges as
+  UTF-16 offsets into the returned text.
+- **Layout rules** (`src/lib/listing-layout.ts`) — ONE layout, designed for
+  the shell's window (900–1300 px of content, the shell's title band with its
+  own search above, its 64 px rail on the left); the browser mirrors it at
+  every width, there is no separate wide-browser variant, and nothing
+  stretches past 1400 px of content.
+  - *Toolbar*: one row at every width, never two. Left: the scope tabs
+    (All / Mine / Shared / Trash with counts; they scroll sideways below
+    900 px). Right: ONE **Filter** button with a count badge (layers off,
+    time range, label filter, each people/organizer/provider term) whose
+    popover holds Layers, Labels (current filter + show/hide the rail), Time
+    range, People and the Hidden calendar meetings; then a **⋯** menu with
+    calendar sync status + Sync now, Refresh, and the column chooser.
+  - *Search*: the shell hides the in-app field — the band owns search (⌘L)
+    and drives the results panel; no `/` hint there. In the browser the
+    field sits at the right of the same row, 240 px (wider on focus), and
+    `/` focuses it.
+  - *Header*: wordmark + Meetings / Recordings / Series; one **Import
+    meeting ▾** split button (menu: Import from… a transcript file, Upload
+    media); the offline-save cloud and **Recorder ●** chips always visible;
+    an account menu at the far right (Settings, theme, Sign out).
+  - *Theme*: set in Darth. Inside the shell the page follows
+    `prefers-color-scheme` live (the boot script ignores a stored browser
+    choice) and the account menu shows "Theme · set in Darth"; in the
+    browser the menu keeps the light/dark toggle.
+  - *Table*: no Labels column — labels are chips on the title (max 2 +
+    "+n"); Owner · Length · Speakers form a compact right-aligned group with
+    fixed widths (shown from 900 px); the date keeps its width and the title
+    takes the rest. "Add recording" is a hover/focus "+" icon on the row
+    (always visible on touch screens), and the unlinked-recordings notice is
+    one slim line.
+
 ## Stack
 
 Next.js (App Router) + Postgres (schema `meeting_whisperer_*`) + AssemblyAI +
