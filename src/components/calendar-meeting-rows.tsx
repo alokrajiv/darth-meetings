@@ -258,7 +258,7 @@ interface CalendarEventRowProps {
  * chip on the first line; the recording strip (cloud state, a matched Darth
  * Recorder recording, the Teams-chat verdict) on the second; ONE control in
  * the action cell — Import… (or the ⚡ auto-sync chip), the strip's own
- * button, or the "Add recording ▾" menu — plus a hover ⋯ for Hide.
+ * button, or the hover "+" Add-recording menu — plus a hover ⋯ for Hide.
  * Pure presentation — fetching, day grouping, and merging live in
  * TranscriptTable.
  */
@@ -486,7 +486,7 @@ export function CalendarEventRow({
       )}
     </div>
   );
-  // The "Add recording ▾" menu is THE action of a bare norec row; once a
+  // The "Add recording" (+) menu is THE action of a bare norec row; once a
   // Darth Recorder recording is matched, the strip's button takes over and
   // the same choices fold into the ⋯.
   const addRecordingIsPrimary = layer === 'norec' && !r.recorderRecording && whereItems.length > 0;
@@ -499,10 +499,6 @@ export function CalendarEventRow({
   // ---- Cells -------------------------------------------------------------
   const middleCell = (key: string) => {
     switch (key) {
-      case 'labels':
-        // Calendar rows carry no labels (v1) — an empty cell keeps the grid
-        // aligned with the archive rows' Labels column.
-        return null;
       case 'owner':
         return r.organizerEmail ? (
           <PersonChip email={r.organizerEmail} self={!!r.organizerSelf} />
@@ -750,9 +746,12 @@ export function CalendarEventRow({
             </Button>
           )}
           {addRecordingIsPrimary && (
+            // A hover/focus icon, not a 180 px button (README "Darth desktop
+            // shell" → Layout rules) — the action column stays narrow.
             <RowMenu
-              trigger="Add recording"
-              triggerIcon={<Plus className="h-3.5 w-3.5" />}
+              trigger="icon"
+              ariaLabel="Add recording"
+              triggerIcon={<Plus />}
               header={
                 <>
                   <p className="font-medium">Where is the recording?</p>

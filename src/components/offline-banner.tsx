@@ -40,7 +40,7 @@ export function OfflineBanner() {
 
   return (
     <div className="pointer-events-none fixed inset-x-0 top-14 z-30 px-6" data-offline-banner>
-      <div className="mx-auto max-w-[1720px]">
+      <div className="mx-auto max-w-[1400px]">
         {promptVisible ? (
           <div
             role="status"

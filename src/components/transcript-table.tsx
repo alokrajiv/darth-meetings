@@ -13,7 +13,6 @@ import {
 } from '@/components/ui/table';
 import { Button } from '@/components/ui/button';
 import { Badge } from '@/components/ui/badge';
-import { Input } from '@/components/ui/input';
 import {
   formatBytes,
   formatAgo,
@@ -43,8 +42,8 @@ import {
   Search,
   ChevronRight,
   Inbox,
-  Columns3,
   GripVertical,
+  Tag,
   Video,
   X,
 } from 'lucide-react';
@@ -57,21 +56,35 @@ import { useUnlinkedRecordings } from '@/components/recordings-surface';
 import { LinkEventDialog } from '@/components/link-event-dialog';
 import { isBareRecording, meetingTitleOf } from '@/lib/meeting-title';
 import { provenanceTitle, sourceOfArchiveRow, stripForArchiveRow } from '@/lib/recording-strip';
-import { LayersDropdown } from '@/components/layers-dropdown';
+import { LayerChecklist } from '@/components/layers-dropdown';
+import {
+  FilterPopover,
+  ListingToolbar,
+  MoreMenu,
+  ToolbarSearch,
+  ToolbarSection,
+} from '@/components/listing-toolbar';
+import {
+  filterBadgeCount,
+  filterSections,
+  moreMenuItems,
+  searchShortcutEnabled,
+} from '@/lib/listing-layout';
 import { SeriesBadge } from '@/components/series-badge';
 import { SeriesDialog } from '@/components/series-dialog';
 import { LabelChips } from '@/components/label-chips';
 import { LabelPicker, anchorFromElement, parseError, type PickerAnchor } from '@/components/label-picker';
 import { BulkLabelBar } from '@/components/bulk-label-bar';
-import { refreshLabelCatalog } from '@/hooks/use-label-catalog';
+import { refreshLabelCatalog, useLabelCatalog } from '@/hooks/use-label-catalog';
 import { OFFLINE_TITLE, useOffline, useOfflineGate } from '@/lib/offline/offline-context';
 import { isNetworkFailure, offlineAwareError } from '@/lib/offline/offline-fetch';
 import { labelFilterToParams, type LabelFilter } from '@/lib/labels';
 import type { LabelRef } from '@/lib/format';
 import {
   PeopleFilterChips,
-  PeopleFilterControl,
+  PeopleFilterFields,
   EMPTY_PEOPLE_FILTERS,
+  countPeopleFilters,
   appendPeopleFilterParams,
   hasPeopleFilters,
   peopleFiltersKey,
@@ -93,8 +106,10 @@ import type {
 
 interface TranscriptTableProps {
   refreshTrigger?: number;
-  /** Extra controls rendered in the toolbar row, left of the search box. */
-  toolbarExtra?: React.ReactNode;
+  /** The labels rail (page.tsx owns it): open state + the Filter popover's
+   * "Labels rail" toggle. */
+  labelRailOpen?: boolean;
+  onToggleLabelRail?: () => void;
   /** Calendar-view rows' Import action — page.tsx wires this to the
    * existing gmeetFocus mechanism (focus + open GmeetImportDialog). */
   onImportMeeting?: (m: { meetingCode: string; eventStart: string }) => void;
@@ -203,7 +218,7 @@ const PAGE_MIN_ROWS = 40;
  * Users pick visibility + order via the toolbar chooser; persisted in
  * localStorage under COLS_STORAGE_KEY.
  */
-type ColKey = 'labels' | 'owner' | 'date' | 'duration' | 'speakers' | 'language' | 'imported';
+type ColKey = 'owner' | 'date' | 'duration' | 'speakers' | 'language' | 'imported';
 
 interface ColPrefs {
   order: ColKey[];
@@ -318,8 +333,10 @@ function cleanDescription(raw: string): string {
     .slice(0, 140);
 }
 
+// No Labels column (README "Darth desktop shell" → Layout rules): labels are
+// chips on the title (max 2 + "+n"). A stored order that still names
+// 'labels' is filtered by loadColPrefs' valid-key check.
 const DEFAULT_COL_ORDER: ColKey[] = [
-  'labels',
   'owner',
   'date',
   'duration',
@@ -331,7 +348,6 @@ const DEFAULT_HIDDEN: ColKey[] = ['language', 'imported'];
 const COLS_STORAGE_KEY = 'mw:cols:v1';
 
 const COL_LABELS: Record<ColKey, string> = {
-  labels: 'Labels',
   owner: 'Owner',
   date: 'Date',
   duration: 'Duration',
@@ -345,25 +361,47 @@ const COL_LABELS: Record<ColKey, string> = {
 // all the remaining room; the date column is rendered LEFT of the title as
 // a narrow time-of-day (Alok 2026-08-30: "title and labels should be most
 // of the listing, time on the very left").
+//
+// Owner · Duration · Speakers (and the opt-in Language / Imported) form ONE
+// compact right-aligned group with fixed widths (README "Darth desktop
+// shell" → Layout rules); the title column takes everything else.
 const COL_HEAD_WIDTH: Record<ColKey, string> = {
-  labels: 'w-[140px]',
-  owner: 'w-[130px]',
+  owner: 'w-[120px]',
   date: 'w-[64px]',
-  duration: 'w-[80px]',
-  speakers: 'w-[70px]',
-  language: 'w-[90px]',
-  imported: 'w-[110px]',
+  duration: 'w-[72px]',
+  speakers: 'w-[56px]',
+  language: 'w-[64px]',
+  imported: 'w-[96px]',
+};
+/** Right-aligned trailing group (head + cells). */
+const COL_ALIGN: Record<ColKey, string> = {
+  owner: 'text-right',
+  date: '',
+  duration: 'text-right',
+  speakers: 'text-right',
+  language: 'text-right',
+  imported: 'text-right',
+};
+/** Header text — Speakers is narrow, so it gets the short form. */
+const COL_HEAD_LABEL: Record<ColKey, string> = {
+  owner: 'Owner',
+  date: 'Date',
+  duration: 'Length',
+  speakers: 'Spk',
+  language: 'Lang',
+  imported: 'Imported',
 };
 /** Columns rendered before the title cell (currently just the time). */
 const LEAD_COLS: ReadonlySet<ColKey> = new Set(['date']);
+// Designed for 900–1300 content px: the whole group shows from 900 up
+// (min-[900px], not lg — the shell's window is ~1000 px wide).
 const COL_RESPONSIVE: Record<ColKey, string> = {
-  labels: 'hidden md:table-cell',
-  owner: 'hidden lg:table-cell',
+  owner: 'hidden min-[900px]:table-cell',
   date: 'hidden md:table-cell',
   duration: 'hidden sm:table-cell',
-  speakers: 'hidden lg:table-cell',
-  language: 'hidden lg:table-cell',
-  imported: 'hidden lg:table-cell',
+  speakers: 'hidden min-[900px]:table-cell',
+  language: 'hidden min-[900px]:table-cell',
+  imported: 'hidden min-[900px]:table-cell',
 };
 
 function loadColPrefs(): ColPrefs {
@@ -398,7 +436,8 @@ const canEditRow = (t: ListRow) => t.access === 'owner' || t.access === 'edit';
 
 export function TranscriptTable({
   refreshTrigger,
-  toolbarExtra,
+  labelRailOpen = false,
+  onToggleLabelRail,
   onImportMeeting,
   labelFilter = null,
   labelFilterReady = true,
@@ -534,8 +573,8 @@ export function TranscriptTable({
   // Fetched once on mount (drives the "Hidden (n)" count), refreshed on
   // popover open and after every add/remove.
   const [mutes, setMutes] = useState<CalendarMuteEntry[]>([]);
+  /** The Filter popover's "Hidden" section is collapsed until asked. */
   const [hiddenOpen, setHiddenOpen] = useState(false);
-  const hiddenMenuRef = useRef<HTMLDivElement | null>(null);
   const fetchMutes = useCallback(async () => {
     try {
       const res = await fetch('/api/calendar-mutes', { credentials: 'include' });
@@ -549,16 +588,6 @@ export function TranscriptTable({
   useEffect(() => {
     void fetchMutes();
   }, [fetchMutes]);
-  useEffect(() => {
-    if (!hiddenOpen) return;
-    const onDown = (e: MouseEvent) => {
-      if (hiddenMenuRef.current && !hiddenMenuRef.current.contains(e.target as Node)) {
-        setHiddenOpen(false);
-      }
-    };
-    document.addEventListener('mousedown', onDown);
-    return () => document.removeEventListener('mousedown', onDown);
-  }, [hiddenOpen]);
 
   // Column prefs (visibility + order) — loaded client-side to avoid SSR
   // localStorage access; saved on every change.
@@ -568,8 +597,6 @@ export function TranscriptTable({
     showDesc: true,
     groupByDay: true,
   });
-  const [colsOpen, setColsOpen] = useState(false);
-  const colsMenuRef = useRef<HTMLDivElement | null>(null);
   const dragKeyRef = useRef<ColKey | null>(null);
   useEffect(() => {
     setColPrefs(loadColPrefs());
@@ -582,16 +609,6 @@ export function TranscriptTable({
       // storage full/blocked — prefs just won't persist
     }
   }, []);
-  useEffect(() => {
-    if (!colsOpen) return;
-    const onDown = (e: MouseEvent) => {
-      if (colsMenuRef.current && !colsMenuRef.current.contains(e.target as Node)) {
-        setColsOpen(false);
-      }
-    };
-    document.addEventListener('mousedown', onDown);
-    return () => document.removeEventListener('mousedown', onDown);
-  }, [colsOpen]);
 
   const visibleCols = useMemo(
     () => colPrefs.order.filter((k) => !colPrefs.hidden.includes(k)),
@@ -1013,18 +1030,15 @@ export function TranscriptTable({
     }, 800);
   });
 
-  // Inside the desktop shell the field is the panel's second input: register
-  // it so the panel can hand typing back to it and never treats a click on
-  // it as "outside".
-  const { inDesktopShell, registerField } = shell;
-  useEffect(() => {
-    if (!inDesktopShell) return;
-    registerField(searchRef);
-    return () => registerField(null);
-  }, [inDesktopShell, registerField]);
+  // Inside the desktop shell there is no in-app search field — the title
+  // band owns search (and ⌘L); the field, its `/` shortcut and hint exist
+  // only in the browser (lib/listing-layout).
+  const { inDesktopShell } = shell;
+  const shortcutOn = searchShortcutEnabled(inDesktopShell);
 
   // Global `/` focuses the search input when no other field has focus.
   useEffect(() => {
+    if (!shortcutOn) return;
     const onKeyDown = (e: KeyboardEvent) => {
       if (e.key !== '/' || e.metaKey || e.ctrlKey || e.altKey) return;
       const el = document.activeElement as HTMLElement | null;
@@ -1039,7 +1053,7 @@ export function TranscriptTable({
     };
     window.addEventListener('keydown', onKeyDown);
     return () => window.removeEventListener('keydown', onKeyDown);
-  }, []);
+  }, [shortcutOn]);
 
   // Infinite scroll: a sentinel below the table loads the next page from
   // EVERY enabled source that still has more (each with its own cursor).
@@ -1480,40 +1494,6 @@ export function TranscriptTable({
 
   const renderColCell = (key: ColKey, t: ListRow) => {
     switch (key) {
-      case 'labels': {
-        // Chips moved here from the title cell (column-chooser controlled,
-        // default on). Placeholder/queued/trashed rows show an empty cell.
-        const placeholder = t.status === 'uploading' || t.assemblyai_id.startsWith('defer-');
-        if (placeholder || t.status === 'waiting' || t.deleted_at) return null;
-        return (
-          // w-0 + min-w-full + overflow-hidden: the chips contribute zero
-          // min-content width, so they can't widen the table (repo gotcha).
-          // `fit` makes the chips shrink+truncate INSIDE that width so the
-          // "+N" badge and the hover-"+" (the [data-label-add] anchor) never
-          // get clipped out of the cell.
-          <div className="w-0 min-w-full overflow-hidden">
-            <LabelChips
-              labels={t.labels}
-              fit
-              disabled={blocked}
-              onFilter={
-                onLabelFilter
-                  ? (l) => onLabelFilter({ kind: 'id', id: l.id, exact: false })
-                  : undefined
-              }
-              onAdd={
-                canEditRow(t)
-                  ? (e) =>
-                      setRowPicker({
-                        id: t.assemblyai_id,
-                        anchor: anchorFromElement(e.currentTarget),
-                      })
-                  : undefined
-              }
-            />
-          </div>
-        );
-      }
       case 'owner':
         return ownerCell(t);
       case 'date': {
@@ -1574,23 +1554,9 @@ export function TranscriptTable({
     saveColPrefs({ ...colPrefs, order });
   };
 
+  /** The ⋯ menu's Columns section (drag to reorder, tick to show). */
   const columnChooser = (
-    <div className="relative" ref={colsMenuRef}>
-      <Button
-        variant="ghost"
-        size="sm"
-        className="h-8 w-8 p-0"
-        title="Choose columns"
-        onClick={() => setColsOpen((v) => !v)}
-      >
-        <Columns3 className="h-4 w-4" />
-        <span className="sr-only">Choose columns</span>
-      </Button>
-      {colsOpen && (
-        <div className="absolute right-0 top-full z-50 mt-1 w-52 rounded-md border bg-popover p-1 shadow-md">
-          <p className="px-2 pb-1 pt-1.5 text-[10px] font-medium uppercase tracking-wider text-muted-foreground">
-            Columns — drag to reorder
-          </p>
+        <div data-column-chooser>
           {colPrefs.order.map((key) => {
             const hidden = colPrefs.hidden.includes(key);
             return (
@@ -1667,8 +1633,6 @@ export function TranscriptTable({
             Reset to defaults
           </button>
         </div>
-      )}
-    </div>
   );
 
   const tabButton = (key: TabKey, label: string, count?: number) => (
@@ -1678,9 +1642,11 @@ export function TranscriptTable({
       onClick={() => setTab(key)}
       disabled={blocked}
       title={blocked ? OFFLINE_TITLE : undefined}
-      className={`relative px-2.5 pb-2.5 pt-1 text-sm transition-colors disabled:cursor-not-allowed disabled:opacity-60 ${
+      role="tab"
+      aria-selected={tab === key}
+      className={`relative shrink-0 whitespace-nowrap px-2.5 pb-2.5 pt-1 text-sm transition-colors disabled:cursor-not-allowed disabled:opacity-60 ${
         tab === key
-          ? 'font-medium text-foreground after:absolute after:inset-x-0 after:-bottom-px after:h-0.5 after:rounded-full after:bg-primary'
+          ? 'font-medium text-foreground after:absolute after:inset-x-0 after:bottom-0 after:h-0.5 after:rounded-full after:bg-primary'
           : 'text-muted-foreground hover:text-foreground'
       }`}
     >
@@ -1761,187 +1727,286 @@ export function TranscriptTable({
     </div>
   );
 
-  const toolbar = (
-    <div className="mb-3 flex flex-wrap items-center gap-x-3 gap-y-1 border-b">
-      <div className="mb-2 mt-0.5">
-        <LayersDropdown
-          layers={layers}
-          unimportedCount={calCounts ? calCounts.unimported : null}
-          norecCount={calCounts ? calCounts.norec : null}
-          inactive={!mergedMode}
-          offline={blocked}
-          onToggle={toggleLayer}
-        />
+  // ---- Toolbar: ONE row (README "Darth desktop shell" → Layout rules) ----
+  // Left: the scope tabs. Right: search (browser only), ONE Filter button
+  // whose popover holds Layers / Labels / Time range / People / Hidden, and
+  // the ⋯ menu (calendar sync, refresh, columns).
+  const { byId: labelById } = useLabelCatalog();
+  const labelFilterName = !labelFilter
+    ? null
+    : labelFilter.kind === 'none'
+      ? 'Unlabelled'
+      : `${labelById.get(labelFilter.id)?.path ?? `Label #${labelFilter.id}`}${labelFilter.exact ? ' (exact)' : ''}`;
+  const resetLayers = () => {
+    setLayers(DEFAULT_LAYERS);
+    try {
+      localStorage.setItem(LAYERS_STORAGE_KEY, JSON.stringify(DEFAULT_LAYERS));
+    } catch {
+      // storage full/blocked — prefs just won't persist
+    }
+  };
+  const filterCount = filterBadgeCount({
+    layers,
+    layersApply: mergedMode,
+    rangePreset,
+    labelFilterActive: !!labelFilter,
+    peopleTerms: countPeopleFilters(peopleFilters),
+  });
+  const clearAllFilters = () => {
+    if (!(layers.archive && layers.unimported && layers.norec)) resetLayers();
+    setRangePreset('all');
+    setPickedMonth(null);
+    if (labelFilter) onLabelFilter?.(null);
+    setPeopleFilters(EMPTY_PEOPLE_FILTERS);
+  };
+
+  const tabsNode =
+    renderMerged && !layers.archive ? (
+      // Archive layer off: All/Mine/Shared/Trash describe the IMPORTED
+      // archive, which isn't on screen — showing "All 121" over a list of
+      // calendar rows reads as "the filter shows everything". Show the
+      // active calendar layers' own counts instead (same filters applied).
+      <div data-layer-counts className="flex items-center gap-3 px-1 pb-2.5 pt-1 text-sm text-muted-foreground">
+        {(['unimported', 'norec'] as const)
+          .filter((v) => layers[v])
+          .map((v) => (
+            <span key={v}>
+              {v === 'unimported' ? 'Not imported' : 'No recording'}
+              {calCounts && (
+                <span className="ml-1.5 rounded-full bg-muted px-1.5 py-0.5 text-[11px] tabular-nums">
+                  {calCounts[v]}
+                </span>
+              )}
+            </span>
+          ))}
       </div>
-      {renderMerged && calConnected && calSync && (
-        <div className="mb-2 mt-0.5 flex items-center gap-0.5 text-[11px] text-muted-foreground">
-          <span
-            title="When your calendar and meeting artifacts were last swept from Google/Microsoft. The background sync runs every 30 minutes; the import dialog always checks live."
-          >
-            {manualSyncing
-              ? 'Syncing…'
-              : calSync.lastPollAt
-                ? `Cal synced ${formatAgo(calSync.lastPollAt)}`
-                : 'Calendar not synced yet'}
-          </span>
-          <Button
-            variant="ghost"
-            size="sm"
-            className="h-6 px-1.5 text-[11px]"
-            disabled={manualSyncing || blocked}
-            title={blocked ? OFFLINE_TITLE : 'Sweep your calendar and meeting artifacts now'}
-            onClick={() => void runManualCalSync()}
-          >
-            <RefreshCw className={`h-3 w-3 ${manualSyncing ? 'animate-spin' : ''}`} />
-            Sync
-          </Button>
-          {manualSyncNote && <span className="ml-1 text-[11px] text-destructive">{manualSyncNote}</span>}
-        </div>
-      )}
-      {mutes.length > 0 && (
-        <div className="relative mb-2 mt-0.5" ref={hiddenMenuRef}>
-          <button
-            type="button"
-            onClick={() => {
-              setHiddenOpen((v) => {
-                if (!v) void fetchMutes();
-                return !v;
-              });
-            }}
-            aria-expanded={hiddenOpen}
-            title="Calendar rows you've hidden — review or undo"
-            className="flex items-center gap-1 rounded-md px-2 py-1 text-xs text-muted-foreground transition-colors hover:text-foreground"
-          >
-            <EyeOff className="h-3 w-3" />
-            Hidden ({mutes.length})
-          </button>
-          {hiddenOpen && (
-            <div className="absolute left-0 top-full z-50 mt-1 w-72 rounded-md border bg-popover p-1 shadow-md">
-              <p className="px-2 pb-1 pt-1.5 text-[10px] font-medium uppercase tracking-wider text-muted-foreground">
-                Hidden calendar meetings
-              </p>
-              <div className="max-h-64 overflow-y-auto">
-                {mutes.map((m) => (
-                  <div
-                    key={`${m.kind}:${m.value}`}
-                    className="flex items-center gap-1.5 rounded px-2 py-1 hover:bg-muted"
-                  >
-                    <div className="min-w-0 flex-1">
-                      <div className="truncate text-sm">
-                        {m.title?.trim() || m.value}
-                      </div>
-                      <div className="text-[10px] uppercase tracking-wide text-muted-foreground">
-                        {m.kind === 'series' ? 'series + future' : 'occurrence'}
-                      </div>
-                    </div>
+    ) : (
+      <div className="flex items-center" role="tablist" aria-label="Scope">
+        {tabButton('all', 'All', counts?.all)}
+        {tabButton('mine', 'Mine', counts?.mine)}
+        {tabButton('shared', 'Shared', counts?.shared)}
+        {tabButton('trash', 'Trash', counts?.trash)}
+      </div>
+    );
+
+  const filterNode = (
+    <FilterPopover
+      count={filterCount}
+      disabled={blocked}
+      disabledTitle={OFFLINE_TITLE}
+      onClearAll={clearAllFilters}
+    >
+      {filterSections({ hiddenCount: mutes.length }).map((section, i) => {
+        switch (section) {
+          case 'layers':
+            return (
+              <ToolbarSection key={section} id={section} title="Layers" first={i === 0}>
+                <LayerChecklist
+                  layers={layers}
+                  unimportedCount={calCounts ? calCounts.unimported : null}
+                  norecCount={calCounts ? calCounts.norec : null}
+                  inactive={!mergedMode}
+                  offline={blocked}
+                  onToggle={toggleLayer}
+                />
+              </ToolbarSection>
+            );
+          case 'labels':
+            return (
+              <ToolbarSection
+                key={section}
+                id={section}
+                title="Labels"
+                first={i === 0}
+                aside={
+                  onToggleLabelRail ? (
                     <button
                       type="button"
-                      onClick={() => void handleUnmute(m)}
-                      disabled={blocked}
-                      title={blocked ? OFFLINE_TITLE : 'Unhide'}
-                      className="rounded p-1 text-muted-foreground hover:bg-muted-foreground/10 hover:text-foreground disabled:cursor-not-allowed disabled:opacity-60"
+                      data-label-rail-toggle
+                      onClick={onToggleLabelRail}
+                      className="text-[11px] text-primary hover:underline"
                     >
-                      <X className="h-3.5 w-3.5" />
-                      <span className="sr-only">Unhide</span>
+                      {labelRailOpen ? 'Hide labels rail' : 'Show labels rail'}
                     </button>
+                  ) : undefined
+                }
+              >
+                <div className="flex min-w-0 items-center gap-1.5 px-2 py-1 text-sm">
+                  <Tag className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
+                  {labelFilterName ? (
+                    <>
+                      <span className="min-w-0 flex-1 truncate" title={labelFilterName}>
+                        {labelFilterName}
+                      </span>
+                      <button
+                        type="button"
+                        onClick={() => onLabelFilter?.(null)}
+                        title="Clear the label filter"
+                        className="rounded p-0.5 text-muted-foreground hover:bg-muted hover:text-foreground"
+                      >
+                        <X className="h-3.5 w-3.5" />
+                        <span className="sr-only">Clear the label filter</span>
+                      </button>
+                    </>
+                  ) : (
+                    <span className="text-muted-foreground">Any label — pick one on the rail or a row chip</span>
+                  )}
+                </div>
+              </ToolbarSection>
+            );
+          case 'range':
+            return (
+              <ToolbarSection key={section} id={section} title="Time range" first={i === 0}>
+                <div className="px-1">{rangePicker}</div>
+              </ToolbarSection>
+            );
+          case 'people':
+            return (
+              <ToolbarSection key={section} id={section} title="People" first={i === 0}>
+                <PeopleFilterFields value={peopleFilters} onChange={setPeopleFilters} disabled={blocked} />
+              </ToolbarSection>
+            );
+          case 'hidden':
+            return (
+              <ToolbarSection
+                key={section}
+                id={section}
+                title="Hidden calendar meetings"
+                first={i === 0}
+                aside={
+                  <button
+                    type="button"
+                    aria-expanded={hiddenOpen}
+                    data-hidden-toggle
+                    onClick={() => {
+                      setHiddenOpen((v) => {
+                        if (!v) void fetchMutes();
+                        return !v;
+                      });
+                    }}
+                    title="Calendar rows you've hidden — review or undo"
+                    className="flex items-center gap-1 text-[11px] text-muted-foreground hover:text-foreground"
+                  >
+                    <EyeOff className="h-3 w-3" />
+                    {hiddenOpen ? 'Hide list' : `Show (${mutes.length})`}
+                  </button>
+                }
+              >
+                {hiddenOpen && (
+                  <div className="max-h-56 overflow-y-auto">
+                    {mutes.map((m) => (
+                      <div
+                        key={`${m.kind}:${m.value}`}
+                        className="flex items-center gap-1.5 rounded px-2 py-1 hover:bg-muted"
+                      >
+                        <div className="min-w-0 flex-1">
+                          <div className="truncate text-sm">{m.title?.trim() || m.value}</div>
+                          <div className="text-[10px] uppercase tracking-wide text-muted-foreground">
+                            {m.kind === 'series' ? 'series + future' : 'occurrence'}
+                          </div>
+                        </div>
+                        <button
+                          type="button"
+                          onClick={() => void handleUnmute(m)}
+                          disabled={blocked}
+                          title={blocked ? OFFLINE_TITLE : 'Unhide'}
+                          className="rounded p-1 text-muted-foreground hover:bg-muted-foreground/10 hover:text-foreground disabled:cursor-not-allowed disabled:opacity-60"
+                        >
+                          <X className="h-3.5 w-3.5" />
+                          <span className="sr-only">Unhide</span>
+                        </button>
+                      </div>
+                    ))}
                   </div>
-                ))}
-              </div>
-            </div>
-          )}
-        </div>
-      )}
-      {renderMerged && !layers.archive ? (
-        // Archive layer off: All/Mine/Shared/Trash describe the IMPORTED
-        // archive, which isn't on screen — showing "All 121" over a list of
-        // calendar rows reads as "the filter shows everything". Show the
-        // active calendar layers' own counts instead (same filters applied).
-        <div
-          data-layer-counts
-          className="flex items-center gap-3 px-1 pb-2.5 pt-1 text-sm text-muted-foreground"
-        >
-          {(['unimported', 'norec'] as const)
-            .filter((v) => layers[v])
-            .map((v) => (
-              <span key={v}>
-                {v === 'unimported' ? 'Not imported' : 'No recording'}
-                {calCounts && (
-                  <span className="ml-1.5 rounded-full bg-muted px-1.5 py-0.5 text-[11px] tabular-nums">
-                    {calCounts[v]}
-                  </span>
                 )}
-              </span>
-            ))}
-        </div>
-      ) : (
-        <div className="flex items-center">
-          {tabButton('all', 'All', counts?.all)}
-          {tabButton('mine', 'Mine', counts?.mine)}
-          {tabButton('shared', 'Shared', counts?.shared)}
-          {tabButton('trash', 'Trash', counts?.trash)}
-        </div>
-      )}
-      <div className="ml-auto flex flex-wrap items-center gap-1.5 pb-2">
-        {toolbarExtra}
-        {rangePicker}
-        <div className="relative">
-          <Search className="pointer-events-none absolute left-2.5 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-muted-foreground" />
-          <Input
-            ref={searchRef}
-            // Inside the Darth desktop shell this field feeds the shared
-            // results panel (components/shell-search) instead of filtering
-            // the listing — the same panel the shell's band search drives.
-            value={shell.inDesktopShell ? shell.query : query}
-            onChange={(e) =>
-              shell.inDesktopShell
-                ? shell.drive({ query: e.target.value, submit: false }, 'field')
-                : setQuery(e.target.value)
-            }
-            onKeyDown={
-              shell.inDesktopShell
-                ? (e) => {
-                    if (e.key === 'Enter') {
-                      e.preventDefault();
-                      shell.drive({ query: e.currentTarget.value, submit: true }, 'field');
-                    } else if (e.key === 'ArrowDown' && shell.open) {
-                      e.preventDefault();
-                      shell.focusResults();
-                    } else if (e.key === 'Escape') {
-                      e.preventDefault();
-                      shell.close();
-                    }
-                  }
-                : undefined
-            }
-            role={shell.inDesktopShell ? 'combobox' : undefined}
-            aria-expanded={shell.inDesktopShell ? shell.open : undefined}
-            aria-controls={shell.inDesktopShell && shell.open ? 'meeting-search-results' : undefined}
-            autoComplete="off"
-            data-testid="meetings-search-input"
-            placeholder="Search meetings…"
+              </ToolbarSection>
+            );
+        }
+      })}
+    </FilterPopover>
+  );
+
+  const calendarSyncShown = renderMerged && calConnected && !!calSync;
+  const moreNode = (
+    <MoreMenu>
+      {moreMenuItems({ calendarSync: calendarSyncShown }).map((item, i) => {
+        switch (item) {
+          case 'sync':
+            return (
+              <ToolbarSection key={item} id={item} title="Calendar" first={i === 0}>
+                <div className="flex items-center justify-between gap-2 px-2 py-0.5">
+                  <span
+                    className="min-w-0 truncate text-xs text-muted-foreground"
+                    title="When your calendar and meeting artifacts were last swept from Google/Microsoft. The background sync runs every 30 minutes; the import dialog always checks live."
+                    data-cal-sync-status
+                  >
+                    {manualSyncing
+                      ? 'Syncing…'
+                      : calSync?.lastPollAt
+                        ? `Synced ${formatAgo(calSync.lastPollAt)}`
+                        : 'Not synced yet'}
+                  </span>
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    className="h-6 shrink-0 px-2 text-[11px]"
+                    disabled={manualSyncing || blocked}
+                    title={blocked ? OFFLINE_TITLE : 'Sweep your calendar and meeting artifacts now'}
+                    onClick={() => void runManualCalSync()}
+                  >
+                    <RefreshCw className={`h-3 w-3 ${manualSyncing ? 'animate-spin' : ''}`} />
+                    Sync now
+                  </Button>
+                </div>
+                {manualSyncNote && <p className="px-2 text-[11px] text-destructive">{manualSyncNote}</p>}
+              </ToolbarSection>
+            );
+          case 'refresh':
+            return (
+              <div key={item} className={i === 0 ? 'px-1 py-1' : 'border-t px-1 py-1'}>
+                <button
+                  type="button"
+                  role="menuitem"
+                  data-more-item="refresh"
+                  onClick={silentRefetchAll}
+                  disabled={blocked}
+                  title={blocked ? OFFLINE_TITLE : undefined}
+                  className="flex w-full items-center gap-2 rounded px-2 py-1.5 text-left text-sm hover:bg-muted disabled:cursor-not-allowed disabled:opacity-50"
+                >
+                  <RefreshCw className="h-3.5 w-3.5 text-muted-foreground" />
+                  Refresh
+                </button>
+              </div>
+            );
+          case 'columns':
+            return (
+              <ToolbarSection key={item} id={item} title="Columns — drag to reorder" first={i === 0}>
+                {columnChooser}
+              </ToolbarSection>
+            );
+        }
+      })}
+    </MoreMenu>
+  );
+
+  const toolbar = (
+    <ListingToolbar
+      inDesktopShell={inDesktopShell}
+      tabs={tabsNode}
+      search={
+        inDesktopShell ? null : (
+          <ToolbarSearch
+            inputRef={searchRef}
+            value={query}
+            onChange={setQuery}
             disabled={blocked}
-            title={blocked ? OFFLINE_TITLE : undefined}
-            className="h-8 w-64 pl-8 pr-8"
+            disabledTitle={OFFLINE_TITLE}
           />
-          <kbd className="pointer-events-none absolute right-2 top-1/2 -translate-y-1/2 rounded border bg-muted px-1.5 font-mono text-[10px] text-muted-foreground">
-            /
-          </kbd>
-        </div>
-        <PeopleFilterControl value={peopleFilters} onChange={setPeopleFilters} disabled={blocked} />
-        {columnChooser}
-        <Button
-          onClick={silentRefetchAll}
-          variant="ghost"
-          size="sm"
-          className="h-8 w-8 p-0"
-          disabled={blocked}
-          title={blocked ? OFFLINE_TITLE : 'Refresh'}
-        >
-          <RefreshCw className="h-4 w-4" />
-          <span className="sr-only">Refresh</span>
-        </Button>
-      </div>
-    </div>
+        )
+      }
+      filter={filterNode}
+      more={moreNode}
+    />
   );
 
   const filterChips = <PeopleFilterChips value={peopleFilters} onChange={setPeopleFilters} disabled={blocked} />;
@@ -2066,18 +2131,27 @@ export function TranscriptTable({
                     onChanged={() => void fetchArchiveRef.current('silent')}
                   />
                 )}
-                {/* Below md every middle column (incl. Labels) is hidden —
-                    keep a compact read-only chip row here so phones still
-                    see labels. No onAdd: [data-label-add] must stay unique
-                    to the Labels column for the 'l'-shortcut anchor. */}
+                {/* Labels live on the title (no Labels column — README
+                    "Darth desktop shell" → Layout rules): max 2 chips +
+                    "+n", and the hover "+" ([data-label-add], the 'l'
+                    shortcut's anchor) for rows the caller can edit. */}
                 {!uploading && !waiting && !trashed && (
                   <LabelChips
                     labels={t.labels}
-                    className="md:hidden"
+                    max={2}
                     disabled={blocked}
                     onFilter={
                       onLabelFilter
                         ? (l) => onLabelFilter({ kind: 'id', id: l.id, exact: false })
+                        : undefined
+                    }
+                    onAdd={
+                      canEditRow(t)
+                        ? (e) =>
+                            setRowPicker({
+                              id: t.assemblyai_id,
+                              anchor: anchorFromElement(e.currentTarget),
+                            })
                         : undefined
                     }
                   />
@@ -2170,7 +2244,7 @@ export function TranscriptTable({
           </div>
         </TableCell>
         {restCols.map((key) => (
-          <TableCell key={key} className={`py-1.5 ${COL_RESPONSIVE[key]}`}>
+          <TableCell key={key} className={`py-1.5 ${COL_ALIGN[key]} ${COL_RESPONSIVE[key]}`}>
             {renderColCell(key, t)}
           </TableCell>
         ))}
@@ -2323,15 +2397,19 @@ export function TranscriptTable({
             {COL_LABELS[key]}
           </TableHead>
         ))}
-        <TableHead className="h-9 w-[46%] bg-muted/50 text-[11px] font-medium uppercase tracking-wider text-muted-foreground">
+        {/* w-full: the title takes every pixel the fixed-width columns
+            leave (auto table layout keeps their specified widths). */}
+        <TableHead className="h-9 w-full bg-muted/50 text-[11px] font-medium uppercase tracking-wider text-muted-foreground">
           Title
         </TableHead>
         {restCols.map((key) => (
           <TableHead
             key={key}
-            className={`h-9 ${COL_HEAD_WIDTH[key]} bg-muted/50 text-[11px] font-medium uppercase tracking-wider text-muted-foreground ${COL_RESPONSIVE[key]}`}
+            title={COL_LABELS[key]}
+            data-col={key}
+            className={`h-9 ${COL_HEAD_WIDTH[key]} ${COL_ALIGN[key]} whitespace-nowrap bg-muted/50 text-[11px] font-medium uppercase tracking-wider text-muted-foreground ${COL_RESPONSIVE[key]}`}
           >
-            {COL_LABELS[key]}
+            {COL_HEAD_LABEL[key]}
           </TableHead>
         ))}
         <TableHead className="h-9 w-[72px] bg-muted/50">&nbsp;</TableHead>
@@ -2569,7 +2647,7 @@ archiveErrorPanel
                       layer={it.layer}
                       visibleCols={restCols}
                       leadCols={leadCols}
-                      colClass={(key) => COL_RESPONSIVE[key as ColKey] ?? ''}
+                      colClass={(key) => `${COL_ALIGN[key as ColKey] ?? ''} ${COL_RESPONSIVE[key as ColKey] ?? ''}`}
                       onImportMeeting={onImportMeeting}
                       onMuteChanged={handleMuteChanged}
                       onOpenSeries={setOpenSeriesId}
@@ -2616,16 +2694,17 @@ archiveErrorPanel
         </div>
       )}
       {hideBare && unlinked.count > 0 && (
+        // One slim line, not a card (README "Darth desktop shell" → Layout).
         <Link
           href="/recordings"
           data-unlinked-banner
-          className="mb-3 flex w-full items-center gap-2 rounded-lg border border-dashed px-3 py-2 text-left text-xs text-muted-foreground transition-colors hover:bg-muted/50"
+          className="mb-2 flex w-full items-center gap-1.5 px-1 text-left text-xs leading-5 text-muted-foreground transition-colors hover:text-foreground"
         >
-          <Laptop className="h-3.5 w-3.5 shrink-0" />
-          <span className="min-w-0 flex-1 truncate">
+          <Laptop className="h-3 w-3 shrink-0" />
+          <span className="min-w-0 truncate">
             {unlinked.count} recording{unlinked.count === 1 ? ' isn’t' : 's aren’t'} linked to a meeting yet
           </span>
-          <span className="shrink-0 font-medium text-primary">Recordings ›</span>
+          <span className="shrink-0 text-primary">Recordings ›</span>
         </Link>
       )}
       {renderMerged ? mergedBody : archiveBody}

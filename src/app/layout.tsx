@@ -9,6 +9,7 @@ import { CompanionBanner } from "@/components/companion-banner";
 import { headers } from "next/headers";
 import { ShellSearchProvider } from "@/components/shell-search";
 import { desktopShellOf } from "@/lib/desktop-shell";
+import { THEME_BOOT_SCRIPT } from "@/lib/listing-layout";
 
 const geistSans = Geist({
   variable: "--font-geist-sans",
@@ -57,13 +58,10 @@ export default async function RootLayout({
       data-shell-os={desktopShell?.os ?? undefined}
     >
       <head>
-        {/* Applies the saved (or OS-preferred) theme before first paint to avoid a flash. */}
-        <script
-          dangerouslySetInnerHTML={{
-            __html:
-              "try{var t=localStorage.getItem('theme');if(t==='dark'||(!t&&matchMedia('(prefers-color-scheme: dark)').matches))document.documentElement.classList.add('dark')}catch(e){}",
-          }}
-        />
+        {/* Applies the theme before first paint to avoid a flash: in the
+            browser the saved (or OS-preferred) one; inside the Darth shell
+            prefers-color-scheme, followed live (Darth sets the theme). */}
+        <script dangerouslySetInnerHTML={{ __html: THEME_BOOT_SCRIPT }} />
       </head>
       <body
         className={`${geistSans.variable} ${geistMono.variable} antialiased`}

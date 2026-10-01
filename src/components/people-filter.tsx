@@ -18,7 +18,7 @@
 import { useEffect, useRef, useState } from 'react';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
-import { Check, Filter, X } from 'lucide-react';
+import { Check, X } from 'lucide-react';
 import type { MeetingProvider } from '@/lib/server/meeting-filters';
 
 export interface PeopleFilters {
@@ -123,20 +123,16 @@ interface PeopleFilterProps {
 const OFFLINE_TITLE = 'Not available offline';
 
 /**
- * The "Filter" toolbar button + its popover (People / Organizer inputs and
- * the provider toggles). Text inputs are drafts committed on Enter, blur,
- * Apply and on every close path (Close button, Escape, click outside) —
- * typed text is never silently discarded; provider toggles commit
- * immediately. Active filters render as
- * removable chips via `PeopleFilterChips` (placed by the caller so the
- * chips can sit on their own toolbar row).
+ * The People / Organizer inputs and the provider toggles — the "People"
+ * section of the listing's ONE Filter popover. Text inputs are drafts
+ * committed on Enter, blur, and when the popover closes (the section
+ * unmounts without a blur, so the unmount commits) — typed text is never
+ * silently discarded; provider toggles commit immediately. Active filters
+ * render as removable chips via `PeopleFilterChips` (placed by the caller).
  */
-export function PeopleFilterControl({ value, onChange, disabled = false }: PeopleFilterProps) {
-  const [open, setOpen] = useState(false);
-  const menuRef = useRef<HTMLDivElement | null>(null);
+export function PeopleFilterFields({ value, onChange, disabled = false }: PeopleFilterProps) {
   const [participantDraft, setParticipantDraft] = useState(value.participant.join(', '));
   const [organizerDraft, setOrganizerDraft] = useState(value.organizer.join(', '));
-  const peopleInputRef = useRef<HTMLInputElement | null>(null);
 
   // Drafts mirror the committed value whenever it changes from outside
   // (chip removal, URL load, Clear).
@@ -156,35 +152,11 @@ export function PeopleFilterControl({ value, onChange, disabled = false }: Peopl
       onChange({ ...value, participant, organizer });
     }
   };
-  // Latest commitText for the document-level close handlers below: closing
-  // the popover (outside click / Escape / Close) unmounts the inputs before
-  // they ever blur, so the close paths commit the drafts themselves.
+  // The popover closing (outside click / Escape) unmounts the inputs before
+  // they ever blur — commit the drafts on unmount through the latest fn.
   const commitRef = useRef(commitText);
   commitRef.current = commitText;
-  const close = () => {
-    commitRef.current();
-    setOpen(false);
-  };
-
-  useEffect(() => {
-    if (!open) return;
-    const onDown = (e: MouseEvent) => {
-      if (menuRef.current && !menuRef.current.contains(e.target as Node)) close();
-    };
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') close();
-    };
-    document.addEventListener('mousedown', onDown);
-    document.addEventListener('keydown', onKey);
-    // Focus the People box on open.
-    const t = setTimeout(() => peopleInputRef.current?.focus(), 0);
-    return () => {
-      document.removeEventListener('mousedown', onDown);
-      document.removeEventListener('keydown', onKey);
-      clearTimeout(t);
-    };
-    // `close` reads through commitRef, so the handlers never go stale.
-  }, [open]);
+  useEffect(() => () => commitRef.current(), []);
 
   const toggleProvider = (key: MeetingProvider) => {
     const on = value.provider.includes(key);
@@ -194,137 +166,77 @@ export function PeopleFilterControl({ value, onChange, disabled = false }: Peopl
     onChange({ ...value, provider });
   };
 
-  const active = countPeopleFilters(value);
-
   return (
-    <div className="relative" ref={menuRef}>
-      <Button
-        variant={active > 0 ? 'secondary' : 'ghost'}
-        size="sm"
-        className="h-8 gap-1.5 px-2"
-        disabled={disabled}
-        title={disabled ? OFFLINE_TITLE : 'Filter by people, organizer or meeting provider'}
-        aria-expanded={open}
-        aria-haspopup="dialog"
-        onClick={() => (open ? close() : setOpen(true))}
-      >
-        <Filter className="h-4 w-4" />
-        <span className="text-xs">Filter</span>
-        {active > 0 && (
-          <span className="rounded-full bg-primary px-1.5 py-0.5 text-[10px] font-semibold leading-none text-primary-foreground tabular-nums">
-            {active}
-          </span>
-        )}
-      </Button>
-      {open && !disabled && (
-        <div
-          role="dialog"
-          aria-label="Meeting filters"
-          className="absolute right-0 top-full z-50 mt-1 w-80 rounded-md border bg-popover p-3 shadow-md"
-        >
-          <form
-            className="space-y-3"
-            onSubmit={(e) => {
-              e.preventDefault();
-              commitText();
-            }}
-          >
-            <label className="block">
-              <span className="mb-1 block text-[11px] font-medium text-muted-foreground">
-                People
-              </span>
-              <Input
-                ref={peopleInputRef}
-                value={participantDraft}
-                onChange={(e) => setParticipantDraft(e.target.value)}
-                onBlur={commitText}
-                placeholder="email, name or @domain — comma = OR"
-                className="h-8 text-sm"
-                aria-label="People (email, name or domain; comma = OR)"
-              />
-              <span className="mt-1 block text-[10px] text-muted-foreground">
-                Matches organizer, attendees and speakers. e.g. <code>@lp-global.com</code>,{' '}
-                <code>nicolas</code>
-              </span>
-            </label>
-            <label className="block">
-              <span className="mb-1 block text-[11px] font-medium text-muted-foreground">
-                Organizer
-              </span>
-              <Input
-                value={organizerDraft}
-                onChange={(e) => setOrganizerDraft(e.target.value)}
-                onBlur={commitText}
-                placeholder="organizer email — comma = OR"
-                className="h-8 text-sm"
-                aria-label="Organizer email (comma = OR)"
-              />
-            </label>
-            <div>
-              <span className="mb-1 block text-[11px] font-medium text-muted-foreground">
-                Provider
-              </span>
-              <div className="flex items-center gap-0.5 rounded-lg border bg-muted/40 p-0.5">
-                {PROVIDER_OPTIONS.map((p) => {
-                  const on = value.provider.includes(p.key);
-                  return (
-                    <button
-                      key={p.key}
-                      type="button"
-                      onClick={() => toggleProvider(p.key)}
-                      aria-pressed={on}
-                      title={p.title}
-                      className={`flex flex-1 items-center justify-center gap-1 rounded-md px-2 py-1 text-xs transition-colors ${
-                        on
-                          ? 'bg-background font-medium text-foreground shadow-sm'
-                          : 'text-muted-foreground hover:text-foreground'
-                      }`}
-                    >
-                      <Check
-                        className={`h-3 w-3 ${on ? 'text-primary' : 'invisible'}`}
-                        aria-hidden
-                      />
-                      {p.label}
-                    </button>
-                  );
-                })}
-              </div>
-              <span className="mt-1 block text-[10px] text-muted-foreground">
-                None selected = any provider.
-              </span>
-            </div>
-            <div className="flex items-center justify-between pt-1">
+    <form
+      className="space-y-2.5 px-1"
+      data-people-filter
+      onSubmit={(e) => {
+        e.preventDefault();
+        commitText();
+      }}
+    >
+      <label className="block">
+        <span className="mb-1 block text-[11px] font-medium text-muted-foreground">People</span>
+        <Input
+          value={participantDraft}
+          onChange={(e) => setParticipantDraft(e.target.value)}
+          onBlur={commitText}
+          disabled={disabled}
+          placeholder="email, name or @domain — comma = OR"
+          className="h-8 text-sm"
+          aria-label="People (email, name or domain; comma = OR)"
+        />
+        <span className="mt-1 block text-[10px] text-muted-foreground">
+          Matches organizer, attendees and speakers. e.g. <code>@lp-global.com</code>,{' '}
+          <code>nicolas</code>
+        </span>
+      </label>
+      <label className="block">
+        <span className="mb-1 block text-[11px] font-medium text-muted-foreground">Organizer</span>
+        <Input
+          value={organizerDraft}
+          onChange={(e) => setOrganizerDraft(e.target.value)}
+          onBlur={commitText}
+          disabled={disabled}
+          placeholder="organizer email — comma = OR"
+          className="h-8 text-sm"
+          aria-label="Organizer email (comma = OR)"
+        />
+      </label>
+      <div>
+        <span className="mb-1 block text-[11px] font-medium text-muted-foreground">Provider</span>
+        <div className="flex items-center gap-0.5 rounded-lg border bg-muted/40 p-0.5">
+          {PROVIDER_OPTIONS.map((p) => {
+            const on = value.provider.includes(p.key);
+            return (
               <button
+                key={p.key}
                 type="button"
-                disabled={active === 0}
-                onClick={() => {
-                  setParticipantDraft('');
-                  setOrganizerDraft('');
-                  onChange(EMPTY_PEOPLE_FILTERS);
-                }}
-                className="text-xs text-muted-foreground hover:text-foreground disabled:opacity-50"
+                onClick={() => toggleProvider(p.key)}
+                disabled={disabled}
+                aria-pressed={on}
+                title={p.title}
+                className={`flex flex-1 items-center justify-center gap-1 rounded-md px-2 py-1 text-xs transition-colors ${
+                  on
+                    ? 'bg-background font-medium text-foreground shadow-sm'
+                    : 'text-muted-foreground hover:text-foreground'
+                }`}
               >
-                Clear all
+                <Check className={`h-3 w-3 ${on ? 'text-primary' : 'invisible'}`} aria-hidden />
+                {p.label}
               </button>
-              <div className="flex items-center gap-1.5">
-                <Button
-                  type="button"
-                  variant="ghost"
-                  size="sm"
-                  className="h-7 px-2 text-xs"
-                  onClick={close}
-                >
-                  Close
-                </Button>
-                <Button type="submit" size="sm" className="h-7 px-2.5 text-xs">
-                  Apply
-                </Button>
-              </div>
-            </div>
-          </form>
+            );
+          })}
         </div>
-      )}
-    </div>
+        <span className="mt-1 block text-[10px] text-muted-foreground">None selected = any provider.</span>
+      </div>
+      {/* Enter in either input submits (commits); the button is for mice. */}
+      <div className="flex justify-end">
+        <Button type="submit" size="sm" variant="outline" className="h-7 px-2.5 text-xs" disabled={disabled}>
+          Apply
+        </Button>
+      </div>
+    </form>
   );
 }
 
