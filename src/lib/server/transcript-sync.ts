@@ -40,6 +40,26 @@ export async function refreshIfPending(
     if (after) return after;
   }
 
+  // A meeting MADE EARLY from a recording (Link / Make a meeting while the
+  // recording was still uploading or transcribing — 2026-09-30) has no job
+  // of its own: the recording's transcription is the one to ask about. The
+  // detail page polls this route, so asking here is what lets the meeting
+  // land within seconds of AAI finishing instead of at the 5-minute sweep;
+  // `refreshBornBare` runs the settle (lib/server/recording-settle.ts).
+  const madeFrom = row.gmeet_context?.fromRecording?.recordingId;
+  if (row.status === 'processing' && !row.aai_job_id && madeFrom && !row.deleted_at) {
+    const { refreshBornBare } = await import('@/lib/server/born-bare');
+    const settled = await refreshBornBare(madeFrom).catch((err) => {
+      console.warn('[transcript-sync] refresh of the recording behind a meeting made early failed:', err);
+      return false;
+    });
+    if (settled) {
+      const after = await getForUser(userId, row.assemblyai_id).catch(() => null);
+      if (after) return after;
+    }
+    return row;
+  }
+
   // 'uploading' / 'waiting' rows have a synthetic `up-…` / `defer-…` id that
   // AAI has never heard of — nothing to refresh until they're promoted.
   if (
