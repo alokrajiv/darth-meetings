@@ -513,6 +513,10 @@ final class RecordingController {
         shareNoticeShown = false; pendingVideoFailure = false; currentSource = nil; sourceMode = "auto"
         lastPickSignature = nil; titleTracker = TitleChangeTracker(interval: 10)   // 0.3.20
         videoFramesTotal = 0; videoDupTotal = 0; lastVideoCount = -1; lastVideoWriter = nil
+        // 0.3.21: the size is per recording — an audio-only start used to inherit the PREVIOUS
+        // recording's size for its first video part (the 0.3.15 comment says it is set there).
+        pinnedSize = nil
+        resetCaptureProfile()                                                       // 0.3.21
         audioForwarder.reset()
         let f = DateFormatter(); f.dateFormat = "yyyy-MM-dd HH.mm.ss"
         base = "\(f.string(from: now)) \(call?.kind.rawValue ?? "display")"
@@ -706,15 +710,19 @@ final class RecordingController {
             (w, h) = CaptureSession.pixelSize(of: filter)
             rlog("record: pixel size \(w)x\(h) took \(Int(Date().timeIntervalSince(t0) * 1000)) ms")
             pinnedSize = (w, h)
-            rec = try catchingObjC { try Recorder(url: url, width: w, height: h, fps: fps, audioTracks: tracks) }
+            // 0.3.21: a recording that starts under pressure starts eased (`start` decided it).
+            let profile = currentProfile
+            let bitRate = Self.videoProfile(for: profile).videoBitRate
+            rec = try catchingObjC { try Recorder(url: url, width: w, height: h, fps: fps, audioTracks: tracks, videoBitRate: bitRate) }
             rec.onStop = { [weak self] err in
                 DispatchQueue.main.async { self?.videoStreamFailed(err) }
             }
             videoStream = try await timed("video stream start on \(source.label)", deadline: deadline,
                                           orphan: { s in Task { try? await s.stopCapture() } }) {
-                try await Self.startVideoStream(filter: filter, fps: self.fps, output: rec, size: (w, h))
+                try await Self.startVideoStream(filter: filter, profile: profile, output: rec, size: (w, h))
             }
             try Task.checkCancellation()
+            streamProfile = profile
         }
         rec.onWriterFailure = { [weak self] err in self?.writerFailed(err) }
         rec.onPreviewFrame = { [weak self] pb in self?.onPreviewFrame?(pb) }
@@ -769,6 +777,10 @@ final class RecordingController {
         resetMicDead()
         healthTimer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in self?.healthTick() }
         healthTimer?.tolerance = 0.2
+        // 0.3.21: the mode changed while the stream was coming up.
+        if let sp = streamProfile, sp != currentProfile {
+            Task { @MainActor in await self.applyCaptureProfile(reason: "changed during the start") }
+        }
         if case .window(let id, _) = source { lastWindowFrame = ShareDetector.windowFrame(id) }
         segments = [[
             "index": 1, "path": url.path, "source": source.json,
@@ -797,6 +809,7 @@ final class RecordingController {
             "mic_device": mic?.deviceJSON ?? NSNull(),         // 0.3.16
             "audio_display_id": Int(displayID),
             "path": url.path, "options": options.json,
+            "capture_profile": currentProfile.rawValue, "capture_profile_mode": captureProfileMode.rawValue,   // 0.3.21
         ], summary: "record: \(recordingId ?? "") \(w)x\(h) tracks=[\(tracks.map { $0.name }.joined(separator: ","))] started=[\(started.joined(separator: ","))] \(options.summary) → \(url.lastPathComponent)")
         onStarted?()
         startResolveTimer()
@@ -839,20 +852,21 @@ final class RecordingController {
         }
     }
 
-    private static func startVideoStream(filter: SCContentFilter, fps: Int, output: Recorder, size: (w: Int, h: Int)? = nil) async throws -> SCStream {
+    /// 0.3.21: the SCK knobs of a capture level. `.audioOnly` (the policy's disabled hook) is
+    /// never a video stream; should it ever reach here it gets the eased stream.
+    static func videoProfile(for load: CaptureLoad) -> VideoCaptureProfile { load == .normal ? .normal : .eased }
+
+    /// 0.3.21: the full video-stream configuration for a part of `size` under `profile` — used
+    /// to create a stream (both creation sites: `beginCapture` and `rollSegment`) AND for the
+    /// live switch (`updateConfiguration` replaces the whole configuration). The 0.3.20 colour
+    /// pinning (sRGB in, 709 matrix) lives in `VideoCaptureProfile.streamConfiguration`.
+    static func videoConfig(size: (w: Int, h: Int), profile: CaptureLoad) -> SCStreamConfiguration {
+        videoProfile(for: profile).streamConfiguration(width: size.w, height: size.h)
+    }
+
+    private static func startVideoStream(filter: SCContentFilter, profile: CaptureLoad, output: Recorder, size: (w: Int, h: Int)? = nil) async throws -> SCStream {
         let (w, h) = size ?? CaptureSession.pixelSize(of: filter)
-        let cfg = SCStreamConfiguration()
-        cfg.width = w; cfg.height = h
-        cfg.scalesToFit = true      // letterbox a differently-shaped source into the pinned size
-        cfg.minimumFrameInterval = CMTime(value: 1, timescale: CMTimeScale(fps))
-        cfg.pixelFormat = kCVPixelFormatType_32BGRA
-        // 0.3.20: pin the colour pipeline to what the writer tags (Rec. 709): sRGB pixels in,
-        // the 709 matrix for any YCbCr conversion SCK does on the way.
-        cfg.colorSpaceName = CGColorSpace.sRGB
-        cfg.colorMatrix = CGDisplayStream.yCbCrMatrix_ITU_R_709_2
-        cfg.showsCursor = true
-        cfg.queueDepth = 6
-        cfg.capturesAudio = false
+        let cfg = videoConfig(size: (w, h), profile: profile)
         let s = SCStream(filter: filter, configuration: cfg, delegate: output)
         try s.addStreamOutput(output, type: .screen, sampleHandlerQueue: output.queue)
         try await s.startCapture()
@@ -902,6 +916,7 @@ final class RecordingController {
                 let url = self.segmentURL(index, for: source)
                 let rec: Recorder
                 var newStream: SCStream?
+                var newProfile = self.currentProfile
                 var w = 0, h = 0
                 if source.isAudioOnly {
                     rec = try catchingObjC { try Recorder(audioOnlyURL: url, audioTracks: tracks) }
@@ -912,11 +927,17 @@ final class RecordingController {
                     // video part sets it, so every later video part keeps the same pixel size
                     // (the server's `-c copy` stitch refuses inputs that differ).
                     if self.pinnedSize == nil { self.pinnedSize = (w, h) }
-                    rec = try catchingObjC { try Recorder(url: url, width: w, height: h, fps: self.fps, audioTracks: tracks) }
+                    // 0.3.21: the new part carries the current capture profile — without this a
+                    // share start / window-gone / writer-error roll silently went back to 5 fps
+                    // BGRA. Eased also means the lower bit rate (a writer's rate is fixed at
+                    // creation, so it only changes when a part is created anyway).
+                    newProfile = self.currentProfile
+                    let bitRate = Self.videoProfile(for: newProfile).videoBitRate
+                    rec = try catchingObjC { try Recorder(url: url, width: w, height: h, fps: self.fps, audioTracks: tracks, videoBitRate: bitRate) }
                     rec.onStop = { [weak self] err in
                         DispatchQueue.main.async { self?.videoStreamFailed(err) }
                     }
-                    newStream = try await Self.startVideoStream(filter: filter, fps: self.fps, output: rec, size: (w, h))
+                    newStream = try await Self.startVideoStream(filter: filter, profile: newProfile, output: rec, size: (w, h))
                 }
                 rec.onWriterFailure = { [weak self] err in self?.writerFailed(err) }
                 rec.onPreviewFrame = { [weak self] pb in self?.onPreviewFrame?(pb) }
@@ -927,6 +948,7 @@ final class RecordingController {
                 self.segmentStart = Date()
                 self.currentSource = source
                 self.videoStream = newStream
+                self.streamProfile = newStream == nil ? nil : newProfile
                 self.segments.append([
                     "index": index, "path": url.path, "source": source.json,
                     "started_at": isoString(self.segmentStart), "bytes": 0, "seconds": 0,
@@ -949,8 +971,14 @@ final class RecordingController {
                 EventLog.shared.log("segment_started", [
                     "recording_id": self.recordingId ?? "", "segment": index, "reason": reason,
                     "source": source.json, "path": url.path, "width": w, "height": h,
+                    "capture_profile": newStream == nil ? NSNull() : newProfile.rawValue,      // 0.3.21
                 ], summary: "record: segment \(index) (\(reason)) → \(source.label)")
                 self.onSegment?(index, reason)
+                // 0.3.21: the profile changed while this roll was in flight — apply it once the
+                // roll is over (a new main-actor task runs after this one's `rolling = false`).
+                if newStream != nil, self.currentProfile != newProfile {
+                    Task { @MainActor in await self.applyCaptureProfile(reason: "after a part roll") }
+                }
             } catch {
                 rlog("record: segment roll failed (\(reason)): \(error.localizedDescription) — staying on the current source")
                 EventLog.shared.log("segment_roll_failed", ["reason": reason, "error": error.localizedDescription])
@@ -1418,6 +1446,232 @@ final class RecordingController {
         return d
     }
 
+    // MARK: capture profile (0.3.21)
+    //
+    // A fanless MacBook Air sat at 100 % system GPU and thermal "fair" for whole Teams calls
+    // while we captured her 2304×1472 px window at 5 fps BGRA. Under pressure the LIVE stream
+    // is eased (2 fps, 420v, no cursor, queue depth 4) with `SCStream.updateConfiguration` —
+    // never by rolling a part (a part with other stream parameters costs a server re-encode).
+    // The decision is `CaptureEasePolicy` (TrayLogic, unit-tested); this feeds it from every
+    // 10 s recording sample and from the thermal / power notifications, applies what it says,
+    // and carries the profile through every stream this recording creates.
+
+    /// Settings ▸ Capture / ws `set_capture_profile_mode` — set through `setCaptureProfileMode`.
+    private(set) var captureProfileMode: CaptureProfileMode = .auto
+    /// What this recording WANTS: every video stream created from now on starts with it.
+    private(set) var currentProfile: CaptureLoad = .normal
+    /// What the live video stream really runs with (nil = no live video stream).
+    private(set) var streamProfile: CaptureLoad?
+    private var easePolicy = CaptureEasePolicy()
+    private var easedSince: Date?
+    private var easedAccum: TimeInterval = 0
+    private var profileChanges = 0
+    private var easeBannerShown = false
+    private var profileApplyInFlight = false
+    /// ws `simulate_capture_pressure`: replaces the policy's inputs field by field (kept until
+    /// `{reset: true}` or a relaunch, so a start under simulated pressure can be tested too).
+    private var simulatedPressure: CaptureEasePolicy.Inputs?
+    private var simulatedFast = false
+    /// Main queue: the first step down of a recording (the one banner, autoHide 6 s).
+    var onCaptureEased: (() -> Void)?
+
+    private var uptime: Double { ProcessInfo.processInfo.systemUptime }
+
+    /// Seconds this recording has wanted an eased capture so far.
+    var easedSeconds: Int { Int(easedAccum + (easedSince.map { Date().timeIntervalSince($0) } ?? 0)) }
+
+    private func setProfile(_ p: CaptureLoad) {
+        let now = Date()
+        if let s = easedSince { easedAccum += now.timeIntervalSince(s); easedSince = nil }
+        currentProfile = p
+        if p != .normal { easedSince = now }
+    }
+
+    /// Readings for a notification tick and the start decision: thermal + Low Power right now,
+    /// memory pressure and GPU from the latest sample.
+    private func liveInputs() -> CaptureEasePolicy.Inputs {
+        var i = CaptureEasePolicy.Inputs(sample: ResourceSampler.shared.latest ?? [:])
+        i.thermal = ResourceSampler.thermalName(ProcessInfo.processInfo.thermalState)
+        i.lowPower = ProcessInfo.processInfo.isLowPowerModeEnabled
+        return i
+    }
+
+    private func withSimulation(_ base: CaptureEasePolicy.Inputs) -> CaptureEasePolicy.Inputs {
+        simulatedPressure.map { base.overridden(by: $0) } ?? base
+    }
+
+    /// New recording (from `start`, state .starting): reset, and START eased when the Mac is
+    /// already under pressure (or the mode says so) — the first stream is created eased, no
+    /// live change needed.
+    private func resetCaptureProfile() {
+        easedAccum = 0; easedSince = nil; profileChanges = 0; easeBannerShown = false
+        streamProfile = nil; profileApplyInFlight = false
+        easePolicy.config = simulatedFast ? .fast : CaptureEasePolicy.Config()
+        let inputs = withSimulation(liveInputs())
+        let p = easePolicy.begin(at: uptime, mode: captureProfileMode, inputs: inputs)
+        setProfile(p)
+        guard p != .normal else { return }
+        let reason = captureProfileMode == .eased ? "mode_eased" : "start: " + CaptureEasePolicy.instantTriggers(inputs).joined(separator: "+")
+        logProfileEvent(from: .normal, to: p, reason: reason, values: inputs, how: "start", applied: true, extra: ["at_start": true])
+    }
+
+    /// The sampler's 10 s recording sample (main queue).
+    func capturePressureSample(_ s: [String: Any]) {
+        guard state == .recording else { return }
+        feedEasePolicy(withSimulation(CaptureEasePolicy.Inputs(sample: s)), isSample: true)
+    }
+
+    /// Thermal state / Low Power Mode changed (main queue): judge at once, no GPU counting.
+    func capturePressureNudge(_ why: String) {
+        guard state == .recording else { return }
+        feedEasePolicy(withSimulation(liveInputs()), isSample: false)
+    }
+
+    private func feedEasePolicy(_ inputs: CaptureEasePolicy.Inputs, isSample: Bool) {
+        guard let d = easePolicy.tick(.init(now: uptime, inputs: inputs, isSample: isSample)) else { return }
+        Task { @MainActor in await self.applyDecision(d, how: "policy") }
+    }
+
+    /// Settings ▸ Capture / ws: takes effect on the running recording at once.
+    func setCaptureProfileMode(_ m: CaptureProfileMode) {
+        captureProfileMode = m
+        guard state == .recording || state == .starting, let d = easePolicy.setMode(m, now: uptime) else { return }
+        Task { @MainActor in await self.applyDecision(d, how: "mode") }
+    }
+
+    @MainActor
+    private func applyDecision(_ d: CaptureEasePolicy.Decision, how: String) async {
+        guard state == .recording || state == .starting else { return }
+        let from = currentProfile
+        setProfile(d.to)
+        let outcome = await applyCaptureProfile(reason: d.reason)
+        var extra: [String: Any] = [:]
+        switch outcome {
+        case .applied: break
+        case .deferred(let why): extra["deferred"] = why
+        case .failed(let err):
+            // Keep the old profile; NEVER roll a part over this.
+            extra["error"] = err
+            setProfile(from)
+            easePolicy.applyFailed(d, now: uptime)
+        }
+        if case .failed = outcome {} else { profileChanges += 1 }
+        logProfileEvent(from: d.from, to: d.to, reason: d.reason, values: d.values, how: how,
+                        applied: { if case .applied = outcome { return true }; return false }(), extra: extra)
+        // The one banner of the recording: the first step down the live stream really took (not
+        // a menu choice the person just made, not an audio-only part with nothing to ease).
+        if d.to > d.from, how != "mode", !easeBannerShown, { if case .applied = outcome { return true }; return false }() {
+            easeBannerShown = true
+            onCaptureEased?()
+        }
+    }
+
+    enum ProfileApply { case applied, deferred(String), failed(String) }
+
+    /// Put the live video stream on `currentProfile` with `updateConfiguration` (a FULL
+    /// configuration at the part's pinned size). Without a live video stream the profile is
+    /// only remembered: the next stream (a roll, a fallback) is created with it. Updates are
+    /// serialised: one in flight carries on to whatever `currentProfile` is when it finishes.
+    @MainActor @discardableResult
+    func applyCaptureProfile(reason: String) async -> ProfileApply {
+        guard !profileApplyInFlight else { return .deferred("follows the update already in flight") }
+        profileApplyInFlight = true
+        defer { profileApplyInFlight = false }
+        var result: ProfileApply = .applied
+        while true {
+            let target = currentProfile
+            guard state == .recording else { return .deferred("not recording yet — the first stream starts with it") }
+            guard currentSource?.isAudioOnly != true else { return .deferred("audio-only part — the next video part starts with it") }
+            guard !rolling else { return .deferred("a part roll is in flight — applied when it ends") }
+            guard !videoStopped, let stream = videoStream, let size = pinnedSize else {
+                return .deferred("no live video stream — the next part starts with it")
+            }
+            if streamProfile == target { return result }
+            let vp = Self.videoProfile(for: target)
+            let t0 = Date()
+            do {
+                try await stream.updateConfiguration(Self.videoConfig(size: size, profile: target))
+                guard stream === videoStream else { return .deferred("the stream was replaced during the update") }
+                streamProfile = target
+                result = .applied
+                rlog("capture: stream → \(target.rawValue) (\(vp.fps) fps \(vp.pixelFormatName), cursor \(vp.showsCursor ? "on" : "off"), queue \(vp.queueDepth)) in \(Int(Date().timeIntervalSince(t0) * 1000)) ms — \(reason)")
+            } catch {
+                rlog("capture: updateConfiguration → \(target.rawValue) FAILED (\(error.localizedDescription)) — keeping \(streamProfile?.rawValue ?? "?")")
+                return .failed(error.localizedDescription)
+            }
+        }
+    }
+
+    private func logProfileEvent(from: CaptureLoad, to: CaptureLoad, reason: String, values: CaptureEasePolicy.Inputs,
+                                 how: String, applied: Bool, extra: [String: Any] = [:]) {
+        let vp = Self.videoProfile(for: to)
+        var e: [String: Any] = [
+            "recording_id": recordingId ?? "", "from": from.rawValue, "to": to.rawValue, "reason": reason,
+            "values": values.json, "mode": captureProfileMode.rawValue, "how": how,
+            "at_s": Int(Date().timeIntervalSince(startedAt ?? Date())), "applied": applied,
+            "simulated": simulatedPressure != nil,
+            "stream": ["fps": vp.fps, "pixel_format": vp.pixelFormatName, "cursor": vp.showsCursor, "queue_depth": vp.queueDepth] as [String: Any],
+            "segment": segmentIndex,
+        ]
+        if simulatedFast { e["fast"] = true }
+        for (k, v) in extra { e[k] = v }
+        EventLog.shared.log("capture_profile", e,
+                            summary: "capture: \(from.rawValue) → \(to.rawValue) (\(reason), \(how))\(applied ? "" : " — not applied live: \((extra["error"] ?? extra["deferred"]) ?? "?")")\(simulatedPressure != nil ? " [simulated]" : "")")
+    }
+
+    /// For `status.capture_profile`.
+    func captureProfileJSON() -> [String: Any] {
+        var d: [String: Any] = ["mode": captureProfileMode.rawValue]
+        guard state == .recording || state == .starting else { return d }
+        let vp = Self.videoProfile(for: currentProfile)
+        d["current"] = currentProfile.rawValue
+        d["stream"] = streamProfile?.rawValue ?? NSNull()
+        d["fps"] = vp.fps
+        d["pixel_format"] = vp.pixelFormatName
+        d["eased_seconds"] = easedSeconds
+        d["changes"] = profileChanges
+        d["gpu_high_streak"] = easePolicy.gpuHighStreak
+        d["inputs"] = easePolicy.lastInputs.json
+        d["simulated"] = simulatedPressure?.json ?? NSNull()
+        d["fast"] = simulatedFast
+        return d
+    }
+
+    /// ws `simulate_capture_pressure {thermal?, gpu_pct?, low_power?, mem_pressure?, clear?, fast?, reset?}`.
+    /// Overrides the policy's INPUTS (real readings fill the fields not given); `clear` = all
+    /// clear; `fast` = 2 GPU samples / 20 s clear / 5 s dwell; `reset` = real readings and the
+    /// real windows again. Judged at once (a notification tick — GPU runs still need samples).
+    func simulateCapturePressure(_ obj: [String: Any]) -> String {
+        if (obj["reset"] as? Bool) == true {
+            simulatedPressure = nil; simulatedFast = false
+            easePolicy.config = CaptureEasePolicy.Config()
+            EventLog.shared.log("test_simulate_capture_pressure", ["recording_id": recordingId ?? NSNull(), "reset": true])
+            return "capture pressure simulation off"
+        }
+        var o = simulatedPressure ?? CaptureEasePolicy.Inputs()
+        if (obj["clear"] as? Bool) == true { o = .clear }
+        if let t = obj["thermal"] as? String { o.thermal = t }
+        if let g = (obj["gpu_pct"] as? Double) ?? (obj["gpu_pct"] as? Int).map(Double.init) { o.gpuPct = g }
+        if let l = obj["low_power"] as? Bool { o.lowPower = l }
+        if let m = obj["mem_pressure"] as? String { o.memPressure = m }
+        simulatedPressure = o
+        if (obj["fast"] as? Bool) == true { simulatedFast = true; easePolicy.config = .fast }
+        rlog("TEST — simulate_capture_pressure \(o.json)\(simulatedFast ? " (fast windows)" : "")")
+        EventLog.shared.log("test_simulate_capture_pressure", ["recording_id": recordingId ?? NSNull(), "inputs": o.json, "fast": simulatedFast])
+        capturePressureNudge("simulate")
+        return "simulated capture pressure: \(o.json.map { "\($0.key)=\($0.value)" }.sorted().joined(separator: " "))\(state == .recording ? "" : " (applies from the next recording)")"
+    }
+
+    /// ws `force_capture_profile {profile: "normal"|"eased"}` — exercises `applyCaptureProfile`
+    /// directly; the policy carries on from the forced level.
+    func forceCaptureProfile(_ name: String) -> String {
+        guard state == .recording else { return "not recording" }
+        guard let p = CaptureLoad(rawValue: name), p != .audioOnly else { return "unknown profile \(name) (normal | eased)" }
+        guard let d = easePolicy.force(p, now: uptime) else { return "already \(p.rawValue)" }
+        Task { @MainActor in await self.applyDecision(d, how: "forced") }
+        return "forcing \(p.rawValue)"
+    }
+
     // MARK: window-gone hold
 
     private func beginWindowGoneHold(reason: String) {
@@ -1548,6 +1802,11 @@ final class RecordingController {
         // and the sampler's summary, on THIS (main) queue — calling it from the detached task
         // below raced `tick` appending samples on main.
         let lastCounters = takeSegmentCounters()
+        // 0.3.21: how much of this recording was eased, read on main before the detach.
+        let easedSecs = easedSeconds
+        let profileChangeCount = profileChanges
+        let profileAtEnd = currentProfile
+        streamProfile = nil
         overloads.detach()
         let resources = ResourceSampler.shared.endRecording()
         mic?.stop()
@@ -1606,6 +1865,9 @@ final class RecordingController {
                 "video_frames": self.videoFramesTotal, "video_dup": self.videoDupTotal,
                 "health": endHealth, "health_line": endLine, "stream_failure": self.streamFailure,
                 "source_mode": self.sourceMode, "resources": resources,
+                // 0.3.21: capture profile
+                "eased_seconds": easedSecs, "profile_changes": profileChangeCount,
+                "capture_profile_end": profileAtEnd.rawValue, "capture_profile_mode": self.captureProfileMode.rawValue,
             ], summary: "record: stopped \(id) (\(reason)) — \(self.segments.count) segment(s), \(secs)s, \(bytes) bytes, mic buffers \(micBuffers), \(endLine), video frames \(self.videoFramesTotal)")
             // 0.3.20: tray.log names windows and apps — full telemetry only, checked before reading.
             if unwell, Telemetry.allows(.logExcerpt) {

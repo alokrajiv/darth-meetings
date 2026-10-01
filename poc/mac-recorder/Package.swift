@@ -15,6 +15,8 @@ let package = Package(
             ]
         ),
         .executableTarget(name: "recorder-poc", dependencies: ["RecorderCore"], path: "Sources/recorder-poc"),
+        // 0.3.21: the capture profiles' SCK stream configuration (no capture, no permission needed).
+        .testTarget(name: "RecorderCoreTests", dependencies: ["RecorderCore"], path: "Tests/RecorderCoreTests"),
         // Objective-C @try/@catch for Swift (0.3.1): AVFoundation raises NSException for bad
         // settings, and one that escapes a main-queue block zombifies the app.
         .target(name: "ObjCTry", path: "Sources/ObjCTry", publicHeadersPath: "include"),

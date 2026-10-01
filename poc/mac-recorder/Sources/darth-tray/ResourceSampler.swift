@@ -36,6 +36,9 @@ final class ResourceSampler {
     var isRecording: () -> Bool = { false }
     /// 0.3.20: the live call, if any (→ 30 s and logged even without a recording).
     var callLive: () -> (app: String, pid: Int32)? = { nil }
+    /// 0.3.21: every RECORDING sample (10 s), after it is logged — the capture-ease policy's
+    /// input (`thermal`, `gpu_pct`, `low_power`, `mem_pressure`). Main queue.
+    var onRecordingSample: (([String: Any]) -> Void)?
     private var timer: Timer?
     private var lastRusage: (user: Double, sys: Double, at: Date)?
     private var lastHost: (user: UInt64, sys: UInt64, idle: UInt64, nice: UInt64)?
@@ -122,6 +125,7 @@ final class ResourceSampler {
             if let call { e["call_app"] = call.app; e["call_pid"] = Int(call.pid) }
             recordingSamples.append(s)
             EventLog.shared.log("resource_sample", e)
+            onRecordingSample?(s)
         } else if let call {
             // 0.3.20: a live call nobody is recording still leaves its numbers behind.
             var e = s
@@ -245,7 +249,7 @@ final class ResourceSampler {
         return nil
     }
 
-    private static func thermalName(_ s: ProcessInfo.ThermalState) -> String {
+    static func thermalName(_ s: ProcessInfo.ThermalState) -> String {
         switch s {
         case .nominal: return "nominal"
         case .fair: return "fair"

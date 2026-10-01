@@ -5,7 +5,7 @@ import ServiceManagement
 import RecorderCore
 import TrayLogic
 
-let VERSION = "0.3.20"
+let VERSION = "0.3.21"
 let WS_PORT: UInt16 = 47800
 let PWA_URL = URL(string: "https://meetings.darth-internal.trames.io/")!
 /// Seconds between "the call ended" and an automatic stop.
@@ -73,6 +73,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         set { UserDefaults.standard.set(newValue, forKey: "bannerAutoHide"); refreshMenu(); broadcast("status") }
     }
     static let BANNER_AUTO_HIDE: TimeInterval = 10
+
+    /// 0.3.21: Settings ▸ Capture — `auto` (ease the screen capture when the Mac is under
+    /// pressure), `eased` (always), `never`. Applies to the running recording at once.
+    var captureProfileMode: CaptureProfileMode {
+        get { CaptureProfileMode(stored: UserDefaults.standard.string(forKey: "captureProfileMode")) }
+        set { UserDefaults.standard.set(newValue.rawValue, forKey: "captureProfileMode"); recorder.setCaptureProfileMode(newValue) }
+    }
+    /// Thermal-state / Low Power Mode observers (0.3.21) — kept for the app's lifetime.
+    var pressureObservers: [NSObjectProtocol] = []
 
     /// 0.3.10: Apple's voice processing (VPIO) on the mic input — acoustic echo cancellation
     /// against the system's own output, noise suppression, Apple's AGC. ON by default: without
@@ -261,6 +270,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         i.toolTip = "Machine-level numbers only — nothing about other apps."
         return i
     }()
+    /// 0.3.21: Settings ▸ Capture: Automatic / Always eased / Never ease.
+    let captureItem = NSMenuItem(title: "Capture", action: nil, keyEquivalent: "")
+    let captureAutoItem: NSMenuItem = {
+        let i = NSMenuItem(title: "Automatic", action: #selector(chooseCaptureAuto), keyEquivalent: "")
+        i.toolTip = "Eases the screen capture (2 fps, no cursor) while this Mac is hot, on Low Power Mode, short of memory or its GPU is pinned — the recording carries on."
+        return i
+    }()
+    let captureEasedItem: NSMenuItem = {
+        let i = NSMenuItem(title: "Always eased", action: #selector(chooseCaptureEased), keyEquivalent: "")
+        i.toolTip = "Every recording captures the screen at 2 fps without the cursor — lighter on a fanless Mac."
+        return i
+    }()
+    let captureNeverItem: NSMenuItem = {
+        let i = NSMenuItem(title: "Never ease", action: #selector(chooseCaptureNever), keyEquivalent: "")
+        i.toolTip = "Always the full capture (5 fps with the cursor), whatever the Mac is doing."
+        return i
+    }()
     /// The first-launch telemetry notice while it is on screen (non-modal).
     var telemetryNotice: NSAlert?
     /// 0.3.20: one click stamps "this is laggy" with what the Mac is doing right now.
@@ -347,6 +373,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             self?.banner.showMessage(title: title, sub: sub, accent: .warning, stoppable: true, near: self?.recordingFrame)
         }
         recorder.onPreviewFrame = { [weak self] pb in self?.preview.showFrame(pb) }
+        // 0.3.21: the capture-ease policy — mode in, the one banner out, fed by every recording
+        // sample and, at once, by thermal-state / Low Power Mode changes.
+        recorder.setCaptureProfileMode(captureProfileMode)
+        recorder.onCaptureEased = { [weak self] in
+            guard let self else { return }
+            self.banner.showMessage(title: "Easing capture to keep this Mac cool", sub: "2 fps, still recording", accent: .info,
+                                    stoppable: true, near: self.recordingFrame, autoHide: 6)
+            self.refreshMenu()
+        }
+        ResourceSampler.shared.onRecordingSample = { [weak self] s in self?.recorder.capturePressureSample(s) }
+        pressureObservers = [
+            NotificationCenter.default.addObserver(forName: ProcessInfo.thermalStateDidChangeNotification, object: nil, queue: .main) { [weak self] _ in
+                self?.recorder.capturePressureNudge("thermal state changed")
+            },
+            NotificationCenter.default.addObserver(forName: .NSProcessInfoPowerStateDidChange, object: nil, queue: .main) { [weak self] _ in
+                self?.recorder.capturePressureNudge("low power mode changed")
+            },
+        ]
         preview.levelsProvider = { [weak self] in
             guard let self else { return (nil, nil, nil, nil, false, 0) }
             let h = self.recorder.health()
@@ -752,6 +796,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let settingsMenu = NSMenu(title: "Settings")
         settingsMenu.addItem(telemetryItem)
         settingsMenu.addItem(telemetryHintItem)
+        captureAutoItem.target = self
+        captureEasedItem.target = self
+        captureNeverItem.target = self
+        let captureMenu = NSMenu(title: "Capture")
+        captureMenu.addItem(captureAutoItem)
+        captureMenu.addItem(captureEasedItem)
+        captureMenu.addItem(captureNeverItem)
+        captureItem.submenu = captureMenu
+        settingsMenu.addItem(captureItem)
         settingsItem.submenu = settingsMenu
         m.addItem(settingsItem)
         m.addItem(.separator())
@@ -821,6 +874,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         telemetryFullItem.state = level == .full ? .on : .off
         telemetryPartialItem.state = level == .partial ? .on : .off
         telemetryItem.title = "Telemetry: \(level == .full ? "Full" : "Partial")"
+        let cmode = captureProfileMode
+        captureAutoItem.state = cmode == .auto ? .on : .off
+        captureEasedItem.state = cmode == .eased ? .on : .off
+        captureNeverItem.state = cmode == .never ? .on : .off
+        captureItem.title = "Capture: " + Self.captureModeTitle(cmode)
+            + (recorder.isRecording && recorder.currentProfile == .eased && cmode == .auto ? " (eased now)" : "")
         authItem.title = auth.signingIn ? "Signing in…" : (auth.signedIn ? "Signed in as \(auth.email ?? "?") — sign out" : "Sign in to Darth Meetings…")
         authItem.isEnabled = !auth.signingIn
         uploadItem.state = autoUpload ? .on : .off
@@ -1350,6 +1409,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                                                                       level: Telemetry.level))
     }
 
+    // MARK: capture profile (0.3.21)
+
+    static func captureModeTitle(_ m: CaptureProfileMode) -> String {
+        switch m { case .auto: return "Automatic"; case .eased: return "Always eased"; case .never: return "Never ease" }
+    }
+    @objc func chooseCaptureAuto() { setCaptureProfileMode(.auto, source: "menu") }
+    @objc func chooseCaptureEased() { setCaptureProfileMode(.eased, source: "menu") }
+    @objc func chooseCaptureNever() { setCaptureProfileMode(.never, source: "menu") }
+
+    func setCaptureProfileMode(_ mode: CaptureProfileMode, source: String) {
+        let previous = captureProfileMode
+        captureProfileMode = mode
+        EventLog.shared.log("capture_profile_mode_set", ["mode": mode.rawValue, "previous": previous.rawValue, "source": source,
+                                                         "recording_id": (recorder.isRecording ? recorder.recordingId : nil) ?? NSNull()],
+                            summary: "capture: mode \(previous.rawValue) → \(mode.rawValue) (\(source))")
+        refreshMenu()
+        broadcast("status")
+    }
+
     @objc func chooseTelemetryFull() { setTelemetryLevel(.full, source: "menu") }
     @objc func chooseTelemetryPartial() { setTelemetryLevel(.partial, source: "menu") }
 
@@ -1645,6 +1723,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             // 0.3.20: what this Mac sends, and what it is (→ recorder_devices.last_status).
             "telemetry_level": Telemetry.level.rawValue,
             "hardware": HardwareInfo.fields,
+            // 0.3.21: {mode} idle; + current, stream, fps, pixel_format, eased_seconds, changes,
+            // gpu_high_streak, inputs, simulated, fast while recording.
+            "capture_profile": recorder.captureProfileJSON(),
             "ts": isoNow(),
         ]
         if recorder.isRecording {
@@ -1754,6 +1835,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         case "redetect_mic": redetectMic(how: "pwa")         // 0.3.16
         case "simulate_mic_dead":                            // 0.3.18 test hook: {mode: "zero"|"quiet"|"low"|null}
             broadcast("mic_dead_simulated", ["outcome": recorder.simulateMicDead(obj["mode"] as? String)])
+        case "simulate_capture_pressure":                    // 0.3.21 test hook: {thermal?, gpu_pct?, low_power?, mem_pressure?, clear?, fast?, reset?}
+            broadcast("capture_pressure_simulated", ["outcome": recorder.simulateCapturePressure(obj)])
+        case "force_capture_profile":                        // 0.3.21 test hook: {profile: "normal"|"eased"}
+            broadcast("capture_profile_forced", ["outcome": recorder.forceCaptureProfile((obj["profile"] as? String) ?? "")])
+        case "set_capture_profile_mode":                     // 0.3.21: {mode: "auto"|"eased"|"never"}
+            if let s = obj["mode"] as? String, let m = CaptureProfileMode(rawValue: s) { setCaptureProfileMode(m, source: "ws") }
         case "set_audio_tracks":                             // 0.3.17: {system?: bool, mic?: bool}
             if let v = obj["system"] as? Bool { setAudioTrack("system", on: v, how: "pwa") }
             if let v = obj["mic"] as? Bool { setAudioTrack("mic", on: v, how: "pwa") }

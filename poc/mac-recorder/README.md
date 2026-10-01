@@ -14,6 +14,108 @@ Native macOS side of Darth Meetings recording (the "Swift tray" angle from Darth
 the user switched it off in the menu (`loginItemUserChoice` in UserDefaults records an explicit choice;
 the default never overrides it). macOS may show "Darth Recorder was added as a login item" once.
 
+**0.3.21 (2026-10-01) — eased capture profile: a hot or busy Mac records at 2 fps instead of fighting the call.**
+A colleague's fanless MacBook Air sat at 100 % system GPU and thermal "fair" for whole Teams calls while
+the tray captured her 1152×736 pt Teams window at 2x (2304×1472 px), 5 fps BGRA. Under pressure the LIVE
+video stream is now eased with `SCStream.updateConfiguration` — never by rolling a part (a part with other
+stream parameters costs a full server re-encode at the stitch).
+
+- **Profiles** (`VideoCaptureProfile` in RecorderCore; the policy's levels are `CaptureLoad` in TrayLogic —
+  `CaptureProfile` was already taken by the 0.2.9 per-app audio/window profile):
+
+  | | fps | pixel format | cursor | queue depth | bit rate (new parts only) |
+  |---|---|---|---|---|---|
+  | `normal` | 5 | BGRA | on | 6 | 1.5 Mbps |
+  | `eased` | 2 | 420v (`420YpCbCr8BiPlanarVideoRange`) | off | 4 | 1.0 Mbps |
+
+  Queue depth 4, not SCK's minimum 3: the Recorder holds `lastPixelBuffer` for idle duplicates, the
+  encoder has frames in flight and the preview holds one while it converts. Both keep the 0.3.20 colour
+  pinning (sRGB in, 709 matrix) and the part's pinned size — `updateConfiguration` REPLACES the whole
+  configuration, so the switch sends a full one (`RecordingController.videoConfig(size:profile:)`) at
+  `pinnedSize`. The writer's adaptor has no source attributes / format hint, so a mid-part BGRA → 420v
+  switch is accepted; the encoded track is 4:2:0 either way. One or two idle duplicates right after a
+  switch re-append the old BGRA `lastPixelBuffer` — harmless. A writer's bit rate is fixed at creation, so
+  1.0 Mbps applies only to a part created while eased (share start, window-gone fallback, writer-error
+  roll); nothing rolls for the bit rate.
+- **Policy** (`CaptureEasePolicy` in TrayLogic, pure, clock passed in). Step DOWN to eased at once on
+  thermal ≥ fair, Low Power Mode, memory pressure ≥ warn, or system GPU ≥ 90 % for 12 CONSECUTIVE real
+  samples (2 min at 10 s — counted, not timed; a notification tick never counts, a sample without a GPU
+  reading breaks the run). Step UP only after 5 minutes with no trigger AND not a single sample ≥ 90 %
+  (the way out is stricter than the way in), and 60 s after the last change. nil / unknown inputs never
+  trigger. A `.audioOnly` step on thermal serious / critical exists behind `Config.allowAudioOnly` —
+  FALSE in this release (an audio-only part costs a server re-encode); with it off, serious is eased.
+  `startingProfile(for:)`: a recording that starts under pressure starts eased (no live change; GPU
+  cannot trigger at start). A failed apply reverts the level and holds off new step-downs for 60 s.
+- **Carried through every stream.** `currentProfile` (what the recording wants) is used at BOTH stream
+  creation sites (`beginCapture`, `rollSegment`) — before this a roll would silently have gone back to
+  5 fps BGRA; `streamProfile` is what the live stream really runs. `applyCaptureProfile(reason:)`
+  converges the live stream onto `currentProfile` (serialised: an update in flight carries on to the
+  newest wish), guarded by recording, no roll in flight, video not stopped, not an audio-only part —
+  otherwise the profile is only remembered and the next video stream starts with it (a roll that raced a
+  change re-applies when it ends). On a throw: logged, the old profile kept, NEVER a part roll.
+- **Wiring.** Every recording `resource_sample` feeds the policy (`ResourceSampler.onRecordingSample`);
+  `ProcessInfo.thermalStateDidChangeNotification` and `NSProcessInfoPowerStateDidChange` tick it at once
+  (thermal + Low Power read live, memory pressure from the last sample). Reset per recording in
+  `start` (with `pinnedSize`). Mode, UserDefaults `captureProfileMode` = `auto` (default) | `eased` |
+  `never`: Settings ▸ Capture: Automatic ✓ / Always eased / Never ease (the title says "(eased now)"
+  while an automatic ease holds), ws `set_capture_profile_mode {mode}`; applies to the running recording
+  at once (`mode_eased` / `mode_never`), `never` = the policy is ignored, `eased` = start eased always.
+- **Events / status** (capture pipeline — both telemetry levels). `capture_profile {recording_id, from,
+  to, reason, values {thermal, gpu_pct, low_power, mem_pressure}, mode, how: policy|mode|forced|start,
+  at_s, applied, deferred?, error?, simulated, fast?, stream {fps, pixel_format, cursor, queue_depth},
+  segment}` on every change attempt (`at_start: true` for a recording that starts eased);
+  `capture_profile_mode_set {mode, previous, source: menu|ws, recording_id}`; `status.capture_profile =
+  {mode}` idle, plus `current`, `stream`, `fps`, `pixel_format`, `eased_seconds`, `changes`,
+  `gpu_high_streak`, `inputs`, `simulated`, `fast` while recording; `recording_started` gains
+  `capture_profile` + `capture_profile_mode`, `segment_started` gains `capture_profile`;
+  `recording_stopped` gains `eased_seconds`, `profile_changes`, `capture_profile_end`,
+  `capture_profile_mode`.
+- **One banner per recording**, on the first step down the live stream really took (not a menu choice,
+  not an audio-only part, not a start already eased): "Easing capture to keep this Mac cool" / "2 fps,
+  still recording", info accent, hides after 6 s. On a fanless Air the ease will likely hold for the
+  whole call, so nothing else is ever shown about it.
+- **Test hooks (ws).** `simulate_capture_pressure {thermal?, gpu_pct?, low_power?, mem_pressure?,
+  clear?: true, fast?: true, reset?: true}` overrides the policy's INPUTS field by field (real readings
+  fill the rest; kept until `reset` or a relaunch, so a start under pressure can be tested too) and
+  ticks it at once; events carry `simulated: true`. `clear` = all clear; `fast` = 2 GPU samples / 20 s
+  clear / 5 s dwell. → broadcast `capture_pressure_simulated {outcome}`. `force_capture_profile
+  {profile: normal|eased}` drives `applyCaptureProfile` directly (`how: forced`; the policy carries on
+  from the forced level) → `capture_profile_forced {outcome}`.
+- **Fixed on the way:** `pinnedSize` was never reset between recordings, so a recording that STARTED
+  audio-only took the previous recording's pixel size for its first video part (0.3.15's comment says it
+  is set there).
+- **Tests:** `swift test` 91 (67 + `CaptureEasePolicyTests` 21 + a new `RecorderCoreTests` target with
+  `VideoCaptureProfileTests` 3: both profiles' `SCStreamConfiguration` fields, 709 colour kept, the eased
+  writer bit rate).
+- **Not verified live** (built 2026-10-01 while Alok's Mac was busy with another E2E: `swift build` + unit
+  tests only, no dev `make-app.sh`). **How to E2E** on a build that holds the Screen Recording grant
+  (ws `ws://127.0.0.1:47800`, a bun `new WebSocket(...)` one-liner as in *Auto-update ▸ Testing*):
+  1. `{cmd:"start", upload:false}` (main display) — `recording_started.capture_profile: "normal"`.
+  2. `{cmd:"simulate_capture_pressure", thermal:"fair", fast:true}` → at once `capture_profile {from:
+     normal, to: eased, reason: thermal_fair, how: policy, applied: true, simulated: true}`, tray.log
+     `capture: stream → eased (2 fps 420v, cursor off, queue 4) in N ms`, the banner once;
+     `{cmd:"status"}` → `capture_profile.current/stream: eased`.
+  3. `{cmd:"simulate_capture_pressure", clear:true}` → ~20–30 s later (20 s clear, next 10 s sample)
+     `capture_profile {to: normal, reason: clear}`; no banner.
+  4. `{cmd:"simulate_capture_pressure", gpu_pct:100}` → after 2 samples `reason: gpu_sustained`; no
+     second banner. `{cmd:"simulate_share", kind:"display"}` while eased → `segment_started
+     .capture_profile: eased` (the roll keeps it; a share by "the call's app" needs a call — otherwise
+     the share is followed for a display recording anyway).
+  5. `{cmd:"force_capture_profile", profile:"normal"}` / `"eased"` → `how: forced`;
+     `{cmd:"set_capture_profile_mode", mode:"never"}` → `capture_profile_mode_set` + `reason: mode_never`;
+     then `mode:"auto"`.
+  6. `{cmd:"stop"}` → `recording_stopped.eased_seconds`, `profile_changes`;
+     `{cmd:"simulate_capture_pressure", reset:true}`.
+  7. The part that switched (part 1 above) — ONE colour header and 4:2:0 throughout:
+     `ffprobe -v error -select_streams v:0 -show_entries stream=pix_fmt,color_range,color_space,color_transfer,color_primaries -of default=nw=1 "<part1>.mp4"`
+     → `pix_fmt=yuv420p`, `color_range=tv`, `bt709` ×3; and
+     `ffprobe -v error -select_streams v:0 -show_entries frame=pts_time,pix_fmt -of csv=p=0 "<part1>.mp4"`
+     → every frame `yuv420p`, frame spacing 0.2 s before the switch and 0.5 s after it (the encoded
+     stream cannot say which source format a frame came from — the spacing change at the
+     `capture_profile.at_s` of step 2 is the evidence that BGRA- and 420v-sourced frames share one part).
+     The server stitch (`-c copy`) of a recording whose parts were created under different profiles must
+     still succeed: size, codec and colour tags are identical, only the bit rate differs.
+
 **0.3.20 (2026-10-01) — diagnostics while on a call: telemetry levels, who is using the CPU/GPU, per-part capture health, "This feels laggy", unclean-exit reports.**
 Recordings lag or lose audio on some Macs and the telemetry could not say whether it was the Mac, the
 call app or our capture. And on 29 Sep 15:10 SGT Ivan's 0.3.18 went silent 35 s after a part roll onto a
