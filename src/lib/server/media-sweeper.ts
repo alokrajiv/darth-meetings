@@ -20,6 +20,7 @@ import {
 import { sweepPendingLocalCopies } from '@/lib/server/aai-from-blob';
 import { listMediaToArchive } from '@/db-ops/recordings';
 import type { GmeetContext } from '@/lib/format';
+import { unlessDraining } from '@/lib/server/deploy-drain';
 
 /**
  * Playback-media preparation (tech-debt A1 + A5).
@@ -439,9 +440,9 @@ export function startMediaSweeper(): void {
   if (g.__mwMediaSweeperStarted) return;
   g.__mwMediaSweeperStarted = true;
   console.log(`[media-sweeper] armed: every ${TICK_MS / 60000}m, ${MAX_PER_TICK} rows/tick, nice -n 15`);
-  const timer = setInterval(() => void tick(), TICK_MS);
+  const timer = setInterval(unlessDraining('media-sweeper', tick), TICK_MS);
   timer.unref?.();
-  setTimeout(() => void tick(), 2 * 60 * 1000).unref?.();
+  setTimeout(unlessDraining('media-sweeper', tick), 2 * 60 * 1000).unref?.();
 }
 
 /** One immediate pass — dev/testing hook. */

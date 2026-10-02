@@ -229,6 +229,125 @@ Claude Agent SDK. Deployed on the .6 dev VM via pm2; nginx in front. The pm2
 app, the VM dir and the DB schema keep the historic `meeting-whisperer` /
 `meeting_whisperer` identifiers on purpose — only the product-facing name changed.
 
+## Deploy
+
+`./deploy.sh` (from the laptop) — blue/green on the .6 VM, no downtime.
+`./deploy.sh --dry-run` prints the plan and what rsync would send, changes
+nothing. `./deploy.sh --help` lists every flag.
+
+Why (2026-10-02 12:10–12:35 SGT): the old script built `.next` IN PLACE under
+the running process (3–5 min of mismatched chunks → "This page couldn't load"
+in the browser and the desktop app), its wait for AI runs matched a darth-chat
+process so the restart never came, and the restart itself was an nginx 502.
+
+**Two colours**, one DB, one storage dir:
+
+| colour | dir | pm2 app | port |
+|---|---|---|---|
+| blue | `~/apps/meeting-whisperer` | `meeting-whisperer` | 3002 |
+| green | `~/apps/meeting-whisperer-green` | `meeting-whisperer-green` | 3012 |
+
+Green's `.env.local` and `storage/` are symlinks to blue's (`MW_STORAGE_DIR`
+unset or relative resolves against each colour's cwd → the symlink; absolute →
+shared anyway). The nginx vhost (`deploy/nginx-meetings.conf`) proxies to
+`upstream meetings_app`, whose servers come from `/etc/nginx/mw-active.conf`:
+the live colour first, the other as `backup` (a refused connect on the live one
+is retried on the backup — `proxy_next_upstream error timeout`, deliberately not
+`http_502`: several API routes return their own 502s). The include file lives
+directly in `/etc/nginx/`, NOT in `conf.d/` (it is only valid inside the
+upstream block). `cat /etc/nginx/mw-active.conf` on the VM = which colour is
+live; run ad-hoc `scripts/*.ts` from that colour's dir.
+
+**A deploy** (`deploy.sh` header has the detail): stop the idle colour → rsync
++ `bun install && bun run build` in ITS dir (the live tree is never touched) →
+drain files in both dirs → start the idle colour and health-check it on its own
+port (`/api/health` 204, `/login` 302) → rewrite `mw-active.conf`, `nginx -t &&
+nginx -s reload` (graceful) → public check (flips back by itself on failure) →
+15 s grace → wait until the OLD colour has no Claude Agent SDK run (only
+processes under `<old dir>/node_modules/@anthropic-ai/claude-agent-sdk*` count —
+darth-chat's `/opt/darth-chat/…` runs no longer block it; 15 s × 60,
+`DEPLOY_FORCE=1` skips) → `pm2 stop` the old colour, `pm2 save` → remove the new
+colour's drain file. Any failure before the flip leaves the live colour exactly
+as it was.
+
+**Background jobs and the overlap.** Every colour arms the in-process
+pollers/sweepers of `src/instrumentation.ts`, and their in-process guards
+(`sweeping`, `globalThis.__mw*` maps) do not reach across processes. Checked job
+by job (2026-10-02):
+
+| job | two processes at once |
+|---|---|
+| ingest-retry | safe — `resetForIngestRetry` is a conditional `UPDATE … RETURNING`; the loser gets "Row changed under us" |
+| gmeet-poller + fast lane | mostly benign (account auto-sync claims via `auto_sync_log` ON CONFLICT; DMs carry dedupe keys); series auto-import has no claim → two near-simultaneous ticks could queue two placeholders |
+| video-fetch-sweeper | wasteful — two full downloads, atomic rename, last one wins |
+| auto-notes-sweeper | risky — notes / speaker-ID backlog runs set `running` unconditionally → two Claude runs on one meeting |
+| recording-poller | risky — queued video reports and recombines are read-then-write → duplicate report run, duplicate combined meeting + AssemblyAI job |
+| deferred-import-poller | risky — the row stays `waiting` during a multi-minute import → a second process imports it again |
+| media-sweeper | risky — the in-place faststart remux uses a fixed temp name (`<src>.faststart.tmp`) → can corrupt the original recording |
+
+So background jobs must never run in both colours, and they don't: a
+`.mw-draining` file in a colour's dir pauses its timer callbacks
+(`src/lib/server/deploy-drain.ts`; a skipped job runs once within 10 s of the
+file going away). The deploy drains the live colour before the new one starts,
+boots the new one drained, and removes the new one's file only after the old
+process is stopped. Background work therefore PAUSES — never overlaps — from
+the drain to the end: normally under a minute; up to 15 min when the old colour
+has an AI run to finish (then the new colour is activated anyway and the old
+one is left running, drained, with a message to stop it). The file stays in the
+retired dir, so a colour pm2 resurrects after a reboot stays passive. HTTP
+never pauses. Real DB claims for the risky jobs (above) would make the drain a
+belt rather than the braces.
+
+**Not switched with the colours:** the `mw-voiceprint` sidecar runs from BLUE's
+`voiceprint/` (deploy.sh keeps that copy current on every deploy; it is still
+not restarted by a deploy, as before).
+
+**One-time VM setup** (the owner runs it; idempotent, never touches blue or the
+live upstream; `deploy.sh` refuses until it has run):
+
+```bash
+ssh azureuser@172.17.0.6 'mkdir -p /tmp/mw-setup' \
+  && scp deploy/setup-blue-green.sh deploy/nginx-meetings.conf deploy/maintenance.html \
+         azureuser@172.17.0.6:/tmp/mw-setup/ \
+  && ssh -t azureuser@172.17.0.6 'bash /tmp/mw-setup/setup-blue-green.sh'
+```
+
+It creates the green dir + symlinks, `/var/www/mw-maintenance/` with
+`maintenance.html`, `/etc/nginx/mw-active.conf` (blue live) if missing, installs
+the vhost (previous copy → `/etc/nginx/mw-meetings-vhost.bak-<ts>`, restored if
+`nginx -t` fails) and registers pm2 `meeting-whisperer-green` with blue's exact
+command, port swapped to 3012, left stopped until the first deploy builds it.
+
+### Maintenance notice
+
+Only ever the owner's own words — no file, no notice; a 5xx is never assumed to
+be a deployment.
+
+```bash
+./deploy.sh --message "Deploying the recorder fixes — back by 12:40 SGT" --eta 10m   # notice, deploy, clear
+./deploy.sh --message "…" --keep-notice                                               # leave it up afterwards
+./deploy.sh --notice "Transcription is slow this afternoon (AssemblyAI)" [--eta 1h]  # post only
+./deploy.sh --clear-notice                                                           # remove only
+```
+
+It writes `/var/www/mw-maintenance/notice.json` `{message, since, eta_at|null,
+build}`; nginx serves it at `/__notice.json` (`Cache-Control: no-store`, 404
+when absent) straight from disk, so it answers while the app is down. Readers
+(`src/lib/maintenance-notice.ts`):
+
+- `<MaintenanceBanner>` in the root layout — polls every 30 s and on focus,
+  "Maintenance until ~HH:MM SGT" when an ETA is set, dismissable per notice;
+- `src/app/global-error.tsx` — replaces Next's built-in "This page couldn't
+  load" page (what users saw on 2026-10-02 — it is the app's page, not the
+  desktop shell's): shows the notice, and for a chunk-load error (a tab on an
+  older build) or while a notice is up polls `/api/health` every 5 s and reloads
+  itself (at most 3 times in 5 min); Reload / Back stay;
+- `deploy/maintenance.html` — nginx's own 502/503/504 page (no colour
+  answering): the notice + ETA, else "Darth Meetings is restarting", retries
+  the URL every 5 s. App-generated 502s pass through untouched;
+- the Darth desktop shell's updating overlay (desktop repo, `src/updating.js`)
+  — the same file, per origin, for every family app.
+
 ## Dev
 
 ```bash

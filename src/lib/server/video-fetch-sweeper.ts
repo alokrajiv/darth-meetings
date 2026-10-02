@@ -9,6 +9,7 @@ import {
   fetchVideoPartFromDrive,
 } from '@/lib/server/recording-fetch';
 import type { GmeetContext } from '@/lib/format';
+import { unlessDraining } from '@/lib/server/deploy-drain';
 
 /**
  * Background video fetcher: rows whose recording is KNOWN (Meet videoFileId /
@@ -149,9 +150,9 @@ export function startVideoFetchSweeper(): void {
   if (started) return;
   started = true;
   console.log(`[video-fetch] armed: every ${TICK_MS / 60000}m`);
-  const timer = setInterval(() => void tick(), TICK_MS);
+  const timer = setInterval(unlessDraining('video-fetch', tick), TICK_MS);
   timer.unref?.();
-  setTimeout(() => void tick(), 90 * 1000).unref?.();
+  setTimeout(unlessDraining('video-fetch', tick), 90 * 1000).unref?.();
 }
 
 /** One immediate pass — dev/testing hook. */

@@ -14,6 +14,7 @@ import { IngestError, ingestLocalAudio } from '@/lib/server/ingest';
 import { queueRecordingGraphSync } from '@/lib/server/recording-sync';
 import { borrowedMediaReason, madeFromRecordingId } from '@/lib/made-early';
 import type { SpeechModel } from '@/lib/aai-language';
+import { unlessDraining } from '@/lib/server/deploy-drain';
 
 /**
  * Re-submits kept-failure rows (status 'error' + gmeet_context.ingestFailure,
@@ -187,8 +188,8 @@ async function tick(): Promise<void> {
 
 export function startIngestRetrySweeper(): void {
   if (guard.timer) return;
-  guard.timer = setInterval(() => void tick(), TICK_MS);
+  guard.timer = setInterval(unlessDraining('ingest-retry', tick), TICK_MS);
   guard.timer.unref?.();
-  setTimeout(() => void tick(), 90_000).unref?.();
+  setTimeout(unlessDraining('ingest-retry', tick), 90_000).unref?.();
   console.log('[ingest-retry] sweeper armed (every 5 min)');
 }

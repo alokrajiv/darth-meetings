@@ -99,6 +99,9 @@ export async function proxy(request: NextRequest) {
     pathname.startsWith('/_next') ||
     pathname.startsWith('/api/auth/') ||
     pathname === '/api/health' ||
+    // The deploy notice: nginx serves it from disk on the VM; anywhere else
+    // (a local dev server) it is a plain 404, never a bounce to sign-in.
+    pathname === '/__notice.json' ||
     pathname === '/favicon.ico' ||
     pathname === '/sw.js' ||
     pathname.startsWith('/icons/')

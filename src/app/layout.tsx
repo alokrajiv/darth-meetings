@@ -4,6 +4,7 @@ import "./globals.css";
 import { SessionKeeper } from "@/components/session-keeper";
 import { SwCleanup } from "@/components/sw-cleanup";
 import { CompanionBanner } from "@/components/companion-banner";
+import { MaintenanceBanner } from "@/components/maintenance-banner";
 import { headers } from "next/headers";
 import { ShellSearchProvider } from "@/components/shell-search";
 import { Toaster } from "@/components/toast";
@@ -66,6 +67,9 @@ export default async function RootLayout({
         {/* One release only (2026-10): unregisters the old offline service
             worker and wipes its caches + IndexedDB. Renders nothing. */}
         <SwCleanup />
+        {/* Client-only: the owner's deploy notice (deploy.sh --message),
+            read from nginx's /__notice.json; nothing when there is none. */}
+        <MaintenanceBanner />
         {/* Client-only: talks to the local Darth Recorder tray (ws://127.0.0.1:47800)
             when one is installed; renders nothing otherwise. */}
         <CompanionBanner />

@@ -13,6 +13,7 @@ import { executeTeamsImport } from '@/lib/server/teams-import-core';
 import { notifyUser, APP_URL } from '@/lib/server/darth-notify';
 import { dm, meetingLine, openLink } from '@/lib/server/dm-copy';
 import type { GmeetContext } from '@/lib/format';
+import { unlessDraining } from '@/lib/server/deploy-drain';
 
 /**
  * Runs imports that were queued while the provider was still preparing the
@@ -487,14 +488,14 @@ async function tick(): Promise<void> {
  * dedupes overlap with the interval.
  */
 export function kickDeferredImportPoller(): void {
-  setTimeout(() => void tick(), 500).unref?.();
+  setTimeout(unlessDraining('deferred-import', tick), 500).unref?.();
 }
 
 export function startDeferredImportPoller(): void {
   if (pollerState.started) return;
   pollerState.started = true;
   console.log(`[deferred-import] armed: every ${TICK_MS / 1000}s`);
-  const timer = setInterval(() => void tick(), TICK_MS);
+  const timer = setInterval(unlessDraining('deferred-import', tick), TICK_MS);
   timer.unref?.();
-  setTimeout(() => void tick(), 20 * 1000).unref?.();
+  setTimeout(unlessDraining('deferred-import', tick), 20 * 1000).unref?.();
 }

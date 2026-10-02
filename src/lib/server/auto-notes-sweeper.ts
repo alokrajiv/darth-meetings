@@ -41,6 +41,7 @@ import { generateAutoNotes, identifySpeakers } from '@/lib/server/auto-notes';
 import { sendDarthDm } from '@/lib/server/darth-notify';
 import { scratchTrashedDm } from '@/lib/server/dm-copy';
 import { SCRATCH_TTL_DAYS } from '@/lib/format';
+import { unlessDraining } from '@/lib/server/deploy-drain';
 
 /**
  * Watchdog for the AI passes. Every SWEEP_MS:
@@ -411,8 +412,8 @@ export function startAutoNotesSweeper(): void {
   if (started) return;
   started = true;
   console.log(`[notes-sweeper] armed: every ${SWEEP_MS / 60000}m, grace ${GRACE_MINUTES}m`);
-  const timer = setInterval(() => void sweep(), SWEEP_MS);
+  const timer = setInterval(unlessDraining('notes-sweeper', sweep), SWEEP_MS);
   timer.unref?.();
   // First pass shortly after boot so a restart-orphaned run recovers fast.
-  setTimeout(() => void sweep(), 60 * 1000).unref?.();
+  setTimeout(unlessDraining('notes-sweeper', sweep), 60 * 1000).unref?.();
 }
