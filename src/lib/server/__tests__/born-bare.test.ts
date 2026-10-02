@@ -11,7 +11,7 @@
  * P7/P8".
  */
 import { afterEach, beforeAll, beforeEach, describe, expect, mock, test } from 'bun:test';
-import { readFileSync } from 'node:fs';
+import { readdirSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import {
   createFakeSql,
@@ -367,5 +367,198 @@ describe('the tray’s “Open transcript” on a recording', () => {
     expect(res.headers.get('location')).toBe(`http://localhost/recording/${RID}?link=1`);
     const other = await proxy(new NextRequest(`http://localhost/transcript/rec-not-a-uuid`)).catch(() => null);
     expect(other?.headers.get('location') ?? '').not.toContain('/recording/');
+  });
+});
+
+/**
+ * Prod, 2026-10-02 (transcripts 1054 / recording 02af969f…): Ivan linked a
+ * recording to a meeting while it was still transcribing. The meeting was
+ * born 'processing' with a minted UUID id and NO job; the listing's pending
+ * query COALESCEd the NULL job id to the minted meeting id, asked AssemblyAI
+ * about it, got a 404 and flipped the meeting to 'error' — so the settle
+ * (which only matched 'processing') skipped it when the recording landed 33 s
+ * later, and Retry re-ingested the RECORDING's file under the meeting's name.
+ */
+describe('meetings made early from a recording (prod 2026-10-02)', () => {
+  const MEETING = '2bd949dd-c829-4cdd-a2b6-d2a86b2eefd5';
+  const FAILURE = {
+    stage: 'aai-job', message: 'This job no longer exists at AssemblyAI', firstAt: 'x', at: 'x',
+    attempts: 1, nextAt: null, retryable: false, opts: { originalFilename: null },
+  };
+  const madeEarlyRow = (over: Record<string, unknown> = {}) => ({
+    id: 1054,
+    user_id: A.userId,
+    assemblyai_id: MEETING,
+    aai_job_id: null,
+    status: 'error',
+    deleted_at: null,
+    imported_content: null,
+    title: null,
+    local_audio_path: `${RID}.mp4`,
+    gmeet_context: {
+      fromRecording: { recordingId: RID, how: 'link', at: '2026-10-02T01:32:34Z' },
+      clips: [{ ord: 0, recordingId: RID, fromMs: 0, toMs: null, offsetMs: 0 }],
+      ingestFailure: FAILURE,
+    },
+    ...over,
+  });
+  const rec = (over: Record<string, unknown> = {}) => ({
+    id: RID, owner_user_id: A.userId, active_transcription_id: 'txn-1', deleted_at: null,
+    standalone: true, upload_state: {}, ...over,
+  });
+  const txn = (status: string, payload: unknown = status === 'completed' ? { utterances: [] } : null) => ({
+    id: 'txn-1', recording_id: RID, status, payload, provider_job_id: 'job-9a87', created_at: new Date().toISOString(),
+  });
+  /** Canned answers for the recording + transcription + meeting reads. */
+  const world = (o: { meeting?: unknown; recording?: unknown; transcription?: unknown; settled?: unknown[] }) => {
+    respond = (q) => {
+      if (q.text.includes('information_schema.columns')) return [{ n: q.text.includes("'standalone'") ? 6 : 1 }];
+      if (/recordings r WHERE r\.id = \$\d+::uuid AND r\.standalone/.test(q.text)) return o.recording ? [o.recording] : [];
+      if (/FROM "[a-z_]+"\.recording_transcriptions WHERE recording_id = ANY/.test(q.text)) {
+        return o.transcription ? [o.transcription] : [];
+      }
+      if (/SELECT \* FROM "[a-z_]+"\.transcripts WHERE user_id = /.test(q.text)) return o.meeting ? [o.meeting] : [];
+      if (/UPDATE "[a-z_]+"\.transcripts t SET status = 'completed'/.test(q.text)) return o.settled ?? [];
+      return [];
+    };
+  };
+  const ranIngest = () =>
+    sql.executed.some((q) => /UPDATE "[a-z_]+"\.transcripts SET status = 'uploading'/.test(q.text));
+
+  test('the job-id SQL twin: with the column present it IS the column — never the meeting id', async () => {
+    const { jobIdFragments } = await import('@/db-ops/aai-job-id');
+    for (const alias of ['t', null] as const) {
+      const present = jobIdFragments(true, alias);
+      for (const f of [present.expr, present.expr2, present.column]) {
+        const frag = f as unknown as { text: string };
+        expect(frag.text).not.toContain('COALESCE');
+        expect(frag.text).not.toContain('assemblyai_id');
+        expect(frag.text).toContain('aai_job_id');
+      }
+      // 045 missing: the pre-1b answer, also under the column's NAME, so a JS
+      // reader never sees a NULL that means "unknown".
+      const absent = jobIdFragments(false, alias);
+      expect((absent.expr as unknown as { text: string }).text).toContain('assemblyai_id ~*');
+      expect((absent.column as unknown as { text: string }).text).toMatch(/END AS aai_job_id$/);
+    }
+  });
+
+  test('no query anywhere repairs a NULL job id from the meeting id', () => {
+    const root = join(import.meta.dir, '..', '..', '..');
+    const offenders: string[] = [];
+    for (const f of readdirSync(root, { recursive: true }) as string[]) {
+      if (!/\.tsx?$/.test(f) || f.includes('__tests__')) continue;
+      const src = readFileSync(join(root, f), 'utf8');
+      if (/COALESCE\(\s*(t\.)?aai_job_id\s*,/.test(src)) offenders.push(f);
+    }
+    expect(offenders).toEqual([]);
+    // The pollers' candidate lists all take the job from the shared twin.
+    const transcripts = readFileSync(join(root, 'db-ops/transcripts.ts'), 'utf8');
+    for (const fn of ['listPendingVisibleToUser', 'jobIdsForVisibleMeetings', 'listStrandedAtAai', 'listStuckAtAai']) {
+      const body = transcripts.slice(transcripts.indexOf(`export async function ${fn}(`)).split('\nexport ')[0]!;
+      expect(body).toContain('await jobIdSql(');
+      expect(body).toMatch(/\$\{job\.expr2?\}/);
+    }
+  });
+
+  test('the settle heals a made-early meeting sitting in error, and drops its failure marker', async () => {
+    await standalone.materialiseMeetingsMadeEarly(RID);
+    const q = sql.executed.find((x) => /UPDATE "[a-z_]+"\.transcripts t SET status = 'completed'/.test(x.text))!;
+    expect(q.text).toContain("t.status IN ('processing', 'error')");
+    expect(q.text).toContain('t.imported_content IS NULL');
+    expect(q.text).toContain("t.gmeet_context->'fromRecording'->>'recordingId' = r.id::text");
+    expect(q.text).toContain("- 'ingestFailure'");
+    expect(q.text).toContain("x.status = 'completed' AND x.payload IS NOT NULL");
+  });
+
+  test('opening the meeting heals it: refreshBornBare on an already-transcribed recording still runs the settle', async () => {
+    const { refreshBornBare } = await import('@/lib/server/born-bare');
+    world({ recording: rec({ ready_notified_at: new Date().toISOString() }), transcription: txn('completed') });
+    expect(await refreshBornBare(RID)).toBe(true);
+    const settle = sql.executed.find((x) => /UPDATE "[a-z_]+"\.transcripts t SET status = 'completed'/.test(x.text));
+    expect(settle?.params).toContain(RID);
+  });
+
+  test('reopen after a recording retry: owner-scoped, only error rows without text, marker dropped', async () => {
+    await standalone.reopenMeetingsMadeEarly(A.userId, RID);
+    const q = sql.executed.find((x) => /SET status = 'processing'/.test(x.text))!;
+    expect(q.text).toContain('t.user_id = $');
+    expect(q.params).toContain(A.userId);
+    expect(q.text).toContain("t.status = 'error' AND t.imported_content IS NULL");
+    expect(q.text).toContain("- 'ingestFailure'");
+  });
+
+  test('a re-sent job resets the transcription’s clock and leftovers; the same job recorded twice does not', async () => {
+    await standalone.recordStandaloneHandOff({
+      recordingId: RID,
+      canonical: { id: 'm1', filename: `${RID}.mp4`, bytes: null, hasVideo: true, sourceRef: {} },
+      parts: [],
+      transcription: { id: 'txn-1', providerJobId: 'job-new', speechModel: null, languageCode: null, status: 'processing' },
+    });
+    const q = sql.executed.find((x) => /INSERT INTO "[a-z_]+"\.recording_transcriptions/.test(x.text))!;
+    expect(q.text).toMatch(/created_at = CASE WHEN recording_transcriptions\.provider_job_id IS DISTINCT FROM EXCLUDED\.provider_job_id THEN now\(\)/);
+    expect(q.text).toMatch(/payload = CASE WHEN recording_transcriptions\.provider_job_id IS DISTINCT FROM EXCLUDED\.provider_job_id THEN NULL/);
+  });
+
+  test('Retry, recording transcribed: the settle fills the meeting — nothing is re-ingested or renamed', async () => {
+    const { retryIngest } = await import('@/lib/server/ingest-retry');
+    world({
+      meeting: madeEarlyRow(),
+      recording: rec(),
+      transcription: txn('completed'),
+      settled: [{ user_id: A.userId, assemblyai_id: MEETING }],
+    });
+    const out = await retryIngest({ user_id: A.userId, assemblyai_id: MEETING }, 'manual');
+    expect(out).toEqual({ ok: true, id: MEETING });
+    const settle = sql.executed.find((x) => /UPDATE "[a-z_]+"\.transcripts t SET status = 'completed'/.test(x.text))!;
+    expect(settle.params).toContain(RID);
+    expect(ranIngest()).toBe(false);
+  });
+
+  test('Retry, recording still transcribing: a clear no-op', async () => {
+    const { retryIngest } = await import('@/lib/server/ingest-retry');
+    world({ meeting: madeEarlyRow(), recording: rec(), transcription: txn('processing') });
+    const out = await retryIngest({ user_id: A.userId, assemblyai_id: MEETING }, 'manual');
+    expect(out.ok).toBe(false);
+    expect(!out.ok && out.error).toContain('still being transcribed');
+    expect(ranIngest()).toBe(false);
+    expect(sql.executed.some((x) => /UPDATE "[a-z_]+"\.transcripts/.test(x.text))).toBe(false);
+  });
+
+  test('Retry, recording transcription failed: the RECORDING is re-sent (here: its file is gone, so it says so)', async () => {
+    const { retryIngest } = await import('@/lib/server/ingest-retry');
+    world({ meeting: madeEarlyRow(), recording: rec(), transcription: txn('error') });
+    const out = await retryIngest({ user_id: A.userId, assemblyai_id: MEETING }, 'manual');
+    expect(out.ok).toBe(false);
+    // It went down the recording's retry: the canonical media was looked up
+    // (none → the recording is marked, never the meeting re-ingested).
+    expect(sql.executed.some((x) => /FROM "[a-z_]+"\.recording_media WHERE recording_id = /.test(x.text))).toBe(true);
+    expect(ranIngest()).toBe(false);
+    expect(sql.executed.some((x) => /SET status = 'processing'/.test(x.text))).toBe(false);
+  });
+
+  test('Retry never touches someone else’s recording, and the sweeper never re-sends a borrower', async () => {
+    const { retryIngest } = await import('@/lib/server/ingest-retry');
+    world({ meeting: madeEarlyRow(), recording: rec({ owner_user_id: 'someone-else' }), transcription: txn('completed') });
+    const other = await retryIngest({ user_id: A.userId, assemblyai_id: MEETING }, 'manual');
+    expect(other.ok).toBe(false);
+    expect(sql.executed.some((x) => /UPDATE "[a-z_]+"\.transcripts/.test(x.text))).toBe(false);
+
+    sql.executed.length = 0;
+    world({ meeting: madeEarlyRow(), recording: rec(), transcription: txn('error') });
+    const swept = await retryIngest({ user_id: A.userId, assemblyai_id: MEETING }, 'sweeper');
+    expect(swept.ok).toBe(false);
+    expect(sql.executed.some((x) => /recording_media|recordings r/.test(x.text))).toBe(false);
+    expect(ranIngest()).toBe(false);
+  });
+
+  test('Retry on a meeting SPLIT off another: refused, the borrowed file stays where it is', async () => {
+    const { retryIngest } = await import('@/lib/server/ingest-retry');
+    world({
+      meeting: madeEarlyRow({ gmeet_context: { splitFrom: { assemblyaiId: 'src' }, ingestFailure: FAILURE } }),
+    });
+    const out = await retryIngest({ user_id: A.userId, assemblyai_id: MEETING }, 'manual');
+    expect(out.ok).toBe(false);
+    expect(ranIngest()).toBe(false);
   });
 });

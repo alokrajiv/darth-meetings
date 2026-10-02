@@ -17,6 +17,7 @@ import {
   mergeStandaloneState,
   recordStandaloneHandOff,
   releaseReadyNotification,
+  reopenMeetingsMadeEarly,
   setStandaloneGroupPart,
   standaloneColumnsExist,
   standaloneMedia,
@@ -45,6 +46,7 @@ import { settleMeetingsMadeEarly } from '@/lib/server/recording-settle';
 import { mediaIdFor, transcriptionIdFor } from '@/lib/recording-graph';
 import { AAI_GONE_REASON, AAI_STUCK_MS, AAI_STUCK_REASON } from '@/lib/aai-job-state';
 import { notifyUser, APP_URL } from '@/lib/server/darth-notify';
+import { publishEvent } from '@/lib/server/event-bus';
 import { dm, meetingLine } from '@/lib/server/dm-copy';
 import { partHashesInOrder, uploadIdentityHash, normalizeSha256 } from '@/lib/same-file';
 import type { DarthUser } from '@/lib/auth/session';
@@ -551,10 +553,44 @@ async function keepFailure(
 /**
  * The sweeper's retry of a kept hand-off: the bytes are already under their
  * permanent name, so this is only the AssemblyAI half again.
+ *
+ * `afterFailedTranscription`: also re-send a recording whose transcription
+ * AssemblyAI ACCEPTED and then failed (active transcription in 'error') —
+ * the Retry of a meeting made from it (`retryRecordingForMeeting`). The new
+ * job lands on the SAME transcription row (`recordStandaloneHandOff` resets
+ * its clock and drops the failed job's leftovers). Never the sweeper's: a
+ * job AssemblyAI failed is retried by a human.
  */
-export async function retryBornBareIngest(recordingId: string): Promise<boolean> {
+export async function retryBornBareIngest(
+  recordingId: string,
+  opts: { afterFailedTranscription?: boolean } = {}
+): Promise<boolean> {
   const rec = await getStandalone(recordingId);
-  if (!rec || rec.deleted_at || rec.active_transcription_id) return false;
+  if (!rec || rec.deleted_at) return false;
+  if (rec.active_transcription_id) {
+    if (!opts.afterFailedTranscription) return false;
+    const { listRecordingTranscriptions } = await import('@/db-ops/recordings');
+    const txn = (await listRecordingTranscriptions([recordingId])).find(
+      (t) => t.id === rec.active_transcription_id
+    );
+    if (txn?.status !== 'error') return false;
+  }
+  // One re-send per recording at a time in this process: the AssemblyAI
+  // upload of a long call takes minutes, and two clicks must not pay twice.
+  if (retrying.has(recordingId)) return false;
+  retrying.add(recordingId);
+  try {
+    return await resendToAai(rec);
+  } finally {
+    retrying.delete(recordingId);
+  }
+}
+
+const gr = globalThis as unknown as { __mwBornBareRetrying?: Set<string> };
+const retrying = (gr.__mwBornBareRetrying ??= new Set<string>());
+
+async function resendToAai(rec: StandaloneRecordingRow): Promise<boolean> {
+  const recordingId = rec.id;
   const canonical = (await standaloneMedia(recordingId)).find((m) => m.kind === 'canonical');
   if (!canonical?.filename || !(await audioFileExists(canonical.filename))) {
     const now = new Date().toISOString();
@@ -598,7 +634,7 @@ export async function retryBornBareIngest(recordingId: string): Promise<boolean>
     },
     parts: [],
     transcription: {
-      id: transcriptionIdFor(recordingId),
+      id: rec.active_transcription_id ?? transcriptionIdFor(recordingId),
       providerJobId: jobId,
       speechModel: model,
       languageCode: rec.upload_state?.languageCode ?? null,
@@ -608,6 +644,79 @@ export async function retryBornBareIngest(recordingId: string): Promise<boolean>
   console.log(`[born-bare] retried hand-off of recording ${recordingId} → job ${jobId}`);
   watchTranscription(recordingId);
   return true;
+}
+
+/** What Retry on a meeting made from a recording did. */
+export type RecordingRetryForMeeting =
+  | { kind: 'settled'; meetings: number }
+  | { kind: 'retrying' }
+  | { kind: 'waiting'; message: string }
+  | { kind: 'refused'; message: string };
+
+/**
+ * Retry on a meeting MADE from a recording (`gmeet_context.fromRecording`).
+ * The meeting has no transcription and no file of its own — both are the
+ * recording's — so this NEVER re-ingests: on prod 2026-10-02 the generic
+ * retry sent the recording's canonical file to AssemblyAI a second time AND
+ * renamed it after the meeting, which broke the recording's own media row.
+ *
+ *   - the recording's transcription is completed with text → the settle
+ *     fills the meeting in (`settled`);
+ *   - it failed (or its hand-off did) → the RECORDING is re-sent
+ *     (`retryBornBareIngest`) and the meeting goes back to 'processing' for
+ *     the settle to fill (`retrying`);
+ *   - it is still uploading / transcribing → nothing to do (`waiting`).
+ *
+ * Owner-scoped: the recording must belong to the meeting's owner (a meeting
+ * can only be made from its owner's own recording).
+ */
+export async function retryRecordingForMeeting(
+  ownerUserId: string,
+  recordingId: string
+): Promise<RecordingRetryForMeeting> {
+  const rec = await getStandalone(recordingId);
+  if (!rec || rec.deleted_at || rec.owner_user_id !== ownerUserId) {
+    return { kind: 'refused', message: 'The recording this meeting was made from is gone — there is nothing to retry.' };
+  }
+  const { listRecordingTranscriptions } = await import('@/db-ops/recordings');
+  const txn = rec.active_transcription_id
+    ? (await listRecordingTranscriptions([recordingId])).find((t) => t.id === rec.active_transcription_id)
+    : undefined;
+
+  if (txn?.status === 'completed') {
+    const n = await settleMeetingsMadeEarly(recordingId, { status: 'completed' });
+    if (n > 0) return { kind: 'settled', meetings: n };
+    return {
+      kind: 'refused',
+      message: txn.payload
+        ? 'This meeting already has its text, or no longer reads it from the recording.'
+        : 'The recording finished without a transcript — re-transcribe the recording.',
+    };
+  }
+
+  const handOffFailed = !txn && !!rec.upload_state?.ingestFailure;
+  if (txn?.status === 'error' || handOffFailed) {
+    const sent = await retryBornBareIngest(recordingId, { afterFailedTranscription: true });
+    if (!sent) {
+      const again = await getStandalone(recordingId);
+      return {
+        kind: 'refused',
+        message: again?.upload_state?.ingestFailure?.message
+          ? `Sending the recording to transcription failed again (${again.upload_state.ingestFailure.message}).`
+          : 'The recording could not be sent to transcription again.',
+      };
+    }
+    for (const m of await reopenMeetingsMadeEarly(ownerUserId, recordingId)) {
+      publishEvent({ kind: 'status', assemblyaiId: m.assemblyai_id });
+    }
+    return { kind: 'retrying' };
+  }
+
+  return {
+    kind: 'waiting',
+    message:
+      'The recording this meeting was made from is still being transcribed — the meeting fills in by itself when it lands.',
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -658,7 +767,14 @@ export async function refreshBornBare(recordingId: string): Promise<boolean> {
   );
   if (!txn) return false;
   if (txn.status !== 'processing') {
-    if (txn.status === 'completed') await notifyReadyOnce(rec);
+    if (txn.status === 'completed') {
+      // Already landed — but a meeting made from it may still be waiting
+      // (or sitting in 'error' because something gave up on it before the
+      // text arrived — prod 2026-10-02). The settle is one UPDATE that
+      // matches nothing on a healthy day.
+      await settleEarly(recordingId, { status: 'completed' });
+      await notifyReadyOnce(rec);
+    }
     return true;
   }
   if (!txn.provider_job_id) return false;
