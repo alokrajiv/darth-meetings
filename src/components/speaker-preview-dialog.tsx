@@ -29,6 +29,7 @@ import { formatTime, type SpeakerLabel, type SpeakerSuggestionMap } from '@/lib/
 import { defaultSpeakerLabel } from '@/lib/speaker-display';
 import { speakerNameState } from '@/lib/speaker-name-state';
 import { UserPicker, type PickerPerson } from '@/components/user-picker';
+import { fileMsOf, servedIsWholeFile, type ServedPlayback } from '@/lib/clip-window';
 
 interface Utterance {
   text: string;
@@ -82,6 +83,11 @@ interface SpeakerPreviewDialogProps {
    * one-recording meeting, which is every meeting on prod.
    */
   sourceTagOf?: ((speaker: string) => string | null) | null;
+  /**
+   * How the served `audioSrc` maps onto the meeting's timeline — the main
+   * player's `ServedPlayback` (lib/clip-window.ts). Null/absent = 1:1.
+   */
+  served?: ServedPlayback | null;
 }
 
 const TOP_N_SEGMENTS = 5;
@@ -138,6 +144,7 @@ export function SpeakerPreviewDialog({
   onPickPerson,
   onRequestCreatePerson,
   sourceTagOf,
+  served = null,
 }: SpeakerPreviewDialogProps) {
   const [speaker, setSpeaker] = useState(initialSpeaker);
   const [cursor, setCursor] = useState(0);
@@ -247,12 +254,29 @@ export function SpeakerPreviewDialog({
     return u ? u.start / 1000 : null;
   }, [currentSegment, utterances]);
 
+  /**
+   * Media seconds for a MEETING position: the served file is the server's
+   * cut (lib/clip-cut.ts), which for a meeting split off a recording — or one
+   * with a split-off hole — is not the meeting's own timeline. Same mapping
+   * as the main player (lib/clip-window.ts), including its stale-whole-file
+   * fallback once the element knows its duration.
+   */
+  const servedRef = useRef(served);
+  servedRef.current = served;
+  const mediaSecOf = useCallback((el: HTMLMediaElement, meetingSec: number): number => {
+    const s = servedRef.current;
+    if (!s) return meetingSec;
+    const durMs = Number.isFinite(el.duration) ? el.duration * 1000 : null;
+    const window = servedIsWholeFile(durMs, s.cutSpanMs) ? s.wholeFileWindow : s.window;
+    return fileMsOf(meetingSec * 1000, window) / 1000;
+  }, []);
+
   const seekToFocus = useCallback(() => {
     const audio = audioRef.current;
     if (!audio || focusStartSec == null) return;
     const apply = () => {
       try {
-        audio.currentTime = focusStartSec;
+        audio.currentTime = mediaSecOf(audio, focusStartSec);
       } catch {
         /* readyState too low */
       }
@@ -267,7 +291,7 @@ export function SpeakerPreviewDialog({
       audio.addEventListener('loadedmetadata', onMeta, { once: true });
       audio.load();
     }
-  }, [focusStartSec]);
+  }, [focusStartSec, mediaSecOf]);
 
   useEffect(() => {
     if (open) seekToFocus();
@@ -289,7 +313,7 @@ export function SpeakerPreviewDialog({
     if (!u) return;
     const audio = audioRef.current;
     if (!audio) return;
-    audio.currentTime = u.start / 1000;
+    audio.currentTime = mediaSecOf(audio, u.start / 1000);
     if (audio.paused) void audio.play();
   };
 

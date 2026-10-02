@@ -3725,6 +3725,9 @@ function TranscriptDetailInner({ transcriptId }: { transcriptId: string }) {
                       ? `/api/transcripts/${row.assemblyai_id}/audio`
                       : null
                   }
+                  // The plain /audio is the server's cut of the meeting's first
+                  // recording: same mapping as the main player.
+                  audioServed={playerServed}
                   hasVideo={hasLocalVideo}
                   collapsed={!!collapsedSections.speakers}
                   onToggleCollapse={() => toggleSection('speakers')}

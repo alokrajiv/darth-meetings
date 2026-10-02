@@ -5,6 +5,7 @@ import { Card, CardContent, CardHeader } from '@/components/ui/card';
 import { PersonChip } from '@/components/person-chip';
 import { type PickerPerson } from '@/components/user-picker';
 import { SpeakerPreviewDialog } from '@/components/speaker-preview-dialog';
+import type { ServedPlayback } from '@/lib/clip-window';
 import { ChevronDown, ChevronUp, Fingerprint, MicOff, Pencil, Sparkles, Users } from 'lucide-react';
 import type { GmeetAttendee, SpeakerLabel, SpeakerSuggestionMap } from '@/lib/format';
 import { personDisplay } from '@/lib/person-display';
@@ -30,6 +31,9 @@ interface PeopleCardProps {
   onRequestCreatePerson: (originalSpeaker: string, name: string) => void;
   /** /api/transcripts/[id]/audio — voice samples in the dialog. Null = no audio. */
   audioSrc: string | null;
+  /** How `audioSrc` (the server's cut) maps onto the meeting's timeline —
+   * the main player's `ServedPlayback`. Absent = 1:1. */
+  audioServed?: ServedPlayback | null;
   hasVideo?: boolean;
   collapsed?: boolean;
   onToggleCollapse?: () => void;
@@ -72,6 +76,7 @@ export function PeopleCard({
   onPickPerson,
   onRequestCreatePerson,
   audioSrc,
+  audioServed = null,
   hasVideo,
   collapsed,
   onToggleCollapse,
@@ -325,6 +330,7 @@ export function PeopleCard({
           speakerLabels={speakerLabels}
           suggestions={suggestions}
           audioSrc={audioSrc}
+          served={audioServed}
           hasVideo={hasVideo}
           canEdit={canEdit}
           onSave={onSave}

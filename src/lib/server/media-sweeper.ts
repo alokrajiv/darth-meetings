@@ -21,6 +21,7 @@ import { sweepPendingLocalCopies } from '@/lib/server/aai-from-blob';
 import { listMediaToArchive } from '@/db-ops/recordings';
 import type { GmeetContext } from '@/lib/format';
 import { unlessDraining } from '@/lib/server/deploy-drain';
+import { precutBackstopPass } from '@/lib/server/clip-precut';
 
 /**
  * Playback-media preparation (tech-debt A1 + A5).
@@ -42,6 +43,11 @@ import { unlessDraining } from '@/lib/server/deploy-drain';
  *     under `nice -n 15`, one log line per row. Also the A5 lifecycle pass:
  *     `.m4a` derivatives whose source file is gone (permanent delete, a
  *     re-transcribe that renamed the source) are removed, one line each.
+ *
+ * The same tick queues the CLIP CUTS that should exist and do not
+ * (`precutBackstopPass`, lib/server/clip-precut.ts): a meeting whose clips
+ * hold a window or a hole is served a cut, normally made when the clips were
+ * written; this catches the ones made before that, or lost.
  *
  * The same tick also runs the MEDIA ARCHIVE backfill (DEC-3 Stage A.3,
  * `media-archive.ts`): local files with no blob yet are copied to the
@@ -410,6 +416,15 @@ async function tick(): Promise<void> {
     }
   } catch (err) {
     console.warn('[media-sweeper] candidate query failed:', err);
+  }
+  try {
+    // Clip cuts (lib/server/clip-precut.ts, M2): a meeting whose clips hold a
+    // window or a hole and whose cut is not on disk is queued — a few per
+    // tick, one ffmpeg at a time, off this tick (the queue runs it). The
+    // first tick after a start is the startup backstop.
+    await precutBackstopPass();
+  } catch (err) {
+    console.warn('[clip-cut] pre-cut backstop failed:', err);
   }
   try {
     await sweepOrphanDerivatives();

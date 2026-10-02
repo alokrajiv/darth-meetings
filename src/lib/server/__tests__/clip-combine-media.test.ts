@@ -48,6 +48,7 @@ function media(over: Partial<ResolvedMedia> = {}): ResolvedMedia {
     audioOnly: null,
     windowFromMs: null,
     windowToMs: null,
+    keptMs: null,
     ...over,
   };
 }

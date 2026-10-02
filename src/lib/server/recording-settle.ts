@@ -2,6 +2,7 @@ import 'server-only';
 import { failMeetingsMadeEarly, materialiseMeetingsMadeEarly } from '@/db-ops/standalone-recordings';
 import { onTranscriptCompleted } from '@/lib/server/post-completion';
 import { prepareMediaForPlayback } from '@/lib/server/media-sweeper';
+import { queueClipPrecut } from '@/lib/server/clip-precut';
 import { queueRecordingGraphSync } from '@/lib/server/recording-sync';
 import { publishEvent } from '@/lib/server/event-bus';
 
@@ -36,6 +37,7 @@ export async function settleMeetingsMadeEarly(
     if (outcome.status !== 'completed') continue;
     queueRecordingGraphSync(m.user_id, m.assemblyai_id, 'recording-settle');
     prepareMediaForPlayback(m.user_id, m.assemblyai_id);
+    queueClipPrecut(m.assemblyai_id, 'recording-settle');
     onTranscriptCompleted(m.user_id, m.assemblyai_id, { utterances: null, silent: true });
   }
   // Recordings that JOINED another meeting of the same occurrence while they

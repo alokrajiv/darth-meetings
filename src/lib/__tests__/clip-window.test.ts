@@ -19,6 +19,7 @@ import {
   meetingMsOf,
   pastWindowEnd,
   servedIsWholeFile,
+  servedMsOfFile,
   servedPlaybackForPart,
   servedPlaybackFromContext,
   windowDurationMs,
@@ -27,7 +28,7 @@ import {
   windowOfClips,
   type PlaybackWindow,
 } from '@/lib/clip-window';
-import { holesOf, type ClipWindow } from '@/lib/clips';
+import { holesOf, keptSegmentsFor, type ClipWindow } from '@/lib/clips';
 
 const RECORDING = '33333333-aaaa-4aaa-8aaa-333333333333';
 const OTHER = '44444444-bbbb-4bbb-8bbb-444444444444';
@@ -217,14 +218,83 @@ describe('the media the server serves — a cut that starts at 0', () => {
     expect(served.cutSpanMs).toBe(TO - FROM);
   });
 
-  it('a meeting never split, and a source with a hole in the middle, are served whole', () => {
-    for (const ctx of [{}, null, { clips: SOURCE }]) {
+  it('a meeting never split is served whole', () => {
+    for (const ctx of [{}, null]) {
       expect(servedPlaybackFromContext(ctx, HOUR / 1000)).toEqual({
         window: null,
         wholeFileWindow: null,
         cutSpanMs: null,
       });
     }
+  });
+
+  it('a source with a hole in the MIDDLE is served the two kept stretches, back to back (M1)', () => {
+    const served = servedPlaybackFromContext({ clips: SOURCE }, HOUR / 1000);
+    // The meeting keeps its own timeline; the hole is a gap the mapping steps over.
+    expect(served.window).toEqual({ fromMs: 0, toMs: null, gaps: [{ fromMs: FROM, toMs: TO }] });
+    const w = served.window;
+    // Before the hole: 1:1.
+    expect(fileMsOf(600_000, w)).toBe(600_000);
+    expect(meetingMsOf(600_000, w)).toBe(600_000);
+    // After it: the served file is (TO − FROM) shorter, and maps back exactly.
+    expect(fileMsOf(2_400_000, w)).toBe(2_400_000 - (TO - FROM));
+    expect(meetingMsOf(2_400_000 - (TO - FROM), w)).toBe(2_400_000);
+    // The served second at the cut IS meeting `to` (half-open, like a clip)…
+    expect(meetingMsOf(FROM, w)).toBe(TO);
+    expect(meetingMsOf(FROM - 1, w)).toBe(FROM - 1);
+    // …and a seek INTO the hole lands where it was cut — i.e. on `to`.
+    expect(fileMsOf(1_500_000, w)).toBe(FROM);
+    expect(meetingMsOf(fileMsOf(1_500_000, w), w)).toBe(TO);
+    // The scrubber still spans the meeting's own hour; the served file is shorter.
+    expect(served.cutSpanMs).toBe(HOUR - (TO - FROM));
+    expect(windowDurationMs(w, HOUR - (TO - FROM))).toBe(HOUR);
+    expect(clampMeetingMs(HOUR + 5_000, w, HOUR - (TO - FROM))).toBe(HOUR);
+    // No `to` on the window: the served file ends where the meeting does.
+    expect(pastWindowEnd(HOUR, w)).toBe(false);
+    // A copy of the WHOLE file (stale cache) is recognised and played the old
+    // way: no window, the player's hole skip.
+    expect(servedIsWholeFile(HOUR, served.cutSpanMs)).toBe(true);
+    expect(served.wholeFileWindow).toBeNull();
+  });
+
+  it('two holes: every gap is stepped over, in order', () => {
+    const A = 600_000;
+    const B = 900_000;
+    const clips: ClipWindow[] = [
+      { ord: 0, recordingId: RECORDING, fromMs: 0, toMs: A, offsetMs: 0 },
+      { ord: 1, recordingId: RECORDING, fromMs: B, toMs: FROM, offsetMs: B },
+      { ord: 2, recordingId: RECORDING, fromMs: TO, toMs: null, offsetMs: TO },
+    ];
+    const served = servedPlaybackFromContext({ clips }, HOUR / 1000);
+    const w = served.window;
+    expect(w?.gaps).toEqual([
+      { fromMs: A, toMs: B },
+      { fromMs: FROM, toMs: TO },
+    ]);
+    const removed = B - A + (TO - FROM);
+    expect(fileMsOf(3_000_000, w)).toBe(3_000_000 - removed);
+    expect(meetingMsOf(3_000_000 - removed, w)).toBe(3_000_000);
+    expect(meetingMsOf(A, w)).toBe(B);
+    expect(meetingMsOf(A + (FROM - B), w)).toBe(TO);
+    // Round trip at every meeting second that is the meeting's own.
+    for (const m of [0, A - 1, B, B + 1_000, FROM - 1, TO, TO + 7_000, HOUR - 1]) {
+      expect(meetingMsOf(fileMsOf(m, w), w)).toBe(m);
+    }
+    expect(served.cutSpanMs).toBe(HOUR - removed);
+  });
+
+  it('a source that lost its opening AND a middle stretch: a lead and a gap', () => {
+    const A = 300_000;
+    const clips: ClipWindow[] = [
+      { ord: 1, recordingId: RECORDING, fromMs: A, toMs: FROM, offsetMs: A },
+      { ord: 2, recordingId: RECORDING, fromMs: TO, toMs: null, offsetMs: TO },
+    ];
+    const served = servedPlaybackFromContext({ clips }, HOUR / 1000);
+    expect(served.window).toEqual({ fromMs: -A, toMs: null, gaps: [{ fromMs: FROM, toMs: TO }] });
+    expect(meetingMsOf(0, served.window)).toBe(A);
+    expect(fileMsOf(TO + 1_000, served.window)).toBe(FROM - A + 1_000);
+    expect(served.cutSpanMs).toBe(HOUR - A - (TO - FROM));
+    expect(served.wholeFileWindow).toEqual({ fromMs: A, toMs: null });
   });
 
   it('a source whose split took its LAST minutes is cut at the end and maps 1:1', () => {
@@ -267,14 +337,38 @@ describe('the media the server serves — a cut that starts at 0', () => {
     });
   });
 
-  it('two clips on one recording: each is its window INSIDE the shared cut', () => {
+  it('two clips on one recording: each is its window INSIDE the shared cut, the gap cut out', () => {
     const parts = [
       { ord: 0, recordingId: OTHER, fromMs: 100_000, toMs: 200_000, offsetMs: 0 },
       { ord: 1, recordingId: OTHER, fromMs: 500_000, toMs: 700_000, offsetMs: 100_000 },
     ];
-    // The server cuts the bounds: 100 000 → 700 000.
+    // The server cuts 100 000 → 200 000 and 500 000 → 700 000, back to back:
+    // 200 000 → 500 000 is not this meeting's and is not in the bytes.
     expect(servedPlaybackForPart(parts[0]!, parts).window).toEqual({ fromMs: 0, toMs: 100_000 });
-    expect(servedPlaybackForPart(parts[1]!, parts).window).toEqual({ fromMs: 400_000, toMs: null });
+    expect(servedPlaybackForPart(parts[1]!, parts).window).toEqual({ fromMs: 100_000, toMs: null });
+    expect(servedPlaybackForPart(parts[1]!, parts).cutSpanMs).toBe(300_000);
+  });
+
+  it('a part of a recording whose middle is not the meeting’s is mapped inside the holed cut', () => {
+    const parts = [
+      { ord: 0, recordingId: OTHER, fromMs: 0, toMs: FROM, offsetMs: 0 },
+      { ord: 1, recordingId: OTHER, fromMs: TO, toMs: null, offsetMs: 50_000 },
+    ];
+    expect(servedPlaybackForPart(parts[0]!, parts).window).toEqual({ fromMs: 0, toMs: FROM });
+    expect(servedPlaybackForPart(parts[1]!, parts).window).toEqual({ fromMs: FROM, toMs: null });
+    expect(servedPlaybackForPart(parts[1]!, parts).cutSpanMs).toBeNull(); // open end: unknown
+  });
+
+  it('servedMsOfFile: file ms → the concatenation, a removed stretch landing on the next kept second', () => {
+    const kept = [
+      { fromMs: 100, toMs: 200 },
+      { fromMs: 500, toMs: null },
+    ];
+    expect(servedMsOfFile(50, kept)).toBe(0);
+    expect(servedMsOfFile(150, kept)).toBe(50);
+    expect(servedMsOfFile(300, kept)).toBe(100);
+    expect(servedMsOfFile(500, kept)).toBe(100);
+    expect(servedMsOfFile(900, kept)).toBe(500);
   });
 
   it('windowInCut re-bases a window and drops it when it IS the cut', () => {
@@ -294,5 +388,33 @@ describe('the media the server serves — a cut that starts at 0', () => {
     expect(servedIsWholeFile(HOUR, span)).toBe(true);
     expect(servedIsWholeFile(HOUR, null)).toBe(false); // unknown span: trust the cut
     expect(servedIsWholeFile(null, span)).toBe(false);
+  });
+});
+
+describe('keptSegmentsFor — what the server cuts a file to (the one definition both sides use)', () => {
+  it('the source after a split: two stretches with the hole between them', () => {
+    expect(keptSegmentsFor(SOURCE, RECORDING)).toEqual([
+      { fromMs: 0, toMs: FROM },
+      { fromMs: TO, toMs: null },
+    ]);
+  });
+
+  it('touching or overlapping clips are one stretch; other recordings are ignored', () => {
+    const clips: ClipWindow[] = [
+      { ord: 2, recordingId: RECORDING, fromMs: FROM, toMs: null, offsetMs: FROM },
+      { ord: 0, recordingId: RECORDING, fromMs: 0, toMs: FROM, offsetMs: 0 },
+      { ord: 1, recordingId: OTHER, fromMs: 5, toMs: 10, offsetMs: 0 },
+    ];
+    expect(keptSegmentsFor(clips, RECORDING)).toEqual([{ fromMs: 0, toMs: null }]);
+    expect(
+      keptSegmentsFor(
+        [
+          { ord: 0, recordingId: RECORDING, fromMs: 0, toMs: TO, offsetMs: 0 },
+          { ord: 1, recordingId: RECORDING, fromMs: FROM, toMs: HOUR, offsetMs: 0 },
+        ],
+        RECORDING
+      )
+    ).toEqual([{ fromMs: 0, toMs: HOUR }]);
+    expect(keptSegmentsFor(clips, '55555555-cccc-4ccc-8ccc-555555555555')).toEqual([]);
   });
 });

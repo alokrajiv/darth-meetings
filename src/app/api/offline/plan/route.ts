@@ -6,6 +6,9 @@ import { listOfflinePlanRows, type OfflinePlanRow } from '@/db-ops/offline-plan'
 import { resolveAudioPath } from '@/lib/server/audio-storage';
 import { hasVideoStream } from '@/lib/server/video-frames';
 import { resolveMediaForMeetings, type ResolvedMedia } from '@/lib/server/recordings';
+import { cutPlanOf, estimateCutBytes } from '@/lib/clip-cut';
+import type { GmeetContext } from '@/lib/format';
+import { findClipCut, storedFileDurationMs } from '@/lib/server/clip-cut';
 
 export const runtime = 'nodejs';
 
@@ -41,8 +44,16 @@ export interface PlanMeetingPart {
   part: number;
   filename: string;
   isVideo: boolean;
-  /** Stored size, null when the file is missing on disk. */
+  /**
+   * What `/audio?part=N` serves, in bytes; null when the file is missing on
+   * disk. For a file the meeting holds only a window of (or has a hole in) the
+   * route serves a CUT (lib/clip-cut.ts): its size once it has been made,
+   * else an estimate — the stored size in proportion to the kept time —
+   * flagged `estimated`. Whole files: the stored size, as always.
+   */
   bytes: number | null;
+  /** `bytes` is an estimate: the cut has not been made yet. */
+  estimated?: true;
 }
 
 export interface PlanMeeting {
@@ -93,14 +104,18 @@ export const GET = withAuth(async ({ user, request }) => {
   );
   // One media resolve for the whole page, not one per meeting: the plan is
   // asked for up to 200 ids at a time. The plan row is skinny, so the
-  // fallback path gets the two columns it reads (the offsets the resolver
-  // would compute from `actuals` are not part of the plan).
+  // fallback path gets the columns it reads — the parts, and the clip mirror
+  // that carries a window or a hole (the offsets the resolver would compute
+  // from `actuals` are not part of the plan).
   const media = await resolveMediaForMeetings(
     rows.map((r) => ({
       id: r.id,
       duration: r.duration,
       local_audio_path: r.local_audio_path,
-      gmeet_context: { videoParts: Array.isArray(r.video_parts) ? r.video_parts : undefined },
+      gmeet_context: {
+        videoParts: Array.isArray(r.video_parts) ? r.video_parts : undefined,
+        ...(r.clips != null ? { clips: r.clips as GmeetContext['clips'] } : {}),
+      },
     }))
   );
   const meetings = await mapLimit(rows, PROBE_CONCURRENCY, (row) =>
@@ -127,12 +142,17 @@ async function toPlanMeeting(
   // on their own (they are only playable next to the primary).
   const canonical = media.find((m) => m.part === 1);
   if (canonical) {
-    const bytes = await storedBytes(canonical.filename);
-    hasLocal = bytes !== null;
+    const stored = await storedBytes(canonical.filename);
+    hasLocal = stored !== null;
     // ffprobe-backed (cached per filename): the stored extension is only a
     // hint for the primary — Drive names arrive without one.
     isVideo = hasLocal ? await hasVideoStream(canonical.filename) : false;
-    parts.push({ part: 1, filename: canonical.filename, isVideo, bytes });
+    parts.push({
+      part: 1,
+      filename: canonical.filename,
+      isVideo,
+      ...(await servedBytes(row.assemblyai_id, canonical, stored, isVideo)),
+    });
 
     // Part numbers are positional, so a file whose bytes haven't landed yet
     // is absent from the resolver's media rather than renumbering the rest.
@@ -142,7 +162,7 @@ async function toPlanMeeting(
         part: m.part,
         filename: m.filename,
         isVideo: m.isVideo === true,
-        bytes: await storedBytes(m.filename),
+        ...(await servedBytes(row.assemblyai_id, m, await storedBytes(m.filename), m.isVideo === true)),
       });
     }
   }
@@ -157,6 +177,39 @@ async function toPlanMeeting(
     rev: row.rev,
     media: { hasLocal, isVideo, parts },
   };
+}
+
+/**
+ * The size of what `/audio` serves for one file of this meeting: the stored
+ * size for a whole file; for a window or a hole the cut's size when it is on
+ * disk, else an estimate (stored × kept ms / file ms) flagged `estimated` —
+ * the stored size itself, still flagged, when the file's length is unknown.
+ * Never MAKES a cut: the plan is a read.
+ */
+async function servedBytes(
+  meetingId: string,
+  m: ResolvedMedia,
+  stored: number | null,
+  isVideo: boolean
+): Promise<{ bytes: number | null; estimated?: true }> {
+  const segments = cutPlanOf(m);
+  if (!segments) return { bytes: stored };
+  const cut = await findClipCut({
+    meetingId,
+    sourceFilename: m.filename,
+    segments,
+    variant: 'av',
+    part: m.part,
+    sourceHasVideo: isVideo,
+    media: m,
+  });
+  if (cut) return { bytes: cut.bytes };
+  if (stored === null) return { bytes: null };
+  // The FILE's length: the graph's media row has it; the row fallback's
+  // `durationMs` is the meeting's (a split-off meeting's window), so probe.
+  const fileMs = m.mediaId && m.durationMs ? m.durationMs : await storedFileDurationMs(m.filename);
+  const estimate = estimateCutBytes({ sourceBytes: stored, sourceDurationMs: fileMs, segments });
+  return { bytes: estimate ?? stored, estimated: true };
 }
 
 async function storedBytes(filename: string): Promise<number | null> {

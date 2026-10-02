@@ -470,6 +470,45 @@ export function windowBoundsFor(
   return { fromMs: from, toMs: to };
 }
 
+/** One stretch of a recording's FILE that a meeting holds, file ms. `toMs: null` = to the end. */
+export interface FileSegment {
+  fromMs: number;
+  toMs: number | null;
+}
+
+/**
+ * The stretches of ONE recording's file a meeting holds: its clips on that
+ * recording in file order, with overlapping and touching ones merged. `[]`
+ * when the meeting holds no clip on it.
+ *
+ * The first segment's start and the last one's end are `windowBoundsFor`;
+ * anything BETWEEN two segments is a hole in the middle of the file (a split
+ * without `keepInBoth`, or two clips of one recording in a combined meeting)
+ * whose bytes are somebody else's meeting. This is what the server cuts a
+ * meeting's media to (lib/clip-cut.ts `cutPlanOf`) and what the player maps
+ * through (lib/clip-window.ts `servedPlaybackFromContext`), so the two can
+ * never disagree about what was removed.
+ */
+export function keptSegmentsFor(
+  clips: ReadonlyArray<Pick<ClipWindow, 'recordingId' | 'fromMs' | 'toMs'>>,
+  recordingId: string
+): FileSegment[] {
+  const mine = clips
+    .filter((c) => c.recordingId === recordingId)
+    .map((c) => ({ fromMs: c.fromMs, toMs: c.toMs }))
+    .sort((a, b) => a.fromMs - b.fromMs || (a.toMs ?? Infinity) - (b.toMs ?? Infinity));
+  const out: FileSegment[] = [];
+  for (const c of mine) {
+    const last = out[out.length - 1];
+    if (last && (last.toMs === null || c.fromMs <= last.toMs)) {
+      last.toMs = last.toMs === null || c.toMs === null ? null : Math.max(last.toMs, c.toMs);
+      continue;
+    }
+    out.push({ ...c });
+  }
+  return out;
+}
+
 // ---------------------------------------------------------------------------
 // The split itself
 // ---------------------------------------------------------------------------

@@ -21,6 +21,7 @@ import { queueRecordingGraphSync } from '@/lib/server/recording-sync';
 import { prepareMediaForPlayback } from '@/lib/server/media-sweeper';
 import { onTranscriptCompleted } from '@/lib/server/post-completion';
 import { addClip } from '@/lib/server/clip-combine';
+import { queueClipPrecut } from '@/lib/server/clip-precut';
 import { purgeStandaloneRecording, refreshBornBare } from '@/lib/server/born-bare';
 import { suggestedEventFromMatch } from '@/lib/server/recorder-match';
 import { isClipTextPolicy, type ClipTextPolicy } from '@/lib/recording-clips';
@@ -270,6 +271,9 @@ async function makeMeeting(
   queueRecordingGraphSync(caller.userId, made.assemblyaiId, `recording-${opts.how}`);
   if (made.ready) {
     prepareMediaForPlayback(caller.userId, made.assemblyaiId);
+    // A meeting made over a WINDOW of the recording is served cut (a whole
+    // recording — today's only shape — costs the pre-cut one row read).
+    queueClipPrecut(made.assemblyaiId, `recording-${opts.how}`);
     onTranscriptCompleted(caller.userId, made.assemblyaiId, { utterances: null, silent: true });
   }
   // Not ready: the meeting was born 'processing' and lib/server/recording-settle.ts

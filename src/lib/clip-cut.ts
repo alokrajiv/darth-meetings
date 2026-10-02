@@ -9,6 +9,9 @@
  * every minute of the recording with a plain GET. Now a windowed file is served
  * as a CUT rendition — produced once with ffmpeg, cached on disk — and the
  * bytes outside the window never leave the server through a meeting route.
+ * Since M1 (same day) that includes a hole in the MIDDLE: a source meeting
+ * whose middle stretch was split off is served the concatenation of what it
+ * kept (`cutPlanOf`), so the hole's bytes are not fetchable either.
  *
  * This file is the PURE half: what counts as windowed, the cache key, the
  * ffmpeg argument lists, the keyframe-safety decision, the "is the copy
@@ -21,11 +24,18 @@
  */
 
 import { createHash } from 'node:crypto';
+import { keptSegmentsFor, storedClipsInContext } from '@/lib/clips';
 
 /** The window of ONE stored file a meeting uses (`ResolvedMedia.windowFromMs/ToMs`). */
 export interface MediaWindowLike {
   windowFromMs: number | null;
   windowToMs: number | null;
+  /**
+   * `ResolvedMedia.keptMs`: the stretches of the file the meeting holds when
+   * there is MORE than one — a hole in the middle. Absent/null = the bounds
+   * above say everything.
+   */
+  keptMs?: ReadonlyArray<{ fromMs: number; toMs: number | null }> | null;
 }
 
 /** A real window, in file ms. `toMs: null` = to the end of the file. */
@@ -35,19 +45,64 @@ export interface CutWindow {
 }
 
 /**
- * The cut a meeting's media route must serve for this file, or null when the
- * meeting holds the WHOLE file (served as-is, no copy).
+ * The single window of this file the meeting's bounds describe, or null when
+ * the bounds are the whole file.
  *
  * Windowed = `from > 0` or a `to` — exactly `windowBoundsFor`'s non-null
- * answer. A source meeting with a hole in the middle keeps `null/null` there
- * (it still plays from 0 to the end) and is therefore NOT cut; see the module
- * header of lib/server/clip-cut.ts for why that is the one case left alone.
+ * answer. It says nothing about a hole in the MIDDLE (a source meeting keeps
+ * `null/null` bounds there): `cutPlanOf` is what the routes ask.
  */
 export function cutWindowOf(m: MediaWindowLike): CutWindow | null {
   const from = m.windowFromMs ?? 0;
   const to = m.windowToMs ?? null;
   if (from <= 0 && to === null) return null;
   return { fromMs: Math.max(0, Math.round(from)), toMs: to === null ? null : Math.round(to) };
+}
+
+/**
+ * What a meeting's media route serves for this file: null = the WHOLE file
+ * (no copy — the fast path), else the kept SEGMENTS, in file order, that the
+ * served rendition is the concatenation of.
+ *
+ * One segment = a window (a split-off meeting, a combined clip). Two or more
+ * = a hole in the middle (a source meeting that had a stretch split off
+ * without `keepInBoth`; cut since M1, 2026-10-02): the stretch between them is
+ * somebody else's meeting, and its bytes are cut out — not merely skipped by
+ * the player. Fractional ms are rounded so the cache key is stable.
+ */
+export function cutPlanOf(m: MediaWindowLike): CutWindow[] | null {
+  const kept = m.keptMs ?? null;
+  if (kept && kept.length >= 2) {
+    return kept.map((k) => ({
+      fromMs: Math.max(0, Math.round(k.fromMs)),
+      toMs: k.toMs === null ? null : Math.round(k.toMs),
+    }));
+  }
+  const w = cutWindowOf(m);
+  return w ? [w] : null;
+}
+
+/**
+ * Does a meeting ROW's clip mirror (`gmeet_context.clips`) make any of its
+ * files served cut — a window or a hole on some recording? The media
+ * sweeper's pre-cut backstop (lib/server/clip-precut.ts) reads this off the
+ * row before it pays for resolving the meeting's media. Absent or malformed
+ * mirror = the whole recording, never cut.
+ */
+export function clipMirrorNeedsCut(gmeetContext: { clips?: unknown } | null | undefined): boolean {
+  const stored = storedClipsInContext(gmeetContext);
+  if (!stored) return false;
+  for (const recordingId of new Set(stored.map((c) => c.recordingId))) {
+    const kept = keptSegmentsFor(stored, recordingId);
+    if (kept.length > 1) return true;
+    if (kept.length === 1 && (kept[0]!.fromMs > 0 || kept[0]!.toMs !== null)) return true;
+  }
+  return false;
+}
+
+/** `1200000-2000000_2400000-end` — a plan as it appears in a cut's name and log line. */
+export function segmentsLabel(segments: readonly CutWindow[]): string {
+  return segments.map((s) => `${s.fromMs}-${s.toMs ?? 'end'}`).join('_');
 }
 
 // ---------------------------------------------------------------------------
@@ -58,12 +113,15 @@ export function cutWindowOf(m: MediaWindowLike): CutWindow | null {
 export type CutVariant = 'av' | 'audio';
 
 /**
- * `${MW_STORAGE_DIR}/clips/<meeting>/<variant>.<from>-<to|end>.<src8>.<ext>`.
+ * `${MW_STORAGE_DIR}/clips/<meeting>/<variant>.<from>-<to|end>[_<from>-<to|end>…].<src8>.<ext>`.
  *
- * Everything that decides the BYTES is in the name — the meeting, the window,
- * the source file (an 8-hex hash of its stored name) and the variant — so a
- * cut can never be served for a window or a file it was not made from, even
- * if a cleanup hook was missed: a re-split simply asks for a different name.
+ * Everything that decides the BYTES is in the name — the meeting, EVERY kept
+ * segment (one for a window; several, `_`-joined, for a file with a hole in
+ * the middle), the source file (an 8-hex hash of its stored name) and the
+ * variant — so a cut can never be served for a window, a hole or a file it
+ * was not made from, even if a cleanup hook was missed: a re-split simply
+ * asks for a different name. A one-segment name is exactly the name a window
+ * cut had before holes were cut, so caches made then stay valid.
  * The extension is NOT in the stem because it depends on which attempt
  * succeeded (a stream copy keeps the source container, a re-encode is mp4/m4a);
  * `cutAttempts` lists the candidates in order.
@@ -75,21 +133,39 @@ export type CutVariant = 'av' | 'audio';
 export function clipCutStem(input: {
   meetingId: string;
   sourceFilename: string;
-  window: CutWindow;
+  segments: readonly CutWindow[];
   variant: CutVariant;
 }): { dir: string; stem: string } {
   if (!/^[A-Za-z0-9_-]+$/.test(input.meetingId)) {
     throw new Error(`Refusing unsafe meeting id for the clip cache: ${input.meetingId}`);
   }
-  const { fromMs, toMs } = input.window;
-  if (!Number.isInteger(fromMs) || fromMs < 0 || (toMs !== null && (!Number.isInteger(toMs) || toMs <= fromMs))) {
-    throw new Error(`Refusing an invalid cut window ${fromMs}-${toMs}`);
-  }
+  assertValidSegments(input.segments);
   const src = createHash('md5').update(input.sourceFilename).digest('hex').slice(0, 8);
   return {
     dir: `clips/${input.meetingId}`,
-    stem: `${input.variant}.${fromMs}-${toMs ?? 'end'}.${src}`,
+    stem: `${input.variant}.${segmentsLabel(input.segments)}.${src}`,
   };
+}
+
+/**
+ * Integer ms, in file order, strictly apart (`keptSegmentsFor` merges touching
+ * segments, so a plan that touches is not canonical and would name the same
+ * bytes two ways), and only the LAST may run to the end. Anything else throws:
+ * it is a bug upstream, never something to cut.
+ */
+function assertValidSegments(segments: readonly CutWindow[]): void {
+  if (segments.length === 0) throw new Error('Refusing an empty cut plan');
+  let prevTo = -1;
+  segments.forEach(({ fromMs, toMs }, i) => {
+    const last = i === segments.length - 1;
+    const bad =
+      !Number.isInteger(fromMs) ||
+      fromMs < 0 ||
+      fromMs <= prevTo ||
+      (toMs === null ? !last : !Number.isInteger(toMs) || toMs <= fromMs);
+    if (bad) throw new Error(`Refusing an invalid cut plan ${segmentsLabel(segments)}`);
+    prevTo = toMs ?? Number.POSITIVE_INFINITY;
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -159,6 +235,8 @@ export function cutAttempts(input: {
   variant: CutVariant;
   /** `codec_name` of the first audio stream, lower-case; null = unknown/none. */
   audioCodec: string | null;
+  /** For a plan of several segments: true only when EVERY segment's start is
+   * keyframe-safe — one attempt is applied to all of them (`buildConcatArgs`). */
   keyframeSafe: boolean;
 }): CutAttempt[] {
   const ext = extOf(input.sourceFilename);
@@ -244,6 +322,30 @@ export function buildCutArgs(input: {
   return args;
 }
 
+/**
+ * Joining the per-segment cuts of a plan with a hole in the middle into ONE
+ * served file: the concat DEMUXER over the segment files, stream-copied.
+ *
+ * That is only sound when every segment was produced the SAME way — all
+ * stream copies of one source, or all re-encodes with one setting — because
+ * the demuxer takes the codec parameters from the first file. The runner
+ * therefore applies ONE attempt to every segment (`cutAttempts` with the
+ * keyframe verdict AND-ed over the segments) and never mixes them.
+ */
+export function buildConcatArgs(input: { list: string; out: string; attempt: CutAttempt }): string[] {
+  const a = input.attempt;
+  const args = ['-y', '-loglevel', 'error', '-nostdin', '-f', 'concat', '-safe', '0', '-i', input.list];
+  args.push('-map', '0', '-c', 'copy', '-avoid_negative_ts', 'make_zero');
+  if (a.format === 'mp4' || ISO_BMFF.has(a.ext)) args.push('-movflags', '+faststart');
+  args.push('-f', a.format, input.out);
+  return args;
+}
+
+/** The concat demuxer's list file: one `file '<path>'` line per segment, quotes escaped. */
+export function concatListBody(paths: readonly string[]): string {
+  return paths.map((p) => `file '${p.replace(/'/g, "'\\''")}'\n`).join('');
+}
+
 // ---------------------------------------------------------------------------
 // Verdicts
 // ---------------------------------------------------------------------------
@@ -302,6 +404,38 @@ export function expectedCutMs(window: CutWindow, sourceDurationMs: number | null
         : window.toMs;
   if (end === null) return null;
   return Math.max(0, end - window.fromMs);
+}
+
+/**
+ * The served length of a whole plan: the sum of its segments. Null when any
+ * segment's length cannot be known (open-ended, unknown source duration).
+ */
+export function expectedPlanMs(segments: readonly CutWindow[], sourceDurationMs: number | null): number | null {
+  let total = 0;
+  for (const s of segments) {
+    const ms = expectedCutMs(s, sourceDurationMs);
+    if (ms === null) return null;
+    total += ms;
+  }
+  return total;
+}
+
+/**
+ * What the served rendition of a plan should weigh before it has been cut
+ * (`GET /api/offline/plan`, 2026-10-02 M3): the source's bytes in proportion
+ * to the kept time. A re-encode does not keep the source's bitrate, so this
+ * is an ESTIMATE and the plan flags it. Null when a length is unknown.
+ */
+export function estimateCutBytes(input: {
+  sourceBytes: number | null;
+  sourceDurationMs: number | null;
+  segments: readonly CutWindow[];
+}): number | null {
+  const { sourceBytes, sourceDurationMs } = input;
+  if (sourceBytes === null || sourceDurationMs === null || sourceDurationMs <= 0) return null;
+  const kept = expectedPlanMs(input.segments, sourceDurationMs);
+  if (kept === null) return null;
+  return Math.round(sourceBytes * Math.min(1, kept / sourceDurationMs));
 }
 
 /**

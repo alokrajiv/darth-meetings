@@ -9,7 +9,7 @@ import {
   type ClipTextPolicy,
   isClipTextPolicy,
 } from '@/lib/recording-clips';
-import { windowBoundsFor, type ClipWindow } from '@/lib/clips';
+import { keptSegmentsFor, windowBoundsFor, type ClipWindow, type FileSegment } from '@/lib/clips';
 import { storedClipsInContext as storedClipsFromContext } from '@/lib/recording-graph';
 import {
   loadMeetingRecordingGraph,
@@ -93,15 +93,21 @@ export interface ResolvedMedia {
    * plays every second, it just has a hole in the middle (the clips say where;
    * `holesOf` in lib/clips.ts turns them into the gaps the player skips).
    *
-   * A split-off meeting gets real bounds. Nothing is cut: `/audio` serves the
-   * same bytes as always and the PLAYER clamps — displayed time is file time
-   * minus `windowFromMs`, seeking maps back, playback stops at `windowToMs`.
-   * The ms mapping itself is `localMsIn`, which every frame grab and every
-   * voiceprint snippet already goes through.
+   * A split-off meeting gets real bounds. Since 2026-10-02 `/audio` serves
+   * the window CUT (lib/clip-cut.ts); server-side readers of the SOURCE file
+   * (frame grabs, voiceprint snippets) still map meeting ms onto the file with
+   * `localMsIn`.
    */
   windowFromMs: number | null;
   /** null = to the end of the file. */
   windowToMs: number | null;
+  /**
+   * The stretches of this file the meeting holds, in file order, when there
+   * is MORE than one — a hole in the middle (`keptSegmentsFor`). null = the
+   * bounds above say everything. `/audio` serves the concatenation of these
+   * (lib/clip-cut.ts `cutPlanOf`), so the hole's bytes are never served.
+   */
+  keptMs: FileSegment[] | null;
 }
 
 /**
@@ -193,6 +199,7 @@ function mediaFromRow(row: MediaOnlyRow): ResolvedMedia[] {
     const stored = storedClipsFromContext(row.gmeet_context);
     const first = stored ? [...stored].sort(compareClipsOnTimeline)[0]! : null;
     const window = first ? windowBoundsFor(stored!, first.recordingId) : null;
+    const kept = first ? keptSegmentsFor(stored!, first.recordingId) : [];
     const base = first ? first.offsetMs - first.fromMs : 0;
     media.push({
       part: 1,
@@ -210,6 +217,7 @@ function mediaFromRow(row: MediaOnlyRow): ResolvedMedia[] {
       audioOnly: null,
       windowFromMs: window?.fromMs ?? null,
       windowToMs: window?.toMs ?? null,
+      keptMs: kept.length > 1 ? kept : null,
     });
   }
   // The extra videos of a stop-restart Meet recording, placed by the SAME
@@ -231,6 +239,7 @@ function mediaFromRow(row: MediaOnlyRow): ResolvedMedia[] {
       // window of the canonical file (a multi-part meeting refuses to split).
       windowFromMs: null,
       windowToMs: null,
+      keptMs: null,
     });
   }
   return media;
@@ -283,7 +292,7 @@ function mediaForRecordings(
   orderedRecordingIds: string[],
   graph: MeetingRecordingGraph,
   clipOffsetMs: Map<string, number>,
-  windows: Map<string, { fromMs: number | null; toMs: number | null }>
+  windows: Map<string, RecordingWindow>
 ): ResolvedMedia[] {
   const out: ResolvedMedia[] = [];
   // Derivatives by the media they were built from. `graph.media` already
@@ -328,6 +337,7 @@ function mediaForRecordings(
         // stop/restart parts cannot be split at all.
         windowFromMs: m.kind === 'canonical' ? (windows.get(recordingId)?.fromMs ?? null) : null,
         windowToMs: m.kind === 'canonical' ? (windows.get(recordingId)?.toMs ?? null) : null,
+        keptMs: m.kind === 'canonical' ? (windows.get(recordingId)?.kept ?? null) : null,
       });
     }
   }
@@ -348,7 +358,7 @@ function placeRecordings(
 ): {
   orderedRecordingIds: string[];
   clipOffsetMs: Map<string, number>;
-  windows: Map<string, { fromMs: number | null; toMs: number | null }>;
+  windows: Map<string, RecordingWindow>;
 } {
   const orderedRecordingIds: string[] = [];
   const clipOffsetMs = new Map<string, number>();
@@ -365,9 +375,20 @@ function placeRecordings(
     toMs: c.to_ms,
     offsetMs: c.offset_ms,
   }));
-  const windows = new Map<string, { fromMs: number | null; toMs: number | null }>();
-  for (const id of orderedRecordingIds) windows.set(id, windowBoundsFor(asWindows, id));
+  const windows = new Map<string, RecordingWindow>();
+  for (const id of orderedRecordingIds) {
+    const kept = keptSegmentsFor(asWindows, id);
+    windows.set(id, { ...windowBoundsFor(asWindows, id), kept: kept.length > 1 ? kept : null });
+  }
   return { orderedRecordingIds, clipOffsetMs, windows };
+}
+
+/** What a meeting holds of one recording's file: its bounds, plus the kept
+ * segments when there is a hole in the middle (`ResolvedMedia.keptMs`). */
+interface RecordingWindow {
+  fromMs: number | null;
+  toMs: number | null;
+  kept: FileSegment[] | null;
 }
 
 /**

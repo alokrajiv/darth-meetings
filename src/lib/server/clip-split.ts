@@ -38,6 +38,8 @@ import {
   type MeetingClipRow,
 } from '@/db-ops/clips';
 import { applyMeetingClips, listSiblingMeetingsForRecordings } from '@/db-ops/recordings';
+import { dropClipCuts } from '@/lib/server/clip-cut-store';
+import { queueClipPrecut } from '@/lib/server/clip-precut';
 import { meetingCopyCount } from '@/db-ops/transcriptions';
 import {
   createForUser,
@@ -619,6 +621,11 @@ export async function splitMeeting(input: SplitInput): Promise<ClipOpResult<Spli
     details: { newId, fromMs: plan.recordingFromMs, toMs: plan.recordingToMs, keepInBoth: !!input.keepInBoth },
   });
 
+  // Both halves are now served CUT (the new meeting its window, the source
+  // the rest with a hole): start the cuts now rather than on first play.
+  queueClipPrecut(newId, 'split');
+  if (!input.keepInBoth) queueClipPrecut(row.assemblyai_id, 'split');
+
   const fresh = await getForUser(access.ownerUserId, newId);
   return {
     ok: true,
@@ -785,6 +792,10 @@ export async function unsplitMeeting(
   await removeRecordingGraphForMeeting(row.id, 'unsplit');
   await deleteForUser(access.ownerUserId, row.assemblyai_id);
   await removeRecordingGraphForMeeting(row.id, 'unsplit/after');
+  // The split-off meeting's cuts go with it; the source's new shape (whole
+  // again, or a smaller hole) is cut now rather than on first play.
+  await dropClipCuts(row.assemblyai_id);
+  queueClipPrecut(sourceAccess.row.assemblyai_id, 'unsplit');
 
   void logActivity({
     transcriptId: sourceAccess.row.id,
