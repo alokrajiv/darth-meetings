@@ -5,6 +5,7 @@ import { OCCURRENCE_WINDOW_S } from '@/lib/meeting-evidence';
 import { IMPORTED_OCCURRENCE_START } from '@/db-ops/imported-occurrences';
 import type { RecorderMatch } from '@/lib/recorder';
 import type { SuggestedEvent } from '@/lib/format';
+import type { TrayLocalDisk } from '@/lib/companion/local-disk';
 
 /**
  * Darth Recorder registry (migration 041) — devices, telemetry events and
@@ -55,7 +56,9 @@ export interface RecorderDeviceRow {
   first_seen: string;
   last_seen: string;
   last_ip: string | null;
-  last_status: Record<string, unknown> | null;
+  /** The tray's status snapshot from its last heartbeat, verbatim (`statusPayload()` in
+   * poc/mac-recorder/Sources/darth-tray/main.swift). 0.3.22+ trays add `local_disk`. */
+  last_status: (Record<string, unknown> & { local_disk?: TrayLocalDisk }) | null;
 }
 
 export interface RecorderRecordingRow {

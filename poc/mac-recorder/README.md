@@ -14,6 +14,44 @@ Native macOS side of Darth Meetings recording (the "Swift tray" angle from Darth
 the user switched it off in the menu (`loginItemUserChoice` in UserDefaults records an explicit choice;
 the default never overrides it). macOS may show "Darth Recorder was added as a login item" once.
 
+**0.3.22 (2026-10-02) — local disk accounting: how much of this Mac the recorder holds, and why.**
+Alok's Mac had ~491 MiB under `~/Movies/Darth Recorder` while the registry knew of 5.1 MB still to upload;
+the rest were files no registry row referenced (pre-registry recordings from 2026-09-15 and the like). The
+question "where is all this stored, and how much is not uploaded?" had no answer short of `du`.
+
+- **Buckets** (`DiskUsage` in TrayLogic, pure; only files that EXIST count): `pending_upload` = rows
+  `local` / `uploading` / `upload_failed` (a row with no status counts as `local`) — exactly what
+  `pendingUpload(automatic: false)` ("Upload … now") would send; `kept` = the part of pending whose row says
+  `upload: false` (a SUBSET of pending, not added twice); `uploaded` = `uploaded` rows whose files are still
+  here (the 1 h purge of 0.3.19 has not run yet); `recording` = the live recording's parts (every file under
+  `<dir>/<id>/` of a `recording` row — the open part is not in `files` until it closes); `orphan` = files
+  under the folder no non-`deleted` row references (deleted rows' leftovers included). A live recording's
+  folder is never orphaned. A file referenced twice counts once. `total = pending + uploaded + recording +
+  orphan`.
+- **Where it runs** (`DiskUsageMonitor`, darth-tray). Never on main: a utility queue stats ONLY the
+  registry's files, at most every 5 s (a trailing run catches a burst's last change), triggered by every
+  status snapshot, `refreshMenu` and the menu opening (the main menu now has the `NSMenuDelegate`). The folder
+  walk (`FileManager.enumerator`, names + sizes, hidden files skipped, nothing opened) runs at launch and then
+  at most every 5 minutes; until the first walk the orphan fields are `null`, not 0. A result that differs in
+  more than the live recording's growth broadcasts a ws `status`; the growth alone only retitles the menu line.
+- **Status** — `local_disk` in every snapshot (ws + the 5-minute heartbeat → `recorder_devices.last_status`),
+  omitted until the first refresh lands:
+  `{dir, total_bytes, files, recordings, pending_upload_bytes, pending_upload_recordings, kept_bytes,
+  uploaded_bytes, recording_bytes, orphan_bytes|null, orphan_files|null, orphans_scanned_at|null,
+  computed_at}` (`recordings` = rows with a file here + orphan groups — one per top-level folder or loose
+  file).
+- **Menu** — under the pending-upload line: "On this Mac: 515 MB in 13 recordings · 5.1 MB waiting to
+  upload · 510 MB not in the registry" (zero clauses left out; "On this Mac: no recordings"; "On this Mac:
+  counting…" before the first result). Sizes are 1000-based like Finder. Click = Show recordings folder;
+  the tooltip is the path.
+- **Web** — Settings › Mac recorder shows "On this Mac: … · … waiting to upload" with a "where?" hint (the
+  folder path) when the tray sends `local_disk` (`src/lib/companion/local-disk.ts`).
+- **Checked** against Alok's real registry + folder (read-only, through the TrayLogic code): 87 rows, 14
+  files walked → 515 012 173 B total = `du -sk` 502 984 KiB; 5 121 195 B pending (6 `local` rows, all
+  `upload: false` → kept), 509 890 978 B in 7 orphan files.
+- **Tests:** `swift test` 102 (91 + `DiskUsageTests` 11). Dev `make-app.sh --no-run` builds; not launched
+  (the owner's tray holds the ws port).
+
 **0.3.21 (2026-10-01) — eased capture profile: a hot or busy Mac records at 2 fps instead of fighting the call.**
 A colleague's fanless MacBook Air sat at 100 % system GPU and thermal "fair" for whole Teams calls while
 the tray captured her 1152×736 pt Teams window at 2x (2304×1472 px), 5 fps BGRA. Under pressure the LIVE
@@ -1216,7 +1254,8 @@ recordings`, with `calls[]`, `recording` (**always a boolean** — the saved fil
 `saved` on `recording_stopped`; 0.1.5 overwrote the boolean and flipped the PWA chip back to
 "Recording"), `recording_since/path/label/id`, `screen_recording_permission`, `signed_in`,
 `email`, `device_id`, `share`, `recordings_pending_upload`, `auto_upload`, `version`,
-`update_available`, `update_staged`, and `stopping_in` during the grace period.
+`update_available`, `update_staged`, `local_disk` (0.3.22 — bytes on this Mac by bucket, see the 0.3.22
+notes), and `stopping_in` during the grace period.
 Commands from the page: `{cmd:"start", pid?}`, `{cmd:"stop"}`, `{cmd:"status"}`,
 `{cmd:"login"}`, `{cmd:"logout"}`, `{cmd:"upload", recording_id, linked_event?}`,
 `{cmd:"list_recordings", req}` → `{type:"recordings", recordings:[…], req}`,
