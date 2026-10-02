@@ -32,8 +32,9 @@ export const runtime = 'nodejs';
  * bytes never landed keeps its number reserved rather than renumbering the
  * ones after it.
  *
- * `?variant=audio` asks for the SOUNDTRACK only — offline "audio" pins, and
- * since 2026-09-18 the player itself whenever its video toggle is off
+ * `?variant=audio` asks for the SOUNDTRACK only — the player whenever its
+ * video toggle is off (since 2026-09-18; the web app's offline "audio" pins,
+ * its first caller, were removed 2026-10-02)
  * (components/audio-player.tsx probes this URL with a 2-byte Range and uses
  * it on 206, so phones pull ~30 MB/h instead of the whole mp4). A stored
  * file with no video stream is served as-is, exactly like the plain route.
@@ -54,7 +55,7 @@ export const runtime = 'nodejs';
  *         blob, so the bytes never cross nginx/Next/Tailscale at all. The
  *         access check below has already run; the redirect is the last thing
  *         that happens. `?via=app`, the `x-darth-media-via: app` header (the
- *         offline pin downloader and the player's probe) and a darth-cli
+ *         player's audio-only probe) and a darth-cli
  *         bearer without `?redirect=1` all opt out — see media-serve.ts.
  *      b. otherwise stream from disk with HTTP Range support so the player
  *         can seek — unchanged.
@@ -178,7 +179,7 @@ async function serveMedia(
 
 /**
  * `?variant=audio` for one stored file. The 202/500 bodies are `no-store`
- * so neither the browser nor the offline service worker ever keeps a
+ * so no browser or proxy cache ever keeps a
  * "preparing" answer around as if it were the media.
  */
 async function streamAudioOnly(

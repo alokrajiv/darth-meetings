@@ -19,8 +19,7 @@ import {
   googleConnectHref,
   type MsLinkStatus,
 } from '@/components/connect-nudge-banner';
-import { OFFLINE_TITLE, useOfflineGate } from '@/lib/offline/offline-context';
-import { isNetworkFailure } from '@/lib/offline/offline-fetch';
+import { isNetworkFailure, NETWORK_ERROR_MESSAGE } from '@/lib/fetch-errors';
 
 /**
  * Setup-review dialog (Alok, 2026-08-30) — ONE modal on any page load while
@@ -94,8 +93,6 @@ export function SetupReviewDialog() {
   const [saving, setSaving] = useState(false);
   const [saveError, setSaveError] = useState<string | null>(null);
   const [decided, setDecided] = useState(false);
-  // Offline mode / network down: Done + the connect links cannot succeed.
-  const { blocked } = useOfflineGate();
 
   useEffect(() => {
     fetch('/api/google/status')
@@ -184,7 +181,7 @@ export function SetupReviewDialog() {
       setOpen(false);
     } catch (err) {
       // Dialog stays open; no unhandled rejection.
-      setSaveError(isNetworkFailure(err) ? OFFLINE_TITLE : 'Could not save — try again');
+      setSaveError(isNetworkFailure(err) ? NETWORK_ERROR_MESSAGE : 'Could not save — try again');
     } finally {
       setSaving(false);
     }
@@ -216,7 +213,7 @@ export function SetupReviewDialog() {
               </p>
             </div>
             {googleMissing ? (
-              <Button size="sm" className="h-7 shrink-0 px-2.5 text-xs" disabled={blocked} title={blocked ? OFFLINE_TITLE : undefined} onClick={() => { window.location.href = googleConnectHref(); }}>
+              <Button size="sm" className="h-7 shrink-0 px-2.5 text-xs" onClick={() => { window.location.href = googleConnectHref(); }}>
                 {google?.status === 'revoked' ? 'Reconnect' : 'Connect'}
               </Button>
             ) : (
@@ -234,7 +231,7 @@ export function SetupReviewDialog() {
               </p>
             </div>
             {msMissing ? (
-              <Button size="sm" variant="outline" className="h-7 shrink-0 px-2.5 text-xs" disabled={blocked} title={blocked ? OFFLINE_TITLE : undefined} onClick={() => { window.location.href = msConnectHref(ms); }}>
+              <Button size="sm" variant="outline" className="h-7 shrink-0 px-2.5 text-xs" onClick={() => { window.location.href = msConnectHref(ms); }}>
                 {ms?.status === 'revoked' ? 'Reconnect' : 'Connect'}
               </Button>
             ) : (ms as MsLinkStatus | null)?.available === false ? (
@@ -305,8 +302,8 @@ export function SetupReviewDialog() {
           </section>
         </div>
 
-        {(saveError || blocked) && (
-          <p className="text-xs text-destructive">{saveError ?? OFFLINE_TITLE}</p>
+        {saveError && (
+          <p className="text-xs text-destructive">{saveError}</p>
         )}
         <DialogFooter className="gap-2 sm:justify-between">
           <button
@@ -316,7 +313,7 @@ export function SetupReviewDialog() {
           >
             Remind me tomorrow
           </button>
-          <Button onClick={() => void done()} disabled={blocked || saving || sync === null} title={blocked ? OFFLINE_TITLE : undefined}>
+          <Button onClick={() => void done()} disabled={saving || sync === null}>
             {saving ? 'Saving…' : googleMissing && scope !== 'off' ? 'Save (auto-sync waits for Google)' : 'Done'}
           </Button>
         </DialogFooter>

@@ -15,8 +15,7 @@ export interface LiveEvent {
  */
 export function useLiveEvents(
   onEvent: (e: LiveEvent) => void,
-  /** `enabled: false` closes the stream (offline mode — the SSE reconnect
-   * loop would otherwise hammer a server it cannot reach every 5 s). */
+  /** `enabled: false` closes the stream. */
   { enabled = true }: { enabled?: boolean } = {}
 ): void {
   const cb = useRef(onEvent);

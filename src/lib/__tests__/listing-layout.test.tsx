@@ -168,14 +168,6 @@ describe('FilterPopover badge', () => {
     expect(html).toContain('data-section');
     expect(html).toContain('Clear all filters');
   });
-  test('disabled (offline): no popover even when asked open', () => {
-    const html = renderToStaticMarkup(
-      <FilterPopover count={1} disabled defaultOpen>
-        x
-      </FilterPopover>
-    );
-    expect(html).not.toContain('data-filter-popover');
-  });
 });
 
 describe('ImportSplitButton', () => {

@@ -13,7 +13,7 @@ import {
 
 /**
  * Call-outs driven by the local Darth Recorder tray (see companion-client.ts).
- * Mounted once in the root layout, same slot as <OfflineBanner>; renders
+ * Mounted once in the root layout; renders
  * nothing unless a tray is connected AND there is something to say:
  *
  *  - "Teams call detected" (+ window title) with Record / Not now while a

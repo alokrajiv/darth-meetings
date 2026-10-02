@@ -131,7 +131,7 @@ on the same contract as Darth Chat (its SPEC §20.76):
     `/` focuses it.
   - *Header*: wordmark + Meetings / Recordings / Series; one **Import
     meeting ▾** split button (menu: Import from… a transcript file, Upload
-    media); the offline-save cloud and **Recorder ●** chips always visible;
+    media); the **Recorder ●** chip always visible;
     an account menu at the far right (Settings, theme, Sign out).
   - *Theme*: set in Darth. Inside the shell the page follows
     `prefers-color-scheme` live (the boot script ignores a stored browser
@@ -143,6 +143,47 @@ on the same contract as Darth Chat (its SPEC §20.76):
     takes the rest. "Add recording" is a hover/focus "+" icon on the row
     (always visible on touch screens), and the unlinked-recordings notice is
     one slim line.
+
+## Offline and PWA — removed 2026-10-02
+
+The website no longer has an offline mode and is no longer an installable
+PWA. Offline is the Darth desktop shell's job: `desktop/src/connectivity.js`
+(Work Offline + network detection) and its local store bridge
+(`window.darthDesktop.store`), documented in `desktop/docs/OFFLINE.md`
+("The web/PWA builds should drop their own offline modes").
+
+**Removed:** the mode-aware service worker and its registration; the
+IndexedDB pin ledger (`darth-offline`), pins, sync scheduler, outbox, the
+`darth-*` Cache Storage caches and cached RSC payloads, storage estimates and
+persistent-storage requests (`src/lib/offline/*`); the web manifest
+(`public/manifest.webmanifest`), the `<link rel="manifest">` / Apple
+web-app metadata and installed-app detection; the app badge and
+`/api/offline/badge`; the offline banner, chip, archive, pin dialog, the
+Settings offline card, the `/offline` page and the "Save for offline…" menu
+item; `/api/offline/outbox` (only the web outbox called it); and every
+"Not available offline" gate — controls are simply enabled. A fetch that
+never reaches the server now reads "Can't reach Darth Meetings — check your
+connection." (`src/lib/fetch-errors.ts`).
+
+**Kept, and why:**
+
+- `GET /api/health` (204, no auth, public in `src/proxy.ts`) — the cheap
+  reachability probe, kept for native clients (the Mac tray, the desktop
+  shell).
+- `GET /api/offline/plan` and `GET/PUT /api/offline/prefs`
+  (`src/db-ops/offline-plan.ts`, the `user_prefs.offline_prefs` counts from
+  migration 040) — darth-cli's `offline plan|prefs` uses them, and a future
+  desktop-shell replica can. Only the web UI that edited the counts is gone.
+- `?variant=audio` on the audio route (`src/lib/server/audio-only.ts`) — the
+  player streams the audio-only extract whenever its video toggle is off.
+- **One release only (2026-10):** `public/sw.js` is now a kill-switch worker
+  (no fetch handler; on activate it deletes every `darth-*` cache,
+  unregisters itself and reloads open windows from the network), still
+  served no-cache and public in `src/proxy.ts`, because a browser keeps an
+  installed worker until an update check succeeds. `src/components/sw-cleanup.tsx`
+  (mounted in the root layout) does the same from the page side: unregisters
+  workers, deletes `darth-*` caches, the `darth-offline` IndexedDB and the
+  `darth-offline-mode` localStorage key. Delete both after one release.
 
 ## Stack
 

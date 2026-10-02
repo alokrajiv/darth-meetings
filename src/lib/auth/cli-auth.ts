@@ -89,9 +89,8 @@ function toModules(v: unknown): string[] {
 
 /**
  * The outcome of one introspection, with the transient case kept apart from
- * a definitive "no": `/api/auth/session` answers 503 for `transient` so the
- * offline provider's session probe never mistakes a darth-auth restart for
- * a signed-out session (which would wipe the device's offline archive).
+ * a definitive "no": `/api/auth/session` answers 503 for `transient` so a
+ * caller never mistakes a darth-auth restart for a signed-out session.
  * Every other caller (proxy, withAuth) still treats both as "no user".
  */
 export type ResolvedTokenOutcome = {

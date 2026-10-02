@@ -20,13 +20,9 @@ const HINTS: Record<ImportAction, string> = {
 
 export function ImportSplitButton({
   onAction,
-  disabled = false,
-  disabledTitle,
   defaultOpen = false,
 }: {
   onAction: (action: ImportAction) => void;
-  disabled?: boolean;
-  disabledTitle?: string;
   /** Tests render the menu open. */
   defaultOpen?: boolean;
 }) {
@@ -38,8 +34,7 @@ export function ImportSplitButton({
       <div className="flex items-stretch">
         <button
           type="button"
-          disabled={disabled}
-          title={disabled ? disabledTitle : HINTS[IMPORT_PRIMARY]}
+          title={HINTS[IMPORT_PRIMARY]}
           data-import-primary
           onClick={() => onAction(IMPORT_PRIMARY)}
           className={`${half} gap-1.5 rounded-l-md px-3`}
@@ -50,8 +45,7 @@ export function ImportSplitButton({
         </button>
         <button
           type="button"
-          disabled={disabled}
-          title={disabled ? disabledTitle : 'More ways to import'}
+          title="More ways to import"
           aria-label="More ways to import"
           aria-expanded={open}
           aria-haspopup="menu"
@@ -62,7 +56,7 @@ export function ImportSplitButton({
           <ChevronDown className="h-4 w-4" />
         </button>
       </div>
-      {open && !disabled && (
+      {open && (
         <div
           role="menu"
           className="absolute right-0 top-full z-50 mt-1.5 w-64 rounded-lg border bg-popover p-1 text-popover-foreground shadow-[0_4px_16px_-2px_rgb(0_0_0/0.08),0_1px_2px_0_rgb(0_0_0/0.04)]"

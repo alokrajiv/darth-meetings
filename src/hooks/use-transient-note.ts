@@ -6,8 +6,7 @@ import { useCallback, useEffect, useRef, useState } from 'react';
  * A short sentence that says what just happened and then gets out of the way.
  *
  * There is no toast library here on purpose — the app's transient notes are
- * plain text that appears where the action was (see the offline notice in
- * `components/audio-upload.tsx`). This is the same idea with a hold time and a
+ * plain text that appears where the action was. This is the same idea with a hold time and a
  * fade, for notes that used to stay on screen forever.
  *
  * Contract for the caller: render ONE wrapper that is always in the DOM and

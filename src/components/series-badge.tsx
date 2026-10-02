@@ -2,8 +2,7 @@
 
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { Repeat, Plus, Check, X, Loader2 } from 'lucide-react';
-import { OFFLINE_TITLE } from '@/lib/offline/offline-types';
-import { isNetworkFailure } from '@/lib/offline/offline-fetch';
+import { isNetworkFailure, NETWORK_ERROR_MESSAGE } from '@/lib/fetch-errors';
 
 /**
  * The "recurring call" badge.
@@ -45,8 +44,6 @@ interface SeriesBadgeProps {
   onChanged: () => void;
   /** 'row' = ghost + reveal-on-row-hover (listing); 'full' = always visible. */
   variant?: 'row' | 'full';
-  /** Offline mode / network down: chips stay visible but inert, the popover never opens. */
-  disabled?: boolean;
 }
 
 export function SeriesBadge({
@@ -57,7 +54,6 @@ export function SeriesBadge({
   onOpenSeries,
   onChanged,
   variant = 'row',
-  disabled = false,
 }: SeriesBadgeProps) {
   const [open, setOpen] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -108,7 +104,6 @@ export function SeriesBadge({
 
   const openPopover = (e: React.MouseEvent) => {
     e.stopPropagation();
-    if (disabled) return;
     const rect = (e.currentTarget as HTMLElement).getBoundingClientRect();
     const width = 288;
     setPos({
@@ -118,7 +113,7 @@ export function SeriesBadge({
     setOpen(true);
     setError(null);
     setNewTitle(defaultTitle?.trim() ?? '');
-    // A failed GET (network dropped, offline 503) is an error, not "no
+    // A failed GET (network dropped) is an error, not "no
     // candidates" — otherwise the popover silently offers nothing.
     void fetch(`/api/transcripts/${assemblyaiId}/series`)
       .then((r) => {
@@ -128,7 +123,7 @@ export function SeriesBadge({
       .then((d) => setCandidates(d?.candidates ?? []))
       .catch((err) => {
         setCandidates([]);
-        setError(isNetworkFailure(err) ? OFFLINE_TITLE : 'Could not update the series');
+        setError(isNetworkFailure(err) ? NETWORK_ERROR_MESSAGE : 'Could not update the series');
       });
   };
 
@@ -143,7 +138,7 @@ export function SeriesBadge({
       .then((d) => setAllSeries(d?.series ?? []))
       .catch((err) => {
         setAllSeries([]);
-        setError(isNetworkFailure(err) ? OFFLINE_TITLE : 'Could not update the series');
+        setError(isNetworkFailure(err) ? NETWORK_ERROR_MESSAGE : 'Could not update the series');
       });
   };
 
@@ -160,7 +155,7 @@ export function SeriesBadge({
       close();
       onChanged();
     } catch (err) {
-      setError(isNetworkFailure(err) ? OFFLINE_TITLE : 'Could not update the series');
+      setError(isNetworkFailure(err) ? NETWORK_ERROR_MESSAGE : 'Could not update the series');
     } finally {
       setBusy(false);
     }
@@ -190,7 +185,7 @@ export function SeriesBadge({
       close();
       onChanged();
     } catch (err) {
-      setError(isNetworkFailure(err) ? OFFLINE_TITLE : 'Could not update the series');
+      setError(isNetworkFailure(err) ? NETWORK_ERROR_MESSAGE : 'Could not update the series');
     } finally {
       setBusy(false);
     }
@@ -200,12 +195,11 @@ export function SeriesBadge({
     return (
       <button
         type="button"
-        disabled={disabled}
         onClick={(e) => {
           e.stopPropagation();
           onOpenSeries(membership.series_id);
         }}
-        title={disabled ? OFFLINE_TITLE : `Recurring call: ${membership.title} — click to see the whole series`}
+        title={`Recurring call: ${membership.title} — click to see the whole series`}
         className="inline-flex max-w-44 shrink-0 items-center gap-1 rounded-full border border-primary/25 bg-primary/5 px-2 py-0.5 text-[11px] text-primary transition-colors hover:bg-primary/10 disabled:cursor-not-allowed disabled:opacity-60"
       >
         <Repeat className="h-3 w-3 shrink-0" />
@@ -220,9 +214,8 @@ export function SeriesBadge({
         <button
           ref={btnRef}
           type="button"
-          disabled={disabled}
           onClick={openPopover}
-          title={disabled ? OFFLINE_TITLE : `Looks like part of "${suspected.title}" — click to confirm or dismiss`}
+          title={`Looks like part of "${suspected.title}" — click to confirm or dismiss`}
           className="inline-flex max-w-44 shrink-0 items-center gap-1 rounded-full border border-dashed border-primary/35 px-2 py-0.5 text-[11px] text-primary/70 transition-colors hover:bg-primary/5 hover:text-primary disabled:cursor-not-allowed disabled:opacity-60"
         >
           <Repeat className="h-3 w-3 shrink-0" />
@@ -233,9 +226,8 @@ export function SeriesBadge({
         <button
           ref={btnRef}
           type="button"
-          disabled={disabled}
           onClick={openPopover}
-          title={disabled ? OFFLINE_TITLE : 'Mark as a recurring call'}
+          title="Mark as a recurring call"
           className={`inline-flex shrink-0 items-center gap-0.5 rounded-full border border-dashed border-muted-foreground/30 px-1.5 py-0.5 text-[11px] text-muted-foreground/70 transition-all hover:border-primary/40 hover:text-primary disabled:cursor-not-allowed disabled:opacity-50 ${
             variant === 'row' ? 'opacity-0 group-hover:opacity-100' : ''
           }`}
@@ -245,7 +237,7 @@ export function SeriesBadge({
           {variant === 'full' && <span className="ml-0.5">Recurring call</span>}
         </button>
       )}
-      {open && pos && !disabled && (
+      {open && pos && (
         <div
           ref={popRef}
           onClick={(e) => e.stopPropagation()}

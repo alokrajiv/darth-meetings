@@ -117,7 +117,7 @@ export interface MediaBlobLike extends BlobLike {
   /**
    * A BYTE RANGE of the blob, inclusive on both ends (`read` gives the whole
    * thing). Stage B's fallback: a caller that must stay on the app — the
-   * offline pin, `?via=app`, darth-cli — and whose local file is gone can
+   * player's probe, `?via=app`, darth-cli — and whose local file is gone can
    * still be served, with seeking, by proxying the blob. Rejects when the
    * blob does not exist.
    */

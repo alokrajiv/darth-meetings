@@ -2181,7 +2181,8 @@ const meetings: Subcommand = {
           ctx.print(data, () => {
             const prefs = data.prefs ?? {};
             const meetings: any[] = data.meetings ?? [];
-            // The web app's ladder (src/lib/offline/offline-sync.ts desiredAutoLevels):
+            // The auto-pin ladder (formerly the web app's desiredAutoLevels; the
+            // web offline mode was removed 2026-10-02):
             // newest N at transcript; of those with a stored recording the first
             // N at audio; of those with video the first N at video. Max wins.
             const level = new Map<string, string>();
