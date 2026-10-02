@@ -26,10 +26,12 @@
 
 import {
   holesOf,
+  keptSegmentsFor,
   storedClipsInContext,
   windowBoundsFor,
   type ClipHole,
   type ClipWindow,
+  type FileSegment,
 } from '@/lib/clips';
 import { compareClipsOnTimeline } from '@/lib/recording-clips';
 
@@ -37,6 +39,15 @@ import { compareClipsOnTimeline } from '@/lib/recording-clips';
 export interface PlaybackWindow {
   fromMs: number;
   toMs: number | null;
+  /**
+   * Stretches of the MEETING timeline that are NOT in the served file — a
+   * hole in the middle that the server cut out (2026-10-02 M1, lib/clip-cut.ts
+   * `cutPlanOf`). Meeting ms, half-open, in order. The served file is
+   * contiguous; the meeting keeps its own timeline (the hole stays where its
+   * notes say it is), so every mapping below steps across these. Absent on
+   * every window that is not a cut with a hole.
+   */
+  gaps?: ClipHole[];
 }
 
 /**
@@ -91,14 +102,33 @@ export function holesFromContext(
 // Meeting time ⇄ file time
 // ---------------------------------------------------------------------------
 
-/** Where a meeting position sits in the FILE. Null window = they are equal. */
+/**
+ * Where a meeting position sits in the FILE. Null window = they are equal.
+ *
+ * A position inside one of the window's `gaps` (a stretch cut out of the
+ * served file) lands where the gap was cut — which is the first second AFTER
+ * it, exactly where the old player's hole skip would have jumped to.
+ */
 export function fileMsOf(meetingMs: number, window: PlaybackWindow | null): number {
-  return Math.max(0, meetingMs) + (window?.fromMs ?? 0);
+  const m = Math.max(0, meetingMs);
+  let removed = 0;
+  for (const g of window?.gaps ?? []) {
+    removed += Math.min(Math.max(0, m - g.fromMs), g.toMs - g.fromMs);
+  }
+  return m - removed + (window?.fromMs ?? 0);
 }
 
-/** Where a file position sits on the MEETING timeline (never negative). */
+/**
+ * Where a file position sits on the MEETING timeline (never negative). Steps
+ * over the window's `gaps`: the served second right after a cut is the
+ * meeting second the gap ENDS at (half-open, like a clip).
+ */
 export function meetingMsOf(fileMs: number, window: PlaybackWindow | null): number {
-  return Math.max(0, fileMs - (window?.fromMs ?? 0));
+  let m = Math.max(0, fileMs - (window?.fromMs ?? 0));
+  for (const g of window?.gaps ?? []) {
+    if (m >= g.fromMs) m += g.toMs - g.fromMs;
+  }
+  return m;
 }
 
 /**
@@ -106,16 +136,17 @@ export function meetingMsOf(fileMs: number, window: PlaybackWindow | null): numb
  *
  * `fileDurationMs` is whatever the media element (or the row) knows about the
  * whole file; null while metadata is still loading. An open-ended window
- * (`toMs: null`) is "to the end of the file", so it needs that number.
+ * (`toMs: null`) is "to the end of the file", so it needs that number. The
+ * span is on the MEETING timeline, so a window's `gaps` are inside it.
  */
 export function windowDurationMs(
   window: PlaybackWindow | null,
   fileDurationMs: number | null
 ): number | null {
   if (!window) return fileDurationMs;
-  if (window.toMs !== null) return Math.max(0, window.toMs - window.fromMs);
-  if (fileDurationMs === null) return null;
-  return Math.max(0, fileDurationMs - window.fromMs);
+  const end = window.toMs ?? fileDurationMs;
+  if (end === null) return null;
+  return meetingMsOf(end, window);
 }
 
 /** Clamp a MEETING position into the window (or into the file when there is none). */
@@ -219,6 +250,11 @@ export function holesBeforeUtterance(
  * minutes keeps its own timeline (the notes still cite the old times), so its
  * cut's 0 is meeting ms `to`. `fileMsOf` / `meetingMsOf` / `windowDurationMs`
  * are plain additions and handle it unchanged.
+ *
+ * A source with a hole in the MIDDLE (M1, same day) is served the
+ * concatenation of what it kept: its window carries the hole as a `gap`, so
+ * meeting time on either side of it maps onto the contiguous served file and
+ * captions, `t:` chips, seeks and the scrubber keep lining up.
  */
 export interface ServedPlayback {
   window: PlaybackWindow | null;
@@ -228,31 +264,67 @@ export interface ServedPlayback {
 }
 
 /**
- * A window (file ms) re-expressed inside a cut of the same file. Null when the
+ * The segments the server cuts a file to (lib/clip-cut.ts `cutPlanOf` — the
+ * same `keptSegmentsFor`), or null when it serves the file whole: one
+ * segment from 0 to the end and nothing removed.
+ */
+function servedCutOf(kept: FileSegment[]): FileSegment[] | null {
+  if (kept.length === 0) return null;
+  if (kept.length === 1 && kept[0]!.fromMs <= 0 && kept[0]!.toMs === null) return null;
+  return kept;
+}
+
+/**
+ * Where a FILE position lands in the served cut — the concatenation of
+ * `segments`. A position in a removed stretch (or before the first segment)
+ * lands where the next kept segment starts.
+ */
+export function servedMsOfFile(fileMs: number, segments: readonly FileSegment[]): number {
+  let acc = 0;
+  for (const s of segments) {
+    if (fileMs <= s.fromMs) return acc;
+    if (s.toMs === null || fileMs < s.toMs) return acc + (fileMs - s.fromMs);
+    acc += s.toMs - s.fromMs;
+  }
+  return acc;
+}
+
+/**
+ * A window (file ms) re-expressed inside a cut of the same file — one window,
+ * or the kept segments of a file with a hole in the middle. Null when the
  * window IS the cut — the player then needs no clamping at all and keeps its
  * native controls.
  */
-export function windowInCut(window: PlaybackWindow | null, cut: PlaybackWindow): PlaybackWindow | null {
+export function windowInCut(
+  window: PlaybackWindow | null,
+  cut: PlaybackWindow | readonly FileSegment[]
+): PlaybackWindow | null {
   if (!window) return null;
-  const from = window.fromMs - cut.fromMs;
-  const to = window.toMs === null ? null : window.toMs - cut.fromMs;
-  const cutEnd = cut.toMs === null ? null : cut.toMs - cut.fromMs;
+  const segments: readonly FileSegment[] = 'fromMs' in cut ? [cut] : cut;
+  const from = servedMsOfFile(window.fromMs, segments);
+  const to = window.toMs === null ? null : servedMsOfFile(window.toMs, segments);
+  const cutEnd = servedEndOf(segments);
   const atEnd = to === null || (cutEnd !== null && to >= cutEnd);
   if (from <= 0 && atEnd) return null;
   return { fromMs: Math.max(0, from), toMs: atEnd ? null : to };
 }
 
-function cutSpanOf(cut: PlaybackWindow, fallbackMs: number | null): number | null {
-  if (cut.toMs !== null) return cut.toMs - cut.fromMs;
-  return fallbackMs !== null && fallbackMs > 0 ? fallbackMs : null;
+/** The served cut's length when every segment is closed; null when the last runs to the end. */
+function servedEndOf(segments: readonly FileSegment[]): number | null {
+  let total = 0;
+  for (const s of segments) {
+    if (s.toMs === null) return null;
+    total += s.toMs - s.fromMs;
+  }
+  return total;
 }
 
 /**
  * The MAIN player of a meeting (its first recording), from the row's clip
  * mirror — the same clips `windowFromContext` reads and the server cuts by.
  *
- * `durationSec` is the row's `duration` (the meeting's own span); it is only
- * used to know how long an open-ended cut should be.
+ * `durationSec` is the row's `duration` (the meeting's own span, a hole
+ * included); it is only used to know how long an open-ended cut should be.
  */
 export function servedPlaybackFromContext(
   gmeetContext: { clips?: unknown } | null | undefined,
@@ -261,27 +333,46 @@ export function servedPlaybackFromContext(
   const stored = storedClipsInContext(gmeetContext);
   if (!stored) return { window: null, wholeFileWindow: null, cutSpanMs: null };
   const first = [...stored].sort(compareClipsOnTimeline)[0]!;
+  const cut = servedCutOf(keptSegmentsFor(stored, first.recordingId));
+  // Served whole: never split, or split with `keepInBoth`.
+  if (!cut) return { window: null, wholeFileWindow: null, cutSpanMs: null };
   const bounds = windowBoundsFor(stored, first.recordingId);
-  if (bounds.fromMs === null && bounds.toMs === null) {
-    // Served whole (never split, or a source with a hole in the middle).
-    return { window: null, wholeFileWindow: null, cutSpanMs: null };
+
+  // Meeting ms of the file's first byte (`offset − from` of the clip that
+  // places it); the kept segments sit on the meeting timeline at file + base.
+  const base = first.offsetMs - first.fromMs;
+  // Meeting ms at the cut's first byte. 0 for a split-off meeting; `to` for a
+  // source whose split took its opening minutes.
+  const leadMs = Math.max(0, cut[0]!.fromMs + base);
+  // What was cut out BETWEEN the kept segments, on the meeting's timeline.
+  const gaps: ClipHole[] = [];
+  for (let i = 1; i < cut.length; i++) {
+    gaps.push({ fromMs: cut[i - 1]!.toMs! + base, toMs: cut[i]!.fromMs + base });
   }
-  const cut: PlaybackWindow = { fromMs: bounds.fromMs ?? 0, toMs: bounds.toMs };
-  // Meeting ms at the cut's first byte: where the first clip lands, moved back
-  // by however far into the cut that clip starts. 0 for a split-off meeting.
-  const leadMs = Math.max(0, first.offsetMs + (cut.fromMs - first.fromMs));
-  const spanMs = durationSec != null ? durationSec * 1000 - leadMs : null;
+  const removedMs = gaps.reduce((n, g) => n + (g.toMs - g.fromMs), 0);
+  const closed = servedEndOf(cut);
+  const spanMs = durationSec != null ? durationSec * 1000 - leadMs - removedMs : null;
+
+  const window: PlaybackWindow | null =
+    leadMs > 0 || gaps.length > 0
+      ? { fromMs: leadMs > 0 ? -leadMs : 0, toMs: null, ...(gaps.length > 0 ? { gaps } : {}) }
+      : null;
   return {
-    window: leadMs > 0 ? { fromMs: -leadMs, toMs: null } : null,
-    wholeFileWindow: cut,
-    cutSpanMs: cutSpanOf(cut, spanMs),
+    window,
+    // The whole file in file coordinates, as before the cut: the bounds (a
+    // hole in the middle is skipped by the player's `holes`, as it was).
+    wholeFileWindow:
+      bounds.fromMs === null && bounds.toMs === null
+        ? null
+        : { fromMs: bounds.fromMs ?? 0, toMs: bounds.toMs },
+    cutSpanMs: closed ?? (spanMs !== null && spanMs > 0 ? spanMs : null),
   };
 }
 
 /**
  * One clip PART of a combined meeting (`playerParts` in lib/combine-ui.ts):
- * its own window, inside the cut the server made of its recording — the
- * bounds of every clip this meeting holds on that recording.
+ * its own window, inside the cut the server made of its recording — every
+ * clip this meeting holds on that recording, holes between them cut out.
  */
 export function servedPlaybackForPart(
   part: Pick<ClipWindow, 'recordingId' | 'fromMs' | 'toMs'>,
@@ -289,18 +380,14 @@ export function servedPlaybackForPart(
 ): ServedPlayback {
   const own: PlaybackWindow | null =
     part.fromMs > 0 || part.toMs !== null ? { fromMs: part.fromMs, toMs: part.toMs } : null;
-  const bounds = windowBoundsFor(
-    clips.map((c) => ({ ord: c.ord, recordingId: c.recordingId, fromMs: c.fromMs, toMs: c.toMs, offsetMs: c.offsetMs })),
-    part.recordingId
-  );
-  if (bounds.fromMs === null && bounds.toMs === null) {
+  const cut = servedCutOf(keptSegmentsFor(clips, part.recordingId));
+  if (!cut) {
     return { window: own, wholeFileWindow: own, cutSpanMs: null };
   }
-  const cut: PlaybackWindow = { fromMs: bounds.fromMs ?? 0, toMs: bounds.toMs };
   return {
     window: windowInCut(own ?? { fromMs: 0, toMs: null }, cut),
     wholeFileWindow: own,
-    cutSpanMs: cutSpanOf(cut, null),
+    cutSpanMs: servedEndOf(cut),
   };
 }
 

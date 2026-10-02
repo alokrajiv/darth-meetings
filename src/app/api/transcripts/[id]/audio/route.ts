@@ -18,7 +18,7 @@ import {
   resolveMeetingContent,
   type ResolvedMedia,
 } from '@/lib/server/recordings';
-import { cutWindowOf, type CutWindow } from '@/lib/clip-cut';
+import { cutPlanOf, type CutWindow } from '@/lib/clip-cut';
 import { clipCutWithin } from '@/lib/server/clip-cut';
 
 export const runtime = 'nodejs';
@@ -74,8 +74,11 @@ export const runtime = 'nodejs';
  * CUT rendition of exactly that window, made once with ffmpeg and cached under
  * `${MW_STORAGE_DIR}/clips/<meeting>/` (lib/server/clip-cut.ts), streamed with
  * Range like any other file and starting at 0. No Stage B redirect and no
- * blob proxy for it — both would hand out the whole recording. A meeting that
- * holds the whole file is served exactly as before (no copy). The recording's
+ * blob proxy for it — both would hand out the whole recording. A file with a
+ * HOLE in the middle (a source meeting whose middle was split off) is served
+ * the same way: the concatenation of the stretches it kept (`cutPlanOf`), so
+ * the hole's bytes are not reachable either. A meeting that holds the whole
+ * file with no hole is served exactly as before (no copy). The recording's
  * OWNER still gets every second through `/api/recordings/:id/audio`.
  *
  * Ownership is enforced before any of the above so a user can't probe
@@ -128,7 +131,7 @@ export const GET = withAuth(async ({ user, request, cliScope }, { params }) => {
     } catch (err) {
       console.error('[GET /api/transcripts/:id/audio] local stream failed:', redactError(err));
       // A windowed file must never fall through to a whole-file URL.
-      if (cutWindowOf(canonical)) {
+      if (cutPlanOf(canonical)) {
         return NextResponse.json({ error: 'Audio unavailable' }, { status: 500 });
       }
       // Fall through to remote URL — though that's almost certainly broken
@@ -173,8 +176,8 @@ async function serveMedia(
 ): Promise<Response> {
   // A window of the file, never the file: checked FIRST, before the Stage B
   // redirect or the blob proxy could hand out the whole recording.
-  const cut = cutWindowOf(media);
-  if (cut) return serveClipCut(request, meetingId, media, cut, audioOnly);
+  const plan = cutPlanOf(media);
+  if (plan) return serveClipCut(request, meetingId, media, plan, audioOnly);
 
   const store = serveStore();
   const target = store ? blobTargetFor(media, audioOnly) : null;
@@ -206,7 +209,9 @@ async function serveMedia(
  * plain URL meanwhile), so it waits only briefly; the plain URL is what a
  * media element is loading and nginx allows 900 s, so it waits longer and
  * answers 503 + Retry-After only when even that is not enough — the ffmpeg
- * carries on and the next request is served from the cache.
+ * carries on and the next request is served from the cache. Since M2 the
+ * clip writers start the cut the moment a window or hole is written
+ * (lib/server/clip-precut.ts), so this wait is the fallback, not the norm.
  */
 const CUT_WAIT_VARIANT_MS = 3_000;
 const CUT_WAIT_PLAIN_MS = 240_000;
@@ -215,7 +220,7 @@ async function serveClipCut(
   request: NextRequest,
   meetingId: string,
   media: ResolvedMedia,
-  window: CutWindow,
+  segments: CutWindow[],
   audioOnly: boolean
 ): Promise<Response> {
   const noStore = { 'Cache-Control': 'private, no-store' };
@@ -223,7 +228,8 @@ async function serveClipCut(
     {
       meetingId,
       sourceFilename: media.filename,
-      window,
+      segments,
+      trigger: 'route',
       variant: audioOnly ? 'audio' : 'av',
       part: media.part,
       sourceDurationMs: media.durationMs,

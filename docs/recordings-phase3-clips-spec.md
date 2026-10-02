@@ -54,6 +54,8 @@ A **clip** = `meeting_clips` row: `(transcript_id, ord, recording_id, from_ms, t
 - Offline pins: N pins the same media URL shape under its own id (bytes are duplicated in the SW cache for now —
   note it, do not solve it here).
 - M with a hole: the player skips the hole (it is not M's content any more); with `keepInBoth` nothing changes.
+- **Superseded 2026-10-02** — media is now served CUT server-side, holes included: see "As built — media served cut"
+  at the end of this file.
 
 ## Un-split
 `DELETE` of N when N has exactly one clip and M still has the matching hole offers "put it back": M's two clips merge
@@ -179,3 +181,43 @@ form `link` already takes. `split` answers `201 SplitOk` (`meeting.id/url`,
 `moved.edits`, `moved.speakerNames`, `source.clips`, `linkedEvent`), every
 refusal `{ error, code }`. `clips` answers `ClipsResponse`, whose `siblings` are
 already caller-scoped — the CLI may print them verbatim.
+
+## As built — media served cut (2026-10-02)
+
+Owner's rule: "it is not the recording being shared — it's the meeting API that reveals it, as if native,
+internally stripping to which minute to which minute or the whole recording." The "nothing is cut (DEC-2)"
+media rule above is retired: the TRANSCRIPTION is still never cut or redone, but the BYTES a meeting route
+hands out are exactly the meeting's.
+
+- **What is served** (`lib/clip-cut.ts` `cutPlanOf`, from `ResolvedMedia.windowFromMs/ToMs` + `keptMs`):
+  a meeting that holds the whole file with no hole → the file itself (fast path, no copy, Stage B redirect
+  and blob proxy as before). A window (split-off meeting, combined clip) → one-segment cut. A hole in the
+  middle (source split without `keepInBoth`, or two clips of one recording in a combined meeting) → the
+  concatenation of the kept segments (`keptSegmentsFor` in `lib/clips.ts`, the one definition the server,
+  the player and the sweeper share). Applies to `/audio`, `?part=N` and `?variant=audio`; decided before
+  any redirect/proxy, never a whole-file fallback.
+- **Cut** (`lib/server/clip-cut.ts`): stream copy only when every segment starts on a keyframe, else H.264/AAC
+  re-encode (`?variant=audio`: AAC copy or mono 64k). A holed plan is cut segment by segment with ONE attempt for
+  all (the concat demuxer needs uniform codec parameters), each segment's length checked, then joined by
+  `-f concat -c copy`; the whole is checked again. The file's own probed duration wins over the resolver's
+  (`durationMs` in the row fallback is the meeting's). Temp files are `<name>.<pid>.tmp` (blue/green safe).
+- **Cache**: `${MW_STORAGE_DIR}/clips/<assemblyai_id>/<variant>.<from>-<to|end>[_<from>-<to|end>…].<src8>.<ext>`
+  — every kept segment is in the name, so a re-split can never be served an old cut; a one-segment name is the
+  pre-hole name (old caches stay valid). Dropped by `setClipMirror`, un-split (the removed half) and permanent
+  delete; `.tmp` older than 2 h swept.
+- **Player** (`lib/clip-window.ts`): a holed source keeps its own timeline (notes, `t:` chips, dividers unchanged);
+  its `PlaybackWindow` carries the hole as `gaps`, and `fileMsOf` / `meetingMsOf` / `windowDurationMs` /
+  `clampMeetingMs` step across them (a seek into the hole lands on its end). `servedPlaybackForPart` maps a
+  combined clip into a holed cut via `servedMsOfFile`. A stale WHOLE file (HTTP cache, older colour) is still
+  recognised by length and played the old way (bounds window + hole skip). The speaker-preview dialog seeks
+  through the same mapping (`audioServed`).
+- **Pre-cut** (`lib/server/clip-precut.ts`, M2): `queueClipPrecut(meeting, trigger)` after split (both halves),
+  un-split, combine add/patch/delete/rollback, make-meeting / link from a recording, and the recording-settle of
+  early-made meetings. One meeting at a time, through `ensureClipCut` (same lock, `[clip-cut] … via=<trigger>`
+  line); both variants. Backstop: the media sweeper's tick (`unlessDraining`) queues ≤2 meetings whose clip
+  mirror needs a cut and whose cut is missing (≤25 resolved per tick, verified meetings remembered per mirror,
+  failures back off 6 h / 3 tries). The route's 240 s wait → 503 stays as the fallback.
+- **Sizes** (`GET /api/offline/plan`, M3): a windowed/holed part reports the cut's size when it exists, else
+  `stored × kept ms / file ms` with `estimated: true`. The plan row now carries the clip mirror (the row
+  fallback resolves windows too), and the plan `rev` includes it when present (unchanged for every meeting
+  without clips).

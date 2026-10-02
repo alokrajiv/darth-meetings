@@ -75,6 +75,7 @@ function mediaOf(over: Partial<Media> = {}): Media {
     audioOnly: { mediaId: 'm-audio', filename: '02af969f.m4a', blobName: AUDIO_BLOB },
     windowFromMs: null,
     windowToMs: null,
+    keptMs: null,
     ...over,
   };
 }

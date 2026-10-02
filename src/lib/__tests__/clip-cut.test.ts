@@ -6,12 +6,18 @@
  */
 import { describe, expect, test } from 'bun:test';
 import {
+  buildConcatArgs,
   buildCutArgs,
   clipCutStem,
+  clipMirrorNeedsCut,
+  concatListBody,
   cutAttempts,
   cutIsExact,
+  cutPlanOf,
   cutWindowOf,
+  estimateCutBytes,
   expectedCutMs,
+  expectedPlanMs,
   frameRefusal,
   isKeyframeSafe,
   keyframesFromProbe,
@@ -20,9 +26,10 @@ import {
 
 const FROM = 1_200_000; // 20:00
 const TO = 2_000_000; // 33:20
+const HOUR = 3_600_000;
 
-describe('cutWindowOf — which files are served cut', () => {
-  test('a whole file (never split, or a source with a hole in the middle) is not cut', () => {
+describe('cutWindowOf — the bounds as one window', () => {
+  test('bounds over the whole file are no window (a hole in the middle is cutPlanOf’s business)', () => {
     expect(cutWindowOf({ windowFromMs: null, windowToMs: null })).toBeNull();
     expect(cutWindowOf({ windowFromMs: 0, windowToMs: null })).toBeNull();
   });
@@ -43,7 +50,7 @@ describe('clipCutStem — the cache key', () => {
   const base = {
     meetingId: 'abc-123_X',
     sourceFilename: 'rec-1.mp4',
-    window: { fromMs: FROM, toMs: TO },
+    segments: [{ fromMs: FROM, toMs: TO }],
     variant: 'av' as const,
   };
 
@@ -54,13 +61,13 @@ describe('clipCutStem — the cache key', () => {
   });
 
   test('an open-ended window says "end"', () => {
-    expect(clipCutStem({ ...base, window: { fromMs: FROM, toMs: null } }).stem).toMatch(/^av\.1200000-end\./);
+    expect(clipCutStem({ ...base, segments: [{ fromMs: FROM, toMs: null }] }).stem).toMatch(/^av\.1200000-end\./);
   });
 
   test('everything that decides the bytes changes the key', () => {
     const k = clipCutStem(base).stem;
-    expect(clipCutStem({ ...base, window: { fromMs: FROM + 1, toMs: TO } }).stem).not.toBe(k);
-    expect(clipCutStem({ ...base, window: { fromMs: FROM, toMs: TO + 1 } }).stem).not.toBe(k);
+    expect(clipCutStem({ ...base, segments: [{ fromMs: FROM + 1, toMs: TO }] }).stem).not.toBe(k);
+    expect(clipCutStem({ ...base, segments: [{ fromMs: FROM, toMs: TO + 1 }] }).stem).not.toBe(k);
     expect(clipCutStem({ ...base, sourceFilename: 'rec-2.mp4' }).stem).not.toBe(k);
     expect(clipCutStem({ ...base, variant: 'audio' }).stem).not.toBe(k);
     expect(clipCutStem({ ...base, meetingId: 'other' }).dir).not.toBe(clipCutStem(base).dir);
@@ -71,8 +78,148 @@ describe('clipCutStem — the cache key', () => {
   test('a crafted meeting id or a nonsense window never becomes a path', () => {
     expect(() => clipCutStem({ ...base, meetingId: '../etc' })).toThrow();
     expect(() => clipCutStem({ ...base, meetingId: 'a/b' })).toThrow();
-    expect(() => clipCutStem({ ...base, window: { fromMs: -1, toMs: TO } })).toThrow();
-    expect(() => clipCutStem({ ...base, window: { fromMs: TO, toMs: FROM } })).toThrow();
+    expect(() => clipCutStem({ ...base, segments: [{ fromMs: -1, toMs: TO }] })).toThrow();
+    expect(() => clipCutStem({ ...base, segments: [{ fromMs: TO, toMs: FROM }] })).toThrow();
+  });
+
+  test('a hole in the middle: EVERY kept segment is in the key, `_`-joined', () => {
+    const holed = clipCutStem({ ...base, segments: [{ fromMs: 0, toMs: FROM }, { fromMs: TO, toMs: null }] });
+    expect(holed.stem).toMatch(/^av\.0-1200000_2000000-end\.[0-9a-f]{8}$/);
+    // A different hole, or the same bounds without a hole, is a different cut.
+    expect(
+      clipCutStem({ ...base, segments: [{ fromMs: 0, toMs: FROM + 1 }, { fromMs: TO, toMs: null }] }).stem
+    ).not.toBe(holed.stem);
+    expect(clipCutStem({ ...base, segments: [{ fromMs: 0, toMs: null }] }).stem).not.toBe(holed.stem);
+  });
+
+  test('a plan that is not canonical is refused, never named', () => {
+    const plan = (segments: Array<{ fromMs: number; toMs: number | null }>) => () =>
+      clipCutStem({ ...base, segments });
+    expect(plan([])).toThrow();
+    expect(plan([{ fromMs: 0, toMs: null }, { fromMs: TO, toMs: null }])).toThrow(); // open end not last
+    expect(plan([{ fromMs: TO, toMs: HOUR }, { fromMs: 0, toMs: FROM }])).toThrow(); // out of order
+    expect(plan([{ fromMs: 0, toMs: FROM }, { fromMs: FROM, toMs: TO }])).toThrow(); // touching: merge them
+    expect(plan([{ fromMs: 0, toMs: TO }, { fromMs: FROM, toMs: HOUR }])).toThrow(); // overlapping
+  });
+});
+
+describe('cutPlanOf — which files are served cut, and as what', () => {
+  test('a whole file (never split, or split with keepInBoth) is served as itself', () => {
+    expect(cutPlanOf({ windowFromMs: null, windowToMs: null })).toBeNull();
+    expect(cutPlanOf({ windowFromMs: null, windowToMs: null, keptMs: null })).toBeNull();
+    // One kept segment is the bounds, nothing more.
+    expect(cutPlanOf({ windowFromMs: null, windowToMs: null, keptMs: [{ fromMs: 0, toMs: null }] })).toBeNull();
+  });
+
+  test('a window is one segment', () => {
+    expect(cutPlanOf({ windowFromMs: FROM, windowToMs: TO })).toEqual([{ fromMs: FROM, toMs: TO }]);
+    expect(cutPlanOf({ windowFromMs: 1000.4, windowToMs: 5000.6 })).toEqual([{ fromMs: 1000, toMs: 5001 }]);
+  });
+
+  test('a source with a hole in the MIDDLE is cut too — the kept segments, in order', () => {
+    // Bounds 0 → end (it still "spans" the file), but the middle is not its.
+    const source = {
+      windowFromMs: null,
+      windowToMs: null,
+      keptMs: [
+        { fromMs: 0, toMs: FROM },
+        { fromMs: TO, toMs: null },
+      ],
+    };
+    expect(cutPlanOf(source)).toEqual([
+      { fromMs: 0, toMs: FROM },
+      { fromMs: TO, toMs: null },
+    ]);
+  });
+});
+
+describe('joining the segments of a hole cut', () => {
+  const reencode = { mode: 'reencode-video', output: 'av', ext: 'mp4', format: 'mp4' } as const;
+
+  test('the concat demuxer, stream-copied into the attempt’s container', () => {
+    const args = buildConcatArgs({ list: '/c/x.list.1.tmp', out: '/c/x.mp4.1.tmp', attempt: reencode });
+    const joined = args.join(' ');
+    expect(joined).toContain('-f concat -safe 0 -i /c/x.list.1.tmp');
+    expect(joined).toContain('-map 0 -c copy');
+    expect(joined).toContain('-movflags +faststart');
+    expect(args.slice(-3)).toEqual(['-f', 'mp4', '/c/x.mp4.1.tmp']);
+    const wav = buildConcatArgs({ list: 'l', out: 'o', attempt: { mode: 'copy', output: 'audio', ext: 'wav', format: 'wav' } });
+    expect(wav).not.toContain('-movflags');
+  });
+
+  test('the list file quotes every path, a quote inside one included', () => {
+    expect(concatListBody(['/a/s0.tmp', "/b/it's.tmp"])).toBe("file '/a/s0.tmp'\nfile '/b/it'\\''s.tmp'\n");
+  });
+
+  test('the expected length of a plan is the sum of its segments', () => {
+    const plan = [
+      { fromMs: 0, toMs: FROM },
+      { fromMs: TO, toMs: null },
+    ];
+    expect(expectedPlanMs(plan, HOUR)).toBe(FROM + (HOUR - TO));
+    expect(expectedPlanMs(plan, null)).toBeNull(); // open end, unknown file
+    expect(expectedPlanMs([{ fromMs: FROM, toMs: TO }], null)).toBe(TO - FROM);
+  });
+});
+
+describe('estimateCutBytes — the offline plan’s size before the cut exists', () => {
+  test('the stored size in proportion to the kept time', () => {
+    expect(estimateCutBytes({ sourceBytes: 3_600_000, sourceDurationMs: HOUR, segments: [{ fromMs: FROM, toMs: TO }] })).toBe(
+      800_000
+    );
+    const holed = [
+      { fromMs: 0, toMs: FROM },
+      { fromMs: TO, toMs: null },
+    ];
+    expect(estimateCutBytes({ sourceBytes: 3_600_000, sourceDurationMs: HOUR, segments: holed })).toBe(
+      3_600_000 - 800_000
+    );
+  });
+
+  test('unknown when either length is', () => {
+    expect(estimateCutBytes({ sourceBytes: null, sourceDurationMs: HOUR, segments: [{ fromMs: 0, toMs: 1 }] })).toBeNull();
+    expect(estimateCutBytes({ sourceBytes: 5, sourceDurationMs: null, segments: [{ fromMs: 0, toMs: 1 }] })).toBeNull();
+    expect(estimateCutBytes({ sourceBytes: 5, sourceDurationMs: 0, segments: [{ fromMs: 0, toMs: 1 }] })).toBeNull();
+  });
+});
+
+describe('clipMirrorNeedsCut — the sweeper’s filter, off the row', () => {
+  const R = '33333333-aaaa-4aaa-8aaa-333333333333';
+  const S = '44444444-bbbb-4bbb-8bbb-444444444444';
+
+  test('no mirror, a whole recording, or two whole recordings: nothing to cut', () => {
+    expect(clipMirrorNeedsCut(null)).toBe(false);
+    expect(clipMirrorNeedsCut({})).toBe(false);
+    expect(clipMirrorNeedsCut({ clips: [{ ord: 0, recordingId: R, fromMs: 0, toMs: null, offsetMs: 0 }] })).toBe(false);
+    expect(
+      clipMirrorNeedsCut({
+        clips: [
+          { ord: 0, recordingId: R, fromMs: 0, toMs: null, offsetMs: 0 },
+          { ord: 1, recordingId: S, fromMs: 0, toMs: null, offsetMs: 5000 },
+        ],
+      })
+    ).toBe(false);
+  });
+
+  test('a window, or a hole in the middle, needs a cut', () => {
+    expect(clipMirrorNeedsCut({ clips: [{ ord: 0, recordingId: R, fromMs: FROM, toMs: TO, offsetMs: 0 }] })).toBe(true);
+    expect(
+      clipMirrorNeedsCut({
+        clips: [
+          { ord: 0, recordingId: R, fromMs: 0, toMs: FROM, offsetMs: 0 },
+          { ord: 1, recordingId: R, fromMs: TO, toMs: null, offsetMs: TO },
+        ],
+      })
+    ).toBe(true);
+    // Touching clips are one stretch: the whole file, no cut.
+    expect(
+      clipMirrorNeedsCut({
+        clips: [
+          { ord: 0, recordingId: R, fromMs: 0, toMs: FROM, offsetMs: 0 },
+          { ord: 1, recordingId: R, fromMs: FROM, toMs: null, offsetMs: FROM },
+        ],
+      })
+    ).toBe(false);
   });
 });
 

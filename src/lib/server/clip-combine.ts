@@ -37,6 +37,7 @@ import {
   type MeetingClipRow,
 } from '@/db-ops/clips';
 import { getRecording } from '@/db-ops/recordings';
+import { queueClipPrecut } from '@/lib/server/clip-precut';
 import { identitiesForUsers } from '@/db-ops/transcript-activity';
 import { logActivity } from '@/db-ops/transcript-activity';
 import { getForUser } from '@/db-ops/transcripts';
@@ -564,6 +565,10 @@ async function writeMirrorAndMaterialise(
   await setClipMirror(access.ownerUserId, access.row.assemblyai_id, {
     clips: isDefault ? null : clips,
   });
+  // A window or hole this write created is served cut: start it now. The
+  // pre-cut reads the row when it runs (after a short settle), so a rollback
+  // below is what it sees — and queues the same meeting again anyway.
+  queueClipPrecut(access.row.assemblyai_id, `combine-${what}`);
 
   // Back to exactly one whole recording: the row gets that recording's own
   // payload back VERBATIM, copied inside Postgres — the same bytes it carried
@@ -642,6 +647,7 @@ async function restorePriorClips(
   await setClipMirror(access.ownerUserId, access.row.assemblyai_id, {
     clips: Array.isArray(priorMirror) ? (priorMirror as unknown[]) : null,
   });
+  queueClipPrecut(access.row.assemblyai_id, 'combine-rollback');
   await materialiseMeeting(access.row.id, { force: true }).catch(() => {});
 }
 

@@ -8,12 +8,16 @@ import { hasVideoStream, mediaHasVideo } from '@/lib/server/video-frames';
 import { ensureLocalMedia } from '@/lib/server/media-local';
 import type { ResolvedMedia } from '@/lib/server/recordings';
 import {
+  buildConcatArgs,
   buildCutArgs,
   clipCutStem,
+  concatListBody,
   cutAttempts,
   cutIsExact,
   expectedCutMs,
+  expectedPlanMs,
   extOf,
+  segmentsLabel,
   isKeyframeSafe,
   keyframesFromProbe,
   type CutVariant,
@@ -26,16 +30,26 @@ const execFileP = promisify(execFile);
  * The CUT renditions a meeting's media routes serve (lib/clip-cut.ts has the
  * why and every pure decision; this file runs them).
  *
- * Layout: `${MW_STORAGE_DIR}/clips/<meeting id>/<variant>.<from>-<to|end>.<src8>.<ext>`
- * — e.g. `clips/9f1c…/av.1200000-2000000.1a2b3c4d.mp4` and, for
- * `?variant=audio` of a video, `audio.1200000-2000000.1a2b3c4d.m4a`.
+ * Layout: `${MW_STORAGE_DIR}/clips/<meeting id>/<variant>.<segments>.<src8>.<ext>`
+ * — e.g. `clips/9f1c…/av.1200000-2000000.1a2b3c4d.mp4` for a window,
+ * `av.0-1200000_2000000-end.1a2b3c4d.mp4` for a source with a hole in the
+ * middle, and, for `?variant=audio` of a video, `audio.<segments>.<src8>.m4a`.
  *
- * - LAZY: nothing is cut until a meeting route asks for that window.
+ * - EARLY, AND LAZY AS THE FALLBACK: the clip writers queue the cut the
+ *   moment a window or hole is written (lib/server/clip-precut.ts, M2), the
+ *   media sweeper backfills any that is missing, and a meeting route that
+ *   still finds none makes it on the spot.
  * - ONCE: one in-flight ffmpeg per output stem, process-wide (globalThis, for
  *   the same reason audio-only.ts keeps its map there — Next bundles a module
- *   once per route graph, and two route graphs must join one job).
- * - ATOMIC: ffmpeg writes `<name>.tmp`, the duration is checked, then a rename.
- *   A reader never sees a half-written cut.
+ *   once per route graph, and two route graphs must join one job). The
+ *   pre-cut goes through the same `ensureClipCut`, so it joins a request's
+ *   job and vice versa.
+ * - ATOMIC: ffmpeg writes `<name>.<pid>.tmp`, the duration is checked, then a
+ *   rename. A reader never sees a half-written cut, and the two colours of a
+ *   blue/green deploy never write the same temp file.
+ * - HOLES: a plan of several segments (lib/clip-cut.ts `cutPlanOf`) is cut
+ *   segment by segment with ONE attempt for all of them, then joined with the
+ *   concat demuxer into one file; each segment and the whole are checked.
  * - STALE-SAFE: everything that decides the bytes is in the name, and a cut
  *   older than its source (the source replaced in place) is rebuilt.
  * - LOCAL ONLY: cuts are not archived to Blob. They are derivatives that the
@@ -47,11 +61,11 @@ const execFileP = promisify(execFile);
  *   runs whenever the meeting's clips are rewritten (`setClipMirror` — split,
  *   un-split, combine add / patch / delete / rollback) and on permanent delete.
  *
- * The one case NOT cut: a source meeting with a HOLE in the middle (split off
- * without `keepInBoth`). Its bounds are still 0 → end, its timeline keeps the
- * hole so its notes stay valid, and its player skips it. Cutting the hole out
- * would need a re-encode of everything after it (or silence and black frames
- * over it) — tracked as a follow-up rather than smuggled in here.
+ * A source meeting with a HOLE in the middle keeps its own timeline (the hole
+ * stays where its notes say it is); only the SERVED file is contiguous, and
+ * the player maps meeting time across the removed span (lib/clip-window.ts
+ * `PlaybackWindow.gaps`). Only a meeting that holds the whole file with no
+ * hole is served the file itself.
  */
 
 const FFMPEG_TIMEOUT_MS = 30 * 60 * 1000;
@@ -62,11 +76,19 @@ export interface ClipCutRequest {
   meetingId: string;
   /** The stored source (`ResolvedMedia.filename`). */
   sourceFilename: string;
-  window: CutWindow;
+  /** What the meeting keeps of the file, in file order (`cutPlanOf`): one
+   * segment for a window, several for a hole in the middle. */
+  segments: CutWindow[];
   variant: CutVariant;
   /** `?part=N`, for the log line only. */
   part: number;
-  /** `ResolvedMedia.durationMs` when known — saves a probe. */
+  /** Who asked, for the log line only: `route`, `split`, `sweeper`, … */
+  trigger?: string;
+  /**
+   * `ResolvedMedia.durationMs` — only a fallback for the file's own probed
+   * length: in the row-fallback resolver it is the ROW's duration, which for
+   * a split-off meeting is its window, not the file.
+   */
   sourceDurationMs?: number | null;
   /** Overrides the video probe (tests); otherwise `mediaHasVideo` / ffprobe. */
   sourceHasVideo?: boolean | null;
@@ -216,15 +238,21 @@ function runFfmpeg(args: string[]): Promise<void> {
  * An existing, fresh cut for this stem, whatever its extension (it depends on
  * which attempt succeeded). A cut older than its source is deleted and missed.
  */
-async function existingCut(dir: string, stem: string, srcMtimeMs: number): Promise<string | null> {
+async function existingCut(
+  dir: string,
+  stem: string,
+  srcMtimeMs: number,
+  opts: { remove: boolean } = { remove: true }
+): Promise<string | null> {
   const names = await fsp.readdir(dir).catch(() => [] as string[]);
   for (const name of names) {
+    // The stem ends in `.<src8>`, so no other plan's name starts with it.
     if (!name.startsWith(`${stem}.`) || name.endsWith('.tmp')) continue;
     const p = path.join(dir, name);
     const st = await fsp.stat(p).catch(() => null);
     if (!st || st.size === 0) continue;
     if (st.mtimeMs < srcMtimeMs) {
-      await fsp.unlink(p).catch(() => {});
+      if (opts.remove) await fsp.unlink(p).catch(() => {});
       continue;
     }
     return p;
@@ -232,40 +260,97 @@ async function existingCut(dir: string, stem: string, srcMtimeMs: number): Promi
   return null;
 }
 
+interface CutKey {
+  hasVideo: boolean;
+  variant: CutVariant;
+  dir: string;
+  stem: string;
+}
+
+/** Where a request's cut lives. `?variant=audio` of an AUDIO file is the same
+ * bytes as the plain cut, so both name the `av` stem. `hasVideoStream` is
+ * cached per process. */
+async function cutKeyOf(req: ClipCutRequest): Promise<CutKey | { error: string }> {
+  const hasVideo =
+    req.sourceHasVideo ??
+    (req.media ? await mediaHasVideo(req.media) : await hasVideoStream(req.sourceFilename));
+  const variant: CutVariant = hasVideo ? req.variant : 'av';
+  try {
+    const k = clipCutStem({
+      meetingId: req.meetingId,
+      sourceFilename: req.sourceFilename,
+      segments: req.segments,
+      variant,
+    });
+    return { hasVideo, variant, dir: path.join(getStorageDir(), k.dir), stem: k.stem };
+  } catch (e) {
+    return { error: e instanceof Error ? e.message : String(e) };
+  }
+}
+
 /**
- * The cut for one (meeting, file, window, variant) — from the cache, or made
+ * The cut for one (meeting, file, plan, variant) — from the cache, or made
  * now. Concurrent callers for the same stem share ONE job (and so one
  * ffmpeg): the job is registered synchronously after the only await, so two
  * requests can never both miss it. Never throws: failures come back as
  * `{ status: 'error' }` and the next request retries.
  */
 export async function ensureClipCut(req: ClipCutRequest): Promise<ClipCutResult> {
-  // `?variant=audio` of an AUDIO file is the same bytes as the plain cut, so
-  // both ask for the `av` stem. `hasVideoStream` is cached per process.
-  const hasVideo =
-    req.sourceHasVideo ??
-    (req.media ? await mediaHasVideo(req.media) : await hasVideoStream(req.sourceFilename));
-  const variant: CutVariant = hasVideo ? req.variant : 'av';
-  let dir: string;
-  let stem: string;
-  try {
-    const k = clipCutStem({
-      meetingId: req.meetingId,
-      sourceFilename: req.sourceFilename,
-      window: req.window,
-      variant,
-    });
-    dir = path.join(getStorageDir(), k.dir);
-    stem = k.stem;
-  } catch (e) {
-    return { status: 'error', error: e instanceof Error ? e.message : String(e) };
-  }
-  const key = path.join(dir, stem);
+  const k = await cutKeyOf(req);
+  if ('error' in k) return { status: 'error', error: k.error };
+  const key = path.join(k.dir, k.stem);
   const running = inflight.get(key);
   if (running) return running;
-  const job = cutOnce({ ...req, variant }, hasVideo, dir, stem).finally(() => inflight.delete(key));
+  const job = cutOnce({ ...req, variant: k.variant }, k.hasVideo, k.dir, k.stem).finally(() =>
+    inflight.delete(key)
+  );
   inflight.set(key, job);
   return job;
+}
+
+/**
+ * The cut that is ALREADY on disk for this request, or null — never makes
+ * one. For the readers that only want to know (the media sweeper's pre-cut
+ * backstop, the offline plan's sizes). A cut older than its stored source
+ * counts as absent.
+ */
+export async function findClipCut(req: ClipCutRequest): Promise<{ path: string; bytes: number } | null> {
+  const k = await cutKeyOf(req);
+  if ('error' in k) return null;
+  let srcMtimeMs = 0;
+  try {
+    srcMtimeMs = (await fsp.stat(resolveAudioPath(req.sourceFilename)).catch(() => null))?.mtimeMs ?? 0;
+  } catch {
+    srcMtimeMs = 0;
+  }
+  const found = await existingCut(k.dir, k.stem, srcMtimeMs, { remove: false });
+  if (!found) return null;
+  const st = await fsp.stat(found).catch(() => null);
+  return st ? { path: found, bytes: st.size } : null;
+}
+
+const durationCache = new Map<string, number | null>();
+
+/**
+ * A stored file's own length, ms (ffprobe, cached per name + mtime). What the
+ * offline plan's size estimate divides by when the resolver's `durationMs`
+ * cannot be trusted to be the FILE's (the row fallback).
+ */
+export async function storedFileDurationMs(filename: string): Promise<number | null> {
+  let abs: string;
+  try {
+    abs = resolveAudioPath(filename);
+  } catch {
+    return null;
+  }
+  const st = await fsp.stat(abs).catch(() => null);
+  if (!st) return null;
+  const key = `${filename}@${st.mtimeMs}`;
+  if (durationCache.has(key)) return durationCache.get(key) ?? null;
+  const ms = await probeDurationMs(abs);
+  if (durationCache.size > 2000) durationCache.clear();
+  durationCache.set(key, ms);
+  return ms;
 }
 
 /** How many cuts are being looked up or produced right now (diagnostics). */
@@ -328,16 +413,30 @@ async function produceCut(
   } catch (e) {
     return { status: 'error', error: `ffprobe failed: ${e instanceof Error ? e.message : String(e)}` };
   }
-  const sourceDurationMs = req.sourceDurationMs ?? facts.durationMs;
+  // The FILE's own length first: the resolver's `durationMs` is, in the row
+  // fallback, the row's duration — for a split-off meeting its window, which
+  // would make every open-ended or file-clipped expectation wrong.
+  const sourceDurationMs = facts.durationMs ?? req.sourceDurationMs ?? null;
+  const segments = req.segments;
 
-  const needsKeyframes = hasVideo && req.window.fromMs > 0;
-  const keyframeSafe = needsKeyframes
-    ? isKeyframeSafe({
-        fromMs: req.window.fromMs,
-        keyframePtsSec: await keyframesNear(src, req.window.fromMs),
+  // One verdict for the whole plan: a copy is only taken when EVERY segment
+  // starts on a keyframe, because the segments are joined by a stream copy
+  // that needs them all made the same way (`buildConcatArgs`).
+  let keyframeSafe = true;
+  if (hasVideo) {
+    for (const seg of segments) {
+      if (seg.fromMs <= 0) continue;
+      const safe = isKeyframeSafe({
+        fromMs: seg.fromMs,
+        keyframePtsSec: await keyframesNear(src, seg.fromMs),
         startTimeSec: facts.startTimeSec,
-      })
-    : true;
+      });
+      if (!safe) {
+        keyframeSafe = false;
+        break;
+      }
+    }
+  }
 
   const attempts = cutAttempts({
     sourceFilename: req.sourceFilename,
@@ -348,27 +447,46 @@ async function produceCut(
   });
 
   await fsp.mkdir(dir, { recursive: true });
-  const expected = expectedCutMs(req.window, sourceDurationMs);
+  const expected = expectedPlanMs(segments, sourceDurationMs);
   const started = Date.now();
-  const tag = `${req.meetingId} part=${req.part} ${req.window.fromMs}-${req.window.toMs ?? 'end'} ${req.variant}`;
+  const tag =
+    `${req.meetingId} part=${req.part} ${segmentsLabel(segments)} ${req.variant}` +
+    (segments.length > 1 ? ` segments=${segments.length}` : '') +
+    (req.trigger ? ` via=${req.trigger}` : '');
   const failures: string[] = [];
+  // An audio-only SOURCE keeps all its tracks; the soundtrack rendition of a
+  // video is the mix (track 0), like the audio-only derivative.
+  const audioTracks = hasVideo ? 'first' : 'all';
 
   for (const attempt of attempts) {
     const out = path.join(dir, `${stem}.${attempt.ext}`);
-    const tmp = `${out}.tmp`;
+    const tmp = `${out}.${process.pid}.tmp`;
+    const scratch: string[] = [];
     await fsp.unlink(tmp).catch(() => {});
     try {
-      await runFfmpeg(
-        buildCutArgs({
-          src,
-          out: tmp,
-          window: req.window,
-          attempt,
-          // An audio-only SOURCE keeps all its tracks; the soundtrack rendition
-          // of a video is the mix (track 0), like the audio-only derivative.
-          audioTracks: hasVideo ? 'first' : 'all',
-        })
-      );
+      if (segments.length === 1) {
+        await runFfmpeg(buildCutArgs({ src, out: tmp, window: segments[0]!, attempt, audioTracks }));
+      } else {
+        // A hole in the middle: each kept segment cut on its own with THIS
+        // attempt, each checked, then joined by a stream copy into one file.
+        const parts: string[] = [];
+        for (const [i, seg] of segments.entries()) {
+          const part = path.join(dir, `${stem}.s${i}.${process.pid}.tmp`);
+          scratch.push(part);
+          await fsp.unlink(part).catch(() => {});
+          await runFfmpeg(buildCutArgs({ src, out: part, window: seg, attempt, audioTracks }));
+          const got = await probeDurationMs(part);
+          const want = expectedCutMs(seg, sourceDurationMs);
+          if (!cutIsExact({ actualMs: got, expectedMs: want })) {
+            throw new Error(`segment ${i + 1}/${segments.length} is ${got ?? '?'} ms, wanted ${want ?? '?'} ms`);
+          }
+          parts.push(part);
+        }
+        const list = path.join(dir, `${stem}.list.${process.pid}.tmp`);
+        scratch.push(list);
+        await fsp.writeFile(list, concatListBody(parts));
+        await runFfmpeg(buildConcatArgs({ list, out: tmp, attempt }));
+      }
       const actual = await probeDurationMs(tmp);
       if (!cutIsExact({ actualMs: actual, expectedMs: expected })) {
         failures.push(`${attempt.mode}: ${actual ?? '?'} ms, wanted ${expected ?? '?'} ms`);
@@ -386,6 +504,8 @@ async function produceCut(
     } catch (e) {
       failures.push(`${attempt.mode}: ${e instanceof Error ? e.message : String(e)}`);
       await fsp.unlink(tmp).catch(() => {});
+    } finally {
+      for (const f of scratch) await fsp.unlink(f).catch(() => {});
     }
   }
   const error = `no attempt produced the window (${failures.join(' | ')})`;

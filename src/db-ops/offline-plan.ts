@@ -30,6 +30,9 @@ export interface OfflinePlanRow {
   provider: 'gmeet' | 'teams' | null;
   local_audio_path: string | null;
   video_parts: NonNullable<GmeetContext['videoParts']> | null;
+  /** `gmeet_context.clips` — the clip mirror, so the row-fallback resolver
+   * knows a meeting's window / hole (and so its served size) too. */
+  clips: unknown;
   /** md5 over everything the meeting page renders from the row. */
   rev: string;
 }
@@ -61,7 +64,11 @@ const revExpr = () => sql`
     (SELECT max(e.updated_at) FROM ${sql(SCHEMA)}.transcript_edits e
       WHERE e.user_id = t.user_id AND e.assemblyai_id = t.assemblyai_id)::text, '|',
     (SELECT max(m.updated_at) FROM ${sql(SCHEMA)}.speaker_mappings m
-      WHERE m.user_id = t.user_id AND m.assemblyai_id = t.assemblyai_id)::text
+      WHERE m.user_id = t.user_id AND m.assemblyai_id = t.assemblyai_id)::text,
+    -- The clip mirror decides the SERVED media (a window or a hole is cut,
+    -- lib/clip-cut.ts). Appended only when present, so the rev of every
+    -- meeting without clips is exactly what it was.
+    COALESCE('|clips:' || (t.gmeet_context->'clips')::text, '')
   ))
 `;
 
@@ -93,6 +100,7 @@ export async function listOfflinePlanRows(
              END AS provider,
              t.local_audio_path,
              t.gmeet_context->'videoParts' AS video_parts,
+             t.gmeet_context->'clips' AS clips,
              ${revExpr()} AS rev,
              row_number() OVER (
                PARTITION BY t.assemblyai_id
@@ -109,7 +117,7 @@ export async function listOfflinePlanRows(
         ${ids !== null ? sql`AND t.assemblyai_id = ANY(${ids})` : sql``}
     )
     SELECT id, assemblyai_id, title, recorded_at, created_at, duration, provider,
-           local_audio_path, video_parts, rev
+           local_audio_path, video_parts, clips, rev
     FROM visible
     WHERE rn = 1
     ORDER BY COALESCE(recorded_at, created_at) DESC, id DESC
