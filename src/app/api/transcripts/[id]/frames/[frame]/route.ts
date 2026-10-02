@@ -4,7 +4,12 @@ import { stat } from 'node:fs/promises';
 import { Readable } from 'node:stream';
 import { withAuth } from '@/lib/auth/with-auth';
 import { resolveAccess } from '@/db-ops/transcript-access';
-import { extractFrame, frameRequestFor, hasVideoStream } from '@/lib/server/video-frames';
+import {
+  extractFrameFromMedia,
+  framePath,
+  frameRequestFor,
+  mediaHasVideo,
+} from '@/lib/server/video-frames';
 import { resolveMeetingContent } from '@/lib/server/recordings';
 
 export const runtime = 'nodejs';
@@ -39,14 +44,21 @@ export const GET = withAuth(async ({ user }, { params }) => {
   }
 
   const request = frameRequestFor((await resolveMeetingContent(access.row)).media, ms);
-  if (!request || !(await hasVideoStream(request.source.filename))) {
+  // A meeting whose stored copy was archived and purged still has its
+  // frames: a cached one is served without looking at the media at all, and
+  // a new one is cut from the archived file pulled into media-local's cache
+  // (`mediaHasVideo` / `extractFrameFromMedia`).
+  const cached = await stat(framePath(access.row.assemblyai_id, ms))
+    .then((st) => st.size > 0)
+    .catch(() => false);
+  if (!request || (!cached && !(await mediaHasVideo(request.source)))) {
     return NextResponse.json({ error: 'No video stored for this transcript' }, { status: 404 });
   }
 
   try {
-    const abs = await extractFrame(
+    const abs = await extractFrameFromMedia(
       access.row.assemblyai_id,
-      request.source.filename,
+      request.source,
       request.fileMs,
       ms
     );

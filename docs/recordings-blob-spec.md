@@ -360,6 +360,29 @@ the audio dir with an EXDEV-safe move. An unusable scratch root logs once and fa
   by an explicit script (`scripts/media-evict.ts`, dry-run default). Until then both copies exist.
 - `/temphigh` is ephemeral by design: after a VM redeploy the cache is simply cold.
 
+### As built ahead of Stage D — the sidecar and frame reads (2026-10-02)
+
+Prod, 2026-10-02: `[voiceprint] suggest failed for speaker A: Error: sidecar /embed 404: {"error": "audio file not
+found: …/storage/audio/<id>.mp4"}` (recordings 02af969f… and 793c624b…). Playback proxies the blob and ingest pulls
+it, but the voiceprint pass handed the sidecar the raw stored path, and the frame grabs did the same (worse:
+`hasVideoStream` cached a missing file as "no video" for the life of the process, so the notes and speaker-ID passes
+silently ran without frames).
+
+`src/lib/server/media-local.ts` is the read half of `ensureLocal`, unflagged: `ensureLocalMedia(media, 'audio' |
+'video', { purpose })` → the stored file when it is on disk (unchanged path, no blob call); for audio the local
+`audio-only/<stem>.m4a`; else a pull of the archived blob — the audio-only extract's blob for audio (~30 MB/h; the
+sidecar decodes anything ffmpeg does, and the player already plays it against the same transcript times), the
+canonical for frames — into `<MW_SCRATCH_DIR or MW_STORAGE_DIR>/media-cache/` (sha256-named, single-flight per blob,
+`.part` + size check against the blob's properties + rename, reference-counted while read, LRU-evicted over
+`MW_MEDIA_CACHE_MAX_BYTES` (default 4 GiB) or idle past `MW_MEDIA_CACHE_TTL_MS` (default 1 h), never while held). It
+never writes back into `storage/audio/`. Nothing to pull (no blob name, no store, pull failed) → null and ONE warning
+per recording per process. Callers: `suggestSpeakersForTranscript` / `enrollFromTranscript` (`localMediaSession` —
+one pull per file per pass), the meet-align voice valve, `POST /api/recordings/:id/align`, and the frames
+(`mediaHasVideo` + `extractFrameFromMedia` in `video-frames.ts`: the frames route, the notes / speaker-ID
+`grab_frames` tool and the post-report pre-warm; a cached frame is served without touching the media). Tests:
+`src/lib/server/__tests__/media-local.test.ts`. Still Stage D's: the 60 GB `/temphigh` cache sizing, sha256
+verification on the pull, and the drain script.
+
 ## Cost (order of magnitude, southeastasia, Hot LRS)
 Storage ≈ US$0.02/GB-month → 80 GB ≈ US$1.6/month. Reads from the VM (same region) are free. Internet egress to
 people's browsers ≈ US$0.09–0.12/GB → a full 600 MB video view ≈ 6 cents; audio-only playback is ~1/20 of that.

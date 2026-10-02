@@ -38,6 +38,7 @@ import {
 import { mergeVoiceSuggestions } from '@/lib/speaker-id-merge';
 import type { TranscriptRow } from '@/db-ops/transcripts';
 import { recordingCallContext } from '@/lib/server/recording-call-context';
+import { localMediaSession } from '@/lib/server/media-local';
 
 const SIDECAR_URL = process.env.MW_VOICEPRINT_URL || 'http://127.0.0.1:3004';
 
@@ -200,6 +201,12 @@ function cosine(a: number[], b: number[]): number {
   return dot / (Math.sqrt(na) * Math.sqrt(nb) || 1);
 }
 
+/**
+ * The stored file's path, WITHOUT checking it exists — the scripts' form
+ * (rebuild-voiceprints). The app's passes go through `localMediaSession`
+ * (lib/server/media-local.ts), which also reaches a file whose local copy is
+ * gone but whose blob is archived.
+ */
 export function audioPathFor(media: ResolvedMedia | null): string | null {
   if (!media) return null;
   try {
@@ -225,32 +232,41 @@ export async function enrollFromTranscript(
 ): Promise<void> {
   if (asList(media).length === 0 || !content?.utterances?.length) return;
 
-  for (const label of labels) {
-    const name = label.customName.trim();
-    if (!name) continue;
-    // "mixed" / "room mic" is a shared-mic label, not a person: enrolling it
-    // (as happened 2026-09-14, voiceprints id 206) makes the matcher SUGGEST
-    // it on other meetings. docs/transcript-page-redesign.md §5.
-    if (isGroupLabel(name)) {
-      console.log(`[voiceprint] not enrolling group label "${name}" (speaker ${label.originalSpeaker})`);
-      continue;
-    }
-    try {
-      // Phase 3b: the file this speaker's voice is actually in.
-      const from = mediaForSpeaker(media, label.originalSpeaker);
-      const audioPath = audioPathFor(from);
-      if (!audioPath || !from) continue;
-      const { segments, seconds } = pickSegments(content, label.originalSpeaker, from);
-      const embedding = await embedViaSidecar(audioPath, segments);
-      if (embedding) {
-        await enrollSample(name, embedding, seconds);
-        console.log(
-          `[voiceprint] enrolled sample for "${name}" (speaker ${label.originalSpeaker}, ${seconds.toFixed(0)}s)`
-        );
+  // A readable local file per recording, pulled from the archive when the
+  // local copy is gone (lib/server/media-local.ts) — the sidecar only reads
+  // paths. Released together at the end.
+  const files = localMediaSession('audio', 'voiceprint enroll');
+  try {
+    for (const label of labels) {
+      const name = label.customName.trim();
+      if (!name) continue;
+      // "mixed" / "room mic" is a shared-mic label, not a person: enrolling it
+      // (as happened 2026-09-14, voiceprints id 206) makes the matcher SUGGEST
+      // it on other meetings. docs/transcript-page-redesign.md §5.
+      if (isGroupLabel(name)) {
+        console.log(`[voiceprint] not enrolling group label "${name}" (speaker ${label.originalSpeaker})`);
+        continue;
       }
-    } catch (err) {
-      console.warn(`[voiceprint] enroll failed for "${name}":`, err);
+      try {
+        // Phase 3b: the file this speaker's voice is actually in.
+        const from = mediaForSpeaker(media, label.originalSpeaker);
+        if (!from) continue;
+        const local = await files.get(from);
+        if (!local) continue; // media-local said why, once
+        const { segments, seconds } = pickSegments(content, label.originalSpeaker, from);
+        const embedding = await embedViaSidecar(local.path, segments);
+        if (embedding) {
+          await enrollSample(name, embedding, seconds);
+          console.log(
+            `[voiceprint] enrolled sample for "${name}" (speaker ${label.originalSpeaker}, ${seconds.toFixed(0)}s)`
+          );
+        }
+      } catch (err) {
+        console.warn(`[voiceprint] enroll failed for "${name}":`, err);
+      }
     }
+  } finally {
+    await files.releaseAll();
   }
 }
 
@@ -293,66 +309,76 @@ export async function suggestSpeakersForTranscript(
   const speakers = [...new Set(content.utterances.map((u) => u.speaker))];
   const suggestions: SpeakerSuggestionMap = {};
   const verdicts: string[] = [];
+  // The sidecar reads a PATH. When the stored copy is gone (archived to blob
+  // and purged — prod 2026-10-02, `sidecar /embed 404: audio file not
+  // found`), media-local pulls the archived file — the small audio-only
+  // extract when there is one — into its bounded cache, once per file for
+  // the whole pass.
+  const files = localMediaSession('audio', 'voiceprint');
 
-  for (const speaker of speakers) {
-    let verdict: SpeakerVerdict = { kind: 'error' };
-    try {
-      // Each recording's snippets come out of ITS file. A label with no
-      // prefix is a single-recording meeting and resolves to the canonical,
-      // exactly as before.
-      const from = mediaForSpeaker(media, speaker);
-      const audioPath = audioPathFor(from);
-      if (!audioPath || !from) {
-        verdict = { kind: 'no-media' };
-        continue;
-      }
-      const { segments, longestMs } = pickSegments(content, speaker, from);
-      if (segments.length === 0) {
-        verdict = { kind: 'no-segment', longestMs };
-        continue;
-      }
-      const embedding = await embedViaSidecar(audioPath, segments);
-      if (!embedding) {
-        verdict = { kind: 'no-segment', longestMs };
-        continue;
-      }
+  try {
+    for (const speaker of speakers) {
+      let verdict: SpeakerVerdict = { kind: 'error' };
+      try {
+        // Each recording's snippets come out of ITS file. A label with no
+        // prefix is a single-recording meeting and resolves to the canonical,
+        // exactly as before.
+        const from = mediaForSpeaker(media, speaker);
+        const local = from ? await files.get(from) : null;
+        if (!local || !from) {
+          verdict = { kind: 'no-media' };
+          continue;
+        }
+        const { segments, longestMs } = pickSegments(content, speaker, from);
+        if (segments.length === 0) {
+          verdict = { kind: 'no-segment', longestMs };
+          continue;
+        }
+        const embedding = await embedViaSidecar(local.path, segments);
+        if (!embedding) {
+          verdict = { kind: 'no-segment', longestMs };
+          continue;
+        }
 
-      const scored = voiceprints
-        .map((vp) => ({ name: vp.name, score: cosine(embedding, vp.embedding) }))
-        .sort((a, b) => b.score - a.score);
+        const scored = voiceprints
+          .map((vp) => ({ name: vp.name, score: cosine(embedding, vp.embedding) }))
+          .sort((a, b) => b.score - a.score);
 
-      const best = scored[0]!;
-      // Runner-up for the margin check = best-scoring *distinct person*. Two
-      // rows of one human (legacy name_key spellings awaiting the rebuild)
-      // are `samePerson` and never compete.
-      const second = scored.find((s) => !samePerson(s.name, best.name));
-      // Threshold, margin (broken by the call roster when it can be), and the
-      // invite gate: a weak match to someone who was not invited is not
-      // surfaced (lib/voiceprint-math.ts decideVoiceMatch).
-      const decision = decideVoiceMatch(best, second, {
-        threshold: THRESHOLD,
-        margin: MARGIN,
-        roster,
-        samePerson,
-        offRosterMin: OFF_ROSTER_MIN,
-      });
-      verdict = decision.verdict;
-      if (decision.suggestion) {
-        // No `evidence` here: the UI renders a voice suggestion's evidence
-        // as "the transcript agrees — …" (the ID pass's slot). Roster
-        // decisions are in the verdict log line.
-        suggestions[speaker] = {
-          name: decision.suggestion.name,
-          confidence: Math.round(decision.suggestion.score * 100) / 100,
-          source: 'voice',
-          ...(decision.suggestion.offRoster ? { offRoster: true } : {}),
-        };
+        const best = scored[0]!;
+        // Runner-up for the margin check = best-scoring *distinct person*. Two
+        // rows of one human (legacy name_key spellings awaiting the rebuild)
+        // are `samePerson` and never compete.
+        const second = scored.find((s) => !samePerson(s.name, best.name));
+        // Threshold, margin (broken by the call roster when it can be), and the
+        // invite gate: a weak match to someone who was not invited is not
+        // surfaced (lib/voiceprint-math.ts decideVoiceMatch).
+        const decision = decideVoiceMatch(best, second, {
+          threshold: THRESHOLD,
+          margin: MARGIN,
+          roster,
+          samePerson,
+          offRosterMin: OFF_ROSTER_MIN,
+        });
+        verdict = decision.verdict;
+        if (decision.suggestion) {
+          // No `evidence` here: the UI renders a voice suggestion's evidence
+          // as "the transcript agrees — …" (the ID pass's slot). Roster
+          // decisions are in the verdict log line.
+          suggestions[speaker] = {
+            name: decision.suggestion.name,
+            confidence: Math.round(decision.suggestion.score * 100) / 100,
+            source: 'voice',
+            ...(decision.suggestion.offRoster ? { offRoster: true } : {}),
+          };
+        }
+      } catch (err) {
+        console.warn(`[voiceprint] suggest failed for speaker ${speaker}:`, err);
+      } finally {
+        verdicts.push(formatVerdict(speaker, verdict));
       }
-    } catch (err) {
-      console.warn(`[voiceprint] suggest failed for speaker ${speaker}:`, err);
-    } finally {
-      verdicts.push(formatVerdict(speaker, verdict));
     }
+  } finally {
+    await files.releaseAll();
   }
   console.log(`[voiceprint] ${assemblyaiId} verdicts: ${verdicts.join(' · ')}`);
   rememberVerdicts(assemblyaiId, verdicts);

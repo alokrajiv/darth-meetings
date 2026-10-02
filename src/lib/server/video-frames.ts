@@ -5,6 +5,8 @@ import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { getStorageDir, resolveAudioPath } from '@/lib/server/audio-storage';
 import { canonicalMedia, localMsIn, type ResolvedMedia } from '@/lib/server/recordings';
+import { ensureLocalMedia, warnOnce } from '@/lib/server/media-local';
+import { mediaStore } from '@/lib/server/media-store';
 
 const execFileP = promisify(execFile);
 
@@ -67,8 +69,20 @@ export async function hasVideoStream(audioFilename: string): Promise<boolean> {
     videoStreamCache.set(audioFilename, false);
     return false;
   }
+  let abs: string;
   try {
-    const abs = resolveAudioPath(audioFilename);
+    abs = resolveAudioPath(audioFilename);
+  } catch {
+    videoStreamCache.set(audioFilename, false);
+    return false;
+  }
+  // A file that is NOT HERE is not "no video": its local copy may be gone
+  // (archived to blob, purged) or not landed yet. Answer false for now but
+  // never cache it — caching made every later frame grab in this process
+  // believe the meeting had no picture. `mediaHasVideo` is the form that
+  // looks past the missing copy.
+  if (!(await fsp.stat(abs).catch(() => null))) return false;
+  try {
     const { stdout } = await execFileP(
       'ffprobe',
       ['-v', 'error', '-select_streams', 'v:0', '-show_entries', 'stream=codec_type', '-of', 'csv=p=0', abs],
@@ -80,6 +94,60 @@ export async function hasVideoStream(audioFilename: string): Promise<boolean> {
   } catch {
     videoStreamCache.set(audioFilename, false);
     return false;
+  }
+}
+
+/**
+ * Does this meeting file have a picture to grab frames from — even when its
+ * local copy is gone?
+ *
+ * On disk: ffprobe says (`hasVideoStream`), exactly as before. Not on disk:
+ * the media row's own `has_video` (`isVideo`) decides, provided there is an
+ * archived blob and a store to pull it from — `extractFrameFromMedia` then
+ * pulls it into media-local's cache. Neither: false, logged once per
+ * recording, so the notes / speaker-ID passes say why they ran without
+ * frames instead of silently losing them (prod 2026-10-02).
+ */
+export async function mediaHasVideo(media: ResolvedMedia): Promise<boolean> {
+  let onDisk = false;
+  try {
+    onDisk = !!(await fsp.stat(resolveAudioPath(media.filename)).catch(() => null));
+  } catch {
+    onDisk = false;
+  }
+  if (onDisk) return hasVideoStream(media.filename);
+  if (AUDIO_ONLY_EXT.test(media.filename) || media.isVideo === false) return false;
+  if (media.isVideo === true && media.blobName && mediaStore()) return true;
+  warnOnce(
+    `frames:${media.recordingId || media.filename}:no-video-source`,
+    `[media-local] frames: ${media.recordingId ? `recording ${media.recordingId} (${media.filename})` : media.filename} ` +
+      'is not on disk and there is no archived video to pull — frames are off for it'
+  );
+  return false;
+}
+
+/**
+ * `extractFrame` for a meeting FILE rather than a filename: a cached frame is
+ * served without touching the media at all; otherwise the file is made local
+ * (the stored copy, or the archived blob pulled into media-local's cache) for
+ * the one ffmpeg seek and released straight after. Throws like `extractFrame`
+ * when no frame can be had.
+ */
+export async function extractFrameFromMedia(
+  assemblyaiId: string,
+  media: ResolvedMedia,
+  fileMs: number,
+  cacheMs: number = fileMs,
+  width: number = FRAME_WIDTH
+): Promise<string> {
+  const cached = framePath(assemblyaiId, cacheMs, width);
+  if (await fsp.stat(cached).then((st) => st.size > 0).catch(() => false)) return cached;
+  const local = await ensureLocalMedia(media, 'video', { purpose: 'frames' });
+  if (!local) throw new Error('the recording file is not available on this server');
+  try {
+    return await extractFrame(assemblyaiId, media.filename, fileMs, cacheMs, width, local.path);
+  } finally {
+    local.release();
   }
 }
 
@@ -153,7 +221,9 @@ export async function extractFrame(
   audioFilename: string,
   fileMs: number,
   cacheMs: number = fileMs,
-  width: number = FRAME_WIDTH
+  width: number = FRAME_WIDTH,
+  /** Read from here instead of the stored file (media-local's cache copy). */
+  srcPath?: string
 ): Promise<string> {
   const ms = fileMs;
   const out = framePath(assemblyaiId, cacheMs, width);
@@ -164,7 +234,7 @@ export async function extractFrame(
     /* extract below */
   }
   await fsp.mkdir(frameDir(assemblyaiId), { recursive: true });
-  const src = resolveAudioPath(audioFilename);
+  const src = srcPath ?? resolveAudioPath(audioFilename);
   const ts = (Math.max(0, Math.floor(ms)) / 1000).toFixed(3);
   // -ss before -i = fast keyframe seek; decode starts near the target
   // rather than from byte zero. scale to a fixed width, -2 keeps aspect.
