@@ -61,15 +61,16 @@ export function expiresCopy(expiresAt: string | null, now: number = Date.now()):
 export function stripForRecordingView(
   r: RecordingViewWire,
   opts: {
-    live?: { pct: number } | null;
+    /** The tray's live progress (bytes from 0.3.9+ trays; null = unknown). */
+    live?: { pct: number; bytesSent?: number | null; bytesTotal?: number | null } | null;
     fmtBytes: (n: number) => string;
     fmtDuration: (s: number) => string;
   }
 ): RecordingStripModel {
   const source = r.source_kind === 'recorder' ? 'mac' : 'file';
   if (r.status === 'uploading') {
-    const total = r.upload?.bytes_total ?? null;
-    const got = r.upload?.bytes_received ?? null;
+    const total = opts.live?.bytesTotal ?? r.upload?.bytes_total ?? null;
+    const got = opts.live?.bytesSent ?? r.upload?.bytes_received ?? null;
     const pct =
       opts.live?.pct ?? (total && got != null && total > 0 ? Math.min(100, (got / total) * 100) : null);
     const text = [
