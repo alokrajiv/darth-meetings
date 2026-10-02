@@ -728,8 +728,8 @@ export async function loadMeetingRecordingGraphs(
  */
 export async function loadGraphMeetingRows(assemblyaiId: string): Promise<GraphMeetingRow[]> {
   // The job id comes through `jobIdSql` so this keeps working on a
-  // schema where migration 045 has not been applied (it selects a NULL, and
-  // `aaiJobIdOf` falls back to a UUID-shaped meeting id, as for any pre-1b row).
+  // schema where migration 045 has not been applied (it then selects the
+  // UUID-shaped meeting id under the column's name, as for any pre-1b row).
   const job = await jobIdSql('t');
   return sql<GraphMeetingRow[]>`
     SELECT t.id, t.user_id, t.assemblyai_id, ${job.column}, t.original_filename, t.status,

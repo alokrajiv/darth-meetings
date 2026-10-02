@@ -92,6 +92,27 @@ describe('refreshPendingAgainstAai — the one completion path the listing and t
     expect(getTranscript).not.toHaveBeenCalled();
   });
 
+  test('prod 2026-10-02: a meeting made early from a recording is never polled, never given up on', async () => {
+    // transcripts 1054: processing, minted UUID id, no job of its own. The
+    // pending/stranded queries now hand it over with aai_job_id NULL (the SQL
+    // twin no longer falls back to the meeting id), and the legacy listing's
+    // lookup answers NULL for it too.
+    const madeEarly = {
+      assemblyai_id: '2bd949dd-c829-4cdd-a2b6-d2a86b2eefd5',
+      status: 'processing',
+      aai_job_id: null,
+    };
+    const rows = [row(madeEarly)];
+    await refreshPendingAgainstAai(rows);
+    const lookup = mock(async (ids: string[]) => new Map(ids.map((id) => [id, null])));
+    await refreshPendingAgainstAai([row({ ...madeEarly, aai_job_id: undefined })], lookup);
+    expect(lookup).toHaveBeenCalledTimes(1);
+    expect(getTranscript).not.toHaveBeenCalled();
+    expect(giveUpOnAaiJob).not.toHaveBeenCalled();
+    expect(updateStatusForUser).not.toHaveBeenCalled();
+    expect((rows[0] as { status: string }).status).toBe('processing');
+  });
+
   test('legacy rows without the job column resolve it through the caller-scoped lookup', async () => {
     getTranscript.mockResolvedValueOnce({ status: 'queued', utterances: null });
     const lookup = mock(async (ids: string[]) => new Map(ids.map((id) => [id, id === 'meeting-1' ? 'job-x' : null])));
