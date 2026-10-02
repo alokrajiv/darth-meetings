@@ -1,0 +1,123 @@
+<!doctype html>
+<!--
+  nginx's 502/503/504 page for Darth Meetings (deploy/nginx-meetings.conf:
+  error_page → /__maintenance.html, served from /var/www/mw-maintenance by
+  deploy/setup-blue-green.sh). Shown only when NO app colour answers.
+
+  - /__notice.json present (deploy.sh --message / --notice) → the owner's own
+    words + "until ~HH:MM SGT" when an ETA was given;
+  - absent → the plain restart line. Never an invented "deploying" text.
+  - Re-requests the original URL every 5 s and reloads once it answers.
+
+  Self-contained on purpose (no app CSS/JS: the app is what is down). The
+  parse/format rules mirror src/lib/maintenance-notice.ts.
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex">
+<title>Darth Meetings</title>
+<style>
+  :root { --bg: #ffffff; --fg: #111111; --muted: #6b6b6b; --card: #f6f6f7; --border: #e4e4e7; --accent: #7c3aed; }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg: #0b0b0c; --fg: #ededed; --muted: #a1a1aa; --card: #161618; --border: #2a2a2e; --accent: #a78bfa; }
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; }
+  body { background: var(--bg); color: var(--fg); font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+         display: flex; align-items: center; justify-content: center; padding: 16px; }
+  main { width: 100%; max-width: 460px; background: var(--card); border: 1px solid var(--border);
+         border-radius: 12px; padding: 28px 24px; text-align: center; }
+  h1 { font-size: 18px; font-weight: 600; margin: 0 0 10px; }
+  p { margin: 0 0 6px; font-size: 14px; line-height: 1.5; }
+  #msg { white-space: pre-line; }
+  .muted { color: var(--muted); font-size: 13px; }
+  .spin { width: 18px; height: 18px; margin: 0 auto 14px; border-radius: 50%;
+          border: 2px solid var(--border); border-top-color: var(--accent); animation: s 0.9s linear infinite; }
+  @keyframes s { to { transform: rotate(360deg); } }
+  @media (prefers-reduced-motion: reduce) { .spin { animation: none; } }
+  .row { display: flex; gap: 8px; justify-content: center; margin-top: 18px; }
+  button { font: inherit; font-size: 14px; padding: 6px 14px; border-radius: 6px; cursor: pointer;
+           border: 1px solid var(--border); background: transparent; color: inherit; }
+  button.primary { background: var(--fg); color: var(--bg); border-color: transparent; }
+</style>
+</head>
+<body>
+<main role="status" aria-live="polite">
+  <div class="spin" aria-hidden="true"></div>
+  <h1 id="title">Darth Meetings is restarting</h1>
+  <p id="msg">This usually takes under a minute.</p>
+  <p id="eta" class="muted" hidden></p>
+  <p class="muted">This page reloads by itself when it is back.</p>
+  <div class="row">
+    <button class="primary" type="button" onclick="location.reload()">Reload</button>
+    <button type="button" onclick="history.length > 1 ? history.back() : (location.href = '/')">Back</button>
+  </div>
+</main>
+<script>
+(function () {
+  'use strict';
+  var RETRY_MS = 5000;
+
+  function sgtClock(iso, now) {
+    var t = Date.parse(iso);
+    if (!isFinite(t)) return null;
+    var d = new Date(t + 8 * 3600 * 1000), n = new Date(now.getTime() + 8 * 3600 * 1000);
+    var hh = String(d.getUTCHours()).padStart(2, '0'), mm = String(d.getUTCMinutes()).padStart(2, '0');
+    var same = d.getUTCFullYear() === n.getUTCFullYear() && d.getUTCMonth() === n.getUTCMonth() && d.getUTCDate() === n.getUTCDate();
+    var day = same ? '' : ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'][d.getUTCDay()] + ' ';
+    return day + hh + ':' + mm + ' SGT';
+  }
+
+  function render(n) {
+    var title = document.getElementById('title'), msg = document.getElementById('msg'), eta = document.getElementById('eta');
+    if (!n) {
+      title.textContent = 'Darth Meetings is restarting';
+      msg.textContent = 'This usually takes under a minute.';
+      eta.hidden = true;
+      return;
+    }
+    title.textContent = 'Darth Meetings is being updated';
+    msg.textContent = n.message;
+    var clock = n.eta_at ? sgtClock(n.eta_at, new Date()) : null;
+    if (clock) {
+      eta.textContent = Date.parse(n.eta_at) < Date.now() ? 'Expected back ~' + clock + ' — running late' : 'Back by ~' + clock;
+      eta.hidden = false;
+    } else {
+      eta.hidden = true;
+    }
+  }
+
+  function loadNotice() {
+    return fetch('/__notice.json', { cache: 'no-store' })
+      .then(function (r) { return r.ok ? r.json() : null; })
+      .then(function (j) {
+        var m = j && typeof j.message === 'string' ? j.message.trim().slice(0, 500) : '';
+        return m ? { message: m, eta_at: typeof j.eta_at === 'string' ? j.eta_at : null } : null;
+      })
+      .catch(function () { return null; });
+  }
+
+  // Is the app answering again? Any status below 500 (incl. the sign-in
+  // redirect, seen as an opaque redirect under redirect: 'manual').
+  function appBack() {
+    return fetch(location.href, { cache: 'no-store', redirect: 'manual', credentials: 'same-origin' })
+      .then(function (r) { return r.type === 'opaqueredirect' || (r.status > 0 && r.status < 500); })
+      .catch(function () { return false; });
+  }
+
+  function cycle() {
+    loadNotice().then(render);
+    appBack().then(function (up) {
+      if (up) location.reload();
+      else setTimeout(cycle, RETRY_MS);
+    });
+  }
+
+  loadNotice().then(render);
+  setTimeout(cycle, RETRY_MS);
+})();
+</script>
+</body>
+</html>

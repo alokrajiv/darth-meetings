@@ -6,6 +6,7 @@ import { OfflineProvider } from "@/lib/offline/offline-context";
 import { AppBadge } from "@/lib/offline/app-badge";
 import { OfflineBanner } from "@/components/offline-banner";
 import { CompanionBanner } from "@/components/companion-banner";
+import { MaintenanceBanner } from "@/components/maintenance-banner";
 import { headers } from "next/headers";
 import { ShellSearchProvider } from "@/components/shell-search";
 import { desktopShellOf } from "@/lib/desktop-shell";
@@ -73,6 +74,9 @@ export default async function RootLayout({
           {/* Installed app only: icon badge = meetings waiting for speaker review. */}
           <AppBadge />
           <OfflineBanner />
+          {/* Client-only: the owner's deploy notice (deploy.sh --message),
+              read from nginx's /__notice.json; nothing when there is none. */}
+          <MaintenanceBanner />
           {/* Client-only: talks to the local Darth Recorder tray (ws://127.0.0.1:47800)
               when one is installed; renders nothing otherwise. */}
           <CompanionBanner />
