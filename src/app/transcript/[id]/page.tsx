@@ -85,6 +85,11 @@ import {
 } from '@/components/ui/dialog';
 import { defaultSpeakerLabel } from '@/lib/speaker-display';
 import { extractHeadings, makeSlugger } from '@/lib/markdown-headings';
+import { LinkIcon } from 'lucide-react';
+import { CopyLinkButton, copyLinkWithToast, useCopyLinkShortcut } from '@/components/copy-link-button';
+import { meetingLinkUrl, resolveMeetingLink, resolveMeetingUuid } from '@/lib/meeting-link';
+import { useShellSearchScope } from '@/components/shell-search';
+import type { ScopeUtterance } from '@/lib/meeting-scope-search';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import {
@@ -180,6 +185,26 @@ function TranscriptDetailInner({ transcriptId }: { transcriptId: string }) {
   }, []);
 
   const [row, setRow] = useState<DetailRow | null>(null);
+  // "Copy link" (header, ⋯ menu, ⌘⇧C): the meeting's permanent /m/<uuid>
+  // link — the desktop shell has no URL bar (lib/meeting-link.ts).
+  const [meetingUuid, setMeetingUuid] = useState<string | null>(null);
+  useEffect(() => {
+    let alive = true;
+    void resolveMeetingUuid(transcriptId).then((u) => {
+      if (alive) setMeetingUuid(u);
+    });
+    return () => {
+      alive = false;
+    };
+  }, [transcriptId]);
+  const getMeetingLink = useCallback(
+    (): string | Promise<string> =>
+      meetingUuid
+        ? meetingLinkUrl(window.location.origin, { meetingUuid, transcriptId })
+        : resolveMeetingLink(transcriptId),
+    [meetingUuid, transcriptId]
+  );
+  useCopyLinkShortcut(row ? getMeetingLink : null);
   const [access, setAccess] = useState<TranscriptAccess>('owner');
   const [shareOpen, setShareOpen] = useState(false);
   const [linkEventOpen, setLinkEventOpen] = useState(false);
@@ -1386,6 +1411,52 @@ function TranscriptDetailInner({ transcriptId }: { transcriptId: string }) {
       window.scrollTo({ top, behavior: 'smooth' });
     },
     [content?.utterances, seekMeetingTime]
+  );
+
+  // Desktop shell search: this meeting is the panel's "Search in <title>"
+  // scope (components/shell-search.tsx). The panel searches what the page
+  // shows — edited text and speaker names unless the Raw view is on — and a
+  // hit jumps here: seek + scroll + a brief highlight of the utterance.
+  const searchScopeTitle = row ? title.trim() || row.original_filename || 'Untitled transcript' : '';
+  const scopeUtterances = useCallback((): ScopeUtterance[] => {
+    const utts = content?.utterances ?? [];
+    const raw = viewMode === 'raw';
+    return utts.map((u, index) => {
+      const named = raw ? null : speakerLabels.find((l) => l.originalSpeaker === u.speaker)?.customName?.trim();
+      return {
+        index,
+        startMs: u.start,
+        speaker: named || defaultSpeakerLabel(u.speaker),
+        text: raw ? u.text : (transcriptEdits[String(index)]?.text ?? u.text),
+      };
+    });
+  }, [content?.utterances, viewMode, speakerLabels, transcriptEdits]);
+  const jumpToUtterance = useCallback(
+    (index: number) => {
+      const u = content?.utterances?.[index];
+      if (!u) return;
+      handleOutlineJump(u.start / 1000);
+      const el = document.querySelector<HTMLElement>(`[data-utterance-index="${index}"]`);
+      if (!el) return;
+      el.classList.add('search-jump-flash');
+      window.setTimeout(() => el.classList.remove('search-jump-flash'), 1600);
+    },
+    [content?.utterances, handleOutlineJump]
+  );
+  const [scopeVersion, setScopeVersion] = useState(0);
+  useEffect(() => {
+    setScopeVersion((v) => v + 1);
+  }, [scopeUtterances]);
+  useShellSearchScope(
+    row && content?.utterances?.length
+      ? {
+          id: transcriptId,
+          title: searchScopeTitle,
+          utterances: scopeUtterances,
+          jump: jumpToUtterance,
+          version: scopeVersion,
+        }
+      : null
   );
 
   // Headings extracted from the description markdown — fed into the right-rail
@@ -2775,7 +2846,8 @@ function TranscriptDetailInner({ transcriptId }: { transcriptId: string }) {
             )}
           </Button>
         )}
-        {/* ⋯ overflow: refresh, downloads, transcript ID */}
+        <CopyLinkButton getLink={getMeetingLink} />
+        {/* ⋯ overflow: copy link, refresh, downloads, transcript ID */}
         <div className="relative" ref={overflowMenuRef}>
           <Button
             variant="ghost"
@@ -2791,6 +2863,21 @@ function TranscriptDetailInner({ transcriptId }: { transcriptId: string }) {
             <div
               className={`absolute right-0 top-full z-50 mt-1 min-w-[220px] rounded-md border bg-popover p-1 ${FLOATING_SHADOW}`}
             >
+              <button
+                type="button"
+                onClick={() => {
+                  void copyLinkWithToast(getMeetingLink());
+                  setOverflowMenuOpen(false);
+                }}
+                className="flex w-full items-center gap-2 rounded px-3 py-1.5 text-left text-sm hover:bg-muted"
+                data-menu-copy-link
+              >
+                <LinkIcon className="h-3.5 w-3.5 text-muted-foreground" />
+                Copy link
+                <kbd className="ml-auto rounded border bg-muted px-1 py-0.5 font-sans text-[10px] text-muted-foreground">
+                  ⇧⌘C
+                </kbd>
+              </button>
               <button
                 type="button"
                 onClick={() => {

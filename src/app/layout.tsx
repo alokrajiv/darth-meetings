@@ -8,6 +8,7 @@ import { OfflineBanner } from "@/components/offline-banner";
 import { CompanionBanner } from "@/components/companion-banner";
 import { headers } from "next/headers";
 import { ShellSearchProvider } from "@/components/shell-search";
+import { Toaster } from "@/components/toast";
 import { desktopShellOf } from "@/lib/desktop-shell";
 import { THEME_BOOT_SCRIPT } from "@/lib/listing-layout";
 
@@ -82,6 +83,8 @@ export default async function RootLayout({
           <ShellSearchProvider inDesktopShell={desktopShell !== null}>
             {children}
           </ShellSearchProvider>
+          {/* "Link copied" and other one-word confirmations (components/toast.tsx). */}
+          <Toaster />
         </OfflineProvider>
       </body>
     </html>

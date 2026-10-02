@@ -49,6 +49,9 @@ import {
 } from 'lucide-react';
 import { PersonChip } from '@/components/person-chip';
 import { useShellSearch } from '@/components/shell-search';
+import { copyLinkWithToast } from '@/components/copy-link-button';
+import { LinkIcon } from 'lucide-react';
+import { resolveMeetingLink } from '@/lib/meeting-link';
 import { RowMenu, type RowMenuSection } from '@/components/row-menu';
 import { RecordingStrip, SourceGlyph } from '@/components/recording-strip';
 import { SuggestedEventStrip } from '@/components/suggested-event-strip';
@@ -1451,6 +1454,15 @@ export function TranscriptTable({
       }
       return [{ key: 'trash', items }];
     }
+    // The meeting's permanent /m/<uuid> link — the desktop shell has no URL
+    // bar (lib/meeting-link.ts). Placeholders too: the ledger id is minted at
+    // queue time and survives the rename.
+    items.push({
+      key: 'copy-link',
+      label: 'Copy link',
+      icon: <LinkIcon />,
+      onSelect: () => void copyLinkWithToast(resolveMeetingLink(t.assemblyai_id)),
+    });
     if (!placeholder && !waiting && canEditRow(t) && !t.has_event) {
       items.push({
         key: 'link',

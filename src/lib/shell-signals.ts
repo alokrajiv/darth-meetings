@@ -40,15 +40,17 @@ export function shellSearchDetail(e: Event): ShellSearchDetail | null {
 
 /**
  * What one search event does to the results panel. Closed: a non-empty query
- * opens it (`open`); a clear or an empty Enter is ignored. Open: every event
- * updates it in place (`update`) — never a second panel. Pure.
+ * opens it (`open`), and so does an EMPTY Enter (the panel opens on its
+ * suggestions — "Search in <this meeting>" and Recent searches); a clear
+ * while typing is ignored. Open: every event updates it in place (`update`)
+ * — never a second panel. Pure.
  */
 export function shellSearchAction(
   panelOpen: boolean,
   detail: ShellSearchDetail
 ): 'open' | 'update' | 'ignore' {
   if (panelOpen) return 'update';
-  return detail.query.trim() ? 'open' : 'ignore';
+  return detail.query.trim() || detail.submit ? 'open' : 'ignore';
 }
 
 /** Listens for the shell signals on `target`; returns the unsubscribe. The

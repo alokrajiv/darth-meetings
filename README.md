@@ -113,6 +113,43 @@ on the same contract as Darth Chat (its SPEC §20.76):
   listing, max 30 hits (title hits first, then newest); the snippet is cut
   from a 400-char SQL window around the earliest term with bold ranges as
   UTF-16 offsets into the returned text.
+- **Search in this meeting** (2026-10-02, like Slack's `in:#channel`) — a
+  meeting page offers its meeting to the panel (`useShellSearchScope`). The
+  panel's first row is then "Search in <title>", selected by default, so
+  Enter in the band (or on that row) applies the chip `in: <title>` in the
+  panel header and the query runs over THAT meeting's transcript —
+  client-side, over what the page shows (edits and speaker names applied,
+  raw text in the Raw view; `src/lib/meeting-scope-search.ts`: every term in
+  the same utterance, transcript order). There is no per-meeting server
+  search: `GET /api/search` ranks whole meetings. A hit shows `m:ss ·
+  speaker` + snippet; Enter / click seeks the player there, scrolls to the
+  utterance and flashes it. The chip's × (or Backspace in the results)
+  removes it → the broad search across all meetings, as before. ↓ in the
+  band hands the keyboard to the panel (desktop `search-field.js down()`),
+  and an empty Enter / ↓ opens the panel on its suggestions.
+- **Recent searches** — the last 5 queries with their chips
+  (`src/lib/recent-searches.ts`), shown when the panel's query is empty;
+  click / Enter re-runs one (a scoped one for another meeting navigates
+  there first and applies the chip when that page offers it), × forgets it.
+  Stored in the shell's local store for Meetings (`window.darthDesktop.store`,
+  table `recent_searches`, one row per darth user id; the shell wipes it on
+  sign-out), else localStorage (`src/lib/recent-searches-store.ts`). The
+  band itself still shows only text: nothing flows page → shell, so a
+  recent query picked in the panel is not echoed into the band.
+- **Copy link** — no URL bar in the shell, so the meeting page header has a
+  **Copy link** button (also first in its ⋯ menu, and ⌘⇧C / Ctrl+Shift+C —
+  listed as a page key in the shell's shortcut map), and every listing row's
+  ⋯ menu has **Copy link**. It copies the permanent
+  `https://meetings.darth-internal.trames.io/m/<meeting uuid>` (migration
+  031 ledger id via `GET /api/meetings/resolve?any=<id>`; falls back to
+  `/transcript/<id>` when there is no ledger row) and toasts "Link copied"
+  (`src/lib/meeting-link.ts`, `src/components/copy-link-button.tsx`,
+  `src/components/toast.tsx`). `/recording/<id>` copies its own URL. The
+  clipboard write uses a pending ClipboardItem when the uuid lookup is still
+  in flight (keeps Safari's user-activation), else `writeText`, else a hidden
+  textarea. The web app has no header search on a meeting page, so the
+  in-meeting scope is shell-only; in a browser the transcript's own ⌘F
+  find (editors) and the browser's find cover it.
 - **Layout rules** (`src/lib/listing-layout.ts`) — ONE layout, designed for
   the shell's window (900–1300 px of content, the shell's title band with its
   own search above, its 64 px rail on the left); the browser mirrors it at
