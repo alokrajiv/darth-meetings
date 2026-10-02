@@ -156,6 +156,37 @@ describe('the Sources block the AI prompts get', () => {
     expect(block).toContain('diarized on its own');
   });
 
+  test('two people recording the same minutes: the overlap window is stated, both texts kept', () => {
+    // Ka Wen's tray from 0:00 for 30 min, Ivan's joined at 10:00 for 30 min.
+    const block = buildSourcesBlock([
+      entry({ durationMs: 1_800_000, recordingDurationMs: 1_800_000, sourceLabel: 'Recorded on Ka Wen’s Mac' }),
+      entry({
+        ord: 1,
+        recordingId: R2,
+        offsetMs: 600_000,
+        durationMs: 1_800_000,
+        recordingDurationMs: 1_800_000,
+        sourceLabel: 'Recorded on Ivan’s Mac',
+        primary: false,
+      }),
+    ]);
+    expect(block).toContain('OVERLAP 10m 00s–30m 00s of the meeting');
+    expect(block).toContain('Recorded on Ka Wen’s Mac');
+    expect(block).toContain('Recorded on Ivan’s Mac');
+    expect(block).toContain(`"${R1.slice(0, 8)}…:<letter>"`);
+    expect(block).toContain(`"${R2.slice(0, 8)}…:<letter>"`);
+    expect(block).toContain('appear TWICE');
+    expect(block).toContain('reconcile');
+  });
+
+  test('recordings that follow each other get no overlap line', () => {
+    const block = buildSourcesBlock([
+      entry({ durationMs: 600_000, recordingDurationMs: 600_000 }),
+      entry({ ord: 1, recordingId: R2, offsetMs: 600_000, durationMs: 600_000, recordingDurationMs: 600_000, primary: false }),
+    ]);
+    expect(block).not.toContain('OVERLAP');
+  });
+
   test('a recording added while still transcribing says so', () => {
     const block = buildSourcesBlock([
       entry({}),

@@ -25,6 +25,13 @@ import { purgeStandaloneRecording, refreshBornBare } from '@/lib/server/born-bar
 import { suggestedEventFromMatch } from '@/lib/server/recorder-match';
 import { isClipTextPolicy, type ClipTextPolicy } from '@/lib/recording-clips';
 import { shareWithInternalInvitees } from '@/lib/server/auto-share';
+import {
+  joinOccurrenceMeeting,
+  occurrenceCandidates,
+  recordingLinkState,
+  type JoinedBody,
+} from '@/lib/server/occurrence-join';
+import { occurrenceKeyOf, type LinkMode } from '@/lib/occurrence-join';
 import type { GmeetContext, SuggestedEvent } from '@/lib/format';
 
 /**
@@ -184,6 +191,8 @@ export interface MadeMeeting {
   /** How many internal invitees the new meeting was shared with (a link to
    * a calendar event; 0 for "Make a meeting" and for an event with none). */
   shares: number;
+  /** A link that made its own meeting (no join) — see `JoinedBody` for the other answer. */
+  joined?: false;
 }
 
 const NOT_FOUND = { ok: false as const, status: 404, error: 'Not found' };
@@ -270,7 +279,7 @@ async function makeMeeting(
   );
   return {
     ok: true,
-    body: { meeting: { id: made.assemblyaiId, title: opts.title }, recordingId, shares },
+    body: { meeting: { id: made.assemblyaiId, title: opts.title }, recordingId, shares, joined: false },
   };
 }
 
@@ -289,6 +298,14 @@ export interface LinkInput {
   /** Adding to an EXISTING meeting: where it lands on that meeting's timeline. */
   offsetMs?: number | null;
   textPolicy?: ClipTextPolicy | null;
+  /**
+   * A link to a calendar occurrence the caller can already see a meeting
+   * for: `join` adds the recording to that meeting (lib/server/occurrence-join.ts),
+   * `separate` makes a meeting of its own as before. Absent = `join`, the
+   * server default; an EXPLICIT `join` whose join is refused answers the
+   * refusal instead of quietly making a second meeting.
+   */
+  mode?: LinkMode | null;
 }
 
 /**
@@ -306,7 +323,7 @@ export async function linkRecording(
   caller: Caller,
   recordingId: string,
   input: LinkInput
-): Promise<ActionResult<MadeMeeting | Record<string, unknown>>> {
+): Promise<ActionResult<MadeMeeting | JoinedBody | Record<string, unknown>>> {
   const rec = await getStandaloneForOwner(caller.userId, recordingId);
   if (!rec) return NOT_FOUND;
   const title = cleanTitle(input.title);
@@ -314,6 +331,8 @@ export async function linkRecording(
 
   const picked = input.event ? sanitizeLinkedEvent(input.event) : null;
   if (picked && (picked.id || picked.meetingCode || picked.title)) {
+    const joined = await joinIfOccurrenceHasMeeting(caller, recordingId, picked, input.mode ?? null);
+    if (joined) return joined;
     const { gmeetContext } = buildGmeetContext(picked, null);
     return makeMeeting(caller, recordingId, {
       title: title ?? picked.title?.slice(0, 300) ?? rec.title,
@@ -328,6 +347,13 @@ export async function linkRecording(
     const resolved = await resolveLinkedEventRef(caller.userId, ref);
     if (!resolved.ok) return { ok: false, status: resolved.status, error: resolved.error };
     const event: LinkedEventInput = resolved.event;
+    const joined = await joinIfOccurrenceHasMeeting(
+      caller,
+      recordingId,
+      { ...event, teamsUrl: resolved.event.teamsUrl },
+      input.mode ?? null
+    );
+    if (joined) return joined;
     const { gmeetContext } = buildGmeetContext(event, null);
     return makeMeeting(caller, recordingId, {
       title: title ?? event.title?.slice(0, 300) ?? rec.title,
@@ -365,6 +391,49 @@ export async function linkRecording(
   }
 
   return { ok: false, status: 400, error: 'Give event, eventRef (a meeting code or event key) or meetingId' };
+}
+
+/**
+ * The join half of a link to a calendar occurrence (owner, 2026-10-02): when
+ * the caller can already open a meeting for that occurrence — Ka Wen linked
+ * hers first and the link shared it with Ivan — Ivan's recording is added to
+ * THAT meeting as another clip instead of becoming a second meeting.
+ *
+ * null = no join happened, make a meeting of its own as before: `separate`
+ * was asked for, no visible meeting of the occurrence can take this
+ * recording, or (default mode only) the join was refused at the last moment.
+ * A refusal under an EXPLICIT `join` is answered, not papered over.
+ */
+async function joinIfOccurrenceHasMeeting(
+  caller: Caller,
+  recordingId: string,
+  event: LinkedEventInput & { teamsUrl?: string },
+  mode: LinkMode | null
+): Promise<ActionResult<JoinedBody> | null> {
+  if (mode === 'separate') return null;
+  const state = await recordingLinkState(recordingId).catch(() => null);
+  if (state && (state.liveMeetings > 0 || state.reservedIn)) {
+    return refusalFor('already-linked');
+  }
+  const { candidate } = await occurrenceCandidates(caller, occurrenceKeyOf(event), { recordingId }).catch(
+    (err) => {
+      console.warn(`[recording-actions] occurrence lookup for ${recordingId} failed (linking separately):`, err);
+      return { candidate: null };
+    }
+  );
+  if (!candidate) return null;
+  const out = await joinOccurrenceMeeting({
+    caller,
+    recordingId,
+    meetingId: candidate.meetingId,
+    how: 'link',
+  });
+  if (out.ok) return { ok: true, body: out.body };
+  if (mode === 'join') return out;
+  console.warn(
+    `[recording-actions] join of ${recordingId} into ${candidate.meetingId} refused (${out.error}) — linking separately`
+  );
+  return null;
 }
 
 /** `POST /api/recordings/:id/make-meeting {title}` — a standalone meeting. */

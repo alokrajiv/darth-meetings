@@ -28,6 +28,8 @@ import {
   listTranscripts,
   resolveMeetingByJoinUrl,
 } from '@/lib/server/ms-graph';
+import { foldIntoOccurrenceMeeting } from '@/lib/server/occurrence-join';
+import { occurrenceKeyOf, parseLinkMode } from '@/lib/occurrence-join';
 import type { GmeetAttendee, GmeetContext, MeetActuals } from '@/lib/format';
 
 export const runtime = 'nodejs';
@@ -53,6 +55,14 @@ export const runtime = 'nodejs';
  * first pass ran blind). Linking also clears the temporary flag (migration
  * 042): a transcript tied to a calendar event is a real meeting and belongs
  * in the archive. Owner and editors.
+ *
+ * `mode: 'join' | 'separate'` (default `join`, owner 2026-10-02 —
+ * lib/server/occurrence-join.ts `foldIntoOccurrenceMeeting`): when THIS
+ * meeting is nothing but one of the caller's own recordings (one clip, their
+ * recording, no notes) and the caller can already open a meeting of that
+ * occurrence, the recording is added to that meeting instead and this one
+ * moves to the owner's trash — answering `{ joined: true, meetingId,
+ * foldedMeetingId, … }` so the client goes there.
  */
 export const POST = withAuth(async ({ user, request }, { params }) => {
   const { id } = await params;
@@ -69,6 +79,8 @@ export const POST = withAuth(async ({ user, request }, { params }) => {
      * calendar cache. Either one; `event` wins when also present. */
     meetingCode?: string;
     eventKey?: string;
+    /** 'join' (default) | 'separate' — see the doc comment above. */
+    mode?: string;
     event?: {
       id?: string;
       title?: string;
@@ -124,6 +136,36 @@ export const POST = withAuth(async ({ user, request }, { params }) => {
         responseStatus: a.responseStatus,
       })),
     };
+  }
+
+  // Joining (owner, 2026-10-02): this meeting is nothing but one of the
+  // caller's recordings and a meeting of that occurrence already exists that
+  // they can open → the recording joins THAT meeting and this one goes to the
+  // trash, pointing at it. `mode: 'separate'` keeps today's link.
+  const mode = parseLinkMode(body.mode);
+  if (mode === null) {
+    return NextResponse.json({ error: "mode must be 'join' or 'separate'" }, { status: 400 });
+  }
+  if (mode !== 'separate') {
+    const folded = await foldIntoOccurrenceMeeting(
+      user,
+      access,
+      occurrenceKeyOf({
+        ...event,
+        joinWebUrl:
+          typeof event.teamsUrl === 'string' ? (parseTeamsJoinLink(event.teamsUrl)?.joinWebUrl ?? null) : null,
+      }),
+      mode ?? null
+    ).catch((err) => {
+      console.warn('[link-event] occurrence join failed (linking on its own):', err);
+      return null;
+    });
+    if (folded && !folded.ok) {
+      return NextResponse.json({ error: folded.error, code: folded.code }, { status: folded.status });
+    }
+    if (folded?.ok) {
+      return NextResponse.json({ ...folded.body, transcript: null, shared: 0, reguessing: false });
+    }
   }
 
   const attendees: GmeetAttendee[] = Array.isArray(event.attendees)

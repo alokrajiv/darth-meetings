@@ -38,5 +38,16 @@ export async function settleMeetingsMadeEarly(
     prepareMediaForPlayback(m.user_id, m.assemblyai_id);
     onTranscriptCompleted(m.user_id, m.assemblyai_id, { utterances: null, silent: true });
   }
+  // Recordings that JOINED another meeting of the same occurrence while they
+  // were still on their way: their text is merged now (or marked failed), and
+  // reservations made while MW_COMBINE was off are finished once it is on.
+  // Loaded lazily — the join module pulls in the whole clip machinery, which
+  // this module (imported by the upload pipeline) must not drag along.
+  try {
+    const { settleOccurrenceJoins } = await import('@/lib/server/occurrence-join');
+    await settleOccurrenceJoins(recordingId, outcome);
+  } catch (err) {
+    console.warn(`[recording-settle] occurrence joins for ${recordingId ?? 'any recording'} failed:`, err);
+  }
   return rows.length;
 }
