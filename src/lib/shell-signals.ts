@@ -3,12 +3,16 @@ import { useEffect, useRef } from 'react';
 /**
  * The Darth desktop shell's signals into the page — window CustomEvents the
  * shell dispatches through `webContents.executeJavaScript` (no preload), only
- * ever inside the shell. Nothing flows page → shell. Same contract as Darth
- * Chat (`src/lib/client/shell-signals.ts` there, SPEC §20.76-8/9):
+ * ever inside the shell. Page → shell is the search echo
+ * (lib/shell-search-echo.ts). Same contract as Darth Chat
+ * (`src/lib/client/shell-signals.ts` there, SPEC §20.76-8/9):
  *
- *   darth-shell:search          detail { query: string, submit: boolean } —
- *                               submit:false while typing (debounced by the
- *                               shell; query '' = cleared), submit:true on Enter
+ *   darth-shell:search          detail { query: string, submit: boolean,
+ *                               scope?: null } — submit:false while typing
+ *                               (debounced by the shell; query '' = cleared),
+ *                               submit:true on Enter; `scope: null` (shell
+ *                               0.3.3) only when the person removed the band's
+ *                               `in:` chip — no key = keep the page's scope
  *   darth-shell:toggle-sidebar  the band's sidebar button (here: the labels rail)
  *   darth-shell:new-chat        not applicable to Meetings — never listened for
  */
@@ -21,6 +25,8 @@ export const SHELL_SIGNALS = {
 export interface ShellSearchDetail {
   query: string;
   submit: boolean;
+  /** Present (and null) only when the person removed the band's scope chip. */
+  scope?: null;
 }
 
 export interface ShellSignalHandlers {
@@ -33,9 +39,14 @@ type SignalTarget = Pick<EventTarget, 'addEventListener' | 'removeEventListener'
 /** The detail of a `darth-shell:search` event, or null when it is not the
  * contract's shape (no string query). Pure. */
 export function shellSearchDetail(e: Event): ShellSearchDetail | null {
-  const d = (e as CustomEvent<unknown>).detail as { query?: unknown; submit?: unknown } | null | undefined;
+  const d = (e as CustomEvent<unknown>).detail as
+    | { query?: unknown; submit?: unknown; scope?: unknown }
+    | null
+    | undefined;
   if (!d || typeof d !== 'object' || typeof d.query !== 'string') return null;
-  return { query: d.query, submit: d.submit === true };
+  const out: ShellSearchDetail = { query: d.query, submit: d.submit === true };
+  if ('scope' in d && d.scope === null) out.scope = null;
+  return out;
 }
 
 /**

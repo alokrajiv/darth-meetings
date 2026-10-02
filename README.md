@@ -93,10 +93,13 @@ on the same contract as Darth Chat (its SPEC §20.76):
   hydration diff. (Reading `headers()` makes every page dynamic-rendered.)
 - **Events** (shell → page only, window `CustomEvent`s, listened for only
   inside the shell — `src/lib/shell-signals.ts`): `darth-shell:search`
-  `{query, submit}` — `submit:false` while typing (shell-debounced, `''` =
-  cleared), `submit:true` on Enter; `darth-shell:toggle-sidebar` toggles the
-  labels rail on the listing; `darth-shell:new-chat` is not applicable and
-  ignored. Nothing flows page → shell.
+  `{query, submit[, scope: null]}` — `submit:false` while typing
+  (shell-debounced, `''` = cleared), `submit:true` on Enter, `scope: null`
+  (shell 0.3.3) only when the person removed the `in:` chip in the band (×,
+  Backspace at the start, Esc) → the panel drops its scope and a later Enter
+  does not re-apply it; `darth-shell:toggle-sidebar` toggles the labels rail
+  on the listing; `darth-shell:new-chat` is not applicable and ignored. The
+  only page → shell path is the search echo (below).
 - **Panel** (`src/components/shell-search.tsx`) — the Darth Chat search
   look: one row per meeting with title, date, meta (owner · duration · where
   it matched · labels) and a ~140-char snippet with the matched words bold.
@@ -133,9 +136,15 @@ on the same contract as Darth Chat (its SPEC §20.76):
   there first and applies the chip when that page offers it), × forgets it.
   Stored in the shell's local store for Meetings (`window.darthDesktop.store`,
   table `recent_searches`, one row per darth user id; the shell wipes it on
-  sign-out), else localStorage (`src/lib/recent-searches-store.ts`). The
-  band itself still shows only text: nothing flows page → shell, so a
-  recent query picked in the panel is not echoed into the band.
+  sign-out), else localStorage (`src/lib/recent-searches-store.ts`).
+- **Band echo** (shell 0.3.3, desktop `docs/SEARCH-HANDOFF.md`) — the band
+  mirrors the panel: every change of its query or chip (a recent picked, the
+  chip applied / removed, the panel closed) calls
+  `window.darthDesktop.search.echo({query, scope: {kind:'meeting', id,
+  label} | null})` (`src/lib/shell-search-echo.ts`), so the band shows
+  `in: <title> ×` + the text. Change-only (the first mount sends nothing, so
+  a reload never wipes the band's text), feature-detected (a browser or an
+  older shell skips it), never awaited, never rejects.
 - **Copy link** — no URL bar in the shell, so the meeting page header has a
   **Copy link** button (also first in its ⋯ menu, and ⌘⇧C / Ctrl+Shift+C —
   listed as a page key in the shell's shortcut map), and every listing row's

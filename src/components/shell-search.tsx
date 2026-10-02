@@ -37,6 +37,7 @@ import {
 } from '@/lib/recent-searches';
 import { loadRecentSearches, saveRecentSearches } from '@/lib/recent-searches-store';
 import { shellSearchAction, useShellSignals, type ShellSearchDetail } from '@/lib/shell-signals';
+import { bandRemovedScope, createBandEchoer } from '@/lib/shell-search-echo';
 import { cn } from '@/lib/utils';
 import { NETWORK_ERROR_MESSAGE, networkErrorMessage } from '@/lib/fetch-errors';
 
@@ -70,6 +71,11 @@ import { NETWORK_ERROR_MESSAGE, networkErrorMessage } from '@/lib/fetch-errors';
  * × (or Backspace in the results) removes it: the broad search across all
  * meetings, as before. The last five searches, with their chips, are kept as
  * "Recent searches" in the shell's local store (lib/recent-searches-store.ts).
+ *
+ * The band mirrors the panel (shell 0.3.3): every change of the panel's query
+ * or chip is echoed into the band field (`in: <title> ×` + the text), and
+ * the chip removed in the band arrives as `scope: null` on the search event
+ * (lib/shell-search-echo.ts).
  */
 
 export const PANEL_DEBOUNCE_MS = 150;
@@ -274,12 +280,22 @@ export function ShellSearchProvider({
   const drive = useCallback(
     (detail: ShellSearchDetail, src: Source) => {
       const action = shellSearchAction(openRef.current, detail);
+      // The person removed the chip in the band (×, Backspace at the start,
+      // Esc): drop the page's scope, and a later Enter does not put it back.
+      const removed = bandRemovedScope(detail);
+      if (removed) {
+        setScope(null);
+        scopeDismissed.current = true;
+      }
       if (action === 'ignore') {
         // Closed + empty: nothing to show, but the in-app field still echoes.
         setQuery(detail.query);
         return;
       }
-      if (action === 'open') openPanel();
+      if (action === 'open') {
+        openPanel();
+        if (removed) scopeDismissed.current = true;
+      }
       setSource(src);
       setQuery(detail.query);
       if (detail.submit) {
@@ -379,6 +395,18 @@ export function ShellSearchProvider({
       sidebarFns.current.delete(fn);
     };
   }, []);
+
+  // Page → band: the band mirrors what the panel holds (its query and chip) —
+  // a Recent search picked here, the chip applied / removed, the panel
+  // closed. Only on a change (the first mount sends nothing, so a reload
+  // never wipes the band's text); fire and forget, feature-detected
+  // (lib/shell-search-echo.ts — a browser or an older shell skips it).
+  const echoer = useRef<ReturnType<typeof createBandEchoer> | null>(null);
+  useEffect(() => {
+    if (!inDesktopShell) return;
+    echoer.current ??= createBandEchoer();
+    echoer.current(open ? query : '', open ? scope : null);
+  }, [inDesktopShell, open, query, scope]);
 
   useShellSignals(inDesktopShell, {
     search: (detail) => drive(detail, 'band'),
