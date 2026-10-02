@@ -143,7 +143,7 @@ LABELS (org-wide, hierarchical 'Customers/LP Global/QBR', many per transcript;
                                   meetings go with it
 
 WRITE (needs read+write for meetings)
-  upload <file> [--event <meeting-code|event-key>] [--title <t>]
+  upload <file> [--event <meeting-code|event-key>] [--separate] [--title <t>]
          [--language <code>] [--scratch] [--resume] [--wait] [--timeout <mins>]
                                   Upload a recording (audio/video; text docs
                                   like .vtt/.txt/.docx go through the text
@@ -151,7 +151,12 @@ WRITE (needs read+write for meetings)
                                   it to a calendar event up front (title,
                                   date, attendees; the meeting is shared
                                   with the invite's Trames colleagues, as
-                                  a Meet/Teams import is);
+                                  a Meet/Teams import is). If you can
+                                  already open a meeting of that
+                                  occurrence (a colleague linked theirs),
+                                  the upload JOINS it as another recording
+                                  instead of making a second meeting —
+                                  --separate makes one of its own anyway;
                                   without it the row is unlinked and you can
                                   'link' it later — same single transcription
                                   run either way. (Once the server runs
@@ -179,7 +184,7 @@ WRITE (needs read+write for meetings)
                                   stopped (--resume just makes a fresh start
                                   say so). Progress goes to stderr (not with
                                   --json). ≤ 8 MB and text docs: one request
-  link <id> <meeting-code|event-key>
+  link <id> <meeting-code|event-key> [--separate]
                                   Attach an existing transcript (typically an
                                   unlinked upload) to a calendar event: sets
                                   date + empty title + attendees, shares it
@@ -187,7 +192,11 @@ WRITE (needs read+write for meetings)
                                   Meet/Teams import does), and re-runs the speaker
                                   guess with the attendee list unless a human
                                   already confirmed names. Metadata only —
-                                  nothing is re-transcribed
+                                  nothing is re-transcribed. If <id> is just
+                                  one of your recordings and you can already
+                                  open a meeting of that occurrence, it is
+                                  FOLDED into that meeting (this one goes
+                                  to your trash); --separate keeps it apart
   set-date <id> <when>            Set the meeting date/time of a transcript
                                   (ISO 8601, 'YYYY-MM-DD HH:mm' in your tz,
                                   or 'YYYY-MM-DD' = noon). For recordings
@@ -1315,6 +1324,8 @@ async function completeUploadSession(ctx: Ctx, id: string, progress: UploadProgr
 
 interface ResumableUploadOpts {
   eventRef?: string;
+  /** --separate: never join the occurrence's existing meeting. */
+  separate?: boolean;
   languageCode?: string;
   scratch: boolean;
   /** --resume was passed: say so when there is nothing to resume. */
@@ -1391,6 +1402,7 @@ async function uploadResumable(ctx: Ctx, file: string, name: string, size: numbe
   const body: Record<string, unknown> = {
     fingerprint: `cli:v1:${sha256}`, size, filename: name, contentType,
     languageCode: opts.languageCode || undefined, eventRef: opts.eventRef || undefined, scratch: opts.scratch || undefined,
+    linkMode: opts.separate ? "separate" : undefined,
     via: "blob", sha256,
   };
   const fingerprint = body.fingerprint as string;
@@ -1735,7 +1747,7 @@ as a Meet/Teams import is) or make a meeting of it and share that MEETING
   recordings audio <rid> [--out <file>]
                                   Download the media (default ./rec-<rid>.<ext>)
 WRITE (needs read+write for meetings)
-  recordings link <rid> <meeting-code|event-key|meeting-id> [--title T] [--offset-ms N]
+  recordings link <rid> <meeting-code|event-key|meeting-id> [--title T] [--offset-ms N] [--separate]
                                   Meeting code / '<eventId>|<startIso>' key /
                                   teams-… ref → makes the meeting for that
                                   calendar occurrence; anything else = the id
@@ -1743,7 +1755,12 @@ WRITE (needs read+write for meetings)
                                   recording to it (--offset-ms places it).
                                   A calendar link shares the MEETING with
                                   the invite's Trames colleagues; the
-                                  recording itself stays private
+                                  recording itself stays private. When you
+                                  can already open a meeting of that
+                                  occurrence (a colleague linked theirs),
+                                  the recording JOINS it as another
+                                  recording — one meeting for the call;
+                                  --separate makes a meeting of its own
   recordings make-meeting <rid> --title "…"
                                   A meeting of its own (no calendar event)
   recordings keep <rid>           Remove the expiry of a temporary recording
@@ -1885,7 +1902,7 @@ async function waitForRecording(ctx: Ctx, rid: string, capMin: number, say: (l: 
 }
 
 async function recordingsCmd(ctx: Ctx, flags: Record<string, string | boolean>, pos: string[]): Promise<number> {
-  liftBoolFlags(pos, flags, ["all", "envelope", "unlinked", "temporary", "regex"]);
+  liftBoolFlags(pos, flags, ["all", "envelope", "unlinked", "temporary", "regex", "separate"]);
   const [sub, ...args] = pos;
   if (!sub || sub === "help" || flags.help === true) { console.log(RECORDINGS_HELP); return 0; }
   const tz = localTz(ctx);
@@ -1983,11 +2000,13 @@ async function recordingsCmd(ctx: Ctx, flags: Record<string, string | boolean>, 
     case "link": {
       const rid = args[0] ? recId(args[0]) : null;
       const ref = args[1];
-      if (!rid || !ref) { console.error("usage: darth-cli meetings recordings link <rid> <meeting-code|event-key|meeting-id> [--title T] [--offset-ms N]"); return 1; }
+      if (!rid || !ref) { console.error("usage: darth-cli meetings recordings link <rid> <meeting-code|event-key|meeting-id> [--title T] [--offset-ms N] [--separate]"); return 1; }
       ctx.requireWrite();
       const body: Record<string, unknown> = {};
+      if (flags.separate === true && !isEventRef(ref)) { console.error("--separate only applies when linking to a calendar event"); return 1; }
       if (isEventRef(ref)) {
         body.eventRef = ref;
+        if (flags.separate === true) body.mode = "separate";
         const title = str(flags.title);
         if (title) body.title = title;
         if (flags["offset-ms"] !== undefined) { console.error("--offset-ms only applies when linking to an existing meeting id"); return 1; }
@@ -2008,6 +2027,13 @@ async function recordingsCmd(ctx: Ctx, flags: Record<string, string | boolean>, 
       }
       const mid = r.data?.meeting?.id ?? r.data?.meetingId ?? (isEventRef(ref) ? "?" : ref);
       ctx.print(r.data, () => {
+        if (r.data?.joined === true) {
+          console.log(`joined → meeting ${mid}${r.data?.meeting?.title ? ` "${r.data.meeting.title}"` : ""} — that occurrence already had a meeting you can open, so your recording was added to it (no new share; --separate makes a meeting of its own)`);
+          if (r.data?.text === "pending") console.log("Its text is merged into the meeting when the transcription finishes.");
+          else if (r.data?.text === "waiting-combine") console.log("Reserved for that meeting — it is added once the server enables combined meetings.");
+          if (mid !== "?") console.log(`Web: ${webBase(ctx)}/transcript/${mid}`);
+          return;
+        }
         console.log(`linked → meeting ${mid}${r.data?.meeting?.title ? ` "${r.data.meeting.title}"` : ""} — ${isEventRef(ref) ? `shared with ${r.data?.shares ?? 0} Trames invitee(s) of the event` : "added (the meeting's own shares apply)"}`);
         if (mid !== "?") console.log(`Web: ${webBase(ctx)}/transcript/${mid}`);
       });
@@ -2062,7 +2088,7 @@ const meetings: Subcommand = {
   help: HELP,
   async run(ctx, argv) {
     const { pos, flags } = parseArgs(argv);
-    liftBoolFlags(pos, flags, ["cascade", "exact", "cached", "details", "wait", "clear", "scratch", "resume", CONSENT_FLAG]);
+    liftBoolFlags(pos, flags, ["cascade", "exact", "cached", "details", "wait", "clear", "scratch", "resume", "separate", CONSENT_FLAG]);
     const [, cmd, ...args] = pos.length && pos[0] === "meetings" ? pos : ["", ...pos];
     if (cmd === "recordings") return recordingsCmd(ctx, flags, args);
     if (!cmd || flags.help === true) { console.log(HELP); return 0; }
@@ -2802,7 +2828,7 @@ const meetings: Subcommand = {
 
       case "upload": {
         const file = args[0];
-        if (!file) { console.error("usage: darth-cli meetings upload <file> [--event <meeting-code|event-key>] [--title <t>] [--language <code>] [--scratch] [--wait] [--timeout <mins>]"); return 1; }
+        if (!file) { console.error("usage: darth-cli meetings upload <file> [--event <meeting-code|event-key>] [--separate] [--title <t>] [--language <code>] [--scratch] [--wait] [--timeout <mins>]"); return 1; }
         if (!existsSync(file) || !statSync(file).isFile()) { console.error(`No such file: ${file}`); return 1; }
         // No --report here on purpose: the CLI never starts the service's AI
         // runs (generation is a human's web-UI ask); the caller's own agent
@@ -2817,6 +2843,11 @@ const meetings: Subcommand = {
         const q = new URLSearchParams();
         const ev = str(flags.event);
         if (ev) q.set("event", ev);
+        // --separate: a meeting of its own even when you can already open a
+        // meeting of that occurrence (the default JOINS it).
+        const separate = flags.separate === true;
+        if (separate && !ev) { console.error("--separate only applies with --event"); return 1; }
+        if (separate) q.set("link_mode", "separate");
         const lang = str(flags.language);
         if (lang) q.set("language_code", lang);
         // Temporary row: sent even alongside --event — the server decides
@@ -2833,7 +2864,7 @@ const meetings: Subcommand = {
           // pieces, resumable for 24 h by re-running the same command.
           say(`Uploading ${name} (${fmtMB(size)} MB, resumable)${ev ? ` → event ${ev}` : " unlinked"}${scratch ? " as a temporary (scratch) transcript" : ""}…`);
           try {
-            const r = await uploadResumable(ctx, file, name, size, { eventRef: ev, languageCode: lang, scratch, resumeExpected: flags.resume === true }, new UploadProgress(!ctx.json, size));
+            const r = await uploadResumable(ctx, file, name, size, { eventRef: ev, languageCode: lang, scratch, separate, resumeExpected: flags.resume === true }, new UploadProgress(!ctx.json, size));
             data = { transcript: r.transcript };
             say(r.via === "prior"
               ? `Already received by the server in the interrupted run — session ${r.sessionId} (nothing re-uploaded)`
@@ -2877,9 +2908,23 @@ const meetings: Subcommand = {
             if (!r.ok) return recordingWriteError("set title", r.status, r.data);
             t = { ...t, title };
           }
-          say(`uploaded to your Recordings — ${rid}  "${t?.title ?? t?.original_filename ?? name}"  status: ${t?.status ?? "?"}  (private to you, not shared)`);
+          // With --event the bytes are a recording only because they JOINED
+          // the occurrence's existing meeting (one you can open): say where.
+          let joinedTo: { id: string; title: string | null } | null = data?.joined?.meetingId
+            ? { id: data.joined.meetingId, title: data.joined.meeting?.title ?? null }
+            : null;
+          if (!joinedTo && ev) {
+            const v = await recordingRequest(ctx, `/api/recordings/${rid}`, {});
+            const m = v.ok ? (v.data?.recording?.meetings ?? []).find((x: any) => !x.trashed) : null;
+            if (m) joinedTo = { id: m.id, title: m.title ?? null };
+          }
+          if (joinedTo) {
+            say(`uploaded and JOINED meeting ${joinedTo.id}${joinedTo.title ? ` "${joinedTo.title}"` : ""} — that occurrence already had a meeting you can open, so this is another recording of it (its text is merged when transcribed; --separate makes a meeting of its own)`);
+            say(`Web: ${webBase(ctx)}/transcript/${joinedTo.id}`);
+          }
+          else say(`uploaded to your Recordings — ${rid}  "${t?.title ?? t?.original_filename ?? name}"  status: ${t?.status ?? "?"}  (private to you, not shared)`);
           if (t?.expires_at || t?.scratch === true) say(`temporary: expires ${t?.expires_at ? fmtDay(t.expires_at, localTz(ctx)) : "in 30 days"} unless kept ('darth-cli meetings recordings keep ${rid}') or linked`);
-          say(`link with: darth-cli meetings recordings link ${rid} <event-ref>`);
+          if (!joinedTo) say(`link with: darth-cli meetings recordings link ${rid} <event-ref>`);
           let view: any = null;
           if (flags.wait === true && t?.status !== "ready") {
             view = await waitForRecording(ctx, rid, capMin, say);
@@ -2889,6 +2934,7 @@ const meetings: Subcommand = {
           }
           ctx.print({
             recording_id: rid, pseudo_id: `rec-${rid}`, status: view?.status ?? t?.status ?? null, born_bare: true,
+            joined_meeting_id: joinedTo?.id ?? null,
             title: view?.title ?? t?.title ?? null, original_filename: t?.original_filename ?? null, created_at: t?.created_at ?? null,
             expires_at: view?.expires_at ?? t?.expires_at ?? null, temporary: view ? view.temporary === true : (t?.scratch === true || !!t?.expires_at),
             recording: view,
@@ -2925,14 +2971,22 @@ const meetings: Subcommand = {
 
       case "link": {
         const [id, ref] = args;
-        if (!id || !ref) { console.error("usage: darth-cli meetings link <id> <meeting-code|event-key>   (key = the 'key' field of 'calendar --view all --json' / --details)"); return 1; }
+        if (!id || !ref) { console.error("usage: darth-cli meetings link <id> <meeting-code|event-key> [--separate]   (key = the 'key' field of 'calendar --view all --json' / --details)"); return 1; }
         ctx.requireWrite();
-        const res = await ctx.api("meetings", `/api/transcripts/${id}/link-event`, { method: "POST", body: JSON.stringify(eventRefBody(ref)) });
+        const linkBody = { ...eventRefBody(ref), ...(flags.separate === true ? { mode: "separate" } : {}) };
+        const res = await ctx.api("meetings", `/api/transcripts/${id}/link-event`, { method: "POST", body: JSON.stringify(linkBody) });
         const data: any = await res.json().catch(() => null);
         if (!res.ok) {
           console.error(`Link failed (HTTP ${res.status}): ${data?.error ?? "unknown error"}`);
           if (res.status === 404) console.error("Tip: 'darth-cli meetings calendar --view all --json' lists your events with their [meeting-code] and exact 'key'; a meeting code resolves to its latest PAST occurrence — use the key for an older one.");
           return 1;
+        }
+        if (data?.joined === true) {
+          ctx.print(data, () => {
+            console.log(`Joined → meeting ${data.meetingId}${data.meeting?.title ? ` "${data.meeting.title}"` : ""}: that occurrence already had a meeting you can open, so this recording was added to it and ${data.foldedMeetingId ?? id} moved to your trash (restore it from the web UI if that was wrong; --separate keeps it apart).`);
+            console.log(`Web: ${webBase(ctx)}/transcript/${data.meetingId}`);
+          });
+          return 0;
         }
         const e = data.event ?? {};
         ctx.print(data, () => {

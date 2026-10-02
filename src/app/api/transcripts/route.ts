@@ -1,5 +1,7 @@
 import { NextResponse } from 'next/server';
 import { withAuth } from '@/lib/auth/with-auth';
+import { parseLinkMode } from '@/lib/occurrence-join';
+import type { JoinedBody } from '@/lib/server/occurrence-join';
 import {
   jobIdsForVisibleMeetings,
   listDeletedForUser,
@@ -246,6 +248,13 @@ export const POST = withAuth(async ({ user, request }) => {
     }
     linkedEvent = resolved.event;
   }
+  // `?link_mode=separate`: a linked upload makes its own meeting even when the
+  // caller can open one of that occurrence already (default `join` —
+  // lib/server/occurrence-join.ts).
+  const linkMode = parseLinkMode(request.nextUrl.searchParams.get('link_mode'));
+  if (linkMode === null) {
+    return NextResponse.json({ error: "link_mode must be 'join' or 'separate'" }, { status: 400 });
+  }
   const reportPref = parseReportPref(request.nextUrl.searchParams.get('report_pref'));
   // Darth Recorder (migration 041): the tray passes the registry id of the
   // recording it is uploading; the finalize tail stamps transcript_id +
@@ -323,11 +332,12 @@ export const POST = withAuth(async ({ user, request }) => {
       attachTo,
       recorderBirth: recorderFacts?.recorderBirth ?? null,
       suggestedEvent: recorderFacts?.suggestedEvent ?? null,
+      linkMode,
     });
     if (!opened.ok) return NextResponse.json({ error: opened.error }, { status: opened.status });
     await saveAudioBytes(opened.spec.tempFilename, Buffer.from(await file.arrayBuffer()));
     const done = await finalizeUpload(user, opened.spec, file.size);
-    return NextResponse.json(done.body, { status: done.status });
+    return NextResponse.json(withJoined(done.body, opened.joined), { status: done.status });
   }
 
   if (!request.body) {
@@ -388,6 +398,7 @@ export const POST = withAuth(async ({ user, request }) => {
     // Only part 1 of a group carries the suggestion — later parts land on
     // its row, which already has it.
     suggestedEvent: multi && multi.index > 1 ? null : (recorderFacts?.suggestedEvent ?? null),
+    linkMode,
   });
   if (!opened.ok) return NextResponse.json({ error: opened.error }, { status: opened.status });
   const { spec } = opened;
@@ -431,5 +442,12 @@ export const POST = withAuth(async ({ user, request }) => {
   await pendingFlush;
 
   const done = await finalizeUpload(user, spec, bytes);
-  return NextResponse.json(done.body, { status: done.status });
+  return NextResponse.json(withJoined(done.body, opened.joined), { status: done.status });
 });
+
+/** The upload joined its occurrence's existing meeting: say so beside the
+ * recording the bytes became, so a client can go to that meeting. */
+function withJoined(body: unknown, joined: JoinedBody | null | undefined): unknown {
+  if (!joined || !body || typeof body !== 'object' || Array.isArray(body)) return body;
+  return { ...(body as Record<string, unknown>), joined };
+}

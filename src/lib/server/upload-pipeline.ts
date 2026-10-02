@@ -25,6 +25,8 @@ import type { DarthUser } from '@/lib/auth/session';
 import type { SpeechModel } from '@/lib/aai-language';
 import type { ReportPref } from '@/lib/report-pref';
 import type { AttachToMarker } from '@/lib/clips';
+import { occurrenceKeyOf, type LinkMode } from '@/lib/occurrence-join';
+import type { JoinedBody } from '@/lib/server/occurrence-join';
 import {
   BORN_BARE_PREFIX,
   abandonBornBare,
@@ -465,6 +467,14 @@ export interface OpenUploadInput {
     app?: string | null;
     kind?: string | null;
   } | null;
+  /**
+   * With a `linkedEvent`: what to do when the caller can already open a
+   * meeting of that occurrence (owner, 2026-10-02 — lib/server/occurrence-join.ts).
+   * `join` (the default — what the tray's Link card gets): the upload is born
+   * a RECORDING and added to that meeting as another clip; no second meeting.
+   * `separate`: a meeting of its own, shared with the invitees, as before.
+   */
+  linkMode?: LinkMode | null;
 }
 
 /**
@@ -540,7 +550,13 @@ async function stampGroupIdentity(
 }
 
 export type OpenUploadResult =
-  | { ok: true; spec: UploadSpec; placeholder: StoredTranscript | BornBareTranscriptWire }
+  | {
+      ok: true;
+      spec: UploadSpec;
+      placeholder: StoredTranscript | BornBareTranscriptWire;
+      /** The upload joined an existing meeting of its linked occurrence. */
+      joined?: JoinedBody | null;
+    }
   | { ok: false; status: number; error: string };
 
 /**
@@ -550,6 +566,76 @@ export type OpenUploadResult =
  */
 export function namesNoMeeting(input: OpenUploadInput): boolean {
   return !input.linkedEvent && !input.attachTo && !input.sourceId && !input.contextExtra;
+}
+
+/** An upload that may join its occurrence's meeting: a plain linked upload —
+ * not a re-run, not already joining a meeting by id, no provenance to keep. */
+function joinableUpload(input: OpenUploadInput): boolean {
+  return !input.sourceId && !input.attachTo && !input.contextExtra;
+}
+
+/**
+ * The upload path of "this occurrence already has a meeting — add my
+ * recording to it" (lib/server/occurrence-join.ts). Only where uploads can be
+ * born as RECORDINGS (design P7): the bytes become the caller's recording and
+ * that recording is added — right now, before a byte moves — to the meeting
+ * of the occurrence the caller can already open, as an audio-only clip whose
+ * text is merged when the transcription lands. No meeting is made for these
+ * bytes and no share is written; the meeting's own shares apply.
+ *
+ * null = no join (no such meeting, recordings are not born bare here, or the
+ * join was refused) — the caller goes on to the ordinary linked upload. A
+ * refused join under an EXPLICIT `join` is still not an upload failure: the
+ * bytes are linked on their own, as the person's link asked, and the log says
+ * why.
+ */
+async function openJoiningUpload(
+  user: DarthUser,
+  input: OpenUploadInput,
+  languageCode: string | undefined
+): Promise<OpenUploadResult | null> {
+  if (!(await bornBareEnabled().catch(() => false))) return null;
+  const join = await import('@/lib/server/occurrence-join');
+  const key = occurrenceKeyOf(input.linkedEvent);
+  const { candidate } = await join
+    .occurrenceCandidates(user, key, { recordingId: null })
+    .catch((err) => {
+      console.warn('[upload] occurrence lookup failed (linking on its own):', err);
+      return { candidate: null };
+    });
+  if (!candidate) return null;
+
+  const opened = await openBornBareUpload(
+    user,
+    {
+      ...input,
+      // Linking says "this is a real meeting" — never temporary.
+      scratch: false,
+      recorderBirth: {
+        ...(input.recorderBirth ?? {}),
+        title: input.linkedEvent?.title?.slice(0, 300) ?? input.recorderBirth?.title ?? null,
+        startedAt: input.recorderBirth?.startedAt ?? input.linkedEvent?.startTime ?? null,
+      },
+    },
+    languageCode
+  );
+  if (!opened.ok || !opened.spec.bornBare) return opened.ok ? null : opened;
+  const recordingId = opened.spec.bornBare.recordingId;
+
+  const out = await join.joinOccurrenceMeeting({
+    caller: user,
+    recordingId,
+    meetingId: candidate.meetingId,
+    how: 'upload',
+  });
+  if (!out.ok) {
+    console.warn(
+      `[upload] joining ${candidate.meetingId} refused (${out.error}) — linking these bytes on their own`
+    );
+    await abandonBornBare(user, recordingId, opened.spec.tempFilename, null).catch(() => {});
+    return null;
+  }
+  return { ...opened, joined: out.body };
 }
 
 async function openBornBareUpload(
@@ -666,6 +752,9 @@ export async function openUpload(
     }
   } else if (namesNoMeeting(input) && (await bornBareEnabled())) {
     return openBornBareUpload(user, input, languageCode);
+  } else if (input.linkedEvent && input.linkMode !== 'separate' && joinableUpload(input)) {
+    const joined = await openJoiningUpload(user, input, languageCode);
+    if (joined) return joined;
   }
 
   if (multi && multi.index > 1) {

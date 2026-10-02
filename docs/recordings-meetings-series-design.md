@@ -1039,3 +1039,139 @@ untouched (I9). README: the rows and the Q10 line. Ships with the next darth-cli
 - **The ready DM reuses the `transcript_ready` notification kind** (same preference toggle).
 - **An old darth-cli** that uploads without `--event` gets `rec-<id>` back; `--wait` then 404s on
   `/api/transcripts/rec-…` until the new build ships (step 4 before step 2 avoids it).
+
+## As built — joining an occurrence's meeting (2026-10-02)
+
+**The owner's model (2026-10-02):** a meeting is a timeline that can hold one or more recording
+segments — whole or partial, possibly from several people, possibly overlapping — and the AI that
+writes its notes sees all of them and combines. Until today, Ivan linking his tray recording to
+Teams occurrence X and Ka Wen linking hers to the same X made TWO meetings, both shared with the
+same invitees (the link-shares-like-imports change). Now the second link joins the first meeting.
+
+### The rule
+
+When a recording is linked to a calendar occurrence and the CALLER can already open a live meeting
+of that occurrence (owner, or a share — Ka Wen's link shared hers with Ivan), the recording is
+added to THAT meeting as another clip. `mode: 'join' | 'separate'` on every link path, default
+`join`; `separate` is the old behaviour (a meeting of its own, shared with the invitees).
+
+| Path | Join |
+|---|---|
+| `POST /api/recordings/:id/link` with `event` / `eventRef` / `eventKey` | `{ joined: true, meetingId, meeting, recordingId, text, alignment, shares: 0, upgradedToEditor }` (201); `joined: false` on the ordinary answer. |
+| Upload with a `linkedEvent` (`POST /api/uploads` body `linkMode`, `POST /api/transcripts?link_mode=`) — the tray's Link card, the web stepper, the calendar row's Upload, `darth-cli upload --event` | Only where uploads are born bare (P7, `MW_RECORDINGS_BORN_BARE`): the bytes become the caller's RECORDING and are joined at open, before a byte moves; the reply carries `joined`. Without born-bare there is nothing to join WITH, so the linked upload is unchanged. The tray's Link card is untouched — it gets the server default. |
+| `POST /api/transcripts/:id/link-event` on a meeting that is nothing but one of the caller's recordings (owner, one clip, their recording, no notes/report) | The recording joins the occurrence's meeting and this meeting goes to the owner's TRASH with `gmeet_context.joinedInto` (Restore brings it back). `{ joined: true, meetingId, foldedMeetingId, … }`; the page goes there. Anything else (notes, an editor linking, someone else's recording) links as before. |
+
+An EXPLICIT `join` that is refused answers the refusal; the DEFAULT falls back to a meeting of its
+own and logs why. The occurrence key is the one the existing code matches occurrences by
+(`importedOccurrenceMatches`): `gmeet_context.eventId` exactly, or the Meet code / Teams cache code
+(`teams-<sha of the join URL>`, the same for every user) / Teams join URL / iCalUID **with the
+start inside `OCCURRENCE_WINDOW_MS`** — stricter than "already imported?" in one place: a provider
+key without a start never joins (a wrong join would put a recording into another week's meeting).
+The `meetings` ledger is not consulted: its `provider_key` is derived from the same `gmeet_context`
+keys, and `occ_start` is only set on pre-import rows.
+
+### What a join does (`lib/server/occurrence-join.ts` `joinOccurrenceMeeting`)
+
+1. **Access.** `resolveAccess` on the target. A caller holding a READ share who is on the
+   meeting's own invite becomes an EDITOR (owner: "they are an internal invitee anyway"); a read
+   share NOT on the invite is refused (someone chose read). The recording must be the caller's
+   (404 otherwise — never an oracle). A recording whose transcription FAILED is refused
+   (`not-ready`), as a link is.
+2. **The clip** — Phase 3b's `addClip`, so the privacy rule, the clip cap
+   (`MAX_CLIPS_PER_MEETING`), the mirror, the materialise and its roll-back are all the existing
+   ones: the WHOLE recording at offset 0, `include` when it is transcribed, `exclude` ("playable
+   now, text later") while it is still uploading/transcribing. Speaker labels namespace as
+   `<recordingId>:<label>`.
+3. **Annotations follow** (`annotationRekey`): adding a recording interleaves utterances and starts
+   the namespace, so every user's index-keyed edits and label-keyed speaker names/suggestions are
+   re-keyed onto the new text — found by exact (start, end, bare speaker, text) partners. Without
+   this, Ka Wen's named speakers fell off her meeting the moment Ivan joined.
+4. **The marker** `gmeet_context.occurrenceJoins.<recordingId>` = `{at, by, byUserId, how, text,
+   alignment, confidence?, measuredOffsetMs?}`. `text`: `merged` · `pending` · `merging` (claimed)
+   · `failed` · `waiting-combine`. `ClipEntry.alignment` is served from it.
+5. **Notes stale** (`notesStale.reason` "Ivan's recording of this call was added on 2 Oct —
+   regenerate to include it") when the meeting has a summary/report; the page is nudged
+   (`status` on the event bus). No share is written; no ready DM.
+6. **Alignment** (fire-and-forget once the text is in): the existing envelope cross-correlation
+   (`alignRecordings`, sidecar) against the meeting's primary recording, run as the recording's
+   owner. Applied only at confidence ≥ `ALIGN_MIN_CONFIDENCE` and when it lands at or after the
+   meeting's zero (`joinedOffsetFromAlign`) — `alignment: 'aligned'`; otherwise the clip stays at
+   0 and is flagged `unaligned`, and the recordings sheet says "Added from the same calendar
+   event, not lined up yet — set its offset below." This applies a correlation result
+   automatically, which Phase 3b's sheet never does — the brief asked for it; the confidence floor
+   and the visible flag are the guard.
+
+**Text later.** `settleMeetingsMadeEarly` (every observer of a recording's completion) now also
+calls `settleOccurrenceJoins(recordingId)`: a `pending` join is CLAIMED (`merging`), its clip
+becomes `include` (`patchClip`), annotations re-key, notes go stale, `merged`, then align. A failed
+transcription marks it `failed` (still audio-only; a retry's completion merges it). The born-bare
+sweep's null call is the backstop and lists only OPEN markers.
+
+**`MW_COMBINE`.** `addClip` is gated by it. With the flag ON everything above happens. With it
+OFF (clips on) the join **degrades to a reservation**: the marker `waiting-combine`, the
+recording's expiry cleared, NO clip, the meeting's text and graph untouched, still no second
+meeting (`recordingLinkState` refuses another link of it). The sweep finishes the reservation the
+first time it runs with the flag on (a refusal then hands the recording back to the owner's
+Recordings). A link-event fold is not done at all with the flag off. Prod has run `MW_COMBINE=1`
+since the 3b rollout (docs/rollout-recordings-2026-09.md).
+
+**Overlap.** Two included clips of different recordings covering the same minutes (≥ 15 s,
+`clipOverlaps`) keep BOTH texts — no dedupe. The notes/report prompt's Sources block
+(`buildSourcesBlock`) adds one line per overlap: the window, both sources with their
+`"<rid8>…:<letter>"` prefixes, and that the same minutes appear twice with different letters and
+must be reconciled into one account.
+
+**Privacy.** Candidates are caller-scoped in SQL (`findOccurrenceMeetings`: owner OR a share on
+the lower-cased email; live, not temporary), so a meeting the caller cannot open is never named or
+counted. Only the caller's own recording ever joins. Media of each clip is served through the
+meeting's routes (`scopeMediaToRow`: the clip is the consent); `/api/recordings/*` stays owner-only.
+The media routes were not touched.
+
+### The question before the link
+
+`GET /api/recordings/:id/link-candidates?event=<key|code>` (owner only) and
+`GET /api/transcripts/:id/link-candidates` (owner/editors; `fromMeetingBlock` says whether this
+meeting may be folded) — or `?eventId=&startTime=&meetingCode=&iCalUID=&joinWebUrl=` with the
+picked event's own facts — answer `LinkCandidatesResponse {candidate, candidates[], defaultMode}`,
+each candidate `{meetingId, title, ownerName, ownerEmail, mine, access, recordingCount, joinable,
+blockedCode, blockedReason}`. The web `LinkEventDialog` (transcript page, recordings surface "Link
+to meeting…", recording page) asks it on a pick and, when there is a joinable candidate, shows
+`JoinChoice`: "This occurrence already has a meeting by Ka Wen Koh — **Add my recording to it**
+(default) / Keep mine separate", then sends `mode`; a joined answer navigates to that meeting. The
+`SuggestedEventStrip`'s "Link to it" asks the same and renders the one-line form. The one-click
+"Link to it" buttons on the recordings surface and the recording page take the server default.
+
+### darth-cli (`cli-subcommand-src/`)
+
+`--separate` on `link <id> <ref>`, `recordings link <rid> <event-ref>` and `upload --event`
+(`mode` / `link_mode` / `linkMode` = `separate`); the joined answers print `joined → meeting …`.
+
+### Files
+
+| | |
+|---|---|
+| `src/lib/occurrence-join.ts` | pure: `LinkMode`/`parseLinkMode`, `occurrenceKeyOf`/`sameOccurrence`, candidate wire + `joinChoiceCopy`, the marker type, `joinedOffsetFromAlign`, `annotationRekey`/`rekeyEdits`/`rekeySpeakerLabels`/`rekeySuggestions`. |
+| `src/db-ops/occurrence-join.ts` | `findOccurrenceMeetings` (caller-scoped), `recordingLinkState`, the marker writes/claim, `listOccurrenceJoins` (open only), `putMeetingSpeakers`. |
+| `src/lib/server/occurrence-join.ts` | `occurrenceCandidates`, `joinOccurrenceMeeting`, `foldIntoOccurrenceMeeting`, `alignJoinedClip`, `settleOccurrenceJoins`, `occurrenceKeyFromQuery`. |
+| `src/lib/clips.ts`, `src/lib/server/clip-combine.ts` | `clipOverlaps`, the Sources block's overlap lines, `ClipEntry.alignment`. |
+| routes / UI | the two `link-candidates` routes; `mode` on `…/link` and `…/link-event`; `linkMode` on both upload routes; `components/occurrence-join-choice.tsx`, `link-event-dialog.tsx`, `suggested-event-strip.tsx`, `recordings-sheet.tsx`. |
+
+Tests: `src/lib/__tests__/occurrence-join.test.ts` (pure), `src/db-ops/__tests__/occurrence-join.test.ts`
+(the SQL: caller scoping, trashed/temporary excluded, arms, exclude, the claim, open-only backstop),
+`src/lib/server/__tests__/occurrence-join.test.ts` (fake postgres: same occurrence/different owner,
+not visible, trashed, next week's occurrence, full / already-in / no recording / read off the
+invite; the join appends without a meeting INSERT or a share INSERT; the cap refusal leaves no
+marker; read→edit; pending → merged on completion; failed; MW_COMBINE off reservation → finished
+when on; `mode: 'separate'`; explicit vs default refusal; the upload path born-bare + joined; the
+link-event fold), `src/lib/__tests__/occurrence-join-choice.test.tsx` (the dialog's choice,
+statically rendered), Sources-block overlap cases in `clip-combine-media.test.ts`.
+
+### Open / not done
+
+- No scratch-Postgres or browser pass was run in this build (unit + fake-postgres only).
+- Phase 3b's own "Add a recording…" sheet does not re-key annotations on add/remove; only the join
+  path does (`carryAnnotations`). Worth moving into `addClip`/`deleteClip`.
+- A marker stuck in `merging` (process died mid-merge) is not re-claimed by the backstop.
+- The tray still opens `/transcript/rec-<id>` (→ the recording page, which lists the meeting it
+  joined) rather than the joined meeting itself; the upload reply carries `joined.meetingId` for a
+  later tray build.

@@ -1395,6 +1395,14 @@ export interface ClipEntry {
    * `[mediaPart, …the stop/restart parts]` — first is the canonical. Empty
    * when `mediaPart` is null. */
   mediaParts: number[];
+  /**
+   * Set only for a recording that JOINED this meeting from a link to the same
+   * calendar occurrence (lib/occurrence-join.ts): `aligned` = placed by the
+   * cross-correlation, `aligning` = being placed, `unaligned` = sitting at
+   * its offset unchecked — the sheet offers "line them up". Absent for every
+   * clip added any other way.
+   */
+  alignment?: 'aligned' | 'unaligned' | 'aligning' | null;
 }
 
 export type CombineRefusalCode =
@@ -1635,6 +1643,56 @@ export function clipEntryExtent(
     return [start, start + Math.max(0, clip.recordingDurationMs - clip.fromMs)];
   }
   return [start, null];
+}
+
+/** Two clips of DIFFERENT recordings covering the same meeting minutes. */
+export interface ClipOverlap {
+  a: { ord: number; recordingId: string };
+  b: { ord: number; recordingId: string };
+  /** Meeting-time window both cover, ms. */
+  fromMs: number;
+  toMs: number;
+}
+
+/** Overlaps shorter than this are a few seconds of hand-over, not "the same
+ * minutes twice". */
+export const MIN_REPORTED_OVERLAP_MS = 15_000;
+
+/**
+ * Where two recordings of a meeting cover the same minutes — Ivan's tray and
+ * Ka Wen's tray both recording the same call. Both texts are KEPT (no
+ * dedupe: neither mic is known to be the better one), so the AI prompts have
+ * to be told those minutes appear twice. Only clips whose text is in the
+ * meeting (`include`, `gap_fill` — `gap_fill` has already yielded where the
+ * other has speech, but a `gap_fill` stretch still overlaps in time) and whose
+ * extent is known are considered. Timeline order, pairs once.
+ */
+export function clipOverlaps(
+  clips: Array<Pick<ClipEntry, 'ord' | 'recordingId' | 'fromMs' | 'toMs' | 'offsetMs' | 'recordingDurationMs' | 'textPolicy'>>
+): ClipOverlap[] {
+  const spans = clips
+    .filter((c) => c.textPolicy !== 'exclude')
+    .map((c) => ({ c, ext: clipEntryExtent(c) }))
+    .filter((x): x is { c: (typeof clips)[number]; ext: [number, number] } => x.ext[1] !== null)
+    .sort((x, y) => x.ext[0] - y.ext[0] || x.c.ord - y.c.ord);
+  const out: ClipOverlap[] = [];
+  for (let i = 0; i < spans.length; i++) {
+    for (let j = i + 1; j < spans.length; j++) {
+      const x = spans[i]!;
+      const y = spans[j]!;
+      if (x.c.recordingId === y.c.recordingId) continue;
+      const from = Math.max(x.ext[0], y.ext[0]);
+      const to = Math.min(x.ext[1], y.ext[1]);
+      if (to - from < MIN_REPORTED_OVERLAP_MS) continue;
+      out.push({
+        a: { ord: x.c.ord, recordingId: x.c.recordingId },
+        b: { ord: y.c.ord, recordingId: y.c.recordingId },
+        fromMs: from,
+        toMs: to,
+      });
+    }
+  }
+  return out;
 }
 
 const POLICY_RANK: Record<ClipTextPolicy, number> = { include: 0, gap_fill: 1, exclude: 2 };

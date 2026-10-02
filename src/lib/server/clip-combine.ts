@@ -1,6 +1,7 @@
 import 'server-only';
 import {
   candidateClipForTime,
+  clipOverlaps,
   clipShortLabel,
   clipSourceKindOf,
   clipSourceLabel,
@@ -23,6 +24,7 @@ import {
 } from '@/lib/clips';
 import { compareClipsOnTimeline, type ClipTextPolicy } from '@/lib/recording-clips';
 import { isBareRecording } from '@/lib/meeting-title';
+import { occurrenceJoinsOf } from '@/lib/occurrence-join';
 import {
   clippedMeetingsOnRecordingExcept,
   combineEnabled,
@@ -154,6 +156,9 @@ export async function combineState(
   const primaryRecordingId = clips.length > 0 ? (clips[0]!.recordingId ?? null) : null;
 
   const spanMs = meetingSpanFromDurations(clips, durationOfRecording(details));
+  // Recordings that joined from a link to the same occurrence carry whether
+  // the correlation placed them (lib/occurrence-join.ts).
+  const joins = occurrenceJoinsOf(access.row.gmeet_context);
 
   // `?part=N` per recording, canonical first — the numbering walks FILES
   // (`mediaForRecordings`), so this is the only place it is correct.
@@ -197,6 +202,7 @@ export async function combineState(
       recordingStartedAt: detail?.started_at ?? null,
       mediaPart: mediaParts[0] ?? null,
       mediaParts,
+      ...(joins[clip.recordingId] ? { alignment: joins[clip.recordingId]!.alignment ?? null } : {}),
     };
   });
 
@@ -738,9 +744,21 @@ export function buildSourcesBlock(entries: ClipEntry[]): string {
     // recording is NOT "A" of another (DEC-1, one job = one diarization space).
     return `- ${e.sourceLabel}${who}, starting at ${at} of the meeting${span}${policy}${heard}. Its speakers appear below as "${e.recordingId.slice(0, 8)}…:<letter>".`;
   });
+  // Two people recorded the same stretch (two trays on one call): both texts
+  // are kept, so the model is told exactly where the same minutes appear
+  // twice, under which two namespaces, and that they are one stretch.
+  const byRecording = new Map(ordered.map((e) => [e.recordingId, e]));
+  const overlaps = clipOverlaps(ordered).map((o) => {
+    const a = byRecording.get(o.a.recordingId);
+    const b = byRecording.get(o.b.recordingId);
+    const name = (e: ClipEntry | undefined, rid: string) =>
+      `${e?.sourceLabel ?? 'a recording'} ("${rid.slice(0, 8)}…:<letter>")`;
+    return `- OVERLAP ${formatDuration(o.fromMs)}–${formatDuration(o.toMs)} of the meeting: ${name(a, o.a.recordingId)} and ${name(b, o.b.recordingId)} both cover it. The same minutes appear TWICE below, once under each recording's speaker prefix, with different letters for the same people and slightly different wording — reconcile them into one account; never count anything said there twice.`;
+  });
   return (
     `SOURCES: this meeting was captured ${recordings.size} times, by different devices, and the transcript below is those recordings placed on ONE timeline (no file was cut and nothing was re-transcribed):\n` +
     lines.join('\n') +
+    (overlaps.length > 0 ? `\n${overlaps.join('\n')}` : '') +
     `\nEach recording was diarized on its own, so the same person may appear under a different letter in each — treat two labels from DIFFERENT recordings as possibly the same human, and never as two people just because the letters differ. Where two recordings overlap you may see the same moment described twice; that is one moment, not two.\n\n`
   );
 }

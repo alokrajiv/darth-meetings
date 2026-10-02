@@ -28,6 +28,7 @@ import { blobTransitFor, mintBlobTicket } from '@/lib/server/darth-uploads-store
 import { uploadIdentityHash, wantsDuplicateAnswer, wantsForce } from '@/lib/same-file';
 import { duplicateForUpload } from '@/lib/server/same-file';
 import { resolveAttachTarget } from '@/lib/server/clip-attach';
+import { parseLinkMode } from '@/lib/occurrence-join';
 import { bornBareWire, recordingIdFromPseudo } from '@/lib/server/born-bare';
 import { getStandaloneForOwner } from '@/db-ops/standalone-recordings';
 import { parseAttachTo, type AttachToMarker } from '@/lib/clips';
@@ -111,8 +112,14 @@ export const runtime = 'nodejs';
  * at …/complete instead. A client that does not say `dupAware` never sees
  * this answer — the tray, darth-cli and older tabs are version-gated by it.
  *
+ * Linked to an event the caller can already open a meeting of (owner,
+ * 2026-10-02): `linkMode: 'join'` (default) makes the bytes a RECORDING added
+ * to that meeting as another clip — `joined: { meetingId, … }` in the reply,
+ * `transcript` is the recording — and `'separate'` keeps a meeting of their
+ * own (lib/server/occurrence-join.ts).
+ *
  * Reply: { id, via, chunkSize, chunkCount, received: number[], resumed,
- *   transcript, blob? }
+ *   transcript, blob?, joined? }
  */
 export const POST = withAuth(async ({ user, request }) => {
   let body: Record<string, unknown>;
@@ -177,6 +184,13 @@ export const POST = withAuth(async ({ user, request }) => {
       { error: 'Invalid tracks (expected {count: non-negative integer, mixFirst: boolean})' },
       { status: 400 }
     );
+  }
+  // `linkMode` ('join' default | 'separate'): with a linked event, join the
+  // occurrence's existing meeting the caller can open, or make a meeting of
+  // its own (lib/server/occurrence-join.ts). `mode` is accepted as a synonym.
+  const linkMode = parseLinkMode(body.linkMode ?? body.mode);
+  if (linkMode === null) {
+    return NextResponse.json({ error: "linkMode must be 'join' or 'separate'" }, { status: 400 });
   }
   // Phase 3b source (c): resolved against the target meeting immediately, so
   // the refusal arrives before the bytes rather than after them.
@@ -356,6 +370,7 @@ export const POST = withAuth(async ({ user, request }) => {
     attachTo,
     suggestedEvent,
     recorderBirth,
+    linkMode,
   });
   if (!opened.ok) return NextResponse.json({ error: opened.error }, { status: opened.status });
 
@@ -401,6 +416,9 @@ export const POST = withAuth(async ({ user, request }) => {
       // shows it as "Link to '<title>'? [Link] [Not this]"; `linkedEvent` in
       // this answer is only ever the caller's own explicit link.
       ...(suggestedEvent ? { suggestedEvent } : {}),
+      // The bytes became a recording that JOINED the occurrence's existing
+      // meeting (`joined.meetingId`) — no meeting of their own.
+      ...(opened.joined ? { joined: opened.joined } : {}),
     },
     { status: 201 }
   );

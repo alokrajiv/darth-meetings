@@ -9,6 +9,7 @@ import type { ReportPref } from '@/lib/report-pref';
 import type { RunningTranscription } from '@/lib/transcriptions';
 import type { AttachToMarker, SplitProvenance, StoredClips } from '@/lib/clips';
 import type { ConferenceProvider } from '@/lib/recorder';
+import type { OccurrenceJoinMarker } from '@/lib/occurrence-join';
 
 /** Temporary (scratch) transcripts are moved to the trash this many days
  * after creation (migration 042). The sweeper, the listing hint and the
@@ -305,6 +306,19 @@ export interface GmeetContext {
    * removes it — the recording goes back to its owner's Recordings).
    */
   fromRecording?: { recordingId: string; at: string; how: 'link' | 'make-meeting' } | null;
+  /**
+   * Recordings that JOINED this meeting because their owner linked them to
+   * the same calendar occurrence (owner 2026-10-02, lib/occurrence-join.ts):
+   * keyed by recording id — where each one's text is (merged / pending /
+   * waiting for MW_COMBINE) and whether its offset was found by the
+   * cross-correlation (`alignment`). The clip list is the record of WHAT is
+   * in the meeting; this says HOW each joined one got there.
+   */
+  occurrenceJoins?: Record<string, OccurrenceJoinMarker> | null;
+  /** This meeting was folded into another meeting of the same occurrence
+   * (a link-event join) and moved to the trash; `meetingId` is where its
+   * recording went. */
+  joinedInto?: { meetingId: string; at: string } | null;
   /** Microsoft Teams source facts (provider === 'teams'). Artifacts are
    * fetched app-only under the ORGANIZER's AAD id — no per-user Microsoft
    * auth exists. `callId` keys the specific occurrence of a recurring

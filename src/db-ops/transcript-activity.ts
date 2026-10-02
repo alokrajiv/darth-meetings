@@ -47,7 +47,12 @@ export type ActivityAction =
   // it again. `details` carries the recording id, the window and the policy.
   | 'clip_add'
   | 'clip_edit'
-  | 'clip_remove';
+  | 'clip_remove'
+  // A recording joined this meeting because its owner linked it to the same
+  // calendar occurrence (lib/server/occurrence-join.ts); `joined_into` on the
+  // owner's own meeting that was folded into it and trashed.
+  | 'occurrence_join'
+  | 'joined_into';
 
 export interface ActivityRow {
   id: number;

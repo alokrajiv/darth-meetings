@@ -385,7 +385,13 @@ export function RecordingsSheet({
                         {row.duration ?? 'length unknown'} · {row.owner}
                         {row.primary ? ' · the meeting’s main file' : ''}
                         {row.entry.transcribed ? '' : ' · still transcribing'}
+                        {row.entry.alignment === 'aligning' ? ' · lining it up…' : ''}
                       </div>
+                      {row.entry.alignment === 'unaligned' && !row.primary && (
+                        <div className="mt-0.5 text-[11px] text-amber-700 dark:text-amber-400" data-clip-unaligned>
+                          Added from the same calendar event, not lined up yet — set its offset below.
+                        </div>
+                      )}
                     </div>
                     <button
                       type="button"
