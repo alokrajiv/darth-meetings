@@ -16,8 +16,12 @@ export const runtime = 'nodejs';
  * verbatim. Or `{ meetingId, offsetMs?, textPolicy? }` → the recording is
  * added to a meeting the caller owns or can edit (Phase 3b, MW_COMBINE).
  *
- * Creates NO share (design P4). Answers `{ meeting: {id, title},
- * recordingId, shares: 0 }`. 404 for a recording that is not the caller's;
+ * A link to an event shares the new MEETING with the event's internal
+ * invitees, exactly as a cloud import does (meeting policy, owner
+ * 2026-10-02; stamped `origin='event-link'` so Unlink takes them back off).
+ * The RECORDING is never shared: every `/api/recordings/*` route still
+ * answers to its owner alone. Answers `{ meeting: {id, title}, recordingId,
+ * shares }` (`shares` = how many invitees were shared; 0 for `meetingId`). 404 for a recording that is not the caller's;
  * 409 `not-ready` while it is still transcribing, `already-linked` when a
  * meeting already holds it.
  */

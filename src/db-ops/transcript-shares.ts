@@ -73,8 +73,8 @@ export interface AddShareInput {
   access: 'edit' | 'read';
   /**
    * Why this share exists (migration 048). Only `'event-link'` is written:
-   * a share created because a calendar event was attached, which "Unlink
-   * from event" undoes. Omitted = a human's own share. Silently dropped when
+   * a share created because a calendar event was linked to the meeting
+   * (lib/server/auto-share.ts), which "Unlink from event" undoes. Omitted = a human's own share. Silently dropped when
    * the column is not there yet (db-ops/share-origin.ts).
    */
   origin?: ShareOrigin;

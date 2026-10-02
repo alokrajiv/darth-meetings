@@ -1848,8 +1848,8 @@ export function AudioUpload({ onTranscriptCreated }: AudioUploadProps) {
             <div className="min-w-0 space-y-3 py-2">
               <p className="text-xs text-muted-foreground">
                 Linking pulls in the meeting&apos;s title, time and invitees — speaker
-                name-guessing and the summary get real context. It doesn&apos;t share
-                anything: the invitees show up as suggestions when you choose to share.
+                name-guessing and the summary get real context. The meeting is shared
+                with the Trames colleagues on the invite, as a Meet or Teams import is.
               </p>
               {googleOk === false ? (
                 <div className="space-y-2.5 rounded-md border bg-muted/40 p-3">

@@ -49,7 +49,7 @@ import {
   updateStatusForUser,
 } from '@/db-ops/transcripts';
 import { deleteAnnotationsForMeeting } from '@/db-ops/transcriptions';
-import { logActivity } from '@/db-ops/transcript-activity';
+import { identityForUser, logActivity } from '@/db-ops/transcript-activity';
 import { resolveAccess, type ResolvedAccess } from '@/db-ops/transcript-access';
 import { materialiseMeeting } from '@/lib/server/clip-materialise';
 import { combineView } from '@/lib/server/clip-combine';
@@ -57,6 +57,7 @@ import { pendingAttachFor } from '@/lib/server/clip-attach';
 import { removeRecordingGraphForMeeting } from '@/lib/server/recording-sync';
 import { resolveLinkedEventRef } from '@/lib/server/linked-event-ref';
 import { registerPeopleFromMeeting } from '@/lib/server/import-helpers';
+import { shareWithInternalInvitees } from '@/lib/server/auto-share';
 import { autoAttachSeries } from '@/lib/server/series-attach';
 import type { GmeetAttendee, GmeetContext, StoredTranscript } from '@/lib/format';
 
@@ -566,11 +567,27 @@ export async function splitMeeting(input: SplitInput): Promise<ClipOpResult<Spli
     }
   }
 
-  // Shares are NOT copied (spec), and the calendar link brings nobody in
-  // either (design P4, owner 2026-09-23): linking never shares. The new
-  // meeting is its owner's alone; the event's invitees are in its context,
-  // so the share dialog suggests them.
+  // Shares are NOT copied from the source (spec). A half linked to a
+  // calendar event is shared with that event's internal invitees, exactly as
+  // a cloud import is (owner 2026-10-02 — the meeting share policy; stamped
+  // `origin = 'event-link'` so "Unlink from event" takes them back off). The
+  // owner is never shared with themself, even when an editor splits.
+  let shared = 0;
   if (linked && attendees.length > 0) {
+    const ownerEmail =
+      access.ownerUserId === by.userId
+        ? by.email
+        : ((await identityForUser(access.ownerUserId).catch(() => null))?.email ?? by.email);
+    shared = await shareWithInternalInvitees(
+      'event-link',
+      created.id,
+      access.ownerUserId,
+      ownerEmail,
+      attendees
+    ).catch((err) => {
+      console.warn(`[split] sharing ${newId} with the invitees failed (continuing):`, err);
+      return 0;
+    });
     await registerPeopleFromMeeting(
       attendees.map((a) => ({ email: a.email, name: a.name })),
       by.userId
@@ -623,6 +640,7 @@ export async function splitMeeting(input: SplitInput): Promise<ClipOpResult<Spli
               title: linked.title ?? null,
               startTime: linked.startTime ?? null,
               attendees: attendees.length,
+              shared,
             },
           }
         : {}),
