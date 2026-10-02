@@ -3,6 +3,18 @@
 Status: **build brief**, written 16:20 SGT after the incident below. Two builders: **A** (this repo: server + web),
 **B** (`poc/mac-recorder`, the Darth Recorder tray). They share the contract in §3 and must not change it.
 
+> **Reversal note — 2026-10-02 (~12:00 SGT, owner).** What a USER link does to sharing changed: a meeting linked to a
+> calendar event (any path — tray Link, web stepper, calendar-row Upload, `darth-cli --event`, `POST
+> /api/recordings/:id/link`, retro-link / "Link to it", split-to-an-event, a linked text import) is now **shared with
+> the event's internal invitees exactly as a cloud import is** (internal domains, edit, no DM), stamped
+> `origin='event-link'` so D5's Unlink still takes those shares back off. This undoes design P4's "a link never
+> shares" (2026-09-23) and restores what D4 below already describes for the tray ("invitee auto-share; the human said
+> yes"). **Unchanged:** D1–D4's rule that only a PERSON links — a recorder match is still a suggestion, never a link,
+> so it can never share by itself (the web banner's "Upload now" no longer forwards the tray's match as a link for
+> exactly that reason). The recording itself is still never shared: `/api/recordings/*` answers its owner alone, and
+> a share recipient reaches the media only through the meeting. Details:
+> `docs/recordings-meetings-series-design.md` "As built — a link shares like an import (2026-10-02)".
+
 ## 1. The incident (why)
 
 Row 935 (`4f677f3a-5946-4da0-8126-7d376cf0de4b`): a Darth Recorder recording of a **Slack DM huddle** (tray reported
@@ -44,7 +56,8 @@ or if not, open the recording in the meeting UI to connect the recording to the 
   - Web (A): a strip on the transcript page (and the listing row's recording strip) when `suggestedEvent` is present
     and undismissed: **"Looks like 'Triton next steps!' · 15:30–16:30 · Google Meet — Link to it · Not this"**.
     "Link to it" runs the existing link flow (the same one darth-cli `meetings link` uses — metadata + share
-    SUGGESTIONS, nothing shared until accepted); "Not this" dismisses. `?link=1` on the transcript page opens the
+    SUGGESTIONS, nothing shared until accepted; **since 2026-10-02 the link itself shares the meeting with the
+    internal invitees**, see the reversal note at the top); "Not this" dismisses. `?link=1` on the transcript page opens the
     existing "link the calendar event" picker directly. darth-cli `meetings get` prints `suggested event:` when set
     (CLI repo is another session's — write the two-line spec for it in the as-built notes, do not edit `../cli`).
 - D5 **Unlink exists as a first-class action** (web ⋯ menu "Unlink from event…", `PATCH /api/transcripts/:id`
