@@ -22,6 +22,7 @@ import { generateAutoReport } from '@/lib/server/auto-notes';
 import { notifyUser } from '@/lib/server/darth-notify';
 import { dm, meetingLine, openLink, whenLine } from '@/lib/server/dm-copy';
 import type { GmeetContext } from '@/lib/format';
+import { unlessDraining } from '@/lib/server/deploy-drain';
 
 /**
  * Watches imports where Meet listed a recording Google was still generating
@@ -701,7 +702,7 @@ export function startRecordingPoller(): void {
   if (started) return;
   started = true;
   console.log(`[recording-poller] armed: every ${TICK_MS / 1000}s`);
-  const timer = setInterval(() => void tick(), TICK_MS);
+  const timer = setInterval(unlessDraining('recording-poller', tick), TICK_MS);
   timer.unref?.();
-  setTimeout(() => void tick(), 15 * 1000).unref?.();
+  setTimeout(unlessDraining('recording-poller', tick), 15 * 1000).unref?.();
 }
