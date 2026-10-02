@@ -19,8 +19,12 @@ const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/
  * REACHABILITY — exactly the two arms of migration 044, stated here as that
  * header requires, and nothing else:
  *   (a) the caller OWNS the recording (`recordings.owner_user_id`);
- *   (b) the caller can open a MEETING that holds a clip on it — owned, or
- *       shared to their email (a trashed meeting counts only for its owner).
+ *   (b) the caller can open a MEETING that holds the WHOLE recording as a
+ *       clip (`from_ms = 0`, `to_ms` null) — owned, or shared to their email
+ *       (a trashed meeting counts only for its owner). A meeting that holds
+ *       only a WINDOW does not count (2026-10-02): its readers get exactly
+ *       that window, cut server-side, from the meeting's own media route —
+ *       never every minute of the recording from this one.
  * Anything else is 404 — the same answer as for an id that does not exist,
  * so this is not an oracle (invariant I2).
  *
@@ -32,7 +36,11 @@ export const GET = withAuth(async ({ user, request }, { params }) => {
   if (!id || !UUID_RE.test(id)) return notFound();
 
   const own = await getRecordingForOwner(user.userId, id).catch(() => null);
-  const allowed = own ? 'owner' : (await reachableThroughMeeting(id, user).catch(() => false)) ? 'meeting' : null;
+  const allowed = own
+    ? 'owner'
+    : (await reachableThroughMeeting(id, user, { wholeRecording: true }).catch(() => false))
+      ? 'meeting'
+      : null;
   if (!allowed) return notFound();
 
   const media = (await standaloneMedia(id)).filter((m) => m.kind === 'canonical' || m.kind === 'part');

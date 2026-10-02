@@ -188,6 +188,15 @@ describe('owner-scoped SQL (I2)', () => {
     expect(q.params).not.toContain('Alok@trames.sg');
   });
 
+  test('the bytes arm counts only a whole-recording clip — never a window', async () => {
+    await standalone.reachableThroughMeeting(RID, A, { wholeRecording: true });
+    const q = sql.executed[0]!;
+    expect(q.text).toContain('c.from_ms = 0 AND c.to_ms IS NULL');
+    sql.executed.length = 0;
+    await standalone.reachableThroughMeeting(RID, A);
+    expect(sql.executed[0]!.text).not.toContain('c.from_ms = 0');
+  });
+
   test('Link/Make a meeting: one transaction, locked on the owner, text copied in SQL, NO share written', async () => {
     respond = (q) => {
       if (q.text.includes('FOR UPDATE')) return [{ id: RID, active_transcription_id: 't1' }];
@@ -338,7 +347,9 @@ describe('source-level: the recording surfaces carry no sharing controls, and th
   test('the media route: owner, or a meeting the caller can open — and 404 otherwise', () => {
     const route = read('app/api/recordings/[id]/audio/route.ts');
     expect(route).toContain('getRecordingForOwner(user.userId, id)');
-    expect(route).toContain('reachableThroughMeeting(id, user)');
+    // Arm (b) counts only a meeting that holds the WHOLE recording: a window's
+    // readers get the window, cut, from the meeting route (2026-10-02).
+    expect(route).toContain('reachableThroughMeeting(id, user, { wholeRecording: true })');
     expect(route).toContain("if (!allowed) return notFound();");
   });
 

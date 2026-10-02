@@ -18,6 +18,8 @@ import {
   resolveMeetingContent,
   type ResolvedMedia,
 } from '@/lib/server/recordings';
+import { cutWindowOf, type CutWindow } from '@/lib/clip-cut';
+import { clipCutWithin } from '@/lib/server/clip-cut';
 
 export const runtime = 'nodejs';
 
@@ -65,6 +67,16 @@ export const runtime = 'nodejs';
  *   3. nothing → 404.
  * There is no step that asks AssemblyAI for a URL any more (DEC-4).
  *
+ * CLIP WINDOWS (2026-10-02, lib/clip-cut.ts). A file the meeting holds only a
+ * WINDOW of (`windowFromMs > 0` or a `windowToMs` — a meeting split off a
+ * longer recording, a combined clip) is never served whole: the answer is a
+ * CUT rendition of exactly that window, made once with ffmpeg and cached under
+ * `${MW_STORAGE_DIR}/clips/<meeting>/` (lib/server/clip-cut.ts), streamed with
+ * Range like any other file and starting at 0. No Stage B redirect and no
+ * blob proxy for it — both would hand out the whole recording. A meeting that
+ * holds the whole file is served exactly as before (no copy). The recording's
+ * OWNER still gets every second through `/api/recordings/:id/audio`.
+ *
  * Ownership is enforced before any of the above so a user can't probe
  * another user's audio by id — and in particular NO SAS IS EVER MINTED for a
  * caller that failed the check: the 404 below returns before the resolver.
@@ -99,7 +111,7 @@ export const GET = withAuth(async ({ user, request, cliScope }, { params }) => {
       return NextResponse.json({ error: 'No such video part' }, { status: 404 });
     }
     try {
-      return await serveMedia(request, part, audioOnly, decision.redirect);
+      return await serveMedia(request, row.assemblyai_id, part, audioOnly, decision.redirect);
     } catch (err) {
       console.error('[GET /api/transcripts/:id/audio] part stream failed:', redactError(err));
       return NextResponse.json({ error: 'Video part unavailable' }, { status: 404 });
@@ -111,9 +123,13 @@ export const GET = withAuth(async ({ user, request, cliScope }, { params }) => {
   const canonical = canonicalMedia(media);
   if (canonical) {
     try {
-      return await serveMedia(request, canonical, audioOnly, decision.redirect);
+      return await serveMedia(request, row.assemblyai_id, canonical, audioOnly, decision.redirect);
     } catch (err) {
       console.error('[GET /api/transcripts/:id/audio] local stream failed:', redactError(err));
+      // A windowed file must never fall through to a whole-file URL.
+      if (cutWindowOf(canonical)) {
+        return NextResponse.json({ error: 'Audio unavailable' }, { status: 500 });
+      }
       // Fall through to remote URL — though that's almost certainly broken
       // for AAI-backed rows; see project memory `aai_audio_url_unusable`.
     }
@@ -149,10 +165,16 @@ type Missing = typeof MISSING;
  */
 async function serveMedia(
   request: NextRequest,
+  meetingId: string,
   media: ResolvedMedia,
   audioOnly: boolean,
   mayRedirect: boolean
 ): Promise<Response> {
+  // A window of the file, never the file: checked FIRST, before the Stage B
+  // redirect or the blob proxy could hand out the whole recording.
+  const cut = cutWindowOf(media);
+  if (cut) return serveClipCut(request, meetingId, media, cut, audioOnly);
+
   const store = serveStore();
   const target = store ? blobTargetFor(media, audioOnly) : null;
 
@@ -174,6 +196,67 @@ async function serveMedia(
     );
   }
   return NextResponse.json({ error: 'Audio file missing' }, { status: 404 });
+}
+
+/**
+ * How long a request waits for a cut that is not cached yet. A stream copy is
+ * seconds; a re-encode of a long video can be minutes. `?variant=audio` keeps
+ * the audio-only protocol (the player's 4 s Range probe → 202 → it plays the
+ * plain URL meanwhile), so it waits only briefly; the plain URL is what a
+ * media element is loading and nginx allows 900 s, so it waits longer and
+ * answers 503 + Retry-After only when even that is not enough — the ffmpeg
+ * carries on and the next request is served from the cache.
+ */
+const CUT_WAIT_VARIANT_MS = 3_000;
+const CUT_WAIT_PLAIN_MS = 240_000;
+
+async function serveClipCut(
+  request: NextRequest,
+  meetingId: string,
+  media: ResolvedMedia,
+  window: CutWindow,
+  audioOnly: boolean
+): Promise<Response> {
+  const noStore = { 'Cache-Control': 'private, no-store' };
+  const result = await clipCutWithin(
+    {
+      meetingId,
+      sourceFilename: media.filename,
+      window,
+      variant: audioOnly ? 'audio' : 'av',
+      part: media.part,
+      sourceDurationMs: media.durationMs,
+    },
+    audioOnly ? CUT_WAIT_VARIANT_MS : CUT_WAIT_PLAIN_MS
+  );
+  if (result === null) {
+    return NextResponse.json(
+      { preparing: true },
+      audioOnly
+        ? { status: 202, headers: noStore }
+        : { status: 503, headers: { ...noStore, 'Retry-After': '30' } }
+    );
+  }
+  if (result.status === 'missing') {
+    // The source is not on this VM. The archive may hold it, but only WHOLE —
+    // and a meeting route never serves a window's recording whole.
+    return NextResponse.json({ error: 'Audio file missing' }, { status: 404 });
+  }
+  if (result.status === 'error') {
+    return NextResponse.json({ error: result.error }, { status: 500, headers: noStore });
+  }
+  // The bytes behind this URL change when the window does (a re-split, an
+  // un-split), so no hour-long max-age: revalidate against the cut's name.
+  const etag = `"${result.path.split('/').slice(-2).join('/')}"`;
+  if (request.headers.get('if-none-match') === etag) {
+    return new Response(null, { status: 304, headers: { ETag: etag, 'Cache-Control': 'private, no-cache' } });
+  }
+  const local = await streamLocalFile(request, result.path, result.contentType, {
+    'Cache-Control': 'private, no-cache',
+    ETag: etag,
+  });
+  if (local === MISSING) return NextResponse.json({ error: 'Audio file missing' }, { status: 404 });
+  return local;
 }
 
 /**
@@ -237,7 +320,8 @@ function mimeFromPath(p: string): string {
 async function streamLocalFile(
   request: NextRequest,
   path: string,
-  contentTypeOverride?: string
+  contentTypeOverride?: string,
+  extraHeaders?: Record<string, string>
 ): Promise<Response | Missing> {
   const fsp = await import('node:fs/promises');
   const fs = await import('node:fs');
@@ -273,6 +357,7 @@ async function streamLocalFile(
           'Content-Length': String(end - start + 1),
           'Content-Type': contentType,
           'Cache-Control': 'private, max-age=3600',
+          ...extraHeaders,
         },
       });
     }
@@ -286,6 +371,7 @@ async function streamLocalFile(
       'Accept-Ranges': 'bytes',
       'Content-Type': contentType,
       'Cache-Control': 'private, max-age=3600',
+      ...extraHeaders,
     },
   });
 }

@@ -56,7 +56,12 @@ import { RecordingCard } from '@/components/recording-card';
 import { SplitClipDialog } from '@/components/split-clip-dialog';
 import { RecordingsSheet } from '@/components/recordings-sheet';
 import { useClips } from '@/hooks/use-clips';
-import { holesBeforeUtterance, windowFromContext, holesFromContext } from '@/lib/clip-window';
+import {
+  holesBeforeUtterance,
+  holesFromContext,
+  servedPlaybackForPart,
+  servedPlaybackFromContext,
+} from '@/lib/clip-window';
 import { candidateClipForTime, formatTimestamp } from '@/lib/clips';
 import { splitSpeakerLabel, type ClipTextPolicy } from '@/lib/recording-clips';
 import {
@@ -499,13 +504,16 @@ function TranscriptDetailInner({ transcriptId }: { transcriptId: string }) {
 
   // --- clips: one recording, several meetings (Phase 3a) ---------------------
   // The player's window comes off the ROW, not off the route: a meeting split
-  // off a longer recording must be clamped on its first frame — never "the
-  // whole hour for one round-trip" — and must stay clamped on a server where
-  // MW_CLIPS was switched off after the split (lib/clip-window.ts).
+  // off a longer recording must be mapped right on its first frame, and must
+  // stay so on a server where MW_CLIPS was switched off after the split
+  // (lib/clip-window.ts). Since 2026-10-02 the server serves such a meeting
+  // its window CUT (lib/clip-cut.ts), so for a split-off meeting this is
+  // "no window at all" — plus what to fall back to if a cached whole file
+  // shows up instead (`ServedPlayback`).
   const clips = useClips(transcriptId);
-  const playerWindow = useMemo(
-    () => windowFromContext(row?.gmeet_context) ?? null,
-    [row?.gmeet_context]
+  const playerServed = useMemo(
+    () => servedPlaybackFromContext(row?.gmeet_context, row?.duration),
+    [row?.gmeet_context, row?.duration]
   );
   // Stretches that are now a meeting of their own. Same reasoning: the row
   // knows, so the transcript's dividers are right from the first render; the
@@ -1124,6 +1132,10 @@ function TranscriptDetailInner({ transcriptId }: { transcriptId: string }) {
     clipParts.find((p) => p.primary) ??
     clipParts[0] ??
     null;
+  // What the player maps through for whatever it is playing: a clip part's
+  // window inside the CUT the server made of its recording, or the row's
+  // mapping for the main player (lib/clip-window.ts ServedPlayback).
+  const activeServed = activeClip ? servedPlaybackForPart(activeClip, clipParts) : playerServed;
   // `seekMeetingTime` is memoised on the videoParts model (every caller of it
   // is), so the clip model reaches it through refs rather than by widening
   // those deps and re-creating half the page's callbacks on every clip load.
@@ -3371,13 +3383,10 @@ function TranscriptDetailInner({ transcriptId }: { transcriptId: string }) {
                   noVideoNote={
                     row.gmeet_context?.recorder ? noVideoNote(row.gmeet_context.recorder) : null
                   }
-                  window={
-                    activeClip
-                      ? activeClip.fromMs > 0 || activeClip.toMs !== null
-                        ? { fromMs: activeClip.fromMs, toMs: activeClip.toMs }
-                        : null
-                      : playerWindow
-                  }
+                  // The server serves a clip's window CUT (lib/clip-cut.ts).
+                  window={activeServed.window}
+                  wholeFileWindow={activeServed.wholeFileWindow}
+                  cutSpanMs={activeServed.cutSpanMs}
                   holes={activeClip ? [] : clipHoles}
                   onTimeUpdate={(t) =>
                     setCurrentTime(t + (activeClip ? activeClip.offsetMs / 1000 : activePartOffset))

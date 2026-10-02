@@ -2,6 +2,7 @@ import 'server-only';
 import { sql } from '@/lib/db';
 import { SCHEMAS } from '@/lib/constants/database';
 import { publishEvent } from '@/lib/server/event-bus';
+import { dropClipCuts } from '@/lib/server/clip-cut-store';
 import {
   aaiJobIdColumnExists,
 } from '@/db-ops/aai-job-id';
@@ -353,6 +354,11 @@ export async function setClipMirror(
     }
     WHERE user_id = ${userId} AND assemblyai_id = ${assemblyaiId}
   `;
+  // The meeting's windows just changed (split, un-split, combine add / patch /
+  // delete / rollback all come through here), so its cut renditions are stale
+  // (lib/server/clip-cut.ts). Their names encode the window, so a stale one
+  // could never be SERVED — this is about not leaving the bytes on disk.
+  await dropClipCuts(assemblyaiId);
   publishEvent({ kind: 'meta', assemblyaiId });
 }
 

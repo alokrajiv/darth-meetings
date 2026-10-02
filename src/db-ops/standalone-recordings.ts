@@ -602,10 +602,18 @@ export async function meetingsHoldingRecording(
  * meeting (owned, or shared to their email, not in the trash unless owned)
  * that holds a clip on this recording? Nothing about the recording is
  * returned — just the answer.
+ *
+ * `wholeRecording: true` (the bytes route, 2026-10-02) counts only a clip
+ * that IS the whole recording (`from_ms = 0 AND to_ms IS NULL`). A reader of
+ * a meeting that holds a WINDOW — a split-off meeting, a combined clip — gets
+ * that window from the meeting's own media route, cut server-side
+ * (lib/server/clip-cut.ts), and never the recording through this one: "it is
+ * not the recording being shared, it's the meeting API that reveals it".
  */
 export async function reachableThroughMeeting(
   recordingId: string,
-  caller: { userId: string; email: string }
+  caller: { userId: string; email: string },
+  opts: { wholeRecording?: boolean } = {}
 ): Promise<boolean> {
   if (!UUID_RE.test(recordingId)) return false;
   const email = caller.email.trim().toLowerCase();
@@ -614,6 +622,7 @@ export async function reachableThroughMeeting(
     FROM ${sql(SCHEMA)}.meeting_clips c
     JOIN ${sql(SCHEMA)}.transcripts t ON t.id = c.transcript_id
     WHERE c.recording_id = ${recordingId}::uuid
+      ${opts.wholeRecording ? sql`AND c.from_ms = 0 AND c.to_ms IS NULL` : sql``}
       AND (
         t.user_id = ${caller.userId}
         OR (t.deleted_at IS NULL AND EXISTS (

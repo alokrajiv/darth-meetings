@@ -196,3 +196,123 @@ export function holesBeforeUtterance(
   }
   return out;
 }
+
+// ---------------------------------------------------------------------------
+// The media the server SERVES (2026-10-02 — cut server-side, lib/clip-cut.ts)
+// ---------------------------------------------------------------------------
+
+/**
+ * Since 2026-10-02 the meeting media routes no longer hand a windowed meeting
+ * its whole file: they serve a CUT of exactly the window (`windowBoundsFor` of
+ * that recording on the meeting — the bounds above), starting at 0. So the
+ * player's window is no longer "where in the file", it is "where in the CUT",
+ * which for a split-off meeting is nothing at all: the bytes ARE the meeting.
+ *
+ * `window` is what the player maps through when the bytes are the cut.
+ * `wholeFileWindow` is what it maps through if they turn out to be the WHOLE
+ * file after all — a copy the browser's HTTP cache or an offline pin kept from
+ * before the cut, or a server one deploy behind during a blue/green switch —
+ * which `servedIsWholeFile` recognises from the media's own duration.
+ *
+ * A `fromMs` BELOW ZERO is legal here and means "the served file starts this
+ * many ms INTO the meeting": a source meeting whose split took its opening
+ * minutes keeps its own timeline (the notes still cite the old times), so its
+ * cut's 0 is meeting ms `to`. `fileMsOf` / `meetingMsOf` / `windowDurationMs`
+ * are plain additions and handle it unchanged.
+ */
+export interface ServedPlayback {
+  window: PlaybackWindow | null;
+  wholeFileWindow: PlaybackWindow | null;
+  /** How long the cut should be, ms; null = unknown (no stale-copy check). */
+  cutSpanMs: number | null;
+}
+
+/**
+ * A window (file ms) re-expressed inside a cut of the same file. Null when the
+ * window IS the cut — the player then needs no clamping at all and keeps its
+ * native controls.
+ */
+export function windowInCut(window: PlaybackWindow | null, cut: PlaybackWindow): PlaybackWindow | null {
+  if (!window) return null;
+  const from = window.fromMs - cut.fromMs;
+  const to = window.toMs === null ? null : window.toMs - cut.fromMs;
+  const cutEnd = cut.toMs === null ? null : cut.toMs - cut.fromMs;
+  const atEnd = to === null || (cutEnd !== null && to >= cutEnd);
+  if (from <= 0 && atEnd) return null;
+  return { fromMs: Math.max(0, from), toMs: atEnd ? null : to };
+}
+
+function cutSpanOf(cut: PlaybackWindow, fallbackMs: number | null): number | null {
+  if (cut.toMs !== null) return cut.toMs - cut.fromMs;
+  return fallbackMs !== null && fallbackMs > 0 ? fallbackMs : null;
+}
+
+/**
+ * The MAIN player of a meeting (its first recording), from the row's clip
+ * mirror — the same clips `windowFromContext` reads and the server cuts by.
+ *
+ * `durationSec` is the row's `duration` (the meeting's own span); it is only
+ * used to know how long an open-ended cut should be.
+ */
+export function servedPlaybackFromContext(
+  gmeetContext: { clips?: unknown } | null | undefined,
+  durationSec: number | null | undefined
+): ServedPlayback {
+  const stored = storedClipsInContext(gmeetContext);
+  if (!stored) return { window: null, wholeFileWindow: null, cutSpanMs: null };
+  const first = [...stored].sort(compareClipsOnTimeline)[0]!;
+  const bounds = windowBoundsFor(stored, first.recordingId);
+  if (bounds.fromMs === null && bounds.toMs === null) {
+    // Served whole (never split, or a source with a hole in the middle).
+    return { window: null, wholeFileWindow: null, cutSpanMs: null };
+  }
+  const cut: PlaybackWindow = { fromMs: bounds.fromMs ?? 0, toMs: bounds.toMs };
+  // Meeting ms at the cut's first byte: where the first clip lands, moved back
+  // by however far into the cut that clip starts. 0 for a split-off meeting.
+  const leadMs = Math.max(0, first.offsetMs + (cut.fromMs - first.fromMs));
+  const spanMs = durationSec != null ? durationSec * 1000 - leadMs : null;
+  return {
+    window: leadMs > 0 ? { fromMs: -leadMs, toMs: null } : null,
+    wholeFileWindow: cut,
+    cutSpanMs: cutSpanOf(cut, spanMs),
+  };
+}
+
+/**
+ * One clip PART of a combined meeting (`playerParts` in lib/combine-ui.ts):
+ * its own window, inside the cut the server made of its recording — the
+ * bounds of every clip this meeting holds on that recording.
+ */
+export function servedPlaybackForPart(
+  part: Pick<ClipWindow, 'recordingId' | 'fromMs' | 'toMs'>,
+  clips: ReadonlyArray<Pick<ClipWindow, 'ord' | 'recordingId' | 'fromMs' | 'toMs' | 'offsetMs'>>
+): ServedPlayback {
+  const own: PlaybackWindow | null =
+    part.fromMs > 0 || part.toMs !== null ? { fromMs: part.fromMs, toMs: part.toMs } : null;
+  const bounds = windowBoundsFor(
+    clips.map((c) => ({ ord: c.ord, recordingId: c.recordingId, fromMs: c.fromMs, toMs: c.toMs, offsetMs: c.offsetMs })),
+    part.recordingId
+  );
+  if (bounds.fromMs === null && bounds.toMs === null) {
+    return { window: own, wholeFileWindow: own, cutSpanMs: null };
+  }
+  const cut: PlaybackWindow = { fromMs: bounds.fromMs ?? 0, toMs: bounds.toMs };
+  return {
+    window: windowInCut(own ?? { fromMs: 0, toMs: null }, cut),
+    wholeFileWindow: own,
+    cutSpanMs: cutSpanOf(cut, null),
+  };
+}
+
+/** Slack before a served file counts as "longer than the cut": packet edges, a GOP. */
+export const WHOLE_FILE_SLACK_MS = 2_000;
+
+/**
+ * Is the media the player just loaded the WHOLE file rather than the cut?
+ * Only when it is clearly longer than the cut should be. Unknown span or an
+ * unknown duration answer false — the cut is what the server serves today.
+ */
+export function servedIsWholeFile(mediaDurationMs: number | null, cutSpanMs: number | null): boolean {
+  if (cutSpanMs === null || mediaDurationMs === null || !Number.isFinite(mediaDurationMs)) return false;
+  return mediaDurationMs > cutSpanMs + Math.max(WHOLE_FILE_SLACK_MS, cutSpanMs * 0.02);
+}

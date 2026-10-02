@@ -20,6 +20,7 @@ import { deleteTranscript as aaiDelete } from '@/lib/server/assemblyai';
 import { aaiJobIdOf } from '@/lib/aai-job-state';
 import { deleteAudioFile } from '@/lib/server/audio-storage';
 import { dropAudioOnly } from '@/lib/server/audio-only';
+import { dropClipCuts } from '@/lib/server/clip-cut-store';
 import { refreshIfPending } from '@/lib/server/transcript-sync';
 import { removeRecordingGraphForMeeting } from '@/lib/server/recording-sync';
 import { deleteAnnotationsForMeeting } from '@/db-ops/transcriptions';
@@ -344,6 +345,10 @@ export const DELETE = withAuth(async ({ user, request }, { params }) => {
   // `local_audio_path`. The bytes are the recording owner's and go back to
   // their Recordings — never out with the meeting, whatever the graph said
   // (a server with MW_RECORDINGS_WRITE off would otherwise walk the row).
+  // The meeting's own cut renditions of its clip windows (lib/server/clip-cut.ts)
+  // are derivatives of THIS meeting, whatever happens to the shared source.
+  await dropClipCuts(access.row.assemblyai_id);
+
   const mayDeleteFiles =
     !access.row.gmeet_context?.fromRecording &&
     mayDeleteRecordingFiles({
