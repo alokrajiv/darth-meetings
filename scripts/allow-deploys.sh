@@ -11,6 +11,7 @@
 #   poc/mac-recorder/make-app.sh --release        tray: build + notarize the release zip
 #   deploy/vm-setup-blue-green.sh                 server: one-time blue/green VM setup (idempotent)
 #   ../admin/scripts/deploy.sh                    admin app: rsync + build + pm2 restart on .6
+#   cd ../desktop && npm run release / deploy    desktop shell: signed build + publish to cli-dist
 #
 # settings.local.json is per-machine and git-ignored by Claude Code; allow rules take
 # precedence over the auto-mode classifier. Re-running is idempotent.
