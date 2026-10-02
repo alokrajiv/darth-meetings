@@ -18,12 +18,12 @@ import type { RecorderMatch } from '@/lib/recorder';
  * AssemblyAI hand-off, the payload when the job completes. It becomes part of
  * a meeting only when its OWNER links it (`createMeetingFromRecording` below).
  *
- * PRIVACY — the same two arms as migration 044, and nothing else:
- *   (a) its OWNER (`recordings.owner_user_id`), for every function marked
- *       CALLER-SCOPED below — the owner predicate is in the SQL;
- *   (b) a caller who can open a MEETING holding a clip on it
- *       (`reachableThroughMeeting`) — the media route's second arm, and only
- *       that route's.
+ * PRIVACY — its OWNER (`recordings.owner_user_id`), and nothing else, for
+ *   every function marked CALLER-SCOPED below — the owner predicate is in the
+ *   SQL. A person a meeting holding a clip on it is shared with reaches its
+ *   media through the MEETING's routes, never through `/api/recordings/*`
+ *   (owner, 2026-10-02 — the recording itself is never shared; until then
+ *   the media route had a second arm, `reachableThroughMeeting`).
  * INTERNAL-ONLY functions take ids with no owner constraint; only the upload
  * pipeline, the pollers and the sweeper call them, with ids they minted or
  * read from these tables themselves — never an id from a request.
@@ -607,34 +607,6 @@ export async function meetingsHoldingRecording(
     WHERE c.recording_id = ${recordingId}::uuid
       AND (t.user_id = ${caller.userId} OR (s.id IS NOT NULL AND t.deleted_at IS NULL))
   `;
-}
-
-/**
- * Reachability arm (b), for the media route ONLY: can the caller open a
- * meeting (owned, or shared to their email, not in the trash unless owned)
- * that holds a clip on this recording? Nothing about the recording is
- * returned — just the answer.
- */
-export async function reachableThroughMeeting(
-  recordingId: string,
-  caller: { userId: string; email: string }
-): Promise<boolean> {
-  if (!UUID_RE.test(recordingId)) return false;
-  const email = caller.email.trim().toLowerCase();
-  const rows = await sql<Array<{ ok: number }>>`
-    SELECT 1 AS ok
-    FROM ${sql(SCHEMA)}.meeting_clips c
-    JOIN ${sql(SCHEMA)}.transcripts t ON t.id = c.transcript_id
-    WHERE c.recording_id = ${recordingId}::uuid
-      AND (
-        t.user_id = ${caller.userId}
-        OR (t.deleted_at IS NULL AND EXISTS (
-              SELECT 1 FROM ${sql(SCHEMA)}.transcript_shares s
-              WHERE s.transcript_id = t.id AND s.shared_with_email = ${email}))
-      )
-    LIMIT 1
-  `;
-  return rows.length > 0;
 }
 
 /** INTERNAL-ONLY — the playable files of a recording, canonical first. */

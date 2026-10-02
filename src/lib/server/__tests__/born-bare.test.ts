@@ -174,21 +174,10 @@ describe('owner-scoped SQL (I2)', () => {
 
   test('a junk id asks nothing at all', async () => {
     expect(await standalone.getStandaloneForOwner(A.userId, 'rec-../../etc')).toBeNull();
-    expect(await standalone.reachableThroughMeeting('not-a-uuid', A)).toBe(false);
     expect(sql.executed.length).toBe(0);
   });
 
-  test('the meeting arm: owner of the meeting, or a share on the LOWER-CASED email — nothing else', async () => {
-    await standalone.reachableThroughMeeting(RID, A);
-    const q = sql.executed[0]!;
-    expect(q.text).toContain('meeting_clips');
-    expect(q.text).toContain('t.user_id = $');
-    expect(q.text).toContain('s.shared_with_email = $');
-    expect(q.params).toContain('alok@trames.sg');
-    expect(q.params).not.toContain('Alok@trames.sg');
-  });
-
-  test('Link/Make a meeting: one transaction, locked on the owner, text copied in SQL, NO share written', async () => {
+  test('Link/Make a meeting: one transaction, locked on the owner, text copied in SQL, no share in the transaction', async () => {
     respond = (q) => {
       if (q.text.includes('FOR UPDATE')) return [{ id: RID, active_transcription_id: 't1' }];
       if (q.text.includes('FROM') && q.text.includes('recording_transcriptions') && q.text.includes('has_payload')) {
@@ -322,7 +311,7 @@ describe('the recording view (pure)', () => {
   });
 });
 
-describe('source-level: the recording surfaces carry no sharing controls, and the media route states its two arms', () => {
+describe('source-level: the recording surfaces carry no sharing controls, and the media route is the owner’s alone', () => {
   const root = join(import.meta.dir, '..', '..', '..');
   const read = (p: string) => readFileSync(join(root, p), 'utf8');
 
@@ -335,11 +324,12 @@ describe('source-level: the recording surfaces carry no sharing controls, and th
     expect(page).not.toContain('/api/transcripts/${id}');
   });
 
-  test('the media route: owner, or a meeting the caller can open — and 404 otherwise', () => {
+  test('the media route: the owner only — a meeting holding a clip does not open it (owner, 2026-10-02)', () => {
     const route = read('app/api/recordings/[id]/audio/route.ts');
     expect(route).toContain('getRecordingForOwner(user.userId, id)');
-    expect(route).toContain('reachableThroughMeeting(id, user)');
-    expect(route).toContain("if (!allowed) return notFound();");
+    expect(route).toContain('if (!own) return notFound();');
+    expect(route).not.toContain('reachableThroughMeeting');
+    expect(route).not.toContain('transcript_shares');
   });
 
   test('the owner routes answer 404 — never 403 — for someone else’s recording', () => {
