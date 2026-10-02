@@ -12,6 +12,12 @@ import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { connectGoogle, getGoogleAccessToken, GoogleNotConnectedError } from '@/lib/google-token';
 import {
+  JoinChoice,
+  fetchLinkCandidates,
+  joinedMeetingHref,
+} from '@/components/occurrence-join-choice';
+import type { LinkMode, OccurrenceMeetingCandidate } from '@/lib/occurrence-join';
+import {
   AlertCircle,
   CalendarSearch,
   ChevronLeft,
@@ -101,6 +107,13 @@ export function LinkEventDialog({
   const [linking, setLinking] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [events, setEvents] = useState<CalendarEventLite[]>([]);
+  /** The picked event's occurrence already has a meeting this can join —
+   * the person chooses: add to it (default) or keep separate. */
+  const [choice, setChoice] = useState<{
+    event: CalendarEventLite;
+    candidate: OccurrenceMeetingCandidate;
+  } | null>(null);
+  const [choosing, setChoosing] = useState<LinkMode | null>(null);
 
   const loadEvents = useCallback(async (forDate: string) => {
     setBusy(true);
@@ -138,7 +151,31 @@ export function LinkEventDialog({
     void loadEvents(next);
   };
 
-  const linkEvent = async (e: CalendarEventLite) => {
+  /**
+   * A pick: first ask whether this occurrence already has a meeting the
+   * recording could join (owner, 2026-10-02). If so the person chooses;
+   * otherwise the link goes straight through, as it always did.
+   */
+  const pickEvent = async (e: CalendarEventLite) => {
+    setLinking(e.id);
+    setError(null);
+    const answer = await fetchLinkCandidates(
+      recordingId ? { recordingId } : { transcriptId },
+      {
+        eventId: e.id,
+        startTime: e.start?.dateTime,
+        meetingCode: e.conferenceData?.conferenceId,
+      }
+    );
+    if (answer?.candidate) {
+      setLinking(null);
+      setChoice({ event: e, candidate: answer.candidate });
+      return;
+    }
+    await linkEvent(e, null);
+  };
+
+  const linkEvent = async (e: CalendarEventLite, mode: LinkMode | null) => {
     setLinking(e.id);
     setError(null);
     try {
@@ -154,6 +191,7 @@ export function LinkEventDialog({
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           accessToken: token,
+          ...(mode ? { mode } : {}),
           event: {
             id: e.id,
             title: e.summary,
@@ -171,21 +209,34 @@ export function LinkEventDialog({
           },
         }),
       });
+      const answer = (await res.json().catch(() => ({}))) as { error?: string };
       if (!res.ok) {
-        const detail = await res.json().catch(() => ({}) as { error?: string });
-        throw new Error(detail.error || `Link failed (${res.status})`);
+        throw new Error(answer.error || `Link failed (${res.status})`);
       }
+      // Joined: the recording is now part of the occurrence's existing
+      // meeting (and a folded-in meeting went to the trash) — go there.
+      const joinedHref = joinedMeetingHref(answer);
       onLinked?.();
       handleClose();
+      if (joinedHref) window.location.assign(joinedHref);
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Link failed');
     } finally {
       setLinking(null);
+      setChoosing(null);
     }
+  };
+
+  const choose = (mode: LinkMode) => {
+    if (!choice) return;
+    setChoosing(mode);
+    void linkEvent(choice.event, mode);
   };
 
   const handleClose = () => {
     setError(null);
+    setChoice(null);
+    setChoosing(null);
     setEvents([]);
     setConnected(false);
     onClose();
@@ -208,7 +259,25 @@ export function LinkEventDialog({
           <DialogTitle className="text-base font-semibold">Link a calendar event</DialogTitle>
         </DialogHeader>
 
-        {!connected ? (
+        {choice ? (
+          <div className="space-y-3 py-1 min-w-0">
+            <JoinChoice candidate={choice.candidate} busy={choosing} onPick={choose} />
+            <button
+              type="button"
+              className="text-xs text-muted-foreground hover:underline disabled:opacity-50"
+              disabled={choosing !== null}
+              onClick={() => setChoice(null)}
+            >
+              ← Pick another event
+            </button>
+            {error && (
+              <p className="text-xs text-destructive flex items-center gap-1">
+                <AlertCircle className="h-4 w-4" />
+                {error}
+              </p>
+            )}
+          </div>
+        ) : !connected ? (
           <div className="space-y-4 py-2 min-w-0">
             {busy ? (
               <p className="flex items-center gap-2 text-sm text-muted-foreground">
@@ -266,7 +335,7 @@ export function LinkEventDialog({
                     <li key={e.id}>
                       <button
                         type="button"
-                        onClick={() => void linkEvent(e)}
+                        onClick={() => void pickEvent(e)}
                         disabled={linking !== null}
                         className="flex w-full items-center gap-3 p-3 text-left hover:bg-accent/40 transition-colors min-w-0"
                       >
@@ -306,10 +375,10 @@ export function LinkEventDialog({
         )}
 
         <DialogFooter>
-          <Button variant="ghost" onClick={handleClose} disabled={busy || linking !== null}>
+          <Button variant="ghost" onClick={handleClose} disabled={busy || linking !== null || choosing !== null}>
             Cancel
           </Button>
-          {!connected && !busy && (
+          {!choice && !connected && !busy && (
             <Button
               onClick={() =>
                 notConnected
