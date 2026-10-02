@@ -1705,11 +1705,14 @@ event or make a meeting of it, then share the MEETING (web UI). Once the
 server runs born-bare uploads, 'meetings upload' without --event lands
 here instead of in 'meetings list'.
 
-  recordings list [--section mac|uploaded|temporary | --unlinked | --temporary]
+  recordings list [--section mac|uploaded|temporary|linked | --unlinked | --temporary]
                   [--q <text>] [--regex] [--limit N] [--cursor C] [--all]
                   [--json] [--envelope]
                                   Newest first. --unlinked = on your Macs +
-                                  uploaded; --temporary = temporary only.
+                                  uploaded; --temporary = temporary only;
+                                  --section linked = your recordings that a
+                                  meeting holds (each with its meeting id —
+                                  never part of the default list).
                                   One page (default 50, max 200) unless --all
                                   (follows next_cursor to the end). --json =
                                   the items array; --envelope (implies JSON)
@@ -1765,7 +1768,11 @@ function recordingItemLine(item: any, tz: string): { id: string; line: string } 
     const at = r.started_at || r.created_at;
     const title = r.title || `Recording · ${when(at)}`;
     const exp = r.temporary && r.expires_at ? `  expires ${fmtDay(r.expires_at, tz)}` : "";
-    const inMtg = r.in_meeting ? "  (in a meeting)" : "";
+    // section=linked items name the meeting(s) they are in; elsewhere a bare flag.
+    const linkedTo = Array.isArray(item.meetings) && item.meetings.length
+      ? `  (in meeting ${item.meetings.map((m: any) => m.title ? `${m.assemblyai_id} "${m.title}"` : m.assemblyai_id).join(", ")})`
+      : "";
+    const inMtg = linkedTo || (r.in_meeting ? "  (in a meeting)" : "");
     return { id: r.id, line: `${r.id}  ${when(at)}  ${fmtDuration(r.duration_sec ?? null).padStart(7)}  ${String(r.status).padEnd(12)}  ${title}${inMtg}${exp}` };
   }
   if (item.kind === "meeting") {
@@ -1886,7 +1893,7 @@ async function recordingsCmd(ctx: Ctx, flags: Record<string, string | boolean>, 
       const section = str(flags.section);
       const picks = [section ? "--section" : null, flags.unlinked === true ? "--unlinked" : null, flags.temporary === true ? "--temporary" : null].filter(Boolean);
       if (picks.length > 1) { console.error(`pick one of ${picks.join(", ")}`); return 1; }
-      if (flags.section !== undefined && !["mac", "uploaded", "temporary"].includes(section ?? "")) { console.error("--section must be mac, uploaded or temporary"); return 1; }
+      if (flags.section !== undefined && !["mac", "uploaded", "temporary", "linked"].includes(section ?? "")) { console.error("--section must be mac, uploaded, temporary or linked"); return 1; }
       const q = new URLSearchParams({ mine: "1", tz });
       if (section) q.set("section", section);
       else if (flags.unlinked === true) q.set("unlinked", "1");
@@ -1929,7 +1936,7 @@ async function recordingsCmd(ctx: Ctx, flags: Record<string, string | boolean>, 
       if (envelope) { console.log(JSON.stringify({ items, next_cursor: next, counts, truncated: next !== null }, null, 2)); return 0; }
       ctx.print(items, () => {
         const c = counts ?? {};
-        console.log(`${c.mac ?? 0} on your Macs · ${c.uploaded ?? 0} uploaded · ${c.temporary ?? 0} temporary`);
+        console.log(`${c.mac ?? 0} on your Macs · ${c.uploaded ?? 0} uploaded · ${c.temporary ?? 0} temporary${typeof c.linked === "number" ? ` · ${c.linked} linked to a meeting` : ""}`);
         if (!items.length) console.log("No recordings here — private recordings appear once you upload without --event (or the Darth Recorder saves one).");
         for (const it of items) console.log(recordingItemLine(it, tz).line);
         if (next) console.log(`more: --cursor ${next}`);
