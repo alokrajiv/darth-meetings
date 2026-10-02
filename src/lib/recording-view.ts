@@ -32,6 +32,8 @@ export interface RecordingViewWire {
   in_meeting: boolean;
   suggested_event: SuggestedEvent | null;
   recorder_recording_id: string | null;
+  /** The call app the Darth Recorder saw, when it came from one (2026-10-02; absent on older servers). */
+  source_app?: string | null;
 }
 
 /** "Recording · Sat 20 Sept 22:00" when it has no title of its own — never the filename. */

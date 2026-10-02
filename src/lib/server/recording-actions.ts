@@ -76,6 +76,8 @@ export interface RecordingView {
   /** The confident calendar match, un-dismissed, while not in a meeting. */
   suggested_event: SuggestedEvent | null;
   recorder_recording_id: string | null;
+  /** The call app the Darth Recorder saw ("Microsoft Teams", "Slack"…), when it came from one. */
+  source_app: string | null;
 }
 
 function iso(v: string | Date | null | undefined): string | null {
@@ -143,6 +145,7 @@ export function recordingViewOf(r: StandaloneListRow, meetings: RecordingMeeting
     in_meeting: inMeeting,
     suggested_event: suggestion,
     recorder_recording_id: r.recorder_recording_id,
+    source_app: typeof r.recorder_call?.app === 'string' && r.recorder_call.app.trim() ? r.recorder_call.app.trim() : null,
   };
 }
 
