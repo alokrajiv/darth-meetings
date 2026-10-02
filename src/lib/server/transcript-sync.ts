@@ -4,6 +4,7 @@ import { getForUser, updateStatusForUser, type TranscriptRow } from '@/db-ops/tr
 import { pollTranscriptionRun, runPollTarget } from '@/lib/server/transcription-runs';
 import { AAI_GONE_REASON, aaiJobIdOf } from '@/lib/aai-job-state';
 import { giveUpOnAaiJob } from '@/lib/server/aai-giveup';
+import { madeEarlyAwaitingText } from '@/lib/made-early';
 import { onTranscriptCompleted } from '@/lib/server/post-completion';
 import { queueRecordingGraphSync } from '@/lib/server/recording-sync';
 
@@ -46,8 +47,13 @@ export async function refreshIfPending(
   // detail page polls this route, so asking here is what lets the meeting
   // land within seconds of AAI finishing instead of at the 5-minute sweep;
   // `refreshBornBare` runs the settle (lib/server/recording-settle.ts).
-  const madeFrom = row.gmeet_context?.fromRecording?.recordingId;
-  if (row.status === 'processing' && !row.aai_job_id && madeFrom && !row.deleted_at) {
+  //
+  // An 'error' row with no text is asked too: the settle heals it once the
+  // recording has its text, whatever flipped it (prod 2026-10-02: a poller
+  // asked AssemblyAI about the meeting's minted id, got a 404 and gave up on
+  // it 33 s before the recording landed). Opening the page is enough.
+  if (madeEarlyAwaitingText(row)) {
+    const madeFrom = row.gmeet_context!.fromRecording!.recordingId;
     const { refreshBornBare } = await import('@/lib/server/born-bare');
     const settled = await refreshBornBare(madeFrom).catch((err) => {
       console.warn('[transcript-sync] refresh of the recording behind a meeting made early failed:', err);

@@ -95,7 +95,10 @@ async function main(): Promise<void> {
       `
     ).length > 0;
   const legacyJobId = sql`CASE WHEN assemblyai_id ~* ${AAI_JOB_ID_RE.source} THEN assemblyai_id END`;
-  const jobIdExpr = hasJobIdColumn ? sql`COALESCE(aai_job_id, ${legacyJobId})` : legacyJobId;
+  // Column present ⇒ it is the whole answer (045 stamped every legacy row): a
+  // NULL beside a UUID-shaped meeting id is a minted id AssemblyAI has never
+  // heard of (src/db-ops/aai-job-id.ts).
+  const jobIdExpr = hasJobIdColumn ? sql`aai_job_id` : legacyJobId;
 
   const rows = await sql<Candidate[]>`
     SELECT user_id, assemblyai_id, ${jobIdExpr} AS aai_job_id, status, title,

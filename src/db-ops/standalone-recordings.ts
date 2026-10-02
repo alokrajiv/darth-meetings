@@ -369,14 +369,26 @@ export async function recordStandaloneHandOff(input: StandaloneHandOff): Promise
           provider_job_id = EXCLUDED.provider_job_id,
           speech_model = EXCLUDED.speech_model,
           language_code = EXCLUDED.language_code,
-          status = EXCLUDED.status
+          status = EXCLUDED.status,
+          -- A NEW job on the same transcription (a retry after the first one
+          -- failed — retryBornBareIngest): its wait starts now (the stuck
+          -- check reads created_at) and nothing of the failed job survives.
+          -- The same job recorded twice changes none of these.
+          created_at = CASE WHEN recording_transcriptions.provider_job_id IS DISTINCT FROM EXCLUDED.provider_job_id
+                            THEN now() ELSE recording_transcriptions.created_at END,
+          completed_at = CASE WHEN recording_transcriptions.provider_job_id IS DISTINCT FROM EXCLUDED.provider_job_id
+                              THEN NULL ELSE recording_transcriptions.completed_at END,
+          payload = CASE WHEN recording_transcriptions.provider_job_id IS DISTINCT FROM EXCLUDED.provider_job_id
+                         THEN NULL ELSE recording_transcriptions.payload END,
+          provider_deleted_at = CASE WHEN recording_transcriptions.provider_job_id IS DISTINCT FROM EXCLUDED.provider_job_id
+                                     THEN NULL ELSE recording_transcriptions.provider_deleted_at END
       `;
       await tx`
         UPDATE ${tx(SCHEMA)}.recordings
         SET active_transcription_id = ${t.id}::uuid,
             sha256 = COALESCE(${input.sha256 ?? null}, sha256),
             upload_state = COALESCE(upload_state, '{}'::jsonb)
-                           - 'ingestFailure' - 'group' - 'bytesReceived',
+                           - 'ingestFailure' - 'group' - 'bytesReceived' - 'failedReason',
             updated_at = now()
         WHERE id = ${input.recordingId}::uuid
       `;
@@ -990,10 +1002,17 @@ export interface MeetingMadeEarly {
  * Fill in every meeting that was made from a recording BEFORE its
  * transcription landed — the same columns `createMeetingFromRecording`
  * writes for a ready recording, copied inside Postgres now that the
- * payload exists. Idempotent: a meeting is matched only while it is still
- * 'processing' with no `imported_content`, so a second observer of the same
- * completion updates nothing. `recordingId` null = every such meeting (the
- * sweeper's backstop for a process that died between the two writes).
+ * payload exists. Idempotent: a meeting is matched only while it has no
+ * `imported_content`, so a second observer of the same completion updates
+ * nothing. `recordingId` null = every such meeting (the sweeper's backstop
+ * for a process that died between the two writes).
+ *
+ * SELF-HEALING: a meeting sitting in 'error' (still with no text) is matched
+ * too, and its `ingestFailure` marker dropped. Whatever put it there — the
+ * recording's transcription failing and then succeeding on a retry
+ * (`failMeetingsMadeEarly`), or, as on prod 2026-10-02, a poller that asked
+ * AssemblyAI about the meeting's own minted id and flipped it on the 404 —
+ * the recording now HAS the text, and the meeting is just a view of it.
  *
  * Only meetings BORN from this recording qualify (`gmeet_context.fromRecording`)
  * — a meeting that merely holds a clip of it (Phase 3b combine) has its own
@@ -1013,7 +1032,7 @@ export async function materialiseMeetingsMadeEarly(recordingId: string | null): 
           (SELECT m.filename FROM ${sql(SCHEMA)}.recording_media m
             WHERE m.recording_id = r.id AND m.kind = 'canonical' ORDER BY m.ord LIMIT 1)),
         imported_content = x.payload,
-        gmeet_context = COALESCE(t.gmeet_context, '{}'::jsonb) ||
+        gmeet_context = (COALESCE(t.gmeet_context, '{}'::jsonb) - 'ingestFailure') ||
           CASE WHEN x.provider_job_id IS NOT NULL AND x.provider_deleted_at IS NOT NULL
                THEN jsonb_build_object('aai', jsonb_build_object('deletedAt', to_jsonb(x.provider_deleted_at), 'jobId', x.provider_job_id))
                ELSE '{}'::jsonb END
@@ -1022,7 +1041,7 @@ export async function materialiseMeetingsMadeEarly(recordingId: string | null): 
     JOIN ${sql(SCHEMA)}.meeting_clips c ON c.recording_id = r.id
     WHERE c.transcript_id = t.id
       AND t.gmeet_context->'fromRecording'->>'recordingId' = r.id::text
-      AND t.status = 'processing' AND t.imported_content IS NULL AND t.deleted_at IS NULL
+      AND t.status IN ('processing', 'error') AND t.imported_content IS NULL AND t.deleted_at IS NULL
       AND x.status = 'completed' AND x.payload IS NOT NULL
       AND (${recordingId}::uuid IS NULL OR r.id = ${recordingId}::uuid)
     RETURNING t.user_id, t.assemblyai_id
@@ -1055,6 +1074,31 @@ export async function failMeetingsMadeEarly(recordingId: string, reason: string)
     WHERE c.transcript_id = t.id AND c.recording_id = ${recordingId}::uuid
       AND t.gmeet_context->'fromRecording'->>'recordingId' = ${recordingId}
       AND t.status = 'processing' AND t.imported_content IS NULL AND t.deleted_at IS NULL
+    RETURNING t.user_id, t.assemblyai_id
+  `;
+}
+
+/**
+ * The recording behind meetings made early was sent to AssemblyAI again
+ * (Retry on such a meeting — lib/server/born-bare.ts
+ * `retryRecordingForMeeting`): the meetings that had been failed with it go
+ * back to 'processing', `ingestFailure` dropped, so the page says
+ * "transcribing" and the settle fills them in when the new job lands.
+ * Owner-scoped; only meetings still without text, born from THIS recording.
+ */
+export async function reopenMeetingsMadeEarly(
+  ownerUserId: string,
+  recordingId: string
+): Promise<MeetingMadeEarly[]> {
+  return sql<MeetingMadeEarly[]>`
+    UPDATE ${sql(SCHEMA)}.transcripts t
+    SET status = 'processing',
+        gmeet_context = COALESCE(t.gmeet_context, '{}'::jsonb) - 'ingestFailure'
+    FROM ${sql(SCHEMA)}.meeting_clips c
+    WHERE c.transcript_id = t.id AND c.recording_id = ${recordingId}::uuid
+      AND t.user_id = ${ownerUserId}
+      AND t.gmeet_context->'fromRecording'->>'recordingId' = ${recordingId}
+      AND t.status = 'error' AND t.imported_content IS NULL AND t.deleted_at IS NULL
     RETURNING t.user_id, t.assemblyai_id
   `;
 }

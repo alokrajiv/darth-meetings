@@ -45,21 +45,40 @@ export interface AaiJobIdRow {
   /** The AssemblyAI job (migration 045). `undefined` = not in the projection
    * / column not there yet; `null` = this row never went to AssemblyAI. */
   aai_job_id?: string | null;
+  /** Only the two provenance markers are read: a meeting MADE from a
+   * recording (`fromRecording`) or SPLIT off another meeting (`splitFrom`)
+   * has a minted id and never had a job of its own. */
+  gmeet_context?: { fromRecording?: unknown; splitFrom?: unknown } | null;
 }
 
 /**
  * The job id to hand AssemblyAI for this row, or null when there is none.
  *
  * ONE accessor, because the answer stopped being derivable from the meeting
- * id: `aai_job_id` when it is set, else — only for a row that predates 1b,
- * which is exactly the case where the column is null or absent — the meeting
- * id when it is UUID-shaped. A row minted by 1b always carries its job id in
- * the column (the promote writes both in one statement, and minting is forced
- * off while the column is missing), so the fallback can never hand AssemblyAI
- * an id we invented.
+ * id:
+ *   - `aai_job_id` set → that job.
+ *   - `aai_job_id` NULL → NO job. Migration 045 stamped every legacy row
+ *     whose meeting id was its job id (`UPDATE … SET aai_job_id =
+ *     assemblyai_id`), and every writer since records the job in the column,
+ *     so a NULL read from the column is the truth: an import, a placeholder,
+ *     or a meeting whose id we MINTED and whose text comes from somewhere
+ *     else (made early from a recording, split off another meeting). A NULL
+ *     must never be "repaired" from a UUID-shaped meeting id — on 2026-10-02
+ *     exactly that handed AssemblyAI the minted id of a meeting made early
+ *     from a recording, AssemblyAI answered 404, and the listing flipped a
+ *     healthy meeting to 'error' 33 s before its text landed.
+ *   - `aai_job_id` ABSENT (`undefined` — not in the projection, or 045 not
+ *     applied, which forces minting off) → the pre-1b rule: the meeting id,
+ *     when it is UUID-shaped. Still never for a row whose provenance says
+ *     its id was minted.
+ *
+ * The SQL twin (`jobIdSql().expr`, db-ops/aai-job-id) follows the same rule:
+ * the column when it exists, the UUID-shaped meeting id only when it does not.
  */
 export function aaiJobIdOf(row: AaiJobIdRow): string | null {
   if (row.aai_job_id) return row.aai_job_id;
+  if (row.aai_job_id !== undefined) return null;
+  if (row.gmeet_context?.fromRecording || row.gmeet_context?.splitFrom) return null;
   return isAaiJobId(row.assemblyai_id) ? row.assemblyai_id : null;
 }
 
@@ -84,8 +103,9 @@ export const AAI_STUCK_REASON =
 
 export interface AaiWaitState {
   assemblyaiId: string;
-  /** Migration 045; omit it and a UUID-shaped `assemblyaiId` is read as the
-   * job, which is what every pre-1b row is. */
+  /** Migration 045. `null` = no job (the column says so); omit it and a
+   * UUID-shaped `assemblyaiId` is read as the job, which is what every pre-1b
+   * row is when the column is not there. */
   aaiJobId?: string | null;
   status: string;
   /**
