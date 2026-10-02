@@ -8,11 +8,13 @@ import { publishEvent } from '@/lib/server/event-bus';
  * probe that keeps the code working before the migration is applied.
  *
  * One value exists: `'event-link'`, a share that exists ONLY because a
- * calendar event was attached to the meeting (the auto-share to internal
- * invitees an upload link made until 2026-09-23). Since design P4 linking
- * never shares, so no NEW link-born share is written (a retranscribe re-run
- * copies an existing one's stamp); the rows already out there keep theirs,
- * and "Unlink from event" still deletes exactly those
+ * calendar event was linked to the meeting — the share with the event's
+ * internal invitees every link makes (`shareWithInternalInvitees('event-link',
+ * …)` in lib/server/auto-share.ts: upload with a linked event, recording
+ * Link, retro-link, split-to-an-event, a linked text import). History: links
+ * shared until 2026-09-23, design P4 stopped it, and the owner reversed P4 on
+ * 2026-10-02 — a link shares like a cloud import again. A retranscribe re-run
+ * copies an existing share's stamp. "Unlink from event" deletes exactly these
  * (docs/recorder-link-confirm-spec.md D5) — a share a human made in the
  * Share dialog carries no origin and is never touched.
  *
@@ -64,9 +66,10 @@ export function shareOriginColumnExists(): Promise<boolean> {
  *     the owner shared them, with edit access, and no human origin. That is
  *     exactly what the pre-P4 upload link created.
  * The unstamped arm only matches shares older than LEGACY_LINK_SHARE_CUTOFF:
- * from then on every link-born share is stamped (048's writer was live) and,
- * since P4, a link shares nobody — so a newer unstamped edit share to an
- * invitee was made by a person and must survive the unlink.
+ * from then on every link-born share is stamped (048's writer was live; P4
+ * wrote none, and the 2026-10-02 link shares stamp again) — so a newer
+ * unstamped edit share to an invitee was made by a person, or by a cloud
+ * import, and must survive the unlink.
  */
 export const LEGACY_LINK_SHARE_CUTOFF = '2026-09-22T10:00:00Z';
 

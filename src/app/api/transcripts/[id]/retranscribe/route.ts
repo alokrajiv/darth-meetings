@@ -133,8 +133,9 @@ async function legacyRetranscribe(user: DarthUser, access: ResolvedAccess): Prom
   }
 
   // Carry the meeting identity so the new row lands in the same series /
-  // calendar slot. The event link shares nobody (design P4) — the new row
-  // gets the SOURCE meeting's own shares instead, just below.
+  // calendar slot. A re-run (`sourceId`) is not a new link, so openUpload
+  // shares nobody from the event — the new row gets the SOURCE meeting's own
+  // shares instead, just below (a link-born one keeps its stamp).
   const linkedEvent: LinkedEventInput | null = ctx?.eventId
     ? {
         id: ctx.eventId,
@@ -177,9 +178,10 @@ async function legacyRetranscribe(user: DarthUser, access: ResolvedAccess): Prom
   const placeholder = opened.placeholder;
 
   // A re-run of a meeting is still that meeting: whoever it is shared with
-  // keeps access on the new row, with the same access level. Until P4 the
+  // keeps access on the new row, with the same access level. Before P4 the
   // linked event did this indirectly (and re-shared invitees the owner had
-  // removed); now it is the source's own share list, nothing more.
+  // removed); now it is the source's own share list, nothing more — the
+  // 2026-10-02 link share skips re-runs for exactly that reason.
   await carryShares(row.id, placeholder.id, ownerId).catch((err) =>
     console.warn(`[retranscribe] ${row.assemblyai_id}: carrying shares failed:`, err)
   );

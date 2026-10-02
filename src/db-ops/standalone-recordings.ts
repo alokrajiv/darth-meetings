@@ -881,7 +881,10 @@ export type MeetingFromRecordingResult =
  * it as a BORROWER (`borrowsRecording`) and never derives a second recording
  * over the same bytes.
  *
- * NO SHARE is written here or anywhere on this path (design P4).
+ * NO SHARE is written here: the caller (`makeMeeting` in
+ * lib/server/recording-actions.ts) shares a meeting LINKED to an event with
+ * the event's internal invitees, after this commits; "Make a meeting" shares
+ * nobody.
  */
 export async function createMeetingFromRecording(
   input: MeetingFromRecordingInput

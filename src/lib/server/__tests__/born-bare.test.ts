@@ -1,7 +1,9 @@
 /**
  * Design P7/P8 — an upload that names no meeting is born a RECORDING
- * (`MW_RECORDINGS_BORN_BARE`), linking it makes the meeting and shares
- * nothing, and everything about it is its owner's alone (invariant I2).
+ * (`MW_RECORDINGS_BORN_BARE`), linking it makes the meeting (the meeting —
+ * never the recording — is shared with a linked event's internal invitees:
+ * link-shares-like-imports.test.ts), and everything about the recording is
+ * its owner's alone (invariant I2).
  *
  * Over the fake postgres tag (db-ops/__tests__/helpers/fake-sql): every query
  * is rendered and logged, so the assertions are on the SQL the code actually
