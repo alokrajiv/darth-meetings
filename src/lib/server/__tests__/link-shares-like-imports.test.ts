@@ -17,6 +17,10 @@
  *     they are (a person's read share is never upgraded or stamped).
  *   - The cloud-import arm is the same rule, unstamped.
  *   - Unlink takes the link-born shares back off (by origin).
+ *   - Re-linking a meeting linked to event A to event B first takes A's
+ *     link-born shares off everyone who is not an internal invitee of B
+ *     (stamped rows only — a person's own share is never touched), then
+ *     adds B's missing invitees; a first link removes nothing.
  *   - The RECORDING stays its owner's: a person the meeting is shared with
  *     can open the meeting, but every `/api/recordings/:id` route answers
  *     them 404.
@@ -420,5 +424,161 @@ describe('the recording stays personal — a share recipient reads the MEETING, 
     currentUser = OWNER;
     const own = await call(`/api/recordings/${RID}`, '@/app/api/recordings/[id]/route');
     expect(own.status).toBe(200);
+  });
+});
+
+describe('re-link to a DIFFERENT event — the previous link’s shares do not outlive it', () => {
+  // Event A (the meeting's current link) and event B (the one it is re-linked to).
+  // Chen is on both; Bea and Dev were only on A; Ivan is new on B.
+  const EVENT_B = {
+    id: 'ev-b',
+    title: 'Triton follow-up',
+    startTime: '2026-10-01T07:30:00.000Z',
+    endTime: '2026-10-01T08:00:00.000Z',
+    attendees: [
+      { email: 'Alok@trames.sg', name: 'Alok', responseStatus: 'accepted' },
+      { email: 'Chen@trames.sg', name: 'Chen', responseStatus: 'accepted' },
+      { email: 'ivan@trames.sg', name: 'Ivan', responseStatus: 'accepted' },
+      { email: 'guest@partner.example', name: 'Guest', responseStatus: 'accepted' },
+    ],
+  };
+  const B_INTERNAL = ['chen@trames.sg', 'ivan@trames.sg'];
+  const DELETE_SHARES = /DELETE FROM "[a-z_]+"\.transcript_shares\b/;
+  const SELECT_SHARES = /SELECT \* FROM "[a-z_]+"\.transcript_shares WHERE transcript_id = \$1/;
+  const keepOf = (q: RenderedQuery) => q.params.find((p): p is string[] => Array.isArray(p));
+
+  test('relinkSharesToEvent: stamped shares of non-B people go first, then only B’s missing invitees are added', async () => {
+    respond = (q) => {
+      if (DELETE_SHARES.test(q.text)) {
+        return [{ shared_with_email: 'bea@trames.sg' }, { shared_with_email: 'dev@trames.sg' }];
+      }
+      // After the delete: Chen's link share (kept — he is on B) and Zed's
+      // hand-made share (origin NULL — never touched).
+      if (SELECT_SHARES.test(q.text)) {
+        return [
+          { shared_with_email: 'chen@trames.sg', access: 'edit', origin: 'event-link' },
+          { shared_with_email: 'zed@trames.sg', access: 'read', origin: null },
+        ];
+      }
+      return baseRespond(q) ?? [];
+    };
+    const out = await autoShare.relinkSharesToEvent(4242, OWNER.userId, OWNER.email, EVENT_B.attendees);
+    expect(out.removed).toEqual(['bea@trames.sg', 'dev@trames.sg']);
+    expect(out.shared).toBe(1);
+
+    const del = sql.executed.find((q) => DELETE_SHARES.test(q.text))!;
+    expect(del).toBeDefined();
+    expect(del.params[0]).toBe(4242);
+    // Stamped rows only — nothing that could match a person's own share.
+    expect(del.text).toContain('origin =');
+    expect(del.params).toContain(shareOrigin.SHARE_ORIGIN_EVENT_LINK);
+    expect(del.text).not.toContain('origin IS NULL');
+    expect(del.text).not.toContain('shared_at <');
+    // Keep = B's INTERNAL invitees, lower-cased; never the owner, never the guest.
+    expect(del.text).toContain('NOT (');
+    expect([...keepOf(del)!].sort()).toEqual(B_INTERNAL);
+
+    // Order: the removal happens BEFORE the new event's shares are written.
+    const writes = shareWrites();
+    expect(writes.map(emailOf)).toEqual(['ivan@trames.sg']);
+    expect(sql.executed.indexOf(writes[0]!)).toBeGreaterThan(sql.executed.indexOf(del));
+    expect(writes[0]!.params).toContain(shareOrigin.SHARE_ORIGIN_EVENT_LINK);
+  });
+
+  test('B with no internal invitees takes every stamped share off and adds none', async () => {
+    respond = (q) => {
+      if (DELETE_SHARES.test(q.text)) return [{ shared_with_email: 'bea@trames.sg' }];
+      return baseRespond(q) ?? [];
+    };
+    const out = await autoShare.relinkSharesToEvent(4242, OWNER.userId, OWNER.email, [
+      { email: 'alok@trames.sg' },
+      { email: 'guest@partner.example' },
+    ]);
+    expect(out).toEqual({ shared: 0, removed: ['bea@trames.sg'] });
+    const del = sql.executed.find((q) => DELETE_SHARES.test(q.text))!;
+    expect(keepOf(del)).toEqual([]);
+    expect(shareWrites()).toHaveLength(0);
+  });
+
+  test('without migration 048 nothing is stamped, so a re-link removes nothing', async () => {
+    const g = globalThis as { __mwShareOriginColumn?: unknown };
+    g.__mwShareOriginColumn = undefined;
+    respond = (q) => {
+      if (q.text.includes('information_schema.columns')) return [{ n: 0 }];
+      return baseRespond(q) ?? [];
+    };
+    const removed = await shareOrigin.removeLinkBornSharesNotIn(4242, B_INTERNAL);
+    expect(removed).toEqual([]);
+    expect(sql.executed.some((q) => DELETE_SHARES.test(q.text))).toBe(false);
+    g.__mwShareOriginColumn = undefined;
+  });
+
+  // The route: `POST /api/transcripts/:id/link-event` is the one path that
+  // links an EXISTING meeting (the link dialog, the "Link to it" strips,
+  // darth-cli `link`). `/api/recordings/:id/link` with an event always makes a
+  // NEW meeting (a recording already in one answers 409 already-linked), and
+  // every other link path (openUpload, split-to-an-event, a linked text
+  // import) creates its meeting, so there is nothing previous to take off.
+  const linkedRow = (ctx: Record<string, unknown> | null) => ({
+    id: 4343,
+    user_id: OWNER.userId,
+    assemblyai_id: 'm-relink',
+    status: 'uploading',
+    title: 'Triton next steps!',
+    scratch: false,
+    local_audio_path: null,
+    speaker_id_status: null,
+    gmeet_context: ctx,
+    __access: 'owner',
+  });
+  const routeRespond =
+    (ctx: Record<string, unknown> | null) =>
+    (q: RenderedQuery): unknown[] => {
+      if (/FROM "[a-z_]+"\.transcripts t\s+LEFT JOIN "[a-z_]+"\.transcript_shares s/.test(q.text)) {
+        return q.params.includes('m-relink') ? [linkedRow(ctx)] : [];
+      }
+      if (DELETE_SHARES.test(q.text)) return [{ shared_with_email: 'bea@trames.sg' }];
+      if (SELECT_SHARES.test(q.text)) return [{ shared_with_email: 'chen@trames.sg', access: 'edit' }];
+      // The people directory registration the route does for every attendee.
+      if (/INSERT INTO "[a-z_]+"\.people\b/.test(q.text)) {
+        return [{ id: 1, name: String(q.params[0]), email: String(q.params[1]) }];
+      }
+      return baseRespond(q) ?? [];
+    };
+  const postLink = async (event: unknown) => {
+    const route = (await import('@/app/api/transcripts/[id]/link-event/route')) as {
+      POST: (r: Request, c: unknown) => Promise<Response>;
+    };
+    const req = new Request('http://localhost/api/transcripts/m-relink/link-event', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ event }),
+    });
+    return route.POST(req, { params: Promise.resolve({ id: 'm-relink' }) });
+  };
+
+  test('link-event on a meeting linked to A, to B → A’s shares for non-B people come off, B’s missing are added', async () => {
+    respond = routeRespond({ eventId: 'ev-triton', eventTitle: 'Triton next steps!', attendees: ATTENDEES });
+    const res = await postLink(EVENT_B);
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { shared: number; sharesRemoved: string[] };
+    expect(body.sharesRemoved).toEqual(['bea@trames.sg']);
+    expect(body.shared).toBe(1);
+    const del = sql.executed.find((q) => DELETE_SHARES.test(q.text))!;
+    expect(del).toBeDefined();
+    expect([...keepOf(del)!].sort()).toEqual(B_INTERNAL);
+    const writes = shareWrites();
+    expect(writes.map(emailOf)).toEqual(['ivan@trames.sg']);
+    expect(sql.executed.indexOf(writes[0]!)).toBeGreaterThan(sql.executed.indexOf(del));
+  });
+
+  test('link-event on a meeting that was never linked removes nothing (a first link only adds)', async () => {
+    respond = routeRespond(null);
+    const res = await postLink(EVENT_B);
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { shared: number; sharesRemoved: string[] };
+    expect(body.sharesRemoved).toEqual([]);
+    expect(sql.executed.some((q) => DELETE_SHARES.test(q.text))).toBe(false);
+    expect(shareWrites().map(emailOf)).toEqual(['ivan@trames.sg']);
   });
 });

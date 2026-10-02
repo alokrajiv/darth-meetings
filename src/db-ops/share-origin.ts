@@ -112,3 +112,39 @@ export async function removeLinkBornShares(
   if (rows.length > 0) publishEvent({ kind: 'shares' });
   return rows.map((r) => r.shared_with_email);
 }
+
+/**
+ * RE-LINK: the meeting was linked to event A and is now being linked to event
+ * B. Take off the shares A's link made for people who are NOT internal
+ * invitees of B, before B's link adds its own — otherwise A's invitees keep a
+ * meeting that is no longer theirs, and only a manual Unlink (which a re-link
+ * never runs) would ever take them off.
+ *
+ * Stamped rows only (`origin = 'event-link'`). Unlike `removeLinkBornShares`
+ * there is NO legacy signature arm: a re-link never guesses that an
+ * un-stamped share was link-born — a share a person made (origin NULL) is
+ * never touched here, whatever its shape. Without migration 048 nothing is
+ * stamped, so nothing is removed.
+ *
+ * `keepEmails` = B's internal invitees (case-insensitive). A share to one of
+ * them stays exactly as it is — same row, same access, same stamp — and B's
+ * link then skips them as already shared. An empty list removes every
+ * stamped share (B has no internal invitees). Returns whose shares went.
+ */
+export async function removeLinkBornSharesNotIn(
+  transcriptId: number,
+  keepEmails: string[]
+): Promise<string[]> {
+  const stamped = await shareOriginColumnExists().catch(() => false);
+  if (!stamped) return [];
+  const keep = [...new Set(keepEmails.map((e) => e.trim().toLowerCase()).filter(Boolean))];
+  const rows = await sql<Array<{ shared_with_email: string }>>`
+    DELETE FROM ${sql(SCHEMA)}.transcript_shares
+    WHERE transcript_id = ${transcriptId}
+      AND origin = ${SHARE_ORIGIN_EVENT_LINK}
+      AND NOT (lower(shared_with_email) = ANY(${keep}::text[]))
+    RETURNING shared_with_email
+  `;
+  if (rows.length > 0) publishEvent({ kind: 'shares' });
+  return rows.map((r) => r.shared_with_email);
+}

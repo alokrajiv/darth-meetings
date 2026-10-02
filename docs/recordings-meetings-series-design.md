@@ -780,6 +780,20 @@ shares. Only what a user-made link does to the meeting's shares changed.
   at link time, so nobody is shared or notified twice.
 - Unlink (`PATCH {unlinkEvent:true}` → `removeLinkBornShares`) is unchanged: it deletes by `origin='event-link'`,
   which is exactly what the link arm writes. Import shares (no origin) survive an unlink, as before.
+- **Re-link to a different event (added 2026-10-02, later the same day).** As first built, linking a meeting that was
+  already linked to event A to event B only ADDED B's invitees: A's invitees kept their link-born shares on a meeting
+  that was no longer theirs, and only a manual Unlink (which a re-link never runs) would ever take them off. Now
+  `POST …/link-event` on a row whose context already names an event (`eventId` / `meetingCode` / `eventTitle` —
+  Unlink's own "is it linked?" test, read BEFORE the merge) calls `relinkSharesToEvent` (`auto-share.ts`): first
+  `removeLinkBornSharesNotIn` (`db-ops/share-origin.ts`) deletes the `origin='event-link'` shares of everyone who is
+  NOT an internal invitee of B, then B's missing invitees are added by the ordinary `'event-link'` arm. Someone on
+  both invites keeps their one share untouched. Stamped rows only — there is deliberately no legacy-signature arm
+  here, so a share a person made (origin NULL) is never touched; without migration 048 a re-link removes nothing.
+  Re-linking to the SAME event runs the same two steps (an invitee dropped from the invite since loses the link's
+  share). The answer carries `sharesRemoved` (emails), the activity log `sharesRemoved: N`. `…/link-event` is the only
+  path that links an EXISTING meeting: `POST /api/recordings/:id/link` with an event always makes a new meeting (a
+  recording already in one answers 409 `already-linked`), and `openUpload`, split-to-an-event and a linked text
+  import all create theirs.
 - **The recording stays personal.** `/api/recordings/:id/audio` lost its second arm (`reachableThroughMeeting`,
   removed): a person a meeting is shared with used to be able to stream the WHOLE recording there, including the
   minutes outside the meeting's clip window. Every `/api/recordings/*` route now answers the owner only; readers play
@@ -802,7 +816,10 @@ uploads write none; `linkRecording` with an event shares 8 on the new meeting an
 meeting" writes no share query at all; the settle never shares; a re-link skips existing shares (a read share stays
 read); the cloud-import arm still writes 8 unstamped edit shares; Unlink deletes by the same origin value; a share
 recipient resolves the meeting but gets 404 from `/api/recordings/:id`, `/content` and `/audio` (the owner gets 200),
-and the media route no longer asks the shared-meeting question at all.
+and the media route no longer asks the shared-meeting question at all. Re-link: `relinkSharesToEvent` deletes
+(stamped rows only, keep = B's internal invitees lower-cased, never the owner or a guest) BEFORE it writes B's missing
+share; B with no internal invitee removes every stamped share; no migration 048 → no DELETE; the route on a meeting
+linked to A removes A's non-B shares and adds B's missing one, and on a never-linked meeting runs no DELETE.
 
 ## As built — P7/P8 (2026-09-23)
 

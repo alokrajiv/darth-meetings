@@ -1,6 +1,6 @@
 import 'server-only';
 import { addShare, listByTranscript } from '@/db-ops/transcript-shares';
-import { SHARE_ORIGIN_EVENT_LINK } from '@/db-ops/share-origin';
+import { removeLinkBornSharesNotIn, SHARE_ORIGIN_EVENT_LINK } from '@/db-ops/share-origin';
 
 // Internal domains: invitees on these are the people a meeting tied to a
 // calendar invite is shared with (and the domains share suggestions are
@@ -23,6 +23,26 @@ export const AUTO_SHARE_DOMAINS = new Set(['trames.sg', 'trames-engineering.com'
  *    back off (docs/recorder-link-confirm-spec.md D5).
  */
 export type AutoShareArm = 'cloud-import' | 'event-link';
+
+/**
+ * The people the policy shares with: every invitee on an internal domain,
+ * lower-cased, de-duplicated, never the owner — email → display name.
+ */
+export function internalInvitees(
+  ownerEmail: string,
+  candidates: ReadonlyArray<{ email?: string | null; name?: string | null }>
+): Map<string, string | null> {
+  const self = ownerEmail.trim().toLowerCase();
+  const wanted = new Map<string, string | null>();
+  for (const a of candidates) {
+    if (typeof a?.email !== 'string') continue;
+    const email = a.email.trim().toLowerCase();
+    const domain = email.split('@')[1] ?? '';
+    if (!email || email === self || !AUTO_SHARE_DOMAINS.has(domain)) continue;
+    if (!wanted.has(email)) wanted.set(email, a.name ?? null);
+  }
+  return wanted;
+}
 
 /**
  * Share a meeting with every INTERNAL invitee of its calendar event, with
@@ -52,15 +72,7 @@ export async function shareWithInternalInvitees(
   candidates: ReadonlyArray<{ email?: string | null; name?: string | null }>
 ): Promise<number> {
   if (arm !== 'cloud-import' && arm !== 'event-link') return 0;
-  const self = ownerEmail.trim().toLowerCase();
-  const wanted = new Map<string, string | null>();
-  for (const a of candidates) {
-    if (typeof a?.email !== 'string') continue;
-    const email = a.email.trim().toLowerCase();
-    const domain = email.split('@')[1] ?? '';
-    if (!email || email === self || !AUTO_SHARE_DOMAINS.has(domain)) continue;
-    if (!wanted.has(email)) wanted.set(email, a.name ?? null);
-  }
+  const wanted = internalInvitees(ownerEmail, candidates);
   if (wanted.size === 0) return 0;
 
   if (arm === 'event-link') {
@@ -87,4 +99,41 @@ export async function shareWithInternalInvitees(
     }
   }
   return shared;
+}
+
+/**
+ * Link a meeting that is ALREADY linked to a calendar event to an event
+ * (`POST /api/transcripts/:id/link-event` on a linked row — the link dialog's
+ * "change event", the "Link to it" strips, `darth-cli meetings link` on a
+ * linked meeting). Two steps, in this order:
+ *
+ *  1. the shares the PREVIOUS link made (`origin = 'event-link'`) for anyone
+ *     who is not an internal invitee of the new event come off
+ *     (`removeLinkBornSharesNotIn`) — A's invitees are not B's, and a re-link
+ *     never runs Unlink;
+ *  2. the new event's internal invitees are added exactly as any link adds
+ *     them (`shareWithInternalInvitees('event-link', …)`): only the missing
+ *     ones, so someone on both invites keeps their one share untouched.
+ *
+ * A share a person made (origin NULL) is never touched, whoever it is for.
+ * Re-linking to the SAME event is the same two steps — an invitee dropped
+ * from the invite since the first link loses the link's share, which is what
+ * "shared as per the invite" means.
+ */
+export async function relinkSharesToEvent(
+  transcriptId: number,
+  ownerUserId: string,
+  ownerEmail: string,
+  candidates: ReadonlyArray<{ email?: string | null; name?: string | null }>
+): Promise<{ shared: number; removed: string[] }> {
+  const keep = [...internalInvitees(ownerEmail, candidates).keys()];
+  const removed = await removeLinkBornSharesNotIn(transcriptId, keep);
+  const shared = await shareWithInternalInvitees(
+    'event-link',
+    transcriptId,
+    ownerUserId,
+    ownerEmail,
+    candidates
+  );
+  return { shared, removed };
 }
