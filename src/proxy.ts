@@ -2,7 +2,9 @@ import { NextResponse } from 'next/server';
 import type { NextRequest } from 'next/server';
 import {
   getDarthBearer,
+  hasAdminAccess,
   hasMeetingsAccess,
+  isAdminApiPath,
   isSessionValue,
   resolveDarthToken,
   NO_ACCESS_MESSAGE,
@@ -128,7 +130,7 @@ export async function proxy(request: NextRequest) {
         { status: 403 }
       );
     }
-    if (!hasMeetingsAccess(identity)) return noAccess(request);
+    if (!mayEnter(identity, pathname)) return noAccess(request);
     return NextResponse.next(); // read-scope → GET-only is enforced in withAuth
   }
 
@@ -139,9 +141,19 @@ export async function proxy(request: NextRequest) {
     if (wantsJson(request)) return unauthorized('Unauthorized - No valid session');
     return loginRedirect(request);
   }
-  if (!hasMeetingsAccess(user)) return noAccess(request);
+  if (!mayEnter(user, pathname)) return noAccess(request);
 
   return NextResponse.next();
+}
+
+/**
+ * `meetings` holders everywhere; on the operator API (/api/admin/*) also a
+ * super-admin (`access`) without `meetings` — darth-admin forwards the admin's
+ * own cookie there, as it does to chat's admin API. The route's
+ * withAdminAuth 404s everyone without `access`, meetings users included.
+ */
+function mayEnter(identity: { modules: string[] }, pathname: string): boolean {
+  return hasMeetingsAccess(identity) || (isAdminApiPath(pathname) && hasAdminAccess(identity));
 }
 
 export const config = {

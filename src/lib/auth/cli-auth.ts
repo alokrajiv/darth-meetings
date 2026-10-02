@@ -184,3 +184,16 @@ export function hasMeetingsAccess(id: Pick<DarthIdentity, 'modules'> | null | un
 
 export const NO_ACCESS_MESSAGE =
   'no access to meetings — ask a darth admin (admin.darth-internal.trames.io)';
+
+/** The darth-auth super-admin module (darth-admin's own gate). */
+export const ADMIN_MODULE = 'access';
+
+/** May this identity call the operator API under /api/admin/* (lib/auth/with-admin-auth.ts)? */
+export function hasAdminAccess(id: { modules?: string[] } | null | undefined): boolean {
+  return !!id && Array.isArray(id.modules) && id.modules.includes(ADMIN_MODULE);
+}
+
+/** The operator API: the one place an `access` holder without `meetings` may reach (the route 404s everyone else). */
+export function isAdminApiPath(pathname: string): boolean {
+  return pathname === '/api/admin' || pathname.startsWith('/api/admin/');
+}

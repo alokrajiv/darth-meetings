@@ -537,3 +537,197 @@ export async function relinkRecordingTranscript(oldTranscriptId: string, newTran
   `;
   return rows.length;
 }
+
+// ---------------------------------------------------------------------------
+// Operator view (darth-admin › Recorder) — ALL users' trays, metadata only.
+// Served only behind withAdminAuth (`access` module); shaped by
+// lib/recorder-admin.ts. Three queries per page load whatever the fleet size:
+// devices (+ per-device freshest events as index-backed LATERALs), progress
+// of the in-flight recordings, and the last 5 registry rows per tray.
+// ---------------------------------------------------------------------------
+
+/** Lifecycle kinds that say whether a tray is recording right now. */
+const RECORDING_LIFECYCLE_KINDS = ['recording_started', 'recording_stopped', 'recording_cancelled'];
+/** Kinds counted as "unclean exits" in the last 7 days. */
+const UNCLEAN_EXIT_KINDS = ['unclean_exit', 'crash_report'];
+
+export interface AdminRecorderDeviceRow extends RecorderDeviceRow {
+  last_event_at: string | null;
+  resource_ts: string | null;
+  resource_payload: Record<string, unknown> | null;
+  life_kind: string | null;
+  life_ts: string | null;
+  life_payload: Record<string, unknown> | null;
+  unclean_exits_7d: number;
+}
+
+/**
+ * Every tray, newest heartbeat first, with the few freshest events the
+ * operator view needs. Each LATERAL walks `recorder_events_device_ts_idx`
+ * (device_id, ts DESC) backwards and is time-bounded, so a tray with a large
+ * history costs the same as a new one.
+ */
+export async function listRecorderDevicesForAdmin(): Promise<AdminRecorderDeviceRow[]> {
+  return sql<AdminRecorderDeviceRow[]>`
+    SELECT d.*,
+           le.ts        AS last_event_at,
+           rs.ts        AS resource_ts,
+           rs.payload   AS resource_payload,
+           life.kind    AS life_kind,
+           life.ts      AS life_ts,
+           life.payload AS life_payload,
+           COALESCE(ux.n, 0)::int AS unclean_exits_7d
+    FROM ${sql(SCHEMA)}.recorder_devices d
+    LEFT JOIN LATERAL (
+      SELECT e.ts FROM ${sql(SCHEMA)}.recorder_events e
+      WHERE e.device_id = d.device_id
+      ORDER BY e.ts DESC LIMIT 1
+    ) le ON true
+    LEFT JOIN LATERAL (
+      SELECT e.ts, e.payload FROM ${sql(SCHEMA)}.recorder_events e
+      WHERE e.device_id = d.device_id AND e.kind = 'resource_sample'
+        AND e.ts > now() - interval '1 day'
+      ORDER BY e.ts DESC LIMIT 1
+    ) rs ON true
+    LEFT JOIN LATERAL (
+      SELECT e.kind, e.ts, e.payload FROM ${sql(SCHEMA)}.recorder_events e
+      WHERE e.device_id = d.device_id AND e.kind = ANY(${RECORDING_LIFECYCLE_KINDS}::text[])
+        AND e.ts > now() - interval '3 days'
+      ORDER BY e.ts DESC LIMIT 1
+    ) life ON true
+    LEFT JOIN LATERAL (
+      SELECT count(*) AS n FROM ${sql(SCHEMA)}.recorder_events e
+      WHERE e.device_id = d.device_id AND e.kind = ANY(${UNCLEAN_EXIT_KINDS}::text[])
+        AND e.ts > now() - interval '7 days'
+    ) ux ON true
+    ORDER BY d.last_seen DESC
+  `;
+}
+
+export interface AdminRecordingProgressRow {
+  device_id: string;
+  recording_id: string;
+  max_segment: number | null;
+  closed_segments: number;
+  closed_bytes: string | number | null;
+  last_progress_at: string | null;
+  latest_source: Record<string, unknown> | null;
+  call: Record<string, unknown> | null;
+  row_started_at: string | null;
+}
+
+/**
+ * Progress of the recordings trays are on right now (one row per input
+ * recording; a handful at most): parts started, parts closed and their
+ * bytes, the newest event naming the recording (resource samples carry
+ * `recording_id` every ~60 s while recording), the newest source the tray
+ * switched to, and the registry row's `call`. Events are read from the
+ * recording's start on, through the (device_id, ts) index.
+ */
+export async function recordingProgressForAdmin(
+  items: Array<{ device_id: string; recording_id: string; since: string | null }>
+): Promise<AdminRecordingProgressRow[]> {
+  const batch = items
+    .filter((i) => i.device_id && i.recording_id)
+    .map((i) => ({
+      device_id: i.device_id,
+      recording_id: i.recording_id.toLowerCase(),
+      // No start known → look back one day (a recording longer than that is not one).
+      since: i.since ?? new Date(Date.now() - 86_400_000).toISOString(),
+    }));
+  if (batch.length === 0) return [];
+  return sql<AdminRecordingProgressRow[]>`
+    SELECT x.device_id::text AS device_id,
+           x.recording_id,
+           p.max_segment,
+           COALESCE(p.closed_segments, 0)::int AS closed_segments,
+           p.closed_bytes, p.last_progress_at, p.latest_source,
+           r.call, r.started_at AS row_started_at
+    FROM jsonb_to_recordset(${sql.json(batch as unknown as never)})
+         AS x(device_id uuid, recording_id text, since timestamptz)
+    LEFT JOIN LATERAL (
+      SELECT max(CASE WHEN e.kind = 'segment_started' AND jsonb_typeof(e.payload->'segment') = 'number'
+                      THEN (e.payload->>'segment')::int END) AS max_segment,
+             count(*) FILTER (WHERE e.kind = 'segment_closed') AS closed_segments,
+             sum(CASE WHEN e.kind = 'segment_closed' AND jsonb_typeof(e.payload->'bytes') = 'number'
+                      THEN (e.payload->>'bytes')::bigint END) AS closed_bytes,
+             max(e.ts) AS last_progress_at,
+             (array_agg(e.payload->'source' ORDER BY e.ts DESC)
+                FILTER (WHERE e.kind IN ('segment_started', 'recording_started')
+                          AND jsonb_typeof(e.payload->'source') = 'object'))[1] AS latest_source
+      FROM ${sql(SCHEMA)}.recorder_events e
+      WHERE e.device_id = x.device_id
+        AND e.ts >= x.since - interval '1 minute'
+        AND lower(e.payload->>'recording_id') = x.recording_id
+    ) p ON true
+    LEFT JOIN ${sql(SCHEMA)}.recorder_recordings r
+      ON r.id::text = x.recording_id AND r.device_id = x.device_id
+  `;
+}
+
+export interface AdminRecentRecordingRow {
+  id: string;
+  device_id: string | null;
+  started_at: string | null;
+  duration_s: number | null;
+  bytes: string | number | null;
+  status: string;
+  transcript_id: string | null;
+  recording_id: string | null;
+  error: string | null;
+  call_app: string | null;
+}
+
+/** The last `perDevice` registry rows of each tray (deleted ones included — this is the operator's record). */
+export async function recentRecordingsForAdmin(
+  deviceIds: string[],
+  perDevice = 5
+): Promise<AdminRecentRecordingRow[]> {
+  if (deviceIds.length === 0) return [];
+  return sql<AdminRecentRecordingRow[]>`
+    SELECT t.id, t.device_id, t.started_at, t.duration_s, t.bytes, t.status, t.transcript_id,
+           t.recording_id, t.error, t.call_app
+    FROM (
+      SELECT r.id, r.device_id::text AS device_id, r.started_at, r.duration_s, r.bytes, r.status,
+             r.transcript_id, r.recording_id, r.error, r.call->>'app' AS call_app,
+             COALESCE(r.started_at, r.created_at) AS sort_at,
+             row_number() OVER (PARTITION BY r.device_id
+                                ORDER BY COALESCE(r.started_at, r.created_at) DESC) AS rn
+      FROM ${sql(SCHEMA)}.recorder_recordings r
+      WHERE r.device_id = ANY(${deviceIds}::uuid[])
+    ) t
+    WHERE t.rn <= ${perDevice}
+    ORDER BY t.device_id, t.sort_at DESC
+  `;
+}
+
+export interface AdminRecorderEventRow {
+  id: string;
+  device_id: string | null;
+  ts: string | Date;
+  kind: string;
+  payload: unknown;
+  received_at: string | Date;
+}
+
+/**
+ * One tray's recent events, newest first. Default: everything but the
+ * `excludeKinds` (the two 60 s samplers); `kinds` names exactly which kinds
+ * to return (samplers included when named). Payloads verbatim — what the
+ * tray sent at its own telemetry level.
+ */
+export async function listRecorderEventsForAdmin(
+  deviceId: string,
+  opts: { limit: number; kinds: string[] | null; excludeKinds: readonly string[] }
+): Promise<AdminRecorderEventRow[]> {
+  const filter = opts.kinds
+    ? sql`AND e.kind = ANY(${opts.kinds}::text[])`
+    : sql`AND NOT (e.kind = ANY(${[...opts.excludeKinds]}::text[]))`;
+  return sql<AdminRecorderEventRow[]>`
+    SELECT e.id::text AS id, e.device_id::text AS device_id, e.ts, e.kind, e.payload, e.received_at
+    FROM ${sql(SCHEMA)}.recorder_events e
+    WHERE e.device_id = ${deviceId}::uuid ${filter}
+    ORDER BY e.ts DESC, e.id DESC
+    LIMIT ${opts.limit}
+  `;
+}
