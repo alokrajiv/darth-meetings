@@ -125,7 +125,7 @@ else
       let args = Array.isArray(e.args) ? e.args.map(String) : String(e.args || "").split(" ").filter(Boolean);
       const hits = args.filter((a) => a.includes(process.env.BLUE_PORT)).length;
       if (hits !== 1) { console.error("blue args " + JSON.stringify(args) + " do not carry the port exactly once"); process.exit(1); }
-      // A path inside blue's tree (e.g. its node_modules/.bin/next) must become green's.
+      // A path inside the blue tree (e.g. its node_modules/.bin/next) must become the green one.
       const swap = (a) => a.split(process.env.BLUE_DIR + "/").join(process.env.GREEN_DIR + "/");
       args = args.map((a) => swap(a.split(process.env.BLUE_PORT).join(process.env.GREEN_PORT)));
       console.log([swap(e.pm_exec_path), e.exec_interpreter || "none", ...args].join("\n"));
