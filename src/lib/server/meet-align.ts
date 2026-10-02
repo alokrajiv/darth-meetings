@@ -17,6 +17,7 @@ import {
   type ValveCheck,
 } from '@/lib/meet-align-valve';
 import { resolveAudioPath } from '@/lib/server/audio-storage';
+import { ensureLocalMedia } from '@/lib/server/media-local';
 import { canonicalMedia, localMsIn, type ResolvedMedia } from '@/lib/server/recordings';
 import { embedSegmentsViaSidecar } from '@/lib/server/voiceprint';
 
@@ -132,6 +133,13 @@ async function runPooledRoomValve(
   }
   if (plan.candidates.length === 0 || !audioPath || !primary) return new Set();
 
+  // The sidecar reads a PATH: the stored file, or — when its local copy is
+  // gone — the archived blob pulled into media-local's cache (logged once
+  // when neither can be had; the valve then keeps dropping, as it always has
+  // without media).
+  const local = await ensureLocalMedia(primary, 'audio', { purpose: 'meet-align valve' });
+  if (!local) return new Set();
+
   const log = (check: ValveCheck) => {
     const c = check.candidate;
     console.log(
@@ -140,18 +148,23 @@ async function runPooledRoomValve(
     );
   };
 
-  const checks = await runVoiceValve(
-    plan,
-    async (candidate) =>
-      embedSegmentsViaSidecar(
-        audioPath,
-        candidate.snippets.map((sn) => ({
-          start_ms: localMsIn(primary, sn.startMs),
-          end_ms: localMsIn(primary, sn.endMs),
-        }))
-      ),
-    log
-  );
+  let checks: Awaited<ReturnType<typeof runVoiceValve>>;
+  try {
+    checks = await runVoiceValve(
+      plan,
+      async (candidate) =>
+        embedSegmentsViaSidecar(
+          local.path,
+          candidate.snippets.map((sn) => ({
+            start_ms: localMsIn(primary, sn.startMs),
+            end_ms: localMsIn(primary, sn.endMs),
+          }))
+        ),
+      log
+    );
+  } finally {
+    local.release();
+  }
 
   const kept = new Set<string>();
   for (const check of checks) {

@@ -4,7 +4,12 @@ import { z } from 'zod';
 import { tool, createSdkMcpServer } from '@anthropic-ai/claude-agent-sdk';
 import { logPayloadMissing } from '@/lib/server/aai-retention';
 import { runClaudeWithMeta, parseJsonFromClaude } from '@/lib/server/claude-agent';
-import { extractFrame, frameSourceFor, hasVideoStream, HIRES_FRAME_WIDTH } from '@/lib/server/video-frames';
+import {
+  extractFrameFromMedia,
+  frameSourceFor,
+  HIRES_FRAME_WIDTH,
+  mediaHasVideo,
+} from '@/lib/server/video-frames';
 import { localMsIn, resolveMeetingContent, type ResolvedMedia } from '@/lib/server/recordings';
 import { recordAiRun, getLatestSessionId } from '@/db-ops/ai-runs';
 import { getServerAccessToken } from '@/lib/server/google-oauth';
@@ -512,7 +517,6 @@ function buildVideoTools(
   durationMs: number | null,
   opts: { purpose?: 'report' | 'speakers'; maxPerRun?: number; stats?: { grabbed: number } } = {}
 ) {
-  const audioFilename = source.filename;
   const speakers = opts.purpose === 'speakers';
   const stats = opts.stats ?? { grabbed: 0 };
   const MAX_PER_CALL = 8;
@@ -561,7 +565,9 @@ function buildVideoTools(
             // reading shows). For a meeting split off a longer recording,
             // the file is shared and the seek is `localMsIn` — the same
             // mapping the `frame:<ms>` it writes will be served through.
-            const abs = await extractFrame(assemblyaiId, audioFilename, localMsIn(source, ms), ms, width);
+            // `…FromMedia`: when the stored copy is gone the archived file is
+            // pulled into media-local's cache once and every grab reads it.
+            const abs = await extractFrameFromMedia(assemblyaiId, source, localMsIn(source, ms), ms, width);
             const data = await fsp.readFile(abs);
             stats.grabbed++;
             content.push({ type: 'text', text: `Frame at ${m}:${String(s).padStart(2, '0')} (${ms} ms):` });
@@ -582,7 +588,7 @@ function rewriteFrameRefs(notes: string, assemblyaiId: string, source: ResolvedM
   return notes.replace(/\(frame:(\d+)\)/g, (_m, msStr: string) => {
     const ms = Number.parseInt(msStr, 10);
     if (source) {
-      void extractFrame(assemblyaiId, source.filename, localMsIn(source, ms), ms).catch(() => {});
+      void extractFrameFromMedia(assemblyaiId, source, localMsIn(source, ms), ms).catch(() => {});
     }
     return `(/api/transcripts/${assemblyaiId}/frames/${ms}.jpg)`;
   });
@@ -1067,7 +1073,7 @@ export async function identifySpeakers(
     const naming = speakerNaming([...allSpeakers]);
 
     const frameSource = await frameSourceForRow(row);
-    const videoOk = frameSource ? await hasVideoStream(frameSource.filename) : false;
+    const videoOk = frameSource ? await mediaHasVideo(frameSource) : false;
     const durationMs = (row.duration ?? content.audio_duration ?? 0) * 1000 || null;
     // Frames: the per-speaker moments plus a few to look around — capped, as
     // vision tokens are the cost (~700 per 960-px frame, ~2k hires).
@@ -1290,7 +1296,7 @@ export async function generateAutoReport(
       : '';
 
     const frameSource = opts.useVideo !== false ? await frameSourceForRow(row) : null;
-    const videoOk = frameSource ? await hasVideoStream(frameSource.filename) : false;
+    const videoOk = frameSource ? await mediaHasVideo(frameSource) : false;
     const durationMs = (row.duration ?? content.audio_duration ?? 0) * 1000 || null;
     const agentOpts = videoOk
       ? {
