@@ -14,8 +14,7 @@ import {
   TableRow,
 } from '@/components/ui/table';
 import { CornerDownRight, Loader2, Plus, Repeat, ScanSearch, Zap } from 'lucide-react';
-import { OFFLINE_TITLE, useOfflineGate } from '@/lib/offline/offline-context';
-import { isNetworkFailure, offlineAwareError } from '@/lib/offline/offline-fetch';
+import { isNetworkFailure, networkErrorMessage, NETWORK_ERROR_MESSAGE } from '@/lib/fetch-errors';
 
 /**
  * The series index: every series in one comparative table (the surface that
@@ -62,7 +61,7 @@ interface OccCounts {
   external: number;
   googleConnected: boolean;
 }
-type OccCell = OccCounts | 'error' | 'offline' | undefined;
+type OccCell = OccCounts | 'error' | 'network' | undefined;
 
 const COUNTS_CHUNK = 4;
 
@@ -110,7 +109,7 @@ const dateLabel = (iso: string | null) =>
 
 export default function SeriesIndexPage() {
   const [data, setData] = useState<SeriesIndexResponse | null>(null);
-  // null = fine; a string = why the index could not load (OFFLINE_TITLE offline).
+  // null = fine; a string = why the index could not load.
   const [error, setError] = useState<string | null>(null);
   const [openSeriesId, setOpenSeriesId] = useState<number | null>(null);
   const [sweeping, setSweeping] = useState(false);
@@ -118,30 +117,22 @@ export default function SeriesIndexPage() {
   const [newSeriesError, setNewSeriesError] = useState<string | null>(null);
   const [occ, setOcc] = useState<Record<number, OccCell>>({});
   const [occLoading, setOccLoading] = useState(false);
-  // Offline mode / network down: the index, the sweep and every action need
-  // the server — one "Not available offline" panel stands in for the table.
-  const { blocked } = useOfflineGate();
 
   const load = useCallback(async () => {
-    if (blocked) {
-      setError(OFFLINE_TITLE);
-      return;
-    }
     try {
       const res = await fetch('/api/series');
-      if (!res.ok) throw await offlineAwareError(res, String(res.status));
+      if (!res.ok) throw new Error(String(res.status));
       setData((await res.json()) as SeriesIndexResponse);
       setError(null);
     } catch (err) {
       setError(
-        isNetworkFailure(err) || (err instanceof Error && err.message === OFFLINE_TITLE)
-          ? OFFLINE_TITLE
+        isNetworkFailure(err)
+          ? NETWORK_ERROR_MESSAGE
           : 'Couldn’t load series.'
       );
     }
-  }, [blocked]);
+  }, []);
 
-  // Re-runs when the connection comes back (blocked flips false → new load).
   useEffect(() => {
     void load();
   }, [load]);
@@ -149,13 +140,10 @@ export default function SeriesIndexPage() {
   // Deep link: /series?series=<id> opens that series' dialog on load (the
   // dup banner's "View it" link and anything else that wants to point at a
   // series from another tab). Read once from the URL — no Suspense dance.
-  // Not honoured while blocked (the dialog could not load anything).
   useEffect(() => {
-    if (blocked) return;
     const raw = new URLSearchParams(window.location.search).get('series');
     const id = raw ? Number(raw) : NaN;
     if (Number.isInteger(id) && id > 0) setOpenSeriesId(id);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   // Importable column: sweep every series' occurrences in small chunks
@@ -163,7 +151,7 @@ export default function SeriesIndexPage() {
   // instant). Re-runs when the series set changes (new series / merge).
   const seriesIds = data?.series.map((s) => s.id).join(',') ?? '';
   useEffect(() => {
-    if (!seriesIds || blocked) return;
+    if (!seriesIds) return;
     let cancelled = false;
     const ids = seriesIds.split(',').map(Number);
     (async () => {
@@ -173,7 +161,7 @@ export default function SeriesIndexPage() {
         try {
           const res = await fetch(`/api/series/occurrence-counts?ids=${chunk.join(',')}`);
           if (cancelled) return;
-          if (!res.ok) throw await offlineAwareError(res, String(res.status));
+          if (!res.ok) throw new Error(String(res.status));
           const j = (await res.json()) as { counts: Record<number, OccCounts | 'error' | null> };
           setOcc((prev) => {
             const next = { ...prev };
@@ -183,7 +171,7 @@ export default function SeriesIndexPage() {
         } catch (err) {
           if (cancelled) return;
           const cell: OccCell =
-            isNetworkFailure(err) || (err instanceof Error && err.message === OFFLINE_TITLE) ? 'offline' : 'error';
+            isNetworkFailure(err) ? 'network' : 'error';
           setOcc((prev) => {
             const next = { ...prev };
             for (const id of chunk) next[id] = cell;
@@ -196,7 +184,7 @@ export default function SeriesIndexPage() {
     return () => {
       cancelled = true;
     };
-  }, [seriesIds, blocked]);
+  }, [seriesIds]);
 
   const runRetroAttach = async () => {
     setSweeping(true);
@@ -213,7 +201,7 @@ export default function SeriesIndexPage() {
       );
       void load();
     } catch (err) {
-      setSweepResult(isNetworkFailure(err) ? OFFLINE_TITLE : 'Sweep failed — try again');
+      setSweepResult(isNetworkFailure(err) ? NETWORK_ERROR_MESSAGE : 'Sweep failed — try again');
     } finally {
       setSweeping(false);
     }
@@ -229,12 +217,12 @@ export default function SeriesIndexPage() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ title }),
       });
-      if (!res.ok) throw await offlineAwareError(res, `Could not create the series (${res.status})`);
+      if (!res.ok) throw new Error(`Could not create the series (${res.status})`);
       const j = (await res.json()) as { series: { id: number } };
       void load();
       setOpenSeriesId(j.series.id);
     } catch (err) {
-      setNewSeriesError(isNetworkFailure(err) ? OFFLINE_TITLE : err instanceof Error ? err.message : 'Could not create the series');
+      setNewSeriesError(networkErrorMessage(err, 'Could not create the series'));
     }
   };
 
@@ -244,14 +232,14 @@ export default function SeriesIndexPage() {
         <Button
           variant="outline"
           size="sm"
-          disabled={sweeping || blocked}
+          disabled={sweeping}
           onClick={() => void runRetroAttach()}
-          title={blocked ? OFFLINE_TITLE : "Re-match every meeting that belongs to no series against the existing series' evidence keys"}
+          title={"Re-match every meeting that belongs to no series against the existing series' evidence keys"}
         >
           {sweeping ? <Loader2 className="h-4 w-4 animate-spin" /> : <ScanSearch className="h-4 w-4" />}
           Re-scan attachments
         </Button>
-        <Button size="sm" onClick={() => void newSeries()} disabled={blocked} title={blocked ? OFFLINE_TITLE : undefined}>
+        <Button size="sm" onClick={() => void newSeries()}>
           <Plus className="h-4 w-4" />
           New series
         </Button>
@@ -269,11 +257,7 @@ export default function SeriesIndexPage() {
           </div>
         )}
 
-        {blocked ? (
-          <div className="rounded-lg border py-16 text-center text-sm text-muted-foreground" data-series-offline>
-            {OFFLINE_TITLE}
-          </div>
-        ) : !data && !error ? (
+        {!data && !error ? (
           <div className="flex items-center justify-center py-16 text-muted-foreground">
             <Loader2 className="h-5 w-5 animate-spin" />
           </div>
@@ -325,10 +309,8 @@ export default function SeriesIndexPage() {
                       return (
                         <TableRow
                           key={s.id}
-                          className={`${blocked ? '' : 'cursor-pointer'} ${sibling ? 'bg-amber-500/[0.04]' : ''}`}
-                          onClick={blocked ? undefined : () => setOpenSeriesId(s.id)}
-                          aria-disabled={blocked || undefined}
-                          title={blocked ? OFFLINE_TITLE : undefined}
+                          className={`cursor-pointer ${sibling ? 'bg-amber-500/[0.04]' : ''}`}
+                          onClick={() => setOpenSeriesId(s.id)}
                         >
                           <TableCell className={`py-2.5 ${sibling ? 'pl-7' : 'pl-4'}`}>
                             <div className="flex min-w-0 items-center gap-2">
@@ -370,8 +352,8 @@ export default function SeriesIndexPage() {
                               ) : (
                                 <span className="text-muted-foreground/50">—</span>
                               )
-                            ) : c === 'error' || c === 'offline' ? (
-                              <span className="text-xs text-muted-foreground/60" title={c === 'offline' ? OFFLINE_TITLE : 'Sweep failed'}>
+                            ) : c === 'error' || c === 'network' ? (
+                              <span className="text-xs text-muted-foreground/60" title={c === 'network' ? NETWORK_ERROR_MESSAGE : 'Sweep failed'}>
                                 ?
                               </span>
                             ) : !c.googleConnected ? (
@@ -422,7 +404,7 @@ export default function SeriesIndexPage() {
                 {data.totals.memberships === 1 ? '' : 's'} in series · {data.totals.unattached} meeting
                 {data.totals.unattached === 1 ? '' : 's'} in no series
 
-                {Object.values(occ).some((c) => c && c !== 'error' && c !== 'offline' && c.googleConnected && c.external === 0) && (
+                {Object.values(occ).some((c) => c && c !== 'error' && c !== 'network' && c.googleConnected && c.external === 0) && (
                   <>
                     {' '}
                     · Importable “—” = not on your calendar (occurrences are swept from your own

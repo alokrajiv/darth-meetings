@@ -36,6 +36,7 @@ import {
   type BornBareTranscriptWire,
 } from '@/lib/server/born-bare';
 import { findStandaloneGroup } from '@/db-ops/standalone-recordings';
+import { shareWithInternalInvitees } from '@/lib/server/auto-share';
 
 /**
  * The media-upload pipeline shared by the two byte-delivery routes:
@@ -789,15 +790,26 @@ export async function openUpload(
     bytesTotal: multi?.groupBytes ?? input.bytesTotal,
     scratch,
   });
-  // NO SHARES HERE (design P4, owner 2026-09-23): linking a recording to a
-  // calendar occurrence never shares — only meetings carry shares, and sharing
-  // is a separate act the person takes. The linked event's invitees land in
-  // gmeet_context.attendees above, which is what the share dialog's
-  // "Suggested from this meeting" (GET …/share-suggestions) offers them from.
-  // Until 2026-09-23 this shared with every internal invitee, with edit
-  // access, the moment an upload opened linked (tray Link, web stepper,
-  // calendar-row Upload, darth-cli --event). Cloud imports still share —
-  // that arm is `shareCloudImportWithInternalInvitees` (lib/server/auto-share).
+  // A meeting linked to a calendar occurrence is shared with the event's
+  // internal invitees, exactly as a cloud import is (owner 2026-10-02,
+  // reversing design P4's "a link never shares" of 2026-09-23): the tray's
+  // Link, the web stepper, the calendar-row Upload and darth-cli --event all
+  // open here with `linkedEvent`. Done now, at link time, so invitees see the
+  // row from the first byte whether or not the text is ready yet. Stamped
+  // `origin = 'event-link'` so "Unlink from event" takes them back off.
+  // What is shared is the MEETING; the recording behind it stays the
+  // owner's. Not on a re-run (`sourceId` — retranscribe carries the source
+  // meeting's own shares) nor on bytes joining an existing meeting
+  // (`attachTo` — that meeting's shares already apply).
+  if (input.linkedEvent && !input.sourceId && !input.attachTo) {
+    await shareWithInternalInvitees(
+      'event-link',
+      placeholder.id,
+      user.userId,
+      user.email,
+      input.linkedEvent.attendees ?? []
+    ).catch((err) => console.warn(`[upload] ${placeholderId}: sharing with the invitees failed:`, err));
+  }
   // D1: the placeholder is born with the moment the tray started recording
   // as its date (after the title above), so an
   // unlinked recording still lands on the right day in the listing.

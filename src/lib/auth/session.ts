@@ -40,8 +40,8 @@ export async function getCurrentUserFromHeaders(headers: Headers): Promise<Darth
 
 /**
  * Same, distinguishing "no session" from "darth-auth could not be asked"
- * (`transient`). Only /api/auth/session cares — it is the offline
- * provider's session probe and must not report a 401 for a hiccup.
+ * (`transient`). Only /api/auth/session cares — it must not report a 401
+ * for a hiccup.
  */
 export async function getCurrentUserFromHeadersDetailed(
   headers: Headers

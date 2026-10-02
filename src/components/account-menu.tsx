@@ -8,7 +8,6 @@ import { useShellSearch } from '@/components/shell-search';
 import { signOut } from '@/components/logout-button';
 import { toggleTheme } from '@/components/theme-toggle';
 import { usePopover } from '@/hooks/use-popover';
-import { OFFLINE_TITLE, useOfflineGate } from '@/lib/offline/offline-context';
 import { THEME_SHELL_NOTE, accountMenuItems } from '@/lib/listing-layout';
 
 /**
@@ -46,7 +45,6 @@ export function AccountMenu({
 }) {
   const shell = useShellSearch();
   const inDesktopShell = shellProp ?? shell.inDesktopShell;
-  const { blocked } = useOfflineGate();
   const { open, toggle, close, ref } = usePopover(defaultOpen);
   const [email, setEmail] = useState<string | null>(null);
   useEffect(() => {
@@ -137,8 +135,6 @@ export function AccountMenu({
                       type="button"
                       role="menuitem"
                       data-account-item="sign-out"
-                      disabled={blocked}
-                      title={blocked ? OFFLINE_TITLE : undefined}
                       className={itemCls}
                       onClick={() => void signOut()}
                     >

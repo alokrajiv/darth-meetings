@@ -9,7 +9,8 @@ import {
   setScratchForUser,
   updateMetaForUser,
 } from '@/db-ops/transcripts';
-import { logActivity } from '@/db-ops/transcript-activity';
+import { identityForUser, logActivity } from '@/db-ops/transcript-activity';
+import { shareWithInternalInvitees } from '@/lib/server/auto-share';
 import { registerPeopleFromMeeting } from '@/lib/server/import-helpers';
 import { resolveLinkedEventRef } from '@/lib/server/linked-event-ref';
 import { getServerAccessToken } from '@/lib/server/google-oauth';
@@ -41,8 +42,11 @@ export const runtime = 'nodejs';
  *   - headless callers (darth-cli `link <id> <ref>`) send `meetingCode` or
  *     `eventKey` and the server resolves the event from the caller's own
  *     calendar cache, minting its backend Google token for enrichment.
- * Either way we merge the event into gmeet_context — which immediately
- * lights up share suggestions for the invitees — set the meeting date, fill
+ * Either way we merge the event into gmeet_context, share the meeting with
+ * the event's internal invitees exactly as a cloud import does (owner
+ * 2026-10-02 — the meeting share policy; stamped `origin = 'event-link'` so
+ * "Unlink from event" takes them back off; a re-link adds only who is
+ * missing and never rewrites a share someone made), set the meeting date, fill
  * an empty title, register the attendees in the people directory and, when
  * the row is completed and nobody has confirmed speaker names yet, re-run
  * the speaker-ID pass with the attendee list as hints (a scratch upload's
@@ -224,6 +228,23 @@ export const POST = withAuth(async ({ user, request }, { params }) => {
     }
   }
   await mergeGmeetContextForUser(access.ownerUserId, id, patch);
+  // The meeting share policy: linked to an event → shared with its internal
+  // invitees. The owner is never shared with themself — an editor linking
+  // someone else's meeting must not hand the OWNER a share of their own row.
+  const ownerEmail =
+    access.ownerUserId === user.userId
+      ? user.email
+      : ((await identityForUser(access.ownerUserId).catch(() => null))?.email ?? user.email);
+  const shared = await shareWithInternalInvitees(
+    'event-link',
+    access.row.id,
+    access.ownerUserId,
+    ownerEmail,
+    attendees
+  ).catch((err) => {
+    console.warn('[link-event] sharing with the invitees failed (continuing):', err);
+    return 0;
+  });
   // D2: a link answers the suggestion — whichever surface did the linking,
   // and whether or not it is the event that was suggested. Removed, not
   // stamped: there is nothing left to offer.
@@ -264,6 +285,7 @@ export const POST = withAuth(async ({ user, request }, { params }) => {
     action: 'edit_meta',
     details: {
       linkedEvent: event.title ?? event.id ?? true,
+      ...(shared > 0 ? { sharedWithInvitees: shared } : {}),
       ...(access.row.scratch ? { scratch: false } : {}),
     },
   });
@@ -306,6 +328,8 @@ export const POST = withAuth(async ({ user, request }, { params }) => {
       attendees: attendees.length,
       enriched: !!actuals,
     },
+    /** How many internal invitees this link shared the meeting with. */
+    shared,
     reguessing,
   });
 });

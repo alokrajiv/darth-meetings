@@ -39,8 +39,7 @@ import {
 } from '@/lib/companion/companion-client';
 import { RecordingStrip, SourceGlyph } from '@/components/recording-strip';
 import { LinkEventDialog } from '@/components/link-event-dialog';
-import { OFFLINE_TITLE } from '@/lib/offline/offline-types';
-import { isNetworkFailure, offlineAwareError } from '@/lib/offline/offline-fetch';
+import { networkErrorMessage } from '@/lib/fetch-errors';
 import {
   linkedMeetingLabel,
   linkedRecordingFacts,
@@ -62,7 +61,9 @@ import {
  * files still on a Mac. A section filter with the server's counts, a
  * search box, and more pages as the list scrolls (the listing's sentinel
  * pattern). Link to meeting… / Make a meeting / Keep move a recording out
- * of the unlinked sections — only a meeting is ever shared.
+ * of the unlinked sections — only a meeting is ever shared (a link to a
+ * calendar event shares it with the invite's internal people); the
+ * recording itself never is.
  *
  * Linked recordings stay findable (2026-10-02): a "Linked to a meeting"
  * section (`section=linked`), and under All a short group of the newest
@@ -231,7 +232,7 @@ export function useRecordingsPage(opts: {
   const fetchPage = useCallback(
     async (after: string | null) => {
       const res = await fetch(urlFor(after), { credentials: 'include' });
-      if (!res.ok) throw await offlineAwareError(res, `Failed to load recordings (${res.status})`);
+      if (!res.ok) throw new Error(`Failed to load recordings (${res.status})`);
       return (await res.json()) as RecordingsPageWire;
     },
     [urlFor]
@@ -251,7 +252,7 @@ export function useRecordingsPage(opts: {
       })
       .catch((err: unknown) => {
         if (gen !== genRef.current) return;
-        setError(isNetworkFailure(err) ? OFFLINE_TITLE : err instanceof Error ? err.message : 'Failed to load recordings');
+        setError(networkErrorMessage(err, 'Failed to load recordings'));
       })
       .finally(() => {
         if (gen === genRef.current) setLoading(false);
@@ -320,7 +321,7 @@ export function useRecordingsPage(opts: {
       })
       .catch((err: unknown) => {
         if (gen !== genRef.current) return;
-        setError(isNetworkFailure(err) ? OFFLINE_TITLE : err instanceof Error ? err.message : 'Failed to load more');
+        setError(networkErrorMessage(err, 'Failed to load more'));
       })
       .finally(() => {
         if (gen === genRef.current) setLoadingMore(false);
@@ -355,7 +356,6 @@ function itemKey(i: RecordingsItemWire): string {
 
 export interface RecordingsSurfaceProps {
   data: RecordingsPage;
-  disabled?: boolean;
   /** Something changed that the archive should notice (a link, a name, a trash). */
   onChanged?: () => void;
 }
@@ -368,7 +368,7 @@ const FILTERS: Array<{ key: RecordingsFilter; label: string; short: string }> = 
   { key: 'linked', label: 'Linked to a meeting', short: 'Linked' },
 ];
 
-export function RecordingsSurface({ data, disabled = false, onChanged }: RecordingsSurfaceProps) {
+export function RecordingsSurface({ data, onChanged }: RecordingsSurfaceProps) {
   const {
     items,
     counts,
@@ -517,7 +517,6 @@ export function RecordingsSurface({ data, disabled = false, onChanged }: Recordi
                 r={it.registry}
                 trayHasIt={companion.connected && trayIds.has(it.registry.id)}
                 live={companion.uploads[it.registry.id]?.status === 'uploading' ? companion.uploads[it.registry.id] : null}
-                disabled={disabled}
                 onChanged={() => {
                   setTimeout(refresh, 800);
                 }}
@@ -533,7 +532,6 @@ export function RecordingsSurface({ data, disabled = false, onChanged }: Recordi
                     ? companion.uploads[it.row.recorder_recording_id]
                     : null
                 }
-                disabled={disabled}
                 onLink={() =>
                   setLinkFor({ kind: 'meeting', id: it.row.assemblyai_id, dateIso: it.row.recorded_at ?? it.row.created_at })
                 }
@@ -549,7 +547,6 @@ export function RecordingsSurface({ data, disabled = false, onChanged }: Recordi
                     ? companion.uploads[it.recording.recorder_recording_id]
                     : null
                 }
-                disabled={disabled}
                 onLink={() =>
                   setLinkFor({
                     kind: 'recording',
@@ -632,13 +629,11 @@ function MacCard({
   r,
   trayHasIt,
   live,
-  disabled,
   onChanged,
 }: {
   r: OwnRecorderRecording;
   trayHasIt: boolean;
   live: { pct: number; bytesSent: number | null; bytesTotal: number | null; segment: number | null; segmentsTotal: number | null } | null;
-  disabled: boolean;
   onChanged: () => void;
 }) {
   const [note, setNote] = useState<string | null>(null);
@@ -707,7 +702,6 @@ function MacCard({
         {!busy && trayHasIt && (
           <button
             type="button"
-            disabled={disabled}
             title="Delete this recording from this Mac — it was never uploaded, so it is gone for good"
             aria-label="Delete from this Mac"
             data-recorder-delete
@@ -729,7 +723,6 @@ function MacCard({
         noGlyph
         onAction={onAction}
         note={note ?? (r.status === 'upload_failed' && r.error ? r.error : null)}
-        disabled={disabled}
       />
     </div>
   );
@@ -756,7 +749,6 @@ function BareCard({
   temporary = false,
   reg,
   live,
-  disabled,
   onLink,
   onChanged,
 }: {
@@ -765,7 +757,6 @@ function BareCard({
   temporary?: boolean;
   reg: OwnRecorderRecording | null;
   live: { pct: number; bytesSent: number | null; bytesTotal: number | null } | null;
-  disabled: boolean;
   onLink: () => void;
   onChanged: () => void;
 }) {
@@ -802,7 +793,7 @@ function BareCard({
     try {
       await fn();
     } catch (e) {
-      setErr(isNetworkFailure(e) ? OFFLINE_TITLE : e instanceof Error ? e.message : 'Failed');
+      setErr(networkErrorMessage(e, 'Failed'));
     } finally {
       setBusy(null);
     }
@@ -937,7 +928,6 @@ function BareCard({
         model={model}
         noGlyph
         onAction={(k) => (k === 'retry' ? retry() : undefined)}
-        disabled={disabled}
       />
       {err && <p className="text-[11px] text-destructive">{err}</p>}
       <div className="flex flex-wrap items-center gap-1 pt-0.5">
@@ -945,7 +935,7 @@ function BareCard({
           size="sm"
           variant="outline"
           className={iconBtn}
-          disabled={disabled || placeholder}
+          disabled={placeholder}
           onClick={onLink}
           title="Link it to a calendar event — the meeting takes the invite's title, date and people"
           data-link-meeting
@@ -957,7 +947,7 @@ function BareCard({
           size="sm"
           variant="outline"
           className={iconBtn}
-          disabled={disabled || placeholder}
+          disabled={placeholder}
           onClick={() => {
             setName(row.title && !filename?.startsWith(row.title) ? row.title : '');
             setRenaming(true);
@@ -973,7 +963,7 @@ function BareCard({
             size="sm"
             variant="outline"
             className={iconBtn}
-            disabled={disabled || placeholder || busy === 'keep'}
+            disabled={placeholder || busy === 'keep'}
             onClick={keep}
             title="Keep it — no expiry; it stays one of your recordings"
             data-keep-recording
@@ -993,7 +983,7 @@ function BareCard({
             size="sm"
             variant="ghost"
             className={`${iconBtn} ml-auto text-muted-foreground hover:text-destructive`}
-            disabled={disabled || busy === 'trash'}
+            disabled={busy === 'trash'}
             onClick={trash}
             title={placeholder ? 'Cancel the upload' : 'Move to trash'}
           >
@@ -1016,18 +1006,17 @@ function BareCard({
  * One STANDALONE recording (design P7) — an upload born as a recording.
  * Actions (§3.1): Link to meeting… · Make a meeting · Keep (temporary only) ·
  * Open (its own page, recording mode) · Delete. Only the owner ever sees
- * this card; nothing on it shares anything.
+ * this card. The recording is never shared; Link to meeting… makes a meeting
+ * that is shared with the event's internal invitees (meeting policy).
  */
 function RecordingCard({
   r,
   live,
-  disabled,
   onLink,
   onChanged,
 }: {
   r: RecordingViewWire;
   live: { pct: number; bytesSent?: number | null; bytesTotal?: number | null } | null;
-  disabled: boolean;
   onLink: () => void;
   onChanged: () => void;
 }) {
@@ -1049,7 +1038,7 @@ function RecordingCard({
     try {
       await fn();
     } catch (e) {
-      setErr(isNetworkFailure(e) ? OFFLINE_TITLE : e instanceof Error ? e.message : 'Failed');
+      setErr(networkErrorMessage(e, 'Failed'));
     } finally {
       setBusy(null);
     }
@@ -1168,7 +1157,7 @@ function RecordingCard({
           {linkable && (
             <button
               type="button"
-              disabled={disabled || busy === 'link'}
+              disabled={busy === 'link'}
               onClick={linkSuggested}
               className="inline-flex h-6 shrink-0 items-center gap-1 rounded-md border border-primary/35 bg-primary/5 px-2 text-[11px] font-medium text-primary hover:bg-primary/10 disabled:opacity-60"
               data-link-suggested
@@ -1179,7 +1168,7 @@ function RecordingCard({
           )}
           <button
             type="button"
-            disabled={disabled || busy === 'dismiss'}
+            disabled={busy === 'dismiss'}
             onClick={dismiss}
             className="inline-flex h-6 shrink-0 items-center rounded-md px-1.5 text-[11px] hover:bg-muted disabled:opacity-60"
             data-dismiss-suggested
@@ -1188,16 +1177,16 @@ function RecordingCard({
           </button>
         </div>
       )}
-      <RecordingStrip model={model} noGlyph disabled={disabled} />
+      <RecordingStrip model={model} noGlyph />
       {err && <p className="text-[11px] text-destructive">{err}</p>}
       <div className="flex flex-wrap items-center gap-1 pt-0.5">
         <Button
           size="sm"
           variant="outline"
           className={iconBtn}
-          disabled={disabled || !linkable}
+          disabled={!linkable}
           onClick={onLink}
-          title={linkable ? 'Link it to a calendar event — that makes it a meeting; nothing is shared' : 'Its transcription failed — retry it first'}
+          title={linkable ? 'Link it to a calendar event — that makes it a meeting, shared with the Trames colleagues on the invite' : 'Its transcription failed — retry it first'}
           data-link-meeting
         >
           <Link2 className="h-3.5 w-3.5" />
@@ -1207,7 +1196,7 @@ function RecordingCard({
           size="sm"
           variant="outline"
           className={iconBtn}
-          disabled={disabled || !linkable}
+          disabled={!linkable}
           onClick={() => {
             setName(r.title ?? '');
             setNaming(true);
@@ -1223,7 +1212,7 @@ function RecordingCard({
             size="sm"
             variant="outline"
             className={iconBtn}
-            disabled={disabled || busy === 'keep'}
+            disabled={busy === 'keep'}
             onClick={keep}
             title="Keep it — no expiry; it stays one of your recordings"
             data-keep-recording
@@ -1240,7 +1229,7 @@ function RecordingCard({
           size="sm"
           variant="ghost"
           className={`${iconBtn} ml-auto text-muted-foreground hover:text-destructive`}
-          disabled={disabled || busy === 'delete' || r.status === 'uploading'}
+          disabled={busy === 'delete' || r.status === 'uploading'}
           onClick={remove}
           title="Delete for good"
           data-recording-delete

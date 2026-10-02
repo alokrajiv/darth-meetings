@@ -86,7 +86,7 @@ describe('compat mode — the byte-identity contract', () => {
     const out = resolveClips([clip()], MEETING);
     expect(out.compat).toBe(true);
     // Not "deep equal" — the same object. A map or a re-join here would
-    // re-serialise the JSON and break /content, the offline caches and
+    // re-serialise the JSON and break /content, offline replicas and
     // darth-cli all at once.
     expect(out.content).toBe(payloadA);
     expect(JSON.stringify(out.content)).toBe(JSON.stringify(payloadA));

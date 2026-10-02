@@ -13,7 +13,7 @@ import {
 
 /**
  * Call-outs driven by the local Darth Recorder tray (see companion-client.ts).
- * Mounted once in the root layout, same slot as <OfflineBanner>; renders
+ * Mounted once in the root layout; renders
  * nothing unless a tray is connected AND there is something to say:
  *
  *  - "Teams call detected" (+ window title) with Record / Not now while a
@@ -136,7 +136,12 @@ export function CompanionBanner() {
             size="sm"
             className="h-7 shrink-0 px-2.5 text-xs"
             data-companion-upload-now
-            onClick={() => savedId && getCompanion().upload(savedId, saved?.matched ?? null)}
+            // Unlinked, always: the tray's match is a GUESS, and a link now
+            // shares the meeting with the event's internal invitees (owner
+            // 2026-10-02). The server parks the match as the meeting's
+            // suggestion, and the person links it from there (rule 4 — the
+            // 2026-09-22 huddle was exactly a guess turned into a link).
+            onClick={() => savedId && getCompanion().upload(savedId, null)}
           >
             <Upload className="h-3.5 w-3.5" /> {failed ? 'Retry upload' : 'Upload now'}
           </Button>

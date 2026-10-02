@@ -93,7 +93,7 @@ describe('B1 — the registry → recording swap', () => {
     expect(src).toContain('setTimeout(refresh, delay)');
     // RecordingCard: the actions are not gated on the upload.
     expect(src).toContain("const linkable = r.status !== 'failed';");
-    expect(src).toMatch(/disabled=\{disabled \|\| !linkable\}\s+onClick=\{onLink\}/);
+    expect(src).toMatch(/disabled=\{!linkable\}\s+onClick=\{onLink\}/);
   });
 });
 

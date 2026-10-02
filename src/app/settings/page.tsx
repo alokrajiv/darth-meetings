@@ -10,11 +10,9 @@ import { GoogleAccountCard } from '@/components/google-account-card';
 import { MicrosoftAccountCard } from '@/components/microsoft-account-card';
 import { NotifyPrefsCard } from '@/components/notify-prefs-card';
 import { AutoSyncCard } from '@/components/auto-sync-card';
-import { OfflineCard } from '@/components/offline-card';
 import { RecorderCard } from '@/components/recorder-card';
 import type { VocabPayload } from '@/lib/format';
-import { OFFLINE_TITLE, useOfflineGate } from '@/lib/offline/offline-context';
-import { isNetworkFailure, offlineAwareError } from '@/lib/offline/offline-fetch';
+import { networkErrorMessage } from '@/lib/fetch-errors';
 
 interface OrgVocabMeta {
   version: number;
@@ -28,16 +26,8 @@ export default function SettingsPage() {
   const [userVocab, setUserVocab] = useState<VocabPayload | null>(null);
   const [orgVocab, setOrgVocab] = useState<VocabPayload | null>(null);
   const [orgMeta, setOrgMeta] = useState<OrgVocabMeta | null>(null);
-  // Offline mode / network down: the vocab editors need the server — a
-  // "Not available offline" card stands in; the other cards gate themselves.
-  const { blocked } = useOfflineGate();
 
   const load = async () => {
-    if (blocked) {
-      setLoading(false);
-      setError(null);
-      return;
-    }
     try {
       setLoading(true);
       setError(null);
@@ -45,8 +35,8 @@ export default function SettingsPage() {
         fetch('/api/vocab/user'),
         fetch('/api/vocab/org'),
       ]);
-      if (!userRes.ok) throw await offlineAwareError(userRes, `user vocab ${userRes.status}`);
-      if (!orgRes.ok) throw await offlineAwareError(orgRes, `org vocab ${orgRes.status}`);
+      if (!userRes.ok) throw new Error(`user vocab ${userRes.status}`);
+      if (!orgRes.ok) throw new Error(`org vocab ${orgRes.status}`);
       const userJson = (await userRes.json()) as { vocab: VocabPayload };
       const orgJson = (await orgRes.json()) as {
         vocab: VocabPayload;
@@ -62,17 +52,15 @@ export default function SettingsPage() {
         updated_by: orgJson.updated_by,
       });
     } catch (err) {
-      setError(isNetworkFailure(err) ? OFFLINE_TITLE : err instanceof Error ? err.message : 'Failed to load settings');
+      setError(networkErrorMessage(err, 'Failed to load settings'));
     } finally {
       setLoading(false);
     }
   };
 
-  // Re-runs when the connection comes back (blocked flips false).
   useEffect(() => {
     void load();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [blocked]);
+  }, []);
 
   const saveUser = async (payload: VocabPayload) => {
     const res = await fetch('/api/vocab/user', {
@@ -114,8 +102,7 @@ export default function SettingsPage() {
           size="sm"
           className="h-8 w-8 p-0"
           onClick={() => void load()}
-          disabled={blocked}
-          title={blocked ? OFFLINE_TITLE : 'Refresh'}
+          title="Refresh"
         >
           <RefreshCw className="h-4 w-4" />
           <span className="sr-only">Refresh</span>
@@ -134,22 +121,10 @@ export default function SettingsPage() {
         <MicrosoftAccountCard />
         <AutoSyncCard />
         <NotifyPrefsCard />
-        <OfflineCard />
         <RecorderCard />
       </div>
 
-      {blocked && (
-        <Card>
-          <CardHeader>
-            <CardTitle>Vocabulary</CardTitle>
-          </CardHeader>
-          <CardContent>
-            <p className="text-sm text-muted-foreground">{OFFLINE_TITLE}</p>
-          </CardContent>
-        </Card>
-      )}
-
-      {!blocked && loading && (
+      {loading && (
         <Card>
           <CardHeader>
             <CardTitle>Loading...</CardTitle>
@@ -162,7 +137,7 @@ export default function SettingsPage() {
         </Card>
       )}
 
-      {!blocked && error && (
+      {error && (
         <Card>
           <CardHeader>
             <CardTitle>Error</CardTitle>
@@ -176,21 +151,19 @@ export default function SettingsPage() {
         </Card>
       )}
 
-      {!blocked && !loading && !error && userVocab && orgVocab && (
+      {!loading && !error && userVocab && orgVocab && (
         <div className="space-y-6">
           <VocabEditor
             title="Your vocabulary"
             description="Personal word boost and spellings — only applied to transcripts you upload."
             initial={userVocab}
             onSave={saveUser}
-            disabled={blocked}
           />
           <VocabEditor
             title="Company vocabulary"
             description="Shared across everyone using Darth Meetings. Anyone can edit; every save is versioned in the database."
             initial={orgVocab}
             onSave={saveOrg}
-            disabled={blocked}
             meta={
               orgMeta && (
                 <p className="text-xs text-muted-foreground mt-1">

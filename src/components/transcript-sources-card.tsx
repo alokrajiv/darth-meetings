@@ -37,8 +37,6 @@ interface TranscriptSourcesCardProps {
   row: StoredTranscript;
   suggestions: SpeakerSuggestionMap;
   canEdit: boolean;
-  /** Offline mode: re-transcribe actions need the server — shown but inert. */
-  disabled?: boolean;
   /** Phase 2: the transcription versions of this meeting, loaded once by the
    * page (this card renders twice — rail + phone drawer). Absent, or
    * `versioned: false`, means the pre-Phase-2 path is in force and this card
@@ -59,7 +57,6 @@ export function TranscriptSourcesCard({
   row,
   suggestions,
   canEdit,
-  disabled = false,
   transcriptions,
   selfEmail,
 }: TranscriptSourcesCardProps) {
@@ -324,9 +321,9 @@ export function TranscriptSourcesCard({
       variant="outline"
       size="sm"
       className="mt-2 h-8 w-full justify-start gap-2 text-[13px]"
-      disabled={disabled || retranscribing !== null}
+      disabled={retranscribing !== null}
       onClick={() => void retranscribeFromVideo()}
-      title={disabled ? 'Not available offline' : `This transcript is the text ${isTeams ? 'Teams' : 'Meet'} wrote — no acoustic speaker separation or voiceprint matching ran. Run the full AssemblyAI pipeline over the meeting video; a new transcript is created alongside this one`}
+      title={`This transcript is the text ${isTeams ? 'Teams' : 'Meet'} wrote — no acoustic speaker separation or voiceprint matching ran. Run the full AssemblyAI pipeline over the meeting video; a new transcript is created alongside this one`}
     >
       {retranscribing ? (
         <Loader2 className="h-4 w-4 animate-spin text-muted-foreground" />
@@ -347,9 +344,9 @@ export function TranscriptSourcesCard({
       variant="outline"
       size="sm"
       className="mt-2 h-8 w-full justify-start gap-2 text-[13px]"
-      disabled={disabled || combining}
+      disabled={combining}
       onClick={() => void combineAndRetranscribe()}
-      title={disabled ? 'Not available offline' : 'Concatenate every stored video of this meeting and run a fresh AssemblyAI transcription over the whole thing — a new transcript is created alongside this one'}
+      title="Concatenate every stored video of this meeting and run a fresh AssemblyAI transcription over the whole thing — a new transcript is created alongside this one"
     >
       {combining ? (
         <Loader2 className="h-4 w-4 animate-spin text-muted-foreground" />
@@ -603,12 +600,10 @@ export function TranscriptSourcesCard({
             <button
               type="button"
               className="mt-1 inline-flex items-center gap-1 text-[11px] font-medium text-primary hover:underline disabled:cursor-not-allowed disabled:text-muted-foreground disabled:no-underline"
-              disabled={disabled || !!runningVersion}
+              disabled={!!runningVersion}
               onClick={() => setRetranscribeOpen(true)}
               title={
-                disabled
-                  ? 'Not available offline'
-                  : runningVersion
+                runningVersion
                     ? 'A transcription is already running on this meeting'
                     : 'Hear this meeting again — another language or another model. Every version is kept and you can switch back'
               }
@@ -621,7 +616,6 @@ export function TranscriptSourcesCard({
             <TranscriptionVersions
               versions={versions}
               canEdit={canEdit}
-              disabled={disabled}
               selfEmail={selfEmail}
               activatingId={transcriptions?.activatingId ?? null}
               onActivate={(id) => transcriptions!.activate(id)}
@@ -687,12 +681,10 @@ export function TranscriptSourcesCard({
           variant="outline"
           size="sm"
           className="mt-2 h-8 w-full justify-start gap-2 text-[13px]"
-          disabled={disabled || upgrading}
+          disabled={upgrading}
           onClick={() => void upgradeModel()}
           title={
-            disabled
-              ? 'Not available offline'
-              : outcome.downgraded
+            outcome.downgraded
                 ? // AAI already fell back once for this language — asking for
                   // the newer model again lands on exactly the same one.
                   `AssemblyAI does not support ${languageLabel(outcome.languageCode) ?? 'this language'} on ${speechModelLabel(DEFAULT_SPEECH_MODEL)}, so a re-run would produce the same result — see Advanced details`

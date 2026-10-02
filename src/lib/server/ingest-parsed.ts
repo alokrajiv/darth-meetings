@@ -5,7 +5,7 @@ import {
   type TranscriptRow,
 } from '@/db-ops/transcripts';
 import { autoNameSpeakers, registerPeopleFromMeeting } from '@/lib/server/import-helpers';
-import { shareCloudImportWithInternalInvitees } from '@/lib/server/auto-share';
+import { shareWithInternalInvitees } from '@/lib/server/auto-share';
 import { autoAttachSeries } from '@/lib/server/series-attach';
 import { onTranscriptCompleted } from '@/lib/server/post-completion';
 import { queueRecordingGraphSync } from '@/lib/server/recording-sync';
@@ -40,10 +40,16 @@ export interface IngestParsedOptions {
   participants?: MeetParticipantInfo[];
   /**
    * CLOUD IMPORTS ONLY (Meet/Teams): the invitees the new meeting is shared
-   * with + registered as people; omitted/empty skips both. A text import
-   * linked to an event never passes this — linking never shares (design P4).
+   * with + registered as people; omitted/empty skips both.
    */
   cloudImportShareList?: Array<{ email: string; name?: string | null }>;
+  /**
+   * A text import a person LINKED to a calendar event: the event's invitees,
+   * shared with the meeting policy (internal domains, edit) and stamped
+   * `origin = 'event-link'` so "Unlink from event" takes them back off
+   * (owner, 2026-10-02 — linking shares like a cloud import does).
+   */
+  eventLinkShareList?: Array<{ email: string; name?: string | null }>;
   /** Prefix for warn logs, e.g. '[gmeet/import]'. */
   logTag?: string;
   /** Temporary transcript (migration 042) — import-text only. */
@@ -106,6 +112,7 @@ export async function ingestParsedUtterances(
     attendees = [],
     participants,
     cloudImportShareList: shareList = [],
+    eventLinkShareList: linkShareList = [],
     logTag = '[ingest-parsed]',
     scratch = false,
   } = opts;
@@ -154,7 +161,7 @@ export async function ingestParsedUtterances(
 
   let autoShared = 0;
   if (shareList.length > 0) {
-    autoShared = await shareCloudImportWithInternalInvitees(
+    autoShared = await shareWithInternalInvitees(
       'cloud-import',
       row.id,
       user.userId,
@@ -162,6 +169,18 @@ export async function ingestParsedUtterances(
       shareList
     );
     await registerPeopleFromMeeting(shareList, user.userId);
+  }
+  if (linkShareList.length > 0) {
+    autoShared += await shareWithInternalInvitees(
+      'event-link',
+      row.id,
+      user.userId,
+      user.email,
+      linkShareList
+    ).catch((err) => {
+      console.warn(`${logTag} sharing with the linked event's invitees failed:`, err);
+      return 0;
+    });
   }
 
   await autoAttachSeries({

@@ -43,8 +43,8 @@ export function matchDay(when: string | null, now: Date = new Date()): string | 
 
 /**
  * "1h 9m" / "56m 45s" / "38s" — THE duration of this app, `formatDuration`
- * from `lib/format.ts`, which is what every listing row, the Recording card
- * and the offline archive print.
+ * from `lib/format.ts`, which is what every listing row and the Recording card
+ * print.
  *
  * It used to have a formatter of its own, which dropped the seconds inside an
  * hour ("56m" where the listing said "56m 45s" for the same meeting). Two

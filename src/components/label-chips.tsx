@@ -33,9 +33,6 @@ export interface LabelChipsProps {
    * overflowing, keeping the "+N" badge and the add "+" visible (used by
    * the listing's width-capped Labels column). */
   fit?: boolean;
-  /** Keeps the add "+" and the filter chips visible but inert (offline mode /
-   * network down — the picker and the filter both need the server). */
-  disabled?: boolean;
   className?: string;
 }
 
@@ -75,7 +72,7 @@ export function LabelChip({
   size?: 'sm' | 'md';
   /** Shrink below max-w to share a width-capped container (fit mode). */
   flexible?: boolean;
-  /** Overrides the tooltip (inert chips in offline mode say why). */
+  /** Overrides the tooltip. */
   title?: string;
 }) {
   const dot = <LabelDot color={color} />;
@@ -134,7 +131,6 @@ export function LabelChips({
   max = 2,
   variant = 'row',
   fit = false,
-  disabled = false,
   className = '',
 }: LabelChipsProps) {
   const { byId } = useLabelCatalog();
@@ -183,11 +179,10 @@ export function LabelChips({
           key={l.id}
           label={l}
           color={labelDotColor(l, byId)}
-          onClick={onFilter && !disabled ? () => onFilter(l) : undefined}
+          onClick={onFilter ? () => onFilter(l) : undefined}
           onRemove={onRemove}
           size={variant === 'full' ? 'md' : 'sm'}
           flexible={fit}
-          title={disabled && onFilter ? 'Not available offline' : undefined}
         />
       ))}
       {rest.length > 0 && (
@@ -225,13 +220,13 @@ export function LabelChips({
                   <button
                     key={l.id}
                     type="button"
-                    disabled={!onFilter || disabled}
+                    disabled={!onFilter}
                     onClick={(e) => {
                       e.stopPropagation();
                       setMoreOpen(false);
                       onFilter?.(l);
                     }}
-                    title={disabled && onFilter ? 'Not available offline' : onFilter ? `Filter by ${l.path}` : l.path}
+                    title={onFilter ? `Filter by ${l.path}` : l.path}
                     className="flex w-full items-center gap-1.5 rounded px-1.5 py-1 text-left text-xs hover:bg-muted disabled:cursor-default disabled:hover:bg-transparent"
                   >
                     <LabelDot color={labelDotColor(l, byId)} />
@@ -246,12 +241,11 @@ export function LabelChips({
       {onAdd && (
         <button
           type="button"
-          disabled={disabled}
           onClick={(e) => {
             e.stopPropagation();
             onAdd(e);
           }}
-          title={disabled ? 'Not available offline' : variant === 'full' ? 'Add a label (l)' : 'Add a label'}
+          title={variant === 'full' ? 'Add a label (l)' : 'Add a label'}
           data-label-add
           className={`inline-flex shrink-0 items-center gap-0.5 rounded-full border border-dashed border-muted-foreground/30 px-1.5 py-0.5 text-[11px] text-muted-foreground/70 transition-all hover:border-primary/40 hover:text-primary disabled:cursor-not-allowed disabled:opacity-50 disabled:hover:border-muted-foreground/30 disabled:hover:text-muted-foreground/70 ${
             variant === 'row' ? 'opacity-0 group-hover:opacity-100' : ''

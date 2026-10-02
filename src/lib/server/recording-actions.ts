@@ -24,6 +24,7 @@ import { addClip } from '@/lib/server/clip-combine';
 import { purgeStandaloneRecording, refreshBornBare } from '@/lib/server/born-bare';
 import { suggestedEventFromMatch } from '@/lib/server/recorder-match';
 import { isClipTextPolicy, type ClipTextPolicy } from '@/lib/recording-clips';
+import { shareWithInternalInvitees } from '@/lib/server/auto-share';
 import type { GmeetContext, SuggestedEvent } from '@/lib/format';
 
 /**
@@ -33,9 +34,15 @@ import type { GmeetContext, SuggestedEvent } from '@/lib/format';
  *
  * Every function here takes the caller and constrains on OWNERSHIP first: a
  * recording that is not the caller's answers exactly like one that does not
- * exist (`not-found` → 404, invariant I2). Nothing here writes a share —
- * linking a recording never shares (design P4); sharing is something the
- * person does to the MEETING afterwards.
+ * exist (`not-found` → 404, invariant I2).
+ *
+ * Shares are a MEETING's, never a recording's. Linking a recording to a
+ * calendar occurrence makes a meeting, and that meeting is shared with the
+ * event's internal invitees exactly as a cloud import is (owner 2026-10-02,
+ * reversing design P4's "a link never shares"). "Make a meeting" with no
+ * event shares nobody. Either way the RECORDING stays the owner's alone:
+ * every `/api/recordings/*` route answers to the owner only, and a share
+ * recipient reaches the media through the meeting's own routes.
  */
 
 export interface Caller {
@@ -174,8 +181,9 @@ export type ActionResult<T> =
 export interface MadeMeeting {
   meeting: { id: string; title: string | null };
   recordingId: string;
-  /** Always 0 — a link never shares (design P4). Present so a client can say so. */
-  shares: 0;
+  /** How many internal invitees the new meeting was shared with (a link to
+   * a calendar event; 0 for "Make a meeting" and for an event with none). */
+  shares: number;
 }
 
 const NOT_FOUND = { ok: false as const, status: 404, error: 'Not found' };
@@ -201,9 +209,11 @@ function refusalFor(code: 'not-found' | 'not-ready' | 'already-linked'): ActionR
 /**
  * The meeting row + clip, then everything a newly created meeting gets:
  * the listing/`/m` ledger, series auto-attach on a STRONG key (as linked
- * uploads do), the graph sync (a borrower: clip rows only), playback prep,
- * and the speaker passes — with NO ready DM (the recording already sent the
- * one DM it gets; "meeting made" needs none — risk §6.1).
+ * uploads do), the share with the linked event's internal invitees (a link
+ * only — meeting policy, as a cloud import shares), the graph sync (a
+ * borrower: clip rows only), playback prep, and the speaker passes — with NO
+ * ready DM (the recording already sent the one DM it gets; "meeting made"
+ * needs none — risk §6.1).
  */
 async function makeMeeting(
   caller: Caller,
@@ -226,6 +236,22 @@ async function makeMeeting(
   if (!made.ok) return refusalFor(made.code);
 
   await announceMeetingInserted(made.assemblyaiId, ctx, opts.title, caller.userId);
+  // Shared at LINK time, ready or not: the settle that finishes an early-made
+  // meeting (lib/server/recording-settle.ts) never shares, so nobody is added
+  // or notified twice. "Make a meeting" carries no event → no share.
+  const shares =
+    opts.how === 'link' && (ctx.attendees?.length ?? 0) > 0
+      ? await shareWithInternalInvitees(
+          'event-link',
+          made.transcriptId,
+          caller.userId,
+          caller.email,
+          ctx.attendees ?? []
+        ).catch((err) => {
+          console.warn(`[recording-actions] sharing ${made.assemblyaiId} with the invitees failed:`, err);
+          return 0;
+        })
+      : 0;
   const row = await getForUser(caller.userId, made.assemblyaiId);
   if (row) {
     await attachSeriesForRow(row).catch((err) =>
@@ -240,11 +266,11 @@ async function makeMeeting(
   // Not ready: the meeting was born 'processing' and lib/server/recording-settle.ts
   // runs the two calls above when the recording's transcription lands.
   console.log(
-    `[recording-actions] ${opts.how}: recording ${recordingId} → meeting ${made.assemblyaiId} (owner ${caller.userId}, 0 shares${made.ready ? '' : ', text pending'})`
+    `[recording-actions] ${opts.how}: recording ${recordingId} → meeting ${made.assemblyaiId} (owner ${caller.userId}, ${shares} shares${made.ready ? '' : ', text pending'})`
   );
   return {
     ok: true,
-    body: { meeting: { id: made.assemblyaiId, title: opts.title }, recordingId, shares: 0 },
+    body: { meeting: { id: made.assemblyaiId, title: opts.title }, recordingId, shares },
   };
 }
 
@@ -270,10 +296,11 @@ export interface LinkInput {
  *
  *  - `eventRef` / `eventKey` (a meeting code, or the calendar event key):
  *    creates the meeting linked to that occurrence of the CALLER'S calendar,
- *    with the recording as its one clip. No share (P4); the invitees become
- *    the share dialog's suggestions.
+ *    with the recording as its one clip, shared with the event's internal
+ *    invitees (meeting policy, like a cloud import).
  *  - `meetingId`: adds the recording to a meeting the caller owns or can edit
  *    (the Phase 3b clip add, behind MW_COMBINE; its own refusals pass through).
+ *    No new share: the meeting's own shares already decide who sees it.
  */
 export async function linkRecording(
   caller: Caller,

@@ -40,8 +40,7 @@ import { requestMediaUpload } from '@/components/audio-upload';
 import { ConnectMicrosoftHint, TeamsChatVerdictLine } from '@/components/calendar-meeting-rows';
 import { msLinkMissing, useMsLinkStatus } from '@/components/connect-nudge-banner';
 import { asTeamsChatVerdict, teamsChatVerdictCopy, type TeamsChatVerdict } from '@/lib/format';
-import { OFFLINE_TITLE, useOfflineGate } from '@/lib/offline/offline-context';
-import { isNetworkFailure, offlineAwareError } from '@/lib/offline/offline-fetch';
+import { isNetworkFailure, NETWORK_ERROR_MESSAGE } from '@/lib/fetch-errors';
 import type {
   CachedMeetingMeta,
   DiscoverWindowResponse,
@@ -76,8 +75,7 @@ async function discoveryGet<T>(url: string): Promise<T> {
   const res = await fetch(url);
   if (res.status === 404) throw new NotConnectedError();
   const j = (await res.json().catch(() => ({}))) as T & { error?: string };
-  // The service worker's offline 503 reads "Not available offline", not "offline".
-  if (!res.ok) throw await offlineAwareError(res, j.error || `Request failed (${res.status})`);
+  if (!res.ok) throw new Error(j.error || `Request failed (${res.status})`);
   return j;
 }
 
@@ -312,10 +310,6 @@ export function GmeetImportDialog({
   const [connectPitch, setConnectPitch] = useState(false);
   const [tab, setTab] = useState<SourceTab>('calendar');
   const [error, setError] = useState<string | null>(null);
-  // Offline mode / network down: nothing in this dialog can reach Google or
-  // the server — banner + disabled <fieldset>s around the bodies (Cancel /
-  // Done / Back stay outside them).
-  const { blocked } = useOfflineGate();
   const [busy, setBusy] = useState(false);
   const [date, setDate] = useState<string>(todayLocalISO());
   const [rows, setRows] = useState<EventRow[]>([]);
@@ -485,7 +479,7 @@ export function GmeetImportDialog({
           skips.delete(key);
           return { ...prev, skips };
         });
-        setError(OFFLINE_TITLE);
+        setError(NETWORK_ERROR_MESSAGE);
       }
     }
   };
@@ -506,7 +500,7 @@ export function GmeetImportDialog({
       // A dropped network rolls the unmute back and says why.
       if (isNetworkFailure(err)) {
         setSyncInfo((prev) => (prev ? { ...prev, skips: new Set([...prev.skips, key]) } : prev));
-        setError(OFFLINE_TITLE);
+        setError(NETWORK_ERROR_MESSAGE);
       }
     }
   };
@@ -526,7 +520,7 @@ export function GmeetImportDialog({
       }
     } catch (err) {
       // non-fatal — except a dropped network, which the user should see
-      if (isNetworkFailure(err)) setError(OFFLINE_TITLE);
+      if (isNetworkFailure(err)) setError(NETWORK_ERROR_MESSAGE);
     }
   }, []);
 
@@ -724,7 +718,6 @@ export function GmeetImportDialog({
   // never ran the one-time connect see the connect step.
   useEffect(() => {
     if (!(open && step === 'connect')) return;
-    if (blocked) return; // no Connect pitch offline — the banner says why
     const start = () => {
       if (focusMeeting?.eventStart) {
         // Reminder-row click: land on that meeting's day.
@@ -753,11 +746,8 @@ export function GmeetImportDialog({
     return () => {
       cancelled = true;
     };
-    // `blocked` is a dep on purpose: opened during the un-probed seconds
-    // before the connection verdict lands, the dialog would otherwise sit on
-    // "Loading your meetings…" until closed; re-running on the flip resumes.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [open, blocked]);
+  }, [open]);
 
   // Scroll the focused meeting into view once its row shows up — and open
   // its import options directly: the caller clicked THIS meeting to import
@@ -1546,23 +1536,12 @@ export function GmeetImportDialog({
           </DialogTitle>
         </DialogHeader>
 
-        {blocked && (
-          <p className="rounded-md border border-amber-500/40 bg-amber-500/10 px-3 py-1.5 text-xs text-amber-800 dark:text-amber-300" data-gmeet-offline-banner>
-            {OFFLINE_TITLE}
-          </p>
-        )}
-
-        {step === 'connect' && !connectPitch && !blocked && (
+        {step === 'connect' && !connectPitch && (
           <div className="py-10 text-center">
             <Loader2 className="h-6 w-6 animate-spin mx-auto text-muted-foreground" />
             <p className="mt-3 text-sm text-muted-foreground">Loading your meetings…</p>
           </div>
         )}
-        {step === 'connect' && !connectPitch && blocked && (
-          <p className="py-10 text-center text-sm text-muted-foreground">{OFFLINE_TITLE}</p>
-        )}
-
-        <fieldset disabled={blocked} className="contents">
 
         {step === 'connect' && connectPitch && (
           <div className="space-y-4 py-2 min-w-0">
@@ -2091,11 +2070,8 @@ export function GmeetImportDialog({
           </div>
         )}
 
-        </fieldset>
-
         {step === 'teams-options' && pickedTeams && (
           <div className="space-y-4 min-w-0">
-            <fieldset disabled={blocked} className="contents">
             <div className="rounded-md border bg-muted/40 p-3 space-y-1.5">
               <p className="text-sm font-medium flex items-center gap-2">
                 <TeamsLogo className="h-4 w-4 shrink-0" />
@@ -2248,14 +2224,13 @@ export function GmeetImportDialog({
             </div>
 
             {error && <p className="text-sm text-destructive">{error}</p>}
-            </fieldset>
 
             <DialogFooter>
               <Button variant="outline" onClick={() => setStep('pick')} disabled={busy}>
                 <ChevronLeft className="h-4 w-4 mr-1" />
                 Back
               </Button>
-              <Button onClick={() => void runTeamsImport()} disabled={busy || blocked} title={blocked ? OFFLINE_TITLE : undefined}>
+              <Button onClick={() => void runTeamsImport()} disabled={busy}>
                 {busy ? <Loader2 className="h-4 w-4 mr-1.5 animate-spin" /> : null}
                 Import
               </Button>
@@ -2265,7 +2240,6 @@ export function GmeetImportDialog({
 
         {step === 'teams-external' && pickedTeams && (
           <div className="space-y-4 min-w-0">
-            <fieldset disabled={blocked} className="contents">
             <div className="rounded-md border bg-muted/40 p-3 space-y-1.5">
               <p className="text-sm font-medium flex items-center gap-2">
                 <TeamsLogo className="h-4 w-4 shrink-0" muted />
@@ -2317,7 +2291,6 @@ export function GmeetImportDialog({
             </div>
 
             {error && <p className="text-sm text-destructive">{error}</p>}
-            </fieldset>
 
             <DialogFooter>
               <Button variant="outline" onClick={() => setStep('pick')} disabled={busy}>
@@ -2325,8 +2298,6 @@ export function GmeetImportDialog({
                 Back
               </Button>
               <Button
-                disabled={blocked}
-                title={blocked ? OFFLINE_TITLE : undefined}
                 onClick={() => {
                   handleClose();
                   requestMediaUpload();
@@ -2339,7 +2310,6 @@ export function GmeetImportDialog({
           </div>
         )}
 
-        <fieldset disabled={blocked} className="contents">
         {step === 'options' && picked && (
           <div className="space-y-4 min-w-0">
             <div className="rounded-md border bg-muted/40 p-3 space-y-1.5">
@@ -2703,15 +2673,13 @@ export function GmeetImportDialog({
           </div>
         )}
 
-        </fieldset>
-
         <DialogFooter>
           {step === 'connect' && connectPitch && (
             <>
               <Button variant="ghost" onClick={handleClose} disabled={busy}>
                 Cancel
               </Button>
-              <Button onClick={connect} disabled={busy || blocked} title={blocked ? OFFLINE_TITLE : undefined}>
+              <Button onClick={connect} disabled={busy}>
                 {busy ? (
                   <Loader2 className="h-4 w-4 mr-2 animate-spin" />
                 ) : (
@@ -2727,7 +2695,7 @@ export function GmeetImportDialog({
                 Cancel
               </Button>
               {selected.size > 0 && (
-                <Button onClick={() => void runBulkImport()} disabled={busy || blocked} title={blocked ? OFFLINE_TITLE : undefined}>
+                <Button onClick={() => void runBulkImport()} disabled={busy}>
                   <Download className="h-4 w-4 mr-2" />
                   Quick-import {selected.size} transcript{selected.size === 1 ? '' : 's'}
                 </Button>
@@ -2746,14 +2714,12 @@ export function GmeetImportDialog({
               </Button>
               <Button
                 onClick={() => runImport()}
-                title={blocked ? OFFLINE_TITLE : undefined}
                 disabled={
                   // Enriching alone doesn't block: once ANY artifact id is
                   // known (poller cache or calendar row), importing is safe —
                   // the server re-resolves everything authoritatively anyway.
                   // Pending artifacts count too: the server queues the import
                   // (defer) and runs it when Google finishes the file.
-                  blocked ||
                   busy ||
                   (!picked?.videoFileId &&
                     !picked?.transcriptDocId &&

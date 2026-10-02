@@ -1,7 +1,6 @@
 'use client';
 
 import { useCallback, useEffect, useMemo, useState } from 'react';
-import { OFFLINE_TITLE, useOfflineGate } from '@/lib/offline/offline-context';
 import { format, formatDistanceToNow, isToday, isYesterday } from 'date-fns';
 import {
   Dialog,
@@ -385,27 +384,17 @@ export function ActivityBar({ transcriptId, refreshSignal }: ActivityBarProps) {
   const [open, setOpen] = useState(false);
   const [loading, setLoading] = useState(false);
   const [selected, setSelected] = useState<string | null>(null);
-  // Pinned meetings serve /activity from the cache; older pins (before the
-  // URL joined the pin set) and un-pinned rows get a muted placeholder.
-  const { blocked } = useOfflineGate();
-  const [unavailable, setUnavailable] = useState(false);
-
   const load = useCallback(async () => {
     try {
       setLoading(true);
       const res = await fetch(`/api/transcripts/${transcriptId}/activity?limit=200`, {
         credentials: 'include',
       });
-      if (!res.ok) {
-        setUnavailable(true);
-        return;
-      }
+      if (!res.ok) return;
       const data = (await res.json()) as ActivitySummary;
       setSummary(data);
-      setUnavailable(false);
     } catch {
-      // network down / no cached answer — placeholder below
-      setUnavailable(true);
+      // network down — the bar just stays empty
     } finally {
       setLoading(false);
     }
@@ -422,7 +411,7 @@ export function ActivityBar({ transcriptId, refreshSignal }: ActivityBarProps) {
   if (!summary) {
     return (
       <div className="inline-flex h-6 items-center gap-2 text-[11px] text-muted-foreground">
-        {loading ? 'Loading activity…' : unavailable && blocked ? `Activity — ${OFFLINE_TITLE}` : ''}
+        {loading ? 'Loading activity…' : ''}
       </div>
     );
   }

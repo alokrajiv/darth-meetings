@@ -584,8 +584,8 @@ export function SplitClipDialog({
                   </button>
                 )}
                 <p className="border-t px-2 py-1 text-[11px] text-muted-foreground">
-                  Linking doesn&apos;t share the new meeting with anyone — the people invited
-                  show up as suggestions when you share it.
+                  Linking shares the new meeting with the Trames colleagues on the invite,
+                  as a Meet or Teams import would.
                 </p>
               </div>
             )}

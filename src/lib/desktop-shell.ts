@@ -34,7 +34,7 @@ export function desktopShellOsOf(ua: string): DesktopShellOs | null {
   return null;
 }
 
-/** `{shell: 'desktop', os}` inside the shell; null in a browser / the PWA. */
+/** `{shell: 'desktop', os}` inside the shell; null in a browser. */
 export function desktopShellOf(ua: string | null | undefined): DesktopShell | null {
   if (!ua || !isInDesktopShell(ua)) return null;
   return { shell: DESKTOP_SHELL_VALUE, os: desktopShellOsOf(ua) };

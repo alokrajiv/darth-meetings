@@ -28,9 +28,6 @@ describe('top-level nav: Meetings · Recordings · Series', () => {
     expect(navItemActive(series!, '/series')).toBe(true);
     expect(navItemActive(series!, null)).toBe(false);
   });
-  test('Recordings and Series need the server; Meetings stays live offline', () => {
-    expect(APP_NAV.filter((n) => n.needsServer).map((n) => n.key)).toEqual(['recordings', 'series']);
-  });
 });
 
 describe('old listing tabs land on /recordings', () => {

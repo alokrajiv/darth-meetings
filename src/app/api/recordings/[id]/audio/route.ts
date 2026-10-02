@@ -1,7 +1,7 @@
 import { NextResponse } from 'next/server';
 import { withAuth } from '@/lib/auth/with-auth';
 import { getRecordingForOwner } from '@/db-ops/recordings';
-import { reachableThroughMeeting, standaloneMedia } from '@/db-ops/standalone-recordings';
+import { standaloneMedia } from '@/db-ops/standalone-recordings';
 import { resolveAudioPath } from '@/lib/server/audio-storage';
 import { ensureAudioOnly } from '@/lib/server/audio-only';
 import { proxyBlobRange, serveStore } from '@/lib/server/media-serve';
@@ -16,13 +16,16 @@ const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/
  * bytes (design P7 risk §6.1: playback of an unclaimed recording needs a
  * route keyed on the RECORDING; the meeting media routes are untouched).
  *
- * REACHABILITY — exactly the two arms of migration 044, stated here as that
- * header requires, and nothing else:
- *   (a) the caller OWNS the recording (`recordings.owner_user_id`);
- *   (b) the caller can open a MEETING that holds a clip on it — owned, or
- *       shared to their email (a trashed meeting counts only for its owner).
- * Anything else is 404 — the same answer as for an id that does not exist,
- * so this is not an oracle (invariant I2).
+ * REACHABILITY — the OWNER only (`recordings.owner_user_id`), like every
+ * `/api/recordings/*` route. Anyone else is 404 — the same answer as for an
+ * id that does not exist, so this is not an oracle (invariant I2).
+ *
+ * A meeting holding a clip on this recording does NOT open this route to the
+ * people that meeting is shared with (owner, 2026-10-02: "it is not the
+ * recording being shared and the recording API shouldn't reply — it's the
+ * meeting API that reveals it"). Until then a meeting's readers reached the
+ * WHOLE recording here, even the minutes outside the meeting's clip window.
+ * They play the meeting through `/api/transcripts/:id/audio` instead.
  *
  * `?part=N` uses the player's numbering (1 = the canonical file, 2… the
  * parts); `?variant=audio` serves the 64 kbps extract when one exists.
@@ -32,8 +35,7 @@ export const GET = withAuth(async ({ user, request }, { params }) => {
   if (!id || !UUID_RE.test(id)) return notFound();
 
   const own = await getRecordingForOwner(user.userId, id).catch(() => null);
-  const allowed = own ? 'owner' : (await reachableThroughMeeting(id, user).catch(() => false)) ? 'meeting' : null;
-  if (!allowed) return notFound();
+  if (!own) return notFound();
 
   const media = (await standaloneMedia(id)).filter((m) => m.kind === 'canonical' || m.kind === 'part');
   const partNo = Number.parseInt(request.nextUrl.searchParams.get('part') ?? '1', 10);

@@ -135,7 +135,7 @@ export interface ResolvedMeetingContent {
   compat: boolean;
   recordingIds: string[];
   /** Stable hash of the clips, the transcriptions they read and the media
-   * ids — what an offline pin compares. In compat mode it is deliberately
+   * ids — what an offline replica compares. In compat mode it is deliberately
    * derived from the SAME inputs as today's plan rev. */
   rev: string;
   /** Edit-map key per utterance, same order as `content.utterances`. */

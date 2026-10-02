@@ -38,6 +38,7 @@ import {
 import { loadRecentSearches, saveRecentSearches } from '@/lib/recent-searches-store';
 import { shellSearchAction, useShellSignals, type ShellSearchDetail } from '@/lib/shell-signals';
 import { cn } from '@/lib/utils';
+import { NETWORK_ERROR_MESSAGE, networkErrorMessage } from '@/lib/fetch-errors';
 
 /**
  * Darth desktop shell search (README "Darth desktop shell").
@@ -570,11 +571,7 @@ export function MeetingSearchPanel({
           .catch((err: unknown) => {
             if (controller.signal.aborted) return;
             setHits([]);
-            setError(
-              err instanceof Error && err.message !== 'Failed to fetch'
-                ? err.message
-                : "Search needs the server — you're offline."
-            );
+            setError(networkErrorMessage(err, NETWORK_ERROR_MESSAGE));
             setStatus('error');
             setAnsweredSeq(seq);
           });

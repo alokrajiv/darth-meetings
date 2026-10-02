@@ -11,7 +11,9 @@ does not argue with them.
 1. **Recordings are for that person and never shared across. Only meetings can be.**
 2. **Temporary uploads always go against recordings.**
 3. **If a recording is linked to a meeting, access through the meetings API is different** — a recording is reachable
-   by its owner, or *through* a meeting the caller may see; never by itself to anyone else.
+   by its owner, or *through* a meeting the caller may see; never by itself to anyone else. *(2026-10-02, owner:
+   "through" means the MEETING's routes — `/api/recordings/*` answers the owner only, and the meeting reveals the
+   recording as if native, cut to its clip window.)*
 4. **Uploading / linking is an action from the user** — pop up and ask to confirm, or open the recording in the
    meeting UI to connect it. Never auto-link, never auto-share from a machine match.
 5. **The UI needs a clear separation: recordings or files — meetings — series.**
@@ -389,7 +391,7 @@ one and rides the existing flag/dual-write/diff-harness machinery.
 | # | Question | Recommendation |
 |---|---|---|
 | Q1 | Does the invitee-side existence hint ("X's Mac recorded this · Ask X to upload") survive rule 1? | **No** (§2.3). Delete it and the nudge; the owner-side "Looks like your recording …" prompt replaces it; a per-recording opt-in "tell the invitees" is the only rule-compatible revival, not built until asked. |
-| Q2 | When the user *links* a recording to an occurrence (tray Link, stepper, CLI `--event`, calendar-row Upload), does the link also share the meeting with all internal invitees with **edit**? | **No — link never shares.** Sharing is a second, explicit ask ("Share with the 8 invitees?") using the existing share-suggestions list, defaulting to *read*. Same behaviour on all four link paths and on retro-link. If the owner prefers to keep the auto-share, the card and the stepper must say it and the level. |
+| Q2 | When the user *links* a recording to an occurrence (tray Link, stepper, CLI `--event`, calendar-row Upload), does the link also share the meeting with all internal invitees with **edit**? | **No — link never shares.** Sharing is a second, explicit ask ("Share with the 8 invitees?") using the existing share-suggestions list, defaulting to *read*. Same behaviour on all four link paths and on retro-link. If the owner prefers to keep the auto-share, the card and the stepper must say it and the level. **REVERSED 2026-10-02 (owner): yes — a link shares the MEETING with the event's internal invitees exactly as a cloud import does (edit, no DM, stamped `event-link`); see "As built — a link shares like an import (2026-10-02)".** |
 | Q3 | Is an unclaimed recording transcribed on upload (today) or only when claimed (D-B's "never bill AAI for a recording nobody has claimed")? | **Transcribe on upload**, default on, tray setting "Transcribe recordings when uploaded" to turn off. The owner's Recordings surface is useless without text, the incident was about sharing not cost, and DEC-4 already made the AssemblyAI id disposable. D-B's cost worry is met by the same-file check and the 30-day expiry on temporaries. |
 | Q4 | Is the tray's auto-upload (default on, `main.swift:89-91`) a "user action" under rule 4? | **Yes.** Upload lands in the owner's private Recordings and shares nothing; the ask is for the *link*. Keep the toggle; keep "Keep on this Mac" in the Record dialog. |
 | Q5 | Does "Name…" on a recording make a standalone meeting? | **Yes, and call it "Make a meeting".** A name on a recording is a meeting's title; a recording keeps the call's own title as a label, not a name. |
@@ -623,6 +625,8 @@ a transcript API suffix, `…/:id/series`), and `/series` is not in `SHELL_PAGES
 (`src/lib/offline/offline-sync.ts`) either — Series is "handled" offline by its nav entry being
 disabled. `/recordings` is handled the same way (`needsServer: true`), and is not precached: it
 has nothing to show without the server.
+*(2026-10-02: superseded — the web offline mode, `src/lib/offline/*` and `needsServer` were removed;
+offline lives in the desktop shell. README "Offline and PWA — removed 2026-10-02".)*
 
 ### P5 — only meetings take a share (`2d0ba0b`)
 
@@ -668,6 +672,9 @@ the route calling it on POST only, the page's Share condition, the surface readi
   shows no poller activity, but it is recorded here rather than assumed away.
 
 ## As built — P4 (2026-09-23)
+
+> **Superseded 2026-10-02** for what a user link does to shares (it shares again, like a cloud import) — see "As
+> built — a link shares like an import (2026-10-02)" below. The no-auto-link half of P4 stands.
 
 Owner decision (Alok, 2026-09-23): recordings are never shared; only meetings carry shares, and
 sharing is a meeting action the person takes. **Linking a recording to a calendar occurrence never
@@ -742,6 +749,60 @@ meeting, owner and emails. Suite: `TZ=UTC bun test` 1240 pass; `tsc`, eslint on 
 - `recorder-recordings.tsx` sends `linkedEvent ?? r.matched` on Upload from the Settings card /
   picker: a machine match becomes a link when the person presses Upload on that row. After P4 it no
   longer shares, but it is still a link the person did not pick explicitly (rule 4). Not changed.
+
+## As built — a link shares like an import (2026-10-02)
+
+Owner decision (Alok, 2026-10-02 ~12:00 SGT), reversing P4 / Q2: *"linked to a calendar event means share with
+internal invitees like cloud imports do. Once linked, the meeting is shared as per meeting policy. Recordings are
+first-class objects and so are meetings; meeting share rules have always been the same. Even when a recording is
+attached to a meeting, it is not the recording being shared and the recording API shouldn't reply — it's the meeting
+API that reveals it, as if native, internally stripping to which minute to which minute or the whole recording."*
+
+P4's **no auto-LINK** stands: linking is still something a person does; a recorder match is a suggestion and never
+shares. Only what a user-made link does to the meeting's shares changed.
+
+### What changed
+
+- `src/lib/server/auto-share.ts` — one helper, `shareWithInternalInvitees(arm, …)`, two arms of ONE rule (internal
+  domains `trames.sg` / `trames-engineering.com`, edit, never the owner, no DM — the import arm never DM'd either):
+  `'cloud-import'` (unchanged behaviour, unstamped, upsert) and `'event-link'` (stamped `origin='event-link'`,
+  migration 048; reads the meeting's existing shares first and adds only the missing people, so a re-link is
+  idempotent and a person's own share — including a downgrade to *read* — is never rewritten or stamped).
+- Every user link path calls the `'event-link'` arm at LINK time, ready or not:
+  `openUpload` (tray Link, web stepper, calendar-row Upload, `darth-cli upload --event`, `POST /api/transcripts`
+  with `x-linked-event`; not for `sourceId` re-runs — retranscribe copies the source's shares — nor `attachTo`),
+  `makeMeeting` in `recording-actions.ts` (`POST /api/recordings/:id/link` with an event — `shares` in the answer is
+  now the real count; "Make a meeting" and the `meetingId` arm share nobody), `POST …/link-event` (retro-link, the
+  "Link to it" strips; answers `shared`), split-to-an-event (`clip-split.ts`; `linkedEvent.shared` in the answer), and
+  a text import linked to an event (`ingestParsedUtterances({ eventLinkShareList })`). An editor linking someone
+  else's meeting never shares the owner with themself (owner email from `identityForUser`).
+- `recording-settle.ts` (an early-made meeting whose text lands later) does not share — the share already happened
+  at link time, so nobody is shared or notified twice.
+- Unlink (`PATCH {unlinkEvent:true}` → `removeLinkBornShares`) is unchanged: it deletes by `origin='event-link'`,
+  which is exactly what the link arm writes. Import shares (no origin) survive an unlink, as before.
+- **The recording stays personal.** `/api/recordings/:id/audio` lost its second arm (`reachableThroughMeeting`,
+  removed): a person a meeting is shared with used to be able to stream the WHOLE recording there, including the
+  minutes outside the meeting's clip window. Every `/api/recordings/*` route now answers the owner only; readers play
+  the meeting through `/api/transcripts/:id/audio`. (`POST /api/recordings/:id/align` still accepts a recording
+  reached through a meeting the caller can EDIT — it returns an offset, never content.)
+- `companion-banner.tsx` "Upload now" no longer forwards the tray's `matched` event as `linkedEvent`: with links
+  sharing again, that would turn a machine guess into an 8-person share — the 2026-09-22 incident. It uploads
+  unlinked; the server parks the match as the meeting's suggestion.
+- Copy (web + darth-cli source): upload stepper link step, split dialog, link dialog, recording card's Link tooltip,
+  the calendar-row recorder Upload tooltip, the suggestion tooltip, darth-cli `upload --event` / `link` /
+  `recordings link` help and output. Not changed (Swift, next tray build): the tray's "Link to “<event>”?" card
+  (`Banner.swift` `showLinkConfirm`) should say the meeting will be shared with N Trames colleagues.
+
+### Tests
+
+`src/lib/server/__tests__/link-shares-like-imports.test.ts` (renamed from `link-never-shares.test.ts`, fake postgres
+tag): a tray-style linked upload with 8 internal invitees (+ the owner in mixed case and an external guest) writes
+exactly those 8 edit shares stamped `event-link` on the placeholder; unlinked / no-internal-invitee / `attachTo`
+uploads write none; `linkRecording` with an event shares 8 on the new meeting and answers `shares: 8`, "Make a
+meeting" writes no share query at all; the settle never shares; a re-link skips existing shares (a read share stays
+read); the cloud-import arm still writes 8 unstamped edit shares; Unlink deletes by the same origin value; a share
+recipient resolves the meeting but gets 404 from `/api/recordings/:id`, `/content` and `/audio` (the owner gets 200),
+and the media route no longer asks the shared-meeting question at all.
 
 ## As built — P7/P8 (2026-09-23)
 

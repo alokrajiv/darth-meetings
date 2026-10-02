@@ -55,7 +55,9 @@ describe('the tooltip names BOTH halves', () => {
     expect(why).toContain('overlap 100%');
     expect(why).toContain('title match 0%');
     expect(why).toContain('This recording is a Slack call and that invite is Google Meet');
-    expect(why).toContain('Nothing is linked or shared until you say so.');
+    expect(why).toContain('Nothing is linked or shared until you say so;');
+    // A link shares the meeting with the invite's internal people (2026-10-02).
+    expect(why).toContain('linking shares the meeting with the Trames colleagues on the invite.');
   });
   test('same product → no warning', () => {
     expect(suggestedEventWhy({ ...TRITON, callKind: 'meet' })).not.toContain('check before linking');
