@@ -42,7 +42,9 @@
 # running, drained, for you to stop). HTTP traffic never pauses.
 #
 # The VM keeps its own .env.local, storage/ and node_modules — never synced
-# (green's .env.local and storage are symlinks to blue's).
+# (green's .env.local is a symlink to blue's; the media store is shared through
+# an absolute MW_STORAGE_DIR — green has no storage/ dir, a symlink there breaks
+# Turbopack's build trace).
 set -euo pipefail
 
 VM="azureuser@172.17.0.6"

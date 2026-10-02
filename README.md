@@ -247,9 +247,12 @@ process so the restart never came, and the restart itself was an nginx 502.
 | blue | `~/apps/meeting-whisperer` | `meeting-whisperer` | 3002 |
 | green | `~/apps/meeting-whisperer-green` | `meeting-whisperer-green` | 3012 |
 
-Green's `.env.local` and `storage/` are symlinks to blue's (`MW_STORAGE_DIR`
-unset or relative resolves against each colour's cwd → the symlink; absolute →
-shared anyway). The nginx vhost (`deploy/nginx-meetings.conf`) proxies to
+Green's `.env.local` is a symlink to blue's, and the media store is shared
+through an ABSOLUTE `MW_STORAGE_DIR` in that file (`…/meeting-whisperer/storage`,
+appended by the setup script when missing). Green has no `storage/` of its own —
+a symlink there breaks `next build`: Turbopack traces `storage/` from
+audio-storage.ts, follows it into blue's tree and fails with "Symlink … points
+out of the filesystem root" (2026-10-02). The nginx vhost (`deploy/nginx-meetings.conf`) proxies to
 `upstream meetings_app`, whose servers come from `/etc/nginx/mw-active.conf`:
 the live colour first, the other as `backup` (a refused connect on the live one
 is retried on the backup — `proxy_next_upstream error timeout`, deliberately not

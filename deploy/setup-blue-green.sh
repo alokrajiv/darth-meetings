@@ -66,11 +66,22 @@ link_shared() { # <name>
   fi
 }
 link_shared .env.local
-link_shared storage
-# MW_STORAGE_DIR: absolute → both colours already share it; relative (or unset,
-# default ./storage) → resolved against each colour's cwd → the symlink above.
+# The media store is shared through an ABSOLUTE MW_STORAGE_DIR in the (shared)
+# .env.local — never through a storage/ symlink in green: Turbopack's build
+# traces `storage/` from audio-storage.ts, follows the symlink into blue's tree
+# and fails with "Symlink … points out of the filesystem root" (seen 2026-10-02).
+if [[ -L "$GREEN_DIR/storage" ]]; then rm "$GREEN_DIR/storage"; say "  removed the old storage symlink in green"; fi
+[[ -e "$GREEN_DIR/storage" ]] && die "$GREEN_DIR/storage exists — green must not have its own media store; move it away"
 storage_env="$(grep -E '^[[:space:]]*MW_STORAGE_DIR=' "$BLUE_DIR/.env.local" | tail -1 | cut -d= -f2- || true)"
-say "  MW_STORAGE_DIR in .env.local: ${storage_env:-<unset: ./storage per colour → shared via the symlink>}"
+if [[ -z "$storage_env" ]]; then
+  printf '\n# blue/green: one absolute media store for both colours (green has no storage/ dir)\nMW_STORAGE_DIR=%s/storage\n' "$BLUE_DIR" >> "$BLUE_DIR/.env.local"
+  storage_env="$BLUE_DIR/storage"
+  say "  MW_STORAGE_DIR=$storage_env appended to .env.local (blue reads the same path relatively today)"
+elif [[ "$storage_env" != /* ]]; then
+  die "MW_STORAGE_DIR in .env.local is relative ($storage_env) — make it absolute so both colours share one store"
+else
+  say "  MW_STORAGE_DIR=$storage_env (absolute, shared)"
+fi
 
 # --- 2. maintenance files -------------------------------------------------------
 say "maintenance dir $NOTICE_DIR"
