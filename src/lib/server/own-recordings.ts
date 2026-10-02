@@ -2,8 +2,10 @@ import 'server-only';
 import { listPendingVisibleToUser } from '@/db-ops/transcripts';
 import {
   hydrateOwnMeetingRows,
+  linkedMeetingsForOwnRecordings,
   listOwnRecordingsPage,
   ownRegistryRowsByIds,
+  type LinkedMeetingRef,
   type PageKey,
 } from '@/db-ops/own-recordings-page';
 import { getStandaloneViewsForOwner, standaloneColumnsExist } from '@/db-ops/standalone-recordings';
@@ -32,6 +34,9 @@ import {
  *                   `transcripts` rows the P6 tabs showed), until they are
  *                   linked, trashed or expire;
  *   - `registry`  — Darth Recorder rows still on a Mac.
+ * Plus, only when asked for by name (`section=linked`, 2026-10-02): the
+ * caller's standalone recordings a live meeting holds, each with the
+ * meetings it is in — kind `recording`, section `linked`, `meetings: [...]`.
  * No day window: the P6 version took the legacy halves from the meetings
  * listing's newest 60 days / ~200 rows, so older recordings silently
  * vanished. Per-section counts ride on every page.
@@ -41,8 +46,22 @@ import {
  * drops anything whose owner is not the caller — the belt on the braces.
  */
 
+/** A meeting a linked recording is in — one the caller can open. */
+export interface LinkedMeeting {
+  assemblyai_id: string;
+  title: string | null;
+  recorded_at: string | null;
+}
+
 export type RecordingsPageItem =
-  | { kind: 'recording'; section: RecordingSection; sort_us: string; recording: RecordingView }
+  | {
+      kind: 'recording';
+      section: RecordingSection;
+      sort_us: string;
+      recording: RecordingView;
+      /** Section 'linked' only: the live meetings holding it that the caller can open. */
+      meetings?: LinkedMeeting[];
+    }
   | {
       kind: 'meeting';
       section: RecordingSection;
@@ -75,6 +94,8 @@ export function foldOwnPage(
     recordingOwners: Map<string, string>;
     meetings: TranscriptListRow[];
     registry: Array<{ user_id: string; view: OwnRecordingView }>;
+    /** The 'linked' section's meetings, by recording id. */
+    linkedMeetings?: Map<string, LinkedMeeting[]>;
   }
 ): RecordingsPageItem[] {
   const recs = new Map(
@@ -94,7 +115,13 @@ export function foldOwnPage(
   for (const k of keys) {
     if (k.kind === 'recording') {
       const recording = recs.get(k.id);
-      if (recording) out.push({ kind: 'recording', section: k.section, sort_us: k.sort_us, recording });
+      if (!recording) continue;
+      if (k.section === 'linked') {
+        const meetings = hydrated.linkedMeetings?.get(k.id) ?? [];
+        out.push({ kind: 'recording', section: 'linked', sort_us: k.sort_us, recording, meetings });
+      } else {
+        out.push({ kind: 'recording', section: k.section, sort_us: k.sort_us, recording });
+      }
     } else if (k.kind === 'meeting') {
       const row = meetings.get(k.id);
       if (row) {
@@ -145,15 +172,24 @@ export async function listOwnRecordingsSurface(
     await Promise.all(processing.map((r) => refreshBornBare(r.id).catch(() => false)));
     recRows = await getStandaloneViewsForOwner(user.userId, recIds);
   }
+  const linkedIds = page.keys.filter((k) => k.kind === 'recording' && k.section === 'linked').map((k) => k.id);
+  const linkedRefs = withStandalone && linkedIds.length > 0 ? await linkedMeetingsForOwnRecordings(user, linkedIds) : [];
+  const linkedMeetings = groupLinkedMeetings(linkedRefs);
   const meetings = await hydrateOwnMeetingRows(user.userId, meetingIds);
   const linkedRegIds = meetings.map((m) => m.recorder_recording_id).filter((id): id is string => !!id);
   const regRows = await ownRegistryRowsByIds(user.userId, [...regIds, ...linkedRegIds]);
 
   const items = foldOwnPage(user.userId, page.keys, {
-    recordings: recRows.map((r) => recordingViewOf(r)),
+    recordings: recRows.map((r) =>
+      recordingViewOf(
+        r,
+        (linkedMeetings.get(r.id) ?? []).map((m) => ({ assemblyai_id: m.assemblyai_id, title: m.title, trashed: false }))
+      )
+    ),
     recordingOwners: new Map(recRows.map((r) => [r.id, r.owner_user_id])),
     meetings,
     registry: regRows.map((r) => ({ user_id: r.user_id, view: ownView(r) })),
+    linkedMeetings,
   });
   return {
     items,
@@ -162,4 +198,23 @@ export async function listOwnRecordingsSurface(
       : null,
     counts: page.counts,
   };
+}
+
+/** The linked meetings by recording id, newest meeting first. */
+export function groupLinkedMeetings(refs: LinkedMeetingRef[]): Map<string, LinkedMeeting[]> {
+  const out = new Map<string, LinkedMeeting[]>();
+  const iso = (v: string | Date | null) => {
+    if (!v) return null;
+    const d = v instanceof Date ? v : new Date(v);
+    return Number.isNaN(d.getTime()) ? null : d.toISOString();
+  };
+  for (const r of refs) {
+    const list = out.get(r.recording_id) ?? [];
+    list.push({ assemblyai_id: r.assemblyai_id, title: r.title, recorded_at: iso(r.recorded_at as string | Date | null) });
+    out.set(r.recording_id, list);
+  }
+  for (const list of out.values()) {
+    list.sort((a, b) => (b.recorded_at ?? '').localeCompare(a.recorded_at ?? ''));
+  }
+  return out;
 }

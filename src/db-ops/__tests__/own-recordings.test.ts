@@ -325,3 +325,154 @@ describe('two users, one database — each sees only their own', () => {
     expect(out).toEqual({ items: [], next_cursor: null, counts: { mac: 0, uploaded: 0, temporary: 0 } });
   });
 });
+
+// ---------------------------------------------------------------------------
+// section=linked (2026-10-02): a linked recording stays findable on
+// /recordings. Asked for by name only; the default answer is unchanged.
+// ---------------------------------------------------------------------------
+
+describe('section=linked', () => {
+  /** The SQL text with the schema qualifier dropped. */
+  const norm = (t: string) => t.replace(/"[a-z_]+"\./g, '');
+  const RA2 = 'a1111111-0000-4000-8000-000000000002';
+  const linkedWorld = () => ({
+    keys: [
+      { kind: 'recording', id: RA2, section: 'linked', sort_us: '1758527280000009' },
+      { kind: 'recording', id: RB, section: 'linked', sort_us: '1758527280000008' },
+    ],
+    counts: [
+      { section: 'mac', n: 1 },
+      { section: 'uploaded', n: 2 },
+      { section: 'linked', n: 1 },
+    ],
+    recordings: [
+      { ...recordingRow(RA2, A.userId), live_clips: 1, all_clips: 1, recorder_call: { app: 'Microsoft Teams', title: 'x' } },
+      { ...recordingRow(RB, B.userId), live_clips: 1, all_clips: 1 },
+    ],
+    meetingRefs: [
+      { recording_id: RA2, assemblyai_id: 'm-old', title: 'Data scrum', recorded_at: new Date('2026-09-20T02:00:00Z') },
+      { recording_id: RA2, assemblyai_id: 'm-new', title: 'Ivan sync', recorded_at: '2026-10-02T01:00:00.000Z' },
+      // A row for someone else's recording, as if the owner predicate were gone.
+      { recording_id: RB, assemblyai_id: 'm-b', title: 'Bea only', recorded_at: '2026-10-02T01:00:00.000Z' },
+    ],
+  });
+
+  const useLinkedWorld = () => {
+    const w = linkedWorld();
+    respond = (q) => {
+      if (q.text.includes('information_schema.columns')) return [{ n: 6 }];
+      if (q.text.includes('DISTINCT ON (c.recording_id')) return w.meetingRefs;
+      if (q.text.includes('GROUP BY i.section')) return w.counts;
+      if (q.text.includes('ORDER BY i.sort_us DESC')) return w.keys;
+      if (q.text.includes('.recordings r') && q.text.includes('r.id = ANY')) return w.recordings;
+      return [];
+    };
+  };
+
+  const run = async (who: typeof A, qs: string) => {
+    const parsed = page.parseRecordingsPageQuery(params(qs));
+    if (!parsed.ok) throw new Error(parsed.error);
+    return mod.listOwnRecordingsSurface(who, parsed.query);
+  };
+
+  test('parse: only by name — the default set and the old flags never include it', () => {
+    const s = (qs: string) => {
+      const r = page.parseRecordingsPageQuery(params(qs));
+      return r.ok ? r.query.sections : null;
+    };
+    expect(s('mine=1&section=linked')).toEqual(['linked']);
+    for (const qs of ['mine=1', 'mine=1&unlinked=1', 'mine=1&temporary=1', 'mine=1&unlinked=1&temporary=1']) {
+      expect(s(qs)).not.toContain('linked');
+    }
+  });
+
+  test('default answer: no linked arm in the SQL, counts keep exactly three keys', async () => {
+    useLinkedWorld(); // even a database that answers a 'linked' count…
+    const out = await run(A, 'mine=1&limit=0');
+    expect(Object.keys(out.counts)).toEqual(['mac', 'uploaded', 'temporary']);
+    expect(out.counts).toEqual({ mac: 1, uploaded: 2, temporary: 0 });
+    const countSql = sql.executed.find((q) => q.text.includes('GROUP BY i.section'))!;
+    expect(countSql.text).not.toContain("'linked' AS section");
+    // …and the unlinked arm still excludes recordings a live meeting holds.
+    expect(norm(countSql.text)).toContain(
+      'AND NOT EXISTS (SELECT 1 FROM meeting_clips c JOIN transcripts tc ON tc.id = c.transcript_id WHERE c.recording_id = r.id AND tc.deleted_at IS NULL)'
+    );
+  });
+
+  test('the linked arm: the caller’s standalone recordings WITH a live clip, owner-bound', async () => {
+    useLinkedWorld();
+    await run(A, 'mine=1&section=linked');
+    const pageSql = sql.executed.find((q) => q.text.includes('ORDER BY i.sort_us DESC'))!;
+    expect(pageSql.text).toContain("'linked' AS section");
+    expect(norm(pageSql.text)).toMatch(
+      /'linked' AS section, .*? FROM recordings r WHERE r\.owner_user_id = \$\d+ AND r\.standalone AND r\.deleted_at IS NULL AND EXISTS \(SELECT 1 FROM meeting_clips c JOIN transcripts tc ON tc\.id = c\.transcript_id WHERE c\.recording_id = r\.id AND tc\.deleted_at IS NULL\)/
+    );
+    const ids = pageSql.params.filter((p) => typeof p === 'string' && /^[ab]{8}-/.test(p as string));
+    expect(new Set(ids)).toEqual(new Set([A.userId]));
+    expect(pageSql.params).toContainEqual(['linked']);
+  });
+
+  test('items carry the meetings they are in (newest first); counts.linked rides along', async () => {
+    useLinkedWorld();
+    const out = await run(A, 'mine=1&section=linked');
+    expect(out.counts).toEqual({ mac: 1, uploaded: 2, temporary: 0, linked: 1 });
+    expect(out.items).toHaveLength(1); // B's recording dropped by the fold
+    const it = out.items[0]!;
+    if (it.kind !== 'recording') throw new Error('kind');
+    expect(it.section).toBe('linked');
+    expect(it.recording.id).toBe(RA2);
+    expect(it.recording.in_meeting).toBe(true);
+    expect(it.recording.source_app).toBe('Microsoft Teams');
+    expect(it.meetings).toEqual([
+      { assemblyai_id: 'm-new', title: 'Ivan sync', recorded_at: '2026-10-02T01:00:00.000Z' },
+      { assemblyai_id: 'm-old', title: 'Data scrum', recorded_at: '2026-09-20T02:00:00.000Z' },
+    ]);
+    expect(it.recording.meetings.map((m) => m.id)).toEqual(['m-new', 'm-old']);
+    const wire = JSON.stringify(out);
+    expect(wire).not.toContain(RB);
+    expect(wire).not.toContain('Bea only');
+  });
+
+  test('the meetings lookup is caller-scoped: own recordings, live meetings the caller can open', async () => {
+    useLinkedWorld();
+    await run(A, 'mine=1&section=linked');
+    const q = sql.executed.find((x) => x.text.includes('DISTINCT ON (c.recording_id'))!;
+    expect(q).toBeDefined();
+    expect(q.text).toContain('r.owner_user_id = $');
+    expect(q.text).toContain('t.deleted_at IS NULL');
+    expect(norm(q.text)).toMatch(
+      /t\.user_id = \$\d+ OR EXISTS \(SELECT 1 FROM transcript_shares s WHERE s\.transcript_id = t\.id AND s\.shared_with_email = \$\d+\)/
+    );
+    expect(q.params).toContain(A.userId);
+    expect(q.params).toContain('alok.raj@trames.sg'); // lower-cased, as shares store it
+    expect(q.params).not.toContain(B.userId);
+    expect(q.params).toContainEqual([RA2, RB]); // the page's keys — re-scoped by owner in SQL
+  });
+
+  test('no meetings lookup when the page holds no linked item', async () => {
+    await run(A, 'mine=1');
+    expect(sql.executed.some((q) => q.text.includes('DISTINCT ON (c.recording_id'))).toBe(false);
+  });
+
+  test('a linked recording whose meeting the caller cannot open still lists, with no meeting named', async () => {
+    useLinkedWorld();
+    const prev = respond;
+    respond = (q) => (q.text.includes('DISTINCT ON (c.recording_id') ? [] : prev(q));
+    const out = await run(A, 'mine=1&section=linked');
+    const it = out.items[0]!;
+    expect(it.kind === 'recording' && it.meetings).toEqual([]);
+  });
+});
+
+describe('groupLinkedMeetings (pure)', () => {
+  test('groups by recording, ISO dates, newest first, null dates last', () => {
+    const g = mod.groupLinkedMeetings([
+      { recording_id: 'r1', assemblyai_id: 'a', title: null, recorded_at: null },
+      { recording_id: 'r1', assemblyai_id: 'b', title: 'B', recorded_at: '2026-10-01T00:00:00Z' },
+      { recording_id: 'r2', assemblyai_id: 'c', title: 'C', recorded_at: '2026-09-01T00:00:00Z' },
+    ]);
+    expect(g.get('r1')!.map((m) => m.assemblyai_id)).toEqual(['b', 'a']);
+    expect(g.get('r1')![0]!.recorded_at).toBe('2026-10-01T00:00:00.000Z');
+    expect(g.get('r2')).toHaveLength(1);
+  });
+});
