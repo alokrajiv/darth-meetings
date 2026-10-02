@@ -4,6 +4,7 @@ import { z } from 'zod';
 import { tool, createSdkMcpServer } from '@anthropic-ai/claude-agent-sdk';
 import { logPayloadMissing } from '@/lib/server/aai-retention';
 import { runClaudeWithMeta, parseJsonFromClaude } from '@/lib/server/claude-agent';
+import { frameRefusal } from '@/lib/clip-cut';
 import {
   extractFrameFromMedia,
   frameSourceFor,
@@ -565,9 +566,16 @@ function buildVideoTools(
             // reading shows). For a meeting split off a longer recording,
             // the file is shared and the seek is `localMsIn` — the same
             // mapping the `frame:<ms>` it writes will be served through.
+            // Only moments INSIDE the meeting's window of the file — the
+            // same refusal the frames route applies (lib/clip-cut.ts).
+            const fileMs = localMsIn(source, ms);
+            if (frameRefusal({ media: source, fileMs, meetingMs: ms })) {
+              content.push({ type: 'text', text: `Frame at ${ms} ms unavailable: outside this meeting` });
+              continue;
+            }
             // `…FromMedia`: when the stored copy is gone the archived file is
             // pulled into media-local's cache once and every grab reads it.
-            const abs = await extractFrameFromMedia(assemblyaiId, source, localMsIn(source, ms), ms, width);
+            const abs = await extractFrameFromMedia(assemblyaiId, source, fileMs, ms, width);
             const data = await fsp.readFile(abs);
             stats.grabbed++;
             content.push({ type: 'text', text: `Frame at ${m}:${String(s).padStart(2, '0')} (${ms} ms):` });
@@ -587,7 +595,7 @@ function buildVideoTools(
 function rewriteFrameRefs(notes: string, assemblyaiId: string, source: ResolvedMedia | null): string {
   return notes.replace(/\(frame:(\d+)\)/g, (_m, msStr: string) => {
     const ms = Number.parseInt(msStr, 10);
-    if (source) {
+    if (source && !frameRefusal({ media: source, fileMs: localMsIn(source, ms), meetingMs: ms })) {
       void extractFrameFromMedia(assemblyaiId, source, localMsIn(source, ms), ms).catch(() => {});
     }
     return `(/api/transcripts/${assemblyaiId}/frames/${ms}.jpg)`;

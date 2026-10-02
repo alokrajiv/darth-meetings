@@ -8,6 +8,7 @@ import {
   holeAt,
   meetingMsOf,
   pastWindowEnd,
+  servedIsWholeFile,
   windowDurationMs,
   type PlaybackWindow,
 } from '@/lib/clip-window';
@@ -59,16 +60,27 @@ interface AudioPlayerProps {
   /** Second line on the lock screen — e.g. the meeting date. */
   mediaSubtitle?: string;
   /**
-   * The window of the file this meeting is (Phase 3a — a meeting split off a
-   * longer recording). null/undefined = the whole file, which is every
-   * meeting that was never split.
+   * The window of the SERVED media this player must clamp to — null/undefined
+   * = all of it, which is every meeting that was never split and, since the
+   * server cuts windows itself (2026-10-02, lib/clip-cut.ts), a split-off
+   * meeting too: its `/audio` IS the window, starting at 0.
    *
-   * Nothing is cut: `/audio` serves the same bytes. The PLAYER clamps —
-   * playback starts at `fromMs`, stops at `toMs`, the scrubber spans the
-   * window and the clock reads from 0. Native controls cannot lie about a
-   * file's duration, so a windowed player draws its own transport.
+   * When set, the PLAYER clamps — playback starts at `fromMs`, stops at
+   * `toMs`, the scrubber spans the window and the clock reads from 0. Native
+   * controls cannot lie about a file's duration, so a windowed player draws
+   * its own transport. A negative `fromMs` means the served file starts that
+   * far INTO the meeting (lib/clip-window.ts `ServedPlayback`).
    */
   window?: PlaybackWindow | null;
+  /**
+   * What to clamp to instead when the loaded media turns out to be the WHOLE
+   * file rather than the cut (`servedIsWholeFile` against `cutSpanMs`): a copy
+   * the browser's HTTP cache kept from before the server cut windows,
+   * or a server one deploy behind. Ignored when `cutSpanMs` is null/undefined.
+   */
+  wholeFileWindow?: PlaybackWindow | null;
+  /** How long the served cut should be, ms (see `wholeFileWindow`). */
+  cutSpanMs?: number | null;
   /**
    * Stretches of THIS meeting's timeline that are now a meeting of their own
    * (the source's side of a split). Not its content any more, so playback
@@ -148,11 +160,17 @@ export const AudioPlayer = forwardRef<AudioPlayerHandle, AudioPlayerProps>(
       // `window` as a prop name reads right at the call site and would be a
       // trap in here, where the global is used for timers — so it is renamed
       // exactly once, on the way in.
-      window: clipWindow = null,
+      window: servedWindow = null,
+      wholeFileWindow = null,
+      cutSpanMs = null,
       holes,
     },
     ref
   ) {
+    // The loaded bytes were the whole file, not the cut (see the props) —
+    // decided on every loadedmetadata, so a later load of the cut flips back.
+    const [servedWhole, setServedWhole] = useState(false);
+    const clipWindow = servedWhole ? wholeFileWindow : servedWindow;
     const mediaRef = useRef<HTMLMediaElement | null>(null);
     // Live in a ref too: the media event handlers below are recreated every
     // render, but the imperative handle and the Media Session handlers are
@@ -195,6 +213,7 @@ export const AudioPlayer = forwardRef<AudioPlayerHandle, AudioPlayerProps>(
     useEffect(() => {
       reloadsRef.current = 0;
       setForceViaApp(false);
+      setServedWhole(false);
     }, [src]);
 
     useEffect(() => {
@@ -524,6 +543,11 @@ export const AudioPlayer = forwardRef<AudioPlayerHandle, AudioPlayerProps>(
       onLoadedMetadata: (e: React.SyntheticEvent<HTMLMediaElement>) => {
         const m = e.target as HTMLMediaElement;
         const fileDuration = Number.isFinite(m.duration) ? m.duration * 1000 : null;
+        // Cut or whole file? The ref is updated NOW so every mapping below —
+        // and the parent's pending seek right after — already uses the answer.
+        const whole = servedIsWholeFile(fileDuration, cutSpanMs);
+        windowRef.current = whole ? wholeFileWindow : servedWindow;
+        setServedWhole(whole);
         const span = windowDurationMs(windowRef.current, fileDuration);
         setSpanSec(span === null ? null : span / 1000);
         // A split-off meeting opens at its own 0, not at the top of the hour.

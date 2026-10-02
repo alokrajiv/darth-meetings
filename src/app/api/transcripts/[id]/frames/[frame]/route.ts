@@ -11,6 +11,8 @@ import {
   mediaHasVideo,
 } from '@/lib/server/video-frames';
 import { resolveMeetingContent } from '@/lib/server/recordings';
+import { frameRefusal } from '@/lib/clip-cut';
+import { holesFromContext } from '@/lib/clip-window';
 
 export const runtime = 'nodejs';
 
@@ -29,6 +31,12 @@ export const runtime = 'nodejs';
  * `frameRequestFor` (lib/server/video-frames.ts) — the one place meeting ms
  * becomes file ms. The cache stays keyed by the MEETING's ms, which is what
  * the citation in its notes says.
+ *
+ * A timestamp OUTSIDE the meeting is refused (2026-10-02): before or after the
+ * meeting's window of the file, or inside a hole that was split off into
+ * somebody else's meeting. A frame is the recording too, and the meeting API
+ * reveals only the minutes the meeting holds (lib/clip-cut.ts
+ * `frameRefusal`). The refusal is a 404, checked BEFORE the cache is read.
  */
 export const GET = withAuth(async ({ user }, { params }) => {
   const { id, frame } = await params;
@@ -44,6 +52,23 @@ export const GET = withAuth(async ({ user }, { params }) => {
   }
 
   const request = frameRequestFor((await resolveMeetingContent(access.row)).media, ms);
+  if (!request) {
+    return NextResponse.json({ error: 'No video stored for this transcript' }, { status: 404 });
+  }
+  // Outside the meeting (before / after its window of the file, or in a hole
+  // split off into another meeting): refused before even the cache is read.
+  const refused = frameRefusal({
+    media: request.source,
+    fileMs: request.fileMs,
+    meetingMs: ms,
+    holes: holesFromContext(
+      access.row.gmeet_context,
+      access.row.duration != null ? access.row.duration * 1000 : null
+    ),
+  });
+  if (refused) {
+    return NextResponse.json({ error: 'That moment is not part of this meeting' }, { status: 404 });
+  }
   // A meeting whose stored copy was archived and purged still has its
   // frames: a cached one is served without looking at the media at all, and
   // a new one is cut from the archived file pulled into media-local's cache
@@ -51,7 +76,7 @@ export const GET = withAuth(async ({ user }, { params }) => {
   const cached = await stat(framePath(access.row.assemblyai_id, ms))
     .then((st) => st.size > 0)
     .catch(() => false);
-  if (!request || (!cached && !(await mediaHasVideo(request.source)))) {
+  if (!cached && !(await mediaHasVideo(request.source))) {
     return NextResponse.json({ error: 'No video stored for this transcript' }, { status: 404 });
   }
 
