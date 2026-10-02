@@ -4,7 +4,6 @@ import { Zap } from 'lucide-react';
 import type { GmeetContext } from '@/lib/format';
 import { autoMarkerOf } from '@/lib/auto-marker';
 import { reportLabel, storedReportPref } from '@/lib/report-pref';
-import { OFFLINE_TITLE } from '@/lib/offline/offline-types';
 
 /**
  * One line on the transcript page answering "why is this here and what is
@@ -19,14 +18,11 @@ export function AutoProvenance({
   ctx,
   generated,
   onOpenSeries,
-  disabled = false,
 }: {
   ctx: GmeetContext | null | undefined;
   /** Notes or a report exist on the row — a held gate was cleared by hand. */
   generated?: boolean;
   onOpenSeries?: (seriesId: number) => void;
-  /** Offline mode / network down: the series title is plain text (the dialog needs the server). */
-  disabled?: boolean;
 }) {
   const m = autoMarkerOf(ctx);
   if (!m) return null;
@@ -41,9 +37,7 @@ export function AutoProvenance({
     m.source === 'series' ? (
       <>
         series{' '}
-        {disabled && m.seriesId ? (
-          <span title={OFFLINE_TITLE}>{m.seriesTitle ?? `#${m.seriesId}`}</span>
-        ) : onOpenSeries && m.seriesId ? (
+        {onOpenSeries && m.seriesId ? (
           <button
             type="button"
             className="underline decoration-dotted underline-offset-2 hover:text-foreground"

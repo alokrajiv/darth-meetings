@@ -12,9 +12,7 @@
 
 import { useCallback, useEffect, useState } from 'react';
 import type { LabelRow } from '@/lib/labels';
-import { OFFLINE_TITLE } from '@/lib/offline/offline-types';
-import { getOfflineMode } from '@/lib/offline/offline-sync';
-import { isNetworkFailure, offlineAwareError } from '@/lib/offline/offline-fetch';
+import { networkErrorMessage } from '@/lib/fetch-errors';
 
 export interface LabelCatalog {
   rows: LabelRow[];
@@ -50,11 +48,8 @@ export function refreshLabelCatalog(): Promise<void> {
   if (inflight) return inflight;
   inflight = (async () => {
     try {
-      // Offline mode: the catalog is never cached; the worker would answer
-      // an instant 503 — skip the request and surface the standard message.
-      if (getOfflineMode() === 'offline') throw new Error(OFFLINE_TITLE);
       const res = await fetch('/api/labels?counts=1', { credentials: 'include' });
-      if (!res.ok) throw await offlineAwareError(res, `Failed to load labels (${res.status})`);
+      if (!res.ok) throw new Error(`Failed to load labels (${res.status})`);
       const data = (await res.json()) as {
         labels?: LabelRow[];
         unlabelled?: number;
@@ -72,12 +67,12 @@ export function refreshLabelCatalog(): Promise<void> {
         total: typeof data.total === 'number' ? data.total : null,
       });
     } catch (err) {
-      // Offline / network down: the rows already loaded stay (degraded
+      // Network down: the rows already loaded stay (degraded
       // scope); consumers render `error` as the reason.
       publish({
         ...current,
         loaded: true,
-        error: isNetworkFailure(err) ? OFFLINE_TITLE : err instanceof Error ? err.message : 'Failed to load labels',
+        error: networkErrorMessage(err, 'Failed to load labels'),
       });
     } finally {
       inflight = null;

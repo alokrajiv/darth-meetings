@@ -21,8 +21,7 @@ import { requestMediaUpload } from '@/components/audio-upload';
 import { PersonChip } from '@/components/person-chip';
 import { RowMenu, type RowMenuItem, type RowMenuSection } from '@/components/row-menu';
 import { RecorderRefStrip, RecordingStrip, SourceGlyph } from '@/components/recording-strip';
-import { OFFLINE_TITLE, useOfflineGate } from '@/lib/offline/offline-context';
-import { isNetworkFailure } from '@/lib/offline/offline-fetch';
+import { networkErrorMessage } from '@/lib/fetch-errors';
 import { reportLabel } from '@/lib/report-pref';
 
 // Server-declared shapes (type-only import — erased at build, no server
@@ -197,15 +196,12 @@ export function TeamsChatVerdictLine({
  * back to this page. */
 export function ConnectMicrosoftHint({ className = '' }: { className?: string }) {
   const ms = useMsLinkStatus(false);
-  // Connecting navigates to Darth Tasks — impossible offline.
-  const { blocked } = useOfflineGate();
   return (
     <button
       type="button"
       data-connect-microsoft-hint
-      disabled={blocked}
       className={`min-w-0 max-w-[34ch] shrink truncate text-left text-[11px] leading-5 text-primary/80 underline-offset-2 hover:underline disabled:cursor-not-allowed disabled:opacity-60 disabled:hover:no-underline ${className}`}
-      title={blocked ? OFFLINE_TITLE : 'Teams meeting chats record when a call started/ended and whether it was recorded. Connect your Microsoft account (via Darth Tasks) to read them.'}
+      title="Teams meeting chats record when a call started/ended and whether it was recorded. Connect your Microsoft account (via Darth Tasks) to read them."
       onClick={(e) => {
         e.stopPropagation();
         window.location.href = msConnectHref(ms);
@@ -243,10 +239,6 @@ interface CalendarEventRowProps {
    * this row — the occurrence becomes imported, so the host refetches BOTH
    * layers, not just the calendar ones. */
   onRowChanged?: () => void;
-  /** Offline mode / network down: row click, Import / the Add-recording
-   * menu, the ⋯ actions and the series chip are inert (visible, "Not
-   * available offline"). */
-  disabled?: boolean;
 }
 
 /**
@@ -272,7 +264,6 @@ export function CalendarEventRow({
   onMuteChanged,
   onOpenSeries,
   onRowChanged,
-  disabled = false,
 }: CalendarEventRowProps) {
   const companion = useCompanion();
   // Unimported rows (artifacts known) import straight away. A row in the
@@ -375,7 +366,7 @@ export function CalendarEventRow({
         setNote(`Nothing at ${providerName} — never recorded`);
       }
     } catch (err) {
-      setNote(isNetworkFailure(err) ? OFFLINE_TITLE : err instanceof Error ? err.message : 'Check failed');
+      setNote(networkErrorMessage(err, 'Check failed'));
     } finally {
       setChecking(false);
     }
@@ -394,7 +385,7 @@ export function CalendarEventRow({
       if (!res.ok) throw new Error(`Failed to hide (${res.status})`);
       onMuteChanged?.();
     } catch (err) {
-      setNote(isNetworkFailure(err) ? OFFLINE_TITLE : err instanceof Error ? err.message : 'Failed to hide');
+      setNote(networkErrorMessage(err, 'Failed to hide'));
     } finally {
       setMuteBusy(false);
     }
@@ -419,8 +410,6 @@ export function CalendarEventRow({
         : `Ask ${providerName} whether the call left a recording or transcript`,
       icon: <Search />,
       busy: checking,
-      disabled: disabled,
-      title: disabled ? OFFLINE_TITLE : undefined,
       onSelect: () => checkEvidence(),
     });
   }
@@ -430,8 +419,6 @@ export function CalendarEventRow({
       label: 'In a file — upload…',
       hint: 'A phone clip, a Zoom export, anything with audio',
       icon: <Upload />,
-      disabled: disabled,
-      title: disabled ? OFFLINE_TITLE : undefined,
       onSelect: openUpload,
     });
     if (companion.connected) {
@@ -440,8 +427,6 @@ export function CalendarEventRow({
         label: 'On this Mac — Darth Recorder…',
         hint: 'Pick it from the recordings on this Mac',
         icon: <Laptop />,
-        disabled: disabled,
-        title: disabled ? OFFLINE_TITLE : undefined,
         onSelect: openUpload,
       });
     }
@@ -451,8 +436,7 @@ export function CalendarEventRow({
       key: 'hide-occ',
       label: 'Hide this occurrence',
       icon: <EyeOff />,
-      disabled: disabled || muteBusy,
-      title: disabled ? OFFLINE_TITLE : undefined,
+      disabled: muteBusy,
       onSelect: () => mute('occurrence', r.key),
     },
   ];
@@ -461,8 +445,7 @@ export function CalendarEventRow({
       key: 'hide-series',
       label: `Hide all${r.seriesCount ? ` ${r.seriesCount}` : ''} occurrence${r.seriesCount === 1 ? '' : 's'} + future ones`,
       icon: <EyeOff />,
-      disabled: disabled || muteBusy,
-      title: disabled ? OFFLINE_TITLE : undefined,
+      disabled: muteBusy,
       onSelect: () => mute('series', r.recurringEventId!),
     });
   }
@@ -536,7 +519,7 @@ export function CalendarEventRow({
 
   // "Going in" on a not-yet-imported meeting = the import dialog focused on
   // it (same mechanism as the reminder rows and the Import… button).
-  const rowClickable = !!r.meetingCode && !!onImportMeeting && layer === 'unimported' && !disabled;
+  const rowClickable = !!r.meetingCode && !!onImportMeeting && layer === 'unimported';
   const autoVia = r.autoSync
     ? r.autoSync.source === 'series'
       ? ` via ${r.autoSync.importerEmail ?? '?'}'s "${r.autoSync.seriesTitle ?? 'series'}" series auto-import`
@@ -606,8 +589,6 @@ export function CalendarEventRow({
   return (
     <TableRow
       onClick={rowClickable ? () => onImportMeeting!({ meetingCode: r.meetingCode!, eventStart: r.eventStart }) : undefined}
-      aria-disabled={disabled || undefined}
-      title={disabled ? OFFLINE_TITLE : undefined}
       data-calendar-row={layer}
       className={`group bg-muted/30 transition-colors hover:bg-accent/30 ${
         r.muted ? 'opacity-60' : ''
@@ -640,12 +621,11 @@ export function CalendarEventRow({
               {r.seriesId !== null && (
                 <button
                   type="button"
-                  disabled={disabled}
                   onClick={(e) => {
                     e.stopPropagation();
                     onOpenSeries?.(r.seriesId!);
                   }}
-                  title={disabled ? OFFLINE_TITLE : `Recurring call: ${r.seriesTitle} — click to see the whole series`}
+                  title={`Recurring call: ${r.seriesTitle} — click to see the whole series`}
                   className="inline-flex max-w-44 shrink-0 items-center gap-1 rounded-full border border-primary/25 bg-primary/5 px-2 py-0.5 text-[11px] text-primary transition-colors hover:bg-primary/10 disabled:cursor-not-allowed disabled:opacity-60"
                 >
                   <Repeat className="h-3 w-3 shrink-0" />
@@ -677,10 +657,9 @@ export function CalendarEventRow({
                 }}
                 originalNote={chat ? teamsChatVerdictCopy(chat, { external: chatExternal }).text : null}
                 onChanged={() => onRowChanged?.()}
-                disabled={disabled}
               />
             ) : cloud ? (
-              <RecordingStrip model={cloud} noGlyph disabled={disabled}>
+              <RecordingStrip model={cloud} noGlyph>
                 {artifactBadges ?? undefined}
               </RecordingStrip>
             ) : null}
@@ -731,8 +710,6 @@ export function CalendarEventRow({
               size="sm"
               variant="outline"
               className="h-7 px-2.5 text-xs"
-              disabled={disabled}
-              title={disabled ? OFFLINE_TITLE : undefined}
               data-import-button
               onClick={(e) => {
                 e.stopPropagation();
@@ -760,8 +737,6 @@ export function CalendarEventRow({
               }
               sections={[{ key: 'where', items: whereItems }, { key: 'hide', items: hideItems }]}
               busy={checking}
-              disabled={disabled}
-              disabledTitle={OFFLINE_TITLE}
               dataAttr="add-recording"
             />
           )}
@@ -769,8 +744,6 @@ export function CalendarEventRow({
             ariaLabel="Event actions"
             header={facts}
             sections={dotsSections}
-            disabled={disabled}
-            disabledTitle={OFFLINE_TITLE}
             dataAttr="event"
           />
         </div>

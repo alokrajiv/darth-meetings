@@ -2,13 +2,12 @@ import type { Metadata, Viewport } from "next";
 import { Geist, Geist_Mono } from "next/font/google";
 import "./globals.css";
 import { SessionKeeper } from "@/components/session-keeper";
-import { OfflineProvider } from "@/lib/offline/offline-context";
-import { AppBadge } from "@/lib/offline/app-badge";
-import { OfflineBanner } from "@/components/offline-banner";
+import { SwCleanup } from "@/components/sw-cleanup";
 import { CompanionBanner } from "@/components/companion-banner";
 import { MaintenanceBanner } from "@/components/maintenance-banner";
 import { headers } from "next/headers";
 import { ShellSearchProvider } from "@/components/shell-search";
+import { Toaster } from "@/components/toast";
 import { desktopShellOf } from "@/lib/desktop-shell";
 import { THEME_BOOT_SCRIPT } from "@/lib/listing-layout";
 
@@ -28,13 +27,10 @@ export const metadata: Metadata = {
     template: "%s · Darth Meetings",
   },
   description: "Upload meeting audio, get a clean speaker-labelled transcript.",
-  // PWA manifest: lets the app be installed (Add to Dock / Home Screen), which
-  // on Safari also lifts the 7-day eviction of the offline caches.
-  manifest: "/manifest.webmanifest",
-  // Safari/iOS install polish: the home-screen/Dock icon and the standalone
-  // (no browser chrome) flag — Chrome reads the manifest, Safari reads these.
+  // Bookmark / home-screen tile icon on Safari and iOS. There is no web
+  // manifest: the PWA was removed 2026-10-02 (README "Offline and PWA —
+  // removed 2026-10-02").
   icons: { apple: "/icons/icon-180.png" },
-  appleWebApp: { capable: true, title: "Meetings", statusBarStyle: "default" },
 };
 
 export const viewport: Viewport = {
@@ -68,25 +64,23 @@ export default async function RootLayout({
         className={`${geistSans.variable} ${geistMono.variable} antialiased`}
       >
         <SessionKeeper />
-        {/* Client-only: registers /sw.js, tracks connectivity and the offline
-            pins; the banner renders nothing unless there is something to say. */}
-        <OfflineProvider>
-          {/* Installed app only: icon badge = meetings waiting for speaker review. */}
-          <AppBadge />
-          <OfflineBanner />
-          {/* Client-only: the owner's deploy notice (deploy.sh --message),
-              read from nginx's /__notice.json; nothing when there is none. */}
-          <MaintenanceBanner />
-          {/* Client-only: talks to the local Darth Recorder tray (ws://127.0.0.1:47800)
-              when one is installed; renders nothing otherwise. */}
-          <CompanionBanner />
-          {/* Inside the shell the band's search drives the results panel (and
-              the in-app search field feeds the same one). Outside it this
-              adds nothing and listens to nothing. */}
-          <ShellSearchProvider inDesktopShell={desktopShell !== null}>
-            {children}
-          </ShellSearchProvider>
-        </OfflineProvider>
+        {/* One release only (2026-10): unregisters the old offline service
+            worker and wipes its caches + IndexedDB. Renders nothing. */}
+        <SwCleanup />
+        {/* Client-only: the owner's deploy notice (deploy.sh --message),
+            read from nginx's /__notice.json; nothing when there is none. */}
+        <MaintenanceBanner />
+        {/* Client-only: talks to the local Darth Recorder tray (ws://127.0.0.1:47800)
+            when one is installed; renders nothing otherwise. */}
+        <CompanionBanner />
+        {/* Inside the shell the band's search drives the results panel (and
+            the in-app search field feeds the same one). Outside it this
+            adds nothing and listens to nothing. */}
+        <ShellSearchProvider inDesktopShell={desktopShell !== null}>
+          {children}
+        </ShellSearchProvider>
+        {/* "Link copied" and other one-word confirmations (components/toast.tsx). */}
+        <Toaster />
       </body>
     </html>
   );

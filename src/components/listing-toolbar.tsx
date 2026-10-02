@@ -63,15 +63,11 @@ export function ToolbarSearch({
   inputRef,
   value,
   onChange,
-  disabled = false,
-  disabledTitle,
   inDesktopShell = false,
 }: {
   inputRef?: Ref<HTMLInputElement>;
   value: string;
   onChange: (next: string) => void;
-  disabled?: boolean;
-  disabledTitle?: string;
   inDesktopShell?: boolean;
 }) {
   return (
@@ -84,8 +80,6 @@ export function ToolbarSearch({
         autoComplete="off"
         data-testid="meetings-search-input"
         placeholder="Search meetings…"
-        disabled={disabled}
-        title={disabled ? disabledTitle : undefined}
         className="peer h-8 w-[240px] pl-8 pr-8 transition-[width] duration-150 focus:w-[320px]"
       />
       {searchShortcutEnabled(inDesktopShell) && (
@@ -103,15 +97,11 @@ export function ToolbarSearch({
 /** ONE Filter button + its popover; the host passes the sections. */
 export function FilterPopover({
   count,
-  disabled = false,
-  disabledTitle,
   defaultOpen = false,
   onClearAll,
   children,
 }: {
   count: number;
-  disabled?: boolean;
-  disabledTitle?: string;
   defaultOpen?: boolean;
   onClearAll?: () => void;
   children: ReactNode;
@@ -123,8 +113,7 @@ export function FilterPopover({
         variant={count > 0 ? 'secondary' : 'outline'}
         size="sm"
         className="h-8 gap-1.5 px-2.5"
-        disabled={disabled}
-        title={disabled ? disabledTitle : 'Layers, labels, time range, people'}
+        title="Layers, labels, time range, people"
         aria-expanded={open}
         aria-haspopup="dialog"
         data-filter-button
@@ -141,7 +130,7 @@ export function FilterPopover({
           </span>
         )}
       </Button>
-      {open && !disabled && (
+      {open && (
         <div
           role="dialog"
           aria-label="Filters"

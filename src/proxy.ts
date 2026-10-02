@@ -87,10 +87,12 @@ export async function proxy(request: NextRequest) {
   const pathname = request.nextUrl.pathname;
 
   // Public routes — no auth required. /login and /logout only bounce to
-  // darth-auth; /api/auth/* are self-gated diagnostics. The service worker,
-  // manifest, icons and the static /offline fallback carry nothing
-  // user-specific and must be fetchable without a session (the SW precaches
-  // /offline at activate time, browsers fetch the manifest cookie-less).
+  // darth-auth; /api/auth/* are self-gated diagnostics. /api/health is the
+  // no-auth reachability probe kept for native clients. Icons
+  // carry nothing user-specific. /sw.js is the one-release kill-switch worker
+  // (README "Offline and PWA — removed 2026-10-02"): the browser's update
+  // check for an old installed worker must reach it without a session, or
+  // the old worker keeps running — drop this line when sw.js is deleted.
   if (
     pathname === '/login' ||
     pathname === '/logout' ||
@@ -102,9 +104,7 @@ export async function proxy(request: NextRequest) {
     pathname === '/__notice.json' ||
     pathname === '/favicon.ico' ||
     pathname === '/sw.js' ||
-    pathname === '/manifest.webmanifest' ||
-    pathname.startsWith('/icons/') ||
-    pathname === '/offline'
+    pathname.startsWith('/icons/')
   ) {
     return NextResponse.next();
   }

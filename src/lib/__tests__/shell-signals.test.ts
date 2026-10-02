@@ -73,11 +73,15 @@ describe('shellSearchDetail', () => {
 });
 
 describe('shellSearchAction — never two panels', () => {
-  test('closed: a non-empty query opens, an empty one / whitespace is ignored', () => {
+  test('closed: a non-empty query opens, a clear / whitespace while typing is ignored', () => {
     expect(shellSearchAction(false, { query: 'q', submit: false })).toBe('open');
     expect(shellSearchAction(false, { query: 'q', submit: true })).toBe('open');
     expect(shellSearchAction(false, { query: '', submit: false })).toBe('ignore');
-    expect(shellSearchAction(false, { query: '   ', submit: true })).toBe('ignore');
+    expect(shellSearchAction(false, { query: '   ', submit: false })).toBe('ignore');
+  });
+  test('closed: an empty Enter opens the panel on its suggestions (recent searches)', () => {
+    expect(shellSearchAction(false, { query: '', submit: true })).toBe('open');
+    expect(shellSearchAction(false, { query: '   ', submit: true })).toBe('open');
   });
   test('open: every event (a clear included) updates in place', () => {
     expect(shellSearchAction(true, { query: 'q', submit: false })).toBe('update');

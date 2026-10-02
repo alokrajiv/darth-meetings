@@ -5,7 +5,6 @@ import { RefreshCw } from 'lucide-react';
 import { AppHeader } from '@/components/app-header';
 import { Button } from '@/components/ui/button';
 import { RecordingsSurface, useRecordingsPage } from '@/components/recordings-surface';
-import { OFFLINE_TITLE, useOfflineGate } from '@/lib/offline/offline-context';
 
 /**
  * Recordings — the caller's own recordings that belong to no meeting
@@ -17,13 +16,12 @@ import { OFFLINE_TITLE, useOfflineGate } from '@/lib/offline/offline-context';
  * latter opens on the Temporary section (`#temporary`).
  */
 export default function RecordingsPage() {
-  const { blocked } = useOfflineGate();
   const tz = useMemo(() => Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC', []);
   const initialFilter = useMemo(
     () => (typeof window !== 'undefined' && window.location.hash === '#temporary' ? 'temporary' : 'all'),
     []
   );
-  const data = useRecordingsPage({ enabled: !blocked, tz, initialFilter });
+  const data = useRecordingsPage({ enabled: true, tz, initialFilter });
   const { loading, refresh } = data;
 
   return (
@@ -32,9 +30,9 @@ export default function RecordingsPage() {
         <Button
           variant="outline"
           size="sm"
-          disabled={blocked || loading}
+          disabled={loading}
           onClick={refresh}
-          title={blocked ? OFFLINE_TITLE : 'Refresh'}
+          title="Refresh"
           aria-label="Refresh"
         >
           <RefreshCw className={`h-4 w-4 ${loading ? 'animate-spin' : ''}`} />
@@ -48,13 +46,7 @@ export default function RecordingsPage() {
             it, and the meeting is what you share.
           </p>
         </div>
-        {blocked ? (
-          <div className="rounded-lg border py-16 text-center text-sm text-muted-foreground" data-recordings-offline>
-            {OFFLINE_TITLE}
-          </div>
-        ) : (
-          <RecordingsSurface data={data} disabled={blocked} />
-        )}
+        <RecordingsSurface data={data} />
       </main>
     </div>
   );

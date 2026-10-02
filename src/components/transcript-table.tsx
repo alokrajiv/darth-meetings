@@ -49,6 +49,9 @@ import {
 } from 'lucide-react';
 import { PersonChip } from '@/components/person-chip';
 import { useShellSearch } from '@/components/shell-search';
+import { copyLinkWithToast } from '@/components/copy-link-button';
+import { LinkIcon } from 'lucide-react';
+import { resolveMeetingLink } from '@/lib/meeting-link';
 import { RowMenu, type RowMenuSection } from '@/components/row-menu';
 import { RecordingStrip, SourceGlyph } from '@/components/recording-strip';
 import { SuggestedEventStrip } from '@/components/suggested-event-strip';
@@ -76,8 +79,7 @@ import { LabelChips } from '@/components/label-chips';
 import { LabelPicker, anchorFromElement, parseError, type PickerAnchor } from '@/components/label-picker';
 import { BulkLabelBar } from '@/components/bulk-label-bar';
 import { refreshLabelCatalog, useLabelCatalog } from '@/hooks/use-label-catalog';
-import { OFFLINE_TITLE, useOffline, useOfflineGate } from '@/lib/offline/offline-context';
-import { isNetworkFailure, offlineAwareError } from '@/lib/offline/offline-fetch';
+import { isNetworkFailure, networkErrorMessage, NETWORK_ERROR_MESSAGE } from '@/lib/fetch-errors';
 import { labelFilterToParams, type LabelFilter } from '@/lib/labels';
 import type { LabelRef } from '@/lib/format';
 import {
@@ -444,17 +446,10 @@ export function TranscriptTable({
   onLabelFilter,
 }: TranscriptTableProps) {
   const router = useRouter();
-  // Offline mode / network down: every server-backed control stays visible
-  // but disabled with the shared tooltip; the listing fetches degrade to a
-  // "You're offline" panel with a "Go offline" shortcut to the archive.
-  const { blocked } = useOfflineGate();
-  const blockedRef = useRef(blocked);
   // Darth Recorder on this Mac: while it is pushing a recording up, its socket
   // knows the real byte counts long before the server does (the server only
   // learns them at `complete`), so an uploading row borrows them.
   const companion = useCompanion();
-  blockedRef.current = blocked;
-  const { enterOffline } = useOffline();
   const [tab, setTab] = useState<TabKey>('all');
   const [query, setQuery] = useState('');
   const [debouncedQ, setDebouncedQ] = useState('');
@@ -510,7 +505,7 @@ export function TranscriptTable({
   // Bumped on every silent refetch so the unlinked-recordings strip follows
   // the same live events the archive does.
   const [liveTick, setLiveTick] = useState(0);
-  const unlinked = useUnlinkedRecordings({ enabled: !blocked, refreshKey: liveTick, tz });
+  const unlinked = useUnlinkedRecordings({ enabled: true, refreshKey: liveTick, tz });
 
   // People / organizer / provider filters — shared by the archive and both
   // calendar layers (the server applies them to rows AND counts). The URL
@@ -666,7 +661,7 @@ export function TranscriptTable({
         const res = await fetch(`/api/transcripts?${params.toString()}`, {
           credentials: 'include',
         });
-        if (!res.ok) throw await offlineAwareError(res, `Failed to load transcripts (${res.status})`);
+        if (!res.ok) throw new Error(`Failed to load transcripts (${res.status})`);
         const data = (await res.json()) as TranscriptListV2Response;
         if (gen !== archiveGenRef.current) return; // superseded by a newer reset
         setError(null);
@@ -684,7 +679,7 @@ export function TranscriptTable({
       } catch (err) {
         if (gen !== archiveGenRef.current) return;
         if (mode === 'reset') {
-          setError(isNetworkFailure(err) ? OFFLINE_TITLE : err instanceof Error ? err.message : 'Failed to load transcripts');
+          setError(networkErrorMessage(err, 'Failed to load transcripts'));
         }
         // more/silent failures are quiet — the loaded window stays usable
       } finally {
@@ -723,15 +718,6 @@ export function TranscriptTable({
       }
       const patch = (p: Partial<CalSourceState>) =>
         setCalSrc((prev) => ({ ...prev, [view]: { ...prev[view], ...p } }));
-      if (blockedRef.current) {
-        // No network: never leave the merged view on a spinner. The error
-        // strip shows the offline line with its Retry.
-        if (mode === 'reset') {
-          calSrcRef.current = { ...calSrcRef.current, [view]: { ...src, loading: false, error: OFFLINE_TITLE } };
-          patch({ loading: false, error: OFFLINE_TITLE });
-        }
-        return;
-      }
       if (mode === 'reset') {
         // Mark loading in the ref synchronously too, so the lazy-load
         // effect can't double-fire a reset within the same commit.
@@ -746,7 +732,7 @@ export function TranscriptTable({
         const res = await fetch(`/api/calendar-meetings?${params.toString()}`, {
           credentials: 'include',
         });
-        if (!res.ok) throw await offlineAwareError(res, `Failed to load calendar meetings (${res.status})`);
+        if (!res.ok) throw new Error(`Failed to load calendar meetings (${res.status})`);
         const data = (await res.json()) as CalendarMeetingsResponse;
         if (gen !== calGenRef.current[view]) return; // superseded by a newer reset
         setCalCounts(data.counts);
@@ -778,7 +764,7 @@ export function TranscriptTable({
           patch({
             loading: false,
             error: isNetworkFailure(err)
-              ? OFFLINE_TITLE
+              ? NETWORK_ERROR_MESSAGE
               : err instanceof Error
                 ? err.message
                 : 'Failed to load calendar meetings',
@@ -837,28 +823,6 @@ export function TranscriptTable({
     if (!peopleLoaded || !labelFilterReady) return;
     void fetchArchive('reset');
   }, [fetchArchive, peopleLoaded, labelFilterReady]);
-
-  // Connection back (blocked flipped true → false): the listing that failed
-  // with the offline panel re-fetches on its own, and the calendar layers
-  // that errored with OFFLINE_TITLE are reset so the lazy loader retries.
-  const wasBlockedRef = useRef(blocked);
-  useEffect(() => {
-    if (wasBlockedRef.current && !blocked) {
-      void fetchArchiveRef.current('reset');
-      setCalSrc((prev) => {
-        let changed = false;
-        const next = { ...prev };
-        for (const v of CAL_VIEWS) {
-          if (prev[v].error === OFFLINE_TITLE) {
-            next[v] = EMPTY_CAL_SOURCE;
-            changed = true;
-          }
-        }
-        return changed ? next : prev;
-      });
-    }
-    wasBlockedRef.current = blocked;
-  }, [blocked]);
 
   // Range/tz changed → the calendar windows are stale. Drop them (bumping
   // gens so in-flight responses discard) and let the lazy loader below
@@ -945,9 +909,9 @@ export function TranscriptTable({
       silentRefetchCalendars();
     } catch (err) {
       // transient — the chip simply keeps the old timestamp; a dropped
-      // network (before the probe noticed) says so for a moment.
+      // network says so for a moment.
       if (isNetworkFailure(err)) {
-        setManualSyncNote(OFFLINE_TITLE);
+        setManualSyncNote(NETWORK_ERROR_MESSAGE);
         window.setTimeout(() => setManualSyncNote(null), 2500);
       }
     } finally {
@@ -1143,7 +1107,7 @@ export function TranscriptTable({
     } catch (err) {
       alert(
         isNetworkFailure(err)
-          ? OFFLINE_TITLE
+          ? NETWORK_ERROR_MESSAGE
           : 'Failed to delete transcript: ' + (err instanceof Error ? err.message : 'Unknown error')
       );
     }
@@ -1172,7 +1136,7 @@ export function TranscriptTable({
     } catch (err) {
       alert(
         isNetworkFailure(err)
-          ? OFFLINE_TITLE
+          ? NETWORK_ERROR_MESSAGE
           : `Failed to ${scratch ? 'move to temporary' : 'keep'}: ` +
               (err instanceof Error ? err.message : 'Unknown error')
       );
@@ -1192,7 +1156,7 @@ export function TranscriptTable({
     } catch (err) {
       alert(
         isNetworkFailure(err)
-          ? OFFLINE_TITLE
+          ? NETWORK_ERROR_MESSAGE
           : 'Failed to restore transcript: ' + (err instanceof Error ? err.message : 'Unknown error')
       );
     }
@@ -1211,7 +1175,7 @@ export function TranscriptTable({
     } catch (err) {
       alert(
         isNetworkFailure(err)
-          ? OFFLINE_TITLE
+          ? NETWORK_ERROR_MESSAGE
           : 'Could not retry: ' + (err instanceof Error ? err.message : 'Unknown error')
       );
     }
@@ -1350,7 +1314,6 @@ export function TranscriptTable({
         e.preventDefault();
         toggleSelected(id, e.shiftKey);
       } else if (key === 'l') {
-        if (blockedRef.current) return; // label mutations need the server
         if (selected.size > 0) {
           e.preventDefault();
           setBulkOpenSignal((n) => n + 1);
@@ -1451,6 +1414,15 @@ export function TranscriptTable({
       }
       return [{ key: 'trash', items }];
     }
+    // The meeting's permanent /m/<uuid> link — the desktop shell has no URL
+    // bar (lib/meeting-link.ts). Placeholders too: the ledger id is minted at
+    // queue time and survives the rename.
+    items.push({
+      key: 'copy-link',
+      label: 'Copy link',
+      icon: <LinkIcon />,
+      onSelect: () => void copyLinkWithToast(resolveMeetingLink(t.assemblyai_id)),
+    });
     if (!placeholder && !waiting && canEditRow(t) && !t.has_event) {
       items.push({
         key: 'link',
@@ -1640,8 +1612,6 @@ export function TranscriptTable({
       key={key}
       type="button"
       onClick={() => setTab(key)}
-      disabled={blocked}
-      title={blocked ? OFFLINE_TITLE : undefined}
       role="tab"
       aria-selected={tab === key}
       className={`relative shrink-0 whitespace-nowrap px-2.5 pb-2.5 pt-1 text-sm transition-colors disabled:cursor-not-allowed disabled:opacity-60 ${
@@ -1686,8 +1656,7 @@ export function TranscriptTable({
             setPickedMonth({ y: now.getFullYear(), m: now.getMonth() });
           }
         }}
-        disabled={blocked}
-        title={blocked ? OFFLINE_TITLE : 'Date range'}
+        title="Date range"
         className="h-8 rounded-md border border-input bg-background px-2 text-xs focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:cursor-not-allowed disabled:opacity-60"
       >
         <option value="all">All time</option>
@@ -1703,8 +1672,7 @@ export function TranscriptTable({
             variant="ghost"
             size="sm"
             className="h-6 w-6 p-0"
-            disabled={blocked}
-            title={blocked ? OFFLINE_TITLE : 'Previous month'}
+            title="Previous month"
             onClick={() => stepMonth(-1)}
           >
             <ChevronLeft className="h-3.5 w-3.5" />
@@ -1715,8 +1683,7 @@ export function TranscriptTable({
             variant="ghost"
             size="sm"
             className="h-6 w-6 p-0"
-            disabled={blocked}
-            title={blocked ? OFFLINE_TITLE : 'Next month'}
+            title="Next month"
             onClick={() => stepMonth(1)}
           >
             <ChevronRight className="h-3.5 w-3.5" />
@@ -1792,8 +1759,6 @@ export function TranscriptTable({
   const filterNode = (
     <FilterPopover
       count={filterCount}
-      disabled={blocked}
-      disabledTitle={OFFLINE_TITLE}
       onClearAll={clearAllFilters}
     >
       {filterSections({ hiddenCount: mutes.length }).map((section, i) => {
@@ -1806,7 +1771,6 @@ export function TranscriptTable({
                   unimportedCount={calCounts ? calCounts.unimported : null}
                   norecCount={calCounts ? calCounts.norec : null}
                   inactive={!mergedMode}
-                  offline={blocked}
                   onToggle={toggleLayer}
                 />
               </ToolbarSection>
@@ -1863,7 +1827,7 @@ export function TranscriptTable({
           case 'people':
             return (
               <ToolbarSection key={section} id={section} title="People" first={i === 0}>
-                <PeopleFilterFields value={peopleFilters} onChange={setPeopleFilters} disabled={blocked} />
+                <PeopleFilterFields value={peopleFilters} onChange={setPeopleFilters} />
               </ToolbarSection>
             );
           case 'hidden':
@@ -1908,8 +1872,7 @@ export function TranscriptTable({
                         <button
                           type="button"
                           onClick={() => void handleUnmute(m)}
-                          disabled={blocked}
-                          title={blocked ? OFFLINE_TITLE : 'Unhide'}
+                          title="Unhide"
                           className="rounded p-1 text-muted-foreground hover:bg-muted-foreground/10 hover:text-foreground disabled:cursor-not-allowed disabled:opacity-60"
                         >
                           <X className="h-3.5 w-3.5" />
@@ -1950,8 +1913,8 @@ export function TranscriptTable({
                     variant="outline"
                     size="sm"
                     className="h-6 shrink-0 px-2 text-[11px]"
-                    disabled={manualSyncing || blocked}
-                    title={blocked ? OFFLINE_TITLE : 'Sweep your calendar and meeting artifacts now'}
+                    disabled={manualSyncing}
+                    title="Sweep your calendar and meeting artifacts now"
                     onClick={() => void runManualCalSync()}
                   >
                     <RefreshCw className={`h-3 w-3 ${manualSyncing ? 'animate-spin' : ''}`} />
@@ -1969,8 +1932,6 @@ export function TranscriptTable({
                   role="menuitem"
                   data-more-item="refresh"
                   onClick={silentRefetchAll}
-                  disabled={blocked}
-                  title={blocked ? OFFLINE_TITLE : undefined}
                   className="flex w-full items-center gap-2 rounded px-2 py-1.5 text-left text-sm hover:bg-muted disabled:cursor-not-allowed disabled:opacity-50"
                 >
                   <RefreshCw className="h-3.5 w-3.5 text-muted-foreground" />
@@ -1999,8 +1960,6 @@ export function TranscriptTable({
             inputRef={searchRef}
             value={query}
             onChange={setQuery}
-            disabled={blocked}
-            disabledTitle={OFFLINE_TITLE}
           />
         )
       }
@@ -2009,7 +1968,7 @@ export function TranscriptTable({
     />
   );
 
-  const filterChips = <PeopleFilterChips value={peopleFilters} onChange={setPeopleFilters} disabled={blocked} />;
+  const filterChips = <PeopleFilterChips value={peopleFilters} onChange={setPeopleFilters} />;
   const peopleActive = hasPeopleFilters(peopleFilters) || !!labelFilter;
 
   const emptyState = (
@@ -2126,7 +2085,6 @@ export function TranscriptTable({
                         : null
                     }
                     defaultTitle={t.title}
-                    disabled={blocked}
                     onOpenSeries={setOpenSeriesId}
                     onChanged={() => void fetchArchiveRef.current('silent')}
                   />
@@ -2139,7 +2097,6 @@ export function TranscriptTable({
                   <LabelChips
                     labels={t.labels}
                     max={2}
-                    disabled={blocked}
                     onFilter={
                       onLabelFilter
                         ? (l) => onLabelFilter({ kind: 'id', id: l.id, exact: false })
@@ -2187,8 +2144,6 @@ export function TranscriptTable({
                 <RecordingStrip
                   model={strip}
                   noGlyph
-                  disabled={blocked}
-                  disabledTitle={OFFLINE_TITLE}
                   onAction={(kind) => (kind === 'retry' ? handleRetryIngest(t) : undefined)}
                 />
               ) : (() => {
@@ -2228,9 +2183,8 @@ export function TranscriptTable({
                   the server deliberately did NOT act on. One line, two
                   explicit answers. The server already limited this field to
                   callers who can act on the row; `access` is checked again
-                  here because the row is also rendered from cached payloads
-                  offline. */}
-              {!trashed && !blocked && t.access !== 'read' && t.suggested_event &&
+                  here as a belt. */}
+              {!trashed && t.access !== 'read' && t.suggested_event &&
                 !t.suggested_event.dismissedAt && (
                   <SuggestedEventStrip
                     compact
@@ -2256,16 +2210,13 @@ export function TranscriptTable({
                 variant="ghost"
                 className="h-7 w-7 p-0 text-muted-foreground opacity-0 transition-opacity hover:text-foreground group-hover:opacity-100"
                 onClick={(e) => handleRestoreTranscript(e, t.assemblyai_id)}
-                disabled={blocked}
-                title={blocked ? OFFLINE_TITLE : 'Restore'}
+                title="Restore"
               >
                 <RotateCcw className="h-3.5 w-3.5" />
               </Button>
             )}
             <RowMenu
               ariaLabel="Meeting actions"
-              disabled={blocked}
-              disabledTitle={OFFLINE_TITLE}
               sections={rowMenuSections(t)}
               dataAttr="row"
             />
@@ -2440,40 +2391,22 @@ export function TranscriptTable({
     </TableRow>
   );
 
-  // Listing fetch failed. An offline verdict gets the "Go offline" shortcut
-  // into the on-device archive instead of a bare "(503)".
-  const archiveErrorPanel =
-    error === OFFLINE_TITLE ? (
-      <div className="flex flex-col items-center py-16 text-center">
-        <p className="text-sm font-medium">You&apos;re offline</p>
-        <p className="mt-1 max-w-sm text-xs text-muted-foreground">
-          Switch to offline mode to browse the meetings saved on this device.
-        </p>
-        <div className="mt-4 flex items-center gap-2">
-          <Button onClick={() => enterOffline()} size="sm">
-            Go offline
-          </Button>
-          <Button onClick={() => void fetchArchive('reset')} variant="outline" size="sm">
-            <RefreshCw className="h-4 w-4" />
-            Retry
-          </Button>
-        </div>
-      </div>
-    ) : (
-      <div className="flex flex-col items-center py-16 text-center">
-        <p className="text-sm font-medium">Couldn&apos;t load transcripts</p>
-        <p className="mt-1 text-xs text-destructive">{error}</p>
-        <Button
-          onClick={() => void fetchArchive('reset')}
-          variant="outline"
-          size="sm"
-          className="mt-4"
-        >
-          <RefreshCw className="h-4 w-4" />
-          Retry
-        </Button>
-      </div>
-    );
+  // Listing fetch failed.
+  const archiveErrorPanel = (
+    <div className="flex flex-col items-center py-16 text-center">
+      <p className="text-sm font-medium">Couldn&apos;t load transcripts</p>
+      <p className="mt-1 text-xs text-destructive">{error}</p>
+      <Button
+        onClick={() => void fetchArchive('reset')}
+        variant="outline"
+        size="sm"
+        className="mt-4"
+      >
+        <RefreshCw className="h-4 w-4" />
+        Retry
+      </Button>
+    </div>
+  );
 
   const archiveBody = loading ? (
     container(spinner)
@@ -2574,9 +2507,7 @@ archiveErrorPanel
           className="flex items-center justify-between gap-2 border-b bg-destructive/5 px-4 py-1.5 text-xs text-destructive"
         >
           <span className="min-w-0 truncate">
-            {calSrc[v].error === OFFLINE_TITLE
-              ? `You're offline — switch to offline mode to browse the meetings saved on this device (${v === 'unimported' ? 'Not imported' : 'No recording'} layer unavailable)`
-              : `Couldn't load the ${v === 'unimported' ? 'Not imported' : 'No recording'} layer — ${calSrc[v].error}`}
+            {`Couldn't load the ${v === 'unimported' ? 'Not imported' : 'No recording'} layer — ${calSrc[v].error}`}
           </span>
           <Button
             variant="outline"
@@ -2652,7 +2583,6 @@ archiveErrorPanel
                       onMuteChanged={handleMuteChanged}
                       onOpenSeries={setOpenSeriesId}
                       onRowChanged={silentRefetchAll}
-                      disabled={blocked}
                     />
                   )
                 )}
@@ -2742,7 +2672,6 @@ archiveErrorPanel
         />
       )}
       <BulkLabelBar
-        disabled={blocked}
         selectedIds={selectedIds}
         selectedLabels={selectedLabels}
         readOnlyCount={selectedReadOnly}

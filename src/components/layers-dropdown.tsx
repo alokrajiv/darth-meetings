@@ -1,7 +1,6 @@
 'use client';
 
 import { Check } from 'lucide-react';
-import { OFFLINE_TITLE } from '@/lib/offline/offline-types';
 
 /**
  * The merged timeline's three layers as a checkbox list — the "Layers"
@@ -32,8 +31,6 @@ interface LayerChecklistProps {
   norecCount: number | null;
   /** Tabs/search/label filter active — archive-only view, controls frozen. */
   inactive: boolean;
-  /** Offline mode / network down: items inert ("Not available offline"). */
-  offline?: boolean;
   onToggle: (key: LayerDropdownKey) => void;
 }
 
@@ -42,7 +39,6 @@ export function LayerChecklist({
   unimportedCount,
   norecCount,
   inactive,
-  offline = false,
   onToggle,
 }: LayerChecklistProps) {
   const label = (key: LayerDropdownKey): string =>
@@ -52,7 +48,7 @@ export function LayerChecklist({
         ? `Not imported${unimportedCount != null ? ` (${unimportedCount})` : ''}`
         : `No recording${norecCount != null ? ` (${norecCount})` : ''}`;
   const enabled = LAYER_ORDER.filter((k) => layers[k]);
-  const frozen = inactive || offline;
+  const frozen = inactive;
   return (
     <div data-layers-menu>
       {LAYER_ORDER.map((key) => {
@@ -67,13 +63,11 @@ export function LayerChecklist({
             disabled={lastOn || frozen}
             data-layer-item={key}
             title={
-              offline
-                ? OFFLINE_TITLE
-                : lastOn
-                  ? 'At least one layer must stay on'
-                  : on
-                    ? 'Hide these rows'
-                    : 'Show these rows'
+              lastOn
+                ? 'At least one layer must stay on'
+                : on
+                  ? 'Hide these rows'
+                  : 'Show these rows'
             }
             onClick={() => onToggle(key)}
             className={`flex w-full items-center gap-2 rounded px-2 py-1.5 text-left text-sm transition-colors hover:bg-muted disabled:cursor-default disabled:hover:bg-transparent ${
@@ -85,7 +79,7 @@ export function LayerChecklist({
           </button>
         );
       })}
-      {inactive && !offline && (
+      {inactive && (
         <p className="px-2 pb-0.5 text-[11px] text-muted-foreground">
           Layers apply on the All tab with no search or label filter.
         </p>

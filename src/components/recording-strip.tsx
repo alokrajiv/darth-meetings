@@ -15,7 +15,6 @@ import {
   type StripTone,
 } from '@/lib/recording-strip';
 import { SuggestedEventStrip } from '@/components/suggested-event-strip';
-import { OFFLINE_TITLE } from '@/lib/offline/offline-types';
 
 /**
  * The recording strip (docs/listing-ui-redesign.md §4): ONE line under a
@@ -72,8 +71,6 @@ export interface RecordingStripProps {
   actionHref?: string | null;
   /** Small muted note after the action ("asked 14:02", "uploading…"). */
   note?: string | null;
-  disabled?: boolean;
-  disabledTitle?: string;
   /** Hide the glyph (the row already shows it in the title line). */
   noGlyph?: boolean;
   className?: string;
@@ -87,8 +84,6 @@ export function RecordingStrip({
   onAction,
   actionHref,
   note,
-  disabled = false,
-  disabledTitle,
   noGlyph = false,
   className = '',
   data,
@@ -148,8 +143,8 @@ export function RecordingStrip({
         ) : onAction ? (
           <button
             type="button"
-            disabled={disabled || busy}
-            title={disabled ? disabledTitle ?? OFFLINE_TITLE : model.action.title}
+            disabled={busy}
+            title={model.action.title}
             onClick={(e) => void act(e)}
             className={actionCls}
             data-strip-action={model.action.kind}
@@ -187,11 +182,10 @@ export interface RecorderRefStripProps {
   originalNote?: string | null;
   /** The owner linked or dismissed the suggestion — the host refetches. */
   onChanged?: (what: 'linked' | 'dismissed') => void;
-  disabled?: boolean;
   className?: string;
 }
 
-export function RecorderRefStrip({ rec, event, originalNote, onChanged, disabled = false, className }: RecorderRefStripProps) {
+export function RecorderRefStrip({ rec, event, originalNote, onChanged, className }: RecorderRefStripProps) {
   const companion = useCompanion();
   const [note, setNote] = useState<string | null>(null);
   const model = stripForRecorderRef(rec, {
@@ -251,7 +245,6 @@ export function RecorderRefStrip({ rec, event, originalNote, onChanged, disabled
       onAction={onAction}
       actionHref={model.action?.kind === 'open' && openId ? `/transcript/${openId}` : null}
       note={note}
-      disabled={disabled}
       className={className}
       data={{ 'data-recorder-recording': rec.status, 'data-recorder-mine': rec.mine ? '1' : '0' }}
     />

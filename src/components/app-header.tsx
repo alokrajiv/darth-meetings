@@ -5,9 +5,7 @@ import { usePathname } from 'next/navigation';
 import { AudioLines, ChevronRight } from 'lucide-react';
 import type { ReactNode } from 'react';
 import { AccountMenu } from '@/components/account-menu';
-import { OfflineChip } from '@/components/offline-chip';
 import { RecorderChip } from '@/components/recorder-chip';
-import { OFFLINE_TITLE, useOfflineGate } from '@/lib/offline/offline-context';
 import { APP_NAV, navItemActive } from '@/lib/app-nav';
 import { LISTING_MAX_CONTENT_PX } from '@/lib/listing-layout';
 
@@ -23,13 +21,12 @@ interface AppHeaderProps {
  * slot differs per page); layout.tsx stays uninvolved.
  *
  * Right side (README "Darth desktop shell" → Layout rules): the page's
- * actions, then the live-status chips that always stay visible (offline-save
- * cloud, Recorder ●), then the account menu at the far right (Settings,
- * theme, Sign out). Same layout in the shell and the browser.
+ * actions, then the live-status chip that always stays visible (Recorder ●),
+ * then the account menu at the far right (Settings, theme, Sign out). Same
+ * layout in the shell and the browser.
  */
 export function AppHeader({ children, breadcrumb }: AppHeaderProps) {
   const pathname = usePathname();
-  const { blocked } = useOfflineGate();
   return (
     <header className="sticky top-0 z-40 h-14 border-b bg-background/85 backdrop-blur">
       <div
@@ -47,9 +44,7 @@ export function AppHeader({ children, breadcrumb }: AppHeaderProps) {
         {!breadcrumb && (
           // Meetings · Recordings · Series (docs/recordings-meetings-series-
           // design.md §3, Q11) — three sibling surfaces. Phone width: a
-          // segmented control; wider: plain links. Recordings and Series
-          // need the server; Meetings stays live offline (cached shell →
-          // offline archive).
+          // segmented control; wider: plain links.
           <nav
             aria-label="Sections"
             data-app-nav
@@ -58,18 +53,6 @@ export function AppHeader({ children, breadcrumb }: AppHeaderProps) {
             {APP_NAV.map((l) => {
               const active = navItemActive(l, pathname);
               const base = 'rounded-md px-2 py-1 transition-colors';
-              if (l.needsServer && blocked) {
-                return (
-                  <span
-                    key={l.href}
-                    aria-disabled="true"
-                    title={OFFLINE_TITLE}
-                    className={`${base} cursor-not-allowed text-muted-foreground/50`}
-                  >
-                    {l.label}
-                  </span>
-                );
-              }
               return (
                 <Link
                   key={l.href}
@@ -104,7 +87,6 @@ export function AppHeader({ children, breadcrumb }: AppHeaderProps) {
         )}
         <div className="ml-auto flex items-center gap-2">
           {children}
-          <OfflineChip />
           <RecorderChip />
           <AccountMenu />
         </div>

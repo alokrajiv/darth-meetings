@@ -4,6 +4,10 @@ Status: **design + staged build brief**, 2026-09-22. Decision: `docs/recordings-
 Azure Blob is the permanent home of recording bytes, the VM is a cache, manipulation happens on the NVMe scratch.
 Depends on Phase 1 tables (`recording_media.blob_name`, `.sha256`, `.bytes`).
 
+> **2026-10-02:** the web app's offline pins and service worker described below (`src/lib/offline/*`, the
+> `public/sw.js` media cache) were removed — README "Offline and PWA — removed 2026-10-02". The
+> `x-darth-media-via: app` header stays: the player's audio-only probe still sends it.
+
 ## Facts (checked 2026-09-21/22)
 
 - Account `darthuploads` (southeastasia, same region as the VM), container `meetings`, used today as **transit**:

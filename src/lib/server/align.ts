@@ -55,7 +55,7 @@ function fail(status: number, error: string, code?: string): AlignResult {
  * when the canonical carries video, else the canonical itself.
  *
  * `buildAudioOnly` is idempotent and shares its in-flight ffmpeg with the
- * offline-pin path, so two people aligning the same pair at once pay for one
+ * player's `?variant=audio` path, so two people aligning the same pair at once pay for one
  * transcode.
  */
 async function audioPathForRecording(

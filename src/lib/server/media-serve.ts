@@ -20,12 +20,12 @@
  *  - `?via=app` — the explicit "keep it on the app" escape hatch. Anything
  *    that needs a same-origin, cookie-authenticated, CORS-free answer says so
  *    with this.
- *  - the `x-darth-media-via: app` REQUEST HEADER — what the offline pin
- *    downloader and the player's Range probe send. It exists because those
- *    two must keep their URL *spelling* untouched: the service worker matches
- *    cached media on the exact path+query, so adding a query parameter to a
- *    pinned URL would orphan every pin made before today. A header changes no
- *    cache key. See src/lib/offline/offline-urls.ts for the full argument.
+ *  - the `x-darth-media-via: app` REQUEST HEADER — what the player's
+ *    audio-only Range probe sends (a cross-origin fetch with `Range` would
+ *    need a CORS preflight against the storage account). It also keeps the
+ *    URL spelling untouched for any caller that keys a local cache on the
+ *    exact path+query (the web app's offline pins did, until they were
+ *    removed 2026-10-02).
  *  - a `dth_` bearer caller (darth-cli), unless it opts in with `?redirect=1`.
  *    The CLI streams to a file with its own HTTP client; a cross-origin
  *    redirect with an Authorization header is a trap, so it stays on the app
@@ -51,8 +51,7 @@ export const MEDIA_SAS_TTL_MS = 60 * 60_000;
 
 /**
  * The request header that means "answer from the app, not from Blob". Sent by
- * the offline pin downloader and by the player's audio-only Range probe — the
- * two callers whose URL spelling is a cache key and therefore cannot change.
+ * the player's audio-only Range probe.
  */
 export const MEDIA_VIA_HEADER = 'x-darth-media-via';
 export const MEDIA_VIA_APP = 'app';
@@ -113,7 +112,7 @@ export function mediaRedirectDecision(input: {
 }): RedirectDecision {
   if (input.searchParams.get('via') === 'app') return { redirect: false, reason: 'via=app' };
   if ((input.headers.get(MEDIA_VIA_HEADER) ?? '').toLowerCase() === MEDIA_VIA_APP) {
-    return { redirect: false, reason: 'offline pin / probe' };
+    return { redirect: false, reason: 'via-app header' };
   }
   if (input.isBearer && input.searchParams.get('redirect') !== '1') {
     return { redirect: false, reason: 'darth-cli bearer' };

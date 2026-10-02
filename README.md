@@ -113,6 +113,43 @@ on the same contract as Darth Chat (its SPEC §20.76):
   listing, max 30 hits (title hits first, then newest); the snippet is cut
   from a 400-char SQL window around the earliest term with bold ranges as
   UTF-16 offsets into the returned text.
+- **Search in this meeting** (2026-10-02, like Slack's `in:#channel`) — a
+  meeting page offers its meeting to the panel (`useShellSearchScope`). The
+  panel's first row is then "Search in <title>", selected by default, so
+  Enter in the band (or on that row) applies the chip `in: <title>` in the
+  panel header and the query runs over THAT meeting's transcript —
+  client-side, over what the page shows (edits and speaker names applied,
+  raw text in the Raw view; `src/lib/meeting-scope-search.ts`: every term in
+  the same utterance, transcript order). There is no per-meeting server
+  search: `GET /api/search` ranks whole meetings. A hit shows `m:ss ·
+  speaker` + snippet; Enter / click seeks the player there, scrolls to the
+  utterance and flashes it. The chip's × (or Backspace in the results)
+  removes it → the broad search across all meetings, as before. ↓ in the
+  band hands the keyboard to the panel (desktop `search-field.js down()`),
+  and an empty Enter / ↓ opens the panel on its suggestions.
+- **Recent searches** — the last 5 queries with their chips
+  (`src/lib/recent-searches.ts`), shown when the panel's query is empty;
+  click / Enter re-runs one (a scoped one for another meeting navigates
+  there first and applies the chip when that page offers it), × forgets it.
+  Stored in the shell's local store for Meetings (`window.darthDesktop.store`,
+  table `recent_searches`, one row per darth user id; the shell wipes it on
+  sign-out), else localStorage (`src/lib/recent-searches-store.ts`). The
+  band itself still shows only text: nothing flows page → shell, so a
+  recent query picked in the panel is not echoed into the band.
+- **Copy link** — no URL bar in the shell, so the meeting page header has a
+  **Copy link** button (also first in its ⋯ menu, and ⌘⇧C / Ctrl+Shift+C —
+  listed as a page key in the shell's shortcut map), and every listing row's
+  ⋯ menu has **Copy link**. It copies the permanent
+  `https://meetings.darth-internal.trames.io/m/<meeting uuid>` (migration
+  031 ledger id via `GET /api/meetings/resolve?any=<id>`; falls back to
+  `/transcript/<id>` when there is no ledger row) and toasts "Link copied"
+  (`src/lib/meeting-link.ts`, `src/components/copy-link-button.tsx`,
+  `src/components/toast.tsx`). `/recording/<id>` copies its own URL. The
+  clipboard write uses a pending ClipboardItem when the uuid lookup is still
+  in flight (keeps Safari's user-activation), else `writeText`, else a hidden
+  textarea. The web app has no header search on a meeting page, so the
+  in-meeting scope is shell-only; in a browser the transcript's own ⌘F
+  find (editors) and the browser's find cover it.
 - **Layout rules** (`src/lib/listing-layout.ts`) — ONE layout, designed for
   the shell's window (900–1300 px of content, the shell's title band with its
   own search above, its 64 px rail on the left); the browser mirrors it at
@@ -131,7 +168,7 @@ on the same contract as Darth Chat (its SPEC §20.76):
     `/` focuses it.
   - *Header*: wordmark + Meetings / Recordings / Series; one **Import
     meeting ▾** split button (menu: Import from… a transcript file, Upload
-    media); the offline-save cloud and **Recorder ●** chips always visible;
+    media); the **Recorder ●** chip always visible;
     an account menu at the far right (Settings, theme, Sign out).
   - *Theme*: set in Darth. Inside the shell the page follows
     `prefers-color-scheme` live (the boot script ignores a stored browser
@@ -143,6 +180,47 @@ on the same contract as Darth Chat (its SPEC §20.76):
     takes the rest. "Add recording" is a hover/focus "+" icon on the row
     (always visible on touch screens), and the unlinked-recordings notice is
     one slim line.
+
+## Offline and PWA — removed 2026-10-02
+
+The website no longer has an offline mode and is no longer an installable
+PWA. Offline is the Darth desktop shell's job: `desktop/src/connectivity.js`
+(Work Offline + network detection) and its local store bridge
+(`window.darthDesktop.store`), documented in `desktop/docs/OFFLINE.md`
+("The web/PWA builds should drop their own offline modes").
+
+**Removed:** the mode-aware service worker and its registration; the
+IndexedDB pin ledger (`darth-offline`), pins, sync scheduler, outbox, the
+`darth-*` Cache Storage caches and cached RSC payloads, storage estimates and
+persistent-storage requests (`src/lib/offline/*`); the web manifest
+(`public/manifest.webmanifest`), the `<link rel="manifest">` / Apple
+web-app metadata and installed-app detection; the app badge and
+`/api/offline/badge`; the offline banner, chip, archive, pin dialog, the
+Settings offline card, the `/offline` page and the "Save for offline…" menu
+item; `/api/offline/outbox` (only the web outbox called it); and every
+"Not available offline" gate — controls are simply enabled. A fetch that
+never reaches the server now reads "Can't reach Darth Meetings — check your
+connection." (`src/lib/fetch-errors.ts`).
+
+**Kept, and why:**
+
+- `GET /api/health` (204, no auth, public in `src/proxy.ts`) — the cheap
+  reachability probe, kept for native clients (the Mac tray, the desktop
+  shell).
+- `GET /api/offline/plan` and `GET/PUT /api/offline/prefs`
+  (`src/db-ops/offline-plan.ts`, the `user_prefs.offline_prefs` counts from
+  migration 040) — darth-cli's `offline plan|prefs` uses them, and a future
+  desktop-shell replica can. Only the web UI that edited the counts is gone.
+- `?variant=audio` on the audio route (`src/lib/server/audio-only.ts`) — the
+  player streams the audio-only extract whenever its video toggle is off.
+- **One release only (2026-10):** `public/sw.js` is now a kill-switch worker
+  (no fetch handler; on activate it deletes every `darth-*` cache,
+  unregisters itself and reloads open windows from the network), still
+  served no-cache and public in `src/proxy.ts`, because a browser keeps an
+  installed worker until an update check succeeds. `src/components/sw-cleanup.tsx`
+  (mounted in the root layout) does the same from the page side: unregisters
+  workers, deletes `darth-*` caches, the `darth-offline` IndexedDB and the
+  `darth-offline-mode` localStorage key. Delete both after one release.
 
 ## Stack
 

@@ -625,6 +625,8 @@ a transcript API suffix, `…/:id/series`), and `/series` is not in `SHELL_PAGES
 (`src/lib/offline/offline-sync.ts`) either — Series is "handled" offline by its nav entry being
 disabled. `/recordings` is handled the same way (`needsServer: true`), and is not precached: it
 has nothing to show without the server.
+*(2026-10-02: superseded — the web offline mode, `src/lib/offline/*` and `needsServer` were removed;
+offline lives in the desktop shell. README "Offline and PWA — removed 2026-10-02".)*
 
 ### P5 — only meetings take a share (`2d0ba0b`)
 

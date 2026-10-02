@@ -116,11 +116,7 @@ export function writePeopleFiltersToUrl(f: PeopleFilters): void {
 interface PeopleFilterProps {
   value: PeopleFilters;
   onChange: (next: PeopleFilters) => void;
-  /** Offline mode / network down: filters re-query the server, so the trigger and chips are inert. */
-  disabled?: boolean;
 }
-
-const OFFLINE_TITLE = 'Not available offline';
 
 /**
  * The People / Organizer inputs and the provider toggles — the "People"
@@ -130,7 +126,7 @@ const OFFLINE_TITLE = 'Not available offline';
  * silently discarded; provider toggles commit immediately. Active filters
  * render as removable chips via `PeopleFilterChips` (placed by the caller).
  */
-export function PeopleFilterFields({ value, onChange, disabled = false }: PeopleFilterProps) {
+export function PeopleFilterFields({ value, onChange }: PeopleFilterProps) {
   const [participantDraft, setParticipantDraft] = useState(value.participant.join(', '));
   const [organizerDraft, setOrganizerDraft] = useState(value.organizer.join(', '));
 
@@ -181,7 +177,6 @@ export function PeopleFilterFields({ value, onChange, disabled = false }: People
           value={participantDraft}
           onChange={(e) => setParticipantDraft(e.target.value)}
           onBlur={commitText}
-          disabled={disabled}
           placeholder="email, name or @domain — comma = OR"
           className="h-8 text-sm"
           aria-label="People (email, name or domain; comma = OR)"
@@ -197,7 +192,6 @@ export function PeopleFilterFields({ value, onChange, disabled = false }: People
           value={organizerDraft}
           onChange={(e) => setOrganizerDraft(e.target.value)}
           onBlur={commitText}
-          disabled={disabled}
           placeholder="organizer email — comma = OR"
           className="h-8 text-sm"
           aria-label="Organizer email (comma = OR)"
@@ -213,7 +207,6 @@ export function PeopleFilterFields({ value, onChange, disabled = false }: People
                 key={p.key}
                 type="button"
                 onClick={() => toggleProvider(p.key)}
-                disabled={disabled}
                 aria-pressed={on}
                 title={p.title}
                 className={`flex flex-1 items-center justify-center gap-1 rounded-md px-2 py-1 text-xs transition-colors ${
@@ -232,7 +225,7 @@ export function PeopleFilterFields({ value, onChange, disabled = false }: People
       </div>
       {/* Enter in either input submits (commits); the button is for mice. */}
       <div className="flex justify-end">
-        <Button type="submit" size="sm" variant="outline" className="h-7 px-2.5 text-xs" disabled={disabled}>
+        <Button type="submit" size="sm" variant="outline" className="h-7 px-2.5 text-xs">
           Apply
         </Button>
       </div>
@@ -242,7 +235,7 @@ export function PeopleFilterFields({ value, onChange, disabled = false }: People
 
 /** Removable chips for every active filter term. Renders nothing when no
  * filter is set. */
-export function PeopleFilterChips({ value, onChange, disabled = false }: PeopleFilterProps) {
+export function PeopleFilterChips({ value, onChange }: PeopleFilterProps) {
   if (!hasPeopleFilters(value)) return null;
   const chip = (key: string, label: string, text: string, onRemove: () => void) => (
     <span
@@ -255,8 +248,6 @@ export function PeopleFilterChips({ value, onChange, disabled = false }: PeopleF
       <button
         type="button"
         onClick={onRemove}
-        disabled={disabled}
-        title={disabled ? OFFLINE_TITLE : undefined}
         className="rounded-full p-0.5 text-muted-foreground hover:bg-muted-foreground/10 hover:text-foreground disabled:cursor-not-allowed disabled:opacity-50"
         aria-label={`Remove filter ${label} ${text}`}
       >
@@ -285,8 +276,6 @@ export function PeopleFilterChips({ value, onChange, disabled = false }: PeopleF
         <button
           type="button"
           onClick={() => onChange(EMPTY_PEOPLE_FILTERS)}
-          disabled={disabled}
-          title={disabled ? OFFLINE_TITLE : undefined}
           className="text-xs text-muted-foreground hover:text-foreground disabled:cursor-not-allowed disabled:opacity-50"
         >
           Clear all
