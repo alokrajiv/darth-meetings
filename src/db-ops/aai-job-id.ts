@@ -18,8 +18,14 @@ import { AAI_JOB_ID_RE } from '@/lib/aai-job-state';
  *      is forced OFF — a minted row with nowhere to record its job id would
  *      be a row we could never poll and never delete at AssemblyAI.
  *   2. **The SQL twins of `aaiJobIdOf`.** The JS accessor (@/lib/aai-job-state)
- *      and these fragments must agree exactly: `aai_job_id` when set, else a
- *      UUID-shaped `assemblyai_id` (a row that predates 1b), else nothing.
+ *      and these fragments must agree exactly: when the column EXISTS it is
+ *      the whole answer — NULL means no job, never "try the meeting id"
+ *      (045 stamped every legacy row, so the only UUID-shaped rows left with
+ *      a NULL are meetings whose id we minted: made early from a recording,
+ *      split off another meeting; asking AssemblyAI about one of those 404s
+ *      and the 404 flips the meeting to 'error' — prod, 2026-10-02). Only
+ *      when the column is MISSING is a UUID-shaped `assemblyai_id` the job
+ *      (pre-1b, minting forced off).
  *
  * Both are read lazily, never at module scope: `bun run build` must succeed
  * with no environment and no database at all.
@@ -74,9 +80,10 @@ export async function mintedIdsEnabled(): Promise<boolean> {
 
 export interface JobIdSql {
   /**
-   * For a projection. Either the column itself or, when 045 has not been
-   * applied, a NULL of the right type under the same name — so `aaiJobIdOf()`
-   * sees `null` and falls back to the meeting id, exactly as for a legacy row.
+   * For a projection, always named `aai_job_id`. Either the column itself or,
+   * when 045 has not been applied, the pre-1b answer (the UUID-shaped meeting
+   * id) under that name — so `aaiJobIdOf()` reads a resolved value either way
+   * and a NULL in it always means "no job".
    */
   column: Fragment;
   /**
@@ -96,20 +103,26 @@ export interface JobIdSql {
  */
 export async function jobIdSql(alias: 't' | null = null): Promise<JobIdSql> {
   const present = await aaiJobIdColumnExists();
+  return jobIdFragments(present, alias);
+}
+
+/** `jobIdSql` with the probe already answered — exported for the tests. */
+export function jobIdFragments(present: boolean, alias: 't' | null = null): JobIdSql {
   const legacy = (): Fragment =>
     alias === 't'
       ? sql`CASE WHEN t.assemblyai_id ~* ${AAI_JOB_ID_RE.source} THEN t.assemblyai_id END`
       : sql`CASE WHEN assemblyai_id ~* ${AAI_JOB_ID_RE.source} THEN assemblyai_id END`;
-  const expr = (): Fragment => {
-    if (!present) return legacy();
-    return alias === 't' ? sql`COALESCE(t.aai_job_id, ${legacy()})` : sql`COALESCE(aai_job_id, ${legacy()})`;
-  };
+  // Column present ⇒ the column, and nothing else — never COALESCEd with the
+  // legacy expression: that fallback is what polled a minted meeting id at
+  // AssemblyAI on 2026-10-02 (see the header).
+  const expr = (): Fragment =>
+    present ? (alias === 't' ? sql`t.aai_job_id` : sql`aai_job_id`) : legacy();
   return {
     column: present
       ? alias === 't'
         ? sql`t.aai_job_id`
         : sql`aai_job_id`
-      : sql`NULL::text AS aai_job_id`,
+      : sql`${legacy()} AS aai_job_id`,
     expr: expr(),
     expr2: expr(),
   };

@@ -18,6 +18,8 @@ import {
   X,
 } from 'lucide-react';
 import { AppHeader } from '@/components/app-header';
+import { CopyLinkButton, useCopyLinkShortcut } from '@/components/copy-link-button';
+import { absoluteUrl } from '@/lib/meeting-link';
 import { AudioPlayer, type AudioPlayerHandle } from '@/components/audio-player';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
@@ -57,6 +59,10 @@ export default function RecordingPage({ params }: { params: Promise<{ id: string
   const [name, setName] = useState('');
   const [linkOpen, setLinkOpen] = useState(false);
   const [now, setNow] = useState(0);
+  // "Copy link" (header button, ⌘⇧C): this page's own URL — the desktop
+  // shell has no URL bar. Owner-only page, so the link is for the owner.
+  const getRecordingLink = useCallback(() => absoluteUrl(`/recording/${encodeURIComponent(id)}`), [id]);
+  useCopyLinkShortcut(rec ? getRecordingLink : null);
 
   const load = useCallback(async () => {
     const res = await fetch(`/api/recordings/${id}`, { credentials: 'include' });
@@ -161,7 +167,7 @@ export default function RecordingPage({ params }: { params: Promise<{ id: string
 
   return (
     <div className="min-h-screen">
-      <AppHeader />
+      <AppHeader>{rec && <CopyLinkButton getLink={getRecordingLink} what="this recording" />}</AppHeader>
       <main className="mx-auto max-w-3xl space-y-4 px-4 py-4 sm:px-6" data-recording-page>
         <Link href="/recordings" className="inline-flex items-center gap-1 text-xs text-muted-foreground hover:text-foreground">
           <ArrowLeft className="h-3.5 w-3.5" /> Recordings

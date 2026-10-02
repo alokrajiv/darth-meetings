@@ -90,7 +90,7 @@ describe('who may be redirected', () => {
   test('the pin / probe header never may — and it is case-insensitive', () => {
     expect(decision('', { [MEDIA_VIA_HEADER]: 'app' })).toEqual({
       redirect: false,
-      reason: 'offline pin / probe',
+      reason: 'via-app header',
     });
     expect(decision('redirect=1', { [MEDIA_VIA_HEADER]: 'APP' }).redirect).toBe(false);
     // Some other value is not the opt-out.

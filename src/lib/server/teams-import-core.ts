@@ -31,7 +31,7 @@ import {
 } from '@/lib/server/recording-sync';
 import { saveAudioStreamToTemp, deleteAudioFile } from '@/lib/server/audio-storage';
 import { IngestError, ingestLocalAudio } from '@/lib/server/ingest';
-import { shareCloudImportWithInternalInvitees } from '@/lib/server/auto-share';
+import { shareWithInternalInvitees } from '@/lib/server/auto-share';
 import { registerPeopleFromMeeting } from '@/lib/server/import-helpers';
 import type { ImportOutcome, ImportUser } from '@/lib/server/gmeet-import-core';
 import type { GmeetAttendee, GmeetContext } from '@/lib/format';
@@ -277,7 +277,7 @@ export async function executeTeamsImport(
       // Same visibility rule as live uploads: invitees see the queued row
       // immediately, not only once the import lands.
       const shareList = attendees.map((a) => ({ email: a.email, name: a.name }));
-      const autoShared = await shareCloudImportWithInternalInvitees(
+      const autoShared = await shareWithInternalInvitees(
         'cloud-import',
         placeholder.id,
         user.userId,
@@ -414,7 +414,7 @@ export async function executeTeamsImport(
       },
     });
     const bgShareList = attendees.map((a) => ({ email: a.email, name: a.name }));
-    const autoShared = await shareCloudImportWithInternalInvitees(
+    const autoShared = await shareWithInternalInvitees(
       'cloud-import',
       placeholder.id,
       user.userId,
@@ -588,7 +588,7 @@ export async function executeTeamsImport(
         () => {}
       );
     }
-    const autoShared = await shareCloudImportWithInternalInvitees(
+    const autoShared = await shareWithInternalInvitees(
       'cloud-import',
       row.id,
       user.userId,

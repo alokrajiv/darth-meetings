@@ -341,8 +341,10 @@ export async function listAutoSyncActivityFor(
 
 // ---------------------------------------------------------------------------
 // Offline support (migration 040): per-ACCOUNT auto-pin counts. The bytes
-// themselves live in each device's browser (service worker + Cache Storage);
-// these numbers only say how many of the newest meetings every device keeps.
+// themselves live on each device; these numbers only say how many of the
+// newest meetings an offline replica keeps. The web app's own offline mode
+// was removed 2026-10-02 — consumers now are darth-cli (`offline plan|prefs`)
+// and, later, the desktop shell's replica.
 // ---------------------------------------------------------------------------
 
 export interface OfflinePrefs {
@@ -356,7 +358,7 @@ export interface OfflinePrefs {
 
 export const DEFAULT_OFFLINE_PREFS: OfflinePrefs = { transcripts: 100, audio: 10, video: 0 };
 
-/** Hard caps — a laptop's browser quota is finite and the plan query pages
+/** Hard caps — a laptop's disk quota is finite and the plan query pages
  * the newest `max(counts)` rows. */
 export const OFFLINE_PREFS_MAX: OfflinePrefs = { transcripts: 500, audio: 100, video: 25 };
 

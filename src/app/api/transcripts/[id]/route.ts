@@ -356,7 +356,7 @@ export const DELETE = withAuth(async ({ user, request }, { params }) => {
       recordingsKept: [...cleanup.recordingsKept, ...after.recordingsKept],
     });
   if (mayDeleteFiles) {
-    // Each stored recording may have an audio-only derivative (offline pins);
+    // Each stored recording may have an audio-only derivative (?variant=audio);
     // drop it with the source so nothing outlives the row.
     if (access.row.local_audio_path) {
       await deleteAudioFile(access.row.local_audio_path);

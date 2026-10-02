@@ -1,10 +1,9 @@
 import type { NextConfig } from "next";
 
-// One id per build, baked into both the Next build id and the client bundle:
-// the offline sync compares NEXT_PUBLIC_BUILD_ID (via /api/offline/plan)
-// against the id it cached pages under and re-fetches documents + static
-// chunks when they differ, so a deploy never leaves stale HTML pointing at
-// chunks that no longer exist.
+// One id per build, baked into both the Next build id and the server env:
+// GET /api/offline/plan reports NEXT_PUBLIC_BUILD_ID as `buildId` so an
+// offline replica (darth-cli today, the desktop shell later) can tell a
+// deploy happened. The web app itself no longer caches anything offline.
 //
 // `next build` loads this config in MORE THAN ONE process, so the id must be
 // deterministic per build or the value inlined into the route chunks differs
@@ -36,9 +35,9 @@ const nextConfig: NextConfig = {
   async headers() {
     return [
       {
-        // The service worker must never be served stale: the browser checks
-        // it on every navigation and a cached copy would pin an old fetch
-        // handler across deploys.
+        // The (kill-switch) service worker must never be served stale: the
+        // browser's update check has to see the new file so an old offline
+        // worker is replaced and unregisters itself. Drop with sw.js.
         source: '/sw.js',
         headers: [
           { key: 'Cache-Control', value: 'no-cache, no-store, must-revalidate' },

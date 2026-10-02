@@ -10,7 +10,7 @@ import {
   setRecordedAtForUser,
 } from '@/db-ops/transcripts';
 import { noteEmptyTranscriptDoc } from '@/db-ops/empty-transcripts';
-import { shareCloudImportWithInternalInvitees } from '@/lib/server/auto-share';
+import { shareWithInternalInvitees } from '@/lib/server/auto-share';
 import { findImportedByMeetingCodes } from '@/db-ops/gmeet-sync';
 import { OCCURRENCE_WINDOW_MS } from '@/lib/meeting-evidence';
 import { registerPeopleFromMeeting } from '@/lib/server/import-helpers';
@@ -569,7 +569,7 @@ export async function executeGmeetImport(
       });
       // Same visibility rule as live uploads: invitees see the queued row
       // immediately, not only once the import lands.
-      const autoShared = await shareCloudImportWithInternalInvitees(
+      const autoShared = await shareWithInternalInvitees(
         'cloud-import',
         placeholder.id,
         user.userId,
@@ -664,7 +664,7 @@ export async function executeGmeetImport(
           },
         },
       });
-      const autoShared = await shareCloudImportWithInternalInvitees(
+      const autoShared = await shareWithInternalInvitees(
         'cloud-import',
         placeholder.id,
         user.userId,
@@ -777,7 +777,7 @@ export async function executeGmeetImport(
         },
       },
     });
-    const autoShared = await shareCloudImportWithInternalInvitees(
+    const autoShared = await shareWithInternalInvitees(
       'cloud-import',
       placeholder.id,
       user.userId,
@@ -1094,7 +1094,7 @@ export async function executeGmeetImport(
         () => {}
       );
     }
-    const autoShared = await shareCloudImportWithInternalInvitees(
+    const autoShared = await shareWithInternalInvitees(
       'cloud-import',
       row.id,
       user.userId,

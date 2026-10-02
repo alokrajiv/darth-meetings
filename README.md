@@ -81,12 +81,284 @@ What **this** member owns / consumes:
   (`PATCH {scratch:false}`, or link it to a calendar event), and is moved to
   the trash automatically 30 days after creation (migration 042).
 
+## Darth desktop shell
+
+Meetings runs inside the Darth desktop shell (Electron, repo `darth/desktop`)
+on the same contract as Darth Chat (its SPEC §20.76):
+
+- **Detection** — the shell's UA carries `DarthDesktop/<ver>`. The root
+  layout reads the *request* UA at SSR (`src/lib/desktop-shell.ts`), sets
+  `<html data-shell="desktop" data-shell-os="mac|win|linux">` and passes
+  `inDesktopShell` to `ShellSearchProvider` — first paint already right, no
+  hydration diff. (Reading `headers()` makes every page dynamic-rendered.)
+- **Events** (shell → page only, window `CustomEvent`s, listened for only
+  inside the shell — `src/lib/shell-signals.ts`): `darth-shell:search`
+  `{query, submit[, scope: null]}` — `submit:false` while typing
+  (shell-debounced, `''` = cleared), `submit:true` on Enter, `scope: null`
+  (shell 0.3.3) only when the person removed the `in:` chip in the band (×,
+  Backspace at the start, Esc) → the panel drops its scope and a later Enter
+  does not re-apply it; `darth-shell:toggle-sidebar` toggles the labels rail
+  on the listing; `darth-shell:new-chat` is not applicable and ignored. The
+  only page → shell path is the search echo (below).
+- **Panel** (`src/components/shell-search.tsx`) — the Darth Chat search
+  look: one row per meeting with title, date, meta (owner · duration · where
+  it matched · labels) and a ~140-char snippet with the matched words bold.
+  Anchored just under the app header, full content width up to 720 px,
+  centred, over the page. Opens on the first non-empty query, follows typing
+  live, runs at once on Enter and moves focus into the results (↑/↓, Enter
+  opens the meeting, Esc closes and clears; a click outside closes). Never
+  two panels. Inside the shell there is no in-app search field (see Layout
+  below); in the browser the field filters the listing as before.
+- **Search** — `GET /api/search?q=` (`src/lib/meeting-search.ts` +
+  `src/db-ops/meeting-search.ts`): every whitespace term must occur in the
+  title, file name, description, AI notes or transcript text (ILIKE over the
+  migration-012 trigram indexes), same visibility and `meetings` gate as the
+  listing, max 30 hits (title hits first, then newest); the snippet is cut
+  from a 400-char SQL window around the earliest term with bold ranges as
+  UTF-16 offsets into the returned text.
+- **Search in this meeting** (2026-10-02, like Slack's `in:#channel`) — a
+  meeting page offers its meeting to the panel (`useShellSearchScope`). The
+  panel's first row is then "Search in <title>", selected by default, so
+  Enter in the band (or on that row) applies the chip `in: <title>` in the
+  panel header and the query runs over THAT meeting's transcript —
+  client-side, over what the page shows (edits and speaker names applied,
+  raw text in the Raw view; `src/lib/meeting-scope-search.ts`: every term in
+  the same utterance, transcript order). There is no per-meeting server
+  search: `GET /api/search` ranks whole meetings. A hit shows `m:ss ·
+  speaker` + snippet; Enter / click seeks the player there, scrolls to the
+  utterance and flashes it. The chip's × (or Backspace in the results)
+  removes it → the broad search across all meetings, as before. ↓ in the
+  band hands the keyboard to the panel (desktop `search-field.js down()`),
+  and an empty Enter / ↓ opens the panel on its suggestions.
+- **Recent searches** — the last 5 queries with their chips
+  (`src/lib/recent-searches.ts`), shown when the panel's query is empty;
+  click / Enter re-runs one (a scoped one for another meeting navigates
+  there first and applies the chip when that page offers it), × forgets it.
+  Stored in the shell's local store for Meetings (`window.darthDesktop.store`,
+  table `recent_searches`, one row per darth user id; the shell wipes it on
+  sign-out), else localStorage (`src/lib/recent-searches-store.ts`).
+- **Band echo** (shell 0.3.3, desktop `docs/SEARCH-HANDOFF.md`) — the band
+  mirrors the panel: every change of its query or chip (a recent picked, the
+  chip applied / removed, the panel closed) calls
+  `window.darthDesktop.search.echo({query, scope: {kind:'meeting', id,
+  label} | null})` (`src/lib/shell-search-echo.ts`), so the band shows
+  `in: <title> ×` + the text. Change-only (the first mount sends nothing, so
+  a reload never wipes the band's text), feature-detected (a browser or an
+  older shell skips it), never awaited, never rejects.
+- **Copy link** — no URL bar in the shell, so the meeting page header has a
+  **Copy link** button (also first in its ⋯ menu, and ⌘⇧C / Ctrl+Shift+C —
+  listed as a page key in the shell's shortcut map), and every listing row's
+  ⋯ menu has **Copy link**. It copies the permanent
+  `https://meetings.darth-internal.trames.io/m/<meeting uuid>` (migration
+  031 ledger id via `GET /api/meetings/resolve?any=<id>`; falls back to
+  `/transcript/<id>` when there is no ledger row) and toasts "Link copied"
+  (`src/lib/meeting-link.ts`, `src/components/copy-link-button.tsx`,
+  `src/components/toast.tsx`). `/recording/<id>` copies its own URL. The
+  clipboard write uses a pending ClipboardItem when the uuid lookup is still
+  in flight (keeps Safari's user-activation), else `writeText`, else a hidden
+  textarea. The web app has no header search on a meeting page, so the
+  in-meeting scope is shell-only; in a browser the transcript's own ⌘F
+  find (editors) and the browser's find cover it.
+- **Layout rules** (`src/lib/listing-layout.ts`) — ONE layout, designed for
+  the shell's window (900–1300 px of content, the shell's title band with its
+  own search above, its 64 px rail on the left); the browser mirrors it at
+  every width, there is no separate wide-browser variant, and nothing
+  stretches past 1400 px of content.
+  - *Toolbar*: one row at every width, never two. Left: the scope tabs
+    (All / Mine / Shared / Trash with counts; they scroll sideways below
+    900 px). Right: ONE **Filter** button with a count badge (layers off,
+    time range, label filter, each people/organizer/provider term) whose
+    popover holds Layers, Labels (current filter + show/hide the rail), Time
+    range, People and the Hidden calendar meetings; then a **⋯** menu with
+    calendar sync status + Sync now, Refresh, and the column chooser.
+  - *Search*: the shell hides the in-app field — the band owns search (⌘L)
+    and drives the results panel; no `/` hint there. In the browser the
+    field sits at the right of the same row, 240 px (wider on focus), and
+    `/` focuses it.
+  - *Header*: wordmark + Meetings / Recordings / Series; one **Import
+    meeting ▾** split button (menu: Import from… a transcript file, Upload
+    media); the **Recorder ●** chip always visible;
+    an account menu at the far right (Settings, theme, Sign out).
+  - *Theme*: set in Darth. Inside the shell the page follows
+    `prefers-color-scheme` live (the boot script ignores a stored browser
+    choice) and the account menu shows "Theme · set in Darth"; in the
+    browser the menu keeps the light/dark toggle.
+  - *Table*: no Labels column — labels are chips on the title (max 2 +
+    "+n"); Owner · Length · Speakers form a compact right-aligned group with
+    fixed widths (shown from 900 px); the date keeps its width and the title
+    takes the rest. "Add recording" is a hover/focus "+" icon on the row
+    (always visible on touch screens), and the unlinked-recordings notice is
+    one slim line.
+
+## Offline and PWA — removed 2026-10-02
+
+The website no longer has an offline mode and is no longer an installable
+PWA. Offline is the Darth desktop shell's job: `desktop/src/connectivity.js`
+(Work Offline + network detection) and its local store bridge
+(`window.darthDesktop.store`), documented in `desktop/docs/OFFLINE.md`
+("The web/PWA builds should drop their own offline modes").
+
+**Removed:** the mode-aware service worker and its registration; the
+IndexedDB pin ledger (`darth-offline`), pins, sync scheduler, outbox, the
+`darth-*` Cache Storage caches and cached RSC payloads, storage estimates and
+persistent-storage requests (`src/lib/offline/*`); the web manifest
+(`public/manifest.webmanifest`), the `<link rel="manifest">` / Apple
+web-app metadata and installed-app detection; the app badge and
+`/api/offline/badge`; the offline banner, chip, archive, pin dialog, the
+Settings offline card, the `/offline` page and the "Save for offline…" menu
+item; `/api/offline/outbox` (only the web outbox called it); and every
+"Not available offline" gate — controls are simply enabled. A fetch that
+never reaches the server now reads "Can't reach Darth Meetings — check your
+connection." (`src/lib/fetch-errors.ts`).
+
+**Kept, and why:**
+
+- `GET /api/health` (204, no auth, public in `src/proxy.ts`) — the cheap
+  reachability probe, kept for native clients (the Mac tray, the desktop
+  shell).
+- `GET /api/offline/plan` and `GET/PUT /api/offline/prefs`
+  (`src/db-ops/offline-plan.ts`, the `user_prefs.offline_prefs` counts from
+  migration 040) — darth-cli's `offline plan|prefs` uses them, and a future
+  desktop-shell replica can. Only the web UI that edited the counts is gone.
+- `?variant=audio` on the audio route (`src/lib/server/audio-only.ts`) — the
+  player streams the audio-only extract whenever its video toggle is off.
+- **One release only (2026-10):** `public/sw.js` is now a kill-switch worker
+  (no fetch handler; on activate it deletes every `darth-*` cache,
+  unregisters itself and reloads open windows from the network), still
+  served no-cache and public in `src/proxy.ts`, because a browser keeps an
+  installed worker until an update check succeeds. `src/components/sw-cleanup.tsx`
+  (mounted in the root layout) does the same from the page side: unregisters
+  workers, deletes `darth-*` caches, the `darth-offline` IndexedDB and the
+  `darth-offline-mode` localStorage key. Delete both after one release.
+
 ## Stack
 
 Next.js (App Router) + Postgres (schema `meeting_whisperer_*`) + AssemblyAI +
 Claude Agent SDK. Deployed on the .6 dev VM via pm2; nginx in front. The pm2
 app, the VM dir and the DB schema keep the historic `meeting-whisperer` /
 `meeting_whisperer` identifiers on purpose — only the product-facing name changed.
+
+## Deploy
+
+`./deploy.sh` (from the laptop) — blue/green on the .6 VM, no downtime.
+`./deploy.sh --dry-run` prints the plan and what rsync would send, changes
+nothing. `./deploy.sh --help` lists every flag.
+
+Why (2026-10-02 12:10–12:35 SGT): the old script built `.next` IN PLACE under
+the running process (3–5 min of mismatched chunks → "This page couldn't load"
+in the browser and the desktop app), its wait for AI runs matched a darth-chat
+process so the restart never came, and the restart itself was an nginx 502.
+
+**Two colours**, one DB, one storage dir:
+
+| colour | dir | pm2 app | port |
+|---|---|---|---|
+| blue | `~/apps/meeting-whisperer` | `meeting-whisperer` | 3002 |
+| green | `~/apps/meeting-whisperer-green` | `meeting-whisperer-green` | 3012 |
+
+Green's `.env.local` is a symlink to blue's, and the media store is shared
+through an ABSOLUTE `MW_STORAGE_DIR` in that file (`…/meeting-whisperer/storage`,
+appended by the setup script when missing). Green has no `storage/` of its own —
+a symlink there breaks `next build`: Turbopack traces `storage/` from
+audio-storage.ts, follows it into blue's tree and fails with "Symlink … points
+out of the filesystem root" (2026-10-02). The nginx vhost (`deploy/nginx-meetings.conf`) proxies to
+`upstream meetings_app`, whose servers come from `/etc/nginx/mw-active.conf`:
+the live colour first, the other as `backup` (a refused connect on the live one
+is retried on the backup — `proxy_next_upstream error timeout`, deliberately not
+`http_502`: several API routes return their own 502s). The include file lives
+directly in `/etc/nginx/`, NOT in `conf.d/` (it is only valid inside the
+upstream block). `cat /etc/nginx/mw-active.conf` on the VM = which colour is
+live; run ad-hoc `scripts/*.ts` from that colour's dir.
+
+**A deploy** (`deploy.sh` header has the detail): stop the idle colour → rsync
++ `bun install && bun run build` in ITS dir (the live tree is never touched) →
+drain files in both dirs → start the idle colour and health-check it on its own
+port (`/api/health` 204, `/login` 302) → rewrite `mw-active.conf`, `nginx -t &&
+nginx -s reload` (graceful) → public check (flips back by itself on failure) →
+15 s grace → wait until the OLD colour has no Claude Agent SDK run (only
+processes under `<old dir>/node_modules/@anthropic-ai/claude-agent-sdk*` count —
+darth-chat's `/opt/darth-chat/…` runs no longer block it; 15 s × 60,
+`DEPLOY_FORCE=1` skips) → `pm2 stop` the old colour, `pm2 save` → remove the new
+colour's drain file. Any failure before the flip leaves the live colour exactly
+as it was.
+
+**Background jobs and the overlap.** Every colour arms the in-process
+pollers/sweepers of `src/instrumentation.ts`, and their in-process guards
+(`sweeping`, `globalThis.__mw*` maps) do not reach across processes. Checked job
+by job (2026-10-02):
+
+| job | two processes at once |
+|---|---|
+| ingest-retry | safe — `resetForIngestRetry` is a conditional `UPDATE … RETURNING`; the loser gets "Row changed under us" |
+| gmeet-poller + fast lane | mostly benign (account auto-sync claims via `auto_sync_log` ON CONFLICT; DMs carry dedupe keys); series auto-import has no claim → two near-simultaneous ticks could queue two placeholders |
+| video-fetch-sweeper | wasteful — two full downloads, atomic rename, last one wins |
+| auto-notes-sweeper | risky — notes / speaker-ID backlog runs set `running` unconditionally → two Claude runs on one meeting |
+| recording-poller | risky — queued video reports and recombines are read-then-write → duplicate report run, duplicate combined meeting + AssemblyAI job |
+| deferred-import-poller | risky — the row stays `waiting` during a multi-minute import → a second process imports it again |
+| media-sweeper | risky — the in-place faststart remux uses a fixed temp name (`<src>.faststart.tmp`) → can corrupt the original recording |
+
+So background jobs must never run in both colours, and they don't: a
+`.mw-draining` file in a colour's dir pauses its timer callbacks
+(`src/lib/server/deploy-drain.ts`; a skipped job runs once within 10 s of the
+file going away). The deploy drains the live colour before the new one starts,
+boots the new one drained, and removes the new one's file only after the old
+process is stopped. Background work therefore PAUSES — never overlaps — from
+the drain to the end: normally under a minute; up to 15 min when the old colour
+has an AI run to finish (then the new colour is activated anyway and the old
+one is left running, drained, with a message to stop it). The file stays in the
+retired dir, so a colour pm2 resurrects after a reboot stays passive. HTTP
+never pauses. Real DB claims for the risky jobs (above) would make the drain a
+belt rather than the braces.
+
+**Not switched with the colours:** the `mw-voiceprint` sidecar runs from BLUE's
+`voiceprint/` (deploy.sh keeps that copy current on every deploy; it is still
+not restarted by a deploy, as before).
+
+**One-time VM setup** (the owner runs it; idempotent, never touches blue or the
+live upstream; `deploy.sh` refuses until it has run):
+
+```bash
+ssh azureuser@172.17.0.6 'mkdir -p /tmp/mw-setup' \
+  && scp deploy/setup-blue-green.sh deploy/nginx-meetings.conf deploy/maintenance.html \
+         azureuser@172.17.0.6:/tmp/mw-setup/ \
+  && ssh -t azureuser@172.17.0.6 'bash /tmp/mw-setup/setup-blue-green.sh'
+```
+
+It creates the green dir + symlinks, `/var/www/mw-maintenance/` with
+`maintenance.html`, `/etc/nginx/mw-active.conf` (blue live) if missing, installs
+the vhost (previous copy → `/etc/nginx/mw-meetings-vhost.bak-<ts>`, restored if
+`nginx -t` fails) and registers pm2 `meeting-whisperer-green` with blue's exact
+command, port swapped to 3012, left stopped until the first deploy builds it.
+
+### Maintenance notice
+
+Only ever the owner's own words — no file, no notice; a 5xx is never assumed to
+be a deployment.
+
+```bash
+./deploy.sh --message "Deploying the recorder fixes — back by 12:40 SGT" --eta 10m   # notice, deploy, clear
+./deploy.sh --message "…" --keep-notice                                               # leave it up afterwards
+./deploy.sh --notice "Transcription is slow this afternoon (AssemblyAI)" [--eta 1h]  # post only
+./deploy.sh --clear-notice                                                           # remove only
+```
+
+It writes `/var/www/mw-maintenance/notice.json` `{message, since, eta_at|null,
+build}`; nginx serves it at `/__notice.json` (`Cache-Control: no-store`, 404
+when absent) straight from disk, so it answers while the app is down. Readers
+(`src/lib/maintenance-notice.ts`):
+
+- `<MaintenanceBanner>` in the root layout — polls every 30 s and on focus,
+  "Maintenance until ~HH:MM SGT" when an ETA is set, dismissable per notice;
+- `src/app/global-error.tsx` — replaces Next's built-in "This page couldn't
+  load" page (what users saw on 2026-10-02 — it is the app's page, not the
+  desktop shell's): shows the notice, and for a chunk-load error (a tab on an
+  older build) or while a notice is up polls `/api/health` every 5 s and reloads
+  itself (at most 3 times in 5 min); Reload / Back stay;
+- `deploy/maintenance.html` — nginx's own 502/503/504 page (no colour
+  answering): the notice + ETA, else "Darth Meetings is restarting", retries
+  the URL every 5 s. App-generated 502s pass through untouched;
+- the Darth desktop shell's updating overlay (desktop repo, `src/updating.js`)
+  — the same file, per origin, for every family app.
 
 ## Dev
 

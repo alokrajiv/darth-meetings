@@ -238,6 +238,9 @@ async function normalizeTextInBackground(
       languageCode: normalized.language ?? null,
       gmeetContext: link?.gmeetContext ?? null,
       attendees: link?.attendees ?? [],
+      // Linked to an event → shared with its internal invitees (meeting
+      // policy, owner 2026-10-02).
+      eventLinkShareList: link?.attendees ?? [],
       logTag: '[import-text]',
       // The placeholder already carries the flag (the upsert never touches
       // it) — restated so the row's intent is explicit on the fill-in too.
@@ -414,6 +417,7 @@ export const POST = withAuth(async ({ user, request }) => {
         recordedAtIso: link?.recordedAtIso ?? null,
         gmeetContext: link?.gmeetContext ?? null,
         attendees: link?.attendees ?? [],
+        eventLinkShareList: link?.attendees ?? [],
         logTag: '[import-text]',
         scratch,
       }

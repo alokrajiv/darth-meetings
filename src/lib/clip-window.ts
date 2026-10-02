@@ -210,7 +210,7 @@ export function holesBeforeUtterance(
  *
  * `window` is what the player maps through when the bytes are the cut.
  * `wholeFileWindow` is what it maps through if they turn out to be the WHOLE
- * file after all — a copy the browser's HTTP cache or an offline pin kept from
+ * file after all — a copy the browser's HTTP cache kept (`max-age=3600`) from
  * before the cut, or a server one deploy behind during a blue/green switch —
  * which `servedIsWholeFile` recognises from the media's own duration.
  *

@@ -11,6 +11,7 @@ import { listAddableRecordings } from '@/db-ops/clips';
 import { getRecording, listRecordingMedia } from '@/db-ops/recordings';
 import { buildAudioOnly, getAudioOnlyPath } from '@/lib/server/audio-only';
 import { resolveAudioPath } from '@/lib/server/audio-storage';
+import { ensureLocalMedia } from '@/lib/server/media-local';
 
 /**
  * "Line them up" — the offset between two recordings of one meeting
@@ -55,12 +56,12 @@ function fail(status: number, error: string, code?: string): AlignResult {
  * when the canonical carries video, else the canonical itself.
  *
  * `buildAudioOnly` is idempotent and shares its in-flight ffmpeg with the
- * offline-pin path, so two people aligning the same pair at once pay for one
+ * player's `?variant=audio` path, so two people aligning the same pair at once pay for one
  * transcode.
  */
 async function audioPathForRecording(
   recordingId: string
-): Promise<{ path: string; filename: string } | { error: string }> {
+): Promise<{ path: string; filename: string; release?: () => void } | { error: string }> {
   const media = await listRecordingMedia([recordingId]);
   const canonical = media
     .filter((m) => m.kind === 'canonical' && m.filename)
@@ -75,7 +76,25 @@ async function audioPathForRecording(
     return { error: 'That recording has no file on this server.' };
   }
   if (!(await fsp.stat(source).catch(() => null))) {
-    return { error: 'That recording’s file is not on this server right now.' };
+    // The local copy is gone (archived and purged): read the archived
+    // soundtrack — the audio-only extract's blob when there is one — out of
+    // media-local's cache instead. Nothing is rebuilt from it here.
+    const derivative = media.find((m) => m.kind === 'audio_only' && m.of_media_id === canonical.id);
+    const local = await ensureLocalMedia(
+      {
+        filename,
+        recordingId,
+        blobName: canonical.blob_name,
+        isVideo: canonical.has_video,
+        audioOnly: derivative?.filename
+          ? { filename: derivative.filename, blobName: derivative.blob_name }
+          : null,
+      },
+      'audio',
+      { purpose: 'align' }
+    );
+    if (!local) return { error: 'That recording’s file is not on this server right now.' };
+    return { path: local.path, filename, release: local.release };
   }
 
   const built = await buildAudioOnly(filename, { nice: true });
@@ -135,9 +154,30 @@ export async function alignRecordings(input: {
     audioPathForRecording(input.againstRecordingId),
     audioPathForRecording(input.recordingId),
   ]);
-  if ('error' in fa) return fail(409, fa.error, 'no-media');
-  if ('error' in fb) return fail(409, fb.error, 'no-media');
+  // Whatever media-local pulled for this call is released once the sidecar
+  // has answered (or not).
+  const releaseAll = () => {
+    if (!('error' in fa)) fa.release?.();
+    if (!('error' in fb)) fb.release?.();
+  };
+  if ('error' in fa || 'error' in fb) {
+    releaseAll();
+    if ('error' in fa) return fail(409, fa.error, 'no-media');
+    return fail(409, (fb as { error: string }).error, 'no-media');
+  }
+  try {
+    return await alignPaths(fa.path, fb.path, nominalOffsetMs, searchWindowMs);
+  } finally {
+    releaseAll();
+  }
+}
 
+async function alignPaths(
+  aPath: string,
+  bPath: string,
+  nominalOffsetMs: number,
+  searchWindowMs: number
+): Promise<AlignResult> {
   let payload: {
     offsetMs: number;
     confidence: number;
@@ -150,8 +190,8 @@ export async function alignRecordings(input: {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        a: fa.path,
-        b: fb.path,
+        a: aPath,
+        b: bPath,
         nominalMs: nominalOffsetMs,
         windowMs: searchWindowMs,
       }),

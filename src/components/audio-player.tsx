@@ -75,7 +75,7 @@ interface AudioPlayerProps {
   /**
    * What to clamp to instead when the loaded media turns out to be the WHOLE
    * file rather than the cut (`servedIsWholeFile` against `cutSpanMs`): a copy
-   * an HTTP cache or an offline pin kept from before the server cut windows,
+   * the browser's HTTP cache kept from before the server cut windows,
    * or a server one deploy behind. Ignored when `cutSpanMs` is null/undefined.
    */
   wholeFileWindow?: PlaybackWindow | null;
@@ -96,12 +96,9 @@ const PROBE_TIMEOUT_MS = 4000;
 
 /**
  * "Answer from the app, don't 302 me to Blob" (DEC-3 Stage B,
- * lib/server/media-serve.ts). The probe below sends it for two reasons:
- * a cross-origin `fetch()` carrying a `Range` header would need a CORS
- * preflight against the storage account, and — the one that actually
- * matters — the probe's URL is a Cache Storage key, so it must stay spelled
- * exactly like the pinned one. A header changes no cache key; a query
- * parameter would have missed every pinned extract.
+ * lib/server/media-serve.ts). The probe below sends it because a
+ * cross-origin `fetch()` carrying a `Range` header would need a CORS
+ * preflight against the storage account.
  *
  * The `<audio>` / `<video>` elements themselves cannot send headers, and do
  * not need to: a media element's load is `no-cors`, `Range` is safelisted
@@ -116,12 +113,9 @@ function viaAppUrl(url: string): string {
 }
 
 /**
- * The audio-only URL for a media route URL, spelled EXACTLY as
- * lib/offline/offline-urls.ts spells it (`variant=audio` first, then
- * `part=N`): the service worker matches cached media on the full
- * path+query, so a 'video' offline pin — which caches both the recording
- * and the extract under these two keys — keeps serving the player from
- * cache in either mode. Null when the URL already names a variant.
+ * The audio-only URL for a media route URL (`variant=audio` first, then
+ * any existing query such as `part=N`). Null when the URL already names a
+ * variant.
  */
 function audioVariantUrl(src: string): string | null {
   if (/[?&]variant=/.test(src)) return null;
@@ -138,7 +132,7 @@ function audioVariantUrl(src: string): string | null {
  * Audio mode on a video recording streams the 64 kbps audio-only extract
  * (`?variant=audio`, ~30 MB/h) instead of the whole mp4 (100–500 MB/h):
  * a one-off two-byte Range probe on mount asks the route whether the
- * extract is ready (206) — otherwise (202 still preparing, 5xx, offline)
+ * extract is ready (206) — otherwise (202 still preparing, 5xx, no network)
  * the full recording is used exactly as before. The video toggle always
  * plays the recording itself.
  *
@@ -375,8 +369,7 @@ export const AudioPlayer = forwardRef<AudioPlayerHandle, AudioPlayerProps>(
      * one day ask Blob for the next byte range with a signature that has
      * expired, and the element reports a plain network/decode error. That is
      * recoverable and the user must not notice: re-request the SAME app URL
-     * (a fresh 302, a fresh SAS) and resume at the same second. The URL is
-     * unchanged on purpose — it is the service worker's cache key.
+     * (a fresh 302, a fresh SAS) and resume at the same second.
      *
      * A failure with NO progress at all is a different animal: the redirect
      * itself did not work for this browser / worker combination. One retry
@@ -588,8 +581,7 @@ export const AudioPlayer = forwardRef<AudioPlayerHandle, AudioPlayerProps>(
     };
 
     // What the elements actually load. `forceViaApp` is only ever set by the
-    // recovery path above; until then these are the URLs the page passed and
-    // the worker has cached.
+    // recovery path above; until then these are the URLs the page passed.
     const videoElementSrc = forceViaApp ? viaAppUrl(src) : src;
     const audioElementSrc = audioSrc && forceViaApp ? viaAppUrl(audioSrc) : audioSrc;
 

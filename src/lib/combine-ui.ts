@@ -491,7 +491,7 @@ export interface PlayerPart {
  * dropped rather than given a number that 404s.
  *
  * The one fallback: when NOT ONE entry carries a `mediaPart` — a response
- * cached by the service worker from a build before this field — the old
+ * cached from a build before this field — the old
  * one-file-per-recording derivation is used, which is right for every meeting
  * whose recordings each hold a single file.
  */

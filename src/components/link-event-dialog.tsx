@@ -52,8 +52,9 @@ interface LinkEventDialogProps {
   transcriptId: string;
   /**
    * Design P7: link a STANDALONE recording instead of a meeting — the pick
-   * goes to `POST /api/recordings/:id/link`, which creates the meeting (no
-   * share). `transcriptId` is ignored when this is set.
+   * goes to `POST /api/recordings/:id/link`, which creates the meeting and
+   * shares it with the event's internal invitees (the recording itself stays
+   * private). `transcriptId` is ignored when this is set.
    */
   recordingId?: string;
   /** Day to open on, ISO — usually the transcript's current date guess. */
@@ -80,7 +81,8 @@ function shiftDate(dateStr: string, days: number): string {
  * Retro-link a transcript to the calendar event it came from: browse the
  * user's calendar (their own Google token, read-only) around the meeting's
  * date, pick the invite, done — the server merges attendees/title/times into
- * the transcript, sets the meeting date, and share suggestions light up.
+ * the transcript, sets the meeting date, and shares the meeting with the
+ * invite's internal people (meeting policy, as a cloud import does).
  */
 export function LinkEventDialog({
   open,
@@ -216,7 +218,7 @@ export function LinkEventDialog({
               <p className="text-sm text-muted-foreground">
                 {notConnected
                   ? 'Connect your Google account once to pick the invite from your calendar.'
-                  : 'Find the invite this came from — its title, date, and attendees get attached, and you\u2019ll get share suggestions for the people who were in it.'}
+                  : 'Find the invite this came from — its title, date, and attendees get attached, and the meeting is shared with the Trames colleagues on it.'}
               </p>
             )}
             {error && (

@@ -25,6 +25,7 @@ import {
   forgetCompanionInstall,
 } from '@/lib/companion/companion-client';
 import { RecorderRecordings } from '@/components/recorder-recordings';
+import { localDiskLine } from '@/lib/companion/local-disk';
 
 /**
  * Settings card for the Mac menu-bar helper ("Darth Recorder"): install
@@ -65,6 +66,7 @@ export function RecorderCard() {
   // click rather than a round-trip later. Cleared as soon as a snapshot agrees.
   const [pendingAuto, setPendingAuto] = useState<boolean | null>(null);
   const [mac, setMac] = useState(true);
+  const [showDiskDir, setShowDiskDir] = useState(false);
   useEffect(() => setMac(companionPlatformSupported()), []);
   useEffect(() => {
     if (pendingAuto !== null && c.autoUpload === pendingAuto) setPendingAuto(null);
@@ -224,6 +226,26 @@ export function RecorderCard() {
                   <Badge variant="secondary">{c.recordingsPendingUpload} to upload</Badge>
                 ) : null}
               </p>
+              {/* Tray 0.3.22+: bytes on this Mac (older trays omit local_disk → nothing shown). */}
+              {c.localDisk && (
+                <p className="text-xs text-muted-foreground" data-recorder-disk>
+                  {localDiskLine(c.localDisk)}{' '}
+                  <button
+                    type="button"
+                    className="underline-offset-2 hover:underline"
+                    title={c.localDisk.dir}
+                    onClick={() => setShowDiskDir((v) => !v)}
+                    data-recorder-disk-where
+                  >
+                    where?
+                  </button>
+                  {showDiskDir && (
+                    <span className="mt-0.5 block break-all font-mono" data-recorder-disk-dir>
+                      {c.localDisk.dir}
+                    </span>
+                  )}
+                </p>
+              )}
               {/* Settings is the history of this Mac: uploaded rows stay in
                   view (the upload picker hides them behind a count instead). */}
               <RecorderRecordings limit={6} showUploaded />

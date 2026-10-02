@@ -16,14 +16,25 @@
  * Sections: 'mac' (registry), 'uploaded' (kept recordings + legacy bare
  * rows), 'temporary' (recordings with an expiry + legacy scratch rows).
  *
+ * And one more, asked for BY NAME only (2026-10-02): 'linked' — the caller's
+ * standalone recordings that a live meeting holds (a `meeting_clips` row on
+ * a meeting not in the trash). Linking used to make a recording vanish from
+ * /recordings; this section keeps it findable. It is never part of the
+ * default set (no `section`, or the older flags), and `counts.linked` is
+ * present only on an answer to `section=linked` — so the default answer is
+ * byte-for-byte what darth-cli has always read.
+ *
  * Order and cursor: `(sort_us DESC, kind ASC, id DESC)`, where `sort_us` is
  * the item's time (capture start, else creation) in integer MICROSECONDS —
  * a Postgres timestamp's own precision, so the keyset compares exactly (a JS
  * Date would round to ms and duplicate or skip rows at a page boundary).
  */
 
+/** The default set: the recordings that belong to no meeting. */
 export const RECORDING_SECTIONS = ['mac', 'uploaded', 'temporary'] as const;
-export type RecordingSection = (typeof RECORDING_SECTIONS)[number];
+/** Every section a request may name — the default set plus 'linked'. */
+export const NAMED_RECORDING_SECTIONS = [...RECORDING_SECTIONS, 'linked'] as const;
+export type RecordingSection = (typeof NAMED_RECORDING_SECTIONS)[number];
 
 export const RECORDING_ITEM_KINDS = ['meeting', 'recording', 'registry'] as const;
 export type RecordingItemKind = (typeof RECORDING_ITEM_KINDS)[number];
@@ -55,6 +66,8 @@ export interface RecordingSectionCounts {
   mac: number;
   uploaded: number;
   temporary: number;
+  /** Only on an answer to `section=linked` (absent otherwise — CLI compat). */
+  linked?: number;
 }
 
 export function encodeRecordingsCursor(c: RecordingsPageCursor): string {
@@ -84,11 +97,12 @@ export function decodeRecordingsCursor(raw: string | null | undefined): Recordin
 const TZ_RE = /^[A-Za-z0-9_/+-]{1,64}$/;
 
 /**
- * `?mine=1[&section=mac|uploaded|temporary][&unlinked=1][&temporary=1]
+ * `?mine=1[&section=mac|uploaded|temporary|linked][&unlinked=1][&temporary=1]
  * [&q=][&regex=1][&limit=][&cursor=][&tz=]` → the query, or an error.
  *
  * `section` names ONE section. The older flags still work: `unlinked=1` =
- * mac + uploaded, `temporary=1` = temporary, both or neither = all three.
+ * mac + uploaded, `temporary=1` = temporary, both or neither = all three
+ * (never 'linked', which is only ever asked for by name).
  */
 export function parseRecordingsPageQuery(
   params: URLSearchParams
@@ -99,8 +113,8 @@ export function parseRecordingsPageQuery(
   let sections: RecordingSection[];
   const section = params.get('section');
   if (section) {
-    if (!(RECORDING_SECTIONS as readonly string[]).includes(section)) {
-      return { ok: false, error: 'section must be one of mac, uploaded, temporary' };
+    if (!(NAMED_RECORDING_SECTIONS as readonly string[]).includes(section)) {
+      return { ok: false, error: 'section must be one of mac, uploaded, temporary, linked' };
     }
     sections = [section as RecordingSection];
   } else {

@@ -12,7 +12,7 @@
  * returns the stored payload **verbatim** — same object, no map, no re-tag,
  * no re-join, plain `"<index>"` edit keys. Every live row is that case after
  * the backfill, so `/content`, `/edits`, `/speakers`, darth-cli and every
- * offline pin stay byte-identical. The non-compat branch below is written
+ * offline replica stay byte-identical. The non-compat branch below is written
  * and tested now so Phase 3 has nothing left to invent, but no prod row
  * reaches it yet.
  *

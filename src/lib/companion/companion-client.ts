@@ -1,6 +1,9 @@
 'use client';
 
 import { useCallback, useEffect, useMemo, useState } from 'react';
+import { parseLocalDisk, type CompanionLocalDisk } from './local-disk';
+
+export type { CompanionLocalDisk } from './local-disk';
 
 /**
  * Link to the local Darth Recorder menu-bar app (poc/mac-recorder, target darth-tray).
@@ -22,6 +25,8 @@ import { useCallback, useEffect, useMemo, useState } from 'react';
  * recording_label, update_available, update_staged.
  * 0.2.0 additions: signed_in, email, device_id, share {app, kind, target},
  * recordings_pending_upload, auto_upload (optional).
+ * 0.3.22: local_disk {dir, total_bytes, pending_upload_bytes, …} — bytes on this Mac
+ * (see ./local-disk.ts); older trays omit it and `localDisk` stays null.
  *
  * `recording_stopped` on 0.1.5 overwrote the boolean `recording` with the
  * saved-file object — which is why `recording` here is derived strictly from
@@ -159,6 +164,8 @@ export type CompanionState = {
   share: CompanionShare | null;
   /** null = the tray does not report it (legacy). */
   recordingsPendingUpload: number | null;
+  /** Tray 0.3.22+ `local_disk`: bytes on this Mac by bucket. null = not reported (older tray). */
+  localDisk: CompanionLocalDisk | null;
   /** The tray answers {cmd:"list_recordings"} — i.e. it is 0.2.0 or newer. */
   supportsRegistry: boolean;
   /** null = the tray does not report it. */
@@ -253,6 +260,7 @@ const initial: CompanionState = {
   deviceId: null,
   share: null,
   recordingsPendingUpload: null,
+  localDisk: null,
   supportsRegistry: false,
   autoUpload: null,
   updateAvailable: null,
@@ -637,6 +645,7 @@ class CompanionClient {
       deviceId: str(m.device_id),
       share: parseShare(m.share),
       recordingsPendingUpload: typeof m.recordings_pending_upload === 'number' ? m.recordings_pending_upload : null,
+      localDisk: parseLocalDisk(m.local_disk),
       autoUpload: typeof m.auto_upload === 'boolean' ? m.auto_upload : null,
       updateAvailable: str(m.update_available),
       updateStaged: str(m.update_staged),

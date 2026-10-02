@@ -4,7 +4,9 @@ import { promises as fsp } from 'node:fs';
 import { execFile, spawn } from 'node:child_process';
 import { promisify } from 'node:util';
 import { getStorageDir, resolveAudioPath } from '@/lib/server/audio-storage';
-import { hasVideoStream } from '@/lib/server/video-frames';
+import { hasVideoStream, mediaHasVideo } from '@/lib/server/video-frames';
+import { ensureLocalMedia } from '@/lib/server/media-local';
+import type { ResolvedMedia } from '@/lib/server/recordings';
 import {
   buildCutArgs,
   clipCutStem,
@@ -38,7 +40,9 @@ const execFileP = promisify(execFile);
  *   older than its source (the source replaced in place) is rebuilt.
  * - LOCAL ONLY: cuts are not archived to Blob. They are derivatives that the
  *   source rebuilds in seconds (a copy) to minutes (a re-encode); a VM that
- *   lost its cache simply regenerates on the next request.
+ *   lost its cache simply regenerates on the next request. The SOURCE may be
+ *   archived-and-purged: it is then pulled through media-local's bounded
+ *   cache (`ensureLocalMedia`) for the one ffmpeg run, exactly as frames are.
  * - CLEANED: `dropClipCuts(meeting)` removes the meeting's whole directory. It
  *   runs whenever the meeting's clips are rewritten (`setClipMirror` — split,
  *   un-split, combine add / patch / delete / rollback) and on permanent delete.
@@ -64,8 +68,14 @@ export interface ClipCutRequest {
   part: number;
   /** `ResolvedMedia.durationMs` when known — saves a probe. */
   sourceDurationMs?: number | null;
-  /** `ResolvedMedia.isVideo` when known (`has_video`); otherwise probed. */
+  /** Overrides the video probe (tests); otherwise `mediaHasVideo` / ffprobe. */
   sourceHasVideo?: boolean | null;
+  /**
+   * The resolved file, when the caller has it (the audio route always does):
+   * lets a source whose stored copy was archived and purged be pulled from
+   * the archive (`ensureLocalMedia`) instead of answering "missing".
+   */
+  media?: ResolvedMedia;
 }
 
 export type ClipCutResult =
@@ -232,7 +242,9 @@ async function existingCut(dir: string, stem: string, srcMtimeMs: number): Promi
 export async function ensureClipCut(req: ClipCutRequest): Promise<ClipCutResult> {
   // `?variant=audio` of an AUDIO file is the same bytes as the plain cut, so
   // both ask for the `av` stem. `hasVideoStream` is cached per process.
-  const hasVideo = req.sourceHasVideo ?? (await hasVideoStream(req.sourceFilename));
+  const hasVideo =
+    req.sourceHasVideo ??
+    (req.media ? await mediaHasVideo(req.media) : await hasVideoStream(req.sourceFilename));
   const variant: CutVariant = hasVideo ? req.variant : 'av';
   let dir: string;
   let stem: string;
@@ -271,20 +283,45 @@ async function cutOnce(
   dir: string,
   stem: string
 ): Promise<ClipCutResult> {
-  let src: string;
+  let stored: string;
   try {
-    src = resolveAudioPath(req.sourceFilename);
+    stored = resolveAudioPath(req.sourceFilename);
   } catch (e) {
     return { status: 'error', error: e instanceof Error ? e.message : String(e) };
   }
-  const srcSt = await fsp.stat(src).catch(() => null);
-  if (!srcSt) return { status: 'missing' };
+  const storedSt = await fsp.stat(stored).catch(() => null);
 
-  const cached = await existingCut(dir, stem, srcSt.mtimeMs);
+  // An archived copy never changes, so only a file ON DISK can make a cut stale.
+  const cached = await existingCut(dir, stem, storedSt?.mtimeMs ?? 0);
   if (cached) {
     return { status: 'ready', path: cached, contentType: contentTypeFor(extOf(cached), outputOf(hasVideo, req.variant)) };
   }
 
+  // The source: the stored file, or — its copy archived and purged (Stage D)
+  // — the archived blob pulled into media-local's bounded cache for this one
+  // cut (`ensureLocalMedia`, the same path frames and voiceprints use). The
+  // cut itself stays local either way; it is never archived.
+  if (storedSt) return produceCut(req, hasVideo, dir, stem, stored);
+  const local = req.media
+    ? await ensureLocalMedia(req.media, hasVideo && req.variant === 'audio' ? 'audio' : 'video', {
+        purpose: 'clip-cut',
+      })
+    : null;
+  if (!local) return { status: 'missing' };
+  try {
+    return await produceCut(req, hasVideo, dir, stem, local.path);
+  } finally {
+    local.release();
+  }
+}
+
+async function produceCut(
+  req: ClipCutRequest,
+  hasVideo: boolean,
+  dir: string,
+  stem: string,
+  src: string
+): Promise<ClipCutResult> {
   let facts: SourceFacts;
   try {
     facts = await probeSource(src);

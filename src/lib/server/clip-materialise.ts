@@ -22,8 +22,8 @@ import type { TranscriptResponse } from '@/lib/format';
  * text on its row (docs/recordings-phase3-clips-spec.md "Model").
  *
  * The Phase 1 rule is that the meeting ROW is what every reader reads:
- * `/content`, the detail page, darth-cli, deep search, the AI prompts, the
- * offline pin. A meeting that uses only a window of a recording therefore has
+ * `/content`, the detail page, darth-cli, deep search, the AI prompts, an
+ * offline replica. A meeting that uses only a window of a recording therefore has
  * to carry the resolved result of that window in `imported_content` like any
  * other meeting — which is what this does, and why it is called from exactly
  * three places:

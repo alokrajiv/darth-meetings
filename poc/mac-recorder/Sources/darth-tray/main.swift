@@ -5,7 +5,7 @@ import ServiceManagement
 import RecorderCore
 import TrayLogic
 
-let VERSION = "0.3.21"
+let VERSION = "0.3.22"
 let WS_PORT: UInt16 = 47800
 let PWA_URL = URL(string: "https://meetings.darth-internal.trames.io/")!
 /// Seconds between "the call ended" and an automatic stop.
@@ -304,6 +304,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     let authItem = NSMenuItem(title: "Sign in to Darth Meetings…", action: #selector(toggleAuth), keyEquivalent: "")
     let uploadItem = NSMenuItem(title: "Upload recordings automatically", action: #selector(toggleAutoUpload), keyEquivalent: "")
     let pendingLine = NSMenuItem(title: "", action: nil, keyEquivalent: "")
+    /// 0.3.22: "On this Mac: 1.2 GB in 7 recordings · 480 MB waiting to upload" — click reveals the folder.
+    let diskLine = NSMenuItem(title: DiskUsageMonitor.COUNTING, action: #selector(revealFolder), keyEquivalent: "")
     let loginItem = NSMenuItem(title: "Open at login", action: #selector(toggleLogin), keyEquivalent: "")
     let versionLine = NSMenuItem(title: "Darth Recorder \(VERSION)", action: nil, keyEquivalent: "")
     let updateItem = NSMenuItem(title: "Check for Updates…", action: #selector(checkForUpdates), keyEquivalent: "")
@@ -342,6 +344,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         shares.onEnd = { [weak self] s in self?.shareEnded(s) }
 
         server.statusProvider = { [weak self] in self?.statusPayload() ?? [:] }
+        // 0.3.22: local disk accounting — walked once now, then kept fresh off the main queue.
+        DiskUsageMonitor.shared.onChange = { [weak self] settledChange in
+            self?.refreshDiskLine()
+            if settledChange { self?.broadcast("status") }
+        }
+        DiskUsageMonitor.shared.refresh(walk: true)
         server.onCommand = { [weak self] cmd, obj in self?.handleCommand(cmd, obj) }
         server.onClientsChanged = { [weak self] n in self?.clients = n; self?.refreshMenu() }
         do { try server.start() } catch { rlog("local server failed: \(error)") }
@@ -783,6 +791,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         authItem.target = self; m.addItem(authItem)
         uploadItem.target = self; m.addItem(uploadItem)
         pendingLine.target = self; pendingLine.action = #selector(uploadPendingFromMenu); m.addItem(pendingLine)
+        diskLine.target = self; diskLine.toolTip = "\(Paths.recordings.path) — click to show it in Finder"; m.addItem(diskLine)
         m.addItem(.separator())
         discreetItem.target = self; m.addItem(discreetItem)
         autoHideItem.target = self; m.addItem(autoHideItem)
@@ -818,6 +827,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         updateItem.target = self; m.addItem(updateItem)
         m.addItem(.separator())
         let quit = NSMenuItem(title: "Quit Darth Recorder", action: #selector(quit), keyEquivalent: "q"); quit.target = self; m.addItem(quit)
+        m.delegate = self          // 0.3.22: fresh disk numbers each time the menu opens
         statusItem.menu = m
     }
 
@@ -886,6 +896,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let pending = Registry.shared.pendingUpload(automatic: false).count
         pendingLine.title = pending == 0 ? "No recordings waiting to upload" : "Upload \(pending) recording\(pending == 1 ? "" : "s") now"
         pendingLine.isEnabled = pending > 0 && auth.signedIn
+        refreshDiskLine()
+        DiskUsageMonitor.shared.refresh()
         loginItem.state = SMAppService.mainApp.status == .enabled ? .on : .off
         if updater.installing { updateItem.title = "Installing update…"; updateItem.isEnabled = false }
         else if let s = updater.staged { updateItem.title = "Install \(s.version) and restart"; updateItem.isEnabled = true }
@@ -1211,6 +1223,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             default: break
             }
         }
+    }
+    /// 0.3.22: the menu's disk line, from the monitor's last result (never stats on main).
+    func refreshDiskLine() {
+        diskLine.title = DiskUsageMonitor.shared.latest?.menuLine ?? DiskUsageMonitor.COUNTING
     }
     @objc func revealFolder() {
         try? FileManager.default.createDirectory(at: Paths.recordings, withIntermediateDirectories: true)
@@ -1728,6 +1744,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             "capture_profile": recorder.captureProfileJSON(),
             "ts": isoNow(),
         ]
+        // 0.3.22: {dir, total_bytes, files, recordings, pending_upload_bytes, pending_upload_recordings,
+        // kept_bytes, uploaded_bytes, recording_bytes, orphan_bytes, orphan_files, orphans_scanned_at,
+        // computed_at} — the last off-main result (omitted until the first one lands); asks for a new one.
+        if let disk = DiskUsageMonitor.shared.json() { d["local_disk"] = disk }
+        DiskUsageMonitor.shared.refresh()
         if recorder.isRecording {
             d["recording_since"] = isoString(recorder.startedAt ?? Date())
             d["recording_path"] = (recorder.segments.last?["path"] as? String) ?? ""
@@ -2014,6 +2035,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 /// older than the click (0.3.15).
 extension AppDelegate: NSMenuDelegate {
     func menuNeedsUpdate(_ menu: NSMenu) {
+        if menu === statusItem.menu { DiskUsageMonitor.shared.refresh(); return }
         if menu === micSubmenu { fillMicSubmenu(); return }
         if menu === audioSubmenu { fillAudioSubmenu(); return }
         guard menu === sourceSubmenu else { return }

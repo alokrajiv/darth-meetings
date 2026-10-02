@@ -89,9 +89,8 @@ function toModules(v: unknown): string[] {
 
 /**
  * The outcome of one introspection, with the transient case kept apart from
- * a definitive "no": `/api/auth/session` answers 503 for `transient` so the
- * offline provider's session probe never mistakes a darth-auth restart for
- * a signed-out session (which would wipe the device's offline archive).
+ * a definitive "no": `/api/auth/session` answers 503 for `transient` so a
+ * caller never mistakes a darth-auth restart for a signed-out session.
  * Every other caller (proxy, withAuth) still treats both as "no user".
  */
 export type ResolvedTokenOutcome = {
@@ -184,3 +183,16 @@ export function hasMeetingsAccess(id: Pick<DarthIdentity, 'modules'> | null | un
 
 export const NO_ACCESS_MESSAGE =
   'no access to meetings — ask a darth admin (admin.darth-internal.trames.io)';
+
+/** The darth-auth super-admin module (darth-admin's own gate). */
+export const ADMIN_MODULE = 'access';
+
+/** May this identity call the operator API under /api/admin/* (lib/auth/with-admin-auth.ts)? */
+export function hasAdminAccess(id: { modules?: string[] } | null | undefined): boolean {
+  return !!id && Array.isArray(id.modules) && id.modules.includes(ADMIN_MODULE);
+}
+
+/** The operator API: the one place an `access` holder without `meetings` may reach (the route 404s everyone else). */
+export function isAdminApiPath(pathname: string): boolean {
+  return pathname === '/api/admin' || pathname.startsWith('/api/admin/');
+}

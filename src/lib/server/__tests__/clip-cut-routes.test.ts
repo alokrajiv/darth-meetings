@@ -28,7 +28,8 @@ describe('the meeting media routes reveal only the window', () => {
     const src = read('app/api/transcripts/[id]/frames/[frame]/route.ts');
     const refusal = src.indexOf('frameRefusal({');
     expect(refusal).toBeGreaterThan(0);
-    expect(refusal).toBeLessThan(src.indexOf('await extractFrame('));
+    expect(refusal).toBeLessThan(src.indexOf('framePath(access.row.assemblyai_id, ms)'));
+    expect(refusal).toBeLessThan(src.indexOf('await extractFrameFromMedia('));
     expect(src).toContain('holesFromContext(');
   });
 
@@ -44,9 +45,10 @@ describe('the meeting media routes reveal only the window', () => {
     expect(read('app/api/transcripts/[id]/route.ts')).toContain('await dropClipCuts(access.row.assemblyai_id)');
   });
 
-  test('the recording bytes route serves non-owners only through a WHOLE-recording clip', () => {
-    expect(read('app/api/recordings/[id]/audio/route.ts')).toContain(
-      'reachableThroughMeeting(id, user, { wholeRecording: true })'
-    );
+  test('a missing windowed source is pulled from the archive, never served whole', () => {
+    const src = read('app/api/transcripts/[id]/audio/route.ts');
+    const body = src.slice(src.indexOf('async function serveClipCut('));
+    expect(body).toContain('media,');
+    expect(read('lib/server/clip-cut.ts')).toContain('await ensureLocalMedia(req.media');
   });
 });

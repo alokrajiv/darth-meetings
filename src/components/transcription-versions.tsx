@@ -9,8 +9,6 @@ import type { ActivateTranscriptionResponse, TranscriptionVersion } from '@/lib/
 interface TranscriptionVersionsProps {
   versions: TranscriptionVersion[];
   canEdit: boolean;
-  /** Offline: switching needs the server — shown, but inert. */
-  disabled?: boolean;
   /** The reader, so their own runs read as "You". */
   selfEmail?: string | null;
   activatingId: string | null;
@@ -29,7 +27,6 @@ interface TranscriptionVersionsProps {
 export function TranscriptionVersions({
   versions,
   canEdit,
-  disabled = false,
   selfEmail,
   activatingId,
   onActivate,
@@ -98,12 +95,8 @@ export function TranscriptionVersions({
                       <button
                         type="button"
                         className="inline-flex items-center gap-1 font-medium text-primary hover:underline disabled:opacity-50"
-                        disabled={disabled || busy || activatingId !== null}
-                        title={
-                          disabled
-                            ? 'Not available offline'
-                            : 'Read the meeting from this version — your edits and names on the current one are kept with it'
-                        }
+                        disabled={busy || activatingId !== null}
+                        title="Read the meeting from this version — your edits and names on the current one are kept with it"
                         onClick={() => void switchTo(v.id)}
                       >
                         {busy && <Loader2 className="h-3 w-3 animate-spin" />}

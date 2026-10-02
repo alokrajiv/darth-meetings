@@ -46,10 +46,41 @@ describe('aaiJobIdOf — which job to ask AssemblyAI about (Phase 1b)', () => {
     expect(aaiJobIdOf({ assemblyai_id: JOB, aai_job_id: MINTED })).toBe(MINTED);
   });
 
-  test('a row that predates the column falls back to its own id — if it is one', () => {
+  test('a row read WITHOUT the column (not projected / 045 missing) falls back to its own id — if it is one', () => {
     expect(aaiJobIdOf({ assemblyai_id: JOB })).toBe(JOB);
-    expect(aaiJobIdOf({ assemblyai_id: JOB, aai_job_id: null })).toBe(JOB);
     expect(aaiJobIdOf({ assemblyai_id: JOB.toUpperCase() })).toBe(JOB.toUpperCase());
+  });
+
+  test('a NULL read from the column is final — never repaired from the meeting id', () => {
+    // 045 stamped every legacy row (`SET aai_job_id = assemblyai_id`), so a
+    // UUID-shaped meeting id beside a NULL job is one we minted.
+    expect(aaiJobIdOf({ assemblyai_id: JOB, aai_job_id: null })).toBeNull();
+    expect(aaiJobIdOf({ assemblyai_id: MINTED, aai_job_id: null })).toBeNull();
+  });
+
+  test('prod 2026-10-02: a meeting MADE EARLY from a recording has no job, whatever the projection', () => {
+    // transcripts 1054: Link to meeting while the recording was transcribing —
+    // status processing, minted UUID id, aai_job_id NULL, fromRecording set.
+    // The listing asked AssemblyAI about the minted id, got a 404 and flipped
+    // the meeting to 'error' before its text landed.
+    const madeEarly = {
+      assemblyai_id: '2bd949dd-c829-4cdd-a2b6-d2a86b2eefd5',
+      gmeet_context: { fromRecording: { recordingId: '02af969f-ee5e-4c82-879f-5d971e568e6c', how: 'link' } },
+    };
+    expect(aaiJobIdOf({ ...madeEarly, aai_job_id: null })).toBeNull();
+    expect(aaiJobIdOf(madeEarly)).toBeNull(); // even with the column absent from the projection
+    expect(aaiJobIdOf({ assemblyai_id: MINTED, gmeet_context: { splitFrom: { assemblyaiId: JOB } } })).toBeNull();
+    // Once its text lands the settle writes the RECORDING's job — that one counts.
+    expect(aaiJobIdOf({ ...madeEarly, aai_job_id: JOB })).toBe(JOB);
+    expect(
+      waitingOnAai({ assemblyaiId: madeEarly.assemblyai_id, aaiJobId: null, status: 'processing' })
+    ).toBe(false);
+    expect(
+      stuckAtAai(
+        { assemblyaiId: madeEarly.assemblyai_id, aaiJobId: null, status: 'processing', waitingSince: ago(48) },
+        NOW
+      )
+    ).toBe(false);
   });
 
   test('a row that never went to AssemblyAI has no job', () => {
@@ -61,8 +92,9 @@ describe('aaiJobIdOf — which job to ask AssemblyAI about (Phase 1b)', () => {
 
   test('a minted meeting id is NEVER mistaken for a job', () => {
     // The whole point of 1b: UUID-shaped no longer means "AssemblyAI knows it".
-    // A minted row always carries its job in the column (minting is forced off
-    // while the column is missing), so the fallback cannot fire for one.
+    // A minted row that went to AssemblyAI carries its job in the column; one
+    // that did not (made early from a recording, split off) carries NULL, and
+    // NULL is final (minting is forced off while the column is missing).
     expect(aaiJobIdOf({ assemblyai_id: MINTED, aai_job_id: JOB })).not.toBe(MINTED);
   });
 });

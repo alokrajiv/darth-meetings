@@ -52,6 +52,7 @@ import {
 import { findImportedOccurrences } from '@/db-ops/imported-occurrences';
 import { markTeamsChatBackfilled } from '@/db-ops/google-accounts';
 import { getMeetingCacheByMeetings } from '@/db-ops/gmeet-meeting-cache';
+import { unlessDraining } from '@/lib/server/deploy-drain';
 
 /**
  * Background sync-and-remind poller. Every POLL_MS, for each user with a
@@ -759,12 +760,12 @@ export function startGmeetPoller(): void {
   console.log(
     `[gmeet-poller] armed: every ${POLL_MS / 60000}m (fast lane every ${FAST_LANE_MS / 60000}m)`
   );
-  const timer = setInterval(() => void sweepAll(), POLL_MS);
+  const timer = setInterval(unlessDraining('gmeet-poller', sweepAll), POLL_MS);
   timer.unref?.();
-  const fast = setInterval(() => void fastLane(), FAST_LANE_MS);
+  const fast = setInterval(unlessDraining('gmeet-fast-lane', fastLane), FAST_LANE_MS);
   fast.unref?.();
   // First pass shortly after boot.
-  setTimeout(() => void sweepAll(), 2 * 60 * 1000).unref?.();
+  setTimeout(unlessDraining('gmeet-poller', sweepAll), 2 * 60 * 1000).unref?.();
 }
 
 /** One immediate fast-lane pass — the manual hook's twin of triggerGmeetPoll. */

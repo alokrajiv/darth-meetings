@@ -1,52 +1,97 @@
 import 'server-only';
-import { addShare } from '@/db-ops/transcript-shares';
+import { addShare, listByTranscript } from '@/db-ops/transcript-shares';
+import { removeLinkBornSharesNotIn, SHARE_ORIGIN_EVENT_LINK } from '@/db-ops/share-origin';
 
-// Internal domains: invitees on these are the people a cloud import shares
-// the new meeting with (and the domains share suggestions are drawn from).
+// Internal domains: invitees on these are the people a meeting tied to a
+// calendar invite is shared with (and the domains share suggestions are
+// drawn from).
 export const AUTO_SHARE_DOMAINS = new Set(['trames.sg', 'trames-engineering.com']);
 
 /**
- * THE CLOUD-IMPORT ARM, and nothing else (docs/recordings-meetings-series-design.md
- * §1.2, §6.2 Q8): a Meet/Teams import — manual, series auto-import, account
- * auto-sync — creates a meeting shared to its internal invitees, because the
- * invite IS the meeting and everyone on it could fetch the provider's
- * artifacts themselves; gating them behind a manual share only invites
- * duplicate imports.
+ * Why a meeting is being shared with its invite's internal people. Both arms
+ * apply ONE rule — the meeting share policy — and differ only in what the
+ * share row records:
  *
- * Rule (owner, 2026-09-23, design step P4): LINKING A RECORDING TO A
- * CALENDAR OCCURRENCE NEVER CREATES SHARES. The tray's Link, the web upload
- * stepper, the calendar row's Upload, `darth-cli meetings upload --event`,
- * retro-link and split-to-an-event are user LINKS — they must not call this.
- * Sharing a linked meeting is a separate, explicit act (the share dialog's
- * "Suggested from this meeting"). Hence the name, and the `arm` argument a
- * caller has to spell out: nobody reaches this by accident from a link path.
- *
- * Shares are written with edit access and no origin (they are not link-born,
- * so "Unlink from event" leaves them alone).
+ *  - `'cloud-import'`: a Meet/Teams import (manual, series auto-import,
+ *    account auto-sync) creates the meeting from the invite itself. Shares
+ *    carry no origin: "Unlink from event" leaves them alone.
+ *  - `'event-link'`: a person LINKED a meeting to a calendar occurrence — the
+ *    tray's Link, the web upload stepper, the calendar row's Upload,
+ *    `darth-cli meetings upload --event`, `POST /api/recordings/:id/link`,
+ *    retro-link (`…/link-event`) and split-to-an-event. Shares are stamped
+ *    `origin = 'event-link'` (migration 048) so unlinking takes exactly them
+ *    back off (docs/recorder-link-confirm-spec.md D5).
  */
-export async function shareCloudImportWithInternalInvitees(
-  arm: 'cloud-import',
+export type AutoShareArm = 'cloud-import' | 'event-link';
+
+/**
+ * The people the policy shares with: every invitee on an internal domain,
+ * lower-cased, de-duplicated, never the owner — email → display name.
+ */
+export function internalInvitees(
+  ownerEmail: string,
+  candidates: ReadonlyArray<{ email?: string | null; name?: string | null }>
+): Map<string, string | null> {
+  const self = ownerEmail.trim().toLowerCase();
+  const wanted = new Map<string, string | null>();
+  for (const a of candidates) {
+    if (typeof a?.email !== 'string') continue;
+    const email = a.email.trim().toLowerCase();
+    const domain = email.split('@')[1] ?? '';
+    if (!email || email === self || !AUTO_SHARE_DOMAINS.has(domain)) continue;
+    if (!wanted.has(email)) wanted.set(email, a.name ?? null);
+  }
+  return wanted;
+}
+
+/**
+ * Share a meeting with every INTERNAL invitee of its calendar event, with
+ * edit access — the meeting share policy (owner, 2026-10-02, reversing the
+ * 2026-09-23 "a link never shares" rule of design P4): the invite IS the
+ * meeting, and everyone on it is a person the meeting belongs to, whether
+ * the meeting came from a cloud import or from a recording someone linked.
+ *
+ * What is shared is the MEETING. A recording behind it stays its owner's:
+ * `/api/recordings/*` answers to the owner alone, and a share recipient
+ * reaches the media only through the meeting's routes.
+ *
+ * Never shares with the owner themself or with an external domain. No DM:
+ * an auto-share notifies nobody (the manual Share dialog is the one that
+ * does). The `'event-link'` arm is idempotent and never rewrites a share
+ * that already exists — a re-link adds only the people missing, and a share
+ * a person made (or downgraded to read) keeps its access and stays
+ * un-stamped, so an unlink never takes it.
+ *
+ * Returns how many shares this call created.
+ */
+export async function shareWithInternalInvitees(
+  arm: AutoShareArm,
   transcriptId: number,
   ownerUserId: string,
   ownerEmail: string,
-  candidates: Array<{ email: string; name?: string | null }>
+  candidates: ReadonlyArray<{ email?: string | null; name?: string | null }>
 ): Promise<number> {
-  if (arm !== 'cloud-import') return 0;
-  const self = ownerEmail.trim().toLowerCase();
+  if (arm !== 'cloud-import' && arm !== 'event-link') return 0;
+  const wanted = internalInvitees(ownerEmail, candidates);
+  if (wanted.size === 0) return 0;
+
+  if (arm === 'event-link') {
+    const existing = await listByTranscript(transcriptId);
+    for (const s of existing) wanted.delete(s.shared_with_email.trim().toLowerCase());
+  }
+
   let shared = 0;
-  for (const a of candidates) {
-    const email = a.email.trim().toLowerCase();
-    const domain = email.split('@')[1] ?? '';
-    if (email === self || !AUTO_SHARE_DOMAINS.has(domain)) continue;
+  for (const [email, name] of wanted) {
     try {
       await addShare({
         transcriptId,
         ownerUserId,
         sharedByUserId: ownerUserId,
         sharedWithEmail: email,
-        sharedWithName: a.name ?? null,
+        sharedWithName: name,
         sharedWithPplId: null,
         access: 'edit',
+        ...(arm === 'event-link' ? { origin: SHARE_ORIGIN_EVENT_LINK } : {}),
       });
       shared++;
     } catch (err) {
@@ -54,4 +99,41 @@ export async function shareCloudImportWithInternalInvitees(
     }
   }
   return shared;
+}
+
+/**
+ * Link a meeting that is ALREADY linked to a calendar event to an event
+ * (`POST /api/transcripts/:id/link-event` on a linked row — the link dialog's
+ * "change event", the "Link to it" strips, `darth-cli meetings link` on a
+ * linked meeting). Two steps, in this order:
+ *
+ *  1. the shares the PREVIOUS link made (`origin = 'event-link'`) for anyone
+ *     who is not an internal invitee of the new event come off
+ *     (`removeLinkBornSharesNotIn`) — A's invitees are not B's, and a re-link
+ *     never runs Unlink;
+ *  2. the new event's internal invitees are added exactly as any link adds
+ *     them (`shareWithInternalInvitees('event-link', …)`): only the missing
+ *     ones, so someone on both invites keeps their one share untouched.
+ *
+ * A share a person made (origin NULL) is never touched, whoever it is for.
+ * Re-linking to the SAME event is the same two steps — an invitee dropped
+ * from the invite since the first link loses the link's share, which is what
+ * "shared as per the invite" means.
+ */
+export async function relinkSharesToEvent(
+  transcriptId: number,
+  ownerUserId: string,
+  ownerEmail: string,
+  candidates: ReadonlyArray<{ email?: string | null; name?: string | null }>
+): Promise<{ shared: number; removed: string[] }> {
+  const keep = [...internalInvitees(ownerEmail, candidates).keys()];
+  const removed = await removeLinkBornSharesNotIn(transcriptId, keep);
+  const shared = await shareWithInternalInvitees(
+    'event-link',
+    transcriptId,
+    ownerUserId,
+    ownerEmail,
+    candidates
+  );
+  return { shared, removed };
 }

@@ -18,8 +18,6 @@ interface RerunDiarizationButtonProps {
   variant?: 'outline' | 'ghost';
   /** Applied directly to the Button so callers control width/alignment. */
   className?: string;
-  /** Offline mode: the run needs the server, keep the button visible but inert. */
-  disabled?: boolean;
 }
 
 /**
@@ -41,7 +39,6 @@ export function RerunDiarizationButton({
   size = 'sm',
   variant = 'outline',
   className,
-  disabled = false,
 }: RerunDiarizationButtonProps) {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -104,11 +101,9 @@ export function RerunDiarizationButton({
         size={size}
         className={className}
         onClick={() => void run()}
-        disabled={disabled || busy || !hasLocalAudio}
+        disabled={busy || !hasLocalAudio}
         title={
-          disabled
-            ? 'Not available offline'
-            : hasLocalAudio
+          hasLocalAudio
             ? 'Voice-level speaker separation from the stored audio — for meetings where several people shared one mic'
             : 'Fetch video for playback first (Sources card below) — diarization runs on that stored copy'
         }

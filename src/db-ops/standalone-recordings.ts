@@ -18,12 +18,12 @@ import type { RecorderMatch } from '@/lib/recorder';
  * AssemblyAI hand-off, the payload when the job completes. It becomes part of
  * a meeting only when its OWNER links it (`createMeetingFromRecording` below).
  *
- * PRIVACY — the same two arms as migration 044, and nothing else:
- *   (a) its OWNER (`recordings.owner_user_id`), for every function marked
- *       CALLER-SCOPED below — the owner predicate is in the SQL;
- *   (b) a caller who can open a MEETING holding a clip on it
- *       (`reachableThroughMeeting`) — the media route's second arm, and only
- *       that route's.
+ * PRIVACY — its OWNER (`recordings.owner_user_id`), and nothing else, for
+ *   every function marked CALLER-SCOPED below — the owner predicate is in the
+ *   SQL. A person a meeting holding a clip on it is shared with reaches its
+ *   media through the MEETING's routes, never through `/api/recordings/*`
+ *   (owner, 2026-10-02 — the recording itself is never shared; until then
+ *   the media route had a second arm, `reachableThroughMeeting`).
  * INTERNAL-ONLY functions take ids with no owner constraint; only the upload
  * pipeline, the pollers and the sweeper call them, with ids they minted or
  * read from these tables themselves — never an id from a request.
@@ -369,14 +369,26 @@ export async function recordStandaloneHandOff(input: StandaloneHandOff): Promise
           provider_job_id = EXCLUDED.provider_job_id,
           speech_model = EXCLUDED.speech_model,
           language_code = EXCLUDED.language_code,
-          status = EXCLUDED.status
+          status = EXCLUDED.status,
+          -- A NEW job on the same transcription (a retry after the first one
+          -- failed — retryBornBareIngest): its wait starts now (the stuck
+          -- check reads created_at) and nothing of the failed job survives.
+          -- The same job recorded twice changes none of these.
+          created_at = CASE WHEN recording_transcriptions.provider_job_id IS DISTINCT FROM EXCLUDED.provider_job_id
+                            THEN now() ELSE recording_transcriptions.created_at END,
+          completed_at = CASE WHEN recording_transcriptions.provider_job_id IS DISTINCT FROM EXCLUDED.provider_job_id
+                              THEN NULL ELSE recording_transcriptions.completed_at END,
+          payload = CASE WHEN recording_transcriptions.provider_job_id IS DISTINCT FROM EXCLUDED.provider_job_id
+                         THEN NULL ELSE recording_transcriptions.payload END,
+          provider_deleted_at = CASE WHEN recording_transcriptions.provider_job_id IS DISTINCT FROM EXCLUDED.provider_job_id
+                                     THEN NULL ELSE recording_transcriptions.provider_deleted_at END
       `;
       await tx`
         UPDATE ${tx(SCHEMA)}.recordings
         SET active_transcription_id = ${t.id}::uuid,
             sha256 = COALESCE(${input.sha256 ?? null}, sha256),
             upload_state = COALESCE(upload_state, '{}'::jsonb)
-                           - 'ingestFailure' - 'group' - 'bytesReceived',
+                           - 'ingestFailure' - 'group' - 'bytesReceived' - 'failedReason',
             updated_at = now()
         WHERE id = ${input.recordingId}::uuid
       `;
@@ -595,43 +607,6 @@ export async function meetingsHoldingRecording(
     WHERE c.recording_id = ${recordingId}::uuid
       AND (t.user_id = ${caller.userId} OR (s.id IS NOT NULL AND t.deleted_at IS NULL))
   `;
-}
-
-/**
- * Reachability arm (b), for the media route ONLY: can the caller open a
- * meeting (owned, or shared to their email, not in the trash unless owned)
- * that holds a clip on this recording? Nothing about the recording is
- * returned — just the answer.
- *
- * `wholeRecording: true` (the bytes route, 2026-10-02) counts only a clip
- * that IS the whole recording (`from_ms = 0 AND to_ms IS NULL`). A reader of
- * a meeting that holds a WINDOW — a split-off meeting, a combined clip — gets
- * that window from the meeting's own media route, cut server-side
- * (lib/server/clip-cut.ts), and never the recording through this one: "it is
- * not the recording being shared, it's the meeting API that reveals it".
- */
-export async function reachableThroughMeeting(
-  recordingId: string,
-  caller: { userId: string; email: string },
-  opts: { wholeRecording?: boolean } = {}
-): Promise<boolean> {
-  if (!UUID_RE.test(recordingId)) return false;
-  const email = caller.email.trim().toLowerCase();
-  const rows = await sql<Array<{ ok: number }>>`
-    SELECT 1 AS ok
-    FROM ${sql(SCHEMA)}.meeting_clips c
-    JOIN ${sql(SCHEMA)}.transcripts t ON t.id = c.transcript_id
-    WHERE c.recording_id = ${recordingId}::uuid
-      ${opts.wholeRecording ? sql`AND c.from_ms = 0 AND c.to_ms IS NULL` : sql``}
-      AND (
-        t.user_id = ${caller.userId}
-        OR (t.deleted_at IS NULL AND EXISTS (
-              SELECT 1 FROM ${sql(SCHEMA)}.transcript_shares s
-              WHERE s.transcript_id = t.id AND s.shared_with_email = ${email}))
-      )
-    LIMIT 1
-  `;
-  return rows.length > 0;
 }
 
 /** INTERNAL-ONLY — the playable files of a recording, canonical first. */
@@ -906,7 +881,10 @@ export type MeetingFromRecordingResult =
  * it as a BORROWER (`borrowsRecording`) and never derives a second recording
  * over the same bytes.
  *
- * NO SHARE is written here or anywhere on this path (design P4).
+ * NO SHARE is written here: the caller (`makeMeeting` in
+ * lib/server/recording-actions.ts) shares a meeting LINKED to an event with
+ * the event's internal invitees, after this commits; "Make a meeting" shares
+ * nobody.
  */
 export async function createMeetingFromRecording(
   input: MeetingFromRecordingInput
@@ -999,10 +977,17 @@ export interface MeetingMadeEarly {
  * Fill in every meeting that was made from a recording BEFORE its
  * transcription landed — the same columns `createMeetingFromRecording`
  * writes for a ready recording, copied inside Postgres now that the
- * payload exists. Idempotent: a meeting is matched only while it is still
- * 'processing' with no `imported_content`, so a second observer of the same
- * completion updates nothing. `recordingId` null = every such meeting (the
- * sweeper's backstop for a process that died between the two writes).
+ * payload exists. Idempotent: a meeting is matched only while it has no
+ * `imported_content`, so a second observer of the same completion updates
+ * nothing. `recordingId` null = every such meeting (the sweeper's backstop
+ * for a process that died between the two writes).
+ *
+ * SELF-HEALING: a meeting sitting in 'error' (still with no text) is matched
+ * too, and its `ingestFailure` marker dropped. Whatever put it there — the
+ * recording's transcription failing and then succeeding on a retry
+ * (`failMeetingsMadeEarly`), or, as on prod 2026-10-02, a poller that asked
+ * AssemblyAI about the meeting's own minted id and flipped it on the 404 —
+ * the recording now HAS the text, and the meeting is just a view of it.
  *
  * Only meetings BORN from this recording qualify (`gmeet_context.fromRecording`)
  * — a meeting that merely holds a clip of it (Phase 3b combine) has its own
@@ -1022,7 +1007,7 @@ export async function materialiseMeetingsMadeEarly(recordingId: string | null): 
           (SELECT m.filename FROM ${sql(SCHEMA)}.recording_media m
             WHERE m.recording_id = r.id AND m.kind = 'canonical' ORDER BY m.ord LIMIT 1)),
         imported_content = x.payload,
-        gmeet_context = COALESCE(t.gmeet_context, '{}'::jsonb) ||
+        gmeet_context = (COALESCE(t.gmeet_context, '{}'::jsonb) - 'ingestFailure') ||
           CASE WHEN x.provider_job_id IS NOT NULL AND x.provider_deleted_at IS NOT NULL
                THEN jsonb_build_object('aai', jsonb_build_object('deletedAt', to_jsonb(x.provider_deleted_at), 'jobId', x.provider_job_id))
                ELSE '{}'::jsonb END
@@ -1031,7 +1016,7 @@ export async function materialiseMeetingsMadeEarly(recordingId: string | null): 
     JOIN ${sql(SCHEMA)}.meeting_clips c ON c.recording_id = r.id
     WHERE c.transcript_id = t.id
       AND t.gmeet_context->'fromRecording'->>'recordingId' = r.id::text
-      AND t.status = 'processing' AND t.imported_content IS NULL AND t.deleted_at IS NULL
+      AND t.status IN ('processing', 'error') AND t.imported_content IS NULL AND t.deleted_at IS NULL
       AND x.status = 'completed' AND x.payload IS NOT NULL
       AND (${recordingId}::uuid IS NULL OR r.id = ${recordingId}::uuid)
     RETURNING t.user_id, t.assemblyai_id
@@ -1064,6 +1049,31 @@ export async function failMeetingsMadeEarly(recordingId: string, reason: string)
     WHERE c.transcript_id = t.id AND c.recording_id = ${recordingId}::uuid
       AND t.gmeet_context->'fromRecording'->>'recordingId' = ${recordingId}
       AND t.status = 'processing' AND t.imported_content IS NULL AND t.deleted_at IS NULL
+    RETURNING t.user_id, t.assemblyai_id
+  `;
+}
+
+/**
+ * The recording behind meetings made early was sent to AssemblyAI again
+ * (Retry on such a meeting — lib/server/born-bare.ts
+ * `retryRecordingForMeeting`): the meetings that had been failed with it go
+ * back to 'processing', `ingestFailure` dropped, so the page says
+ * "transcribing" and the settle fills them in when the new job lands.
+ * Owner-scoped; only meetings still without text, born from THIS recording.
+ */
+export async function reopenMeetingsMadeEarly(
+  ownerUserId: string,
+  recordingId: string
+): Promise<MeetingMadeEarly[]> {
+  return sql<MeetingMadeEarly[]>`
+    UPDATE ${sql(SCHEMA)}.transcripts t
+    SET status = 'processing',
+        gmeet_context = COALESCE(t.gmeet_context, '{}'::jsonb) - 'ingestFailure'
+    FROM ${sql(SCHEMA)}.meeting_clips c
+    WHERE c.transcript_id = t.id AND c.recording_id = ${recordingId}::uuid
+      AND t.user_id = ${ownerUserId}
+      AND t.gmeet_context->'fromRecording'->>'recordingId' = ${recordingId}
+      AND t.status = 'error' AND t.imported_content IS NULL AND t.deleted_at IS NULL
     RETURNING t.user_id, t.assemblyai_id
   `;
 }

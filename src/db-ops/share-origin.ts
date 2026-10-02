@@ -8,11 +8,13 @@ import { publishEvent } from '@/lib/server/event-bus';
  * probe that keeps the code working before the migration is applied.
  *
  * One value exists: `'event-link'`, a share that exists ONLY because a
- * calendar event was attached to the meeting (the auto-share to internal
- * invitees an upload link made until 2026-09-23). Since design P4 linking
- * never shares, so no NEW link-born share is written (a retranscribe re-run
- * copies an existing one's stamp); the rows already out there keep theirs,
- * and "Unlink from event" still deletes exactly those
+ * calendar event was linked to the meeting — the share with the event's
+ * internal invitees every link makes (`shareWithInternalInvitees('event-link',
+ * …)` in lib/server/auto-share.ts: upload with a linked event, recording
+ * Link, retro-link, split-to-an-event, a linked text import). History: links
+ * shared until 2026-09-23, design P4 stopped it, and the owner reversed P4 on
+ * 2026-10-02 — a link shares like a cloud import again. A retranscribe re-run
+ * copies an existing share's stamp. "Unlink from event" deletes exactly these
  * (docs/recorder-link-confirm-spec.md D5) — a share a human made in the
  * Share dialog carries no origin and is never touched.
  *
@@ -64,9 +66,10 @@ export function shareOriginColumnExists(): Promise<boolean> {
  *     the owner shared them, with edit access, and no human origin. That is
  *     exactly what the pre-P4 upload link created.
  * The unstamped arm only matches shares older than LEGACY_LINK_SHARE_CUTOFF:
- * from then on every link-born share is stamped (048's writer was live) and,
- * since P4, a link shares nobody — so a newer unstamped edit share to an
- * invitee was made by a person and must survive the unlink.
+ * from then on every link-born share is stamped (048's writer was live; P4
+ * wrote none, and the 2026-10-02 link shares stamp again) — so a newer
+ * unstamped edit share to an invitee was made by a person, or by a cloud
+ * import, and must survive the unlink.
  */
 export const LEGACY_LINK_SHARE_CUTOFF = '2026-09-22T10:00:00Z';
 
@@ -106,6 +109,42 @@ export async function removeLinkBornShares(
             AND shared_at < ${LEGACY_LINK_SHARE_CUTOFF}::timestamptz
           RETURNING shared_with_email
         `;
+  if (rows.length > 0) publishEvent({ kind: 'shares' });
+  return rows.map((r) => r.shared_with_email);
+}
+
+/**
+ * RE-LINK: the meeting was linked to event A and is now being linked to event
+ * B. Take off the shares A's link made for people who are NOT internal
+ * invitees of B, before B's link adds its own — otherwise A's invitees keep a
+ * meeting that is no longer theirs, and only a manual Unlink (which a re-link
+ * never runs) would ever take them off.
+ *
+ * Stamped rows only (`origin = 'event-link'`). Unlike `removeLinkBornShares`
+ * there is NO legacy signature arm: a re-link never guesses that an
+ * un-stamped share was link-born — a share a person made (origin NULL) is
+ * never touched here, whatever its shape. Without migration 048 nothing is
+ * stamped, so nothing is removed.
+ *
+ * `keepEmails` = B's internal invitees (case-insensitive). A share to one of
+ * them stays exactly as it is — same row, same access, same stamp — and B's
+ * link then skips them as already shared. An empty list removes every
+ * stamped share (B has no internal invitees). Returns whose shares went.
+ */
+export async function removeLinkBornSharesNotIn(
+  transcriptId: number,
+  keepEmails: string[]
+): Promise<string[]> {
+  const stamped = await shareOriginColumnExists().catch(() => false);
+  if (!stamped) return [];
+  const keep = [...new Set(keepEmails.map((e) => e.trim().toLowerCase()).filter(Boolean))];
+  const rows = await sql<Array<{ shared_with_email: string }>>`
+    DELETE FROM ${sql(SCHEMA)}.transcript_shares
+    WHERE transcript_id = ${transcriptId}
+      AND origin = ${SHARE_ORIGIN_EVENT_LINK}
+      AND NOT (lower(shared_with_email) = ANY(${keep}::text[]))
+    RETURNING shared_with_email
+  `;
   if (rows.length > 0) publishEvent({ kind: 'shares' });
   return rows.map((r) => r.shared_with_email);
 }

@@ -4,7 +4,12 @@ import { stat } from 'node:fs/promises';
 import { Readable } from 'node:stream';
 import { withAuth } from '@/lib/auth/with-auth';
 import { resolveAccess } from '@/db-ops/transcript-access';
-import { extractFrame, frameRequestFor, hasVideoStream } from '@/lib/server/video-frames';
+import {
+  extractFrameFromMedia,
+  framePath,
+  frameRequestFor,
+  mediaHasVideo,
+} from '@/lib/server/video-frames';
 import { resolveMeetingContent } from '@/lib/server/recordings';
 import { frameRefusal } from '@/lib/clip-cut';
 import { holesFromContext } from '@/lib/clip-window';
@@ -50,6 +55,8 @@ export const GET = withAuth(async ({ user }, { params }) => {
   if (!request) {
     return NextResponse.json({ error: 'No video stored for this transcript' }, { status: 404 });
   }
+  // Outside the meeting (before / after its window of the file, or in a hole
+  // split off into another meeting): refused before even the cache is read.
   const refused = frameRefusal({
     media: request.source,
     fileMs: request.fileMs,
@@ -62,14 +69,21 @@ export const GET = withAuth(async ({ user }, { params }) => {
   if (refused) {
     return NextResponse.json({ error: 'That moment is not part of this meeting' }, { status: 404 });
   }
-  if (!(await hasVideoStream(request.source.filename))) {
+  // A meeting whose stored copy was archived and purged still has its
+  // frames: a cached one is served without looking at the media at all, and
+  // a new one is cut from the archived file pulled into media-local's cache
+  // (`mediaHasVideo` / `extractFrameFromMedia`).
+  const cached = await stat(framePath(access.row.assemblyai_id, ms))
+    .then((st) => st.size > 0)
+    .catch(() => false);
+  if (!cached && !(await mediaHasVideo(request.source))) {
     return NextResponse.json({ error: 'No video stored for this transcript' }, { status: 404 });
   }
 
   try {
-    const abs = await extractFrame(
+    const abs = await extractFrameFromMedia(
       access.row.assemblyai_id,
-      request.source.filename,
+      request.source,
       request.fileMs,
       ms
     );

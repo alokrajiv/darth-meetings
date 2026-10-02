@@ -4,7 +4,6 @@ import { useState } from 'react';
 import { Button } from '@/components/ui/button';
 import { Video, X, BellOff, CircleAlert, FileText, Clapperboard } from 'lucide-react';
 import { MeetLogo, TeamsLogo } from '@/components/provider-icon';
-import { OFFLINE_TITLE } from '@/lib/offline/offline-types';
 
 export interface Reminder {
   id: number;
@@ -42,11 +41,8 @@ export function GmeetRemindersCard({
   onOpenMeeting,
   onAct,
   onClose,
-  disabled = false,
 }: {
   reminders: Reminder[];
-  /** Offline / network down: every server-backed action is inert (still visible). */
-  disabled?: boolean;
   /** 'banner' = top-of-page callout; 'popover' = header-icon dropdown. */
   variant?: 'banner' | 'popover';
   onOpenSync: () => void;
@@ -82,8 +78,6 @@ export function GmeetRemindersCard({
             size="sm"
             className="h-7 px-2.5 text-xs"
             onClick={onOpenSync}
-            disabled={disabled}
-            title={disabled ? OFFLINE_TITLE : undefined}
           >
             <Video className="h-3.5 w-3.5" />
             Open sync
@@ -111,8 +105,7 @@ export function GmeetRemindersCard({
             <button
               type="button"
               onClick={() => onOpenMeeting?.(r)}
-              disabled={disabled}
-              title={disabled ? OFFLINE_TITLE : 'See this meeting — opens the import dialog on its day'}
+              title="See this meeting — opens the import dialog on its day"
               className="flex min-w-0 flex-1 items-center gap-1.5 truncate text-left hover:underline underline-offset-2 disabled:cursor-not-allowed disabled:opacity-60 disabled:hover:no-underline"
             >
               {/* Provider marker: teams-… meeting codes are Teams meetings. */}
@@ -149,8 +142,7 @@ export function GmeetRemindersCard({
                 variant="ghost"
                 size="sm"
                 className="h-6 w-6 p-0"
-                title={disabled ? OFFLINE_TITLE : 'Never remind about this meeting'}
-                disabled={disabled}
+                title="Never remind about this meeting"
                 onClick={() => onAct(r, 'mute')}
               >
                 <BellOff className="h-3.5 w-3.5" />
@@ -159,8 +151,7 @@ export function GmeetRemindersCard({
                 variant="ghost"
                 size="sm"
                 className="h-6 w-6 p-0"
-                title={disabled ? OFFLINE_TITLE : 'Dismiss'}
-                disabled={disabled}
+                title="Dismiss"
                 onClick={() => onAct(r, 'dismiss')}
               >
                 <X className="h-3.5 w-3.5" />

@@ -74,7 +74,8 @@ export function suggestedEventWhy(s: SuggestedEvent): string {
     `title match ${Math.round(s.titleScore * 100)}%.` +
     (call ? ` The recording is a ${call} call.` : '') +
     mismatch +
-    ' Nothing is linked or shared until you say so.'
+    ' Nothing is linked or shared until you say so; linking shares the meeting with the' +
+    ' Trames colleagues on the invite.'
   );
 }
 

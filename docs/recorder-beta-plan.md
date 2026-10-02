@@ -238,6 +238,24 @@ Decisions taken while building (per "write it down in this file"):
   for document navigations too); `/api/google/*` and `/api/ms/status` still 403
   ("Requires a browser session") on that path, which is expected.
 
+### Operator API — darth-admin › Recorder (2026-10-02)
+Super-admin only: `withAdminAuth` (`src/lib/auth/with-admin-auth.ts`) = same
+credential resolution as `withAuth`, gate = darth-auth module `access`; anyone
+signed in without it gets 404 `{error:'Not found'}` (as darth-chat's admin API);
+no credential → 401. The edge proxy lets an `access` holder without `meetings`
+through on `/api/admin/*` only. darth-admin forwards the admin's own cookie /
+`Bearer dth_` over loopback (`DARTH_MEETINGS_INTERNAL_URL`, default
+`http://127.0.0.1:3002`). Metadata only — never frames or file contents.
+- `GET /api/admin/recorder/devices` → `{latest_app_version, server_time, devices[]}`,
+  every tray newest heartbeat first; shaping rules in `src/lib/recorder-admin.ts`
+  (live = heartbeat or event within 6 min; the recording-now answer is the newer of
+  the heartbeat snapshot and the last `recording_started|stopped|cancelled` event;
+  progress = that recording's `segment_*` events + the newest event naming it).
+  Three queries whatever the fleet size (`listRecorderDevicesForAdmin`,
+  `recordingProgressForAdmin`, `recentRecordingsForAdmin`).
+- `GET /api/admin/recorder/events?device_id=&limit=≤200&kinds=csv` → one tray's
+  events newest first; `resource_sample` / `process_sample` only when named.
+
 ## Stream S2 — PWA (meetings app client)
 - `src/lib/companion/companion-client.ts`: new fields/events above; `recording` stays a
   boolean derived from `m.recording === true`; expose `signedIn`, `email`, `share`,

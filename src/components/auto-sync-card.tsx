@@ -3,8 +3,7 @@
 import { useEffect, useState } from 'react';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { RefreshCw, Loader2 } from 'lucide-react';
-import { OFFLINE_TITLE, useOfflineGate } from '@/lib/offline/offline-context';
-import { isNetworkFailure, offlineAwareError } from '@/lib/offline/offline-fetch';
+import { isNetworkFailure, NETWORK_ERROR_MESSAGE } from '@/lib/fetch-errors';
 import { reportLabel, type ReportPref } from '@/lib/report-pref';
 
 /**
@@ -81,28 +80,20 @@ export function AutoSyncCard() {
   const [data, setData] = useState<Payload | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
-  // Offline mode / network down: nothing here can load or save.
-  const { blocked } = useOfflineGate();
 
   const load = async () => {
-    if (blocked) {
-      setError(OFFLINE_TITLE);
-      return;
-    }
     try {
       const res = await fetch('/api/auto-sync');
-      if (!res.ok) throw await offlineAwareError(res, String(res.status));
+      if (!res.ok) throw new Error(String(res.status));
       setData((await res.json()) as Payload);
       setError(null);
     } catch (err) {
-      setError(isNetworkFailure(err) || (err instanceof Error && err.message === OFFLINE_TITLE) ? OFFLINE_TITLE : 'Couldn’t load auto-sync settings.');
+      setError(isNetworkFailure(err) ? NETWORK_ERROR_MESSAGE : 'Couldn’t load auto-sync settings.');
     }
   };
-  // Re-runs when the connection comes back (blocked flips false).
   useEffect(() => {
     void load();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [blocked]);
+  }, []);
 
   const save = async (patch: Record<string, unknown>) => {
     if (!data || saving) return;
@@ -121,7 +112,7 @@ export function AutoSyncCard() {
       if (json?.autoSync) setData({ ...data, autoSync: json.autoSync });
       setError(null);
     } catch (err) {
-      setError(isNetworkFailure(err) ? OFFLINE_TITLE : 'Could not save — try again');
+      setError(isNetworkFailure(err) ? NETWORK_ERROR_MESSAGE : 'Could not save — try again');
     } finally {
       setSaving(false);
     }
@@ -150,10 +141,9 @@ export function AutoSyncCard() {
           </div>
         ) : null}
         {error ? (
-          <p className={`mb-3 text-sm ${error === OFFLINE_TITLE ? 'text-muted-foreground' : 'text-destructive'}`}>{error}</p>
+          <p className="mb-3 text-sm text-destructive">{error}</p>
         ) : null}
         {data ? (
-          <fieldset disabled={blocked} className="contents" title={blocked ? OFFLINE_TITLE : undefined}>
           <div className="space-y-4">
             {!data.googleConnected && (
               <p className="rounded-md border border-amber-300 bg-amber-50 px-3 py-2 text-xs text-amber-800 dark:bg-amber-950/30 dark:text-amber-300">
@@ -293,7 +283,6 @@ export function AutoSyncCard() {
               </div>
             )}
           </div>
-          </fieldset>
         ) : null}
       </CardContent>
     </Card>

@@ -155,10 +155,12 @@ export function ShareDialog({
     }
   };
 
-  // "Share with the N invitees?" in one step, read-only (design P4 / Q2):
-  // linking a recording to an occurrence shares nobody, so after a link this
-  // is how the owner brings the invitees in. Read is the default for the ask;
-  // anyone can be promoted to editor from the list below.
+  // "Share with all N" suggestions in one step, read-only (design P4 / Q2).
+  // Since 2026-10-02 a link to an event shares its internal invitees by
+  // itself, so after a link this mostly brings in whoever that left out
+  // (people named in the meeting but not on the invite, anyone removed and
+  // wanted back). Read is the default for the ask; anyone can be promoted to
+  // editor from the list below.
   const handleAddAllSuggestions = async () => {
     setAddingSuggestion('*');
     setError(null);

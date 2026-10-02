@@ -35,9 +35,11 @@ export interface RowMenuSection {
 
 export interface RowMenuProps {
   sections: RowMenuSection[];
-  /** 'dots' (default) = hover-revealed ⋯ icon; a string = a visible outline
-   * button with that label and a chevron. */
-  trigger?: 'dots' | string;
+  /** 'dots' (default) = hover-revealed ⋯ icon; 'icon' = a hover/focus-
+   * revealed icon button (`triggerIcon`, tooltip = `ariaLabel`) — a row
+   * action that must not cost a column of width; a string = a visible
+   * outline button with that label and a chevron. */
+  trigger?: 'dots' | 'icon' | string;
   triggerIcon?: React.ReactNode;
   /** Kept visible (not hover-only) — for dots on touch-first surfaces. */
   alwaysVisible?: boolean;
@@ -134,12 +136,35 @@ export function RowMenu({
   };
 
   const isDots = trigger === 'dots';
+  const isIcon = trigger === 'icon';
+  // Hover-revealed triggers stay visible on touch screens (no hover there),
+  // while their menu is open, and on keyboard focus.
+  const revealCls =
+    alwaysVisible || open
+      ? 'opacity-100'
+      : 'opacity-0 group-hover:opacity-100 focus-visible:opacity-100 [@media(hover:none)]:opacity-100';
   const items = sections.flatMap((s) => s.items);
   if (items.length === 0) return null;
 
   return (
     <>
-      {isDots ? (
+      {isIcon ? (
+        <Button
+          ref={btnRef}
+          size="sm"
+          variant="ghost"
+          aria-label={ariaLabel}
+          aria-expanded={open}
+          aria-haspopup="menu"
+          title={disabled ? disabledTitle : ariaLabel}
+          disabled={disabled}
+          data-row-menu={dataAttr ?? ''}
+          onClick={toggle}
+          className={`h-7 w-7 p-0 text-muted-foreground transition-opacity hover:text-foreground [&_svg]:h-3.5 [&_svg]:w-3.5 ${revealCls} ${className}`}
+        >
+          {busy ? <Loader2 className="animate-spin" /> : triggerIcon}
+        </Button>
+      ) : isDots ? (
         <Button
           ref={btnRef}
           size="sm"
@@ -151,9 +176,7 @@ export function RowMenu({
           disabled={disabled}
           data-row-menu={dataAttr ?? ''}
           onClick={toggle}
-          className={`h-7 w-7 p-0 text-muted-foreground transition-opacity hover:text-foreground ${
-            alwaysVisible || open ? 'opacity-100' : 'opacity-0 group-hover:opacity-100 focus-visible:opacity-100'
-          } ${className}`}
+          className={`h-7 w-7 p-0 text-muted-foreground transition-opacity hover:text-foreground ${revealCls} ${className}`}
         >
           <Ellipsis className="h-4 w-4" />
         </Button>

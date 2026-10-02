@@ -77,6 +77,27 @@ function itemsSql(userId: string, q: RecordingsPageQuery, withStandalone: boolea
     OR ${title} ~* ${BARE_TITLE_PG.defaultMemo}
   )`;
 
+  // A live clip: a `meeting_clips` row on a meeting not in the trash — the
+  // same test `createMeetingFromRecording` answers 'already-linked' with.
+  const liveClip = sql`
+    SELECT 1 FROM ${sql(SCHEMA)}.meeting_clips c
+    JOIN ${sql(SCHEMA)}.transcripts tc ON tc.id = c.transcript_id
+    WHERE c.recording_id = r.id AND tc.deleted_at IS NULL`;
+
+  // 'linked' (2026-10-02) — present in the CTE only when the request names
+  // it, so the default answer's counts keep exactly their three keys.
+  const linked =
+    withStandalone && q.sections.includes('linked')
+      ? sql`
+      SELECT 'recording'::text AS kind, r.id::text AS id, 'linked' AS section,
+             ${usOf(sql`COALESCE(r.started_at, r.created_at)`)} AS sort_us
+      FROM ${sql(SCHEMA)}.recordings r
+      WHERE r.owner_user_id = ${userId} AND r.standalone AND r.deleted_at IS NULL
+        AND EXISTS (${liveClip})
+        AND (${match([sql`r.title`, sql`r.upload_state->>'originalFilename'`])})
+      UNION ALL`
+      : sql``;
+
   const standalone = withStandalone
     ? sql`
       SELECT 'recording'::text AS kind, r.id::text AS id,
@@ -84,15 +105,13 @@ function itemsSql(userId: string, q: RecordingsPageQuery, withStandalone: boolea
              ${usOf(sql`COALESCE(r.started_at, r.created_at)`)} AS sort_us
       FROM ${sql(SCHEMA)}.recordings r
       WHERE r.owner_user_id = ${userId} AND r.standalone AND r.deleted_at IS NULL
-        AND NOT EXISTS (
-          SELECT 1 FROM ${sql(SCHEMA)}.meeting_clips c
-          JOIN ${sql(SCHEMA)}.transcripts tc ON tc.id = c.transcript_id
-          WHERE c.recording_id = r.id AND tc.deleted_at IS NULL)
+        AND NOT EXISTS (${liveClip})
         AND (${match([sql`r.title`, sql`r.upload_state->>'originalFilename'`])})
       UNION ALL`
     : sql``;
 
   return sql`
+    ${linked}
     ${standalone}
     SELECT 'meeting'::text AS kind, t.assemblyai_id AS id,
            CASE WHEN t.scratch THEN 'temporary' ELSE 'uploaded' END AS section,
@@ -164,7 +183,12 @@ export async function listOwnRecordingsPage(
     const hasMore = keys.length > q.limit;
     if (hasMore) keys.length = q.limit;
     const out: RecordingSectionCounts = { mac: 0, uploaded: 0, temporary: 0 };
-    for (const row of counts) out[row.section] = row.n;
+    // `linked` is a key of the answer only when it was asked for (CLI compat).
+    if (q.sections.includes('linked')) out.linked = 0;
+    for (const row of counts) {
+      if (row.section === 'linked' && !q.sections.includes('linked')) continue;
+      out[row.section] = row.n;
+    }
     return { keys, next: hasMore ? keys[keys.length - 1]! : null, counts: out };
   } catch (err) {
     if ((err as { code?: string })?.code === '2201B') {
@@ -235,6 +259,47 @@ export async function ownRegistryRowsByIds(userId: string, ids: string[]): Promi
   return sql<RecorderRecordingRow[]>`
     SELECT * FROM ${sql(SCHEMA)}.recorder_recordings
     WHERE user_id = ${userId} AND id = ANY(${uuids}::uuid[])
+  `;
+}
+
+/** A meeting holding one of the caller's recordings (the 'linked' section). */
+export interface LinkedMeetingRef {
+  recording_id: string;
+  assemblyai_id: string;
+  title: string | null;
+  /** The meeting's own time: `recorded_at`, else when the row was made. */
+  recorded_at: string | null;
+}
+
+/**
+ * CALLER-SCOPED — for the caller's OWN recordings (`owner_user_id` re-asked
+ * here, never trusted from the page), the live meetings (not in the trash)
+ * holding a clip on each that the caller can OPEN: their own, or one shared
+ * to their email — `meetingsHoldingRecording`'s rule. A meeting that moved
+ * to someone who did not share it back is not named (the recording still
+ * counts as linked; the row just has no meeting to open).
+ */
+export async function linkedMeetingsForOwnRecordings(
+  caller: { userId: string; email: string },
+  recordingIds: string[]
+): Promise<LinkedMeetingRef[]> {
+  const uuids = recordingIds.filter((id) => UUID_RE.test(id));
+  if (uuids.length === 0) return [];
+  const email = caller.email.trim().toLowerCase();
+  return sql<LinkedMeetingRef[]>`
+    SELECT DISTINCT ON (c.recording_id, t.assemblyai_id)
+           c.recording_id::text AS recording_id, t.assemblyai_id, t.title,
+           COALESCE(t.recorded_at, t.created_at) AS recorded_at
+    FROM ${sql(SCHEMA)}.recordings r
+    JOIN ${sql(SCHEMA)}.meeting_clips c ON c.recording_id = r.id
+    JOIN ${sql(SCHEMA)}.transcripts t ON t.id = c.transcript_id
+    WHERE r.id = ANY(${uuids}::uuid[]) AND r.owner_user_id = ${caller.userId}
+      AND r.standalone AND r.deleted_at IS NULL
+      AND t.deleted_at IS NULL
+      AND (t.user_id = ${caller.userId}
+           OR EXISTS (SELECT 1 FROM ${sql(SCHEMA)}.transcript_shares s
+                      WHERE s.transcript_id = t.id AND s.shared_with_email = ${email}))
+    ORDER BY c.recording_id, t.assemblyai_id
   `;
 }
 

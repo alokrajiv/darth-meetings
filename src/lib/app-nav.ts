@@ -9,15 +9,12 @@ export interface AppNavItem {
   key: 'meetings' | 'recordings' | 'series';
   href: string;
   label: string;
-  /** Needs the server: rendered disabled while offline/blocked. Meetings
-   * stays live offline (cached shell → offline archive). */
-  needsServer: boolean;
 }
 
 export const APP_NAV: readonly AppNavItem[] = [
-  { key: 'meetings', href: '/', label: 'Meetings', needsServer: false },
-  { key: 'recordings', href: '/recordings', label: 'Recordings', needsServer: true },
-  { key: 'series', href: '/series', label: 'Series', needsServer: true },
+  { key: 'meetings', href: '/', label: 'Meetings' },
+  { key: 'recordings', href: '/recordings', label: 'Recordings' },
+  { key: 'series', href: '/series', label: 'Series' },
 ];
 
 /** Is this nav item the current surface? Meetings owns `/` only. */

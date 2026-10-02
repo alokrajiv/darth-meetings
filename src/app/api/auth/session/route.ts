@@ -9,10 +9,9 @@ export const runtime = 'nodejs';
  * `darth_session` cookie, or 401. Diagnostics only (the transcript page reads
  * `email` from it); proxy + withAuth are the real gate.
  *
- * It is also the offline provider's connectivity + session probe, and a 401
- * there wipes the device's offline archive — so a darth-auth hiccup
- * (unreachable, 5xx, timeout) answers 503 `{ transient: true }` instead of
- * 401. The probe maps >= 500 to "can't reach the app", never to "signed out".
+ * A darth-auth hiccup (unreachable, 5xx, timeout) answers 503
+ * `{ transient: true }` instead of 401, so a caller never mistakes "auth
+ * service down" for "signed out".
  */
 export async function GET(request: NextRequest) {
   try {

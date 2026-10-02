@@ -200,3 +200,33 @@
   color: transparent;
   animation: shimmer 2s linear infinite;
 }
+
+/* Search-result matches (desktop-shell search panel): the matched words in
+   bold foreground, no highlighter tint — the Darth Chat search look. */
+mark.search-match {
+  background: transparent;
+  color: var(--color-foreground);
+  font-weight: 600;
+}
+
+/* "Search in this meeting" → a hit jumps to its utterance and flashes it
+   briefly (components/shell-search.tsx, transcript page jumpToUtterance). */
+.search-jump-flash {
+  border-radius: 0.375rem;
+  animation: search-jump-flash 1.6s ease-out;
+}
+@keyframes search-jump-flash {
+  0%,
+  35% {
+    background-color: color-mix(in oklab, var(--color-primary) 14%, transparent);
+  }
+  100% {
+    background-color: transparent;
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .search-jump-flash {
+    animation: none;
+    outline: 2px solid color-mix(in oklab, var(--color-primary) 40%, transparent);
+  }
+}

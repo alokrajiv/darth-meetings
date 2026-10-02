@@ -12,7 +12,9 @@ import { relinkRecordingTranscript } from '@/db-ops/recorder';
 import { audioFileExists } from '@/lib/server/audio-storage';
 import { IngestError, ingestLocalAudio } from '@/lib/server/ingest';
 import { queueRecordingGraphSync } from '@/lib/server/recording-sync';
+import { borrowedMediaReason, madeFromRecordingId } from '@/lib/made-early';
 import type { SpeechModel } from '@/lib/aai-language';
+import { unlessDraining } from '@/lib/server/deploy-drain';
 
 /**
  * Re-submits kept-failure rows (status 'error' + gmeet_context.ingestFailure,
@@ -27,6 +29,14 @@ import type { SpeechModel } from '@/lib/aai-language';
  * one. `promoteUploadingRow` keeps a non-placeholder id as it is, so a retry
  * puts a SECOND job id on the SAME meeting instead of renaming it — the file
  * on disk, the /m link and every share stay where they are.
+ *
+ * A meeting that BORROWS its media (made from a recording, or split off
+ * another meeting — lib/made-early.ts) is never re-ingested: its
+ * `local_audio_path` is someone else's file, and `ingestLocalAudio` would
+ * send it to AssemblyAI a second time and rename it after this meeting (prod
+ * 2026-10-02: the recording's canonical file was renamed out from under its
+ * media row). A meeting made from a recording is retried THROUGH the
+ * recording instead (`retryRecordingForMeeting`).
  *
  * Runs every TICK_MS from instrumentation.ts; `retryIngest` is also called on
  * demand by POST /api/transcripts/:id/retry-ingest. One row at a time — the
@@ -58,6 +68,8 @@ export async function retryIngest(
     if (!fresh || fresh.status !== 'error' || !failure) {
       return { ok: false, error: 'Not a failed hand-off any more' };
     }
+    const borrowed = borrowedMediaReason(fresh);
+    if (borrowed) return await retryBorrower(fresh, borrowed, trigger);
     if (!fresh.local_audio_path || !(await audioFileExists(fresh.local_audio_path))) {
       await markIngestFailed(
         fresh.user_id,
@@ -130,6 +142,36 @@ export async function retryIngest(
   }
 }
 
+/**
+ * Retry for a meeting whose bytes and text belong to something else. Never
+ * calls `ingestLocalAudio`. The sweeper leaves these alone entirely: a
+ * borrower's failure is settled by its recording (the born-bare sweeper and
+ * the settle), and re-sending a recording AssemblyAI failed is a human's call.
+ */
+async function retryBorrower(
+  row: TranscriptRow,
+  reason: 'made-from-recording' | 'split',
+  trigger: 'sweeper' | 'manual'
+): Promise<RetryOutcome> {
+  if (reason === 'split') {
+    return {
+      ok: false,
+      error: 'This meeting was split off another one — its recording and text belong to that meeting; retry it there.',
+    };
+  }
+  if (trigger === 'sweeper') {
+    return { ok: false, error: 'Made from a recording — settled by the recording, not re-sent' };
+  }
+  const recordingId = madeFromRecordingId(row)!;
+  const { retryRecordingForMeeting } = await import('@/lib/server/born-bare');
+  const out = await retryRecordingForMeeting(row.user_id, recordingId);
+  console.log(
+    `[ingest-retry] ${row.assemblyai_id} made from recording ${recordingId} (${trigger}): ${out.kind}`
+  );
+  if (out.kind === 'settled' || out.kind === 'retrying') return { ok: true, id: row.assemblyai_id };
+  return { ok: false, error: out.message };
+}
+
 async function tick(): Promise<void> {
   let rows: TranscriptRow[];
   try {
@@ -146,8 +188,8 @@ async function tick(): Promise<void> {
 
 export function startIngestRetrySweeper(): void {
   if (guard.timer) return;
-  guard.timer = setInterval(() => void tick(), TICK_MS);
+  guard.timer = setInterval(unlessDraining('ingest-retry', tick), TICK_MS);
   guard.timer.unref?.();
-  setTimeout(() => void tick(), 90_000).unref?.();
+  setTimeout(unlessDraining('ingest-retry', tick), 90_000).unref?.();
   console.log('[ingest-retry] sweeper armed (every 5 min)');
 }

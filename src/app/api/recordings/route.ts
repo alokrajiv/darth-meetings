@@ -6,7 +6,7 @@ import { RecordingsRegexError } from '@/db-ops/own-recordings-page';
 export const runtime = 'nodejs';
 
 /**
- * GET /api/recordings?mine=1[&section=mac|uploaded|temporary][&q=][&regex=1]
+ * GET /api/recordings?mine=1[&section=mac|uploaded|temporary|linked][&q=][&regex=1]
  *                           [&limit=0..200][&cursor=][&tz=<IANA>]
  *
  * The caller's OWN recordings that belong to no meeting — the Recordings
@@ -20,6 +20,12 @@ export const runtime = 'nodejs';
  *
  * Answer: `{ items, next_cursor, counts: { mac, uploaded, temporary } }`
  * (lib/server/own-recordings OwnRecordingsResponse).
+ *
+ * `section=linked` (2026-10-02) — asked for by name only, never part of the
+ * default: the caller's recordings a live meeting holds, each item carrying
+ * `meetings: [{ assemblyai_id, title, recorded_at }]` (the ones the caller
+ * can open), and `counts.linked` on that answer only. The default answer
+ * keeps its three count keys, byte-compatible for darth-cli.
  *
  * Owner only, by construction (invariant I2): there is no form of this
  * route that lists anyone else's recording, and no parameter that asks.

@@ -6,10 +6,10 @@ import { getStorageDir, resolveAudioPath } from '@/lib/server/audio-storage';
 import { hasVideoStream } from '@/lib/server/video-frames';
 
 /**
- * Audio-only derivatives of stored meeting recordings, for offline pins.
+ * Audio-only derivatives of stored meeting recordings (`?variant=audio`).
  *
- * A Meet/Teams recording is a video container of several hundred MB; the
- * offline "audio" pin level only wants the soundtrack (mono AAC 64 kbps is
+ * A Meet/Teams recording is a video container of several hundred MB; a
+ * listener only wants the soundtrack (mono AAC 64 kbps is
  * ~30 MB/hour, an order of magnitude smaller). The derivative lives next to
  * the source tree under `${MW_STORAGE_DIR}/audio-only/<stored name>.m4a`
  * and is produced ONCE. Since 2026-09-18 (tech-debt A1.2) every import

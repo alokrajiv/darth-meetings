@@ -26,7 +26,7 @@ import { findImportedByMeetingCodes } from '@/db-ops/gmeet-sync';
 import { findImportedByTeamsMeetings } from '@/db-ops/teams-import';
 import { createDeferredPlaceholder, getAnyByAssemblyaiId } from '@/db-ops/transcripts';
 import { addShare } from '@/db-ops/transcript-shares';
-import { shareCloudImportWithInternalInvitees } from '@/lib/server/auto-share';
+import { shareWithInternalInvitees } from '@/lib/server/auto-share';
 import { kickDeferredImportPoller } from '@/lib/server/deferred-import-poller';
 import { randomUUID } from 'node:crypto';
 import { identityForUser, userIdForEmail } from '@/db-ops/transcript-activity';
@@ -555,7 +555,7 @@ async function queueAwaitingRecording(
       },
     },
   });
-  const autoShared = await shareCloudImportWithInternalInvitees(
+  const autoShared = await shareWithInternalInvitees(
     'cloud-import',
     placeholder.id,
     caller.userId,

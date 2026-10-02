@@ -10,8 +10,7 @@ import {
 import { Button } from '@/components/ui/button';
 import { Badge } from '@/components/ui/badge';
 import { getGoogleAccessToken, GoogleNotConnectedError } from '@/lib/google-token';
-import { OFFLINE_TITLE, useOfflineGate } from '@/lib/offline/offline-context';
-import { isNetworkFailure, offlineAwareError } from '@/lib/offline/offline-fetch';
+import { isNetworkFailure, networkErrorMessage, NETWORK_ERROR_MESSAGE } from '@/lib/fetch-errors';
 import { storedReportPref, type ReportPref } from '@/lib/report-pref';
 import {
   Repeat,
@@ -495,13 +494,7 @@ export function SeriesDialog({ seriesId, onClose, onChanged, onMerged }: SeriesD
   const [actionError, setActionError] = useState<string | null>(null);
   const [occ, setOcc] = useState<OccurrencesResult | null>(null);
   const [occError, setOccError] = useState<false | string>(false);
-  // Offline mode / network down: nothing in this dialog works without the
-  // server — banner + one disabled <fieldset> around the body; Close stays live.
-  const { blocked } = useOfflineGate();
-  const extLink = (className: string, title?: string) =>
-    blocked
-      ? { className: `${className} pointer-events-none opacity-50`, title: OFFLINE_TITLE, 'aria-disabled': true, tabIndex: -1 }
-      : { className, title };
+  const extLink = (className: string, title?: string) => ({ className, title });
   const [busyIds, setBusyIds] = useState<Set<string>>(new Set());
   const [importErrors, setImportErrors] = useState<Map<string, string>>(new Map());
   const [massProgress, setMassProgress] = useState<{ done: number; total: number } | null>(null);
@@ -522,39 +515,31 @@ export function SeriesDialog({ seriesId, onClose, onChanged, onMerged }: SeriesD
 
   const loadDetail = useCallback(async () => {
     if (!seriesId) return;
-    if (blocked) {
-      setDetailError(OFFLINE_TITLE);
-      return;
-    }
     setDetailError(null);
     try {
       const res = await fetch(`/api/series/${seriesId}`);
-      if (!res.ok) throw await offlineAwareError(res, `Couldn't load this series (${res.status})`);
+      if (!res.ok) throw new Error(`Couldn't load this series (${res.status})`);
       setDetail((await res.json()) as SeriesDetail);
     } catch (err) {
-      setDetailError(isNetworkFailure(err) ? OFFLINE_TITLE : err instanceof Error ? err.message : "Couldn't load this series");
+      setDetailError(networkErrorMessage(err, "Couldn't load this series"));
     }
-  }, [seriesId, blocked]);
+  }, [seriesId]);
 
   const loadOccurrences = useCallback(
     async (forceRefresh = false) => {
       if (!seriesId) return;
-      if (blocked) {
-        setOccError(OFFLINE_TITLE);
-        return;
-      }
       setOccError(false);
       try {
         const res = await fetch(
           `/api/series/${seriesId}/occurrences${forceRefresh ? '?refresh=1' : ''}`
         );
-        if (!res.ok) throw await offlineAwareError(res, String(res.status));
+        if (!res.ok) throw new Error(String(res.status));
         setOcc((await res.json()) as OccurrencesResult);
       } catch (err) {
-        setOccError(isNetworkFailure(err) || (err instanceof Error && err.message === OFFLINE_TITLE) ? OFFLINE_TITLE : 'failed');
+        setOccError(isNetworkFailure(err) ? NETWORK_ERROR_MESSAGE : 'failed');
       }
     },
-    [seriesId, blocked]
+    [seriesId]
   );
 
   useEffect(() => {
@@ -587,10 +572,10 @@ export function SeriesDialog({ seriesId, onClose, onChanged, onMerged }: SeriesD
     setActionError(null);
     try {
       const res = await run();
-      if (!res.ok) throw await offlineAwareError(res, `${label} failed (${res.status})`);
+      if (!res.ok) throw new Error(`${label} failed (${res.status})`);
       return true;
     } catch (err) {
-      setActionError(isNetworkFailure(err) ? OFFLINE_TITLE : err instanceof Error ? err.message : `${label} failed`);
+      setActionError(networkErrorMessage(err, `${label} failed`));
       return false;
     }
   };
@@ -731,13 +716,13 @@ export function SeriesDialog({ seriesId, onClose, onChanged, onMerged }: SeriesD
       // A failed list is an error, not "No other series".
       try {
         const res = await fetch('/api/series');
-        if (!res.ok) throw await offlineAwareError(res, `Couldn't list series (${res.status})`);
+        if (!res.ok) throw new Error(`Couldn't list series (${res.status})`);
         const j = (await res.json()) as {
           series: Array<{ id: number; title: string; member_count: number }>;
         };
         setMergeTargets(j.series.filter((s) => s.id !== seriesId));
       } catch (err) {
-        setMergeError(isNetworkFailure(err) ? OFFLINE_TITLE : err instanceof Error ? err.message : "Couldn't list series");
+        setMergeError(networkErrorMessage(err, "Couldn't list series"));
       }
     }
   };
@@ -761,14 +746,14 @@ export function SeriesDialog({ seriesId, onClose, onChanged, onMerged }: SeriesD
         body: JSON.stringify({ fromSeriesId: seriesId }),
       });
       if (!res.ok) {
-        const j = (await res.json().catch(() => null)) as { error?: string; offline?: boolean } | null;
-        throw new Error(j?.offline === true ? OFFLINE_TITLE : (j?.error ?? `Merge failed (${res.status})`));
+        const j = (await res.json().catch(() => null)) as { error?: string } | null;
+        throw new Error(j?.error ?? `Merge failed (${res.status})`);
       }
       onChanged();
       if (onMerged) onMerged(target.id);
       else onClose();
     } catch (err) {
-      setMergeError(isNetworkFailure(err) ? OFFLINE_TITLE : err instanceof Error ? err.message : 'Merge failed');
+      setMergeError(networkErrorMessage(err, 'Merge failed'));
     } finally {
       setMergeBusy(false);
     }
@@ -826,18 +811,17 @@ export function SeriesDialog({ seriesId, onClose, onChanged, onMerged }: SeriesD
         }
         if (res.ok || res.status === 409) return null; // 409 = already imported
         const j = (await res.json().catch(() => null)) as
-          | { error?: string; emptyTranscript?: boolean; offline?: boolean }
+          | { error?: string; emptyTranscript?: boolean }
           | null;
         // Empty transcript Doc (no speech captured): not a failure — the
         // sweep now shows the occurrence as "transcript empty".
         if (res.status === 422 && j?.emptyTranscript) return null;
-        if (res.status === 503 && j?.offline === true) return OFFLINE_TITLE;
         return j?.error ?? `Import failed (${res.status})`;
       } catch (err) {
         if (err instanceof GoogleNotConnectedError) {
           return 'Connect Google first (Import meeting → Connect), then retry.';
         }
-        if (isNetworkFailure(err)) return OFFLINE_TITLE;
+        if (isNetworkFailure(err)) return NETWORK_ERROR_MESSAGE;
         return err instanceof Error ? err.message : 'Import failed';
       }
     },
@@ -918,19 +902,13 @@ export function SeriesDialog({ seriesId, onClose, onChanged, onMerged }: SeriesD
               size="sm"
               className="h-6 w-6 shrink-0 p-0 text-muted-foreground"
               onClick={() => void rename()}
-              disabled={blocked}
-              title={blocked ? OFFLINE_TITLE : 'Rename series'}
+              title="Rename series"
             >
               <Pencil className="h-3 w-3" />
             </Button>
           </DialogTitle>
         </DialogHeader>
 
-        {blocked && (
-          <p className="rounded-md border border-amber-500/40 bg-amber-500/10 px-3 py-1.5 text-xs text-amber-800 dark:text-amber-300" data-series-offline-banner>
-            {OFFLINE_TITLE}
-          </p>
-        )}
         {actionError && <p className="text-xs text-destructive">{actionError}</p>}
 
         {!detail ? (
@@ -938,7 +916,7 @@ export function SeriesDialog({ seriesId, onClose, onChanged, onMerged }: SeriesD
             <div className="flex flex-col items-center gap-3 py-10 text-center text-sm text-muted-foreground">
               <p>{detailError}</p>
               <div className="flex gap-2">
-                <Button variant="outline" size="sm" onClick={() => void loadDetail()} disabled={blocked} title={blocked ? OFFLINE_TITLE : undefined}>
+                <Button variant="outline" size="sm" onClick={() => void loadDetail()}>
                   <RefreshCw className="h-3.5 w-3.5" />
                   Retry
                 </Button>
@@ -953,7 +931,6 @@ export function SeriesDialog({ seriesId, onClose, onChanged, onMerged }: SeriesD
             </div>
           )
         ) : (
-          <fieldset disabled={blocked} className="contents">
           <div className="space-y-4">
             {/* ---- guessed members ------------------------------------- */}
             {detail.suggestions.length > 0 && (
@@ -1412,8 +1389,8 @@ export function SeriesDialog({ seriesId, onClose, onChanged, onMerged }: SeriesD
                 </div>
               ) : occError ? (
                 <div className="rounded-lg border py-4 text-center text-xs text-muted-foreground">
-                  {occError === OFFLINE_TITLE ? OFFLINE_TITLE : 'Couldn’t sweep occurrences.'}{' '}
-                  <button className="text-primary underline disabled:cursor-not-allowed disabled:opacity-50" onClick={() => void loadOccurrences()} disabled={blocked}>
+                  {occError === 'failed' ? 'Couldn’t sweep occurrences.' : occError}{' '}
+                  <button className="text-primary underline disabled:cursor-not-allowed disabled:opacity-50" onClick={() => void loadOccurrences()}>
                     Retry
                   </button>
                 </div>
@@ -1919,7 +1896,6 @@ export function SeriesDialog({ seriesId, onClose, onChanged, onMerged }: SeriesD
               </span>
             </div>
           </div>
-          </fieldset>
         )}
       </DialogContent>
     </Dialog>

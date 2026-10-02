@@ -39,8 +39,14 @@ import {
 } from '@/lib/companion/companion-client';
 import { RecordingStrip, SourceGlyph } from '@/components/recording-strip';
 import { LinkEventDialog } from '@/components/link-event-dialog';
-import { OFFLINE_TITLE } from '@/lib/offline/offline-types';
-import { isNetworkFailure, offlineAwareError } from '@/lib/offline/offline-fetch';
+import { networkErrorMessage } from '@/lib/fetch-errors';
+import {
+  linkedMeetingLabel,
+  linkedRecordingFacts,
+  registryItemsAwaitingSwap,
+  swapRefreshDelay,
+  type LinkedMeetingWire,
+} from '@/lib/recordings-live';
 
 /**
  * The Recordings surface (docs/recordings-meetings-series-design.md §3.1):
@@ -55,7 +61,16 @@ import { isNetworkFailure, offlineAwareError } from '@/lib/offline/offline-fetch
  * files still on a Mac. A section filter with the server's counts, a
  * search box, and more pages as the list scrolls (the listing's sentinel
  * pattern). Link to meeting… / Make a meeting / Keep move a recording out
- * of here — only a meeting is ever shared.
+ * of the unlinked sections — only a meeting is ever shared (a link to a
+ * calendar event shares it with the invite's internal people); the
+ * recording itself never is.
+ *
+ * Linked recordings stay findable (2026-10-02): a "Linked to a meeting"
+ * section (`section=linked`), and under All a short group of the newest
+ * ones, each with Open meeting / Open recording. A Mac row whose upload is
+ * under way refetches until the server hands it back as its recording, so
+ * Link / Make a meeting are there while the bytes still move
+ * (lib/recordings-live.ts).
  */
 
 /** Own-registry row as the server serves it (lib/server/recorder-view
@@ -82,7 +97,14 @@ export interface OwnRecorderRecording {
 
 /** One item of `GET /api/recordings?mine=1` (lib/server/own-recordings RecordingsPageItem). */
 export type RecordingsItemWire =
-  | { kind: 'recording'; section: RecordingSection; sort_us: string; recording: RecordingViewWire }
+  | {
+      kind: 'recording';
+      section: RecordingSection;
+      sort_us: string;
+      recording: RecordingViewWire;
+      /** Section 'linked' only: the meetings holding it that the caller can open. */
+      meetings?: LinkedMeetingWire[];
+    }
   | {
       kind: 'meeting';
       section: RecordingSection;
@@ -144,6 +166,9 @@ export type RecordingsFilter = 'all' | RecordingSection;
 export interface RecordingsPage {
   items: RecordingsItemWire[];
   counts: RecordingSectionCounts;
+  /** Linked recordings: the count, and (outside the Linked filter) the
+   * newest few for the All view's group. */
+  linked: { count: number; preview: RecordingsItemWire[] };
   filter: RecordingsFilter;
   setFilter: (f: RecordingsFilter) => void;
   query: string;
@@ -157,6 +182,8 @@ export interface RecordingsPage {
 }
 
 const PAGE_SIZE = 50;
+/** How many linked recordings the All view shows under its own heading. */
+export const LINKED_PREVIEW = 4;
 
 /**
  * The paginated list. A new filter / search / refresh starts over at page
@@ -205,7 +232,7 @@ export function useRecordingsPage(opts: {
   const fetchPage = useCallback(
     async (after: string | null) => {
       const res = await fetch(urlFor(after), { credentials: 'include' });
-      if (!res.ok) throw await offlineAwareError(res, `Failed to load recordings (${res.status})`);
+      if (!res.ok) throw new Error(`Failed to load recordings (${res.status})`);
       return (await res.json()) as RecordingsPageWire;
     },
     [urlFor]
@@ -225,12 +252,58 @@ export function useRecordingsPage(opts: {
       })
       .catch((err: unknown) => {
         if (gen !== genRef.current) return;
-        setError(isNetworkFailure(err) ? OFFLINE_TITLE : err instanceof Error ? err.message : 'Failed to load recordings');
+        setError(networkErrorMessage(err, 'Failed to load recordings'));
       })
       .finally(() => {
         if (gen === genRef.current) setLoading(false);
       });
   }, [enabled, fetchPage, nonce, evKey]);
+
+  // The registry -> recording swap (lib/recordings-live.ts): a Mac row seen
+  // uploading refetches, on a short backoff, until the server lists it as
+  // the recording its upload opened — the row Link / Make a meeting act on.
+  const awaitingSwap = useMemo(
+    () => registryItemsAwaitingSwap(items, companion.uploads).join(','),
+    [items, companion.uploads]
+  );
+  const swapRef = useRef<{ key: string; attempt: number }>({ key: '', attempt: 0 });
+  useEffect(() => {
+    if (!enabled || loading || !awaitingSwap) return;
+    if (swapRef.current.key !== awaitingSwap) swapRef.current = { key: awaitingSwap, attempt: 0 };
+    const delay = swapRefreshDelay(swapRef.current.attempt);
+    if (delay === null) return;
+    swapRef.current.attempt += 1;
+    const t = setTimeout(refresh, delay);
+    return () => clearTimeout(t);
+  }, [enabled, loading, awaitingSwap, items, refresh]);
+
+  // Linked recordings outside the Linked filter: their count for the chip and
+  // the newest few for the All view's group (`section=linked` is asked for by
+  // name; the default answer never carries it).
+  const [linkedCount, setLinkedCount] = useState(0);
+  const [linkedPreview, setLinkedPreview] = useState<RecordingsItemWire[]>([]);
+  useEffect(() => {
+    if (!enabled || filter === 'linked') return;
+    let live = true;
+    const params = new URLSearchParams({
+      mine: '1',
+      section: 'linked',
+      limit: String(filter === 'all' ? LINKED_PREVIEW : 0),
+      tz,
+    });
+    if (debounced) params.set('q', debounced);
+    fetch(`/api/recordings?${params.toString()}`, { credentials: 'include' })
+      .then(async (res) => (res.ok ? ((await res.json()) as RecordingsPageWire) : null))
+      .then((data) => {
+        if (!live || !data) return;
+        setLinkedCount(data.counts.linked ?? 0);
+        setLinkedPreview(data.items);
+      })
+      .catch(() => {});
+    return () => {
+      live = false;
+    };
+  }, [enabled, filter, debounced, tz, nonce, evKey]);
 
   const loadMore = useCallback(() => {
     if (!cursor || loading || loadingMore || error) return;
@@ -248,7 +321,7 @@ export function useRecordingsPage(opts: {
       })
       .catch((err: unknown) => {
         if (gen !== genRef.current) return;
-        setError(isNetworkFailure(err) ? OFFLINE_TITLE : err instanceof Error ? err.message : 'Failed to load more');
+        setError(networkErrorMessage(err, 'Failed to load more'));
       })
       .finally(() => {
         if (gen === genRef.current) setLoadingMore(false);
@@ -258,6 +331,10 @@ export function useRecordingsPage(opts: {
   return {
     items,
     counts,
+    linked:
+      filter === 'linked'
+        ? { count: counts.linked ?? 0, preview: [] }
+        : { count: linkedCount, preview: filter === 'all' ? linkedPreview : [] },
     filter,
     setFilter,
     query,
@@ -279,7 +356,6 @@ function itemKey(i: RecordingsItemWire): string {
 
 export interface RecordingsSurfaceProps {
   data: RecordingsPage;
-  disabled?: boolean;
   /** Something changed that the archive should notice (a link, a name, a trash). */
   onChanged?: () => void;
 }
@@ -289,11 +365,25 @@ const FILTERS: Array<{ key: RecordingsFilter; label: string; short: string }> = 
   { key: 'mac', label: 'On your Macs', short: 'Macs' },
   { key: 'uploaded', label: 'Uploaded, not in a meeting', short: 'Uploaded' },
   { key: 'temporary', label: 'Temporary', short: 'Temporary' },
+  { key: 'linked', label: 'Linked to a meeting', short: 'Linked' },
 ];
 
-export function RecordingsSurface({ data, disabled = false, onChanged }: RecordingsSurfaceProps) {
-  const { items, counts, filter, setFilter, query, setQuery, loading, loadingMore, hasMore, error, refresh, loadMore } =
-    data;
+export function RecordingsSurface({ data, onChanged }: RecordingsSurfaceProps) {
+  const {
+    items,
+    counts,
+    linked,
+    filter,
+    setFilter,
+    query,
+    setQuery,
+    loading,
+    loadingMore,
+    hasMore,
+    error,
+    refresh,
+    loadMore,
+  } = data;
   const companion = useCompanion();
   const tray = useCompanionRecordings(companion.connected);
   const trayIds = useMemo(() => new Set(tray.recordings.map((r) => r.id)), [tray.recordings]);
@@ -333,8 +423,8 @@ export function RecordingsSurface({ data, disabled = false, onChanged }: Recordi
     if (visibleRef.current) loadMoreRef.current();
   }, [items.length]);
 
-  const total = counts.mac + counts.uploaded + counts.temporary;
-  const countOf = (f: RecordingsFilter) => (f === 'all' ? total : counts[f]);
+  const total = counts.mac + counts.uploaded + counts.temporary + linked.count;
+  const countOf = (f: RecordingsFilter) => (f === 'all' ? total : f === 'linked' ? linked.count : counts[f]);
   const empty = !loading && !error && items.length === 0;
 
   return (
@@ -361,6 +451,7 @@ export function RecordingsSurface({ data, disabled = false, onChanged }: Recordi
               {...(f.key === 'temporary' ? { id: 'temporary' } : {})}
             >
               {f.key === 'temporary' && <Hourglass className="h-3 w-3" />}
+              {f.key === 'linked' && <Link2 className="h-3 w-3" />}
               <span className="sm:hidden">{f.short}</span>
               <span className="hidden sm:inline">{f.label}</span>
               <span className="rounded-full bg-muted px-1.5 text-[11px] tabular-nums">{countOf(f.key)}</span>
@@ -399,9 +490,13 @@ export function RecordingsSurface({ data, disabled = false, onChanged }: Recordi
             <Laptop className="h-5 w-5 text-muted-foreground" />
           </div>
           <p className="mt-3 text-sm font-medium">
-            {query.trim() ? 'No recording matches that search' : 'No recordings outside a meeting'}
+            {query.trim()
+              ? 'No recording matches that search'
+              : filter === 'linked'
+                ? 'No recording is linked to a meeting yet'
+                : 'No recordings outside a meeting'}
           </p>
-          {!query.trim() && (
+          {!query.trim() && filter !== 'linked' && (
             <p className="mt-1 max-w-md text-xs text-muted-foreground">
               Recordings are yours alone — nobody else sees them. A new upload waits here until you
               link it to a meeting or make a meeting of it; when one looks like a meeting in your
@@ -414,13 +509,14 @@ export function RecordingsSurface({ data, disabled = false, onChanged }: Recordi
       {items.length > 0 && (
         <div className="grid gap-2 md:grid-cols-2" data-recordings-list>
           {items.map((it) =>
-            it.kind === 'registry' ? (
+            it.kind === 'recording' && it.section === 'linked' ? (
+              <LinkedCard key={itemKey(it)} r={it.recording} meetings={it.meetings ?? []} />
+            ) : it.kind === 'registry' ? (
               <MacCard
                 key={itemKey(it)}
                 r={it.registry}
                 trayHasIt={companion.connected && trayIds.has(it.registry.id)}
                 live={companion.uploads[it.registry.id]?.status === 'uploading' ? companion.uploads[it.registry.id] : null}
-                disabled={disabled}
                 onChanged={() => {
                   setTimeout(refresh, 800);
                 }}
@@ -436,7 +532,6 @@ export function RecordingsSurface({ data, disabled = false, onChanged }: Recordi
                     ? companion.uploads[it.row.recorder_recording_id]
                     : null
                 }
-                disabled={disabled}
                 onLink={() =>
                   setLinkFor({ kind: 'meeting', id: it.row.assemblyai_id, dateIso: it.row.recorded_at ?? it.row.created_at })
                 }
@@ -452,7 +547,6 @@ export function RecordingsSurface({ data, disabled = false, onChanged }: Recordi
                     ? companion.uploads[it.recording.recorder_recording_id]
                     : null
                 }
-                disabled={disabled}
                 onLink={() =>
                   setLinkFor({
                     kind: 'recording',
@@ -474,6 +568,10 @@ export function RecordingsSurface({ data, disabled = false, onChanged }: Recordi
             Load more
           </Button>
         </div>
+      )}
+
+      {filter === 'all' && linked.preview.length > 0 && (
+        <LinkedGroup items={linked.preview} count={linked.count} onShowAll={() => setFilter('linked')} />
       )}
 
       {linkFor && (
@@ -531,13 +629,11 @@ function MacCard({
   r,
   trayHasIt,
   live,
-  disabled,
   onChanged,
 }: {
   r: OwnRecorderRecording;
   trayHasIt: boolean;
   live: { pct: number; bytesSent: number | null; bytesTotal: number | null; segment: number | null; segmentsTotal: number | null } | null;
-  disabled: boolean;
   onChanged: () => void;
 }) {
   const [note, setNote] = useState<string | null>(null);
@@ -606,7 +702,6 @@ function MacCard({
         {!busy && trayHasIt && (
           <button
             type="button"
-            disabled={disabled}
             title="Delete this recording from this Mac — it was never uploaded, so it is gone for good"
             aria-label="Delete from this Mac"
             data-recorder-delete
@@ -628,7 +723,6 @@ function MacCard({
         noGlyph
         onAction={onAction}
         note={note ?? (r.status === 'upload_failed' && r.error ? r.error : null)}
-        disabled={disabled}
       />
     </div>
   );
@@ -655,7 +749,6 @@ function BareCard({
   temporary = false,
   reg,
   live,
-  disabled,
   onLink,
   onChanged,
 }: {
@@ -664,7 +757,6 @@ function BareCard({
   temporary?: boolean;
   reg: OwnRecorderRecording | null;
   live: { pct: number; bytesSent: number | null; bytesTotal: number | null } | null;
-  disabled: boolean;
   onLink: () => void;
   onChanged: () => void;
 }) {
@@ -701,7 +793,7 @@ function BareCard({
     try {
       await fn();
     } catch (e) {
-      setErr(isNetworkFailure(e) ? OFFLINE_TITLE : e instanceof Error ? e.message : 'Failed');
+      setErr(networkErrorMessage(e, 'Failed'));
     } finally {
       setBusy(null);
     }
@@ -836,7 +928,6 @@ function BareCard({
         model={model}
         noGlyph
         onAction={(k) => (k === 'retry' ? retry() : undefined)}
-        disabled={disabled}
       />
       {err && <p className="text-[11px] text-destructive">{err}</p>}
       <div className="flex flex-wrap items-center gap-1 pt-0.5">
@@ -844,7 +935,7 @@ function BareCard({
           size="sm"
           variant="outline"
           className={iconBtn}
-          disabled={disabled || placeholder}
+          disabled={placeholder}
           onClick={onLink}
           title="Link it to a calendar event — the meeting takes the invite's title, date and people"
           data-link-meeting
@@ -856,7 +947,7 @@ function BareCard({
           size="sm"
           variant="outline"
           className={iconBtn}
-          disabled={disabled || placeholder}
+          disabled={placeholder}
           onClick={() => {
             setName(row.title && !filename?.startsWith(row.title) ? row.title : '');
             setRenaming(true);
@@ -872,7 +963,7 @@ function BareCard({
             size="sm"
             variant="outline"
             className={iconBtn}
-            disabled={disabled || placeholder || busy === 'keep'}
+            disabled={placeholder || busy === 'keep'}
             onClick={keep}
             title="Keep it — no expiry; it stays one of your recordings"
             data-keep-recording
@@ -892,7 +983,7 @@ function BareCard({
             size="sm"
             variant="ghost"
             className={`${iconBtn} ml-auto text-muted-foreground hover:text-destructive`}
-            disabled={disabled || busy === 'trash'}
+            disabled={busy === 'trash'}
             onClick={trash}
             title={placeholder ? 'Cancel the upload' : 'Move to trash'}
           >
@@ -915,18 +1006,17 @@ function BareCard({
  * One STANDALONE recording (design P7) — an upload born as a recording.
  * Actions (§3.1): Link to meeting… · Make a meeting · Keep (temporary only) ·
  * Open (its own page, recording mode) · Delete. Only the owner ever sees
- * this card; nothing on it shares anything.
+ * this card. The recording is never shared; Link to meeting… makes a meeting
+ * that is shared with the event's internal invitees (meeting policy).
  */
 function RecordingCard({
   r,
   live,
-  disabled,
   onLink,
   onChanged,
 }: {
   r: RecordingViewWire;
-  live: { pct: number } | null;
-  disabled: boolean;
+  live: { pct: number; bytesSent?: number | null; bytesTotal?: number | null } | null;
   onLink: () => void;
   onChanged: () => void;
 }) {
@@ -948,7 +1038,7 @@ function RecordingCard({
     try {
       await fn();
     } catch (e) {
-      setErr(isNetworkFailure(e) ? OFFLINE_TITLE : e instanceof Error ? e.message : 'Failed');
+      setErr(networkErrorMessage(e, 'Failed'));
     } finally {
       setBusy(null);
     }
@@ -1067,7 +1157,7 @@ function RecordingCard({
           {linkable && (
             <button
               type="button"
-              disabled={disabled || busy === 'link'}
+              disabled={busy === 'link'}
               onClick={linkSuggested}
               className="inline-flex h-6 shrink-0 items-center gap-1 rounded-md border border-primary/35 bg-primary/5 px-2 text-[11px] font-medium text-primary hover:bg-primary/10 disabled:opacity-60"
               data-link-suggested
@@ -1078,7 +1168,7 @@ function RecordingCard({
           )}
           <button
             type="button"
-            disabled={disabled || busy === 'dismiss'}
+            disabled={busy === 'dismiss'}
             onClick={dismiss}
             className="inline-flex h-6 shrink-0 items-center rounded-md px-1.5 text-[11px] hover:bg-muted disabled:opacity-60"
             data-dismiss-suggested
@@ -1087,16 +1177,16 @@ function RecordingCard({
           </button>
         </div>
       )}
-      <RecordingStrip model={model} noGlyph disabled={disabled} />
+      <RecordingStrip model={model} noGlyph />
       {err && <p className="text-[11px] text-destructive">{err}</p>}
       <div className="flex flex-wrap items-center gap-1 pt-0.5">
         <Button
           size="sm"
           variant="outline"
           className={iconBtn}
-          disabled={disabled || !linkable}
+          disabled={!linkable}
           onClick={onLink}
-          title={linkable ? 'Link it to a calendar event — that makes it a meeting; nothing is shared' : 'Its transcription failed — retry it first'}
+          title={linkable ? 'Link it to a calendar event — that makes it a meeting, shared with the Trames colleagues on the invite' : 'Its transcription failed — retry it first'}
           data-link-meeting
         >
           <Link2 className="h-3.5 w-3.5" />
@@ -1106,7 +1196,7 @@ function RecordingCard({
           size="sm"
           variant="outline"
           className={iconBtn}
-          disabled={disabled || !linkable}
+          disabled={!linkable}
           onClick={() => {
             setName(r.title ?? '');
             setNaming(true);
@@ -1122,7 +1212,7 @@ function RecordingCard({
             size="sm"
             variant="outline"
             className={iconBtn}
-            disabled={disabled || busy === 'keep'}
+            disabled={busy === 'keep'}
             onClick={keep}
             title="Keep it — no expiry; it stays one of your recordings"
             data-keep-recording
@@ -1139,13 +1229,118 @@ function RecordingCard({
           size="sm"
           variant="ghost"
           className={`${iconBtn} ml-auto text-muted-foreground hover:text-destructive`}
-          disabled={disabled || busy === 'delete' || r.status === 'uploading'}
+          disabled={busy === 'delete' || r.status === 'uploading'}
           onClick={remove}
           title="Delete for good"
           data-recording-delete
         >
           {busy === 'delete' ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Trash2 className="h-3.5 w-3.5" />}
         </Button>
+      </div>
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+
+/**
+ * All view: the newest linked recordings under their own heading, after the
+ * unlinked list — they need nothing from you, so they do not crowd it.
+ */
+export function LinkedGroup({
+  items,
+  count,
+  onShowAll,
+}: {
+  items: RecordingsItemWire[];
+  count: number;
+  onShowAll: () => void;
+}) {
+  return (
+    <section className="space-y-2 pt-2" data-linked-group aria-label="Linked to a meeting">
+      <div className="flex items-center justify-between gap-2">
+        <h2 className="inline-flex items-center gap-1.5 text-xs font-medium text-muted-foreground">
+          <Link2 className="h-3.5 w-3.5" />
+          Linked to a meeting
+          <span className="rounded-full bg-muted px-1.5 text-[11px] tabular-nums">{count}</span>
+        </h2>
+        {count > items.length && (
+          <button type="button" onClick={onShowAll} className="text-xs text-primary hover:underline" data-linked-show-all>
+            Show all {count}
+          </button>
+        )}
+      </div>
+      <div className="grid gap-2 md:grid-cols-2">
+        {items.map((it) =>
+          it.kind === 'recording' ? <LinkedCard key={itemKey(it)} r={it.recording} meetings={it.meetings ?? []} /> : null
+        )}
+      </div>
+    </section>
+  );
+}
+
+/**
+ * One recording a meeting holds (section 'linked'). Its own facts — date,
+ * duration, source app, size — the meeting(s) it is in, and two ways out:
+ * Open meeting and Open recording. Nothing here links, unlinks or shares;
+ * the meeting is where that happens.
+ */
+export function LinkedCard({ r, meetings }: { r: RecordingViewWire; meetings: LinkedMeetingWire[] }) {
+  const title = recordingDisplayTitle(r, (iso) => shortWhen(iso));
+  const facts = linkedRecordingFacts(r, {
+    when: (iso) => shortWhen(iso),
+    duration: formatDuration,
+    bytes: formatBytes,
+  });
+  const first = meetings[0] ?? null;
+  const linkCls = 'inline-flex h-7 items-center gap-1 rounded-md px-2 text-xs font-medium transition-colors hover:bg-muted';
+  return (
+    <div className={cardCls()} data-recording-card="linked" data-recording-id={r.id}>
+      <div className="flex min-w-0 items-start gap-2">
+        <SourceGlyph
+          source={r.source_kind === 'recorder' ? 'mac' : 'file'}
+          className="mt-1 h-3.5 w-3.5"
+          title={r.original_filename ?? undefined}
+        />
+        <div className="min-w-0 flex-1">
+          <p className="truncate text-sm font-medium" title={r.original_filename ?? undefined}>
+            {title}
+          </p>
+          {facts && <p className="truncate text-[11px] text-muted-foreground">{facts}</p>}
+        </div>
+      </div>
+      <div className="flex min-w-0 flex-col gap-0.5 text-[11px] text-muted-foreground" data-linked-meetings>
+        {meetings.length > 0 ? (
+          meetings.map((m) => (
+            <span key={m.assemblyai_id} className="flex min-w-0 items-center gap-1.5">
+              <Link2 className="h-3 w-3 shrink-0" />
+              <span className="min-w-0 truncate">
+                In <span className="text-foreground/80">{linkedMeetingLabel(m, (iso) => shortWhen(iso))}</span>
+              </span>
+            </span>
+          ))
+        ) : (
+          <span className="flex min-w-0 items-center gap-1.5">
+            <Link2 className="h-3 w-3 shrink-0" />
+            In a meeting you can no longer open
+          </span>
+        )}
+      </div>
+      <div className="flex flex-wrap items-center gap-1 pt-0.5">
+        {first && (
+          <a
+            href={`/transcript/${encodeURIComponent(first.assemblyai_id)}`}
+            className={`${linkCls} border border-primary/35 bg-primary/5 text-primary hover:bg-primary/10`}
+            data-open-meeting
+          >
+            <ExternalLink className="h-3.5 w-3.5" />
+            Open meeting
+          </a>
+        )}
+        <a href={`/recording/${encodeURIComponent(r.id)}`} className={`${linkCls} text-foreground`} data-open-recording>
+          <ExternalLink className="h-3.5 w-3.5" />
+          Open recording
+        </a>
       </div>
     </div>
   );

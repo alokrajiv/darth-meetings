@@ -2,7 +2,9 @@ import { NextResponse } from 'next/server';
 import type { NextRequest } from 'next/server';
 import {
   getDarthBearer,
+  hasAdminAccess,
   hasMeetingsAccess,
+  isAdminApiPath,
   isSessionValue,
   resolveDarthToken,
   NO_ACCESS_MESSAGE,
@@ -85,21 +87,24 @@ export async function proxy(request: NextRequest) {
   const pathname = request.nextUrl.pathname;
 
   // Public routes — no auth required. /login and /logout only bounce to
-  // darth-auth; /api/auth/* are self-gated diagnostics. The service worker,
-  // manifest, icons and the static /offline fallback carry nothing
-  // user-specific and must be fetchable without a session (the SW precaches
-  // /offline at activate time, browsers fetch the manifest cookie-less).
+  // darth-auth; /api/auth/* are self-gated diagnostics. /api/health is the
+  // no-auth reachability probe kept for native clients. Icons
+  // carry nothing user-specific. /sw.js is the one-release kill-switch worker
+  // (README "Offline and PWA — removed 2026-10-02"): the browser's update
+  // check for an old installed worker must reach it without a session, or
+  // the old worker keeps running — drop this line when sw.js is deleted.
   if (
     pathname === '/login' ||
     pathname === '/logout' ||
     pathname.startsWith('/_next') ||
     pathname.startsWith('/api/auth/') ||
     pathname === '/api/health' ||
+    // The deploy notice: nginx serves it from disk on the VM; anywhere else
+    // (a local dev server) it is a plain 404, never a bounce to sign-in.
+    pathname === '/__notice.json' ||
     pathname === '/favicon.ico' ||
     pathname === '/sw.js' ||
-    pathname === '/manifest.webmanifest' ||
-    pathname.startsWith('/icons/') ||
-    pathname === '/offline'
+    pathname.startsWith('/icons/')
   ) {
     return NextResponse.next();
   }
@@ -128,7 +133,7 @@ export async function proxy(request: NextRequest) {
         { status: 403 }
       );
     }
-    if (!hasMeetingsAccess(identity)) return noAccess(request);
+    if (!mayEnter(identity, pathname)) return noAccess(request);
     return NextResponse.next(); // read-scope → GET-only is enforced in withAuth
   }
 
@@ -139,9 +144,19 @@ export async function proxy(request: NextRequest) {
     if (wantsJson(request)) return unauthorized('Unauthorized - No valid session');
     return loginRedirect(request);
   }
-  if (!hasMeetingsAccess(user)) return noAccess(request);
+  if (!mayEnter(user, pathname)) return noAccess(request);
 
   return NextResponse.next();
+}
+
+/**
+ * `meetings` holders everywhere; on the operator API (/api/admin/*) also a
+ * super-admin (`access`) without `meetings` — darth-admin forwards the admin's
+ * own cookie there, as it does to chat's admin API. The route's
+ * withAdminAuth 404s everyone without `access`, meetings users included.
+ */
+function mayEnter(identity: { modules: string[] }, pathname: string): boolean {
+  return hasMeetingsAccess(identity) || (isAdminApiPath(pathname) && hasAdminAccess(identity));
 }
 
 export const config = {

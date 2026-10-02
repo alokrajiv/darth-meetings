@@ -22,8 +22,12 @@ export const runtime = 'nodejs';
  *     unshared, or never theirs) and the client unpins it.
  * Every row carries `rev` (page-content fingerprint) and the stored media
  * parts with sizes so the client can budget downloads and detect staleness.
- * `buildId` lets the client notice a deploy and re-fetch cached documents
- * whose /_next/static assets have moved.
+ * `buildId` lets the client notice a deploy.
+ *
+ * The web app no longer consumes this (its offline mode was removed
+ * 2026-10-02 — README "Offline and PWA — removed 2026-10-02"). Callers:
+ * darth-cli `offline plan` (cli-subcommand-src/index.ts) and, later, the
+ * desktop shell's offline replica.
  */
 
 const MAX_IDS = 200;

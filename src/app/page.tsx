@@ -1,33 +1,23 @@
 'use client';
 
 import { useEffect, useRef, useState } from 'react';
-import Link from 'next/link';
 import { useRouter } from 'next/navigation';
 import { legacyTabRedirect } from '@/lib/app-nav';
 import { TranscriptTable } from '@/components/transcript-table';
 import { AudioUpload, requestMediaUpload } from '@/components/audio-upload';
 import { getGoogleAccessToken } from '@/lib/google-token';
-import { LogoutButton } from '@/components/logout-button';
 import { GmeetImportDialog } from '@/components/gmeet-import-dialog';
 import { GmeetRemindersCard, type Reminder } from '@/components/gmeet-reminders-card';
 import { TranscriptImportDialog } from '@/components/transcript-import-dialog';
 import { AppHeader } from '@/components/app-header';
 import { SetupReviewDialog } from '@/components/setup-review-dialog';
 import { LabelRail, LABEL_RAIL_STORAGE_KEY } from '@/components/label-rail';
+import { useShellToggleSidebar } from '@/components/shell-search';
 import { Button } from '@/components/ui/button';
-import {
-  Settings,
-  Video,
-  FileText,
-  FileAudio,
-  ChevronDown,
-  CircleAlert,
-  Loader2,
-  Tag,
-} from 'lucide-react';
+import { ImportSplitButton } from '@/components/import-split-button';
+import { CircleAlert } from 'lucide-react';
+import { LISTING_MAX_CONTENT_PX } from '@/lib/listing-layout';
 import { labelFilterToParams, parseLabelFilter, type LabelFilter } from '@/lib/labels';
-import { OfflineArchive } from '@/components/offline-archive';
-import { OFFLINE_TITLE, useOffline, useOfflineGate } from '@/lib/offline/offline-context';
 
 const REMINDERS_COLLAPSED_KEY = 'mw-reminders-collapsed';
 
@@ -56,16 +46,6 @@ export default function Home() {
     const to = legacyTabRedirect(window.location.search);
     if (to) router.replace(to);
   }, [router]);
-  // Offline mode swaps the network-backed listing for the on-device archive
-  // and hides every control that needs the server (upload, import, reminders).
-  // `ready` = the provider restored the mode from this device; until then
-  // the listing must not mount (it would fire its requests for one commit
-  // and then be replaced by the archive in offline mode).
-  const { mode, ready: offlineReady } = useOffline();
-  const offline = mode === 'offline';
-  // `blocked` = offline mode OR the probe says the network is down: every
-  // control that needs the server stays VISIBLE but disabled with a tooltip.
-  const { blocked } = useOfflineGate();
   const [refreshTrigger, setRefreshTrigger] = useState(0);
   const [gmeetOpen, setGmeetOpen] = useState(false);
   const [gmeetSyncMode, setGmeetSyncMode] = useState(false);
@@ -74,8 +54,6 @@ export default function Home() {
     eventStart: string | null;
   } | null>(null);
   const [textImportOpen, setTextImportOpen] = useState(false);
-  const [importMenuOpen, setImportMenuOpen] = useState(false);
-  const importMenuRef = useRef<HTMLDivElement>(null);
 
   // Meeting reminders (the poller's findings). The page owns the data: it
   // feeds the top banner (dismissable for good, localStorage), the header
@@ -88,12 +66,11 @@ export default function Home() {
     setRemindersCollapsed(localStorage.getItem(REMINDERS_COLLAPSED_KEY) === '1');
   }, []);
   useEffect(() => {
-    if (offline || !offlineReady) return;
     fetch('/api/gmeet/reminders')
       .then((r) => (r.ok ? r.json() : null))
       .then((data) => setReminders(data?.reminders ?? []))
       .catch(() => {});
-  }, [refreshTrigger, offline, offlineReady]);
+  }, [refreshTrigger]);
   const reminderCount = reminders.length;
   const actOnReminder = (r: Reminder, action: 'dismiss' | 'mute') => {
     setReminders((prev) => prev.filter((x) => x.id !== r.id));
@@ -108,8 +85,8 @@ export default function Home() {
         eventStart: r.eventStart,
       }),
     }).catch(() => {
-      // Dropped (network down before the probe noticed) — put it back so the
-      // dismissal is not silently lost.
+      // Dropped (network down) — put it back so the dismissal is not
+      // silently lost.
       setReminders((prev) => (prev.some((x) => x.id === r.id) ? prev : [r, ...prev]));
     });
   };
@@ -151,22 +128,20 @@ export default function Home() {
   // Post-connect landing: the Google callback returns to /?meet=1|sync
   // (&google=connected) so the import dialog the user came from reopens —
   // now with silent server-minted tokens.
-  // Runs once the offline mode is restored: while blocked the dialog is not
-  // opened (it cannot load anything), but the params are still stripped.
   const urlParamsHandledRef = useRef(false);
   useEffect(() => {
-    if (!offlineReady || urlParamsHandledRef.current) return;
+    if (urlParamsHandledRef.current) return;
     urlParamsHandledRef.current = true;
     const params = new URLSearchParams(window.location.search);
     const meet = params.get('meet');
-    if (meet && !blocked) {
+    if (meet) {
       setGmeetSyncMode(meet === 'sync');
       setGmeetOpen(true);
     }
     // /m/<uuid> of a not-yet-imported occurrence lands here as
     // /?import=<code>&start=<iso> — open the import dialog focused on it.
     const importCode = params.get('import');
-    if (importCode && !blocked) {
+    if (importCode) {
       setGmeetFocus({ meetingCode: importCode, eventStart: params.get('start') });
       setGmeetOpen(true);
     }
@@ -179,7 +154,7 @@ export default function Home() {
       const qs = params.toString();
       window.history.replaceState(null, '', `${window.location.pathname}${qs ? `?${qs}` : ''}`);
     }
-  }, [offlineReady, blocked]);
+  }, []);
 
   const handleTranscriptCreated = () => {
     setRefreshTrigger((prev) => prev + 1);
@@ -190,7 +165,7 @@ export default function Home() {
   // (localStorage `mw-label-rail`); the rail and the table both receive it.
   //
   // The rail starts COLLAPSED for everyone — only an explicit stored 'open'
-  // reopens it (phones/PWA used to boot with a 240px column eating the
+  // reopens it (phones used to boot with a 240px column eating the
   // listing). Below Tailwind's `md` (768px) the rail is an overlay drawer
   // instead of a side column, and its open state is never persisted there:
   // a phone always starts closed, the toolbar "Labels" button opens it.
@@ -247,82 +222,23 @@ export default function Home() {
       // storage blocked — state just won't persist
     }
   };
-
-  // Close the hand-rolled Import popover on outside click / Escape.
-  useEffect(() => {
-    if (!importMenuOpen) return;
-    const onPointerDown = (e: MouseEvent) => {
-      if (importMenuRef.current && !importMenuRef.current.contains(e.target as Node)) {
-        setImportMenuOpen(false);
-      }
-    };
-    const onKeyDown = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') setImportMenuOpen(false);
-    };
-    document.addEventListener('mousedown', onPointerDown);
-    document.addEventListener('keydown', onKeyDown);
-    return () => {
-      document.removeEventListener('mousedown', onPointerDown);
-      document.removeEventListener('keydown', onKeyDown);
-    };
-  }, [importMenuOpen]);
+  // Darth desktop shell: the band's sidebar button toggles the labels rail
+  // (a no-op subscription outside the shell).
+  useShellToggleSidebar(() => toggleRail(!railCollapsed));
 
   return (
     <div className="min-h-screen">
+      {/* Header (README "Darth desktop shell" → Layout rules): ONE import
+          split button, the reminders badge; AppHeader adds the
+          Recorder chip and the account menu at the far right. */}
       <AppHeader>
-        <div className="relative" ref={importMenuRef}>
-          <Button
-            variant="outline"
-            size="sm"
-            onClick={() => setImportMenuOpen((o) => !o)}
-            aria-expanded={importMenuOpen}
-            aria-haspopup="menu"
-            disabled={blocked}
-            title={blocked ? OFFLINE_TITLE : undefined}
-          >
-            Import
-            <ChevronDown className="h-4 w-4" />
-          </Button>
-          {importMenuOpen && !blocked && (
-            <div
-              role="menu"
-              className="absolute right-0 top-full z-50 mt-1.5 w-64 rounded-lg border bg-popover p-1 text-popover-foreground shadow-[0_4px_16px_-2px_rgb(0_0_0/0.08),0_1px_2px_0_rgb(0_0_0/0.04)]"
-            >
-              <button
-                type="button"
-                role="menuitem"
-                className="flex w-full items-start gap-2.5 rounded-md px-3 py-2 text-left hover:bg-muted"
-                onClick={() => {
-                  setImportMenuOpen(false);
-                  setTextImportOpen(true);
-                }}
-              >
-                <FileText className="mt-0.5 h-4 w-4 shrink-0 text-muted-foreground" />
-                <span className="min-w-0">
-                  <span className="block text-sm font-medium">Transcript file</span>
-                  <span className="block text-[11px] text-muted-foreground">
-                    Teams, Zoom, VTT…
-                  </span>
-                </span>
-              </button>
-            </div>
-          )}
-        </div>
-        <Button
-          variant="outline"
-          size="sm"
-          onClick={() => requestMediaUpload()}
-          disabled={blocked}
-          title={blocked ? OFFLINE_TITLE : undefined}
-        >
-          <FileAudio className="h-4 w-4" />
-          Upload media
-        </Button>
-        <Button size="sm" onClick={() => setGmeetOpen(true)} disabled={blocked} title={blocked ? OFFLINE_TITLE : undefined}>
-          <Video className="h-4 w-4" />
-          Import meeting
-        </Button>
-        <div className="h-5 w-px bg-border" />
+        <ImportSplitButton
+          onAction={(a) => {
+            if (a === 'import-meeting') setGmeetOpen(true);
+            else if (a === 'import-file') setTextImportOpen(true);
+            else requestMediaUpload();
+          }}
+        />
         {reminderCount > 0 && (
           <div className="relative" ref={reminderMenuRef}>
             <Button
@@ -345,7 +261,6 @@ export default function Home() {
                 <GmeetRemindersCard
                   reminders={reminders}
                   variant="popover"
-                  disabled={blocked}
                   onOpenSync={() => {
                     setReminderMenuOpen(false);
                     setGmeetSyncMode(true);
@@ -359,33 +274,17 @@ export default function Home() {
             )}
           </div>
         )}
-        <Link href="/settings">
-          <Button variant="ghost" size="sm" className="h-8 w-8 p-0" title="Settings">
-            <Settings className="h-4 w-4" />
-            <span className="sr-only">Settings</span>
-          </Button>
-        </Link>
-        <LogoutButton />
       </AppHeader>
 
-      <main className="mx-auto max-w-[1720px] px-6 py-4">
+      {/* One layout at every width: designed for the shell's 900–1300 px
+          window, never wider than LISTING_MAX_CONTENT_PX. */}
+      <main className="mx-auto px-6 py-4" style={{ maxWidth: LISTING_MAX_CONTENT_PX }}>
         {/* Renders the page-wide drag-drop overlay, the hidden file input the
-            header button clicks, and in-flight upload progress rows. Mounted in
-            BOTH modes so a dropped file never navigates the tab; it gates
-            itself while blocked. */}
+            header button clicks, and in-flight upload progress rows. */}
         <AudioUpload onTranscriptCreated={handleTranscriptCreated} />
-        {!offlineReady ? (
-          <div className="flex items-center justify-center py-16">
-            <Loader2 className="h-5 w-5 animate-spin text-muted-foreground" />
-          </div>
-        ) : offline ? (
-          <OfflineArchive />
-        ) : (
-        <>
         {!remindersCollapsed && (
           <GmeetRemindersCard
             reminders={reminders}
-            disabled={blocked}
             onOpenSync={() => {
               setGmeetSyncMode(true);
               setGmeetOpen(true);
@@ -418,22 +317,8 @@ export default function Home() {
               labelFilter={labelFilter}
               labelFilterReady={labelReady}
               onLabelFilter={setLabelFilter}
-              toolbarExtra={
-                railCollapsed ? (
-                  <Button
-                    variant="outline"
-                    size="sm"
-                    className="h-8"
-                    title="Show the labels rail"
-                    data-label-rail-show
-                    onClick={() => toggleRail(false)}
-                  >
-                    <Tag className="h-3.5 w-3.5" />
-                    Labels
-                    {labelFilter && <span className="h-1.5 w-1.5 rounded-full bg-primary" />}
-                  </Button>
-                ) : undefined
-              }
+              labelRailOpen={!railCollapsed}
+              onToggleLabelRail={() => toggleRail(!railCollapsed)}
               onImportMeeting={(m) => {
                 // Same focus mechanism as reminder rows: open the import dialog
                 // scrolled to that meeting's day, highlighting the meeting.
@@ -443,8 +328,6 @@ export default function Home() {
             />
           </div>
         </div>
-        </>
-        )}
       </main>
 
       <GmeetImportDialog
