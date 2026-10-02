@@ -115,8 +115,9 @@ RECORDINGS (yours only, never shared — see 'darth-cli meetings recordings')
                                   meeting (unlinked uploads, temporary ones,
                                   Darth Recorder files still on a Mac). A
                                   recording is never shared: link it to an
-                                  event or make a meeting of it, then share
-                                  the MEETING
+                                  event (the MEETING it makes is shared with
+                                  the invite's Trames colleagues) or make a
+                                  meeting of it, then share the MEETING
 
 LABELS (org-wide, hierarchical 'Customers/LP Global/QBR', many per transcript;
 <label> = a path, case-insensitive, or '#<id>' from 'labels')
@@ -148,8 +149,9 @@ WRITE (needs read+write for meetings)
                                   like .vtt/.txt/.docx go through the text
                                   importer) and transcribe it. --event links
                                   it to a calendar event up front (title,
-                                  date, attendees; linking shares nobody —
-                                  invitees become share suggestions);
+                                  date, attendees; the meeting is shared
+                                  with the invite's Trames colleagues, as
+                                  a Meet/Teams import is);
                                   without it the row is unlinked and you can
                                   'link' it later — same single transcription
                                   run either way. (Once the server runs
@@ -180,8 +182,9 @@ WRITE (needs read+write for meetings)
   link <id> <meeting-code|event-key>
                                   Attach an existing transcript (typically an
                                   unlinked upload) to a calendar event: sets
-                                  date + empty title + attendees, lights up
-                                  share suggestions, and re-runs the speaker
+                                  date + empty title + attendees, shares it
+                                  with the invite's Trames colleagues (as a
+                                  Meet/Teams import does), and re-runs the speaker
                                   guess with the attendee list unless a human
                                   already confirmed names. Metadata only —
                                   nothing is re-transcribed
@@ -377,11 +380,12 @@ and the rows are tagged cal:alice; the footer says which calendars answered.
 People will drop an audio/video file on you without saying which meeting
 it was. The system is built so this costs ONE transcription run: upload
 first, decide what it belongs to afterwards. Linking later is a metadata
-write (date, title, attendees, share suggestions) — nothing is re-run.
+write (date, title, attendees, and a share with the invite's Trames
+colleagues) — nothing is re-run.
 
     # 1. If you ALREADY know the event, link up front (best case: title,
-    #    date, attendees + share suggestions all land at once; linking
-    #    never shares — the owner shares from the web UI when they choose):
+    #    date, attendees land at once, and the meeting is shared with the
+    #    invite's Trames colleagues — as a Meet/Teams import would be):
     darth-cli meetings calendar --view all --from 2026-09-15 --to 2026-09-15 --json
     darth-cli meetings upload ./call.m4a --event abc-defg-hij --wait
     darth-cli meetings upload ./call.m4a --event 'evt123|2026-09-15T06:00:00.000Z' --wait
@@ -1701,9 +1705,10 @@ const RECORDINGS_HELP = `darth-cli meetings recordings — your private recordin
 
 A recording is an upload (or a Darth Recorder file) that belongs to no
 meeting. It is PRIVATE to you and is never shared: link it to a calendar
-event or make a meeting of it, then share the MEETING (web UI). Once the
-server runs born-bare uploads, 'meetings upload' without --event lands
-here instead of in 'meetings list'.
+event (the MEETING it makes is shared with the invite's Trames colleagues,
+as a Meet/Teams import is) or make a meeting of it and share that MEETING
+(web UI). Once the server runs born-bare uploads, 'meetings upload' without
+--event lands here instead of in 'meetings list'.
 
   recordings list [--section mac|uploaded|temporary|linked | --unlinked | --temporary]
                   [--q <text>] [--regex] [--limit N] [--cursor C] [--all]
@@ -1736,7 +1741,9 @@ WRITE (needs read+write for meetings)
                                   calendar occurrence; anything else = the id
                                   of a meeting you own or edit → adds the
                                   recording to it (--offset-ms places it).
-                                  Linking shares NOBODY
+                                  A calendar link shares the MEETING with
+                                  the invite's Trames colleagues; the
+                                  recording itself stays private
   recordings make-meeting <rid> --title "…"
                                   A meeting of its own (no calendar event)
   recordings keep <rid>           Remove the expiry of a temporary recording
@@ -2001,7 +2008,7 @@ async function recordingsCmd(ctx: Ctx, flags: Record<string, string | boolean>, 
       }
       const mid = r.data?.meeting?.id ?? r.data?.meetingId ?? (isEventRef(ref) ? "?" : ref);
       ctx.print(r.data, () => {
-        console.log(`linked → meeting ${mid}${r.data?.meeting?.title ? ` "${r.data.meeting.title}"` : ""} — ${r.data?.shares ?? 0} shares (share it from the meeting when you want to)`);
+        console.log(`linked → meeting ${mid}${r.data?.meeting?.title ? ` "${r.data.meeting.title}"` : ""} — ${isEventRef(ref) ? `shared with ${r.data?.shares ?? 0} Trames invitee(s) of the event` : "added (the meeting's own shares apply)"}`);
         if (mid !== "?") console.log(`Web: ${webBase(ctx)}/transcript/${mid}`);
       });
       return 0;
@@ -2016,7 +2023,7 @@ async function recordingsCmd(ctx: Ctx, flags: Record<string, string | boolean>, 
       if (!r.ok) return recordingWriteError("make-meeting", r.status, r.data);
       const m = r.data?.meeting ?? {};
       ctx.print(r.data, () => {
-        console.log(`meeting ${m.id ?? "?"} "${m.title ?? title}" made from recording ${rid} — ${r.data?.shares ?? 0} shares (share it from the meeting when you want to)`);
+        console.log(`meeting ${m.id ?? "?"} "${m.title ?? title}" made from recording ${rid} — not shared (share it from the meeting when you want to)`);
         if (m.id) console.log(`Web: ${webBase(ctx)}/transcript/${m.id}`);
       });
       return 0;
@@ -2930,7 +2937,7 @@ const meetings: Subcommand = {
         ctx.print(data, () => {
           const when = e.startTime ? fmtLocalDateTime(e.startTime, localTz(ctx)) : "?";
           console.log(`Linked ${data.transcript?.assemblyai_id ?? id} → "${e.title ?? "(untitled)"}"  ${when}  (${e.provider ?? "no meeting link"}, ${e.attendees ?? 0} attendees${e.enriched ? ", Meet participants captured" : ""})`);
-          console.log(`Date set to the event start; title ${data.transcript?.title ? `"${data.transcript.title}"` : "(empty)"}; invitees now appear as share suggestions in the web UI.`);
+          console.log(`Date set to the event start; title ${data.transcript?.title ? `"${data.transcript.title}"` : "(empty)"}; shared with ${data.shared ?? 0} Trames invitee(s).`);
           if (data.reguessing) console.log(`Re-guessing speaker names with the attendee list — 'darth-cli meetings speakers ${id}' in a minute or two.`);
         });
         return 0;

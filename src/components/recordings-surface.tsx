@@ -62,7 +62,9 @@ import {
  * files still on a Mac. A section filter with the server's counts, a
  * search box, and more pages as the list scrolls (the listing's sentinel
  * pattern). Link to meeting… / Make a meeting / Keep move a recording out
- * of the unlinked sections — only a meeting is ever shared.
+ * of the unlinked sections — only a meeting is ever shared (a link to a
+ * calendar event shares it with the invite's internal people); the
+ * recording itself never is.
  *
  * Linked recordings stay findable (2026-10-02): a "Linked to a meeting"
  * section (`section=linked`), and under All a short group of the newest
@@ -1016,7 +1018,8 @@ function BareCard({
  * One STANDALONE recording (design P7) — an upload born as a recording.
  * Actions (§3.1): Link to meeting… · Make a meeting · Keep (temporary only) ·
  * Open (its own page, recording mode) · Delete. Only the owner ever sees
- * this card; nothing on it shares anything.
+ * this card. The recording is never shared; Link to meeting… makes a meeting
+ * that is shared with the event's internal invitees (meeting policy).
  */
 function RecordingCard({
   r,
@@ -1197,7 +1200,7 @@ function RecordingCard({
           className={iconBtn}
           disabled={disabled || !linkable}
           onClick={onLink}
-          title={linkable ? 'Link it to a calendar event — that makes it a meeting; nothing is shared' : 'Its transcription failed — retry it first'}
+          title={linkable ? 'Link it to a calendar event — that makes it a meeting, shared with the Trames colleagues on the invite' : 'Its transcription failed — retry it first'}
           data-link-meeting
         >
           <Link2 className="h-3.5 w-3.5" />
