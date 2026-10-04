@@ -37,7 +37,8 @@ export const GET = withAuth(async ({ user, request }, { params }) => {
   const own = await getRecordingForOwner(user.userId, id).catch(() => null);
   if (!own) return notFound();
 
-  const media = (await standaloneMedia(id)).filter((m) => m.kind === 'canonical' || m.kind === 'part');
+  const all = await standaloneMedia(id);
+  const media = all.filter((m) => m.kind === 'canonical' || m.kind === 'part');
   const partNo = Number.parseInt(request.nextUrl.searchParams.get('part') ?? '1', 10);
   const target = Number.isInteger(partNo) && partNo >= 1 ? media[partNo - 1] : undefined;
   if (!target?.filename) {
@@ -45,7 +46,8 @@ export const GET = withAuth(async ({ user, request }, { params }) => {
   }
 
   const range = request.headers.get('range');
-  if (request.nextUrl.searchParams.get('variant') === 'audio') {
+  const wantAudio = request.nextUrl.searchParams.get('variant') === 'audio';
+  if (wantAudio) {
     const extract = await ensureAudioOnly(target.filename);
     if (extract.status === 'preparing') {
       return NextResponse.json({ preparing: true }, { status: 202, headers: { 'Cache-Control': 'private, no-store' } });
@@ -66,6 +68,22 @@ export const GET = withAuth(async ({ user, request }, { params }) => {
   if (local) return local;
 
   const store = serveStore();
+  // `?variant=audio` with neither local file here (Stage D evicted them): the
+  // archived audio-only extract when there is one — the soundtrack the player
+  // asked for, a fraction of the video's bytes — else the canonical below.
+  if (store && wantAudio) {
+    const extract = all.find(
+      (m) => m.kind === 'audio_only' && m.of_media_id === target.id && m.blob_name && m.filename
+    );
+    if (extract) {
+      const proxied = await proxyBlobRange(
+        store,
+        { blobName: extract.blob_name!, filename: extract.filename!, bytes: null },
+        range
+      );
+      if (proxied) return proxied;
+    }
+  }
   if (store && target.blob_name) {
     const proxied = await proxyBlobRange(
       store,

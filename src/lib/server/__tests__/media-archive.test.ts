@@ -138,6 +138,18 @@ mock.module('@/db-ops/recordings', () => ({
     const c = db.canaries.find((x) => x.name === name);
     if (c) c.missing_at ??= new Date().toISOString();
   },
+  // Stage D (docs/recordings-stage-d-spec.md): imported by media-archive.ts for
+  // the read-back verification; this file never calls them, they only have to
+  // exist for the module to link when the file runs alone.
+  async mediaEvictionColumnsExist() {
+    return false;
+  },
+  async stampMediaVerified() {
+    return true;
+  },
+  async stampMediaVerifyFailed() {
+    return true;
+  },
 }));
 
 // The only raw query the module makes is the busy probe.

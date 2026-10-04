@@ -129,6 +129,36 @@ export interface GraphFileFacts {
   audio: Map<string, number | null>;
   /** `audio-only/<stem>.m4a` stems present → bytes. */
   audioOnly: Map<string, number | null>;
+  /**
+   * Stage D (docs/recordings-stage-d-spec.md): stems whose `audio_only` row is
+   * ARCHIVED (`blob_name` set) while `audio-only/<stem>.m4a` is not on disk →
+   * the row's bytes. The blob IS the derivative once the local copy has been
+   * evicted, so an absent file must not make the row "stale" — deleting it
+   * would queue its blob for deletion. Keyed on the stem of a file the row
+   * still names, so a derivative of a file the meeting no longer has (a
+   * renamed source) is still dropped. Absent = no such rows (or not asked).
+   */
+  archivedAudioOnly?: Map<string, number | null>;
+}
+
+/**
+ * `GraphFileFacts.archivedAudioOnly` from the recording's existing media rows:
+ * every `audio_only` row with a `blob_name` whose `<stem>.m4a` the disk probe
+ * did NOT find. Pure — the caller reads the rows.
+ */
+export function archivedAudioOnlyFacts(
+  probedAudioOnly: Map<string, number | null>,
+  existing: ReadonlyArray<{ kind: string; filename: string | null; blob_name: string | null; bytes: number | null }>
+): Map<string, number | null> {
+  const out = new Map<string, number | null>();
+  for (const m of existing) {
+    if (m.kind !== 'audio_only' || !m.blob_name || !m.filename) continue;
+    if (!/\.m4a$/i.test(m.filename)) continue;
+    const stem = stemOf(m.filename);
+    if (probedAudioOnly.has(stem)) continue;
+    out.set(stem, m.bytes ?? null);
+  }
+  return out;
 }
 
 // ---------------------------------------------------------------------------
@@ -455,7 +485,9 @@ export function deriveRecordingGraph(
   const audioOnlyFor = (of: DesiredMedia, ord: number): DesiredMedia | null => {
     if (!files || !of.filename) return null;
     const stem = stemOf(of.filename);
-    if (!files.audioOnly.has(stem)) return null;
+    const onDisk = files.audioOnly.has(stem);
+    // Not on disk but archived (Stage D evicted it): keep describing it.
+    if (!onDisk && !files.archivedAudioOnly?.has(stem)) return null;
     return {
       id: mediaIdFor(recordingId, 'audio_only', ord),
       kind: 'audio_only',
@@ -463,7 +495,7 @@ export function deriveRecordingGraph(
       offsetMs: of.offsetMs,
       durationMs: of.durationMs,
       filename: `${stem}.m4a`,
-      bytes: files.audioOnly.get(stem) ?? null,
+      bytes: (onDisk ? files.audioOnly.get(stem) : files.archivedAudioOnly?.get(stem)) ?? null,
       hasVideo: false,
       sourceRef: null,
       ofMediaId: of.id,

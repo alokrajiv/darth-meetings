@@ -1,9 +1,8 @@
 import { NextResponse } from 'next/server';
-import { promises as fsp } from 'node:fs';
 import { withAuth } from '@/lib/auth/with-auth';
 import { getOfflinePrefs, type OfflinePrefs } from '@/db-ops/user-prefs';
 import { listOfflinePlanRows, type OfflinePlanRow } from '@/db-ops/offline-plan';
-import { resolveAudioPath } from '@/lib/server/audio-storage';
+import { storedFileSources, type StoredFileSource } from '@/lib/server/stored-media';
 import { hasVideoStream } from '@/lib/server/video-frames';
 import { resolveMediaForMeetings, type ResolvedMedia } from '@/lib/server/recordings';
 import { cutPlanOf, estimateCutBytes } from '@/lib/clip-cut';
@@ -66,7 +65,9 @@ export interface PlanMeeting {
   provider: 'gmeet' | 'teams' | null;
   rev: string;
   media: {
-    /** A primary recording is stored on the server (and present on disk). */
+    /** A primary recording is stored on the server — on its disk, or in the
+     * media archive (Stage D evicts verified local copies; `/audio` serves
+     * those from the blob). */
     hasLocal: boolean;
     /** The primary recording carries a video stream. */
     isVideo: boolean;
@@ -118,8 +119,14 @@ export const GET = withAuth(async ({ user, request }) => {
       },
     }))
   );
+  // Where every file's bytes are, for the whole page in one go: a stat each,
+  // plus ONE archive lookup for the files not on this disk — an evicted
+  // meeting still has media (its size is the archived row's `bytes`).
+  const sources = await storedFileSources([
+    ...new Set([...media.values()].flatMap((ms) => ms.map((m) => m.filename))),
+  ]);
   const meetings = await mapLimit(rows, PROBE_CONCURRENCY, (row) =>
-    toPlanMeeting(row, media.get(row.id) ?? [])
+    toPlanMeeting(row, media.get(row.id) ?? [], sources)
   );
 
   const body: OfflinePlanResponse = {
@@ -132,8 +139,14 @@ export const GET = withAuth(async ({ user, request }) => {
 
 async function toPlanMeeting(
   row: OfflinePlanRow,
-  media: ResolvedMedia[]
+  media: ResolvedMedia[],
+  sources: Map<string, StoredFileSource>
 ): Promise<PlanMeeting> {
+  /** Bytes we hold for a file — the local copy's size, else the archived row's. */
+  const storedBytes = (filename: string): number | null => {
+    const src = sources.get(filename);
+    return src?.held ? src.bytes : null;
+  };
   const parts: PlanMeetingPart[] = [];
   let hasLocal = false;
   let isVideo = false;
@@ -142,11 +155,17 @@ async function toPlanMeeting(
   // on their own (they are only playable next to the primary).
   const canonical = media.find((m) => m.part === 1);
   if (canonical) {
-    const stored = await storedBytes(canonical.filename);
+    const stored = storedBytes(canonical.filename);
     hasLocal = stored !== null;
-    // ffprobe-backed (cached per filename): the stored extension is only a
-    // hint for the primary — Drive names arrive without one.
-    isVideo = hasLocal ? await hasVideoStream(canonical.filename) : false;
+    // ffprobe-backed (cached per filename) when the file is on this disk: the
+    // stored extension is only a hint for the primary — Drive names arrive
+    // without one. An archived file that is not here: its media row's
+    // `has_video` (nothing to probe, and the plan never pulls a blob).
+    isVideo = !hasLocal
+      ? false
+      : sources.get(canonical.filename)?.localBytes != null
+        ? await hasVideoStream(canonical.filename)
+        : canonical.isVideo === true;
     parts.push({
       part: 1,
       filename: canonical.filename,
@@ -162,7 +181,7 @@ async function toPlanMeeting(
         part: m.part,
         filename: m.filename,
         isVideo: m.isVideo === true,
-        ...(await servedBytes(row.assemblyai_id, m, await storedBytes(m.filename), m.isVideo === true)),
+        ...(await servedBytes(row.assemblyai_id, m, storedBytes(m.filename), m.isVideo === true)),
       });
     }
   }
@@ -207,18 +226,11 @@ async function servedBytes(
   if (stored === null) return { bytes: null };
   // The FILE's length: the graph's media row has it; the row fallback's
   // `durationMs` is the meeting's (a split-off meeting's window), so probe.
+  // An archived file that is not on disk always has a media row (only the
+  // graph knows a blob), so it never reaches the probe.
   const fileMs = m.mediaId && m.durationMs ? m.durationMs : await storedFileDurationMs(m.filename);
   const estimate = estimateCutBytes({ sourceBytes: stored, sourceDurationMs: fileMs, segments });
   return { bytes: estimate ?? stored, estimated: true };
-}
-
-async function storedBytes(filename: string): Promise<number | null> {
-  try {
-    const st = await fsp.stat(resolveAudioPath(filename));
-    return st.size;
-  } catch {
-    return null;
-  }
 }
 
 /** Order-preserving map with bounded concurrency (no deps). */

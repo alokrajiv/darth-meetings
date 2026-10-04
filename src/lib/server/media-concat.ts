@@ -54,6 +54,17 @@ async function landOutput(
  * an honest error than a silent hours-long re-encode on the VM.
  */
 export async function concatMediaToTemp(filenames: string[], opts: ConcatOpts = {}): Promise<string> {
+  return concatMediaPathsToTemp(filenames.map(resolveAudioPath), opts);
+}
+
+/**
+ * `concatMediaToTemp` over ABSOLUTE input paths — for inputs that are not
+ * (or no longer) under the audio dir: a stored file Stage D evicted is read
+ * from media-local's cache (docs/recordings-stage-d-spec.md "As built —
+ * readers"). The output still lands in the audio dir as a temp the ingest
+ * consumes; the inputs are only read.
+ */
+export async function concatMediaPathsToTemp(paths: string[], opts: ConcatOpts = {}): Promise<string> {
   const workspace = await openWorkspace(opts.scratchId);
   const listPath = path.join(workspace.dir, `concat-${randomUUID()}.txt`);
   // Container by CONTENT, not habit: stitched phone recordings (m4a) are
@@ -65,13 +76,13 @@ export async function concatMediaToTemp(filenames: string[], opts: ConcatOpts = 
   // audio-only and whose later parts carry a window (Darth Recorder 0.3.15
   // lets a video source be added mid-call) would otherwise be named `.m4a`
   // and be treated as audio for the rest of its life (2026-09-22).
-  const anyHasVideo = (await Promise.all(filenames.map(hasVideo))).some(Boolean);
+  const anyHasVideo = (
+    await Promise.all(paths.map(async (abs) => (await probeMediaAt(path.basename(abs), abs)).hasVideo))
+  ).some(Boolean);
   const outName = `concat-${randomUUID()}.${anyHasVideo ? 'mp4' : 'm4a'}`;
   const outAbs = path.join(workspace.dir, outName);
   // ffmpeg concat-demuxer list syntax: file 'path' — single quotes escaped.
-  const list = filenames
-    .map((f) => `file '${resolveAudioPath(f).replace(/'/g, "'\\''")}'`)
-    .join('\n');
+  const list = paths.map((abs) => `file '${abs.replace(/'/g, "'\\''")}'`).join('\n');
   await fsp.writeFile(listPath, list);
   try {
     await execFileP(
@@ -160,6 +171,11 @@ interface AudioTrackMeta {
 }
 
 async function probePart(filename: string): Promise<PartProbe> {
+  return probeMediaAt(filename, null);
+}
+
+/** `probePart` of a file at an absolute path (`concatMediaPathsToTemp`); null = the stored `filename`. */
+async function probeMediaAt(filename: string, abs: string | null): Promise<PartProbe> {
   const empty: PartProbe = {
     filename,
     hasVideo: false,
@@ -179,7 +195,7 @@ async function probePart(filename: string): Promise<PartProbe> {
         'stream=codec_type,width,height,r_frame_rate,avg_frame_rate' +
           ':stream_disposition=attached_pic,default:stream_tags=language:format=duration',
         '-of', 'json',
-        resolveAudioPath(filename),
+        abs ?? resolveAudioPath(filename),
       ],
       { timeout: 30_000 }
     );
@@ -259,10 +275,6 @@ function parseRate(raw: string | undefined): number | null {
 function streamFps(avg: string | undefined, r: string | undefined): number {
   const fps = parseRate(avg) ?? parseRate(r) ?? FALLBACK_FPS;
   return Math.min(MAX_FPS, Math.max(MIN_FPS, fps));
-}
-
-async function hasVideo(filename: string): Promise<boolean> {
-  return (await probePart(filename)).hasVideo;
 }
 
 /** What the mixed-part stitch normalises every leg to. */

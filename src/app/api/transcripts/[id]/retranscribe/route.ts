@@ -7,7 +7,9 @@ import { mergeGmeetContextForUser } from '@/db-ops/transcripts';
 import { addShare, listByTranscript } from '@/db-ops/transcript-shares';
 import { SHARE_ORIGIN_EVENT_LINK } from '@/db-ops/share-origin';
 import { DEFAULT_SPEECH_MODEL, LEGACY_SPEECH_MODEL, type SpeechModel } from '@/lib/aai-language';
-import { audioFileSize, resolveAudioPath } from '@/lib/server/audio-storage';
+import { resolveAudioPath } from '@/lib/server/audio-storage';
+import { ensureLocalMedia } from '@/lib/server/media-local';
+import { storedFileSource } from '@/lib/server/stored-media';
 import { finalizeUpload, openUpload, type LinkedEventInput } from '@/lib/server/upload-pipeline';
 import { startTranscriptionRun } from '@/lib/server/transcription-runs';
 import type { DarthUser } from '@/lib/auth/session';
@@ -106,7 +108,6 @@ export const POST = withAuth(async ({ user, request }, { params }) => {
  */
 async function legacyRetranscribe(user: DarthUser, access: ResolvedAccess): Promise<Response> {
   const row = access.row;
-  const ownerId = row.user_id;
   const ctx = row.gmeet_context;
 
   if (ctx?.retranscribed) {
@@ -127,10 +128,40 @@ async function legacyRetranscribe(user: DarthUser, access: ResolvedAccess): Prom
       { status: 422 }
     );
   }
-  const bytes = await audioFileSize(row.local_audio_path);
-  if (bytes === null) {
+  // Held = on this disk, or archived (Stage D evicts verified local copies).
+  const source = await storedFileSource(row.local_audio_path);
+  const bytes = source.bytes;
+  if (!source.held || bytes === null) {
     return NextResponse.json({ error: 'Stored audio file is missing on disk.' }, { status: 422 });
   }
+  // The stored file's own bytes, HELD until they are copied below so Stage D
+  // cannot evict them in between (a pulled copy when the local one is gone).
+  // Taken before the new row is opened, so a fetch that fails costs nothing.
+  const local = await ensureLocalMedia(source.media, 'canonical', { purpose: 'retranscribe (legacy)' });
+  if (!local) {
+    return NextResponse.json(
+      { error: 'The stored audio could not be fetched from the archive — try again in a few minutes.' },
+      { status: 503 }
+    );
+  }
+  try {
+    return await legacyRetranscribeHeld(user, access, bytes, local.path, local.source === 'disk');
+  } finally {
+    local.release();
+  }
+}
+
+async function legacyRetranscribeHeld(
+  user: DarthUser,
+  access: ResolvedAccess,
+  bytes: number,
+  src: string,
+  /** The stored file itself (may be hard-linked); else a media-cache copy (always copied). */
+  srcIsStored: boolean
+): Promise<Response> {
+  const row = access.row;
+  const ownerId = row.user_id;
+  const ctx = row.gmeet_context;
 
   // Carry the meeting identity so the new row lands in the same series /
   // calendar slot. A re-run (`sourceId`) is not a new link, so openUpload
@@ -186,13 +217,17 @@ async function legacyRetranscribe(user: DarthUser, access: ResolvedAccess): Prom
     console.warn(`[retranscribe] ${row.assemblyai_id}: carrying shares failed:`, err)
   );
 
-  // The bytes are already on disk: hard-link them under the temp name the
-  // pipeline expects (falls back to a copy on filesystems without links).
+  // The bytes are already local: hard-link them under the temp name the
+  // pipeline expects (falls back to a copy on filesystems without links — a
+  // pulled copy in the NVMe media cache is on another filesystem, EXDEV).
   // The pipeline renames the temp file to its permanent name on success and
   // deletes it on failure — the original stays put either way.
-  const src = resolveAudioPath(row.local_audio_path);
+  // A media-cache entry is never linked: the pipeline treats its input as a
+  // temp it may rewrite, and a second name on the cache's inode would let it
+  // change the cached bytes.
   const tmp = resolveAudioPath(spec.tempFilename);
   try {
+    if (!srcIsStored) throw new Error('copy, do not link, a cache entry');
     await fsp.link(src, tmp);
   } catch {
     await fsp.copyFile(src, tmp);

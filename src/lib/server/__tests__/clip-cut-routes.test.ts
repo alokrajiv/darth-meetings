@@ -85,6 +85,10 @@ describe('the meeting media routes reveal only the window', () => {
     const src = read('app/api/transcripts/[id]/audio/route.ts');
     const body = src.slice(src.indexOf('async function serveClipCut('));
     expect(body).toContain('media,');
-    expect(read('lib/server/clip-cut.ts')).toContain('await ensureLocalMedia(req.media');
+    // Stage D readers: the cut's source ALWAYS goes through media-local (the
+    // resolved media when the route has it), on disk or pulled, and is held.
+    const cut = read('lib/server/clip-cut.ts');
+    expect(cut).toContain('const source: LocalizableMedia = req.media ??');
+    expect(cut).toContain('await ensureLocalMedia(source,');
   });
 });

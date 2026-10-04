@@ -3,6 +3,7 @@ import { promises as fsp } from 'node:fs';
 import { resolveAudioPath } from '@/lib/server/audio-storage';
 import { getAudioOnlyPath } from '@/lib/server/audio-only';
 import {
+  archivedAudioOnlyFacts,
   borrowsRecording,
   canonicalKeyOf,
   deriveRecordingGraph,
@@ -17,6 +18,7 @@ import {
 } from '@/lib/recording-graph';
 import {
   activeTranscriptionIdOf,
+  clearLocalEvictedOnDisk,
   applyMeetingClips,
   applyRecordingGraph,
   dropDerivativeMediaByFilename,
@@ -25,6 +27,7 @@ import {
   removeMeetingFromRecordingGraph,
   stampTranscriptionProviderDeleted,
 } from '@/db-ops/recordings';
+import { archivedAudioOnlyRows } from '@/db-ops/media-readers';
 import {
   blobsHeldByMeeting,
   deleteBlobsForRemovedRecordings,
@@ -91,8 +94,19 @@ const g = globalThis as unknown as {
 };
 const inflight = (g.__mwRecordingSyncInflight ??= new Map<string, Promise<RecordingSyncResult>>());
 
-/** Bytes on disk for the row's own files, and which extracts exist. */
-async function probeFiles(row: GraphMeetingRow): Promise<GraphFileFacts> {
+/**
+ * Bytes on disk for the row's own files, and which extracts exist.
+ *
+ * Stage D (docs/recordings-stage-d-spec.md): an extract whose local copy was
+ * evicted is still a file of this recording — its blob is the copy. The
+ * recording's existing `audio_only` rows are read once, and an ARCHIVED one
+ * whose `<stem>.m4a` is not on disk is reported as `archivedAudioOnly`, so the
+ * derived graph keeps it and `applyRecordingGraph` neither deletes the row nor
+ * queues its blob for deletion. When that read fails the answer is `undefined`
+ * ("not probed"): derivatives are then not judged at all this time, which is
+ * the safe direction.
+ */
+async function probeFiles(row: GraphMeetingRow): Promise<GraphFileFacts | undefined> {
   const audio = new Map<string, number | null>();
   const audioOnly = new Map<string, number | null>();
   for (const name of recordingFilenames(row)) {
@@ -109,7 +123,20 @@ async function probeFiles(row: GraphMeetingRow): Promise<GraphFileFacts> {
       audioOnly.set(name.replace(/\.[^./]+$/, ''), extract.size);
     }
   }
-  return { audio, audioOnly };
+  let existing: Awaited<ReturnType<typeof archivedAudioOnlyRows>>;
+  try {
+    existing = await archivedAudioOnlyRows(recordingIdFor(canonicalKeyOf(row)));
+  } catch (err) {
+    console.warn(`[recording-sync] ${row.assemblyai_id}: media rows unreadable, derivatives not judged:`, err);
+    return undefined;
+  }
+  // Only stems of files this row still names: a derivative of a source the
+  // meeting no longer has stays stale and is dropped as before.
+  const stems = new Set(recordingFilenames(row).map((n) => n.replace(/\.[^./]+$/, '')));
+  const archivedAudioOnly = new Map(
+    [...archivedAudioOnlyFacts(audioOnly, existing)].filter(([stem]) => stems.has(stem))
+  );
+  return { audio, audioOnly, archivedAudioOnly };
 }
 
 /**
@@ -183,6 +210,16 @@ export async function syncRecordingGraphForMeeting(
   // over the whole recording (docs/recordings-phase3-clips-spec.md).
   const clips = [...desiredClipsFor(me), ...(owner.id === me.id ? [] : desiredClipsFor(owner))];
   const applied = await applyRecordingGraph({ graph, clips, createdBy: 'recording-sync' });
+
+  // Stage D: a stored file the probe found on disk cannot be "evicted" — a
+  // re-ingest put it back under its name. Clear the mark so the eviction pass
+  // can judge it again (it re-hashes before deleting). Best effort.
+  if (files) {
+    const onDisk = [...files.audio.keys(), ...[...files.audioOnly.keys()].map((stem) => `${stem}.m4a`)];
+    await clearLocalEvictedOnDisk(applied.recordingId, onDisk).catch((err) =>
+      console.warn(`[recording-sync] ${me.assemblyai_id}: clearing evicted marks failed:`, err)
+    );
+  }
 
   // DEC-3 Stage A: the files this sync has just described get their permanent
   // copy in Azure Blob. Fire-and-forget and inert unless both

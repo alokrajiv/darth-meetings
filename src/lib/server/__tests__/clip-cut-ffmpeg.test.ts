@@ -398,3 +398,123 @@ describe.skipIf(!HAVE_FFMPEG)('clip cut with real ffmpeg', () => {
     expect(existsSync(join(storage, 'audio', 'tone.m4a'))).toBe(true);
   });
 });
+
+// ---------------------------------------------------------------------------
+// Stage D readers (docs/recordings-stage-d-spec.md "As built — readers"): the
+// cut's source is read through media-local and HELD for every ffprobe/ffmpeg
+// run, on disk or pulled from the archive; the key does not move when the
+// source is evicted; a failed probe is never cached as "no video".
+// ---------------------------------------------------------------------------
+
+describe.skipIf(!HAVE_FFMPEG)('clip cut — Stage D readers', () => {
+  type Media = import('@/lib/server/recordings').ResolvedMedia;
+  const media = (filename: string, over: Partial<Media> = {}): Media =>
+    ({
+      part: 1,
+      mediaId: 'm-1',
+      recordingId: 'r-1',
+      filename,
+      isVideo: true,
+      offsetMs: 0,
+      durationMs: 10_000,
+      transcribed: true,
+      blobName: null,
+      audioOnly: null,
+      windowFromMs: null,
+      windowToMs: null,
+      keptMs: null,
+      ...over,
+    }) as Media;
+
+  async function watchHold(abs: string, job: Promise<unknown>): Promise<boolean> {
+    const { localMediaHeld } = await import('@/lib/server/media-local');
+    let seen = false;
+    let done = false;
+    void job.finally(() => (done = true));
+    while (!done) {
+      if (localMediaHeld(abs)) seen = true;
+      await new Promise((r) => setTimeout(r, 2));
+    }
+    return seen;
+  }
+
+  test('on disk: the stored file is held while ffmpeg cuts it, released after', async () => {
+    const { localMediaHeld } = await import('@/lib/server/media-local');
+    const abs = join(storage, 'audio', 'held.mp4');
+    execFileSync('cp', [join(storage, 'audio', 'card.mp4'), abs]);
+    const job = ensureClipCut({
+      meetingId: 'mtg-held',
+      sourceFilename: 'held.mp4',
+      segments: [{ fromMs: 3000, toMs: 6000 }],
+      variant: 'av',
+      part: 1,
+      media: media('held.mp4'),
+    });
+    expect(await watchHold(abs, job)).toBe(true);
+    expect((await job).status).toBe('ready');
+    expect(localMediaHeld(abs)).toBe(false);
+  });
+
+  test('evicted: the archived blob is pulled into the cache, held for the cut, never written to storage/audio', async () => {
+    const { localMediaHeld, cacheFileFor, resetMediaLocalForTests } = await import('@/lib/server/media-local');
+    const { setMediaStoreForTests } = await import('@/lib/server/media-store');
+    const { FakeMediaBlob } = await import('./helpers/fake-media-blob');
+    const { readFileSync } = await import('node:fs');
+    const store = new FakeMediaBlob();
+    const blob = 'r-1/m-evicted.mp4';
+    store.put(blob, new Uint8Array(readFileSync(join(storage, 'audio', 'card.mp4'))), 'video/mp4');
+    setMediaStoreForTests(store);
+    try {
+      const job = ensureClipCut({
+        meetingId: 'mtg-evicted',
+        sourceFilename: 'evicted.mp4', // not on disk
+        segments: [{ fromMs: 2000, toMs: 6000 }],
+        variant: 'av',
+        part: 1,
+        media: media('evicted.mp4', { blobName: blob }),
+      });
+      const cached = cacheFileFor(blob);
+      expect(await watchHold(cached, job)).toBe(true);
+      const r = await job;
+      expect(r.status).toBe('ready');
+      if (r.status === 'ready') expect(Math.abs(durationMs(r.path) - 4000)).toBeLessThan(200);
+      expect(localMediaHeld(cached)).toBe(false);
+      expect(existsSync(join(storage, 'audio', 'evicted.mp4'))).toBe(false);
+    } finally {
+      setMediaStoreForTests(null);
+      resetMediaLocalForTests();
+    }
+  });
+
+  test('a cut made before the source was evicted is still found after (same key, counted fresh)', async () => {
+    const { rmSync: rm } = await import('node:fs');
+    const abs = join(storage, 'audio', 'soon-gone.mp4');
+    execFileSync('cp', [join(storage, 'audio', 'card.mp4'), abs]);
+    const req = {
+      meetingId: 'mtg-soon-gone',
+      sourceFilename: 'soon-gone.mp4',
+      segments: [{ fromMs: 4000, toMs: 8000 }],
+      variant: 'av' as const,
+      part: 1,
+      media: media('soon-gone.mp4'),
+    };
+    const made = await ensureClipCut(req);
+    expect(made.status).toBe('ready');
+    rm(abs); // Stage D evicts the source
+    const found = await findClipCut(req);
+    expect(found?.path).toBe(made.status === 'ready' ? made.path : '');
+    // …and a request is served the cut, not "missing".
+    const again = await ensureClipCut(req);
+    expect(again).toEqual(made);
+  });
+
+  test('hasVideoStream never caches a failed probe as "no video"', async () => {
+    const { hasVideoStream } = await import('@/lib/server/video-frames');
+    const { writeFileSync, copyFileSync } = await import('node:fs');
+    const abs = join(storage, 'audio', 'flaky.mp4');
+    writeFileSync(abs, 'not a media file at all');
+    expect(await hasVideoStream('flaky.mp4')).toBe(false); // ffprobe failed
+    copyFileSync(join(storage, 'audio', 'card.mp4'), abs);
+    expect(await hasVideoStream('flaky.mp4')).toBe(true); // not stuck on the failure
+  });
+});

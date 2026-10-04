@@ -145,6 +145,12 @@ interface ActualMedia {
   sha256: string | null;
   /** Only for the INFO block: how long a blob-only row has been blob-only. */
   created_at: Date;
+  /**
+   * Stage D (migration 051): the local copy was removed ON PURPOSE after its
+   * blob was read back and matched. A missing file is then the expected state
+   * — INFO, never a finding. NULL on a schema without 051 (`evictCol`).
+   */
+  local_evicted_at: Date | null;
 }
 interface ActualTranscription {
   id: string;
@@ -283,6 +289,17 @@ async function main() {
             WHERE a.transcription_id = recording_transcriptions.id) AS annotations`
     : sql`NULL::jsonb AS requested, 0 AS annotations`;
 
+  // And migration 051 (Stage D): without it nothing has been evicted.
+  const has051 =
+    (
+      await sql`
+        SELECT 1 FROM information_schema.columns
+        WHERE table_schema = ${SCHEMA} AND table_name = 'recording_media'
+          AND column_name = 'local_evicted_at'
+      `
+    ).length > 0;
+  const evictCol = has051 ? sql`local_evicted_at` : sql`NULL::timestamptz AS local_evicted_at`;
+
   const rows = await sql<GraphMeetingRow[]>`
     SELECT t.id, t.user_id, t.assemblyai_id, ${jobIdCol}, t.original_filename, t.status,
            t.created_at, t.completed_at, t.duration, t.language_code,
@@ -315,7 +332,7 @@ async function main() {
     sql<ActualMedia[]>`
       SELECT id, recording_id, kind, ord, offset_ms::float8 AS offset_ms,
              duration_ms::float8 AS duration_ms, filename, has_video, source_ref, of_media_id,
-             blob_name, sha256, created_at
+             blob_name, sha256, created_at, ${evictCol}
       FROM ${sql(SCHEMA)}.recording_media
     `,
     sql<ActualTranscription[]>`
@@ -355,6 +372,13 @@ async function main() {
   let skippedRows = 0;
   /** Meetings split off another one — clips only, by design (Phase 3a). */
   let borrowed = 0;
+  /**
+   * Stage D: derivative rows (`audio_only`) whose local file was evicted. With
+   * `--check-files` the graph only derives an extract it can SEE on disk, so
+   * such a row would otherwise read as "not derivable from the row" — the
+   * expected state after an eviction, so it is counted as INFO instead.
+   */
+  let evictedNotDerived = 0;
   const liveMeetingIds = new Set(rows.map((r) => r.id));
   const expectedRecordingIds = new Set<string>();
 
@@ -449,6 +473,10 @@ async function main() {
     const wantMedia = new Map(graph.media.filter((m) => kinds.has(m.kind)).map((m) => [m.id, m]));
     for (const m of actualMedia) {
       if (!wantMedia.has(m.id)) {
+        if (m.local_evicted_at && m.kind !== 'canonical' && m.kind !== 'part') {
+          evictedNotDerived += 1;
+          continue;
+        }
         flagDrift(tag, `media ${m.kind}#${m.ord} ${m.id} is not derivable from the row`);
       }
     }
@@ -587,10 +615,13 @@ async function main() {
         m.filename
           ? path.join(storage, m.kind === 'audio_only' ? 'audio-only' : 'audio', m.filename)
           : null;
-      const lostLocal = archived.filter((m) => {
+      const missing = archived.filter((m) => {
         const p = localOf(m);
         return p ? !existsSync(p) : false;
       });
+      // Stage D removed these on purpose (ledger in media_local_evictions).
+      const evictedGone = missing.filter((m) => m.local_evicted_at);
+      const lostLocal = missing.filter((m) => !m.local_evicted_at);
       const waiting = unarchived.filter((m) => {
         const p = localOf(m);
         return p ? existsSync(p) : false;
@@ -598,16 +629,20 @@ async function main() {
       // Blob-before-local is Stage C's NORMAL state for the first minutes of
       // a recording's life (`MW_AAI_FROM_BLOB`: AssemblyAI reads the blob and
       // the VM fetches its copy afterwards), and Stage D's normal state for
-      // ever after. Neither is drift; the age is what tells them apart.
+      // ever after. Neither is drift; the age is what tells them apart. Rows
+      // Stage D evicted (`local_evicted_at`) are split out below.
       const fresh = lostLocal.filter(
         (m) => Date.now() - m.created_at.getTime() < 24 * 3600_000
       );
       infos.push(
-        `  archived, local file gone    : ${lostLocal.length}  (blob-only: ${fresh.length} newer than 24 h` +
-          ` — Stage C's fetch may still be in flight; the rest is expected once Stage D drains storage/)`
+        `  archived, local file gone    : ${lostLocal.length}  (not evicted by Stage D; blob-only: ${fresh.length} newer than 24 h` +
+          ` — Stage C's fetch may still be in flight; older ones were purged before Stage D kept a ledger)`
       );
       infos.push(
         `  local file present, no blob  : ${waiting.length}  (what the backfill still has to copy)`
+      );
+      infos.push(
+        `  evicted by Stage D           : ${evictedGone.length}  (local copy removed after a verified read-back — expected)`
       );
     }
     // Migration 047 may not be applied on this schema yet.
@@ -615,6 +650,14 @@ async function main() {
       SELECT count(*)::int AS n, min(queued_at) AS oldest
       FROM ${sql(SCHEMA)}.media_blob_deletes
     `.catch(() => null);
+    if (has051) {
+      infos.push(`media evicted (Stage D)        : ${media.filter((m) => m.local_evicted_at).length}`);
+      if (evictedNotDerived > 0) {
+        infos.push(
+          `  evicted extracts not derived : ${evictedNotDerived}  (--check-files cannot see an evicted extract; not drift)`
+        );
+      }
+    }
     if (pending) {
       infos.push(
         `blobs queued for delete        : ${pending[0]?.n ?? 0}` +

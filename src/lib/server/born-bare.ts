@@ -36,6 +36,7 @@ import {
   resolveAudioPath,
 } from '@/lib/server/audio-storage';
 import { dropAudioOnly } from '@/lib/server/audio-only';
+import { isArchivedMedia, localizableStoredFile, withHeldStoredFiles } from '@/lib/server/stored-media';
 import { concatMediaSmart, probeDurationSec, withSkippedNotes } from '@/lib/server/media-concat';
 import { normalizeMultiTrack } from '@/lib/server/multitrack';
 import { sniffMediaExtension } from '@/lib/server/video-frames';
@@ -592,7 +593,10 @@ const retrying = (gr.__mwBornBareRetrying ??= new Set<string>());
 async function resendToAai(rec: StandaloneRecordingRow): Promise<boolean> {
   const recordingId = rec.id;
   const canonical = (await standaloneMedia(recordingId)).find((m) => m.kind === 'canonical');
-  if (!canonical?.filename || !(await audioFileExists(canonical.filename))) {
+  // Stage D: an ARCHIVED canonical (blob_name + sha256) is still held even when
+  // its local copy was evicted — it is pulled into the media cache below.
+  const archived = !!canonical && isArchivedMedia(canonical);
+  if (!canonical?.filename || (!(await audioFileExists(canonical.filename)) && !archived)) {
     const now = new Date().toISOString();
     const prev = rec.upload_state?.ingestFailure;
     await mergeStandaloneState(rec.owner_user_id, recordingId, {
@@ -611,7 +615,17 @@ async function resendToAai(rec: StandaloneRecordingRow): Promise<boolean> {
   let jobId: string | null = null;
   let model: string | null = null;
   try {
-    const audioUrl = await uploadFile(resolveAudioPath(canonical.filename));
+    // The stored file's own bytes, HELD for the whole upload so Stage D cannot
+    // evict it mid-stream; a cache copy when the local one is gone.
+    const media = localizableStoredFile(
+      canonical.filename,
+      archived ? { ...canonical, blob_name: canonical.blob_name!, sha256: canonical.sha256!, recording_id: recordingId } : null
+    );
+    const uploaded = await withHeldStoredFiles([media], 'canonical', 'born-bare resend', ([local]) =>
+      uploadFile(local!.path)
+    );
+    if (!uploaded.ok) throw new Error('the archived recording could not be fetched from the media archive');
+    const audioUrl = uploaded.value;
     const submitted = await submitForIngest(rec.owner_user_id, audioUrl, {
       originalFilename: rec.upload_state?.originalFilename ?? null,
       languageCode: rec.upload_state?.languageCode ?? undefined,
@@ -801,9 +815,13 @@ export async function refreshBornBare(recordingId: string): Promise<boolean> {
     if (won) {
       console.log(`[born-bare] recording ${recordingId} transcribed (${aai.utterances?.length ?? 0} utterances)`);
       // DEC-4 needs our own copy of the bytes, as for a meeting (aai-retention
-      // `mediaIsSafe`): the canonical file on this disk.
+      // `mediaIsSafe`): the canonical file on this disk, or its archived blob
+      // (blob_name + sha256) once Stage D has evicted the local copy.
       const canonical = (await standaloneMedia(recordingId)).find((m) => m.kind === 'canonical');
-      if (canonical?.filename && (await audioFileExists(canonical.filename))) {
+      if (
+        canonical?.filename &&
+        (isArchivedMedia(canonical) || (await audioFileExists(canonical.filename)))
+      ) {
         await deleteAtAaiForRecording(txn.id, txn.provider_job_id, aai.utterances?.length ?? 0).catch(
           (err) => console.warn('[born-bare] AAI delete failed:', err)
         );
@@ -991,7 +1009,15 @@ export async function sweepBornBare(): Promise<void> {
   if (deleteOnCompleteEnabled()) {
     try {
       for (const p of await listStandaloneAaiDeletePending(10)) {
-        if (!p.canonical_filename || !(await audioFileExists(p.canonical_filename))) continue;
+        if (!p.canonical_filename) continue;
+        // Held = on this disk, or archived (Stage D may have evicted the local copy).
+        const held =
+          isArchivedMedia({
+            filename: p.canonical_filename,
+            blob_name: p.canonical_blob_name,
+            sha256: p.canonical_sha256,
+          }) || (await audioFileExists(p.canonical_filename));
+        if (!held) continue;
         await deleteAtAaiForRecording(p.transcription_id, p.provider_job_id, p.utterances);
       }
     } catch (err) {

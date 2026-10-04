@@ -55,6 +55,8 @@ export interface ResolvedMediaDerivative {
   filename: string;
   /** Its own `blob_name`; null until the archive has stamped it. */
   blobName: string | null;
+  /** Its `recording_media.sha256` — what a pull from the archive is checked against. */
+  sha256: string | null;
 }
 
 /** One playable file, in the numbering `/audio?part=N` already uses. */
@@ -82,6 +84,12 @@ export interface ResolvedMedia {
    * reads this and nothing else to decide whether a redirect is possible.
    */
   blobName: string | null;
+  /**
+   * `recording_media.sha256` — the hash the archive stamped and Stage D read
+   * back; a pull from the blob into the media cache is checked against it.
+   * null in fallback mode.
+   */
+  sha256: string | null;
   /** The `audio_only` extract of THIS file, when one has been built. */
   audioOnly: ResolvedMediaDerivative | null;
   /**
@@ -214,6 +222,7 @@ function mediaFromRow(row: MediaOnlyRow): ResolvedMedia[] {
       // about the archive: there is no blob to serve and no derivative row.
       // `?variant=audio` still works — it goes through the local extract.
       blobName: null,
+      sha256: null,
       audioOnly: null,
       windowFromMs: window?.fromMs ?? null,
       windowToMs: window?.toMs ?? null,
@@ -234,6 +243,7 @@ function mediaFromRow(row: MediaOnlyRow): ResolvedMedia[] {
       durationMs: p.durationSec != null ? Math.round(p.durationSec * 1000) : null,
       transcribed: false,
       blobName: null,
+      sha256: null,
       audioOnly: null,
       // A stop/restart part is never windowed: a split only ever takes a
       // window of the canonical file (a multi-part meeting refuses to split).
@@ -306,6 +316,7 @@ function mediaForRecordings(
       mediaId: d.id,
       filename: d.filename,
       blobName: d.blob_name,
+      sha256: d.sha256,
     });
   }
   let part = 0;
@@ -331,6 +342,7 @@ function mediaForRecordings(
         durationMs: m.duration_ms ?? null,
         transcribed: covered.size === 0 ? m.kind === 'canonical' : covered.has(m.id),
         blobName: m.blob_name,
+        sha256: m.sha256,
         audioOnly: derivatives.get(m.id) ?? null,
         // Only the CANONICAL file carries the meeting's window: a clip always
         // windows the file the transcription was made from, and a meeting with

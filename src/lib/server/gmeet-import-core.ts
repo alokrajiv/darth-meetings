@@ -24,8 +24,9 @@ import {
   utterancesFromEntries,
   type ParsedMeetTranscript,
 } from '@/lib/server/gmeet';
-import { copyAudioToTemp, deleteAudioFile } from '@/lib/server/audio-storage';
-import { concatMediaToTemp } from '@/lib/server/media-concat';
+import { copyPathToAudioTemp, deleteAudioFile } from '@/lib/server/audio-storage';
+import { concatMediaPathsToTemp } from '@/lib/server/media-concat';
+import { storedFileSources, withHeldStoredFiles } from '@/lib/server/stored-media';
 import { IngestError, ingestLocalAudio } from '@/lib/server/ingest';
 import { ingestParsedUtterances } from '@/lib/server/ingest-parsed';
 import {
@@ -994,25 +995,51 @@ export async function executeGmeetImport(
     // the NEW transcription covers the whole meeting — re-transcribing just
     // the first video would repeat the missing-content confusion this flow
     // exists to fix.
+    //
+    // Every input through media-local, HELD until ffmpeg is done (Stage D may
+    // have evicted a local copy — it is then read from the media cache — and
+    // must not evict one mid-concat).
+    const names = [sourceRow.local_audio_path, ...sourceStoredParts.map((p) => p.filename!)];
+    let combined: { ok: true; value: string } | { ok: false };
     try {
-      tempFilename = await concatMediaToTemp([
-        sourceRow.local_audio_path,
-        ...sourceStoredParts.map((p) => p.filename!),
-      ]);
+      const sources = await storedFileSources(names);
+      combined = await withHeldStoredFiles(
+        names.map((n) => sources.get(n)!.media),
+        'canonical',
+        'gmeet combine',
+        (locals) => concatMediaPathsToTemp(locals.map((l) => l.path))
+      );
     } catch (err) {
       console.error('[gmeet/import] video concat failed:', err);
       return out(502, { error: 'Combining the meeting videos failed', detail: String(err) });
     }
+    if (!combined.ok) {
+      return out(502, {
+        error: 'Combining the meeting videos failed: a stored video could not be read here or from the archive — try again in a few minutes.',
+      });
+    }
+    tempFilename = combined.value;
     originalFilename = `combined-${sourceStoredParts.length + 1}-videos.mp4`;
   } else if (sourceRow?.local_audio_path) {
     // Re-run from local: the bytes were already fetched (fetch-audio) —
     // copy them so the ingest rename consumes the copy, not the source.
+    // Read through media-local and held until the copy is made (Stage D: an
+    // evicted local copy comes from the media cache). Always a COPY: the
+    // ingest consumes its input.
+    let copied: { ok: true; value: string } | { ok: false };
     try {
-      tempFilename = await copyAudioToTemp(sourceRow.local_audio_path);
+      const source = (await storedFileSources([sourceRow.local_audio_path])).get(sourceRow.local_audio_path)!;
+      copied = await withHeldStoredFiles([source.media], 'canonical', 'gmeet re-run', ([local]) =>
+        copyPathToAudioTemp(local!.path)
+      );
     } catch (err) {
       console.error('[gmeet/import] local audio copy failed:', err);
       return out(502, { error: 'Could not read the stored audio — try fetching audio again.' });
     }
+    if (!copied.ok) {
+      return out(502, { error: 'Could not read the stored audio — try fetching audio again.' });
+    }
+    tempFilename = copied.value;
     originalFilename = sourceRow.original_filename ?? sourceRow.local_audio_path;
   } else {
     let meta;

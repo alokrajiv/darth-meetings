@@ -12,6 +12,7 @@ import {
   mediaStore,
   type MediaBlobLike,
 } from '@/lib/server/media-store';
+import { redactSasInText } from '@/lib/server/media-serve';
 import {
   clearPendingBlobDelete,
   insertMediaCanary,
@@ -23,9 +24,12 @@ import {
   markMediaCanaryMissing,
   markMediaCanarySeen,
   markPendingBlobDeleteFailed,
+  mediaEvictionColumnsExist,
   queueBlobDeletes,
   setRecordingSha256,
   stampMediaArchived,
+  stampMediaVerified,
+  stampMediaVerifyFailed,
   type ArchivedBlobRef,
   type RecordingMediaRow,
 } from '@/db-ops/recordings';
@@ -102,6 +106,7 @@ export type ArchiveOutcome =
 const g = globalThis as unknown as {
   __mwMediaArchiveInflight?: Map<string, Promise<ArchiveOutcome>>;
   __mwMediaArchiveCanary?: { at: number; gate: CanaryGate };
+  __mwMediaVerifyInflight?: Map<string, Promise<VerifyOutcome>>;
 };
 const inflight = (g.__mwMediaArchiveInflight ??= new Map<string, Promise<ArchiveOutcome>>());
 
@@ -120,8 +125,12 @@ export function localMediaPath(row: Pick<RecordingMediaRow, 'kind' | 'filename'>
   }
 }
 
-/** sha256 of a local file, streamed (never read whole into memory). */
-async function sha256OfFile(abs: string): Promise<string> {
+/**
+ * sha256 of a local file, streamed (never read whole into memory). Exported for
+ * Stage D: the eviction hashes the file once more right before the unlink, and
+ * the operator scripts use the same function so their answer is the archive's.
+ */
+export async function sha256OfFile(abs: string): Promise<string> {
   const hash = createHash('sha256');
   for await (const chunk of createReadStream(abs, { highWaterMark: 1024 * 1024 })) {
     hash.update(chunk as Buffer);
@@ -361,6 +370,121 @@ async function archiveMediaOnce(row: RecordingMediaRow, opts: ArchiveOptions): P
       error: err instanceof Error ? err.message : String(err),
     };
   }
+}
+
+// ---------------------------------------------------------------------------
+// Stage D — the read-back (docs/recordings-stage-d-spec.md "Code")
+// ---------------------------------------------------------------------------
+
+export type VerifyOutcome =
+  | { status: 'verified'; bytes: number; sha256: string; ms: number }
+  | { status: 'mismatch'; error: string }
+  | { status: 'skipped'; reason: string };
+
+/**
+ * Read an archived blob BACK from Azure and prove it is the file the row
+ * describes: every byte streamed through sha256 and counted, and both must
+ * equal `recording_media.sha256` / `bytes`. The Stage A stamp only proved that
+ * the hash computed while UPLOADING equals the metadata we set — it never
+ * re-read the bytes — and Stage D deletes local copies on the strength of
+ * this, so nothing cheaper will do. Reads are in-region and free.
+ *
+ * Order (spec "Decisions"): the properties gate first (exists, size, stored
+ * hash) so a wrong blob fails without a download; then the streamed read; then
+ * the stamp, guarded on `blob_name` AND `sha256` so a re-archive that landed
+ * while we were reading cannot be stamped verified with the old answer.
+ *
+ * A mismatch is recorded (`blob_verify_failed_at` / `_error`, which also
+ * revokes any earlier pass) and shouted, and NEVER repaired here: the status
+ * script shows it and a human decides. A read that dies part-way is recorded
+ * the same way (so the 24 h retry back-off applies) but reported as
+ * `skipped` — it says nothing about the bytes. Errors from Azure can carry a
+ * SAS URL; every message is redacted before it is logged or stored.
+ *
+ * Serialised per media id, like `archiveMedia`: the sweeper and an in-process
+ * caller asking at once share one download.
+ */
+export function verifyArchivedBlob(
+  row: RecordingMediaRow,
+  opts: { store?: MediaBlobLike | null } = {}
+): Promise<VerifyOutcome> {
+  const map = (g.__mwMediaVerifyInflight ??= new Map<string, Promise<VerifyOutcome>>());
+  const existing = map.get(row.id);
+  if (existing) return existing;
+  const run = verifyOnce(row, opts).finally(() => {
+    if (map.get(row.id) === run) map.delete(row.id);
+  });
+  map.set(row.id, run);
+  return run;
+}
+
+async function verifyOnce(
+  row: RecordingMediaRow,
+  opts: { store?: MediaBlobLike | null }
+): Promise<VerifyOutcome> {
+  const store = opts.store === undefined ? mediaStore() : opts.store;
+  if (!store) return { status: 'skipped', reason: 'no media store on this host' };
+  if (!row.blob_name || !row.sha256 || row.bytes == null) {
+    return { status: 'skipped', reason: 'row is not archived' };
+  }
+  if (!(await mediaEvictionColumnsExist().catch(() => false))) {
+    return { status: 'skipped', reason: 'migration 051 (media_local_eviction) is not applied' };
+  }
+  const blobName = row.blob_name;
+  const label = `${row.kind} ${blobName}`;
+  const started = Date.now();
+
+  const fail = async (error: string): Promise<VerifyOutcome> => {
+    const safe = redactSasInText(error);
+    await stampMediaVerifyFailed(row.id, safe);
+    console.error(`[media-verify] MISMATCH ${label} (media ${row.id}): ${safe}`);
+    return { status: 'mismatch', error: safe };
+  };
+
+  // 1. The properties gate — no download for a blob that is plainly wrong.
+  let props: Awaited<ReturnType<MediaBlobLike['properties']>>;
+  try {
+    props = await store.properties(blobName);
+  } catch (err) {
+    // Transient (network, auth refresh): says nothing about the bytes, so no
+    // stamp at all — the next tick asks again.
+    const msg = redactSasInText(err instanceof Error ? err.message : String(err));
+    return { status: 'skipped', reason: `properties failed: ${msg}` };
+  }
+  if (!props) return fail('blob is not in the container');
+  if (props.bytes !== row.bytes) return fail(`blob is ${props.bytes} B, the row says ${row.bytes} B`);
+  if (props.metadata.sha256 !== row.sha256) {
+    return fail(`blob metadata sha256 is ${props.metadata.sha256 ?? '(none)'}, the row says ${row.sha256}`);
+  }
+
+  // 2. The read-back, streamed: never more than one chunk in memory.
+  const hash = createHash('sha256');
+  let bytes = 0;
+  try {
+    const reader = (await store.read(blobName)).getReader();
+    for (;;) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      if (!value || value.byteLength === 0) continue;
+      hash.update(value);
+      bytes += value.byteLength;
+    }
+  } catch (err) {
+    const msg = redactSasInText(err instanceof Error ? err.message : String(err));
+    await stampMediaVerifyFailed(row.id, `read-back failed: ${msg}`);
+    console.warn(`[media-verify] ${label} (media ${row.id}): read-back failed after ${bytes} B: ${msg}`);
+    return { status: 'skipped', reason: `read-back failed: ${msg}` };
+  }
+  const sha256 = hash.digest('hex');
+  if (bytes !== row.bytes) return fail(`read back ${bytes} B, the row says ${row.bytes} B`);
+  if (sha256 !== row.sha256) return fail(`read back sha256 ${sha256}, the row says ${row.sha256}`);
+
+  // 3. The stamp — only for the name and hash we actually read against.
+  const stamped = await stampMediaVerified(row.id, { blobName, sha256, bytes });
+  if (!stamped) {
+    return { status: 'skipped', reason: 'the row was re-stamped (or removed) while it was being read' };
+  }
+  return { status: 'verified', bytes, sha256, ms: Date.now() - started };
 }
 
 /**

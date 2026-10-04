@@ -90,6 +90,19 @@ export interface RecordingMediaRow {
   source_ref: Record<string, unknown> | null;
   of_media_id: string | null;
   created_at: string;
+  // Stage D (migration 051, docs/recordings-stage-d-spec.md). OPTIONAL because
+  // they are only selected on a schema that has the columns (`mediaColsNow`):
+  // absent = "this database has no Stage D yet", never "not verified".
+  /** The read-back of the blob matched `sha256` + `bytes` at this time. */
+  blob_verified_at?: string | null;
+  /** The hash that read-back produced; only valid while it equals `sha256`. */
+  blob_verified_sha256?: string | null;
+  blob_verified_bytes?: number | null;
+  /** The last read-back that did NOT match (a human decides; never auto-repaired). */
+  blob_verify_failed_at?: string | null;
+  blob_verify_error?: string | null;
+  /** Stage D removed the local copy; a missing file is then the normal state. */
+  local_evicted_at?: string | null;
 }
 
 export interface RecordingTranscriptionRow {
@@ -143,6 +156,27 @@ const mediaCols = sql`
   bytes::float8 AS bytes,
   has_video, sha256, source_ref, of_media_id, created_at
 `;
+// Stage D's six columns (migration 051) — appended to `mediaCols` only where
+// the probe says they exist, because a SELECT naming a missing column is a
+// hard error, and this list is read on every playback path.
+const mediaColsStageD = sql`
+  ${mediaCols},
+  blob_verified_at, blob_verified_sha256,
+  blob_verified_bytes::float8 AS blob_verified_bytes,
+  blob_verify_failed_at, blob_verify_error, local_evicted_at
+`;
+/**
+ * Does THIS database have the Stage D columns? Picks between `mediaCols` and
+ * `mediaColsStageD` at each call site. The probe is cached per process
+ * (`mediaEvictionColumnsExist`), so after the first call this costs nothing;
+ * a failed probe answers "without" and is retried next time.
+ *
+ * Returns a boolean, never the fragment itself: a postgres.js fragment is a
+ * thenable, and handing one out of an async function would EXECUTE it.
+ */
+async function stageDColumnsOn(): Promise<boolean> {
+  return mediaEvictionColumnsExist().catch(() => false);
+}
 const clipCols = sql`
   transcript_id, ord, recording_id, transcription_id,
   from_ms::float8 AS from_ms,
@@ -321,6 +355,7 @@ export interface RecordingMediaInsert {
 
 /** INTERNAL-ONLY — idempotent on `id`, same reason as `createRecording`. */
 export async function addRecordingMedia(input: RecordingMediaInsert): Promise<RecordingMediaRow> {
+  const cols = (await stageDColumnsOn()) ? mediaColsStageD : mediaCols;
   const rows = await sql<RecordingMediaRow[]>`
     INSERT INTO ${sql(SCHEMA)}.recording_media
       (id, recording_id, kind, ord, offset_ms, duration_ms, filename, blob_name,
@@ -341,15 +376,16 @@ export async function addRecordingMedia(input: RecordingMediaInsert): Promise<Re
       has_video   = COALESCE(EXCLUDED.has_video, recording_media.has_video),
       sha256      = COALESCE(EXCLUDED.sha256, recording_media.sha256),
       source_ref  = COALESCE(EXCLUDED.source_ref, recording_media.source_ref)
-    RETURNING ${mediaCols}
+    RETURNING ${cols}
   `;
   return rows[0]!;
 }
 
 /** INTERNAL-ONLY — one media row by its (deterministic) id. */
 export async function getRecordingMediaRow(id: string): Promise<RecordingMediaRow | null> {
+  const cols = (await stageDColumnsOn()) ? mediaColsStageD : mediaCols;
   const rows = await sql<RecordingMediaRow[]>`
-    SELECT ${mediaCols} FROM ${sql(SCHEMA)}.recording_media WHERE id = ${id}::uuid
+    SELECT ${cols} FROM ${sql(SCHEMA)}.recording_media WHERE id = ${id}::uuid
   `;
   return rows[0] ?? null;
 }
@@ -357,8 +393,9 @@ export async function getRecordingMediaRow(id: string): Promise<RecordingMediaRo
 /** INTERNAL-ONLY — every file of the given recordings, in player order. */
 export async function listRecordingMedia(recordingIds: string[]): Promise<RecordingMediaRow[]> {
   if (recordingIds.length === 0) return [];
+  const cols = (await stageDColumnsOn()) ? mediaColsStageD : mediaCols;
   return sql<RecordingMediaRow[]>`
-    SELECT ${mediaCols} FROM ${sql(SCHEMA)}.recording_media
+    SELECT ${cols} FROM ${sql(SCHEMA)}.recording_media
     WHERE recording_id = ANY(${recordingIds}::uuid[])
     ORDER BY recording_id,
              CASE kind WHEN 'canonical' THEN 0 WHEN 'part' THEN 1 ELSE 2 END,
@@ -804,6 +841,18 @@ export async function applyRecordingGraph(
   // unlinked upload, not derived from any meeting) is never "promoted away"
   // and dropped below, whatever this meeting's clip did.
   const has049 = await standaloneColumnsExist().catch(() => false);
+  // Stage D (migration 051): an `audio_only` row whose local file Stage D
+  // removed is NOT stale because the disk no longer has the file — its blob is
+  // the copy, and deleting the row would queue that blob for deletion below
+  // (docs/recordings-stage-d-spec.md: a missing file with `local_evicted_at`
+  // set is the normal state). Asked before the transaction for the same reason
+  // as the probes above; when the probe itself fails we cannot tell evicted
+  // rows apart, so derivatives are simply not judged this time.
+  const stageD = await mediaEvictionColumnsExist().then(
+    (v) => v,
+    () => null
+  );
+  const judgeDerivatives = graph.filesProbed && stageD !== null;
 
   await sql.begin(async (tx) => {
     // What these meetings pointed at BEFORE — a promotion changes the answer.
@@ -874,7 +923,12 @@ export async function applyRecordingGraph(
       DELETE FROM ${tx(SCHEMA)}.recording_media
       WHERE recording_id = ${rec.id}::uuid
         AND NOT (id = ANY(${keepMediaIds}::uuid[]))
-        AND (${graph.filesProbed} OR kind IN ('canonical', 'part'))
+        AND (${judgeDerivatives} OR kind IN ('canonical', 'part'))
+        ${
+          stageD
+            ? tx`AND NOT (local_evicted_at IS NOT NULL AND kind NOT IN ('canonical', 'part'))`
+            : tx``
+        }
       RETURNING id, blob_name
     `;
     staleMediaRemoved = stale.length;
@@ -1383,8 +1437,9 @@ export function resetMediaArchiveTablesProbe(): void {
  * are on their way out, and the pacing budget belongs to live media.
  */
 export async function listMediaToArchive(limit: number): Promise<RecordingMediaRow[]> {
+  const cols = (await stageDColumnsOn()) ? mediaColsStageD : mediaCols;
   return sql<RecordingMediaRow[]>`
-    SELECT ${mediaCols} FROM ${sql(SCHEMA)}.recording_media m
+    SELECT ${cols} FROM ${sql(SCHEMA)}.recording_media m
     WHERE m.filename IS NOT NULL
       AND m.blob_name IS NULL
       AND EXISTS (
@@ -1407,9 +1462,23 @@ export async function stampMediaArchived(
   id: string,
   p: { blobName: string; sha256: string; bytes: number }
 ): Promise<boolean> {
+  // Stage D (docs/recordings-stage-d-spec.md "Decisions"): a verification is
+  // only valid for the hash it was computed against, so every stamp RESETS the
+  // read-back and eviction columns in the same UPDATE — a re-archive under the
+  // same blob name (the faststart remux) must be read back again before its
+  // local copy may go. Only named when migration 051 is there (a missing
+  // column fails the UPDATE). A probe that fails leaves them untouched, which
+  // is safe: the eviction query also demands `blob_verified_sha256 = sha256`,
+  // and a re-archive of different bytes changes `sha256`.
+  const stageD = await mediaEvictionColumnsExist().catch(() => false);
+  const reset = stageD
+    ? sql`,
+        blob_verified_at = NULL, blob_verified_sha256 = NULL, blob_verified_bytes = NULL,
+        blob_verify_failed_at = NULL, blob_verify_error = NULL, local_evicted_at = NULL`
+    : sql``;
   const rows = await sql<Array<{ id: string }>>`
     UPDATE ${sql(SCHEMA)}.recording_media
-    SET blob_name = ${p.blobName}, sha256 = ${p.sha256}, bytes = ${p.bytes}
+    SET blob_name = ${p.blobName}, sha256 = ${p.sha256}, bytes = ${p.bytes}${reset}
     WHERE id = ${id}::uuid
     RETURNING id
   `;
@@ -1642,4 +1711,317 @@ export async function markMediaCanaryMissing(name: string): Promise<void> {
     SET missing_at = COALESCE(missing_at, now())
     WHERE name = ${name}
   `;
+}
+
+// ---------------------------------------------------------------------------
+// Stage D — read-back verification and local eviction
+// (docs/recordings-stage-d-spec.md; migration 051, which the spec calls 048)
+//
+// APPEND-ONLY section, same rules as the archive's above: these columns are
+// NOT derived from the `transcripts` row, only `media-archive.ts` /
+// `media-evict.ts` write them, and no sync names them. Every function here is
+// INTERNAL-ONLY: it takes media ids with no owner constraint and is called by
+// the sweeper and the operator scripts, never with a client-supplied id.
+// ---------------------------------------------------------------------------
+
+const gStageD = globalThis as unknown as { __mwMediaEvictionColumns?: Promise<boolean> };
+
+/**
+ * Migration 051's six columns AND its ledger table, probed once per process
+ * like `mediaArchiveTablesExist`. Silent on purpose: `mediaColsNow` asks this
+ * on every playback path, and a laptop or a stage schema without the
+ * migration is a normal state, not a warning (the Stage D passes say so
+ * themselves, once, when they are actually configured). A FAILED probe is not
+ * cached.
+ */
+export function mediaEvictionColumnsExist(): Promise<boolean> {
+  return (gStageD.__mwMediaEvictionColumns ??= (async () => {
+    const rows = await sql<Array<{ cols: number; tables: number }>>`
+      SELECT
+        (SELECT count(*)::int FROM information_schema.columns
+          WHERE table_schema = ${SCHEMA} AND table_name = 'recording_media'
+            AND column_name IN ('blob_verified_at', 'blob_verified_sha256', 'blob_verified_bytes',
+                                'blob_verify_failed_at', 'blob_verify_error', 'local_evicted_at')
+        ) AS cols,
+        (SELECT count(*)::int FROM information_schema.tables
+          WHERE table_schema = ${SCHEMA} AND table_name = 'media_local_evictions'
+        ) AS tables
+    `;
+    return (rows[0]?.cols ?? 0) === 6 && (rows[0]?.tables ?? 0) === 1;
+  })().catch((err) => {
+    gStageD.__mwMediaEvictionColumns = undefined;
+    throw err;
+  }));
+}
+
+/** Tests / the integration check: forget the cached 051 probe. */
+export function resetMediaEvictionColumnsProbe(): void {
+  gStageD.__mwMediaEvictionColumns = undefined;
+}
+
+/**
+ * INTERNAL-ONLY — archived files whose blob has never been read back, oldest
+ * capture first. A row whose last read-back FAILED is retried only after 24 h:
+ * a mismatch is for a human to look at (`media-archive-status.ts`), and a
+ * transient read error must not turn into a full re-download every tick.
+ * Rows of a soft-deleted recording are left out, as in `listMediaToArchive`.
+ * Call only after `mediaEvictionColumnsExist()` said yes.
+ */
+export async function listMediaToVerify(limit: number): Promise<RecordingMediaRow[]> {
+  return sql<RecordingMediaRow[]>`
+    SELECT ${mediaColsStageD} FROM ${sql(SCHEMA)}.recording_media m
+    WHERE m.blob_name IS NOT NULL
+      AND m.sha256 IS NOT NULL
+      AND m.bytes IS NOT NULL
+      AND m.blob_verified_at IS NULL
+      AND (m.blob_verify_failed_at IS NULL OR m.blob_verify_failed_at < now() - interval '24 hours')
+      AND EXISTS (
+        SELECT 1 FROM ${sql(SCHEMA)}.recordings r
+        WHERE r.id = m.recording_id AND r.deleted_at IS NULL
+      )
+    ORDER BY m.created_at, m.id
+    LIMIT ${limit}
+  `;
+}
+
+/**
+ * INTERNAL-ONLY — the read-back matched. Guarded on `blob_name` AND `sha256`
+ * (spec "Code"): if the archive re-stamped the row while the blob was being
+ * streamed, this verification is of bytes the row no longer describes and must
+ * not land. Returns false in that case (and when the row is gone).
+ */
+export async function stampMediaVerified(
+  id: string,
+  p: { blobName: string; sha256: string; bytes: number }
+): Promise<boolean> {
+  const rows = await sql<Array<{ id: string }>>`
+    UPDATE ${sql(SCHEMA)}.recording_media
+    SET blob_verified_at = now(),
+        blob_verified_sha256 = ${p.sha256},
+        blob_verified_bytes = ${p.bytes},
+        blob_verify_failed_at = NULL,
+        blob_verify_error = NULL
+    WHERE id = ${id}::uuid AND blob_name = ${p.blobName} AND sha256 = ${p.sha256}
+    RETURNING id
+  `;
+  return rows.length > 0;
+}
+
+/**
+ * INTERNAL-ONLY — the read-back did NOT match (or could not complete). Any
+ * earlier verification is revoked in the same UPDATE: a blob that fails today
+ * must not keep a pass from last week that would let its local copy be
+ * deleted. Never repairs anything — a human decides (the local file, if
+ * present, is the truth).
+ */
+export async function stampMediaVerifyFailed(id: string, error: string): Promise<void> {
+  await sql`
+    UPDATE ${sql(SCHEMA)}.recording_media
+    SET blob_verify_failed_at = now(),
+        blob_verify_error = ${error.slice(0, 500)},
+        blob_verified_at = NULL,
+        blob_verified_sha256 = NULL,
+        blob_verified_bytes = NULL
+    WHERE id = ${id}::uuid
+  `;
+}
+
+/**
+ * INTERNAL-ONLY — forget a verification (not the archive stamp): the eviction
+ * found the local file rewritten after the read-back, so the blob no longer
+ * provably holds what is on disk. The re-archive itself is `archiveMedia`'s
+ * "rewritten since the stamp" path, which re-stamps and so resets this again.
+ */
+export async function clearMediaVerification(id: string): Promise<void> {
+  await sql`
+    UPDATE ${sql(SCHEMA)}.recording_media
+    SET blob_verified_at = NULL, blob_verified_sha256 = NULL, blob_verified_bytes = NULL
+    WHERE id = ${id}::uuid
+  `;
+}
+
+/**
+ * INTERNAL-ONLY — local copies Stage D may remove: read-back-verified at least
+ * `minAgeDays` ago FOR THE HASH THE ROW CARRIES NOW (`blob_verified_sha256 =
+ * sha256`, and the same byte count), not yet evicted, one of the kinds whose
+ * file lives under `storage/audio*`, recording live. Oldest capture first
+ * (spec "Decisions"); `largestFirst` is the script's drain order.
+ */
+export async function listEvictableMedia(opts: {
+  minAgeDays: number;
+  limit: number;
+  largestFirst?: boolean;
+}): Promise<RecordingMediaRow[]> {
+  const order = opts.largestFirst
+    ? sql`ORDER BY m.bytes DESC NULLS LAST, m.created_at, m.id`
+    : sql`ORDER BY m.created_at, m.id`;
+  return sql<RecordingMediaRow[]>`
+    SELECT ${mediaColsStageD} FROM ${sql(SCHEMA)}.recording_media m
+    WHERE m.blob_name IS NOT NULL
+      AND m.sha256 IS NOT NULL
+      AND m.filename IS NOT NULL
+      AND m.blob_verified_at IS NOT NULL
+      AND m.blob_verified_at <= now() - (${opts.minAgeDays}::float8 * interval '1 day')
+      AND m.blob_verified_sha256 = m.sha256
+      AND m.blob_verified_bytes IS NOT DISTINCT FROM m.bytes
+      AND m.local_evicted_at IS NULL
+      AND m.kind IN ('canonical', 'audio_only', 'part')
+      AND EXISTS (
+        SELECT 1 FROM ${sql(SCHEMA)}.recordings r
+        WHERE r.id = m.recording_id AND r.deleted_at IS NULL
+      )
+    ${order}
+    LIMIT ${opts.limit}
+  `;
+}
+
+/** One `media_local_evictions` row (migration 051). */
+export interface LocalEvictionInsert {
+  mediaId: string;
+  recordingId: string;
+  kind: string;
+  filename: string;
+  localPath: string;
+  bytes: number;
+  /** Hashed right before the unlink. */
+  localSha256: string;
+  blobName: string;
+  /** `recording_media.sha256` at that moment (= `blob_verified_sha256`). */
+  blobSha256: string;
+  blobVerifiedAt: string | Date;
+  /** 'sweeper' | 'script:<user>@<host>'. */
+  evictedBy: string;
+  note?: string | null;
+}
+
+/**
+ * INTERNAL-ONLY — LEDGER FIRST, UNLINK SECOND (spec "Decisions"). Sets
+ * `local_evicted_at` and writes the ledger row in ONE transaction, BEFORE the
+ * caller unlinks. The UPDATE is the guard and runs first: it only matches
+ * while the row still carries the blob name and hash the caller hashed the
+ * file against, its verification is still for that hash, and nobody evicted it
+ * meanwhile. No match → nothing is written and this returns false, and the
+ * caller must NOT unlink. A crash after this commits and before the unlink
+ * leaves a file the ledger calls gone — harmless, and `media-evict.ts
+ * --orphans` lists it; the opposite order could delete a file with no record.
+ */
+export async function recordLocalEviction(e: LocalEvictionInsert): Promise<boolean> {
+  let ok = false;
+  await sql.begin(async (tx) => {
+    const hit = await tx<Array<{ id: string }>>`
+      UPDATE ${tx(SCHEMA)}.recording_media
+      SET local_evicted_at = now()
+      WHERE id = ${e.mediaId}::uuid
+        AND blob_name = ${e.blobName}
+        AND sha256 = ${e.blobSha256}
+        AND blob_verified_sha256 = sha256
+        AND local_evicted_at IS NULL
+      RETURNING id
+    `;
+    if (hit.length === 0) return;
+    await tx`
+      INSERT INTO ${tx(SCHEMA)}.media_local_evictions
+        (media_id, recording_id, kind, filename, local_path, bytes, local_sha256,
+         blob_name, blob_sha256, blob_verified_at, evicted_by, note)
+      VALUES (${e.mediaId}::uuid, ${e.recordingId}::uuid, ${e.kind}, ${e.filename},
+              ${e.localPath}, ${e.bytes}, ${e.localSha256}, ${e.blobName}, ${e.blobSha256},
+              ${e.blobVerifiedAt}, ${e.evictedBy}, ${e.note ?? null})
+    `;
+    ok = true;
+  });
+  return ok;
+}
+
+/**
+ * INTERNAL-ONLY — the eviction came for a verified row and its local file was
+ * already missing (purged before Stage D, never landed on this colour). Mark
+ * it evicted so it stops being a candidate, with a ledger row that says so
+ * (`local_sha256 = ''`, the note) — the same one transaction as a real
+ * eviction. Only a verified, archived, not-yet-evicted row qualifies; returns
+ * false otherwise.
+ */
+/**
+ * INTERNAL-ONLY — Stage D: the probe found these stored files ON DISK again
+ * for a recording whose rows say the local copy was evicted. That happens when
+ * a re-ingest (ingest-retry on an evicted kept-failure row) renames a fresh
+ * temp to the stored name. The mark comes off so the row is a candidate again;
+ * the eviction re-hashes the file against `sha256` before it deletes anything,
+ * and the archive's own "rewritten since the stamp" path re-archives different
+ * bytes. Inert without migration 051.
+ */
+export async function clearLocalEvictedOnDisk(recordingId: string, filenames: string[]): Promise<number> {
+  if (filenames.length === 0) return 0;
+  if (!(await mediaEvictionColumnsExist().catch(() => false))) return 0;
+  const rows = await sql<Array<{ id: string }>>`
+    UPDATE ${sql(SCHEMA)}.recording_media
+    SET local_evicted_at = NULL
+    WHERE recording_id = ${recordingId}::uuid
+      AND local_evicted_at IS NOT NULL
+      AND filename = ANY(${filenames}::text[])
+    RETURNING id
+  `;
+  return rows.length;
+}
+
+export async function markLocalAlreadyGone(
+  id: string,
+  note: string,
+  ctx: { localPath: string; by: string }
+): Promise<boolean> {
+  let ok = false;
+  await sql.begin(async (tx) => {
+    const rows = await tx<
+      Array<{
+        recording_id: string;
+        kind: string;
+        filename: string | null;
+        bytes: number | null;
+        blob_name: string;
+        sha256: string;
+        blob_verified_at: Date;
+      }>
+    >`
+      UPDATE ${tx(SCHEMA)}.recording_media
+      SET local_evicted_at = now()
+      WHERE id = ${id}::uuid
+        AND local_evicted_at IS NULL
+        AND blob_name IS NOT NULL
+        AND sha256 IS NOT NULL
+        AND blob_verified_at IS NOT NULL
+      RETURNING recording_id, kind, filename, bytes::float8 AS bytes, blob_name, sha256,
+                blob_verified_at
+    `;
+    const r = rows[0];
+    if (!r) return;
+    await tx`
+      INSERT INTO ${tx(SCHEMA)}.media_local_evictions
+        (media_id, recording_id, kind, filename, local_path, bytes, local_sha256,
+         blob_name, blob_sha256, blob_verified_at, evicted_by, note)
+      VALUES (${id}::uuid, ${r.recording_id}::uuid, ${r.kind}, ${r.filename ?? ''},
+              ${ctx.localPath}, ${r.bytes ?? 0}, '', ${r.blob_name}, ${r.sha256},
+              ${r.blob_verified_at}, ${ctx.by}, ${note})
+    `;
+    ok = true;
+  });
+  return ok;
+}
+
+/**
+ * INTERNAL-ONLY — the stems of SOURCE files (`canonical` / `part`) whose local
+ * copy Stage D removed. The derivative sweep (`media-sweeper.ts`) treats an
+ * `audio-only/<stem>.m4a` with no `<stem>.*` in the audio dir as an orphan;
+ * after an eviction that is no longer true, and removing the extract would
+ * also drop its row and queue its blob — the very copy the voiceprint pass
+ * pulls. Asked only for the stems that sweep is about to remove.
+ */
+export async function evictedSourceStems(stems: string[]): Promise<Set<string>> {
+  if (stems.length === 0) return new Set();
+  const rows = await sql<Array<{ filename: string }>>`
+    SELECT filename FROM ${sql(SCHEMA)}.recording_media
+    WHERE kind IN ('canonical', 'part')
+      AND local_evicted_at IS NOT NULL
+      AND filename IS NOT NULL
+      AND regexp_replace(filename, '\\.[^.]*$', '') = ANY(${stems}::text[])
+  `;
+  return new Set(rows.map((r) => r.filename.replace(/\.[^.]*$/, '')));
 }

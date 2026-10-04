@@ -176,9 +176,25 @@ export async function writeChunkAt(
  * keeps its audio.
  */
 export async function copyAudioToTemp(sourceFilename: string): Promise<string> {
+  return copyPathToAudioTemp(resolveAudioPath(sourceFilename));
+}
+
+/**
+ * `copyAudioToTemp` from an ABSOLUTE path — a stored file Stage D evicted is
+ * read from media-local's cache, and the ingest must get a temp of its own
+ * under the audio dir (it rewrites, renames and deletes its input; a cache
+ * entry must never be handed to it). Always a copy, never a link.
+ */
+export async function copyPathToAudioTemp(sourceAbs: string): Promise<string> {
   await ensureAudioDir();
   const tempFilename = `upload-${randomUUID()}.part`;
-  await fsp.copyFile(resolveAudioPath(sourceFilename), resolveAudioPath(tempFilename));
+  const dest = resolveAudioPath(tempFilename);
+  try {
+    await fsp.copyFile(sourceAbs, dest);
+  } catch (err) {
+    await fsp.unlink(dest).catch(() => {});
+    throw err;
+  }
   return tempFilename;
 }
 

@@ -371,3 +371,109 @@ describe('frames look past a purged stored copy', () => {
     expect(readdirSync(path.join(scratch, 'media-cache'))).toEqual([]);
   });
 });
+
+describe('Stage D: the pull is verified and bounded, disk hits are held', () => {
+  const sha = (b: Uint8Array) => new Bun.CryptoHasher('sha256').update(b).digest('hex');
+  const cache = () => path.join(scratch, 'media-cache');
+  const cacheFiles = () => (existsSync(cache()) ? readdirSync(cache()) : []);
+
+  test('a pull whose bytes do not hash to the row’s sha256 → null, "sha256 mismatch", nothing cached', async () => {
+    const m = { ...mediaOf({ audioOnly: null }), sha256: 'f'.repeat(64) };
+    expect(await local.ensureLocalMedia(m, 'video', { purpose: 'frames' })).toBeNull();
+    expect(warnings().some((w) => w.includes('sha256 mismatch'))).toBe(true);
+    expect(cacheFiles()).toEqual([]); // no entry, no .part
+  });
+
+  test('the right sha256 → pulled and cached as before; the derivative is checked against ITS hash', async () => {
+    const ok = await local.ensureLocalMedia(
+      { ...mediaOf({ audioOnly: null }), sha256: sha(VIDEO_BYTES) },
+      'video',
+      { purpose: 'frames' }
+    );
+    expect(ok?.source).toBe('blob');
+    ok!.release();
+    const media = mediaOf();
+    const wrongDerivative = {
+      ...media,
+      sha256: sha(VIDEO_BYTES),
+      audioOnly: { ...media.audioOnly!, sha256: 'e'.repeat(64) },
+    };
+    expect(await local.ensureLocalMedia(wrongDerivative, 'audio', { purpose: 'voiceprint' })).toBeNull();
+    expect(warnings().some((w) => w.includes('sha256 mismatch'))).toBe(true);
+  });
+
+  test('low free space → the cache is evicted first, then the pull goes ahead', async () => {
+    // An idle entry the eviction can take, and a filesystem that is "full"
+    // until it has run.
+    const old = await local.ensureLocalMedia(mediaOf(), 'audio', { purpose: 't' });
+    old!.release();
+    process.env.MW_MEDIA_CACHE_TTL_MS = '1';
+    const stale = new Date(Date.now() - 60_000);
+    utimesSync(old!.path, stale, stale);
+    let free = 1024;
+    local.setMediaCacheStatfsForTests(async () => {
+      const r = { bavail: free, bsize: 1 };
+      if (!existsSync(old!.path)) free = 10 * 1024 ** 3; // the eviction made room
+      return r;
+    });
+    try {
+      process.env.MW_MEDIA_CACHE_MIN_FREE_BYTES = String(1024 ** 3);
+      const got = await local.ensureLocalMedia(mediaOf({ audioOnly: null }), 'video', { purpose: 'frames' });
+      expect(existsSync(old!.path)).toBe(false);
+      expect(got?.source).toBe('blob');
+      got!.release();
+    } finally {
+      local.setMediaCacheStatfsForTests(null);
+      delete process.env.MW_MEDIA_CACHE_MIN_FREE_BYTES;
+    }
+  });
+
+  test('still short after the eviction → null, and the warning names the free space', async () => {
+    local.setMediaCacheStatfsForTests(async () => ({ bavail: 4096, bsize: 1024 }));
+    try {
+      process.env.MW_MEDIA_CACHE_MIN_FREE_BYTES = String(5 * 1024 ** 3);
+      expect(await local.ensureLocalMedia(mediaOf(), 'audio', { purpose: 'voiceprint' })).toBeNull();
+      const w = warnings().find((x) => x.includes('not enough free space'));
+      expect(w).toContain(`${4096 * 1024} B free`);
+      expect(reads()).toEqual([]); // refused before a byte was read
+      expect(cacheFiles()).toEqual([]);
+    } finally {
+      local.setMediaCacheStatfsForTests(null);
+      delete process.env.MW_MEDIA_CACHE_MIN_FREE_BYTES;
+    }
+  });
+
+  test('a disk hit is held until released (what the eviction asks)', async () => {
+    const stored = path.join(storage, 'audio', '02af969f.mp4');
+    writeFileSync(stored, VIDEO_BYTES);
+    expect(local.localMediaHeld(stored)).toBe(false);
+    const a = await local.ensureLocalMedia(mediaOf(), 'audio', { purpose: 't' });
+    const b = await local.ensureLocalMedia(mediaOf(), 'video', { purpose: 't' });
+    expect(a?.source).toBe('disk');
+    expect(local.localMediaHeld(stored)).toBe(true);
+    a!.release();
+    a!.release(); // idempotent per handle: b still holds it
+    expect(local.localMediaHeld(stored)).toBe(true);
+    b!.release();
+    expect(local.localMediaHeld(stored)).toBe(false);
+
+    const derived = path.join(storage, 'audio-only', '02af969f.m4a');
+    rmSync(stored);
+    writeFileSync(derived, AUDIO_BYTES);
+    const c = await local.ensureLocalMedia(mediaOf(), 'audio', { purpose: 't' });
+    expect(c?.source).toBe('disk-audio-only');
+    expect(local.localMediaHeld(derived)).toBe(true);
+    c!.release();
+    expect(local.localMediaHeld(derived)).toBe(false);
+  });
+
+  test("want 'canonical': a non-video row whose file is gone pulls the CANONICAL blob, never the extract", async () => {
+    writeFileSync(path.join(storage, 'audio-only', '02af969f.m4a'), AUDIO_BYTES); // a local extract too
+    const m = mediaOf({ isVideo: false, filename: '02af969f.m4a' });
+    const got = await local.ensureLocalMedia(m, 'canonical', { purpose: 'retranscribe' });
+    expect(got?.source).toBe('blob');
+    expect(reads()).toEqual([`read ${CANON_BLOB}`]);
+    expect(new Uint8Array(readFileSync(got!.path))).toEqual(VIDEO_BYTES);
+    got!.release();
+  });
+});

@@ -29,7 +29,7 @@ import type { SpeechModel } from '@/lib/aai-language';
 import { decideRunPoll, type RunPollObservation } from '@/lib/transcription-run-state';
 import { getTranscript, isAaiNotFound, submitTranscription, uploadFile } from '@/lib/server/assemblyai';
 import { vocabForSubmit } from '@/lib/server/ingest';
-import { audioFileSize, resolveAudioPath } from '@/lib/server/audio-storage';
+import { storedFileSource, withHeldStoredFiles } from '@/lib/server/stored-media';
 import { rematerialiseMeetingsOnRecording } from '@/lib/server/clip-materialise';
 import {
   alignMeetingsToTranscription,
@@ -135,8 +135,10 @@ export async function startTranscriptionRun(input: StartRunInput): Promise<Start
       body: { error: 'No stored recording for this meeting — nothing to re-run.' },
     };
   }
-  const bytes = await audioFileSize(row.local_audio_path);
-  if (bytes === null) {
+  // Held = on this disk, or archived (Stage D evicts verified local copies;
+  // the upload below then reads a pulled copy from the media cache).
+  const source = await storedFileSource(row.local_audio_path);
+  if (!source.held) {
     return {
       kind: 'refused',
       status: 422,
@@ -249,9 +251,10 @@ export async function startTranscriptionRun(input: StartRunInput): Promise<Start
 }
 
 /**
- * The AssemblyAI hand-off, off the request's critical path. The bytes are
- * already on our disk and stay there: `uploadFile` streams the STORED file, so
- * unlike the pre-Phase-2 flow nothing is hard-linked, copied or renamed.
+ * The AssemblyAI hand-off, off the request's critical path. `uploadFile`
+ * streams the STORED file (or, once Stage D has evicted it, its archived copy
+ * pulled into the media cache), so unlike the pre-Phase-2 flow nothing is
+ * hard-linked, copied or renamed.
  */
 async function submitInBackground(
   input: StartRunInput,
@@ -262,7 +265,15 @@ async function submitInBackground(
   try {
     const languageCode = input.languageCode === 'auto' ? undefined : input.languageCode;
     const { keytermsPrompt, customSpelling } = await vocabForSubmit(ownerUserId);
-    const audioUrl = await uploadFile(resolveAudioPath(storedFilename));
+    // The stored file's own bytes (never the audio-only extract), HELD for the
+    // whole upload so Stage D cannot evict it mid-stream; pulled into the
+    // media cache when the local copy is gone.
+    const source = await storedFileSource(storedFilename);
+    const uploaded = await withHeldStoredFiles([source.media], 'canonical', 'retranscribe', ([local]) =>
+      uploadFile(local!.path)
+    );
+    if (!uploaded.ok) throw new Error(`stored recording ${storedFilename} could not be read locally or from the archive`);
+    const audioUrl = uploaded.value;
     // 'auto' = `language_detection: true` plus the documented model fallback
     // list (`speechModelsRequest`, inside submitTranscription). That IS the
     // code-switching configuration docs/eval-aai-code-switching-2026-09-21.md

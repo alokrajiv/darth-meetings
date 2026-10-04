@@ -1,5 +1,4 @@
 import 'server-only';
-import { promises as fsp } from 'node:fs';
 import {
   alignAdvice,
   ALIGN_WIDE_WINDOW_MS,
@@ -11,7 +10,7 @@ import { listAddableRecordings } from '@/db-ops/clips';
 import { getRecording, listRecordingMedia } from '@/db-ops/recordings';
 import { buildAudioOnly, getAudioOnlyPath } from '@/lib/server/audio-only';
 import { resolveAudioPath } from '@/lib/server/audio-storage';
-import { ensureLocalMedia } from '@/lib/server/media-local';
+import { ensureLocalMedia, holdLocalPath } from '@/lib/server/media-local';
 
 /**
  * "Line them up" — the offset between two recordings of one meeting
@@ -69,41 +68,57 @@ async function audioPathForRecording(
   if (!canonical?.filename) return { error: 'That recording has no file on this server.' };
   const filename = canonical.filename;
 
-  let source: string;
   try {
-    source = resolveAudioPath(filename);
+    resolveAudioPath(filename);
   } catch {
     return { error: 'That recording has no file on this server.' };
   }
-  if (!(await fsp.stat(source).catch(() => null))) {
-    // The local copy is gone (archived and purged): read the archived
-    // soundtrack — the audio-only extract's blob when there is one — out of
-    // media-local's cache instead. Nothing is rebuilt from it here.
-    const derivative = media.find((m) => m.kind === 'audio_only' && m.of_media_id === canonical.id);
-    const local = await ensureLocalMedia(
-      {
-        filename,
-        recordingId,
-        blobName: canonical.blob_name,
-        isVideo: canonical.has_video,
-        audioOnly: derivative?.filename
-          ? { filename: derivative.filename, blobName: derivative.blob_name }
-          : null,
-      },
-      'audio',
-      { purpose: 'align' }
-    );
-    if (!local) return { error: 'That recording’s file is not on this server right now.' };
-    return { path: local.path, filename, release: local.release };
-  }
+  const derivative = media.find((m) => m.kind === 'audio_only' && m.of_media_id === canonical.id);
+  // ONE media-local handle, held until the caller's `release()` after the
+  // sidecar has answered (up to ALIGN_TIMEOUT_MS), so Stage D cannot evict
+  // the file mid-correlation. The ladder: the stored file on disk; else (its
+  // local copy archived and evicted) the extract on disk, else the archived
+  // soundtrack — the extract's blob when there is one — pulled into the cache.
+  // Nothing is rebuilt from a pulled copy.
+  const local = await ensureLocalMedia(
+    {
+      filename,
+      recordingId,
+      blobName: canonical.blob_name,
+      sha256: canonical.sha256,
+      isVideo: canonical.has_video,
+      audioOnly: derivative?.filename
+        ? { filename: derivative.filename, blobName: derivative.blob_name, sha256: derivative.sha256 }
+        : null,
+    },
+    'audio',
+    { purpose: 'align' }
+  );
+  if (!local) return { error: 'That recording’s file is not on this server right now.' };
+  if (local.source !== 'disk') return { path: local.path, filename, release: local.release };
 
+  // The stored file is here (and held): read its extract, building it when
+  // missing — a video decoded for its loudness is minutes of ffmpeg for nothing.
   const built = await buildAudioOnly(filename, { nice: true });
   if (built.status === 'error') {
     // Not fatal: the correlation can read the original, it is just slower.
     console.warn(`[align] audio-only build failed for ${filename}: ${built.error}`);
-    return { path: source, filename };
+    return { path: local.path, filename, release: local.release };
   }
-  return { path: built.derived ? getAudioOnlyPath(filename) : source, filename };
+  if (!built.derived) return { path: local.path, filename, release: local.release };
+  // The extract is what the sidecar reads, and media-local's ladder handed out
+  // the SOURCE (on disk, so it answers first): hold the extract by path too, so
+  // Stage D cannot evict the `audio_only` row's file mid-correlation either.
+  const extract = getAudioOnlyPath(filename);
+  const releaseExtract = holdLocalPath(extract);
+  return {
+    path: extract,
+    filename,
+    release: () => {
+      releaseExtract();
+      local.release();
+    },
+  };
 }
 
 export async function alignRecordings(input: {

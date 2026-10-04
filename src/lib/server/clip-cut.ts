@@ -5,7 +5,7 @@ import { execFile, spawn } from 'node:child_process';
 import { promisify } from 'node:util';
 import { getStorageDir, resolveAudioPath } from '@/lib/server/audio-storage';
 import { hasVideoStream, mediaHasVideo } from '@/lib/server/video-frames';
-import { ensureLocalMedia } from '@/lib/server/media-local';
+import { ensureLocalMedia, type LocalizableMedia } from '@/lib/server/media-local';
 import type { ResolvedMedia } from '@/lib/server/recordings';
 import {
   buildConcatArgs,
@@ -268,11 +268,18 @@ interface CutKey {
 }
 
 /** Where a request's cut lives. `?variant=audio` of an AUDIO file is the same
- * bytes as the plain cut, so both name the `av` stem. `hasVideoStream` is
- * cached per process. */
+ * bytes as the plain cut, so both name the `av` stem.
+ *
+ * With a media row at hand its `has_video` (`isVideo`) decides — the same
+ * answer whether or not the stored file is on this disk, so a cut made before
+ * Stage D evicted the source is still found after it, and nothing ffprobes a
+ * file that is not held. Only a row that does not know (fallback mode, a null
+ * `has_video`) falls back to the probe (`hasVideoStream` is cached per
+ * process). */
 async function cutKeyOf(req: ClipCutRequest): Promise<CutKey | { error: string }> {
   const hasVideo =
     req.sourceHasVideo ??
+    req.media?.isVideo ??
     (req.media ? await mediaHasVideo(req.media) : await hasVideoStream(req.sourceFilename));
   const variant: CutVariant = hasVideo ? req.variant : 'av';
   try {
@@ -317,6 +324,12 @@ export async function ensureClipCut(req: ClipCutRequest): Promise<ClipCutResult>
 export async function findClipCut(req: ClipCutRequest): Promise<{ path: string; bytes: number } | null> {
   const k = await cutKeyOf(req);
   if ('error' in k) return null;
+  // A cut older than its stored source is stale (the source was rewritten).
+  // When the source is NOT on this disk (Stage D evicted it, or it never
+  // landed here) its mtime is unknown and 0 is used, so any existing cut
+  // counts as fresh: an archived source never changes — a rewrite would have
+  // happened on disk and re-archived it (`stampMediaArchived`) before any
+  // eviction — so there is nothing the cut could be stale against.
   let srcMtimeMs = 0;
   try {
     srcMtimeMs = (await fsp.stat(resolveAudioPath(req.sourceFilename)).catch(() => null))?.mtimeMs ?? 0;
@@ -382,16 +395,25 @@ async function cutOnce(
     return { status: 'ready', path: cached, contentType: contentTypeFor(extOf(cached), outputOf(hasVideo, req.variant)) };
   }
 
-  // The source: the stored file, or — its copy archived and purged (Stage D)
-  // — the archived blob pulled into media-local's bounded cache for this one
-  // cut (`ensureLocalMedia`, the same path frames and voiceprints use). The
-  // cut itself stays local either way; it is never archived.
-  if (storedSt) return produceCut(req, hasVideo, dir, stem, stored);
-  const local = req.media
-    ? await ensureLocalMedia(req.media, hasVideo && req.variant === 'audio' ? 'audio' : 'video', {
-        purpose: 'clip-cut',
-      })
-    : null;
+  // The source, ALWAYS through media-local: the stored file on disk, or — its
+  // copy archived and evicted (Stage D) — the archived blob pulled into the
+  // bounded cache (`ensureLocalMedia`, the same path frames and voiceprints
+  // use). Either way the handle HOLDS the file for the ffprobe and every
+  // ffmpeg run below, so the eviction cannot take it mid-cut, and is
+  // released after the last one. `?variant=audio` of a video may read the
+  // audio-only extract (smaller, same timeline); everything else reads the
+  // stored file's own bytes. With no media row (fallback mode) only the disk
+  // can answer. The cut itself stays local either way; it is never archived.
+  const source: LocalizableMedia = req.media ?? {
+    filename: req.sourceFilename,
+    recordingId: '',
+    blobName: null,
+    isVideo: hasVideo,
+    audioOnly: null,
+  };
+  const local = await ensureLocalMedia(source, hasVideo && req.variant === 'audio' ? 'audio' : 'video', {
+    purpose: 'clip-cut',
+  });
   if (!local) return { status: 'missing' };
   try {
     return await produceCut(req, hasVideo, dir, stem, local.path);

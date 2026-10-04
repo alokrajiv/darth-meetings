@@ -1,6 +1,7 @@
 import { describe, expect, test } from 'bun:test';
 import type { GmeetContext } from '../format';
 import {
+  archivedAudioOnlyFacts,
   canonicalKeyOf,
   deriveRecordingGraph,
   desiredClipFor,
@@ -379,6 +380,41 @@ describe('file facts', () => {
   test('no faststart rows: the remux rewrites the source in place', () => {
     const graph = deriveRecordingGraph(r, { audio: new Map(), audioOnly: new Map([['c', 1]]) });
     expect(graph.media.some((m) => m.kind === 'faststart')).toBe(false);
+  });
+
+  // Stage D: Stage D deletes LOCAL copies of verified rows. An extract whose
+  // file is gone but whose row is archived is still a file of the recording.
+  test('an ARCHIVED extract whose file is not on disk is still described (bytes from the row)', () => {
+    const graph = deriveRecordingGraph(r, {
+      audio: new Map(),
+      audioOnly: new Map(),
+      archivedAudioOnly: new Map([['c', 4321]]),
+    });
+    const extracts = graph.media.filter((m) => m.kind === 'audio_only');
+    expect(extracts).toHaveLength(1);
+    expect(extracts[0]!.filename).toBe('c.m4a');
+    expect(extracts[0]!.bytes).toBe(4321);
+    // The canonical is not on disk either: bytes null, which the upsert COALESCEs.
+    expect(graph.media.find((m) => m.kind === 'canonical')!.bytes).toBeNull();
+  });
+
+  test('without archived facts an absent extract is simply not there (dropped as stale, as before)', () => {
+    const graph = deriveRecordingGraph(r, { audio: new Map(), audioOnly: new Map() });
+    expect(graph.media.some((m) => m.kind === 'audio_only')).toBe(false);
+    expect(graph.filesProbed).toBe(true);
+  });
+
+  test('archivedAudioOnlyFacts: archived extract rows not found on disk, nothing else', () => {
+    const rows = [
+      { kind: 'audio_only', filename: 'c.m4a', blob_name: 'b/c', bytes: 10 },
+      { kind: 'audio_only', filename: 'c.part2.m4a', blob_name: 'b/p', bytes: 20 },
+      { kind: 'audio_only', filename: 'd.m4a', blob_name: null, bytes: 30 }, // never archived
+      { kind: 'canonical', filename: 'c.mp4', blob_name: 'b/m', bytes: 40 },
+      { kind: 'audio_only', filename: null, blob_name: 'b/x', bytes: 50 },
+    ];
+    // c.part2 is on disk: the probe answers for it.
+    const facts = archivedAudioOnlyFacts(new Map([['c.part2', 21]]), rows);
+    expect([...facts]).toEqual([['c', 10]]);
   });
 });
 

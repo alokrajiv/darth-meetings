@@ -2,6 +2,7 @@ import 'server-only';
 import path from 'node:path';
 import { createHash, randomUUID } from 'node:crypto';
 import { createWriteStream, promises as fsp } from 'node:fs';
+import { statfs as nodeStatfs } from 'node:fs/promises';
 import { Writable } from 'node:stream';
 import { getStorageDir, resolveAudioPath } from '@/lib/server/audio-storage';
 import { mediaStore, type MediaBlobLike } from '@/lib/server/media-store';
@@ -43,14 +44,27 @@ import { scratchRoot } from '@/lib/server/scratch-dir';
  * `MW_MEDIA_CACHE_MAX_BYTES` (default 4 GiB) or idle past
  * `MW_MEDIA_CACHE_TTL_MS` (default 1 h) — never while held.
  *
- * Every caller must `release()` what it got (a disk hit's release is a
- * no-op), typically in a `finally`.
+ * Every caller must `release()` what it got, typically in a `finally`. Since
+ * Stage D (docs/recordings-stage-d-spec.md) a DISK hit is reference-counted
+ * too, keyed by the absolute path handed out: `localMediaHeld(path)` is how the
+ * eviction (`media-evict.ts`) sees that an ffmpeg / sidecar / upload is
+ * reading a stored file right now and leaves it alone.
+ *
+ * Stage D also makes the pull stricter: the bytes are hashed while they are
+ * written and must equal the row's `sha256` when the caller knows it (the
+ * `.part` is removed and nothing is cached otherwise), and a pull never starts
+ * when the cache's filesystem would be left with less than
+ * `MW_MEDIA_CACHE_MIN_FREE_BYTES` (default 5 GiB) — the cache lives on the
+ * shared `/temphigh` NVMe and must never fill it.
  */
 
 export const MEDIA_CACHE_MAX_BYTES_ENV = 'MW_MEDIA_CACHE_MAX_BYTES';
 export const MEDIA_CACHE_TTL_MS_ENV = 'MW_MEDIA_CACHE_TTL_MS';
 const DEFAULT_CACHE_MAX_BYTES = 4 * 1024 * 1024 * 1024;
 const DEFAULT_CACHE_TTL_MS = 60 * 60_000;
+/** Stage D: free space the cache's filesystem must keep AFTER a pull. */
+export const MEDIA_CACHE_MIN_FREE_BYTES_ENV = 'MW_MEDIA_CACHE_MIN_FREE_BYTES';
+const DEFAULT_CACHE_MIN_FREE_BYTES = 5 * 1024 * 1024 * 1024;
 /** A `.part` older than this is a crashed pull's leftover. */
 const STALE_PART_MS = 60 * 60_000;
 
@@ -62,19 +76,34 @@ export interface LocalizableMedia {
   recordingId: string;
   /** `recording_media.blob_name`; null = never archived / fallback mode. */
   blobName: string | null;
+  /**
+   * `recording_media.sha256` of the stored file (Stage D). When known, a pull
+   * of `blobName` must hash to it; absent/null = the size check only, as
+   * before.
+   */
+  sha256?: string | null;
   isVideo: boolean | null;
   /** The `audio_only` derivative, when one has been built. */
-  audioOnly: { filename: string; blobName: string | null } | null;
+  audioOnly: { filename: string; blobName: string | null; sha256?: string | null } | null;
 }
 
-export type LocalMediaWant = 'audio' | 'video';
+/**
+ * - `'audio'`: anything with the soundtrack — the stored file, else the local
+ *   or archived audio-only extract (smallest pull), else the canonical blob.
+ * - `'video'`: the picture — the stored file, else the canonical blob.
+ * - `'canonical'`: THE STORED FILE'S OWN BYTES and nothing else — the stored
+ *   file, else the canonical blob, never a derivative and regardless of
+ *   `isVideo`. Re-transcription and re-ingest need the exact bytes
+ *   `recordings.sha256` describes.
+ */
+export type LocalMediaWant = 'audio' | 'video' | 'canonical';
 
 export interface LocalMedia {
   /** Absolute path, readable now. */
   path: string;
   /** Where it came from — for logs and tests. */
   source: 'disk' | 'disk-audio-only' | 'blob';
-  /** Let the cache evict it again. Idempotent; a no-op for a disk hit. */
+  /** Drop this handle's reference (the cache may evict, Stage D may delete). Idempotent. */
   release(): void;
 }
 
@@ -127,7 +156,42 @@ function labelOf(media: LocalizableMedia): string {
   return media.recordingId ? `recording ${media.recordingId} (${media.filename})` : media.filename;
 }
 
-const NOOP_RELEASE = () => {};
+/**
+ * Take a reference on `abs` and return its release: idempotent per handle,
+ * and the count is what `localMediaHeld` and the cache's eviction read.
+ */
+function hold(abs: string, onRelease?: () => void): () => void {
+  refs.set(abs, (refs.get(abs) ?? 0) + 1);
+  let released = false;
+  return () => {
+    if (released) return;
+    released = true;
+    const n = (refs.get(abs) ?? 1) - 1;
+    if (n <= 0) refs.delete(abs);
+    else refs.set(abs, n);
+    onRelease?.();
+  };
+}
+
+/**
+ * Hold a stored file by PATH, for a caller that reads a file this module did
+ * not hand out — align.ts reads the on-disk audio-only extract of a video it
+ * holds the source of. Same count `localMediaHeld` and the eviction read; the
+ * returned release is idempotent. Only for paths under the storage dir.
+ */
+export function holdLocalPath(absPath: string): () => void {
+  return hold(absPath);
+}
+
+/**
+ * Is somebody reading `absPath` through this module right now (a handle not
+ * yet released), or is a pull writing it? Stage D's eviction asks this
+ * before it deletes a stored file — an ffmpeg pass, the voiceprint sidecar
+ * or an AssemblyAI upload holding the file blocks its eviction.
+ */
+export function localMediaHeld(absPath: string): boolean {
+  return (refs.get(absPath) ?? 0) > 0 || inflight.has(absPath);
+}
 
 /**
  * A readable local path for `media`, or null (logged once) when there is
@@ -152,8 +216,14 @@ export async function ensureLocalMedia(
   } catch {
     stored = null;
   }
-  if (stored && (await isNonEmptyFile(stored))) {
-    return { path: stored, source: 'disk', release: NOOP_RELEASE };
+  if (stored) {
+    // Held BEFORE the stat, so an eviction that asks `localMediaHeld` after
+    // this point sees the reader even while the stat is in flight.
+    const releaseStored = hold(stored);
+    if (await isNonEmptyFile(stored)) {
+      return { path: stored, source: 'disk', release: releaseStored };
+    }
+    releaseStored();
   }
 
   // 2. The local audio-only derivative, when audio is all that is wanted.
@@ -162,16 +232,20 @@ export async function ensureLocalMedia(
     const derivedName = media.audioOnly?.filename ?? `${stem}.m4a`;
     if (!derivedName.includes('/') && !derivedName.includes('\\') && !derivedName.includes('..')) {
       const derived = path.join(getStorageDir(), 'audio-only', derivedName);
+      const releaseDerived = hold(derived);
       if (await isNonEmptyFile(derived)) {
-        return { path: derived, source: 'disk-audio-only', release: NOOP_RELEASE };
+        return { path: derived, source: 'disk-audio-only', release: releaseDerived };
       }
+      releaseDerived();
     }
   }
 
-  // 3. The archive.
+  // 3. The archive. Only `'audio'` may take the derivative's blob; `'video'`
+  // and `'canonical'` pull the stored file's own.
   const store = opts.store === undefined ? mediaStore() : opts.store;
-  const blobName =
-    want === 'audio' ? (media.audioOnly?.blobName ?? media.blobName) : media.blobName;
+  const useDerivative = want === 'audio' && !!media.audioOnly?.blobName;
+  const blobName = useDerivative ? media.audioOnly!.blobName : media.blobName;
+  const expectedSha256 = (useDerivative ? media.audioOnly?.sha256 : media.sha256) ?? null;
   if (!blobName) {
     warnOnce(
       `${opts.purpose}:${media.recordingId || media.filename}:no-blob`,
@@ -190,16 +264,7 @@ export async function ensureLocalMedia(
   const target = cacheFileFor(blobName);
   // Hold the entry BEFORE awaiting anything, so a concurrent eviction pass
   // never deletes the file between "it is there" and the caller reading it.
-  refs.set(target, (refs.get(target) ?? 0) + 1);
-  let released = false;
-  const release = () => {
-    if (released) return;
-    released = true;
-    const n = (refs.get(target) ?? 1) - 1;
-    if (n <= 0) refs.delete(target);
-    else refs.set(target, n);
-    void evictMediaCache().catch(() => {});
-  };
+  const release = hold(target, () => void evictMediaCache().catch(() => {}));
 
   try {
     if (await isNonEmptyFile(target)) {
@@ -209,7 +274,9 @@ export async function ensureLocalMedia(
     } else {
       let job = inflight.get(target);
       if (!job) {
-        job = pullToCache(store, blobName, target, tag).finally(() => inflight.delete(target));
+        job = pullToCache(store, blobName, target, tag, expectedSha256).finally(() =>
+          inflight.delete(target)
+        );
         inflight.set(target, job);
       }
       await job;
@@ -227,24 +294,76 @@ export async function ensureLocalMedia(
   }
 }
 
+/** `statfs` — swappable so the free-space guard can be tested. */
+type StatfsLike = (p: string) => Promise<{ bavail: number | bigint; bsize: number | bigint }>;
+let statfsImpl: StatfsLike = nodeStatfs as unknown as StatfsLike;
+
+/** Tests: pretend the cache's filesystem has this much room (null = the real one). */
+export function setMediaCacheStatfsForTests(fn: StatfsLike | null): void {
+  statfsImpl = fn ?? (nodeStatfs as unknown as StatfsLike);
+}
+
+/** Free bytes for an unprivileged writer on `dir`'s filesystem; null = cannot tell. */
+async function freeBytes(dir: string): Promise<number | null> {
+  try {
+    const st = await statfsImpl(dir);
+    return Number(st.bavail) * Number(st.bsize);
+  } catch {
+    return null;
+  }
+}
+
+function minFreeBytes(): number {
+  // 0 is a legitimate setting (tests, a dedicated volume); unset/garbage = default.
+  const raw = Number(process.env[MEDIA_CACHE_MIN_FREE_BYTES_ENV]);
+  return Number.isFinite(raw) && raw >= 0 && process.env[MEDIA_CACHE_MIN_FREE_BYTES_ENV]?.trim()
+    ? raw
+    : DEFAULT_CACHE_MIN_FREE_BYTES;
+}
+
+/**
+ * Stage D: never start a pull that would leave the cache's filesystem with
+ * less than `MW_MEDIA_CACHE_MIN_FREE_BYTES` — the cache shares `/temphigh`
+ * with every scratch job. Short → evict the cache first and look again; still
+ * short → throw, which `ensureLocalMedia` turns into null plus one warning
+ * naming the free space. A filesystem that cannot be asked is not a reason to
+ * refuse every read: the pull goes ahead, as before this guard existed.
+ */
+async function ensureCacheRoom(dir: string, size: number): Promise<void> {
+  const need = size + minFreeBytes();
+  const free = await freeBytes(dir);
+  if (free === null || free >= need) return;
+  await evictMediaCache();
+  const after = await freeBytes(dir);
+  if (after === null || after >= need) return;
+  throw new Error(
+    `not enough free space for the media cache at ${dir}: ${after} B free, ` +
+      `${need} B needed (${size} B + ${MEDIA_CACHE_MIN_FREE_BYTES_ENV} ${need - size} B) — pull refused`
+  );
+}
+
 /**
  * Blob → `<target>.<uuid>.part` → verify the size against the blob's own
- * properties → rename. The rename is atomic within the cache dir, so a reader
- * never sees half a file; a pull that dies leaves only a `.part` the next
- * eviction pass deletes.
+ * properties and, when the caller knows it, the sha256 of the bytes written
+ * (hashed on the way through — Stage D) → rename. The rename is atomic within
+ * the cache dir, so a reader never sees half a file; a pull that dies — or
+ * whose bytes are not the row's — leaves no cache entry, its `.part` removed.
  */
 async function pullToCache(
   store: MediaBlobLike,
   blobName: string,
   target: string,
-  tag: string
+  tag: string,
+  expectedSha256: string | null
 ): Promise<string> {
   const started = Date.now();
   await fsp.mkdir(path.dirname(target), { recursive: true });
   const props = await store.properties(blobName);
   if (!props) throw new Error(`blob ${blobName} does not exist`);
+  await ensureCacheRoom(path.dirname(target), props.bytes);
 
   const part = `${target}.${randomUUID()}.part`;
+  const hash = createHash('sha256');
   let bytes = 0;
   try {
     const reader = (await store.read(blobName)).getReader();
@@ -256,6 +375,7 @@ async function pullToCache(
         if (done) break;
         if (!value || value.byteLength === 0) continue;
         bytes += value.byteLength;
+        hash.update(value);
         await writer.write(value);
       }
       await writer.close();
@@ -267,6 +387,12 @@ async function pullToCache(
     if (bytes === 0 || bytes !== props.bytes) {
       throw new Error(`pulled ${bytes} B, the blob is ${props.bytes} B`);
     }
+    const sha256 = hash.digest('hex');
+    if (expectedSha256 && sha256 !== expectedSha256) {
+      throw new Error(
+        `sha256 mismatch: the pulled bytes hash to ${sha256}, the media row says ${expectedSha256} — not cached`
+      );
+    }
     await fsp.rename(part, target);
   } catch (err) {
     await fsp.unlink(part).catch(() => {});
@@ -274,7 +400,8 @@ async function pullToCache(
   }
   const ms = Date.now() - started;
   console.log(
-    `${tag}: pulled ${blobName} into the media cache, ${(bytes / 1024 / 1024).toFixed(1)} MB in ${(ms / 1000).toFixed(1)}s`
+    `${tag}: pulled ${blobName} into the media cache, ${(bytes / 1024 / 1024).toFixed(1)} MB in ${(ms / 1000).toFixed(1)}s` +
+      (expectedSha256 ? ' (sha256 verified)' : '')
   );
   return target;
 }

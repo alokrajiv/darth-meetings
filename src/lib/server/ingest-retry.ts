@@ -9,7 +9,8 @@ import {
   type TranscriptRow,
 } from '@/db-ops/transcripts';
 import { relinkRecordingTranscript } from '@/db-ops/recorder';
-import { audioFileExists } from '@/lib/server/audio-storage';
+import { copyPathToAudioTemp, deleteAudioFile } from '@/lib/server/audio-storage';
+import { storedFileSource, withHeldStoredFiles } from '@/lib/server/stored-media';
 import { IngestError, ingestLocalAudio } from '@/lib/server/ingest';
 import { queueRecordingGraphSync } from '@/lib/server/recording-sync';
 import { borrowedMediaReason, madeFromRecordingId } from '@/lib/made-early';
@@ -70,7 +71,8 @@ export async function retryIngest(
     }
     const borrowed = borrowedMediaReason(fresh);
     if (borrowed) return await retryBorrower(fresh, borrowed, trigger);
-    if (!fresh.local_audio_path || !(await audioFileExists(fresh.local_audio_path))) {
+    const source = fresh.local_audio_path ? await storedFileSource(fresh.local_audio_path) : null;
+    if (!fresh.local_audio_path || !source?.held) {
       await markIngestFailed(
         fresh.user_id,
         fresh.assemblyai_id,
@@ -79,7 +81,27 @@ export async function retryIngest(
       );
       return { ok: false, error: 'Stored file is missing — cannot retry' };
     }
+    // Stage D: the local copy was evicted but the bytes are archived. The
+    // ingest treats its input as a temp (rewrites, renames, deletes it), so it
+    // is handed a fresh COPY under the audio dir — never the media-cache entry
+    // — made while the pulled file is held, and released straight after.
+    let ingestInput = fresh.local_audio_path;
+    if (source.localBytes === null) {
+      const copied = await withHeldStoredFiles([source.media], 'canonical', 'ingest-retry', ([local]) =>
+        copyPathToAudioTemp(local!.path)
+      ).catch((err) => {
+        console.warn(`[ingest-retry] ${fresh.assemblyai_id}: archived copy could not be fetched:`, err);
+        return { ok: false as const };
+      });
+      if (!copied.ok) {
+        // Transient (the archive or the cache): the row stays retryable and
+        // the sweeper's backoff tries again.
+        return { ok: false, error: 'The archived recording could not be fetched — try again in a few minutes' };
+      }
+      ingestInput = copied.value;
+    }
     if (!(await resetForIngestRetry(fresh.user_id, fresh.assemblyai_id))) {
+      if (ingestInput !== fresh.local_audio_path) await deleteAudioFile(ingestInput).catch(() => {});
       return { ok: false, error: 'Row changed under us' };
     }
     console.log(`[ingest-retry] ${fresh.assemblyai_id} attempt ${failure.attempts + 1} (${trigger})`);
@@ -89,7 +111,7 @@ export async function retryIngest(
     }, 60_000);
     heartbeat.unref?.();
     try {
-      const out = await ingestLocalAudio(fresh.user_id, fresh.local_audio_path, {
+      const out = await ingestLocalAudio(fresh.user_id, ingestInput, {
         originalFilename: failure.opts.originalFilename,
         languageCode: failure.opts.languageCode,
         title: failure.opts.title ?? fresh.title ?? null,

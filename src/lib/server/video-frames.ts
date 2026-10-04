@@ -92,7 +92,10 @@ export async function hasVideoStream(audioFilename: string): Promise<boolean> {
     videoStreamCache.set(audioFilename, has);
     return has;
   } catch {
-    videoStreamCache.set(audioFilename, false);
+    // A FAILED probe is not a verdict: the file may have gone between the
+    // stat and ffprobe (Stage D evicts local copies), or ffprobe timed out.
+    // Answer false for now but never cache it — only a probe that ran says
+    // what the file holds.
     return false;
   }
 }

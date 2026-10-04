@@ -16,9 +16,16 @@ import {
   drainPendingBlobDeletes,
   fmtBytes,
   localMediaPath,
+  verifyArchivedBlob,
 } from '@/lib/server/media-archive';
+import { evictFilesPerTick, evictionPass, mediaEvictFlagOn } from '@/lib/server/media-evict';
 import { sweepPendingLocalCopies } from '@/lib/server/aai-from-blob';
-import { listMediaToArchive } from '@/db-ops/recordings';
+import {
+  evictedSourceStems,
+  listMediaToArchive,
+  listMediaToVerify,
+  mediaEvictionColumnsExist,
+} from '@/db-ops/recordings';
 import type { GmeetContext } from '@/lib/format';
 import { unlessDraining } from '@/lib/server/deploy-drain';
 import { precutBackstopPass } from '@/lib/server/clip-precut';
@@ -54,6 +61,13 @@ import { precutBackstopPass } from '@/lib/server/clip-precut';
  * permanent media container, oldest first, at most 2 GB / 5 files per tick and
  * never while an ingest or an AI run is in flight. It is last in the tick and
  * inert unless DARTH_MEDIA_ACCOUNT and MW_MEDIA_ARCHIVE are both set.
+ *
+ * After it, DEC-3 Stage D (docs/recordings-stage-d-spec.md): the READ-BACK
+ * verification of archived blobs (`verifyBackfillPass` — every byte streamed
+ * back from Azure and hashed, at most 10 GB / 20 files per tick), and, only
+ * with MW_MEDIA_EVICT=1, the eviction of local copies verified at least 7 days
+ * ago (`evictionPass`, media-evict.ts). Both are inert unless the archive is
+ * configured and migration 051 is applied.
  *
  * And the other direction, DEC-3 Stage C (`aai-from-blob.ts`): a recording
  * whose bytes went to AssemblyAI straight from the blob has no local copy
@@ -104,6 +118,24 @@ function archiveCaps(): { maxFiles: number; maxBytes: number; scan: number } {
   // Candidates read per tick; the extra ones absorb rows whose file is gone.
   return { maxFiles, maxBytes, scan: Math.max(50, maxFiles + 25) };
 }
+/**
+ * Stage D's read-back budget per tick: 20 files / 10 GB by default (today's
+ * 108 GB container is verified in about an hour of ticks), both raisable from
+ * the env like the archive's; `scripts/media-archive-status.ts --verify`
+ * drains faster. Reads are in-region and free.
+ */
+const VERIFY_FILES_PER_TICK_ENV = 'MW_VERIFY_FILES_PER_TICK';
+const VERIFY_GB_PER_TICK_ENV = 'MW_VERIFY_GB_PER_TICK';
+const VERIFY_MAX_FILES_PER_TICK = 20;
+const VERIFY_MAX_BYTES_PER_TICK = 10 * 1024 * 1024 * 1024;
+function verifyCaps(): { maxFiles: number; maxBytes: number; scan: number } {
+  const files = Number.parseInt(process.env[VERIFY_FILES_PER_TICK_ENV] ?? '', 10);
+  const gb = Number.parseFloat(process.env[VERIFY_GB_PER_TICK_ENV] ?? '');
+  const maxFiles = Number.isFinite(files) && files > 0 ? files : VERIFY_MAX_FILES_PER_TICK;
+  const maxBytes =
+    Number.isFinite(gb) && gb > 0 ? Math.round(gb * 1024 * 1024 * 1024) : VERIFY_MAX_BYTES_PER_TICK;
+  return { maxFiles, maxBytes, scan: maxFiles + 25 };
+}
 /** Blobs whose rows are already gone, retried per tick. */
 const ARCHIVE_DELETE_PER_TICK = 25;
 /** Stage C local copies fetched per tick — a whole recording each. */
@@ -143,7 +175,7 @@ function short(e: string): string {
  * marker. Serial per row; rows are deduped on assemblyai_id so the import
  * hook and the sweeper never run ffmpeg twice on one file.
  */
-async function prepareRow(row: MediaRow, opts: { nice: boolean; tag: string }): Promise<void> {
+export async function prepareRow(row: MediaRow, opts: { nice: boolean; tag: string }): Promise<void> {
   const { primary, parts } = storedFiles(row);
   if (!primary) return;
   const files = [primary, ...parts];
@@ -152,10 +184,31 @@ async function prepareRow(row: MediaRow, opts: { nice: boolean; tag: string }): 
   let audioOk = true;
   const errors: string[] = [];
   const report: string[] = [];
+  // Stage D: a file whose local copy is gone but whose bytes are in the
+  // archive (`blob_name` + `sha256` on its canonical/part row) has nothing to
+  // prepare here — the extract and the remux are made from a LOCAL file, and
+  // re-populating `storage/` is exactly what Stage D must not do. It counts
+  // as done (no error, no attempt), not as "file missing" three times over.
+  // Asked once per row, only when something is missing; a failed lookup
+  // keeps today's answer (missing).
+  let archived: Map<string, unknown> | null = null;
+  const archivedOf = async (f: string): Promise<boolean> => {
+    if (!archived) {
+      const missing: string[] = [];
+      for (const name of files) if (!(await audioFileExists(name))) missing.push(name);
+      const { archivedStoredFiles } = await import('@/db-ops/media-readers');
+      archived = await archivedStoredFiles(missing).catch(() => new Map());
+    }
+    return archived.has(f);
+  };
 
   for (const [i, f] of files.entries()) {
     const label = i === 0 ? 'primary' : `part${i + 1}`;
     if (!(await audioFileExists(f))) {
+      if (await archivedOf(f)) {
+        report.push(`${label} archived, not on disk — nothing to prepare`);
+        continue;
+      }
       faststartOk = false;
       audioOk = false;
       errors.push(`${label}: file missing (${f})`);
@@ -294,13 +347,44 @@ async function listMediaPrepCandidates(limit: number): Promise<MediaRow[]> {
  * ingest-retry promotions, re-transcribes — and anything that slipped).
  * Crashed transcodes leave `<stem>.m4a.tmp`; those are removed once stale.
  */
-async function sweepOrphanDerivatives(): Promise<void> {
+export async function sweepOrphanDerivatives(): Promise<void> {
   const dir = getAudioOnlyDir();
   const entries = await fsp.readdir(dir).catch(() => null);
   if (!entries || entries.length === 0) return;
   const sources = await fsp.readdir(getAudioDir()).catch(() => null);
   if (!sources) return; // can't tell what is live — do nothing
   const liveStems = new Set(sources.map((f) => path.parse(f).name));
+  // Stage D: a source whose local copy was EVICTED is still live — its blob is
+  // the copy. Without this, evicting a canonical would make its extract look
+  // orphaned, and removing the extract also drops its row and queues its blob
+  // for deletion (`queueDerivativeMediaDrop`). Asked only for the stems that
+  // would otherwise go, and only where migration 051 exists; a failed lookup
+  // removes nothing this tick.
+  const wouldGo = entries
+    .filter((f) => f.endsWith('.m4a') && !liveStems.has(path.parse(f).name))
+    .map((f) => path.parse(f).name);
+  if (wouldGo.length > 0 && (await mediaEvictionColumnsExist().catch(() => false))) {
+    const evicted = await evictedSourceStems(wouldGo).catch(() => null);
+    if (!evicted) return;
+    for (const stem of evicted) liveStems.add(stem);
+  }
+  // Orphan-ness is a DATABASE decision, not a disk one (Stage D readers,
+  // docs/recordings-stage-d-spec.md "As built — readers"): an extract is an
+  // orphan only when NO canonical/part media row and no meeting
+  // (`local_audio_path`, `videoParts[].filename`, trashed ones included) still
+  // names its stem. A source that is merely not on this disk — evicted, a
+  // Stage C copy still landing, a blue/green slot that never had it — keeps its
+  // extract. A failed lookup removes nothing this tick.
+  const stillUnnamed = wouldGo.filter((stem) => !liveStems.has(stem));
+  if (stillUnnamed.length > 0) {
+    const { stemsStillNamed } = await import('@/db-ops/media-readers');
+    const named = await stemsStillNamed(stillUnnamed).catch((err) => {
+      console.warn('[media-sweeper] orphan check: source lookup failed, nothing removed this tick:', err);
+      return null;
+    });
+    if (!named) return;
+    for (const stem of named) liveStems.add(stem);
+  }
   const now = Date.now();
   /** Files removed below, so their `recording_media` rows can go too. */
   const dropped: string[] = [];
@@ -319,7 +403,9 @@ async function sweepOrphanDerivatives(): Promise<void> {
     if (liveStems.has(stem)) continue;
     await fsp.unlink(abs).catch(() => {});
     dropped.push(f);
-    console.log(`[media-sweeper] removed orphan derivative ${f} (no source ${stem}.* in the audio dir)`);
+    console.log(
+      `[media-sweeper] removed orphan derivative ${f} (no source ${stem}.* in the audio dir, none named in the database)`
+    );
   }
   queueDerivativeMediaDrop(dropped, '[media-sweeper]');
 }
@@ -404,6 +490,67 @@ async function archiveBackfillPass(): Promise<void> {
   await drainPendingBlobDeletes(ARCHIVE_DELETE_PER_TICK);
 }
 
+/**
+ * DEC-3 Stage D — the read-back (docs/recordings-stage-d-spec.md "Code"):
+ * archived blobs nobody has read back yet (or whose last read-back failed more
+ * than 24 h ago), oldest capture first, streamed from Azure through sha256 by
+ * `verifyArchivedBlob`. Paced exactly like the archive backfill — skipped
+ * while an ingest or an AI run is in flight, re-checked every
+ * ARCHIVE_YIELD_CHECK_EVERY files, stopped at the per-tick caps (a single
+ * blob larger than the byte cap is still read, alone, first).
+ *
+ * One `[media-verify] tick:` line when something happened. Inert — not one
+ * query — without an archive store; one cached probe without migration 051.
+ */
+async function verifyBackfillPass(): Promise<void> {
+  if (!archiveStore()) return;
+  if (!(await mediaEvictionColumnsExist().catch(() => false))) return;
+  const yieldTo = await archiveShouldYield();
+  if (yieldTo) {
+    console.log(`[media-verify] read-back skipped — ${yieldTo}`);
+    return;
+  }
+
+  const caps = verifyCaps();
+  const candidates = await listMediaToVerify(caps.scan);
+  if (candidates.length === 0) return;
+
+  let files = 0;
+  let bytes = 0;
+  let mismatched = 0;
+  const report: string[] = [];
+  for (const row of candidates) {
+    if (files > 0 && files % ARCHIVE_YIELD_CHECK_EVERY === 0) {
+      const now = await archiveShouldYield();
+      if (now) {
+        report.push(`paused — ${now}`);
+        break;
+      }
+    }
+    if (archiveBudgetVerdict({ files, bytes }, row.bytes ?? 0, caps) === 'stop') break;
+    const out = await verifyArchivedBlob(row);
+    if (out.status === 'verified') {
+      files += 1;
+      bytes += out.bytes;
+    } else if (out.status === 'mismatch') {
+      // Counted against the budget too: the bytes were (mostly) read.
+      files += 1;
+      bytes += row.bytes ?? 0;
+      mismatched += 1;
+    } else {
+      report.push(`skipped (${out.reason})`);
+    }
+  }
+
+  if (files > 0 || report.length > 0) {
+    console.log(
+      `[media-verify] tick: ${files - mismatched} verified, ${fmtBytes(bytes)} read back` +
+        (mismatched > 0 ? `, ${mismatched} MISMATCH (see media-archive-status.ts)` : '') +
+        (report.length > 0 ? ` | ${report.join(' | ')}` : '')
+    );
+  }
+}
+
 async function tick(): Promise<void> {
   if (g.__mwMediaSweeperTicking) return; // a long extract can outlive the interval
   g.__mwMediaSweeperTicking = true;
@@ -446,6 +593,18 @@ async function tick(): Promise<void> {
     await archiveBackfillPass();
   } catch (err) {
     console.warn('[media-archive] backfill pass failed:', err);
+  }
+  try {
+    // Stage D: read back what the archive stamped, then — only when
+    // MW_MEDIA_EVICT is on — drop local copies verified long enough ago.
+    await verifyBackfillPass();
+  } catch (err) {
+    console.warn('[media-verify] read-back pass failed:', err);
+  }
+  try {
+    if (mediaEvictFlagOn()) await evictionPass({ files: evictFilesPerTick(), by: 'sweeper' });
+  } catch (err) {
+    console.warn('[media-evict] eviction pass failed:', err);
   } finally {
     g.__mwMediaSweeperTicking = false;
   }

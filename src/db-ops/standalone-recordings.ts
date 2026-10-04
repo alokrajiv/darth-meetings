@@ -611,10 +611,23 @@ export async function meetingsHoldingRecording(
 
 /** INTERNAL-ONLY — the playable files of a recording, canonical first. */
 export async function standaloneMedia(recordingId: string): Promise<
-  Array<{ id: string; kind: string; ord: number; filename: string | null; blob_name: string | null; has_video: boolean | null }>
+  Array<{
+    id: string;
+    kind: string;
+    ord: number;
+    filename: string | null;
+    blob_name: string | null;
+    has_video: boolean | null;
+    /** Stage D readers: an archived file (`blob_name` + `sha256`) is held
+     * even when its local copy is gone; `bytes` sizes it without a stat. */
+    sha256: string | null;
+    bytes: number | null;
+    of_media_id: string | null;
+  }>
 > {
   return sql`
-    SELECT id, kind, ord, filename, blob_name, has_video
+    SELECT id, kind, ord, filename, blob_name, has_video, sha256,
+           bytes::float8 AS bytes, of_media_id
     FROM ${sql(SCHEMA)}.recording_media
     WHERE recording_id = ${recordingId}::uuid
     ORDER BY CASE kind WHEN 'canonical' THEN 0 WHEN 'part' THEN 1 ELSE 2 END, ord
@@ -787,13 +800,22 @@ export async function listStandaloneIngestRetries(limit: number): Promise<
 
 /** DEC-4: completed jobs still held at AssemblyAI. */
 export async function listStandaloneAaiDeletePending(limit: number): Promise<
-  Array<{ transcription_id: string; provider_job_id: string; utterances: number; canonical_filename: string | null }>
+  Array<{
+    transcription_id: string;
+    provider_job_id: string;
+    utterances: number;
+    canonical_filename: string | null;
+    /** Stage D: an archived canonical counts as "we hold the media" (DEC-4). */
+    canonical_blob_name: string | null;
+    canonical_sha256: string | null;
+  }>
 > {
   return sql`
     SELECT t.id AS transcription_id, t.provider_job_id,
            COALESCE(jsonb_array_length(CASE WHEN jsonb_typeof(t.payload->'utterances') = 'array'
                                             THEN t.payload->'utterances' END), 0) AS utterances,
-           m.filename AS canonical_filename
+           m.filename AS canonical_filename,
+           m.blob_name AS canonical_blob_name, m.sha256 AS canonical_sha256
     FROM ${sql(SCHEMA)}.recordings r
     JOIN ${sql(SCHEMA)}.recording_transcriptions t ON t.recording_id = r.id
     LEFT JOIN ${sql(SCHEMA)}.recording_media m ON m.recording_id = r.id AND m.kind = 'canonical'

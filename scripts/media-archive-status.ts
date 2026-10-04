@@ -18,8 +18,24 @@
  * (i.e. on the VM). It reads; it never writes a blob, and the DB session is
  * opened `default_transaction_read_only` so even a bug cannot change a row.
  *
- * Exit code 0 = healthy, 1 = the canary is gone or a blob disagrees with its
- * row, 2 = refused to run.
+ * Stage D (docs/recordings-stage-d-spec.md, migration 051): per kind, how many
+ * archived files have been READ BACK and matched (verified), not yet
+ * (unverified), whose last read-back did not match (verify-failed — a human
+ * decides; the rows are listed), and whose local copy Stage D removed
+ * (evicted — a missing file is then the normal state, not a defect).
+ *
+ *   SCHEMA_PREFIX=prod bun --conditions=react-server scripts/media-archive-status.ts --verify [--limit N]
+ *
+ * `--verify` is the fast drain of the sweeper's read-back: it runs
+ * `verifyArchivedBlob` synchronously over the rows still to verify (all of
+ * them unless `--limit`), printing one OK / MISMATCH line per row and a total.
+ * It is the only mode that WRITES — the verification columns, through the
+ * app's own db-ops and connection (the report's session stays read-only) —
+ * and it needs the server libs, hence `--conditions=react-server`, plus the
+ * VM's managed identity to read the container.
+ *
+ * Exit code 0 = healthy, 1 = the canary is gone, a blob disagrees with its
+ * row or a read-back did not match, 2 = refused to run.
  */
 
 import postgres from 'postgres';
@@ -42,6 +58,7 @@ function value(name: string): string | null {
 }
 
 const CHECK_BLOBS = flag('--check-blobs');
+const VERIFY = flag('--verify');
 const VERBOSE = flag('--verbose');
 const LIMIT = Number(value('--limit') ?? 200);
 
@@ -74,6 +91,17 @@ interface TotalRow {
   no_file: number;
   archived_bytes: number;
   pending_bytes: number;
+}
+
+interface StageDRow {
+  kind: string;
+  verified: number;
+  unverified: number;
+  verify_failed: number;
+  evicted: number;
+  verified_bytes: number;
+  unverified_bytes: number;
+  evicted_bytes: number;
 }
 
 interface CanaryRow {
@@ -155,6 +183,86 @@ async function main() {
   );
 
   let bad = 0;
+
+  // ---- Stage D: read-back verification and eviction ---------------------
+  const has051 =
+    (
+      await sql<Array<{ n: number }>>`
+        SELECT count(*)::int AS n FROM information_schema.columns
+        WHERE table_schema = ${SCHEMA} AND table_name = 'recording_media'
+          AND column_name IN ('blob_verified_at', 'blob_verify_failed_at', 'local_evicted_at')
+      `
+    )[0]?.n === 3;
+  console.log('');
+  if (!has051) {
+    console.log('read-back / evict : migration 051 (media_local_eviction) not applied on this schema');
+  } else {
+    const stageD = await sql<StageDRow[]>`
+      SELECT kind,
+             count(*) FILTER (WHERE blob_verified_at IS NOT NULL AND blob_verified_sha256 = sha256)::int
+               AS verified,
+             count(*) FILTER (WHERE blob_verified_at IS NULL AND blob_verify_failed_at IS NULL)::int
+               AS unverified,
+             count(*) FILTER (WHERE blob_verified_at IS NULL AND blob_verify_failed_at IS NOT NULL)::int
+               AS verify_failed,
+             count(*) FILTER (WHERE local_evicted_at IS NOT NULL)::int AS evicted,
+             COALESCE(sum(bytes) FILTER (WHERE blob_verified_at IS NOT NULL
+                                           AND blob_verified_sha256 = sha256), 0)::float8 AS verified_bytes,
+             COALESCE(sum(bytes) FILTER (WHERE blob_verified_at IS NULL), 0)::float8 AS unverified_bytes,
+             COALESCE(sum(bytes) FILTER (WHERE local_evicted_at IS NOT NULL), 0)::float8 AS evicted_bytes
+      FROM ${sql(SCHEMA)}.recording_media
+      WHERE blob_name IS NOT NULL
+      GROUP BY kind
+      ORDER BY kind
+    `;
+    console.log(
+      `  ${pad('kind', 12)}${padL('verified', 9)}${padL('unverif.', 9)}${padL('failed', 8)}${padL('evicted', 9)}` +
+        `${padL('verified bytes', 16)}${padL('unverif. bytes', 16)}${padL('evicted bytes', 15)}`
+    );
+    const t = { v: 0, u: 0, f: 0, e: 0, vb: 0, ub: 0, eb: 0 };
+    for (const r of stageD) {
+      t.v += r.verified;
+      t.u += r.unverified;
+      t.f += r.verify_failed;
+      t.e += r.evicted;
+      t.vb += r.verified_bytes;
+      t.ub += r.unverified_bytes;
+      t.eb += r.evicted_bytes;
+      console.log(
+        `  ${pad(r.kind, 12)}${padL(r.verified, 9)}${padL(r.unverified, 9)}${padL(r.verify_failed, 8)}${padL(r.evicted, 9)}` +
+          `${padL(fmtBytes(r.verified_bytes), 16)}${padL(fmtBytes(r.unverified_bytes), 16)}${padL(fmtBytes(r.evicted_bytes), 15)}`
+      );
+    }
+    console.log(
+      `  ${pad('TOTAL', 12)}${padL(t.v, 9)}${padL(t.u, 9)}${padL(t.f, 8)}${padL(t.e, 9)}` +
+        `${padL(fmtBytes(t.vb), 16)}${padL(fmtBytes(t.ub), 16)}${padL(fmtBytes(t.eb), 15)}`
+    );
+    console.log(
+      `read-back         : verified ${t.v}/${t.v + t.u + t.f}` +
+        (t.f > 0 ? ` — ${t.f} DID NOT MATCH (a human decides; the local file, if present, is the truth)` : '')
+    );
+    console.log(
+      `evicted           : ${t.e} local cop${t.e === 1 ? 'y' : 'ies'} removed by Stage D (MW_MEDIA_EVICT=${process.env.MW_MEDIA_EVICT ?? '(unset)'}); ` +
+        'a missing local file on these rows is the normal state'
+    );
+    if (t.f > 0) {
+      bad += t.f;
+      const failed = await sql<
+        Array<{ id: string; kind: string; blob_name: string; blob_verify_failed_at: Date; blob_verify_error: string | null }>
+      >`
+        SELECT id, kind, blob_name, blob_verify_failed_at, blob_verify_error
+        FROM ${sql(SCHEMA)}.recording_media
+        WHERE blob_name IS NOT NULL AND blob_verified_at IS NULL AND blob_verify_failed_at IS NOT NULL
+        ORDER BY blob_verify_failed_at DESC
+        LIMIT 50
+      `;
+      for (const r of failed) {
+        console.log(
+          `  FAILED ${pad(r.blob_name, 48)} ${r.kind} ${r.blob_verify_failed_at.toISOString()} ${r.blob_verify_error ?? ''}`
+        );
+      }
+    }
+  }
 
   // ---- the canary (spec Stage A.4) --------------------------------------
   console.log('');
@@ -285,9 +393,63 @@ async function main() {
     }
   }
 
+  // ---- --verify: the fast drain of the read-back (Stage D) --------------
+  if (VERIFY) {
+    console.log('');
+    if (!has051) {
+      console.log('--verify          : skipped — migration 051 is not applied on this schema');
+    } else if (!mediaStore()) {
+      console.log(`--verify          : skipped — ${DARTH_MEDIA_ACCOUNT_ENV} is not set on this host`);
+    } else {
+      bad += await runVerify();
+    }
+  }
+
   console.log('─────────────────────────────────────────────────────────────');
   await sql.end();
   process.exit(bad > 0 ? 1 : 0);
+}
+
+/**
+ * `--verify`: the sweeper's read-back, run synchronously over every row still
+ * to verify (or `--limit N` of them). Imported lazily: the report above must
+ * keep working as a plain `bun run` with no server libs and no app env, and
+ * only this mode needs them. `SCHEMA_PREFIX` is already in the env (checked
+ * at the top), so the app's db layer reads the same schema.
+ */
+async function runVerify(): Promise<number> {
+  process.env.SCHEMA_PREFIX = explicitPrefix!;
+  const { verifyArchivedBlob, fmtBytes: fmt } = await import('@/lib/server/media-archive');
+  const { listMediaToVerify } = await import('@/db-ops/recordings');
+  const { sql: appSql } = await import('@/lib/db');
+  const limit = value('--limit') ? LIMIT : 1_000_000;
+  const rows = await listMediaToVerify(limit);
+  console.log(`--verify          : ${rows.length} blob(s) to read back`);
+  let ok = 0;
+  let mismatch = 0;
+  let skipped = 0;
+  let bytes = 0;
+  const started = Date.now();
+  for (const r of rows) {
+    const out = await verifyArchivedBlob(r);
+    if (out.status === 'verified') {
+      ok += 1;
+      bytes += out.bytes;
+      console.log(`  OK       ${pad(r.blob_name ?? '', 48)} ${pad(r.kind, 11)} ${fmt(out.bytes)} ${(out.ms / 1000).toFixed(1)}s`);
+    } else if (out.status === 'mismatch') {
+      mismatch += 1;
+      console.log(`  MISMATCH ${pad(r.blob_name ?? '', 48)} ${pad(r.kind, 11)} ${out.error}`);
+    } else {
+      skipped += 1;
+      console.log(`  SKIPPED  ${pad(r.blob_name ?? '', 48)} ${pad(r.kind, 11)} ${out.reason}`);
+    }
+  }
+  console.log(
+    `--verify          : ${ok} verified (${fmt(bytes)} in ${((Date.now() - started) / 1000).toFixed(0)}s), ` +
+      `${mismatch} MISMATCH, ${skipped} skipped`
+  );
+  await appSql.end();
+  return mismatch;
 }
 
 main().catch(async (err) => {
