@@ -7,6 +7,7 @@ import { SCHEMAS } from '@/lib/constants/database';
 import { getStorageDir } from '@/lib/server/audio-storage';
 import { getAudioOnlyPath } from '@/lib/server/audio-only';
 import {
+  archiveMedia,
   archiveShouldYield,
   archiveStore,
   canaryGate,
@@ -266,17 +267,11 @@ export async function evictLocalCopy(
 
   // 4. The bytes on disk are the bytes that were verified.
   if (st.size !== row.bytes) {
-    await clearMediaVerification(mediaId);
-    const reason = `local file is ${st.size} B, the verified blob is ${row.bytes} B — rewritten after the read-back`;
-    console.warn(`[media-evict] ${row.kind} ${row.filename}: ${reason}; verification cleared, nothing deleted`);
-    return { status: 'rewritten', mediaId, reason };
+    return rewritten(row, `local file is ${st.size} B, the verified blob is ${row.bytes} B — rewritten after the read-back`);
   }
   const localSha256 = await sha256OfFile(abs);
   if (localSha256 !== row.sha256) {
-    await clearMediaVerification(mediaId);
-    const reason = `local sha256 ${localSha256} is not the verified ${row.sha256} — rewritten after the read-back`;
-    console.warn(`[media-evict] ${row.kind} ${row.filename}: ${reason}; verification cleared, nothing deleted`);
-    return { status: 'rewritten', mediaId, reason };
+    return rewritten(row, `local sha256 ${localSha256} is not the verified ${row.sha256} — rewritten after the read-back`);
   }
   // Hashing a 3 GB file takes a while; a write during it shows up here.
   const again = await fsp.lstat(abs).catch(() => null);
@@ -349,6 +344,36 @@ export interface EvictionPassSummary {
  * log line per tick, and only when something happened. Inert — not one query
  * — without an archive store; inert after one probe without migration 051.
  */
+/**
+ * The file on disk is not the file that was read back: something rewrote it in
+ * place AFTER the stamp (the faststart remux, the 2026-09-25 track-disposition
+ * fix run with `--skip-archive`, …). The local file is the newer truth, so the
+ * blob is brought up to date from it — `archiveMedia` with `rehash` overwrites
+ * the blob under the same name and re-stamps the row (sha256, bytes, Stage D
+ * columns reset). The verify pass then reads it back, and the eviction after
+ * that deletes the local copy — without this the row would bounce between
+ * "verified" and "rewritten" every tick, forever. Nothing is deleted here.
+ */
+async function rewritten(row: RecordingMediaRow, reason: string): Promise<EvictOutcome> {
+  await clearMediaVerification(row.id);
+  let tail: string;
+  try {
+    const re = await archiveMedia(row, { rehash: true });
+    tail =
+      re.status === 'archived' || re.status === 'adopted'
+        ? `; re-archived from the local file (${fmtBytes(re.bytes)}, ${re.sha256.slice(0, 12)}…)`
+        : re.status === 'skipped'
+          ? `; re-archive skipped (${re.reason})`
+          : re.status === 'failed'
+            ? `; re-archive failed (${redactSasInText(re.error)})`
+            : '; re-archive off';
+  } catch (err) {
+    tail = `; re-archive failed (${redactSasInText(err instanceof Error ? err.message : String(err))})`;
+  }
+  console.warn(`[media-evict] ${row.kind} ${row.filename}: ${reason}; verification cleared, nothing deleted${tail}`);
+  return { status: 'rewritten', mediaId: row.id, reason: reason + tail };
+}
+
 export async function evictionPass(opts: { files: number; by: string }): Promise<EvictionPassSummary> {
   const summary: EvictionPassSummary = {
     evicted: 0,

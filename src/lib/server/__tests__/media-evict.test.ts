@@ -491,14 +491,25 @@ describe('reasons not to delete', () => {
     writeFileSync(abs, changed);
     const old = new Date(Date.now() - 2 * 3600_000);
     utimesSync(abs, old, old);
+    // media puts only — the first archive in 36 h also writes a canary blob
+    const mediaPuts = () => store.calls.filter((c) => c.startsWith('putStream') && !c.includes('_canary')).length;
+    const putsBefore = mediaPuts();
     const out = await evict.evictLocalCopy(v as never, { by: BY, store });
     expect(out.status).toBe('rewritten');
     expect(existsSync(abs)).toBe(true);
     const live = db.media.get(row.id)!;
     expect(live.blob_verified_at).toBeNull();
-    expect(live.blob_name).toBe(row.blob_name); // the STAMP is not touched
+    expect(live.blob_name).toBe(row.blob_name); // same blob name — the blob is OVERWRITTEN from the local file
     expect(live.local_evicted_at).toBeNull();
     expect(db.ledger).toEqual([]);
+    // The local file is the newer truth: it was re-archived in the same call,
+    // so the row's hash now describes the file on disk and the next verify +
+    // evict ticks can finish the job instead of bouncing forever.
+    const newSha = createHash('sha256').update(changed).digest('hex');
+    expect(live.sha256).toBe(newSha);
+    expect(live.bytes).toBe(changed.length);
+    expect(mediaPuts()).toBe(putsBefore + 1);
+    expect(out.status === 'rewritten' && out.reason).toContain('re-archived from the local file');
   });
 
   test('rewritten with a different size → same', async () => {
