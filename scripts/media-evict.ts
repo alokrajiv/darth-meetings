@@ -5,6 +5,7 @@
  *   SCHEMA_PREFIX=prod bun --conditions=react-server scripts/media-evict.ts
  *   SCHEMA_PREFIX=prod bun --conditions=react-server scripts/media-evict.ts --min-age-days 0 --limit 50
  *   SCHEMA_PREFIX=prod bun --conditions=react-server scripts/media-evict.ts --apply [--limit N] [--largest-first]
+ *   SCHEMA_PREFIX=prod bun --conditions=react-server scripts/media-evict.ts --apply --media-id <uuid>[,<uuid>…]
  *   SCHEMA_PREFIX=prod bun --conditions=react-server scripts/media-evict.ts --orphans
  *
  * The dry run prints the candidate table — media id, kind, bytes, captured,
@@ -46,7 +47,7 @@ function value(name: string): string | null {
 if (flag('--help') || flag('-h')) {
   console.log(
     'usage: SCHEMA_PREFIX=<p> bun --conditions=react-server scripts/media-evict.ts ' +
-      '[--apply] [--limit N] [--min-age-days N] [--largest-first] [--orphans]'
+      '[--apply] [--limit N] [--min-age-days N] [--largest-first] [--media-id <uuid>[,…]] [--orphans]'
   );
   process.exit(0);
 }
@@ -56,6 +57,13 @@ const ORPHANS = flag('--orphans');
 const LARGEST_FIRST = flag('--largest-first');
 const LIMIT = Number(value('--limit') ?? 200);
 const MIN_AGE_RAW = value('--min-age-days');
+// `--media-id a,b` restricts the run to those recording_media ids (still only
+// if they pass every gate: verified, aged, not evicted). For the cold-cache
+// proof of one chosen row, and for re-trying a row the sweeper skipped.
+const MEDIA_IDS = (value('--media-id') ?? '')
+  .split(',')
+  .map((s) => s.trim().toLowerCase())
+  .filter(Boolean);
 
 if (!Number.isInteger(LIMIT) || LIMIT <= 0) {
   console.error('refused: --limit takes a positive integer');
@@ -63,6 +71,10 @@ if (!Number.isInteger(LIMIT) || LIMIT <= 0) {
 }
 if (MIN_AGE_RAW !== null && !(Number.parseFloat(MIN_AGE_RAW) >= 0)) {
   console.error('refused: --min-age-days takes a number ≥ 0');
+  process.exit(2);
+}
+if (MEDIA_IDS.some((id) => !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(id))) {
+  console.error('refused: --media-id takes comma-separated uuids');
   process.exit(2);
 }
 if (APPLY && ORPHANS) {
@@ -186,11 +198,21 @@ async function main(): Promise<number> {
   }
 
   const minAgeDays = MIN_AGE_RAW !== null ? Number.parseFloat(MIN_AGE_RAW) : evictAfterDays();
-  const rows = await listEvictableMedia({ minAgeDays, limit: LIMIT, largestFirst: LARGEST_FIRST });
+  const all = await listEvictableMedia({
+    minAgeDays,
+    limit: MEDIA_IDS.length ? Math.max(LIMIT, 100_000) : LIMIT,
+    largestFirst: LARGEST_FIRST,
+  });
+  const rows = MEDIA_IDS.length ? all.filter((r) => MEDIA_IDS.includes(String(r.id).toLowerCase())) : all;
   console.log(
     `candidates        : ${rows.length} (verified ≥ ${minAgeDays} day(s) ago, not evicted, ` +
-      `${LARGEST_FIRST ? 'largest' : 'oldest capture'} first, limit ${LIMIT})`
+      `${LARGEST_FIRST ? 'largest' : 'oldest capture'} first, limit ${LIMIT}` +
+      `${MEDIA_IDS.length ? `, only ${MEDIA_IDS.length} requested id(s)` : ''})`
   );
+  if (MEDIA_IDS.length && rows.length < MEDIA_IDS.length) {
+    const found = new Set(rows.map((r) => String(r.id).toLowerCase()));
+    for (const id of MEDIA_IDS) if (!found.has(id)) console.log(`  not a candidate   : ${id} (unknown, unverified, too young, or already evicted)`);
+  }
   console.log('');
   console.log(
     `  ${pad('media id', 37)}${pad('kind', 11)}${padL('bytes', 10)}  ${pad('captured', 17)} ${pad('verified at', 17)} path`

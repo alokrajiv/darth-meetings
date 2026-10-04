@@ -67,7 +67,7 @@ else
   committed="UNCOMMITTED (--force-dirty)"
 fi
 sha="$(shasum -a 256 "$FILE" | cut -c1-12)"
-say "$FILE — $(wc -l < "$FILE" | tr -d ' ') lines, sha256 $sha…, $committed"
+say "$FILE — $(wc -l < "$FILE" | tr -d ' ') lines, sha256 ${sha}…, $committed"
 
 # ---- what the file creates / alters (for the eye) ----------------------------
 say "objects named in the file:"
@@ -104,4 +104,4 @@ remote_psql_stdin "--single-transaction -f -" < "$FILE" | sed 's/^/      /' \
 
 say "prod schema $SCHEMA after:"
 remote_psql "-c \"$COUNTS_SQL\"" | sed 's/^/      /'
-say "applied $FILE ($sha…) at $(TZ=Asia/Singapore date '+%Y-%m-%d %H:%M SGT')"
+say "applied $FILE (${sha}…) at $(TZ=Asia/Singapore date '+%Y-%m-%d %H:%M SGT')"
