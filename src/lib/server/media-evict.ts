@@ -33,7 +33,7 @@ import {
  * Removes the LOCAL copy of a media file under `storage/audio/` or
  * `storage/audio-only/` once its blob has been read back from Azure and
  * matched (`verifyArchivedBlob`, media-archive.ts) at least
- * `MW_MEDIA_EVICT_AFTER_DAYS` (default 7) days ago. Shared by the sweeper's
+ * `MW_MEDIA_EVICT_AFTER_DAYS` (default 0: as soon as it is verified) days ago. Shared by the sweeper's
  * pass (`evictionPass`, only with `MW_MEDIA_EVICT=1`) and the operator script
  * (`scripts/media-evict.ts`, dry-run unless `--apply`). Work that needs the
  * bytes afterwards gets them from the bounded cache (`ensureLocalMedia`).
@@ -71,7 +71,7 @@ export const EVICT_FILES_PER_TICK_ENV = 'MW_EVICT_FILES_PER_TICK';
 /** A file modified more recently than this is being worked on — leave it. */
 export const MEDIA_EVICT_MTIME_MIN_MS = 60 * 60 * 1000;
 
-const DEFAULT_EVICT_AFTER_DAYS = 7;
+const DEFAULT_EVICT_AFTER_DAYS = 0;
 const DEFAULT_EVICT_FILES_PER_TICK = 20;
 /** The pass re-asks `archiveShouldYield` every this many files (spec "Code"). */
 const EVICT_YIELD_CHECK_EVERY = 5;
@@ -85,9 +85,10 @@ export function mediaEvictFlagOn(): boolean {
 }
 
 /**
- * Days between the read-back and the deletion. 7 by default: the blob's 14-day
- * soft delete, and any post-archive rewrite (remux, re-encode) has long
- * settled by then (spec "Decisions"). 0 is allowed (the script's full view).
+ * Days between the read-back and the deletion. 0 by default (Alok, 2026-10-04:
+ * "just delete already verified after adding to db") — the read-back + ledger
+ * are the safety, not time; a rewrite after the stamp is caught by the
+ * pre-delete re-hash and re-archived (`rewritten`). Set >0 for a cooling-off.
  */
 export function evictAfterDays(): number {
   const raw = (process.env[MEDIA_EVICT_AFTER_DAYS_ENV] ?? '').trim();

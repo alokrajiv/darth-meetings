@@ -413,11 +413,13 @@ describe('the read-back (verifyArchivedBlob)', () => {
 });
 
 describe('verify → age gate → evict', () => {
-  test('the happy path: ledger row, local_evicted_at, file gone — only once the age gate passes', async () => {
+  test('the happy path: ledger row, local_evicted_at, file gone — only once a configured age gate passes', async () => {
     const { row, abs, bytes } = archived();
     await verifyArchivedBlob(row as never);
 
-    // Verified a moment ago: inside the 7-day gate, nothing is a candidate.
+    // With a 7-day cooling-off configured and the row verified a moment ago,
+    // nothing is a candidate (the default gate is 0: see 'defaults').
+    process.env.MW_MEDIA_EVICT_AFTER_DAYS = '7';
     let pass = await evict.evictionPass({ files: 20, by: 'sweeper' });
     expect(pass.evicted).toBe(0);
     expect(existsSync(abs)).toBe(true);
@@ -449,6 +451,7 @@ describe('verify → age gate → evict', () => {
   test('MW_MEDIA_EVICT_AFTER_DAYS moves the gate', async () => {
     const { row } = archived();
     await verifiedAgo(row, 2);
+    process.env.MW_MEDIA_EVICT_AFTER_DAYS = '7';
     expect((await evict.evictionPass({ files: 20, by: 'sweeper' })).evicted).toBe(0);
     process.env.MW_MEDIA_EVICT_AFTER_DAYS = '1';
     expect((await evict.evictionPass({ files: 20, by: 'sweeper' })).evicted).toBe(1);
@@ -708,13 +711,13 @@ describe('flags and caps are read lazily', () => {
     delete process.env.MW_MEDIA_EVICT;
     expect(evict.mediaEvictFlagOn()).toBe(false);
   });
-  test('defaults: 7 days, 20 files; 0 days allowed', () => {
-    expect(evict.evictAfterDays()).toBe(7);
-    expect(evict.evictFilesPerTick()).toBe(20);
-    process.env.MW_MEDIA_EVICT_AFTER_DAYS = '0';
+  test('defaults: 0 days, 20 files; a cooling-off is opt-in', () => {
     expect(evict.evictAfterDays()).toBe(0);
-    process.env.MW_MEDIA_EVICT_AFTER_DAYS = 'junk';
+    expect(evict.evictFilesPerTick()).toBe(20);
+    process.env.MW_MEDIA_EVICT_AFTER_DAYS = '7';
     expect(evict.evictAfterDays()).toBe(7);
+    process.env.MW_MEDIA_EVICT_AFTER_DAYS = 'junk';
+    expect(evict.evictAfterDays()).toBe(0);
     process.env.MW_EVICT_FILES_PER_TICK = '3';
     expect(evict.evictFilesPerTick()).toBe(3);
     expect(evict.MEDIA_EVICT_MTIME_MIN_MS).toBe(3600_000);

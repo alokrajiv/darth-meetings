@@ -39,8 +39,9 @@ Nothing in this stage writes to the blob container except the lifecycle canary t
   one transaction BEFORE the unlink. A crash between the two leaves a file on disk that the ledger says is
   gone — harmless (the next pass sees `local_evicted_at` set and skips the row; `scripts/media-evict.ts
   --orphans` lists such files). The opposite order could delete a file with no record of it.
-- **Age gate: 7 days from verification, env-tunable** (`MW_MEDIA_EVICT_AFTER_DAYS`, default 7). Reason: the
-  14-day blob soft delete and the rule that any post-archive rewrite (remux, re-encode) has long settled.
+- **Age gate: none by default, env-tunable** (`MW_MEDIA_EVICT_AFTER_DAYS`, default 0 — was 7 until the 2026-10-04
+  rollout; Alok: the read-back and the ledger are the safety, not time). A rewrite after the stamp is caught by
+  the pre-delete re-hash and the row is re-archived from the local file (`rewritten`, 6ef19b9).
 - **Oldest capture first**, caps per tick. A drain of today's 110 GB is a few hours of 5-minute ticks; the
   script can drain faster.
 - **Frames (`storage/frames/`, 238 MB) are untouched.** They are already a cache keyed on the blob (c972097).
@@ -214,7 +215,7 @@ deviations:
 | Env | Default | Meaning |
 |---|---|---|
 | `MW_MEDIA_EVICT` | off | `1`/`true`: the sweeper's eviction pass runs |
-| `MW_MEDIA_EVICT_AFTER_DAYS` | 7 | days from read-back to delete (0 allowed) |
+| `MW_MEDIA_EVICT_AFTER_DAYS` | 0 | days from read-back to delete (>0 = cooling-off) |
 | `MW_EVICT_FILES_PER_TICK` | 20 | deletions per tick |
 | `MW_VERIFY_FILES_PER_TICK` / `MW_VERIFY_GB_PER_TICK` | 20 / 10 | read-backs per tick |
 | `MW_MEDIA_CACHE_MIN_FREE_BYTES` | 5 GiB | free space the cache's filesystem keeps after a pull |
