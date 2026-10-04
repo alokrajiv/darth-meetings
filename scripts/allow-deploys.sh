@@ -11,6 +11,7 @@
 #   poc/mac-recorder/make-app.sh --release        tray: build + notarize the release zip
 #   deploy/vm-setup-blue-green.sh                 server: one-time blue/green VM setup (idempotent)
 #   ../admin/scripts/deploy.sh                    admin app: rsync + build + pm2 restart on .6
+#   scripts/vm-apply-migration.sh NNN             server: apply migrations/NNN_*.sql to prod PG on .6
 #   cd ../desktop && npm run release / deploy    desktop shell: signed build + publish to cli-dist
 #
 # settings.local.json is per-machine and git-ignored by Claude Code; allow rules take
@@ -31,6 +32,10 @@ RULES=(
   "Bash(deploy/vm-setup-blue-green.sh:*)"
   "Bash(./deploy/vm-setup-blue-green.sh)"
   "Bash(./deploy/vm-setup-blue-green.sh:*)"
+  "Bash(scripts/vm-apply-migration.sh)"
+  "Bash(scripts/vm-apply-migration.sh:*)"
+  "Bash(./scripts/vm-apply-migration.sh)"
+  "Bash(./scripts/vm-apply-migration.sh:*)"
   "Bash(../admin/scripts/deploy.sh)"
   "Bash(../admin/scripts/deploy.sh:*)"
   "Bash(/Users/alokrajiv/crp-workspace/darth/admin/scripts/deploy.sh)"
