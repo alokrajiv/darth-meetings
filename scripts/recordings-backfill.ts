@@ -199,6 +199,24 @@ async function main() {
     byAaiId.set(row.assemblyai_id, [...(byAaiId.get(row.assemblyai_id) ?? []), row]);
   }
 
+  // A meeting the APP already gave a graph (a recorder upload, a split, a
+  // combine — recordings with ids the app minted, not the uuidv5 this script
+  // derives) is not derivable from its row: writing the derived graph beside
+  // it would mint a second recording for the same bytes, and on prod
+  // 2026-10-04 it tripped `recording_transcriptions_job_idx` on the first
+  // such meeting. Tolerate a schema from before migration 044 (no clips yet).
+  const appOwned = new Map<string, string>();
+  try {
+    const clips = await sql<Array<{ transcript_id: string; recording_id: string }>>`
+      SELECT c.transcript_id::text, c.recording_id::text
+      FROM ${sql(SCHEMA)}.meeting_clips c
+      WHERE c.ord = 0
+    `;
+    for (const c of clips) appOwned.set(c.transcript_id, c.recording_id);
+  } catch {
+    /* meeting_clips not there yet: nothing is app-owned */
+  }
+
   const plans: MeetingPlan[] = [];
   const owners = new Set<string>();
   const groupMembers = new Map<string, string[]>();
@@ -206,6 +224,15 @@ async function main() {
   for (const row of kept) {
     const group = byAaiId.get(row.assemblyai_id) ?? [row];
     const owner = ownerRowOf(group) ?? row;
+    const existing = appOwned.get(String(row.id));
+    const derivedId = deriveRecordingGraph(owner, undefined).recording.id;
+    if (existing && existing !== derivedId) {
+      skipped.push({
+        id: row.assemblyai_id,
+        why: `already has a graph the app wrote (recording ${existing}); not derivable, nothing to backfill`,
+      });
+      continue;
+    }
     const key = canonicalKeyOf(owner);
     groupMembers.set(key, [...(groupMembers.get(key) ?? []), row.assemblyai_id]);
     const owns = !owners.has(key);

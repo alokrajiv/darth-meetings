@@ -129,9 +129,12 @@ async function orphans(): Promise<void> {
   const audioNames = new Set<string>(meetings.map((m) => m.filename));
   const audioOnlyNames = new Set<string>();
   const evicted = new Set<string>();
+  /** Audio-dir files a MEDIA ROW names — the only ones Stage A/D ever touch. */
+  const mediaAudioNames = new Set<string>();
   for (const r of named) {
     const dir = r.kind === 'audio_only' ? 'audio-only' : 'audio';
     (dir === 'audio' ? audioNames : audioOnlyNames).add(r.filename);
+    if (dir === 'audio') mediaAudioNames.add(r.filename);
     if (r.evicted) evicted.add(`${dir}/${r.filename}`);
   }
   // An extract is also "named" by its source's stem (the derivative sweep's
@@ -142,6 +145,8 @@ async function orphans(): Promise<void> {
   let unnamedBytes = 0;
   let ledgerSaysGone = 0;
   let ledgerBytes = 0;
+  let meetingOnly = 0;
+  let meetingOnlyBytes = 0;
   for (const dir of ['audio', 'audio-only'] as const) {
     const abs = path.join(storage, dir);
     const entries = await fsp.readdir(abs, { withFileTypes: true }).catch(() => []);
@@ -154,6 +159,16 @@ async function orphans(): Promise<void> {
         ledgerSaysGone += 1;
         ledgerBytes += size;
         console.log(`  EVICTED-BUT-PRESENT ${pad(key, 64)} ${padL(fmtBytes(size), 10)}`);
+        continue;
+      }
+      // Named by a meeting's `local_audio_path` but by NO media row: outside
+      // the archive, so Stage A never copies it and Stage D never evicts it
+      // (prod 2026-10-04: two copies a pre-guard ingest retry made under the
+      // meeting's name). Listed so it is not mistaken for "still local".
+      if (dir === 'audio' && audioNames.has(e.name) && !mediaAudioNames.has(e.name)) {
+        meetingOnly += 1;
+        meetingOnlyBytes += size;
+        console.log(`  MEETING-ONLY        ${pad(key, 64)} ${padL(fmtBytes(size), 10)}  (no media row: never archived)`);
         continue;
       }
       const isNamed =
@@ -170,6 +185,7 @@ async function orphans(): Promise<void> {
   }
   console.log(
     `orphans           : ${unnamed} file(s) no row names (${fmtBytes(unnamedBytes)}), ` +
+      `${meetingOnly} named only by a meeting (${fmtBytes(meetingOnlyBytes)}), ` +
       `${ledgerSaysGone} the ledger says are evicted (${fmtBytes(ledgerBytes)}) — report only, nothing deleted`
   );
 }
