@@ -3,6 +3,8 @@ import type { ReportPref } from '@/lib/report-pref';
 import { sql } from '@/lib/db';
 import { SCHEMAS } from '@/lib/constants/database';
 import { parseStoredPatterns, type SeriesPattern } from '@/lib/series-patterns';
+import { seriesOwnershipReady } from '@/db-ops/series-ownership-schema';
+import { isAuditor } from '@/db-ops/auditors';
 
 /**
  * Curated series (docs/curated-series-spec.md, owner 2026-10-06): a small set
@@ -14,11 +16,13 @@ import { parseStoredPatterns, type SeriesPattern } from '@/lib/series-patterns';
  * follow a membership) is lib/server/curated-series.ts — every membership
  * write goes through it, never straight through these helpers from a route.
  *
- * PRIVACY (spec §6): everyone sees every series (name, description,
- * patterns, labels, followers, auto-import status) — a series is a curated
- * definition, not a meeting. Its MEMBERS are meetings, so every function
+ * PRIVACY (spec §11.6 — v2, a series runs as its OWNER): a series exists
+ * only for its owner, editors, followers and the auditors
+ * (`seriesVisibleTo`); everyone else gets nothing — not its name, not its
+ * id on a meeting, not a count. Its MEMBERS are meetings, so every function
  * here that serves members to a person takes the caller and returns only
  * meetings they own or hold a share on; counts are "visible to you".
+ * Every listing here is filtered by BOTH predicates.
  */
 
 const SCHEMA = SCHEMAS.MEETING_WHISPERER;
@@ -52,22 +56,107 @@ export interface SeriesRow {
   description: string | null;
   /** The matcher's input (lib/series-patterns), validated on read. */
   patterns: SeriesPattern[];
-  /** Several series match → the lowest wins (then the lowest id). */
+  /** Display / tie-break order only (v2 §11.2): which chip shows first and
+   * which auto-import series owns an occurrence. Lowest first, then id. */
   priority: number;
   auto_import: SeriesAutoImportCfg | null;
+  /** The person the series runs as (migration 054) — null before it. */
+  owner_user_id: string | null;
+  /** Lower-cased; null before 054 or when the backfill could not map it. */
+  owner_email: string | null;
   created_at: string;
   updated_at: string;
 }
 
-/** `SELECT *` works before AND after 053 — normalise the columns it may or
- * may not carry, and parse the patterns once. */
-function normalizeRow(raw: Record<string, unknown>): SeriesRow {
+/** `SELECT *` works before AND after 053/054 — normalise the columns it may
+ * or may not carry, and parse the patterns once. */
+export function normalizeRow(raw: Record<string, unknown>): SeriesRow {
+  const ownerEmail = typeof raw.owner_email === 'string' ? raw.owner_email.trim().toLowerCase() : '';
   return {
     ...(raw as unknown as SeriesRow),
     description: (raw.description as string | null | undefined) ?? null,
     patterns: parseStoredPatterns(raw.patterns),
     priority: typeof raw.priority === 'number' ? raw.priority : 100,
+    owner_user_id: (raw.owner_user_id as string | null | undefined) ?? null,
+    owner_email: ownerEmail || null,
   };
+}
+
+const normEmail = (e: string) => e.trim().toLowerCase();
+
+/**
+ * THE series visibility predicate (spec §11.6 canSeeSeries, in SQL): the
+ * caller owns the series (by user id or email), edits it, follows it — or is
+ * an auditor. `alias` is the series table's alias in the surrounding query.
+ * Needs 054 (owner_email, series_editors): callers check
+ * seriesOwnershipReady first.
+ */
+export function seriesVisibleTo(
+  alias: string,
+  caller: { userId: string; email: string },
+  callerIsAuditor: boolean
+) {
+  if (callerIsAuditor) return sql`true`;
+  const email = normEmail(caller.email);
+  const id = sql.unsafe(`${alias}.id`);
+  return sql`(
+    ${sql.unsafe(`${alias}.owner_email`)} = ${email}
+    OR ${sql.unsafe(`${alias}.owner_user_id`)} = ${caller.userId}::uuid
+    OR EXISTS (SELECT 1 FROM ${sql(SCHEMA)}.series_editors ed
+               WHERE ed.series_id = ${id} AND ed.email = ${email})
+    OR EXISTS (SELECT 1 FROM ${sql(SCHEMA)}.series_followers fo
+               WHERE fo.series_id = ${id} AND fo.email = ${email})
+  )`;
+}
+
+/**
+ * The listing's series chip (db-ops/transcripts — legacy + v2 listing): for
+ * the row aliased `rowAlias`, the FIRST series by priority then id that the
+ * meeting is in AND the caller may see (§11.6). A meeting can be in several
+ * series; one the caller cannot see is never named. Before 054 → NULL (no
+ * owner, nobody can be shown a series).
+ *
+ * Returns the select-list columns (`series_id`, `series_title`) and the
+ * LATERAL join that feeds them; use both or neither.
+ */
+export async function listingSeriesSql(
+  rowAlias: string,
+  caller: { userId: string; email: string }
+) {
+  const ready = await seriesOwnershipReady().catch(() => false);
+  if (!ready) {
+    return {
+      cols: () => sql`NULL::int AS series_id, NULL::text AS series_title,`,
+      join: () => sql``,
+    };
+  }
+  const callerIsAuditor = await isAuditor(caller.email).catch(() => false);
+  const tid = sql.unsafe(`${rowAlias}.id`);
+  return {
+    cols: () => sql`ser.series_id, ser.series_title,`,
+    join: () => sql`
+      LEFT JOIN LATERAL (
+        SELECT sm.series_id, se.title AS series_title
+        FROM ${sql(SCHEMA)}.series_members sm
+        JOIN ${sql(SCHEMA)}.series se ON se.id = sm.series_id
+        WHERE sm.transcript_id = ${tid}
+          AND ${seriesVisibleTo('se', caller, callerIsAuditor)}
+        ORDER BY se.priority, se.id
+        LIMIT 1
+      ) ser ON true`,
+  };
+}
+
+/** Ids of every series the caller may see (§11.6). */
+export async function visibleSeriesIds(
+  caller: { userId: string; email: string },
+  callerIsAuditor: boolean
+): Promise<Set<number>> {
+  const rows = await sql<Array<{ id: number }>>`
+    SELECT s.id FROM ${sql(SCHEMA)}.series s
+    WHERE ${seriesVisibleTo('s', caller, callerIsAuditor)}
+  `;
+  return new Set(rows.map((r) => r.id));
 }
 
 export interface SeriesListEntry extends SeriesRow {
@@ -94,23 +183,36 @@ export interface SeriesMemberEntry {
   access: 'owner' | 'edit' | 'read';
 }
 
-/** Create a series (053 columns — callers check curatedSeriesReady first). */
+/** Create a series; the creator is its owner (053 + 054 columns — callers
+ * check seriesOwnershipReady first). */
 export async function createSeries(input: {
   userId: string;
+  email: string;
   title: string;
   description?: string | null;
   patterns?: SeriesPattern[];
   priority?: number;
 }): Promise<SeriesRow> {
   const [row] = await sql<Array<Record<string, unknown>>>`
-    INSERT INTO ${sql(SCHEMA)}.series (title, created_by, description, patterns, priority)
+    INSERT INTO ${sql(SCHEMA)}.series
+      (title, created_by, description, patterns, priority, owner_user_id, owner_email)
     VALUES (
       ${input.title}, ${input.userId}, ${input.description ?? null},
-      ${sql.json((input.patterns ?? []) as unknown as never)}, ${input.priority ?? 100}
+      ${sql.json((input.patterns ?? []) as unknown as never)}, ${input.priority ?? 100},
+      ${input.userId}, ${normEmail(input.email)}
     )
     RETURNING *
   `;
   return normalizeRow(row!);
+}
+
+/** Hand the series to a new owner (the route checked who may, §11.1). */
+export async function setSeriesOwner(id: number, owner: { userId: string; email: string }): Promise<void> {
+  await sql`
+    UPDATE ${sql(SCHEMA)}.series
+    SET owner_user_id = ${owner.userId}, owner_email = ${normEmail(owner.email)}, updated_at = NOW()
+    WHERE id = ${id}
+  `;
 }
 
 export async function getSeries(id: number): Promise<SeriesRow | null> {
@@ -177,11 +279,15 @@ export async function deleteSeriesRow(id: number): Promise<void> {
 }
 
 /**
- * The /series index: every series (everyone sees every series), with counts
- * and cadence over the members the CALLER can open — the global member count
- * would say how many meetings of a series exist that they cannot see.
+ * The /series index: the series the CALLER may see (§11.6 — owner, editor,
+ * follower, auditor), with counts and cadence over the members the caller
+ * can open — the global member count would say how many meetings of a
+ * series exist that they cannot see. Needs 054.
  */
-export async function listSeries(caller: { userId: string; email: string }): Promise<SeriesListEntry[]> {
+export async function listSeries(
+  caller: { userId: string; email: string },
+  callerIsAuditor: boolean
+): Promise<SeriesListEntry[]> {
   const email = caller.email.trim().toLowerCase();
   const rows = await sql<Array<Record<string, unknown>>>`
     WITH vis AS (
@@ -216,6 +322,7 @@ export async function listSeries(caller: { userId: string; email: string }): Pro
     FROM ${sql(SCHEMA)}.series s
     LEFT JOIN counts c ON c.series_id = s.id
     LEFT JOIN cadence cd ON cd.series_id = s.id
+    WHERE ${seriesVisibleTo('s', caller, callerIsAuditor)}
     ORDER BY lower(s.title), s.id
   `;
   return rows.map((r) => ({
@@ -227,18 +334,23 @@ export async function listSeries(caller: { userId: string; email: string }): Pro
 }
 
 /** Index footer: the caller's own view — their visible meetings in a series
- * vs in none (never org-wide totals). */
-export async function seriesTotals(caller: {
-  userId: string;
-  email: string;
-}): Promise<{ memberships: number; unattached: number }> {
+ * THEY can see vs in none of those (never org-wide totals). */
+export async function seriesTotals(
+  caller: { userId: string; email: string },
+  callerIsAuditor: boolean
+): Promise<{ memberships: number; unattached: number }> {
   const email = caller.email.trim().toLowerCase();
   const [row] = await sql<Array<{ memberships: number; unattached: number }>>`
     SELECT
-      count(m.id)::int AS memberships,
-      count(t.id) FILTER (WHERE m.id IS NULL)::int AS unattached
+      count(t.id) FILTER (WHERE inv.n > 0)::int AS memberships,
+      count(t.id) FILTER (WHERE inv.n = 0)::int AS unattached
     FROM ${sql(SCHEMA)}.transcripts t
-    LEFT JOIN ${sql(SCHEMA)}.series_members m ON m.transcript_id = t.id
+    CROSS JOIN LATERAL (
+      SELECT count(*)::int AS n
+      FROM ${sql(SCHEMA)}.series_members m
+      JOIN ${sql(SCHEMA)}.series s ON s.id = m.series_id
+      WHERE m.transcript_id = t.id AND ${seriesVisibleTo('s', caller, callerIsAuditor)}
+    ) inv
     WHERE t.deleted_at IS NULL
       AND NOT t.scratch
       AND t.status NOT IN ('uploading', 'waiting')
@@ -255,8 +367,8 @@ export async function seriesTotals(caller: {
 
 /**
  * Series that hold at least one meeting the caller can open — "series you
- * are in" (the auto-sync card's overriding-series list). Not a gate: every
- * series is visible to everyone.
+ * are in" (the auto-sync card's overriding-series list). NOT a visibility
+ * gate: intersect with `visibleSeriesIds` before naming any of them.
  */
 export async function seriesWithCallerMembers(caller: {
   userId: string;
@@ -385,16 +497,41 @@ export async function listSeriesWithAutoImport(): Promise<SeriesRow[]> {
   return rows.map(normalizeRow);
 }
 
-export async function getMembership(
-  transcriptId: number
-): Promise<{ series_id: number; title: string; how: string } | null> {
-  const [row] = await sql<Array<{ series_id: number; title: string; how: string }>>`
-    SELECT m.series_id, s.title, m.how
+export interface SeriesMembershipRef {
+  series_id: number;
+  title: string;
+  how: string;
+  priority: number;
+}
+
+/**
+ * The series a meeting is in that the CALLER may see (§11.6) — first by
+ * priority, then id. A meeting can be in several series (§11.2); a series
+ * the caller cannot see is never named. Needs 054.
+ */
+export async function listVisibleMemberships(
+  transcriptId: number,
+  caller: { userId: string; email: string },
+  callerIsAuditor: boolean
+): Promise<SeriesMembershipRef[]> {
+  return sql<SeriesMembershipRef[]>`
+    SELECT m.series_id, s.title, m.how, s.priority
     FROM ${sql(SCHEMA)}.series_members m
     JOIN ${sql(SCHEMA)}.series s ON s.id = m.series_id
     WHERE m.transcript_id = ${transcriptId}
+      AND ${seriesVisibleTo('s', caller, callerIsAuditor)}
+    ORDER BY s.priority, s.id
   `;
-  return row ?? null;
+}
+
+/** Is the meeting a member of THIS series? ENGINE / ROUTE-GATE USE — never
+ * served as such. */
+export async function isMemberOf(seriesId: number, transcriptId: number): Promise<boolean> {
+  const rows = await sql<Array<{ one: number }>>`
+    SELECT 1 AS one FROM ${sql(SCHEMA)}.series_members
+    WHERE series_id = ${seriesId} AND transcript_id = ${transcriptId}
+  `;
+  return rows.length > 0;
 }
 
 // ---------------------------------------------------------------------------
@@ -402,13 +539,17 @@ export async function getMembership(
 // runs labels + follow shares around every one of these).
 // ---------------------------------------------------------------------------
 
-/** Add an 'auto' membership unless the meeting is already in a series (a
- * manual membership written concurrently wins). true = inserted. */
+/** Add an 'auto' membership in this series unless it is already there (a
+ * manual membership written concurrently wins). true = inserted.
+ *
+ * `ON CONFLICT DO NOTHING` with NO target on purpose: it is correct both
+ * before migration 055 (transcript_id still UNIQUE — a meeting stays in its
+ * first series) and after it (unique per (series, transcript)). */
 export async function insertAutoMembership(seriesId: number, transcriptId: number): Promise<boolean> {
   const rows = await sql<Array<{ id: number }>>`
     INSERT INTO ${sql(SCHEMA)}.series_members (series_id, transcript_id, how, added_by)
     VALUES (${seriesId}, ${transcriptId}, 'auto', NULL)
-    ON CONFLICT (transcript_id) DO NOTHING
+    ON CONFLICT DO NOTHING
     RETURNING id
   `;
   return rows.length > 0;
@@ -425,19 +566,30 @@ export async function deleteAutoMembership(seriesId: number, transcriptId: numbe
   return rows.length > 0;
 }
 
-/** A person attached the meeting to this series: insert, or move it here
- * and make it manual. */
+/** A person attached the meeting to this series: insert it 'manual', or
+ * make an existing membership in THIS series manual. Other series the
+ * meeting is in are untouched (a meeting can be in several, §11.2).
+ * true = it is a member of this series now (false only before migration
+ * 055, when it already sits in another series). */
 export async function upsertManualMembership(
   seriesId: number,
   transcriptId: number,
   userId: string
-): Promise<void> {
-  await sql`
+): Promise<boolean> {
+  const ins = await sql<Array<{ id: number }>>`
     INSERT INTO ${sql(SCHEMA)}.series_members (series_id, transcript_id, how, added_by)
     VALUES (${seriesId}, ${transcriptId}, 'manual', ${userId})
-    ON CONFLICT (transcript_id)
-    DO UPDATE SET series_id = ${seriesId}, how = 'manual', added_by = ${userId}, added_at = NOW()
+    ON CONFLICT DO NOTHING
+    RETURNING id
   `;
+  if (ins.length > 0) return true;
+  const upd = await sql<Array<{ id: number }>>`
+    UPDATE ${sql(SCHEMA)}.series_members
+    SET how = 'manual', added_by = ${userId}, added_at = NOW()
+    WHERE series_id = ${seriesId} AND transcript_id = ${transcriptId}
+    RETURNING id
+  `;
+  return upd.length > 0;
 }
 
 /** Detach the meeting from THIS series (any how). true = it was a member. */

@@ -7,10 +7,10 @@ import { SCHEMAS } from '@/lib/constants/database';
  * who get a read share of every meeting in a series, past and future.
  *
  * Plain rows. The shares themselves are written and taken back by the
- * membership engine (lib/server/curated-series.ts), and WHO may add or
- * remove a follower is lib/series-permissions.ts — following grants read
- * access to other people's meetings, so it is an auditor's act. Everyone may
- * SEE who follows a series (spec §6).
+ * membership engine (lib/server/curated-series.ts) — only for members the
+ * series' OWNER may share (§11.4) — and WHO may add or remove a follower is
+ * lib/series-permissions.ts (owner + editors; a follower removes themselves).
+ * Only people who can see the series see who follows it (§11.6).
  */
 
 const SCHEMA = SCHEMAS.MEETING_WHISPERER;
@@ -63,11 +63,11 @@ export async function deleteFollower(seriesId: number, email: string): Promise<b
   return rows.length > 0;
 }
 
-/** Ids of the series that have at least one follower (the matcher ranks them
- * first — lib/series-patterns compareSeriesPrecedence). */
-export async function followedSeriesIds(): Promise<Set<number>> {
-  const rows = await sql<Array<{ series_id: number }>>`
-    SELECT DISTINCT series_id FROM ${sql(SCHEMA)}.series_followers
+/** Every follower row (the matcher cache — a small table). */
+export async function listAllFollowers(): Promise<SeriesFollower[]> {
+  return sql<SeriesFollower[]>`
+    SELECT series_id, email, name, added_by_email, added_at::text AS added_at
+    FROM ${sql(SCHEMA)}.series_followers
+    ORDER BY series_id, email
   `;
-  return new Set(rows.map((r) => r.series_id));
 }

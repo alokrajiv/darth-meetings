@@ -1,8 +1,10 @@
--- One-off (2026-10-06): give the auditors a read share of every EXISTING
--- meeting with an outside party on it — the same rule new meetings follow
--- from now on (src/lib/auditor-policy.ts + shareWithAuditors in
--- src/lib/server/auto-share.ts). The lists below MIRROR auditor-policy.ts;
--- change them together.
+-- Give the auditors a read share of every EXISTING meeting with an outside
+-- party on it — the same rule new meetings follow (src/lib/auditor-policy.ts
+-- + shareWithAuditors in src/lib/server/auto-share.ts). First run
+-- 2026-10-06; re-run it after adding someone to the `auditors` table
+-- (migration 054 — WHO the auditors are lives there now, not in a VALUES
+-- list here). The domain lists below MIRROR auditor-policy.ts; change them
+-- together.
 --
 --   outside party = an invitee / the organizer on a domain that is not
 --     internal (trames.sg, trames-engineering.com), not a calendar resource
@@ -12,17 +14,18 @@
 --     never touched (ON CONFLICT DO NOTHING), and an auditor removed from a
 --     meeting before (auditor_share_removals, migration 052) is skipped.
 --
--- Needs 048 (origin) + 052 (the ledger). Idempotent: a re-run adds nothing.
+-- Needs 048 (origin) + 052 (the ledger) + 054 (auditors). Idempotent: a
+-- re-run adds nothing.
 -- Dry run: wrap in BEGIN … ROLLBACK and read the RETURNING rows.
 SET search_path = meeting_whisperer_prod, public;
 
-WITH auditors(email, name) AS (
-  VALUES ('alok@trames.sg', 'Alok Rajiv'), ('ivan@trames.sg', 'Ivan Seow')
+WITH aud AS (
+  SELECT lower(email) AS email, name FROM auditors
 ),
 auditor_ids AS (
   -- the auditor's own user_id(s), to skip meetings they own
   SELECT DISTINCT a.email, ta.user_id
-  FROM auditors a JOIN transcript_activity ta ON lower(ta.user_email) = a.email
+  FROM aud a JOIN transcript_activity ta ON lower(ta.user_email) = a.email
 ),
 emails AS (
   SELECT t.id, lower(e) AS email
@@ -50,7 +53,7 @@ INSERT INTO transcript_shares (
 SELECT t.id, t.user_id, t.user_id, a.email, a.name, NULL, 'read', 'auditor-external'
 FROM external_meetings m
 JOIN transcripts t ON t.id = m.id
-CROSS JOIN auditors a
+CROSS JOIN aud a
 WHERE NOT EXISTS (SELECT 1 FROM auditor_ids ai WHERE ai.email = a.email AND ai.user_id = t.user_id)
   AND NOT EXISTS (
     SELECT 1 FROM auditor_share_removals r
