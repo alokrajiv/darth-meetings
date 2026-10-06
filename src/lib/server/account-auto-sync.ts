@@ -245,10 +245,14 @@ export async function sweepAccountAutoSync(): Promise<void> {
  * definition (lib/server/auto-import-plan.seriesOwnerFor). */
 async function seriesOwnsOrOptsOut(g: Group): Promise<boolean> {
   const rec = g.electors.find((e) => e.row.recurring_event_id)?.row.recurring_event_id ?? null;
+  // The curated matcher reads title + invite: every elector's own calendar
+  // row contributes its invitees (they are the same event).
+  const organizer = g.electors.find((e) => e.row.cal_organizer_email)?.row.cal_organizer_email ?? null;
+  const attendees = [...new Set(g.electors.flatMap((e) => e.row.cal_attendee_emails ?? []))];
   const s = await seriesOwnerFor({
-    code: g.code,
-    startIso: g.startIso,
-    provider: g.provider,
+    title: g.title,
+    organizerEmail: organizer,
+    attendees,
     recurringEventId: rec,
   });
   return !!s;

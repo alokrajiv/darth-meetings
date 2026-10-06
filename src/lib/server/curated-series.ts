@@ -25,7 +25,9 @@ import {
   removeSeriesRuleLabels,
 } from '@/lib/server/series-labels';
 import { SHARE_ORIGIN_SERIES_FOLLOW } from '@/lib/auditor-policy';
+import { ownAttendeesForOccurrences } from '@/db-ops/calendar-event-cache';
 import {
+  factsFromCalendarRow,
   factsFromContext,
   pickSeries,
   seriesMatches,
@@ -408,6 +410,82 @@ export async function unfollowSeries(seriesId: number, email: string): Promise<{
     origin: SHARE_ORIGIN_SERIES_FOLLOW,
   });
   return { removed, shares: gone.length };
+}
+
+// ---------------------------------------------------------------------------
+// Calendar occurrences (no stored meeting yet) — spec §7
+// ---------------------------------------------------------------------------
+
+/** The series a calendar occurrence belongs to: the same winner rule as
+ * membership (an import of it joins exactly this series), minus exclusions,
+ * which belong to stored meetings. */
+export async function seriesForFacts(facts: SeriesFacts): Promise<CuratedSeries | null> {
+  return pickSeries(await loadCuratedSeries(), facts);
+}
+
+/** A calendar row's series, in the shape the listings serve. */
+export interface SeriesHit {
+  series_id: number;
+  title: string;
+  auto_import: SeriesRow['auto_import'];
+}
+
+export const toSeriesHit = (s: CuratedSeries): SeriesHit => ({
+  series_id: s.id,
+  title: s.title,
+  auto_import: s.auto_import,
+});
+
+export interface OccurrenceForSeries {
+  /** Caller's key for the answer map. */
+  key: string;
+  title: string | null;
+  organizerEmail?: string | null;
+  recurringEventId?: string | null;
+  /** Invitee emails; undefined = not known to the caller (see below). */
+  attendees?: string[] | null;
+  /** Meet code / `teams-…` stamp + instant — how missing attendees are found. */
+  code?: string | null;
+  startIso?: string | null;
+}
+
+/**
+ * Batch form for the calendar listings (calendar-meetings, calendar/events)
+ * and the auto-import owner: the series of each occurrence, keyed by `key`.
+ * When some series has an INVITE rule and an occurrence arrives without its
+ * attendees, they are read from the CALLER's OWN calendar row for it
+ * (`ownAttendeesForOccurrences` — never another person's calendar).
+ */
+export async function seriesForOccurrences(
+  callerUserId: string | null,
+  occs: OccurrenceForSeries[]
+): Promise<Map<string, CuratedSeries>> {
+  const out = new Map<string, CuratedSeries>();
+  if (occs.length === 0) return out;
+  const series = await loadCuratedSeries();
+  if (series.every((s) => s.patterns.length === 0)) return out;
+  const needsInvite = series.some((s) => s.patterns.some((p) => p.kind === 'invite'));
+  let invitees = new Map<string, string[]>();
+  const missing = occs.filter((o) => o.attendees === undefined && o.code && o.startIso);
+  if (needsInvite && callerUserId && missing.length > 0) {
+    invitees = await ownAttendeesForOccurrences(
+      callerUserId,
+      missing.map((o) => ({ code: o.code!, startIso: o.startIso! }))
+    ).catch(() => new Map<string, string[]>());
+  }
+  for (const o of occs) {
+    const attendees =
+      o.attendees ?? (o.code && o.startIso ? invitees.get(`${o.code}|${o.startIso}`) : undefined) ?? [];
+    const facts = factsFromCalendarRow({
+      title: o.title,
+      organizer_email: o.organizerEmail ?? null,
+      recurring_event_id: o.recurringEventId ?? null,
+      attendees: attendees.map((email) => ({ email })),
+    });
+    const winner = pickSeries(series, facts);
+    if (winner) out.set(o.key, winner);
+  }
+  return out;
 }
 
 // ---------------------------------------------------------------------------

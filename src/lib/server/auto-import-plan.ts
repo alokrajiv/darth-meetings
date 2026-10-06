@@ -1,9 +1,9 @@
 import 'server-only';
 import { listAutoSyncUsers, getAutoSyncLog, type AutoSyncUser, type AutoSyncLogRow } from '@/db-ops/user-prefs';
-import { findSeriesByKeys, getSeries, findAutoImportLogByStart, type SeriesRow, type AutoImportLogRow } from '@/db-ops/series';
+import { getSeries, findAutoImportLogByStart, type SeriesRow, type AutoImportLogRow } from '@/db-ops/series';
 import { mergedCalendarOccurrence } from '@/db-ops/calendar-event-cache';
-import { getTeamsJoinUrlByMeeting } from '@/db-ops/gmeet-meeting-cache';
-import { recurringBaseId, type SeriesKeyInput } from '@/lib/series-keys';
+import { seriesForFacts } from '@/lib/server/curated-series';
+import { factsFromCalendarRow } from '@/lib/series-patterns';
 import { strongestReport, type ReportPref } from '@/lib/auto-marker';
 
 /**
@@ -41,7 +41,8 @@ export interface OccurrenceFacts {
   /** Attendee emails (any case). Organiser is added automatically. */
   attendees?: string[] | null;
   recurringEventId?: string | null;
-  /** Teams: the join URL (resolved from the cache when absent). */
+  /** Teams: the join URL, when known (informational — series ownership
+   * is decided by the curated matcher on title/invite, not by the URL). */
   teamsJoinUrl?: string | null;
 }
 
@@ -86,25 +87,24 @@ export function interestedAutoSyncUsers(
 }
 
 /** The series (if any) holding an explicit auto-import setting for this
- * occurrence. Matches on Meet code / Teams join URL / recurring base id —
- * the same keys the series index attaches on. */
+ * occurrence: the curated matcher's winner for its facts (title, invite,
+ * organiser, recurring — lib/series-patterns, the same rule membership
+ * uses, so the import lands in exactly this series), and only when THAT
+ * series carries a setting. Curated series, 2026-10-06 (spec §7) — this
+ * used to match the old evidence keys (Meet code / join URL / base id). */
 export async function seriesOwnerFor(
-  occ: Pick<OccurrenceFacts, 'code' | 'startIso' | 'provider' | 'recurringEventId' | 'teamsJoinUrl'>
+  occ: Pick<OccurrenceFacts, 'title' | 'organizerEmail' | 'attendees' | 'recurringEventId'>
 ): Promise<SeriesRow | null> {
-  const keys: SeriesKeyInput[] = [];
-  if (occ.provider === 'gmeet') keys.push({ kind: 'meeting-code', value: occ.code });
-  else {
-    const url = occ.teamsJoinUrl ?? (await getTeamsJoinUrlByMeeting(occ.code, occ.startIso).catch(() => null));
-    if (url) keys.push({ kind: 'teams-join-url', value: url });
-  }
-  if (occ.recurringEventId) keys.push({ kind: 'recurring-base-id', value: recurringBaseId(occ.recurringEventId) });
-  if (keys.length === 0) return null;
-  const hits = await findSeriesByKeys(keys);
-  for (const h of hits) {
-    const s = await getSeries(h.series_id);
-    if (s?.auto_import) return s;
-  }
-  return null;
+  const winner = await seriesForFacts(
+    factsFromCalendarRow({
+      title: occ.title ?? null,
+      organizer_email: occ.organizerEmail ?? null,
+      recurring_event_id: occ.recurringEventId ?? null,
+      attendees: (occ.attendees ?? []).map((email) => ({ email })),
+    })
+  );
+  if (!winner?.auto_import) return null;
+  return getSeries(winner.id);
 }
 
 /** Election order for account-owned occurrences: organiser first (owns the

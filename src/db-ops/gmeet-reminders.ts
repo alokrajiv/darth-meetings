@@ -19,6 +19,11 @@ export interface UnimportedCandidateRow extends GmeetReminderRow {
   user_id: string;
   recurring_event_id: string | null;
   cal_event_key: string | null;
+  /** The user's own calendar row's organiser + invitee emails — the facts a
+   * curated series' invite rule reads (lib/server/auto-import-plan
+   * seriesOwnerFor). */
+  cal_organizer_email: string | null;
+  cal_attendee_emails: string[] | null;
 }
 
 export async function listOpenUnimportedForUsers(
@@ -29,10 +34,19 @@ export async function listOpenUnimportedForUsers(
     SELECT r.id, r.user_id, r.kind, r.event_key, r.meeting_code, r.title, r.event_start,
            r.organizer_self, r.has_recording, r.has_transcript,
            r.first_seen_at, r.last_seen_at,
-           c.recurring_event_id, c.event_key AS cal_event_key
+           c.recurring_event_id, c.event_key AS cal_event_key,
+           c.organizer_email AS cal_organizer_email,
+           c.attendee_emails AS cal_attendee_emails
     FROM ${sql(SCHEMA)}.gmeet_reminders r
     LEFT JOIN LATERAL (
-      SELECT c.recurring_event_id, c.event_key, c.event_id
+      SELECT c.recurring_event_id, c.event_key, c.event_id, c.organizer_email,
+             ARRAY(
+               SELECT lower(a->>'email')
+               FROM jsonb_array_elements(
+                 CASE WHEN jsonb_typeof(c.attendees) = 'array' THEN c.attendees ELSE '[]'::jsonb END
+               ) a
+               WHERE a->>'email' IS NOT NULL
+             ) AS attendee_emails
       FROM ${sql(SCHEMA)}.calendar_event_cache c
       WHERE c.user_id = r.user_id
         AND c.meeting_code = r.meeting_code

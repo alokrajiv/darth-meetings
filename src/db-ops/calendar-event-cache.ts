@@ -231,6 +231,92 @@ export async function hasCalendarOccurrence(
   return rows.length > 0;
 }
 
+/** One of a user's OWN cached calendar events, with what the curated-series
+ * matcher and the series occurrence sweep read (lib/series-patterns
+ * factsFromCalendarRow + the classified attachments). */
+export interface OwnCalendarRow {
+  event_key: string;
+  event_id: string;
+  recurring_event_id: string | null;
+  ical_uid: string | null;
+  title: string | null;
+  event_start: string;
+  event_end: string | null;
+  /** Meet code, or the canonical `teams-…` stamp; null = no conference. */
+  meeting_code: string | null;
+  organizer_email: string | null;
+  attendees: CalendarEventAttendee[] | null;
+  html_link: string | null;
+  attachment_video_count: number;
+  attachment_video_file_id: string | null;
+  attachment_transcript_doc_id: string | null;
+  attachment_gemini_notes: boolean;
+}
+
+/**
+ * The user's OWN calendar rows in [fromIso, toIso) — the curated series'
+ * occurrence source (docs/curated-series-spec.md §7: own-calendar rows only,
+ * the own-token rule stands). Strictly `user_id = userId`: never another
+ * person's calendar.
+ */
+export async function listOwnCalendarRows(
+  userId: string,
+  fromIso: string,
+  toIso: string
+): Promise<OwnCalendarRow[]> {
+  return sql<OwnCalendarRow[]>`
+    SELECT event_key, event_id, recurring_event_id, ical_uid, title,
+           event_start::text AS event_start, event_end::text AS event_end,
+           meeting_code, organizer_email, attendees, html_link,
+           attachment_video_count, attachment_video_file_id,
+           attachment_transcript_doc_id, attachment_gemini_notes
+    FROM ${sql(SCHEMA)}.calendar_event_cache
+    WHERE user_id = ${userId}
+      AND event_start >= ${fromIso}::timestamptz
+      AND event_start < ${toIso}::timestamptz
+    ORDER BY event_start
+  `;
+}
+
+/**
+ * Invitees of the user's OWN calendar rows for these occurrences (code +
+ * instant ±60 s) — what an invite-rule series needs to judge a listing row
+ * that carries only an attendee count. Keyed `<code>|<startIso as given>`.
+ */
+export async function ownAttendeesForOccurrences(
+  userId: string,
+  occs: Array<{ code: string; startIso: string }>
+): Promise<Map<string, string[]>> {
+  const out = new Map<string, string[]>();
+  const codes = [...new Set(occs.map((o) => o.code).filter(Boolean))];
+  const instants = occs.map((o) => Date.parse(o.startIso)).filter((n) => !Number.isNaN(n));
+  if (codes.length === 0 || instants.length === 0) return out;
+  const from = new Date(Math.min(...instants) - 120_000).toISOString();
+  const to = new Date(Math.max(...instants) + 120_000).toISOString();
+  const rows = await sql<Array<{ meeting_code: string; event_start: string; emails: string[] | null }>>`
+    SELECT meeting_code, event_start::text AS event_start,
+           ARRAY(
+             SELECT lower(a->>'email')
+             FROM jsonb_array_elements(
+               CASE WHEN jsonb_typeof(attendees) = 'array' THEN attendees ELSE '[]'::jsonb END
+             ) a
+             WHERE a->>'email' IS NOT NULL
+           ) AS emails
+    FROM ${sql(SCHEMA)}.calendar_event_cache
+    WHERE user_id = ${userId}
+      AND meeting_code = ANY(${codes}::text[])
+      AND event_start BETWEEN ${from}::timestamptz AND ${to}::timestamptz
+  `;
+  for (const o of occs) {
+    const at = Date.parse(o.startIso);
+    const hit = rows.find(
+      (r) => r.meeting_code === o.code && Math.abs(Date.parse(r.event_start) - at) <= 60_000
+    );
+    if (hit) out.set(`${o.code}|${o.startIso}`, hit.emails ?? []);
+  }
+  return out;
+}
+
 /**
  * THE caller-involvement check (2026-08-24 privacy audit) — the reusable
  * form of unimportedVisibleTo's calendar arms, for routes that resolve

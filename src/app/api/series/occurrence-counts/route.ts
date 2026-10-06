@@ -1,7 +1,7 @@
 import { NextResponse } from 'next/server';
 import { withAuth } from '@/lib/auth/with-auth';
 import { sweepSeriesOccurrences, type SeriesOccurrencesResult } from '@/lib/server/series-occurrences';
-import { seriesWithCallerMembers } from '@/db-ops/series';
+import { getSeries } from '@/db-ops/series';
 
 export const runtime = 'nodejs';
 export const maxDuration = 120;
@@ -23,17 +23,17 @@ export const GET = withAuth(async ({ user, request }) => {
     return NextResponse.json({ error: `at most ${MAX_IDS} ids per call` }, { status: 400 });
   }
   const caller = { userId: user.userId, email: user.email };
-  // PRIVACY GATE (2026-08-24): invisible series report null, same as
-  // missing ones — no existence oracle.
-  const visible = await seriesWithCallerMembers(caller);
+  // Every series is visible to everyone (curated series, spec §6) and the
+  // sweep only ever reads the CALLER's own calendar — no gate beyond
+  // existence (a missing series reports null).
   const results = await Promise.all(
-    ids.map((id) =>
-      visible.has(id)
+    ids.map(async (id) =>
+      (await getSeries(id))
         ? sweepSeriesOccurrences(id, caller).catch((err: unknown) => {
             console.warn(`[series] occurrence-counts sweep failed for ${id}:`, err);
             return 'error' as const;
           })
-        : Promise.resolve(null)
+        : null
     )
   );
   const counts: Record<

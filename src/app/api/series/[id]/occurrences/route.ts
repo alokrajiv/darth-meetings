@@ -1,7 +1,7 @@
 import { NextResponse } from 'next/server';
 import { withAuth } from '@/lib/auth/with-auth';
 import { sweepSeriesOccurrences, type SeriesOccurrence } from '@/lib/server/series-occurrences';
-import { seriesWithCallerMembers, getSeries } from '@/db-ops/series';
+import { getSeries } from '@/db-ops/series';
 import { listAutoSyncUsers } from '@/db-ops/user-prefs';
 import { interestedAutoSyncUsers } from '@/lib/server/auto-import-plan';
 import { strongestReport, type ReportPref } from '@/lib/auto-marker';
@@ -11,8 +11,8 @@ export const runtime = 'nodejs';
 export const maxDuration = 120;
 
 /**
- * GET /api/series/:id/occurrences — every occurrence we can see for this
- * series (calendar + Graph merged), with artifact presence and
+ * GET /api/series/:id/occurrences — every occurrence of this series on the
+ * caller's own calendar (Meet + Graph enriched), with artifact presence and
  * already-imported cross-references. The external sweep is cached ~6h per
  * user; `?refresh=1` forces a fresh one. Imported state is always fresh.
  */
@@ -21,11 +21,11 @@ export const GET = withAuth(async ({ user, request }, { params }) => {
   if (!Number.isInteger(id) || id <= 0) {
     return NextResponse.json({ error: 'Bad id' }, { status: 400 });
   }
-  // PRIVACY GATE (2026-08-24): the sweep reads other users' transcript
-  // titles, app-only Graph artifacts and global-cache rows for the series.
-  if (!(await seriesWithCallerMembers({ userId: user.userId, email: user.email })).has(id)) {
-    return NextResponse.json({ error: 'Not found' }, { status: 404 });
-  }
+  // PRIVACY (curated series, spec §6/§7): every series is visible to
+  // everyone, and the sweep itself is caller-scoped — occurrences come only
+  // from the CALLER's own calendar rows (Meet records and Graph artifacts
+  // only for the codes / join URLs on those rows), and a member meeting is
+  // named only when the caller can open it (lib/server/series-occurrences).
   const forceRefresh = new URL(request.url).searchParams.get('refresh') === '1';
   const result = await sweepSeriesOccurrences(
     id,

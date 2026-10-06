@@ -3,7 +3,6 @@ import type { ReportPref } from '@/lib/report-pref';
 import { sql } from '@/lib/db';
 import { SCHEMAS } from '@/lib/constants/database';
 import { parseStoredPatterns, type SeriesPattern } from '@/lib/series-patterns';
-import type { SeriesKeyInput } from '@/lib/series-keys';
 
 /**
  * Curated series (docs/curated-series-spec.md, owner 2026-10-06): a small set
@@ -377,43 +376,6 @@ export async function recordAutoImportFire(input: {
   `;
 }
 
-// ---------------------------------------------------------------------------
-// LEGACY key readers (series_keys) — read-only, still used by the occurrence
-// sweep, the calendar chips and the auto-import owner until those move onto
-// the curated matcher (spec §7). Nothing writes series_keys any more.
-// ---------------------------------------------------------------------------
-
-/** Batch series lookup for calendar rows by stripped recurringEventId. */
-export interface SeriesKeyHit {
-  series_id: number;
-  title: string;
-  auto_import: SeriesAutoImportCfg | null;
-}
-
-export async function findSeriesByRecurringBaseIds(baseIds: string[]): Promise<Map<string, SeriesKeyHit>> {
-  if (baseIds.length === 0) return new Map();
-  const rows = await sql<Array<{ value: string } & SeriesKeyHit>>`
-    SELECT k.value, k.series_id, s.title, s.auto_import
-    FROM ${sql(SCHEMA)}.series_keys k
-    JOIN ${sql(SCHEMA)}.series s ON s.id = k.series_id
-    WHERE k.kind = 'recurring-base-id' AND k.value = ANY(${baseIds})
-  `;
-  return new Map(rows.map((r) => [r.value, { series_id: r.series_id, title: r.title, auto_import: r.auto_import }]));
-}
-
-/** Same, keyed by Meet code (series attach on codes too — a listing row
- * with no recurring id can still belong to an auto-importing series). */
-export async function findSeriesByMeetingCodes(codes: string[]): Promise<Map<string, SeriesKeyHit>> {
-  if (codes.length === 0) return new Map();
-  const rows = await sql<Array<{ value: string } & SeriesKeyHit>>`
-    SELECT k.value, k.series_id, s.title, s.auto_import
-    FROM ${sql(SCHEMA)}.series_keys k
-    JOIN ${sql(SCHEMA)}.series s ON s.id = k.series_id
-    WHERE k.kind = 'meeting-code' AND k.value = ANY(${codes})
-  `;
-  return new Map(rows.map((r) => [r.value, { series_id: r.series_id, title: r.title, auto_import: r.auto_import }]));
-}
-
 /** Every series carrying an explicit auto-import setting (on OR off) — the
  * ones that override account auto-sync for their occurrences. */
 export async function listSeriesWithAutoImport(): Promise<SeriesRow[]> {
@@ -421,41 +383,6 @@ export async function listSeriesWithAutoImport(): Promise<SeriesRow[]> {
     SELECT * FROM ${sql(SCHEMA)}.series WHERE auto_import IS NOT NULL ORDER BY title
   `;
   return rows.map(normalizeRow);
-}
-
-export interface SeriesKeyRow {
-  id: number;
-  series_id: number;
-  kind: string;
-  value: string;
-  source: string;
-}
-
-export async function listKeys(seriesId: number): Promise<SeriesKeyRow[]> {
-  return sql<SeriesKeyRow[]>`
-    SELECT id, series_id, kind, value, source
-    FROM ${sql(SCHEMA)}.series_keys WHERE series_id = ${seriesId}
-  `;
-}
-
-/** Series whose key bag matches any of these keys, most-matched first.
- * Returns which kinds matched so callers can tell strong from weak. */
-export async function findSeriesByKeys(
-  keys: SeriesKeyInput[]
-): Promise<Array<{ series_id: number; title: string; matched_kinds: string[] }>> {
-  if (keys.length === 0) return [];
-  const kinds = keys.map((k) => k.kind);
-  const values = keys.map((k) => k.value);
-  return sql<Array<{ series_id: number; title: string; matched_kinds: string[] }>>`
-    SELECT k.series_id, s.title,
-           array_agg(DISTINCT k.kind) AS matched_kinds
-    FROM ${sql(SCHEMA)}.series_keys k
-    JOIN ${sql(SCHEMA)}.series s ON s.id = k.series_id
-    JOIN unnest(${kinds}::text[], ${values}::text[]) AS q(kind, value)
-      ON q.kind = k.kind AND q.value = k.value
-    GROUP BY k.series_id, s.title
-    ORDER BY count(*) DESC
-  `;
 }
 
 export async function getMembership(

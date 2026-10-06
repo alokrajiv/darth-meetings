@@ -19,9 +19,8 @@ import {
   sharedCalendarRow,
 } from '@/lib/server/shared-calendar';
 import { parseMeetingFilters } from '@/lib/server/meeting-filters';
-import { findSeriesByMeetingCodes, findSeriesByRecurringBaseIds, type SeriesKeyHit } from '@/db-ops/series';
+import { seriesForOccurrences } from '@/lib/server/curated-series';
 import { ensureMeetingsForOccurrences } from '@/db-ops/meetings';
-import { recurringBaseId } from '@/lib/series-keys';
 import { APP_URL } from '@/lib/server/darth-notify';
 
 export const runtime = 'nodejs';
@@ -185,18 +184,15 @@ function aiState(has: boolean | null, status: string | null): 'ready' | 'running
 
 interface RowExtras {
   uuids: Map<string, string>;
-  seriesByBase: Map<string, SeriesKeyHit>;
-  seriesByCode: Map<string, SeriesKeyHit>;
+  /** Row key → its curated series. */
+  seriesByKey: Map<string, { id: number; title: string }>;
 }
 
 function toRow(r: CalendarWindowRow, tz: string, now: number, x: RowExtras): CalendarEventRow {
   const start = new Date(r.event_start);
   const occKey = r.meeting_code ? `${r.meeting_code}|${start.toISOString()}` : null;
   const uuid = occKey ? (x.uuids.get(occKey) ?? null) : null;
-  const series =
-    (r.recurring_event_id ? x.seriesByBase.get(recurringBaseId(r.recurring_event_id)) : null) ??
-    (r.meeting_code ? x.seriesByCode.get(r.meeting_code) : null) ??
-    null;
+  const series = x.seriesByKey.get(r.key) ?? null;
   const accessible = r.imported_accessible === true;
   return {
     key: r.key,
@@ -219,7 +215,7 @@ function toRow(r: CalendarWindowRow, tz: string, now: number, x: RowExtras): Cal
     calendarUrl: r.html_link,
     meetingUuid: uuid,
     meetingUrl: uuid ? `${APP_URL}/m/${uuid}` : null,
-    series: series ? { id: series.series_id, title: series.title } : null,
+    series,
     muted: r.muted,
     evidence: {
       recording: r.has_recording,
@@ -350,17 +346,29 @@ export const GET = withAuth(async ({ user, request }) => {
       provider: r.meeting_code!.startsWith('teams-') ? 'teams' : 'gmeet',
       title: r.title,
     }));
-  const baseIds = [...new Set(served.flatMap((r) => (r.recurring_event_id ? [recurringBaseId(r.recurring_event_id)] : [])))];
-  const [uuids, seriesByBase, seriesByCode] = await Promise.all([
+  const [uuids, matched] = await Promise.all([
     ensureMeetingsForOccurrences(occs).catch((err) => {
       console.warn('[calendar/events] occurrence uuid mint failed:', err);
       return new Map<string, string>();
     }),
-    findSeriesByRecurringBaseIds(baseIds),
-    findSeriesByMeetingCodes([...new Set(occs.map((o) => o.code))]),
+    // The curated matcher on the caller's own rows (they carry the invite).
+    seriesForOccurrences(
+      user.userId,
+      served.map((r) => ({
+        key: r.key,
+        title: r.title,
+        organizerEmail: r.organizer_email,
+        recurringEventId: r.recurring_event_id,
+        attendees: (r.attendees ?? []).map((a) => a.email).filter((e): e is string => !!e),
+      }))
+    ).catch((err) => {
+      console.warn('[calendar/events] series match failed:', err);
+      return new Map<string, never>();
+    }),
   ]);
+  const seriesByKey = new Map([...matched].map(([k, s]) => [k, { id: s.id, title: s.title }]));
   const now = Date.now();
-  let events = served.map((r) => toRow(r, tz, now, { uuids, seriesByBase, seriesByCode }));
+  let events = served.map((r) => toRow(r, tz, now, { uuids, seriesByKey }));
   const extra = shared.flat();
   if (extra.length > 0) {
     events = [...events, ...extra].sort((a, b) =>

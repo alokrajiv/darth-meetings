@@ -1,6 +1,5 @@
 import 'server-only';
 import {
-  classifyCalendarAttachments,
   classifyRecordings,
   classifyTranscripts,
   OCCURRENCE_WINDOW_MS,
@@ -8,6 +7,7 @@ import {
 import {
   getMeetingCacheByKeys,
   getMeetingCacheByMeetings,
+  getTeamsJoinUrlByMeeting,
   type GmeetMeetingCacheRow,
 } from '@/db-ops/gmeet-meeting-cache';
 import {
@@ -28,9 +28,11 @@ import {
 } from '@/lib/server/ms-graph';
 import { parseTeamsJoinLink, pickOccurrenceArtifacts } from '@/lib/teams-link';
 import { listConferenceRecordsByCode } from '@/lib/server/gmeet';
-import { listKeys, getSeries } from '@/db-ops/series';
+import { getSeries } from '@/db-ops/series';
 import { listEmptyTranscriptDocIds } from '@/db-ops/empty-transcripts';
-import { recurringBaseId } from '@/lib/series-keys';
+import { listOwnCalendarRows, type OwnCalendarRow } from '@/db-ops/calendar-event-cache';
+import { loadCuratedSeries } from '@/lib/server/curated-series';
+import { factsFromCalendarRow, pickSeries } from '@/lib/series-patterns';
 import { importedOccurrenceMatches } from '@/lib/imported-occurrence';
 import type { GmeetAttendee } from '@/lib/format';
 
@@ -38,23 +40,28 @@ import type { GmeetAttendee } from '@/lib/format';
  * Live occurrence sweep for a series — every instance we can see, including
  * artifact-less ones, merged from two sources:
  *
- *  - Google Calendar (caller's server-minted token): title search filtered
- *    by conferenceId / recurringEventId base, plus iCalUID lookups. Titles
- *    alone are ambiguous and recurringEventIds get re-sliced on "this and
- *    following" edits (verified: one series → 6 variants), hence the
- *    belt-and-suspenders union. Attachments ride the user's own event copy
- *    and never expire — this is what sees months-old recordings.
+ *  - The caller's OWN calendar, as the poller cached it
+ *    (calendar_event_cache, `user_id = caller`): every row whose facts the
+ *    curated matcher gives to THIS series (lib/series-patterns — the same
+ *    winner rule membership uses, so an import of the occurrence joins this
+ *    series). Curated series, 2026-10-06 (docs/curated-series-spec.md §7):
+ *    this replaced the live Calendar `q=title` search filtered by the old
+ *    evidence keys. Attachments ride the user's own event copy and never
+ *    expire — the cache keeps them classified — so months-old recordings
+ *    are still seen. Own-calendar rows only: the own-token rule stands.
  *  - Google Meet REST API (caller's token): conferenceRecords filtered by
- *    the series' meeting code(s) — every call Google still holds (~30 days)
+ *    the meeting codes of the matched calendar rows — every call Google
+ *    still holds (~30 days)
  *    with its recording/transcript inventory. This is what the import
  *    dialog uses too, and it sees artifacts the calendar copy does NOT
  *    carry: Meet attaches files to the event only for some attendees
  *    (verified 2026-08-21: DevOps Scrum, 112 calendar instances, 1 with an
  *    attachment, while Meet listed transcripts for the recent occurrences).
- *  - Microsoft Graph (Teams series): the series meeting object lists every
- *    occurrence's transcript/recording keyed by callId — including
- *    occurrences from before the caller was invited (verified: calendar saw
- *    5 instances, Graph had 11).
+ *  - Microsoft Graph (Teams series): the join URLs of the matched calendar
+ *    rows' `teams-…` codes (the artifact cache's stashed resolution); the
+ *    series meeting object lists every occurrence's transcript/recording
+ *    keyed by callId — including occurrences from before the caller was
+ *    invited (verified: calendar saw 5 instances, Graph had 11).
  *
  * Occurrences themselves are ephemeral (computed here, never mirrored), but
  * every Meet-record inventory the sweep performs IS written back to the
@@ -66,7 +73,6 @@ import type { GmeetAttendee } from '@/lib/format';
  */
 
 const SCHEMA = SCHEMAS.MEETING_WHISPERER;
-const CAL_API = 'https://www.googleapis.com/calendar/v3';
 /** How far back the calendar sweep looks. */
 const SWEEP_MONTHS_BACK = 12;
 /** Include near-future instances so the dialog shows what's coming. */
@@ -99,21 +105,6 @@ declare global {
 }
 const sweepCache: Map<string, SweepCacheEntry> =
   globalThis.__mwSeriesSweepCache ?? (globalThis.__mwSeriesSweepCache = new Map());
-
-interface CalInstance {
-  id?: string;
-  status?: string;
-  summary?: string;
-  htmlLink?: string;
-  recurringEventId?: string;
-  iCalUID?: string;
-  organizer?: { email?: string };
-  start?: { dateTime?: string; date?: string };
-  end?: { dateTime?: string; date?: string };
-  attendees?: Array<{ email?: string; displayName?: string; responseStatus?: string }>;
-  attachments?: Array<{ fileId?: string; title?: string; mimeType?: string }>;
-  conferenceData?: { conferenceId?: string };
-}
 
 export interface OccurrenceImportedRef {
   assemblyai_id: string;
@@ -198,51 +189,6 @@ export interface SeriesOccurrencesResult {
   };
 }
 
-const FIELDS =
-  'items(id,status,summary,htmlLink,recurringEventId,iCalUID,organizer(email),start,end,' +
-  'attendees(email,displayName,responseStatus),attachments(fileId,title,mimeType),' +
-  'conferenceData(conferenceId)),nextPageToken';
-
-async function calList(token: string, params: URLSearchParams): Promise<CalInstance[]> {
-  const out: CalInstance[] = [];
-  let pageToken: string | undefined;
-  for (let p = 0; p < 8; p++) {
-    if (pageToken) params.set('pageToken', pageToken);
-    const res = await fetch(`${CAL_API}/calendars/primary/events?${params}`, {
-      headers: { Authorization: `Bearer ${token}` },
-    });
-    if (!res.ok) return out;
-    const j = (await res.json()) as { items?: CalInstance[]; nextPageToken?: string };
-    out.push(...(j.items ?? []));
-    pageToken = j.nextPageToken;
-    if (!pageToken) break;
-  }
-  return out;
-}
-
-/** Artifact classification — same rules as the import dialog: a classic
- * "… - Transcript" Doc wins; otherwise a "Notes by Gemini" Doc counts as the
- * transcript source (Gemini keeps the transcript in that Doc's "Transcript"
- * tab, which the import extracts). Series that run Gemini notes instead of
- * plain transcription only ever get the Gemini Doc attached — verified
- * 2026-08-21 on DevOps Scrum (the Meet API's own transcript docId IS the
- * Gemini Doc). Other docs (agendas, "Notes - <title>") are ignored. */
-function classifyAttachments(e: CalInstance): {
-  videoFileId: string | null;
-  transcriptDocId: string | null;
-  geminiNotes: boolean;
-} {
-  // ONE shared rule set (lib/meeting-evidence) — this used to anchor
-  // /transcript\s*$/i while the dialog matched anywhere, so "Transcript of
-  // X" was a transcript in one surface and nothing in the other (D7).
-  const c = classifyCalendarAttachments(e.attachments);
-  return {
-    videoFileId: c.videoFileId,
-    transcriptDocId: c.transcriptDocId,
-    geminiNotes: c.geminiNotes,
-  };
-}
-
 interface ImportedRow {
   id: number;
   assemblyai_id: string;
@@ -262,15 +208,19 @@ interface ImportedRow {
   is_member: boolean;
 }
 
-/** Everything imported that could belong to this series: members plus rows
- * matching any series key. Fetched once, matched to occurrences in JS. */
+/** The series' members (spec §7: the imported cross-reference IS the
+ * membership), with whether the CALLER can open each. Matched to
+ * occurrences in JS. Inaccessible members still count as "imported" for an
+ * occurrence on the caller's own calendar (so nothing re-imports it) but are
+ * never folded in as rows of their own, and never carry a title or id out of
+ * the sweep (see matchImported / the fold-in below). */
 async function loadImportedCandidates(
   seriesId: number,
   caller: { userId: string; email: string }
 ): Promise<ImportedRow[]> {
   const normEmail = caller.email.trim().toLowerCase();
   return sql<ImportedRow[]>`
-    SELECT DISTINCT t.id, t.assemblyai_id, t.title,
+    SELECT t.id, t.assemblyai_id, t.title,
            t.recorded_at::text AS recorded_at, t.created_at::text AS created_at,
            COALESCE(
              t.gmeet_context->>'startTime',
@@ -284,22 +234,16 @@ async function loadImportedCandidates(
            t.gmeet_context->'teams'->>'callId' AS teams_call_id,
            t.gmeet_context->>'meetingCode' AS meeting_code,
            t.status,
-           (t.user_id = ${caller.userId} OR sh.id IS NOT NULL) AS accessible,
-           COALESCE(m.series_id = ${seriesId}, false) AS is_member
-    FROM ${sql(SCHEMA)}.transcripts t
-    LEFT JOIN ${sql(SCHEMA)}.series_members m ON m.transcript_id = t.id
-    LEFT JOIN ${sql(SCHEMA)}.series_keys k ON k.series_id = ${seriesId} AND (
-      (k.kind = 'meeting-code' AND t.gmeet_context->>'meetingCode' = k.value) OR
-      (k.kind = 'recurring-base-id' AND
-       regexp_replace(COALESCE(t.gmeet_context->>'recurringEventId',''), '_R\\d{8}T\\d{6}Z?$', '') = k.value) OR
-      (k.kind = 'teams-join-url' AND t.gmeet_context->'teams'->>'joinWebUrl' = k.value) OR
-      (k.kind = 'graph-meeting-id' AND t.gmeet_context->'teams'->>'graphMeetingId' = k.value)
-    )
-    LEFT JOIN ${sql(SCHEMA)}.transcript_shares sh
-      ON sh.transcript_id = t.id AND sh.shared_with_email = ${normEmail}
-    WHERE t.deleted_at IS NULL
+           (t.user_id = ${caller.userId} OR EXISTS (
+             SELECT 1 FROM ${sql(SCHEMA)}.transcript_shares sh
+             WHERE sh.transcript_id = t.id AND sh.shared_with_email = ${normEmail}
+           )) AS accessible,
+           true AS is_member
+    FROM ${sql(SCHEMA)}.series_members m
+    JOIN ${sql(SCHEMA)}.transcripts t ON t.id = m.transcript_id
+    WHERE m.series_id = ${seriesId}
+      AND t.deleted_at IS NULL
       AND NOT t.scratch
-      AND (m.series_id = ${seriesId} OR k.id IS NOT NULL)
   `;
 }
 
@@ -337,7 +281,9 @@ function matchImported(
       )
     )
     .map((c) => ({
-      assemblyai_id: c.assemblyai_id,
+      // PRIVACY (spec §6): a meeting the caller cannot open is "imported by
+      // someone" — no id, no title.
+      assemblyai_id: c.accessible ? c.assemblyai_id : '',
       title: c.accessible ? c.title : null,
       accessible: c.accessible,
       queued: c.status === 'waiting',
@@ -402,16 +348,22 @@ export async function sweepSeriesOccurrences(
   // series (the caller may simply not be on the calendar event — e.g. a
   // colleague's import in a series they were never invited to). Fold them
   // in so the list and counts agree with "N meetings in this series".
-  const linked = new Set(occurrences.flatMap((o) => o.imported.map((i) => i.assemblyai_id)));
+  // Members the caller cannot open are never folded in (spec §6: members
+  // are never listed beyond the caller's access).
+  const linked = new Set(
+    occurrences.flatMap((o) =>
+      o.imported.filter((i) => i.accessible).map((i) => i.assemblyai_id)
+    )
+  );
   for (const c of candidates) {
-    if (!c.is_member || linked.has(c.assemblyai_id)) continue;
+    if (!c.is_member || !c.accessible || linked.has(c.assemblyai_id)) continue;
     linked.add(c.assemblyai_id);
     const startIso = new Date(c.recorded_at ?? c.created_at).toISOString();
     occurrences.push({
       key: `imp-${c.assemblyai_id}`,
       startIso,
       endIso: null,
-      title: c.accessible ? c.title : null,
+      title: c.title,
       source: 'imported',
       upcoming: false,
       meetingCode: c.meeting_code,
@@ -432,8 +384,8 @@ export async function sweepSeriesOccurrences(
       imported: [
         {
           assemblyai_id: c.assemblyai_id,
-          title: c.accessible ? c.title : null,
-          accessible: c.accessible,
+          title: c.title,
+          accessible: true,
           queued: c.status === 'waiting',
           failed: c.status === 'error',
         },
@@ -599,7 +551,66 @@ async function refreshRecentEvidence(
   }
 }
 
-/** The expensive external enumeration: calendar pages + Graph artifacts. */
+/** One matched own-calendar row → an occurrence (attachments as the poller
+ * classified them; a `teams-…` stamp is not a Meet code). */
+function occurrenceFromCalendarRow(row: OwnCalendarRow, nowMs: number): SeriesOccurrence {
+  const startIso = new Date(row.event_start).toISOString();
+  const teamsRow = row.meeting_code?.startsWith('teams-') ?? false;
+  return {
+    key: row.event_id,
+    startIso,
+    endIso: row.event_end ? new Date(row.event_end).toISOString() : null,
+    title: row.title,
+    source: 'calendar',
+    upcoming: Date.parse(startIso) > nowMs,
+    meetingCode: teamsRow ? null : row.meeting_code,
+    eventId: row.event_id,
+    recurringEventId: row.recurring_event_id,
+    iCalUID: row.ical_uid,
+    organizerEmail: row.organizer_email,
+    attendees: (row.attendees ?? [])
+      .filter((a) => a?.email)
+      .map((a) => ({ email: a.email, name: a.displayName, responseStatus: a.responseStatus })),
+    hasRecording: Boolean(row.attachment_video_file_id),
+    hasTranscript: Boolean(row.attachment_transcript_doc_id),
+    videoFileId: row.attachment_video_file_id,
+    transcriptDocId: row.attachment_transcript_doc_id,
+    geminiNotes: row.attachment_gemini_notes,
+    emptyTranscript: false,
+    teams: null,
+    meet: null,
+    calendarUrl: row.html_link,
+    imported: [],
+  };
+}
+
+/** The classified-attachment shape the discovery write-back wants, rebuilt
+ * from the cache columns (what classifyCalendarAttachments produced when the
+ * poller cached the row). */
+function attachmentsOf(row: OwnCalendarRow) {
+  return {
+    videoFileId: row.attachment_video_file_id,
+    videoCount: row.attachment_video_count ?? 0,
+    transcriptDocId: row.attachment_transcript_doc_id,
+    geminiNotes: row.attachment_gemini_notes,
+  };
+}
+
+/**
+ * The expensive external enumeration (cached ~6h per series+user):
+ *
+ *  1. the caller's OWN calendar rows in the sweep window whose facts the
+ *     curated matcher gives to this series (same winner rule as membership,
+ *     so priority fights resolve identically everywhere);
+ *  2. Meet conference records for those rows' codes — they ENRICH the
+ *     matched rows only. A record no own-calendar row claims is dropped:
+ *     Meet codes get reused (personal rooms), and "own-calendar rows only"
+ *     (spec §7) means a call the caller was not invited to never becomes an
+ *     occurrence — let alone an auto-import;
+ *  3. Graph artifacts for the join URLs of the matched Teams rows (one join
+ *     URL = one Teams meeting object, so its other occurrences ARE this
+ *     meeting's).
+ */
 async function computeSweepSkeleton(
   seriesTitle: string,
   seriesId: number,
@@ -610,97 +621,50 @@ async function computeSweepSkeleton(
   graphChecked: boolean;
   occurrences: SeriesOccurrence[];
 }> {
-  const keys = await listKeys(seriesId);
-  const byKind = (kind: string) => keys.filter((k) => k.kind === kind).map((k) => k.value);
-  const codes = new Set(byKind('meeting-code'));
-  const bases = new Set([...byKind('recurring-base-id'), ...byKind('ical-uid-base')]);
-  const joinUrls = byKind('teams-join-url');
-  const graphMeetingIds = byKind('graph-meeting-id');
-
   const timeMin = new Date(Date.now() - SWEEP_MONTHS_BACK * 30 * DAY_MS).toISOString();
   const timeMax = new Date(Date.now() + SWEEP_DAYS_FORWARD * DAY_MS).toISOString();
   const nowMs = Date.now();
 
-  // ---- Google Calendar side ----------------------------------------------
+  // ---- the caller's own calendar, through the curated matcher -------------
   const minted = await getServerAccessToken(caller.userId).catch(() => null);
   const googleConnected = Boolean(minted);
-  const instances = new Map<string, CalInstance>();
-  if (minted) {
-    const queries: URLSearchParams[] = [];
-    queries.push(
-      new URLSearchParams({
-        q: seriesTitle,
-        timeMin,
-        timeMax,
-        singleEvents: 'true',
-        orderBy: 'startTime',
-        maxResults: '250',
-        fields: FIELDS,
-      })
-    );
-    for (const base of bases) {
-      queries.push(
-        new URLSearchParams({
-          iCalUID: `${base}@google.com`,
-          timeMin,
-          timeMax,
-          singleEvents: 'true',
-          maxResults: '250',
-          fields: FIELDS,
-        })
-      );
-    }
-    const results = await Promise.all(queries.map((p) => calList(minted.token, p)));
-    for (const item of results.flat()) {
-      if (!item.id || item.status === 'cancelled') continue;
-      const matchesSeries =
-        (item.conferenceData?.conferenceId && codes.has(item.conferenceData.conferenceId)) ||
-        (item.recurringEventId && bases.has(recurringBaseId(item.recurringEventId))) ||
-        (item.iCalUID && bases.has(recurringBaseId(item.iCalUID.replace(/@google\.com$/i, ''))));
-      if (!matchesSeries) continue;
-      instances.set(item.id, item);
-    }
-  }
+  const [rows, allSeries] = await Promise.all([
+    listOwnCalendarRows(caller.userId, timeMin, timeMax),
+    loadCuratedSeries(),
+  ]);
+  const matched = rows.filter((r) => pickSeries(allSeries, factsFromCalendarRow(r))?.id === seriesId);
+  // One occurrence per calendar instance (a re-keyed start leaves the newest).
+  const byEvent = new Map<string, OwnCalendarRow>();
+  for (const r of matched) byEvent.set(r.event_id, r);
+  const rowOfEvent = new Map<string, OwnCalendarRow>(byEvent);
 
-  const occurrences: SeriesOccurrence[] = [];
-  for (const inst of instances.values()) {
-    const startIso = inst.start?.dateTime ?? inst.start?.date;
-    if (!startIso) continue;
-    const { videoFileId, transcriptDocId, geminiNotes } = classifyAttachments(inst);
-    occurrences.push({
-      key: inst.id!,
-      startIso,
-      endIso: inst.end?.dateTime ?? inst.end?.date ?? null,
-      title: inst.summary ?? null,
-      source: 'calendar',
-      upcoming: Date.parse(startIso) > nowMs,
-      meetingCode: inst.conferenceData?.conferenceId ?? null,
-      eventId: inst.id!,
-      recurringEventId: inst.recurringEventId ?? null,
-      iCalUID: inst.iCalUID ?? null,
-      organizerEmail: inst.organizer?.email ?? null,
-      attendees: (inst.attendees ?? [])
-        .filter((a) => a.email)
-        .map((a) => ({ email: a.email!, name: a.displayName, responseStatus: a.responseStatus })),
-      hasRecording: Boolean(videoFileId),
-      hasTranscript: Boolean(transcriptDocId),
-      videoFileId,
-      transcriptDocId,
-      geminiNotes,
-      emptyTranscript: false,
-      teams: null,
-      meet: null,
-      calendarUrl: inst.htmlLink ?? null,
-      imported: [],
-    });
+  const occurrences: SeriesOccurrence[] = [...byEvent.values()].map((r) =>
+    occurrenceFromCalendarRow(r, nowMs)
+  );
+  const codes = new Set(
+    [...byEvent.values()]
+      .map((r) => r.meeting_code)
+      .filter((c): c is string => !!c && !c.startsWith('teams-'))
+  );
+  // Teams: the canonical join URL a past probe stashed for each `teams-…`
+  // code (gmeet_meeting_cache raw.teamsResolution) — keyed back to the
+  // occurrences it belongs to, so Graph artifacts only land on them.
+  const teamsOccs = new Map<string, SeriesOccurrence[]>();
+  for (const r of byEvent.values()) {
+    if (!r.meeting_code?.startsWith('teams-')) continue;
+    const url = await getTeamsJoinUrlByMeeting(r.meeting_code, r.event_start).catch(() => null);
+    if (!url) continue;
+    const occ = occurrences.find((o) => o.eventId === r.event_id);
+    if (occ) teamsOccs.set(url, [...(teamsOccs.get(url) ?? []), occ]);
   }
+  const joinUrls = [...teamsOccs.keys()];
 
   // ---- Google Meet REST API side (conference records per meeting code) ----
   // Calendar attachments are per-copy and frequently absent on the caller's
   // event; Meet's own record of each call is authoritative for "was this
-  // recorded / transcribed". Enrich matching calendar instances, surface
-  // the rest as Meet-only occurrences. Records not recorded at all add no
-  // occurrence (the calendar already lists the instance as bare).
+  // recorded / transcribed". It enriches the MATCHED calendar instances
+  // only — a record none of them claims is not an occurrence of this series
+  // (a reused code; see the function doc).
   let meetChecked = false;
   if (minted && codes.size > 0) {
     for (const code of codes) {
@@ -784,30 +748,8 @@ async function computeSweepSkeleton(
               : meet;
             return;
           }
-          occurrences.push({
-            key: `meet-${rec.name.replace(/^conferenceRecords\//, '')}`,
-            startIso: rec.startTime,
-            endIso: rec.endTime ?? null,
-            title: seriesTitle,
-            source: 'meet',
-            upcoming: false,
-            meetingCode: code,
-            eventId: null,
-            recurringEventId: null,
-            iCalUID: null,
-            organizerEmail: null,
-            attendees: [],
-            hasRecording: hasRec,
-            hasTranscript: hasTr,
-            videoFileId: fileId,
-            transcriptDocId: docId,
-            geminiNotes: false,
-            emptyTranscript: false,
-            teams: null,
-            meet,
-            calendarUrl: null,
-            imported: [],
-          });
+          // No own-calendar instance within the window: not this series'
+          // (the inventory above is still written back to the shared cache).
         });
       }
       // Write back what this sweep learned — best-effort, never blocks the
@@ -815,8 +757,8 @@ async function computeSweepSkeleton(
       try {
         const existing = await getMeetingCacheByKeys(writeBacks.map((w) => w.key));
         for (const w of writeBacks) {
-          const inst = w.target ? instances.get(w.target.eventId ?? '') : undefined;
-          const att = inst ? classifyCalendarAttachments(inst.attachments) : null;
+          const calRow = w.target ? rowOfEvent.get(w.target.eventId ?? '') : undefined;
+          const att = calRow ? attachmentsOf(calRow) : null;
           const row = await persistMeetingEvidence(minted.token, {
             userId: caller.userId,
             meetingCode: code,
@@ -851,7 +793,7 @@ async function computeSweepSkeleton(
 
   // ---- Microsoft Graph side (Teams series) --------------------------------
   let graphChecked = false;
-  if (isGraphConfigured() && (joinUrls.length > 0 || graphMeetingIds.length > 0)) {
+  if (isGraphConfigured() && joinUrls.length > 0) {
     for (const rawUrl of joinUrls) {
       const info = parseTeamsJoinLink(rawUrl);
       if (!info) continue;
@@ -863,9 +805,9 @@ async function computeSweepSkeleton(
           listTranscripts(info.organizerOid, meeting.id),
           listRecordings(info.organizerOid, meeting.id),
         ]);
-        // Attach artifacts to matching calendar instances first…
+        // Attach artifacts to this join URL's calendar instances first…
         const claimed = new Set<string>();
-        for (const occ of occurrences) {
+        for (const occ of teamsOccs.get(rawUrl) ?? []) {
           if (!occ.endIso) continue;
           const picked = pickOccurrenceArtifacts(gTr, gRec, occ.startIso, occ.endIso);
           const callId = picked.transcript?.callId ?? picked.recording?.callId ?? null;

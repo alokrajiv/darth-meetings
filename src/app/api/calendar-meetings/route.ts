@@ -7,11 +7,11 @@ import {
   type CalendarMeetingDbRow,
   type CalendarMeetingView,
 } from '@/db-ops/calendar-event-cache';
-import { findSeriesByRecurringBaseIds, findSeriesByMeetingCodes, listAutoImportLogForSeries, type SeriesKeyHit, type AutoImportLogRow } from '@/db-ops/series';
+import { listAutoImportLogForSeries, type AutoImportLogRow } from '@/db-ops/series';
+import { seriesForOccurrences, toSeriesHit, type SeriesHit } from '@/lib/server/curated-series';
 import { ensureMeetingsForOccurrences } from '@/db-ops/meetings';
 import { getAutoSyncLog, predictedAutoSyncImporters, type AutoSyncLogRow, type PredictedAutoSync } from '@/db-ops/user-prefs';
 import { strongestReport, type ReportPref } from '@/lib/auto-marker';
-import { recurringBaseId } from '@/lib/series-keys';
 import { parseMeetingFilters } from '@/lib/server/meeting-filters';
 import { recordingsForOccurrences, type OccurrenceRecordingHit } from '@/db-ops/recorder';
 import type { RecorderRecordingRef } from '@/lib/recorder';
@@ -74,8 +74,9 @@ export interface CalendarMeetingRow {
   recurringEventId: string | null;
   /** Cached occurrences of the series ("Hide all N…"); null = not recurring. */
   seriesCount: number | null;
-  /** App-level series this occurrence belongs to (recurring-base-id match) —
-   * renders the same member chip archive rows get; click opens SeriesDialog. */
+  /** Curated series this occurrence belongs to (the matcher's winner on its
+   * title / invite — lib/series-patterns) — renders the same member chip
+   * archive rows get; click opens SeriesDialog. */
   seriesId: number | null;
   seriesTitle: string | null;
   /** norec rows only: what the last provider probe (poller sweep or a
@@ -186,7 +187,7 @@ function occKeyOf(r: CalendarMeetingDbRow): string | null {
  * per-row lookups. */
 function autoSyncOf(
   key: string | null,
-  series: SeriesKeyHit | null,
+  series: SeriesHit | null,
   log: Map<string, AutoSyncLogRow>,
   predicted: Map<string, PredictedAutoSync>,
   seriesLog: Map<string, AutoImportLogRow>
@@ -275,21 +276,17 @@ function recorderRefOf(
 
 function toRow(
   r: CalendarMeetingDbRow,
-  seriesByBase: Map<string, SeriesKeyHit>,
+  seriesByKey: Map<string, SeriesHit>,
   extras: {
     uuids: Map<string, string>;
     log: Map<string, AutoSyncLogRow>;
     predicted: Map<string, PredictedAutoSync>;
-    seriesByCode: Map<string, SeriesKeyHit>;
     seriesLog: Map<string, AutoImportLogRow>;
     recorder: Map<string, OccurrenceRecordingHit>;
     callerUserId: string;
   }
 ): CalendarMeetingRow {
-  const series =
-    (r.recurring_event_id ? seriesByBase.get(recurringBaseId(r.recurring_event_id)) : null) ??
-    (r.meeting_code ? extras.seriesByCode.get(r.meeting_code) : null) ??
-    null;
+  const series = seriesByKey.get(r.key) ?? null;
   const occKey = occKeyOf(r);
   return {
     meetingUuid: occKey ? (extras.uuids.get(occKey) ?? null) : null,
@@ -370,14 +367,6 @@ export const GET = withAuth(async ({ user, request }) => {
     }),
   ]);
 
-  // One batch lookup maps this page's recurring events onto app-level series.
-  const baseIds = [
-    ...new Set(
-      page.days.flatMap((d) =>
-        d.rows.flatMap((r) => (r.recurring_event_id ? [recurringBaseId(r.recurring_event_id)] : []))
-      )
-    ),
-  ];
   // Pre-import identity + auto-sync intent, batched over the served rows.
   const allRows = page.days.flatMap((d) => d.rows);
   const occs = allRows
@@ -395,9 +384,24 @@ export const GET = withAuth(async ({ user, request }) => {
   // colleague's unlinked recording is not folded in at all — not its
   // existence, its owner, its state, its duration nor its meeting id
   // (db-ops/recorder, docs/recordings-meetings-series-design.md F1/P1).
-  const [seriesByBase, seriesByCode, uuids, log, predicted, recorder] = await Promise.all([
-    findSeriesByRecurringBaseIds(baseIds),
-    findSeriesByMeetingCodes([...new Set(occs.map((o) => o.code))]),
+  const [seriesMatched, uuids, log, predicted, recorder] = await Promise.all([
+    // The curated matcher on each served row (title, organiser, recurring;
+    // invitees from the CALLER's own calendar row when a series has an
+    // invite rule) — the same winner an import of the row would join.
+    seriesForOccurrences(
+      user.userId,
+      allRows.map((r) => ({
+        key: r.key,
+        title: r.title,
+        organizerEmail: r.organizer_email,
+        recurringEventId: r.recurring_event_id,
+        code: r.meeting_code,
+        startIso: r.meeting_code ? isoOf(r.event_start) : null,
+      }))
+    ).catch((err) => {
+      console.warn('[calendar-meetings] series match failed:', err);
+      return new Map<string, never>();
+    }),
     ensureMeetingsForOccurrences(occs).catch((err) => {
       console.warn('[calendar-meetings] occurrence uuid mint failed:', err);
       return new Map<string, string>();
@@ -414,16 +418,19 @@ export const GET = withAuth(async ({ user, request }) => {
       return new Map<string, OccurrenceRecordingHit>();
     }),
   ]);
+  const seriesByKey = new Map<string, SeriesHit>(
+    [...seriesMatched].map(([k, s]) => [k, toSeriesHit(s)])
+  );
   const seriesLog =
     view === 'unimported'
       ? await listAutoImportLogForSeries(
-          [...new Set([...seriesByBase.values(), ...seriesByCode.values()].filter((h) => h.auto_import).map((h) => h.series_id))]
+          [...new Set([...seriesByKey.values()].filter((h) => h.auto_import).map((h) => h.series_id))]
         ).catch(() => new Map<string, AutoImportLogRow>())
       : new Map<string, AutoImportLogRow>();
-  const extras = { uuids, log, predicted, seriesByCode, seriesLog, recorder, callerUserId: user.userId };
+  const extras = { uuids, log, predicted, seriesLog, recorder, callerUserId: user.userId };
 
   const body: CalendarMeetingsResponse = {
-    days: page.days.map((d) => ({ key: d.key, rows: d.rows.map((r) => toRow(r, seriesByBase, extras)) })),
+    days: page.days.map((d) => ({ key: d.key, rows: d.rows.map((r) => toRow(r, seriesByKey, extras)) })),
     counts,
     nextCursor: page.nextCursor,
     hasMore: page.hasMore,
