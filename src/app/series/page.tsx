@@ -27,6 +27,7 @@ import {
 import { Loader2, Plus, Repeat, UserCheck, Zap } from 'lucide-react';
 import { isNetworkFailure, networkErrorMessage, NETWORK_ERROR_MESSAGE } from '@/lib/fetch-errors';
 import { describePattern, type SeriesPattern } from '@/lib/series-patterns';
+import { LISTING_MAX_CONTENT_PX } from '@/lib/listing-layout';
 
 /**
  * The series index (curated series, docs/curated-series-spec.md): every
@@ -139,7 +140,8 @@ export default function SeriesIndexPage() {
         </Button>
       </AppHeader>
 
-      <main className="mx-auto max-w-5xl px-6 py-4">
+      {/* Same content width as the header and the meetings listing. */}
+      <main className="mx-auto px-6 py-4" style={{ maxWidth: LISTING_MAX_CONTENT_PX }}>
         {!data && !error ? (
           <div className="flex items-center justify-center py-16 text-muted-foreground">
             <Loader2 className="h-5 w-5 animate-spin" />
@@ -160,14 +162,17 @@ export default function SeriesIndexPage() {
           data && (
             <>
               <div className="rounded-lg border">
-                <Table>
+                {/* Fixed layout: the shadcn cells are nowrap by default, so an
+                    auto table let long descriptions push the right-hand
+                    columns out of the bordered box. */}
+                <Table className="table-fixed">
                   <TableHeader>
                     <TableRow>
                       <TableHead className="pl-4">Series</TableHead>
-                      <TableHead className="w-64">Patterns</TableHead>
-                      <TableHead className="w-48">Labels · followers</TableHead>
+                      <TableHead className="w-[26%]">Patterns</TableHead>
+                      <TableHead className="w-[24%]">Labels · followers</TableHead>
                       <TableHead
-                        className="w-24 text-right"
+                        className="w-20 text-right"
                         title="Meetings in this series that you own or that are shared with you"
                       >
                         Yours
@@ -178,7 +183,7 @@ export default function SeriesIndexPage() {
                   <TableBody>
                     {data.series.map((s) => (
                       <TableRow key={s.id} className="cursor-pointer align-top" onClick={() => setOpenSeriesId(s.id)}>
-                        <TableCell className="py-2.5 pl-4">
+                        <TableCell className="whitespace-normal py-2.5 pl-4">
                           <div className="flex min-w-0 items-center gap-2">
                             <Repeat className="h-3.5 w-3.5 shrink-0 text-primary/70" />
                             <span className="min-w-0 truncate text-sm font-medium">{s.title}</span>
@@ -197,7 +202,7 @@ export default function SeriesIndexPage() {
                             </p>
                           )}
                         </TableCell>
-                        <TableCell className="py-2.5">
+                        <TableCell className="whitespace-normal py-2.5">
                           {s.patterns.length === 0 ? (
                             <span className="text-xs text-muted-foreground">manual only</span>
                           ) : (
@@ -216,7 +221,7 @@ export default function SeriesIndexPage() {
                             <p className="text-[10px] text-muted-foreground">priority {s.priority}</p>
                           )}
                         </TableCell>
-                        <TableCell className="space-y-1 py-2.5">
+                        <TableCell className="space-y-1 whitespace-normal py-2.5">
                           <LabelChipsStatic labels={s.labels} />
                           {s.followers.length > 0 && (
                             <p
@@ -255,7 +260,7 @@ export default function SeriesIndexPage() {
       </main>
 
       <Dialog open={creating} onOpenChange={(o) => (!o ? setCreating(false) : null)}>
-        <DialogContent className="max-h-[85vh] overflow-y-auto rounded-xl sm:max-w-xl">
+        <DialogContent className="max-h-[88vh] grid-cols-[minmax(0,1fr)] overflow-y-auto rounded-xl sm:max-w-3xl">
           <DialogHeader>
             <DialogTitle className="flex items-center gap-2">
               <Repeat className="h-4 w-4 text-primary" /> New series

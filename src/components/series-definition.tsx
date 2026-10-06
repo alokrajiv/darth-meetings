@@ -397,7 +397,7 @@ export function SeriesDefinitionForm({
           className="h-8 w-24"
         />
         <span className="block text-[11px] text-muted-foreground">
-          When several series match one meeting, the lowest number wins.
+          When several series match one meeting, a followed series wins first; then the lowest number.
         </span>
       </label>
 

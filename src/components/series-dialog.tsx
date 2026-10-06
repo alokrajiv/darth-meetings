@@ -818,7 +818,12 @@ export function SeriesDialog({ seriesId, onClose, onChanged }: SeriesDialogProps
   const open = seriesId !== null;
   return (
     <Dialog open={open} onOpenChange={(o) => (!o ? onClose() : null)}>
-      <DialogContent className="max-h-[85vh] overflow-y-auto rounded-xl sm:max-w-2xl">
+      {/* Wide like the page (the occurrences table, the auto-import card and
+          the Import button all need the room), and grid-cols minmax(0,1fr):
+          DialogContent is a grid, whose items default to min-width:auto —
+          one long occurrence title then widened the column past the dialog
+          and everything on the right was clipped. */}
+      <DialogContent className="max-h-[88vh] w-[min(1200px,calc(100vw-4rem))] max-w-none grid-cols-[minmax(0,1fr)] overflow-y-auto rounded-xl sm:max-w-none">
         <DialogHeader>
           <DialogTitle className="flex items-center gap-2 pr-8">
             <Repeat className="h-4 w-4 shrink-0 text-primary" />
