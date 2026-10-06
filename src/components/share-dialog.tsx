@@ -11,10 +11,10 @@ import {
 } from '@/components/ui/dialog';
 import { Button } from '@/components/ui/button';
 import { Badge } from '@/components/ui/badge';
-import { Check, Crown, Loader2, ShieldCheck, Trash2, Users } from 'lucide-react';
+import { Check, Crown, Loader2, Repeat, ShieldCheck, Trash2, Users } from 'lucide-react';
 import { UserPicker, type PickerPerson } from '@/components/user-picker';
 import type { TranscriptShare, TranscriptAccess } from '@/lib/format';
-import { isAuditorShare } from '@/lib/auditor-policy';
+import { isAuditorShare, isSeriesFollowShare } from '@/lib/auditor-policy';
 
 interface ShareDialogProps {
   open: boolean;
@@ -41,6 +41,9 @@ export function ShareDialog({
 }: ShareDialogProps) {
   const [shares, setShares] = useState<TranscriptShare[]>([]);
   const [owner, setOwner] = useState<{ email: string | null; name: string | null } | null>(null);
+  // The meeting's curated series — names the "Following <series>" note on
+  // follow shares (origin 'series-follow').
+  const [series, setSeries] = useState<{ id: number; title: string } | null>(null);
   const [loading, setLoading] = useState(false);
   const [pendingAccess, setPendingAccess] = useState<'edit' | 'read'>('edit');
   const [pickerKey, setPickerKey] = useState(0); // bump to reset the picker after add
@@ -70,12 +73,14 @@ export function ShareDialog({
         credentials: 'include',
       });
       if (!res.ok) throw new Error(`Failed (${res.status})`);
-      const { shares: rows, owner: ownerInfo } = (await res.json()) as {
+      const { shares: rows, owner: ownerInfo, series: seriesInfo } = (await res.json()) as {
         shares: TranscriptShare[];
         owner?: { email: string | null; name: string | null };
+        series?: { id: number; title: string } | null;
       };
       setShares(rows);
       setOwner(ownerInfo ?? null);
+      setSeries(seriesInfo ?? null);
       onSharesChangedRef.current?.(rows);
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to load');
@@ -360,6 +365,25 @@ export function ShareDialog({
           </div>
         )}
 
+        {shares.some(isSeriesFollowShare) && (
+          <div
+            className="mt-2 flex gap-2 rounded-md border border-amber-300/60 bg-amber-50 px-3 py-2 text-xs leading-5 text-amber-900 dark:border-amber-500/30 dark:bg-amber-950/30 dark:text-amber-200"
+            data-series-follow-note
+          >
+            <Repeat className="mt-0.5 h-3.5 w-3.5 shrink-0" />
+            <p>
+              {shares
+                .filter(isSeriesFollowShare)
+                .map((s) => s.shared_with_name || s.shared_with_email.split('@')[0])
+                .join(' and ')}{' '}
+              {shares.filter(isSeriesFollowShare).length === 1 ? 'reads' : 'read'} this meeting because they
+              follow the series{' '}
+              <span className="font-medium">{series ? `“${series.title}”` : 'it belongs to'}</span>.
+              {canManage && ' You can remove them — the removal is recorded and they are not added back.'}
+            </p>
+          </div>
+        )}
+
         <div className="mt-2 rounded-md border">
           <div className="border-b px-3 py-2 text-xs font-medium text-muted-foreground">
             {shares.length === 0
@@ -406,6 +430,16 @@ export function ShareDialog({
                         title="Added automatically: someone from outside Tramés was in this meeting"
                       >
                         <ShieldCheck className="h-3 w-3" /> Auditor
+                      </Badge>
+                    )}
+                    {isSeriesFollowShare(s) && (
+                      <Badge
+                        variant="outline"
+                        className="shrink-0 gap-1 border-amber-300/70 px-1 py-0 text-[10px] font-normal text-amber-800 dark:text-amber-300"
+                        title={`Added automatically: follows the series${series ? ` “${series.title}”` : ''}`}
+                      >
+                        <Repeat className="h-3 w-3" />
+                        <span className="max-w-32 truncate">Following {series?.title ?? 'series'}</span>
                       </Badge>
                     )}
                   </div>

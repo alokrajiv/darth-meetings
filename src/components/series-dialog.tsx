@@ -26,7 +26,6 @@ import {
   ExternalLink,
   CalendarClock,
   CalendarDays,
-  Merge,
   Zap,
   Info,
   ChevronRight,
@@ -34,12 +33,24 @@ import {
   Users,
   Link2,
 } from 'lucide-react';
+import {
+  LabelChipsStatic,
+  PatternList,
+  SeriesDefinitionForm,
+  SeriesFollowersSection,
+  type SeriesDefinitionValues,
+  type SeriesFollowerView,
+  type SeriesPermissionsView,
+} from '@/components/series-definition';
+import type { SeriesPattern } from '@/lib/series-patterns';
 
 /**
- * The series view: confirmed members, guessed members awaiting a yes/no, and
- * the live occurrence sweep (calendar + Graph) with per-occurrence and mass
- * import. Occurrences are computed server-side on every open — nothing about
- * them is persisted.
+ * The series view (curated series, docs/curated-series-spec.md): the
+ * definition — description, patterns, default labels, priority — with an
+ * edit mode, the followers, auto-import, and the occurrence sweep over the
+ * caller's own calendar with per-occurrence and mass import. Occurrences
+ * are computed server-side on every open — nothing about them is persisted.
+ * Members are only ever the meetings the caller can open (spec §6).
  */
 
 interface AutoImportCfg {
@@ -56,7 +67,23 @@ interface AutoImportCfg {
 }
 
 interface SeriesDetail {
-  series: { id: number; title: string; notes: string | null; auto_import: AutoImportCfg | null };
+  series: {
+    id: number;
+    title: string;
+    notes: string | null;
+    description: string | null;
+    patterns: SeriesPattern[];
+    priority: number;
+    created_by: string;
+    auto_import: AutoImportCfg | null;
+  };
+  /** false until migration 053 is applied — the definition is read-only. */
+  ready: boolean;
+  labels: Array<{ id: number; path: string; name: string; color: string | null }>;
+  followers: SeriesFollowerView[];
+  permissions: SeriesPermissionsView | null;
+  viewer?: { email: string };
+  /** Caller-visible members only (owned or shared). */
   members: Array<{
     transcript_id: number;
     assemblyai_id: string;
@@ -64,33 +91,7 @@ interface SeriesDetail {
     recorded_at: string | null;
     created_at: string;
     how: string;
-    accessible: boolean;
-  }>;
-  suggestions: Array<{
-    transcript_id: number;
-    assemblyai_id: string;
-    title: string | null;
-    recorded_at: string | null;
-    created_at: string;
-    matched_kinds: string[];
-    status: string;
-    duration: number | null;
-    source: 'uploaded' | 'imported';
-    owned: boolean;
-    provider: 'gmeet' | 'teams' | null;
-    event_title: string | null;
-    event_start: string | null;
-    organizer_email: string | null;
-    attendee_count: number;
-  }>;
-  /** Probable-duplicate sibling series (shared Meet code / recurring event /
-   * Teams meeting / name) — the one-click merge prompt. */
-  dupes: Array<{
-    id: number;
-    title: string;
-    member_count: number;
-    last_recorded_at: string | null;
-    reason: string;
+    access: 'owner' | 'edit' | 'read';
   }>;
 }
 
@@ -165,9 +166,6 @@ interface SeriesDialogProps {
   onClose: () => void;
   /** Membership/import changed — parents refresh their lists. */
   onChanged: () => void;
-  /** This series was merged INTO targetSeriesId — hosts that can switch the
-   * open dialog to the survivor pass this; otherwise the dialog just closes. */
-  onMerged?: (targetSeriesId: number) => void;
 }
 
 const dateLabel = (iso: string) =>
@@ -193,13 +191,6 @@ const gapLabel = (ms: number) => {
   if (days < 10) return `${Math.round(days)}d`;
   if (days < 60) return `${Math.round(days / 7)} wks`;
   return `${Math.round(days / 30)} mo`;
-};
-
-const durationLabel = (secs: number | null) => {
-  if (!secs || secs <= 0) return null;
-  const m = Math.round(secs / 60);
-  if (m < 60) return `${m} min`;
-  return `${Math.floor(m / 60)}h ${String(m % 60).padStart(2, '0')}m`;
 };
 
 /** What each auto-import choice actually does — shown in the (i) popovers and
@@ -246,15 +237,6 @@ const REPORT_INFO: Record<ReportPref, { label: string; detail: string }> = {
     label: 'Generate later',
     detail: 'Just import. You trigger the summary + report yourself from the transcript page.',
   },
-};
-
-const MATCH_KIND_LABEL: Record<string, { label: string; strong: boolean }> = {
-  'meeting-code': { label: 'same Meet link', strong: true },
-  'recurring-base-id': { label: 'same calendar series', strong: true },
-  'ical-uid-base': { label: 'same calendar series', strong: true },
-  'teams-join-url': { label: 'same Teams meeting', strong: true },
-  'graph-meeting-id': { label: 'same Teams meeting', strong: true },
-  'normalized-title': { label: 'similar title only', strong: false },
 };
 
 /** Small (i) glyph that reveals a panel on hover/focus — the dialog has no
@@ -486,7 +468,7 @@ function CoverageStrip({ occurrences }: { occurrences: Occurrence[] }) {
   );
 }
 
-export function SeriesDialog({ seriesId, onClose, onChanged, onMerged }: SeriesDialogProps) {
+export function SeriesDialog({ seriesId, onClose, onChanged }: SeriesDialogProps) {
   const [detail, setDetail] = useState<SeriesDetail | null>(null);
   // Why the detail could not load (was a bare spinner forever) — Retry + Close.
   const [detailError, setDetailError] = useState<string | null>(null);
@@ -498,12 +480,7 @@ export function SeriesDialog({ seriesId, onClose, onChanged, onMerged }: SeriesD
   const [busyIds, setBusyIds] = useState<Set<string>>(new Set());
   const [importErrors, setImportErrors] = useState<Map<string, string>>(new Map());
   const [massProgress, setMassProgress] = useState<{ done: number; total: number } | null>(null);
-  const [mergeOpen, setMergeOpen] = useState(false);
-  const [mergeTargets, setMergeTargets] = useState<
-    Array<{ id: number; title: string; member_count: number }> | null
-  >(null);
-  const [mergeBusy, setMergeBusy] = useState(false);
-  const [mergeError, setMergeError] = useState<string | null>(null);
+  const [editing, setEditing] = useState(false);
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
   const toggleExpanded = (key: string) =>
     setExpanded((prev) => {
@@ -547,9 +524,7 @@ export function SeriesDialog({ seriesId, onClose, onChanged, onMerged }: SeriesD
     setOcc(null);
     setImportErrors(new Map());
     setMassProgress(null);
-    setMergeOpen(false);
-    setMergeTargets(null);
-    setMergeError(null);
+    setEditing(false);
     setActionError(null);
     setDetailError(null);
     setExpanded(new Set());
@@ -579,30 +554,14 @@ export function SeriesDialog({ seriesId, onClose, onChanged, onMerged }: SeriesD
       return false;
     }
   };
-  const confirmSuggestion = async (assemblyaiId: string) => {
-    if (!seriesId) return;
-    const ok = await guarded('Confirm', () =>
-      fetch(`/api/series/${seriesId}/members`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ transcriptId: assemblyaiId, how: 'confirmed' }),
-      })
-    );
-    if (ok) refresh();
-  };
-  const rejectSuggestion = async (assemblyaiId: string) => {
-    if (!seriesId) return;
-    const ok = await guarded('Reject', () =>
-      fetch(
-        `/api/series/${seriesId}/members?transcriptId=${encodeURIComponent(assemblyaiId)}&remember=1`,
-        { method: 'DELETE' }
-      )
-    );
-    if (ok) refresh();
-  };
   const removeMember = async (assemblyaiId: string) => {
     if (!seriesId) return;
-    if (!confirm('Remove this meeting from the series? It won’t be suggested again.')) return;
+    if (
+      !confirm(
+        'Not this series? The meeting leaves it (with the series’ labels and follow shares), and its patterns won’t pull it back.'
+      )
+    )
+      return;
     const ok = await guarded('Remove', () =>
       fetch(
         `/api/series/${seriesId}/members?transcriptId=${encodeURIComponent(assemblyaiId)}&remember=1`,
@@ -611,18 +570,32 @@ export function SeriesDialog({ seriesId, onClose, onChanged, onMerged }: SeriesD
     );
     if (ok) refresh();
   };
-  const rename = async () => {
-    if (!seriesId || !detail) return;
-    const title = prompt('Series name', detail.series.title)?.trim();
-    if (!title || title === detail.series.title) return;
-    const ok = await guarded('Rename', () =>
-      fetch(`/api/series/${seriesId}`, {
+  /** Save the edited definition. Patterns/priority are only sent when they
+   * changed (on a followed series they are auditor-only — spec §6). */
+  const saveDefinition = async (
+    v: SeriesDefinitionValues,
+    changed: { matching: boolean }
+  ): Promise<string | null> => {
+    if (!seriesId) return 'No series';
+    try {
+      const res = await fetch(`/api/series/${seriesId}`, {
         method: 'PATCH',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ title }),
-      })
-    );
-    if (ok) refresh();
+        body: JSON.stringify({
+          title: v.title,
+          description: v.description,
+          labels: v.labels,
+          ...(changed.matching ? { patterns: v.patterns, priority: v.priority } : {}),
+        }),
+      });
+      const j = (await res.json().catch(() => null)) as { error?: string } | null;
+      if (!res.ok) return j?.error ?? `Couldn't save (${res.status})`;
+      setEditing(false);
+      refresh();
+      return null;
+    } catch (err) {
+      return networkErrorMessage(err, "Couldn't save");
+    }
   };
   // ---- auto-import config -------------------------------------------------
   // Optimistic + latest-wins: the UI flips instantly, one PATCH is in flight
@@ -700,63 +673,16 @@ export function SeriesDialog({ seriesId, onClose, onChanged, onMerged }: SeriesD
 
   const deleteSeries = async () => {
     if (!seriesId) return;
-    if (!confirm('Delete this series? Transcripts are kept — only the grouping goes away.'))
+    if (
+      !confirm(
+        'Delete this series? Meetings are kept — the grouping goes away, and with it the series’ default labels and its followers’ read shares.'
+      )
+    )
       return;
     const ok = await guarded('Delete', () => fetch(`/api/series/${seriesId}`, { method: 'DELETE' }));
     if (!ok) return;
     onChanged();
     onClose();
-  };
-
-  // ---- merging ------------------------------------------------------------
-  const openMergePicker = async () => {
-    setMergeOpen(true);
-    setMergeError(null);
-    if (mergeTargets === null) {
-      // A failed list is an error, not "No other series".
-      try {
-        const res = await fetch('/api/series');
-        if (!res.ok) throw new Error(`Couldn't list series (${res.status})`);
-        const j = (await res.json()) as {
-          series: Array<{ id: number; title: string; member_count: number }>;
-        };
-        setMergeTargets(j.series.filter((s) => s.id !== seriesId));
-      } catch (err) {
-        setMergeError(networkErrorMessage(err, "Couldn't list series"));
-      }
-    }
-  };
-
-  const mergeInto = async (target: { id: number; title: string; member_count: number }) => {
-    if (!seriesId || !detail) return;
-    const ok = confirm(
-      `Merge "${detail.series.title}" (${detail.members.length} meeting${
-        detail.members.length === 1 ? '' : 's'
-      }) into "${target.title}" (${target.member_count})?\n\n` +
-        `All meetings and matching rules move to "${target.title}", and ` +
-        `"${detail.series.title}" is deleted. This cannot be undone.`
-    );
-    if (!ok) return;
-    setMergeBusy(true);
-    setMergeError(null);
-    try {
-      const res = await fetch(`/api/series/${target.id}/merge`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ fromSeriesId: seriesId }),
-      });
-      if (!res.ok) {
-        const j = (await res.json().catch(() => null)) as { error?: string } | null;
-        throw new Error(j?.error ?? `Merge failed (${res.status})`);
-      }
-      onChanged();
-      if (onMerged) onMerged(target.id);
-      else onClose();
-    } catch (err) {
-      setMergeError(networkErrorMessage(err, 'Merge failed'));
-    } finally {
-      setMergeBusy(false);
-    }
   };
 
   // ---- importing ----------------------------------------------------------
@@ -897,15 +823,17 @@ export function SeriesDialog({ seriesId, onClose, onChanged, onMerged }: SeriesD
           <DialogTitle className="flex items-center gap-2 pr-8">
             <Repeat className="h-4 w-4 shrink-0 text-primary" />
             <span className="min-w-0 truncate">{detail?.series.title ?? 'Series'}</span>
-            <Button
-              variant="ghost"
-              size="sm"
-              className="h-6 w-6 shrink-0 p-0 text-muted-foreground"
-              onClick={() => void rename()}
-              title="Rename series"
-            >
-              <Pencil className="h-3 w-3" />
-            </Button>
+            {detail?.ready && !editing && (
+              <Button
+                variant="ghost"
+                size="sm"
+                className="h-6 w-6 shrink-0 p-0 text-muted-foreground"
+                onClick={() => setEditing(true)}
+                title="Edit the series — name, description, patterns, labels, priority"
+              >
+                <Pencil className="h-3 w-3" />
+              </Button>
+            )}
           </DialogTitle>
         </DialogHeader>
 
@@ -932,151 +860,57 @@ export function SeriesDialog({ seriesId, onClose, onChanged, onMerged }: SeriesD
           )
         ) : (
           <div className="space-y-4">
-            {/* ---- guessed members ------------------------------------- */}
-            {detail.suggestions.length > 0 && (
-              <div className="rounded-lg border border-primary/20 bg-primary/[0.03] p-2.5">
-                <p className="mb-1.5 text-[11px] font-medium uppercase tracking-wider text-primary/80">
-                  Probably part of this series — confirm?
-                </p>
-                <p className="mb-1.5 text-[11px] text-muted-foreground">
-                  Meetings you can see that look like this series but aren’t in any series yet.
-                  ✓ adds it here, ✗ hides it for good.
-                </p>
-                <div className="space-y-1.5">
-                  {detail.suggestions.map((s) => {
-                    const when = s.recorded_at ?? s.event_start;
-                    const kinds = [
-                      ...new Map(
-                        s.matched_kinds.map((k) => {
-                          const m = MATCH_KIND_LABEL[k] ?? { label: k, strong: false };
-                          return [m.label, m] as const;
-                        })
-                      ).values(),
-                    ];
-                    const weakOnly = kinds.every((k) => !k.strong);
-                    const sourceLabel =
-                      s.provider === 'teams'
-                        ? 'Teams import'
-                        : s.provider === 'gmeet'
-                          ? s.assemblyai_id.startsWith('gmeet-')
-                            ? 'Meet transcript import'
-                            : 'Meet recording import'
-                          : s.assemblyai_id.startsWith('ext-')
-                            ? 'text import (no audio)'
-                            : s.source === 'uploaded'
-                              ? 'uploaded file'
-                              : 'import';
-                    return (
-                      <div
-                        key={s.transcript_id}
-                        className="rounded-md border bg-background px-2 py-1.5"
-                      >
-                        <div className="flex items-center gap-2">
-                          <a
-                            href={`/transcript/${s.assemblyai_id}`}
-                            target="_blank"
-                            rel="noopener noreferrer"
-                            {...extLink('inline-flex min-w-0 flex-1 items-center gap-1 truncate text-sm hover:text-primary', 'Open this meeting (new tab)')}
-
-                          >
-                            <span className="truncate">{s.title || 'Untitled meeting'}</span>
-                            <ExternalLink className="h-3 w-3 shrink-0 text-muted-foreground/60" />
-                          </a>
-                          {kinds.map((k) => (
-                            <span
-                              key={k.label}
-                              className={`shrink-0 rounded-full px-1.5 py-px text-[10px] ${
-                                k.strong
-                                  ? 'bg-status-ok/10 text-status-ok'
-                                  : 'bg-amber-500/10 text-amber-700 dark:text-amber-400'
-                              }`}
-                              title={
-                                k.strong
-                                  ? 'Strong match — same underlying meeting identity'
-                                  : 'Weak match — only the title looks alike; check before confirming'
-                              }
-                            >
-                              {k.label}
-                            </span>
-                          ))}
-                          <Button
-                            size="sm"
-                            variant="ghost"
-                            className="h-6 w-6 shrink-0 p-0 text-status-ok"
-                            title="Yes, it belongs here"
-                            onClick={() => void confirmSuggestion(s.assemblyai_id)}
-                          >
-                            <Check className="h-3.5 w-3.5" />
-                          </Button>
-                          <Button
-                            size="sm"
-                            variant="ghost"
-                            className="h-6 w-6 shrink-0 p-0 text-muted-foreground"
-                            title="No — don't suggest again"
-                            onClick={() => void rejectSuggestion(s.assemblyai_id)}
-                          >
-                            <X className="h-3.5 w-3.5" />
-                          </Button>
-                        </div>
-                        <div className="mt-0.5 flex flex-wrap items-center gap-x-1.5 text-[11px] text-muted-foreground">
-                          <span>
-                            {when
-                              ? `${dateLabel(when)} ${timeLabel(when)}`
-                              : `added ${dateLabel(s.created_at)} · meeting date unknown`}
-                          </span>
-                          <span>·</span>
-                          <span>{sourceLabel}</span>
-                          {durationLabel(s.duration) && (
-                            <>
-                              <span>·</span>
-                              <span>{durationLabel(s.duration)}</span>
-                            </>
-                          )}
-                          {s.attendee_count > 0 && (
-                            <>
-                              <span>·</span>
-                              <span>{s.attendee_count} invitees</span>
-                            </>
-                          )}
-                          <span>·</span>
-                          <span>{s.owned ? 'yours' : 'shared with you'}</span>
-                          {weakOnly && (
-                            <>
-                              <span>·</span>
-                              <span className="text-amber-700 dark:text-amber-400">
-                                title match only — open it to check
-                              </span>
-                            </>
-                          )}
-                          <InfoHover className="ml-auto" align="right">
-                            <div className="space-y-1">
-                              <DetailRow label="Title">{s.title || '—'}</DetailRow>
-                              {s.event_title && s.event_title !== s.title && (
-                                <DetailRow label="Calendar event">{s.event_title}</DetailRow>
-                              )}
-                              <DetailRow label="When">
-                                {when ? fullWhen(when, null) : 'unknown (no calendar link)'}
-                              </DetailRow>
-                              <DetailRow label="Added">{fullWhen(s.created_at, null)}</DetailRow>
-                              <DetailRow label="Source">{sourceLabel}</DetailRow>
-                              {s.organizer_email && (
-                                <DetailRow label="Organizer">{s.organizer_email}</DetailRow>
-                              )}
-                              <DetailRow label="Status">{s.status}</DetailRow>
-                              <DetailRow label="Matched by">
-                                {s.matched_kinds.join(', ')}
-                              </DetailRow>
-                              <DetailRow label="Id">
-                                <span className="font-mono">{s.assemblyai_id}</span>
-                              </DetailRow>
-                            </div>
-                          </InfoHover>
-                        </div>
-                      </div>
-                    );
-                  })}
-                </div>
+            {/* ---- definition ------------------------------------------ */}
+            {editing ? (
+              <div className="rounded-lg border border-primary/20 bg-primary/[0.02] p-3">
+                <SeriesDefinitionForm
+                  initial={{
+                    title: detail.series.title,
+                    description: detail.series.description ?? '',
+                    patterns: detail.series.patterns,
+                    priority: detail.series.priority,
+                    labels: detail.labels.map((l) => l.path),
+                  }}
+                  matchingLocked={!detail.permissions?.editMatching}
+                  submitLabel="Save"
+                  onSubmit={saveDefinition}
+                  onCancel={() => setEditing(false)}
+                />
               </div>
+            ) : (
+              <div className="space-y-2 rounded-lg border p-2.5">
+                {detail.series.description && (
+                  <p className="text-sm text-foreground/90">{detail.series.description}</p>
+                )}
+                <div>
+                  <p className="mb-0.5 text-[11px] font-medium uppercase tracking-wider text-muted-foreground">
+                    Patterns <span className="normal-case tracking-normal">· priority {detail.series.priority}</span>
+                  </p>
+                  <PatternList patterns={detail.series.patterns} />
+                </div>
+                {detail.labels.length > 0 && (
+                  <div className="flex flex-wrap items-center gap-1.5">
+                    <span className="text-[11px] font-medium uppercase tracking-wider text-muted-foreground">
+                      Labels
+                    </span>
+                    <LabelChipsStatic labels={detail.labels} />
+                  </div>
+                )}
+                {!detail.ready && (
+                  <p className="text-[11px] text-muted-foreground">
+                    Curated series aren’t switched on yet (migration 053) — read-only.
+                  </p>
+                )}
+              </div>
+            )}
+            {detail.ready && (
+              <SeriesFollowersSection
+                seriesId={detail.series.id}
+                followers={detail.followers}
+                permissions={detail.permissions}
+                viewerEmail={detail.viewer?.email ?? null}
+                onChanged={refresh}
+              />
             )}
 
             {/* ---- auto-import ----------------------------------------- */}
@@ -1250,79 +1084,6 @@ export function SeriesDialog({ seriesId, onClose, onChanged, onMerged }: SeriesD
                 </div>
               );
             })()}
-
-            {/* ---- probable duplicate → one-click merge ---------------- */}
-            {detail.dupes.length > 0 && !mergeOpen && (
-              <div className="rounded-lg border border-amber-500/40 bg-amber-500/[0.06] px-3 py-2">
-                <p className="text-[11px] font-medium uppercase tracking-wider text-amber-700 dark:text-amber-400">
-                  Probably a duplicate
-                </p>
-                <div className="mt-1 space-y-1">
-                  {detail.dupes.map((d) => {
-                    const thisBigger = detail.members.length > d.member_count;
-                    const sameName =
-                      d.title.trim().toLowerCase() === detail.series.title.trim().toLowerCase();
-                    const mine = detail.members.length;
-                    const otherLast = d.last_recorded_at ? dateLabel(d.last_recorded_at) : null;
-                    return (
-                      <div key={d.id} className="flex flex-wrap items-center gap-x-2 gap-y-1 text-xs">
-                        <span className="min-w-0">
-                          {sameName ? (
-                            <>
-                              <span className="font-medium">Another series with the same name</span>{' '}
-                              <span className="text-muted-foreground">
-                                (#{d.id}, {d.member_count} meeting{d.member_count === 1 ? '' : 's'}
-                                {otherLast ? `, last ${otherLast}` : ''}) is the {d.reason} as this one
-                                ({mine} meeting{mine === 1 ? '' : 's'}).
-                              </span>
-                            </>
-                          ) : (
-                            <>
-                              <span className="font-medium">“{d.title}”</span>{' '}
-                              <span className="text-muted-foreground">
-                                ({d.member_count} meeting{d.member_count === 1 ? '' : 's'}
-                                {otherLast ? `, last ${otherLast}` : ''}) is the {d.reason} as this one
-                                ({mine} meeting{mine === 1 ? '' : 's'}).
-                              </span>
-                            </>
-                          )}
-                        </span>
-                        <a
-                          href={`/series?series=${d.id}`}
-                          target="_blank"
-                          rel="noopener noreferrer"
-                          {...extLink('inline-flex items-center gap-1 text-xs text-primary hover:underline', 'Open the other series in a new tab to compare before merging')}
-
-                        >
-                          View it <ExternalLink className="h-3 w-3" />
-                        </a>
-                        <Button
-                          size="sm"
-                          variant="outline"
-                          className="h-6 border-amber-500/50 px-2 text-xs"
-                          disabled={mergeBusy}
-                          title={
-                            thisBigger
-                              ? `This series has more meetings — open “${d.title}” and merge it into this one instead, or merge anyway.`
-                              : `Move this series’ ${detail.members.length} meeting${detail.members.length === 1 ? '' : 's'} and matching rules into “${d.title}” and delete this one`
-                          }
-                          onClick={() => void mergeInto(d)}
-                        >
-                          <Merge className="h-3 w-3" />
-                          Merge this one into it
-                        </Button>
-                        {thisBigger && (
-                          <span className="text-[11px] text-muted-foreground">
-                            (this one is bigger — usually merge the smaller into the larger)
-                          </span>
-                        )}
-                      </div>
-                    );
-                  })}
-                </div>
-                {mergeError && <p className="pt-1 text-xs text-destructive">{mergeError}</p>}
-              </div>
-            )}
 
             {/* ---- occurrence sweep ------------------------------------ */}
             <div>
@@ -1590,10 +1351,10 @@ export function SeriesDialog({ seriesId, onClose, onChanged, onMerged }: SeriesD
                                 </div>
                               </InfoHover>
                               {o.imported.length > 0 ? (
-                                o.imported.map((imp) =>
+                                o.imported.map((imp, impIdx) =>
                                   imp.queued ? (
                                     <a
-                                      key={imp.assemblyai_id}
+                                      key={imp.assemblyai_id || `hidden-${impIdx}`}
                                       href={`/transcript/${imp.assemblyai_id}`}
                                       target="_blank"
                                       rel="noopener noreferrer"
@@ -1604,7 +1365,7 @@ export function SeriesDialog({ seriesId, onClose, onChanged, onMerged }: SeriesD
                                     </a>
                                   ) : imp.failed && imp.accessible ? (
                                     <a
-                                      key={imp.assemblyai_id}
+                                      key={imp.assemblyai_id || `hidden-${impIdx}`}
                                       href={`/transcript/${imp.assemblyai_id}`}
                                       target="_blank"
                                       rel="noopener noreferrer"
@@ -1614,7 +1375,7 @@ export function SeriesDialog({ seriesId, onClose, onChanged, onMerged }: SeriesD
                                       <X className="h-3 w-3" /> failed
                                     </a>
                                   ) : imp.accessible ? (
-                                    <span key={imp.assemblyai_id} className="group/imp inline-flex items-center gap-0.5">
+                                    <span key={imp.assemblyai_id || `hidden-${impIdx}`} className="group/imp inline-flex items-center gap-0.5">
                                       <a
                                         href={`/transcript/${imp.assemblyai_id}`}
                                         target="_blank"
@@ -1638,7 +1399,7 @@ export function SeriesDialog({ seriesId, onClose, onChanged, onMerged }: SeriesD
                                     </span>
                                   ) : (
                                     <span
-                                      key={imp.assemblyai_id}
+                                      key={imp.assemblyai_id || `hidden-${impIdx}`}
                                       className="rounded-full bg-muted px-2 py-0.5 text-[11px] text-muted-foreground"
                                       title="Imported by a colleague (not shared with you)"
                                     >
@@ -1703,10 +1464,10 @@ export function SeriesDialog({ seriesId, onClose, onChanged, onMerged }: SeriesD
                                 {o.imported.length > 0 && (
                                   <>
                                     {' '}
-                                    {o.imported.map((imp) =>
+                                    {o.imported.map((imp, impIdx) =>
                                       imp.accessible ? (
                                         <a
-                                          key={imp.assemblyai_id}
+                                          key={imp.assemblyai_id || `hidden-${impIdx}`}
                                           href={`/transcript/${imp.assemblyai_id}`}
                                           target="_blank"
                                           rel="noopener noreferrer"
@@ -1716,7 +1477,7 @@ export function SeriesDialog({ seriesId, onClose, onChanged, onMerged }: SeriesD
                                           {imp.title || imp.assemblyai_id} ↗
                                         </a>
                                       ) : (
-                                        <span key={imp.assemblyai_id} className="text-muted-foreground">
+                                        <span key={imp.assemblyai_id || `hidden-${impIdx}`} className="text-muted-foreground">
                                           (a colleague’s import, not shared with you)
                                         </span>
                                       )
@@ -1796,103 +1557,57 @@ export function SeriesDialog({ seriesId, onClose, onChanged, onMerged }: SeriesD
                       <span className="w-28 shrink-0 text-xs tabular-nums text-muted-foreground">
                         {dateLabel(m.recorded_at ?? m.created_at)}
                       </span>
-                      {m.accessible ? (
-                        <a
-                          href={`/transcript/${m.assemblyai_id}`}
-                          target="_blank"
-                          rel="noopener noreferrer"
-                          {...extLink('min-w-0 flex-1 truncate text-left text-sm hover:text-primary', `${m.title || 'Untitled meeting'} (new tab)`)}
-
-                        >
-                          {m.title || 'Untitled meeting'}
-                        </a>
-                      ) : (
-                        <span className="min-w-0 flex-1 truncate text-sm text-muted-foreground">
-                          {m.title || 'Untitled meeting'}{' '}
-                          <span className="text-[11px]">(not shared with you)</span>
+                      <a
+                        href={`/transcript/${m.assemblyai_id}`}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        {...extLink('min-w-0 flex-1 truncate text-left text-sm hover:text-primary', `${m.title || 'Untitled meeting'} (new tab)`)}
+                      >
+                        {m.title || 'Untitled meeting'}
+                      </a>
+                      {m.how === 'manual' && (
+                        <span className="shrink-0 text-[10px] text-muted-foreground" title="Added by hand — stays even if the patterns stop matching">
+                          manual
                         </span>
                       )}
-                      <Button
-                        size="sm"
-                        variant="ghost"
-                        className="h-6 w-6 shrink-0 p-0 text-muted-foreground hover:text-destructive"
-                        title="Remove from series"
-                        onClick={() => void removeMember(m.assemblyai_id)}
-                      >
-                        <X className="h-3.5 w-3.5" />
-                      </Button>
+                      {m.access !== 'read' && (
+                        <Button
+                          size="sm"
+                          variant="ghost"
+                          className="h-6 w-6 shrink-0 p-0 text-muted-foreground hover:text-destructive"
+                          title="Not this series"
+                          onClick={() => void removeMember(m.assemblyai_id)}
+                        >
+                          <X className="h-3.5 w-3.5" />
+                        </Button>
+                      )}
                     </div>
                   ))}
                 </div>
               </div>
             )}
 
-            {/* ---- merge picker ---------------------------------------- */}
-            {mergeOpen && (
-              <div className="rounded-lg border border-primary/20 bg-primary/[0.03] p-2.5">
-                <p className="mb-1.5 text-[11px] font-medium uppercase tracking-wider text-primary/80">
-                  Merge “{detail.series.title}” into…
-                </p>
-                {mergeTargets === null ? (
-                  <div className="flex items-center gap-2 py-2 text-xs text-muted-foreground">
-                    <Loader2 className="h-3.5 w-3.5 animate-spin" /> Loading series…
-                  </div>
-                ) : mergeTargets.length === 0 ? (
-                  <p className="py-1 text-xs text-muted-foreground">No other series to merge into.</p>
-                ) : (
-                  <div className="max-h-48 space-y-0.5 overflow-y-auto">
-                    {mergeTargets.map((t) => (
-                      <button
-                        key={t.id}
-                        type="button"
-                        disabled={mergeBusy}
-                        onClick={() => void mergeInto(t)}
-                        className="flex w-full items-center gap-2 rounded px-1.5 py-1 text-left text-sm hover:bg-muted disabled:opacity-50"
-                      >
-                        <Repeat className="h-3 w-3 shrink-0 text-primary/70" />
-                        <span className="min-w-0 flex-1 truncate">{t.title}</span>
-                        <span className="shrink-0 text-[11px] tabular-nums text-muted-foreground">
-                          {t.member_count}
-                        </span>
-                      </button>
-                    ))}
-                  </div>
-                )}
-                {mergeBusy && (
-                  <div className="flex items-center gap-2 pt-1.5 text-xs text-muted-foreground">
-                    <Loader2 className="h-3.5 w-3.5 animate-spin" /> Merging…
-                  </div>
-                )}
-                {mergeError && <p className="pt-1.5 text-xs text-destructive">{mergeError}</p>}
-              </div>
-            )}
-
             {/* ---- footer ---------------------------------------------- */}
             <div className="flex items-center justify-between border-t pt-3">
               <div className="flex items-center gap-1">
-                <Button
-                  variant="ghost"
-                  size="sm"
-                  className="h-7 px-2 text-xs text-muted-foreground hover:text-destructive"
-                  onClick={() => void deleteSeries()}
-                >
-                  <Trash2 className="h-3 w-3" />
-                  Delete series
-                </Button>
-                <Button
-                  variant="ghost"
-                  size="sm"
-                  className="h-7 px-2 text-xs text-muted-foreground"
-                  title="Fold this series into another one (dupe repair)"
-                  onClick={() => (mergeOpen ? setMergeOpen(false) : void openMergePicker())}
-                >
-                  <Merge className="h-3 w-3" />
-                  Merge…
-                </Button>
+                {detail.permissions?.delete && (
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    className="h-7 px-2 text-xs text-muted-foreground hover:text-destructive"
+                    onClick={() => void deleteSeries()}
+                  >
+                    <Trash2 className="h-3 w-3" />
+                    Delete series
+                  </Button>
+                )}
               </div>
-              <span className="text-[11px] text-muted-foreground">
+              <span
+                className="text-[11px] text-muted-foreground"
+                title="Only meetings you own or that are shared with you are counted"
+              >
                 {detail.members.length} meeting{detail.members.length === 1 ? '' : 's'} in this
-                series
+                series visible to you
               </span>
             </div>
           </div>

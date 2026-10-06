@@ -94,11 +94,11 @@ READ
   attachment-get <id> <attId> [--out <file>]   Download one attachment
   labels                          Org-wide label tree with visible-to-you counts
                                   (subtree-inclusive) and #ids; --json = flat rows
-  series                          Recurring-call series you're in: id, title,
-                                  cadence, members, auto-import + dup badges
-  series <id>                     One series: config, evidence keys, members
-                                  (imported transcripts), pending suggestions,
-                                  probable duplicates
+  series                          Every curated series: id, title, patterns,
+                                  default labels, followers, auto-import, and
+                                  how many of its meetings YOU can open
+  series <id>                     One series: description, patterns, labels,
+                                  followers, auto-import, members you can open
   notify                          Your Slack DM notification switches, one
                                   line per kind (opt-out: on unless turned off)
   offline plan [<id,…>]           What the web app keeps offline for you under
@@ -216,18 +216,19 @@ WRITE (needs read+write for meetings)
                                   Prints the transcript id + the stable
                                   /m/<uuid> link. --wait polls until the
                                   import completes (default cap 30 min)
-  series set <id> [--title <t>] [--notes <md>] [--auto-import on|off]
-             [--mode transcript|video|both] [--report detailed-video|detailed-text|later]
-                                  Rename / edit notes / configure auto-import
+  series set <id> [--title <t>] [--description <d>] [--notes <md>]
+             [--auto-import on|off] [--mode transcript|video|both]
+             [--report detailed-video|detailed-text|later]
+                                  Rename / describe / configure auto-import
                                   (on = future occurrences import on their own
-                                  under YOUR Google link)
-  series merge <into-id> <from-id>   Fold a duplicate series into another
-                                  (keys+members move, the loser is deleted,
-                                  logged as you). Both must be visible to you
-  series attach <id> <transcript-id> [--manual]   Attach a transcript you can
-                                  access (absorbs its keys; default 'confirmed')
-  series detach <id> <transcript-id> [--remember]   Detach; --remember = never
-                                  re-suggest it for this series
+                                  under YOUR Google link). Patterns, labels and
+                                  followers are edited in the web UI (/series)
+  series attach <id> <transcript-id>   Put a meeting you own or edit in the
+                                  series by hand (stays even when its patterns
+                                  stop matching)
+  series detach <id> <transcript-id> [--remember]   Take it out of THAT series;
+                                  --remember = "not this series" (the patterns
+                                  never pull it back)
   auto-sync                       Your account-level auto-sync switch + what it
                                   did recently (imports de-duplicated company-
                                   wide: one import per meeting, others shared in)
@@ -2496,16 +2497,20 @@ const meetings: Subcommand = {
           if (!sub) {
             const data = await ctx.expectJson<{ series: any[]; totals: any }>(ctx.api("meetings", `/api/series`));
             ctx.print(data, () => {
-              if (!data.series.length) return console.log("No series visible to you.");
+              if (!data.series.length) return console.log("No series yet.");
               for (const r of data.series) {
                 const bits = [
                   String(r.id).padStart(4),
                   (r.cadence ?? "ad-hoc").padEnd(8),
-                  `${String(r.member_count).padStart(3)} imported`,
+                  `${String(r.visible_member_count ?? r.member_count ?? 0).padStart(3)} yours`,
                   r.auto_enabled ? "auto" : "    ",
-                  r.dup ? `DUP?(${r.dup_with.map((d: any) => d.id).join(",")})` : "",
                 ];
                 console.log(`${bits.join("  ")}  ${r.title}`);
+                if (r.description) console.log(`        ${r.description}`);
+                const pats = (r.patterns ?? []).map((p: any) => p.kind === "title" ? `/${p.regex}/i` : `invite:${(p.all ?? []).join("+")}`);
+                if (pats.length) console.log(`        patterns: ${pats.join("  ")}`);
+                if (r.labels?.length) console.log(`        labels:   ${r.labels.map((l: any) => l.path).join(", ")}`);
+                if (r.followers?.length) console.log(`        followers: ${r.followers.map((f: any) => f.email).join(", ")}`);
               }
               console.log(`\n${data.series.length} series — 'series <id>' for details`);
             });
@@ -2516,19 +2521,22 @@ const meetings: Subcommand = {
           ctx.print(data, () => {
             const sr = data.series;
             console.log(`series:      #${sr.id}  ${sr.title}`);
+            if (sr.description) console.log(`about:       ${sr.description}`);
             const ai = sr.auto_import;
             console.log(`auto-import: ${ai?.enabled ? `ON (mode ${ai.mode}, report ${ai.report}, by ${ai.byEmail})` : "off"}`);
+            console.log(`priority:    ${sr.priority ?? 100}`);
+            const pats = (sr.patterns ?? []).map((p: any) =>
+              p.kind === "title"
+                ? `title /${p.regex}/i`
+                : `invite ${(p.all ?? []).join("+")}${p.any?.length ? ` any(${p.any.join(",")})` : ""}${p.internalOnly ? " internal-only" : ""}${p.recurringOnly ? " recurring" : ""}${p.maxPeople ? ` ≤${p.maxPeople}` : ""}`
+            );
+            console.log(`patterns:    ${pats.join("  |  ") || "(none — manual members only)"}`);
+            console.log(`labels:      ${(data.labels ?? []).map((l: any) => l.path).join(", ") || "(none)"}`);
+            console.log(`followers:   ${(data.followers ?? []).map((f: any) => f.email).join(", ") || "(none)"}`);
             if (sr.notes) console.log(`notes:       ${sr.notes.split("\n")[0]}`);
-            console.log(`keys:        ${data.keys.map((k: any) => `${k.kind}=${k.value.length > 40 ? k.value.slice(0, 40) + "…" : k.value}`).join("  ") || "(none)"}`);
-            console.log(`members (${data.members.length}):`);
+            console.log(`members you can open (${data.members.length}):`);
             for (const m of data.members) {
-              console.log(`  ${m.assemblyai_id ?? "(hidden)"}  ${m.recorded_at?.slice(0, 10) ?? "????-??-??"}  ${m.visible === false ? "(not visible to you)" : (m.title ?? "")}`);
-            }
-            if (data.suggestions?.length) {
-              console.log(`suggested (unconfirmed): ${data.suggestions.length} — confirm in the web UI or 'series attach'`);
-            }
-            if (data.dupes?.length) {
-              console.log(`probable duplicates: ${data.dupes.map((d: any) => `#${d.id} ${d.title}`).join(", ")} — 'series merge ${sr.id} <from-id>' to fold`);
+              console.log(`  ${m.assemblyai_id}  ${m.recorded_at?.slice(0, 10) ?? "????-??-??"}  ${m.how === "manual" ? "[manual] " : ""}${m.title ?? ""}`);
             }
           });
           return 0;
@@ -2537,9 +2545,10 @@ const meetings: Subcommand = {
         ctx.requireWrite();
         if (sub === "set") {
           const id = asId(args[1]);
-          if (!id) { console.error("usage: darth-cli meetings series set <id> [--title <t>] [--notes <md>] [--auto-import on|off] [--mode ...] [--report detailed-video|detailed-text|later]"); return 1; }
+          if (!id) { console.error("usage: darth-cli meetings series set <id> [--title <t>] [--description <d>] [--notes <md>] [--auto-import on|off] [--mode ...] [--report detailed-video|detailed-text|later]"); return 1; }
           const body: any = {};
           if (str(flags.title) !== undefined) body.title = str(flags.title);
+          if (str(flags.description) !== undefined) body.description = str(flags.description);
           if (str(flags.notes) !== undefined) body.notes = str(flags.notes);
           const ai = str(flags["auto-import"]);
           if (ai !== undefined) {
@@ -2549,34 +2558,31 @@ const meetings: Subcommand = {
             if (mode) body.autoImport.mode = mode;
             if (report) body.autoImport.report = report;
           }
-          if (!Object.keys(body).length) { console.error("nothing to change — pass --title/--notes/--auto-import"); return 1; }
+          if (!Object.keys(body).length) { console.error("nothing to change — pass --title/--description/--notes/--auto-import"); return 1; }
           await ctx.expectJson(ctx.api("meetings", `/api/series/${id}`, { method: "PATCH", body: JSON.stringify(body) }));
           if (!ctx.json) console.log("Updated.");
           return 0;
         }
         if (sub === "merge") {
-          const into = asId(args[1]); const from = asId(args[2]);
-          if (!into || !from) { console.error("usage: darth-cli meetings series merge <into-id> <from-id>"); return 1; }
-          await ctx.expectJson(ctx.api("meetings", `/api/series/${into}/merge`, { method: "POST", body: JSON.stringify({ fromSeriesId: from }) }));
-          if (!ctx.json) console.log(`Merged #${from} into #${into} (keys+members moved, #${from} deleted).`);
-          return 0;
+          console.error("series merge is gone — curated series are edited (patterns / priority) in the web UI, not merged");
+          return 1;
         }
         if (sub === "attach" || sub === "detach") {
           const id = asId(args[1]); const tid = args[2];
           if (!id || !tid) { console.error(`usage: darth-cli meetings series ${sub} <series-id> <transcript-id>`); return 1; }
           if (sub === "attach") {
             await ctx.expectJson(ctx.api("meetings", `/api/series/${id}/members`, {
-              method: "POST", body: JSON.stringify({ transcriptId: tid, how: flags.manual === true ? "manual" : "confirmed" }) }));
+              method: "POST", body: JSON.stringify({ transcriptId: tid }) }));
             if (!ctx.json) console.log("Attached.");
           } else {
             const qs = new URLSearchParams({ transcriptId: tid });
             if (flags.remember === true) qs.set("remember", "1");
             await ctx.expectJson(ctx.api("meetings", `/api/series/${id}/members?${qs}`, { method: "DELETE" }));
-            if (!ctx.json) console.log(flags.remember === true ? "Detached (and won't be re-suggested)." : "Detached.");
+            if (!ctx.json) console.log(flags.remember === true ? "Detached — not this series (its patterns won't pull it back)." : "Detached.");
           }
           return 0;
         }
-        console.error(`unknown series subcommand '${sub}' — try: series | series <id> | set | merge | attach | detach`);
+        console.error(`unknown series subcommand '${sub}' — try: series | series <id> | set | attach | detach`);
         return 1;
       }
 

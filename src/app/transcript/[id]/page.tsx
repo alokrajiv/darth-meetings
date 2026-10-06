@@ -339,11 +339,16 @@ function TranscriptDetailInner({ transcriptId }: { transcriptId: string }) {
   const [seriesMembership, setSeriesMembership] = useState<
     { series_id: number; title: string } | null | 'loading'
   >('loading');
+  // Owner or editor: may change the meeting's series ("Not this series").
+  const [seriesCanEdit, setSeriesCanEdit] = useState(false);
   const [openSeriesId, setOpenSeriesId] = useState<number | null>(null);
   const loadSeriesInfo = useCallback(() => {
     fetch(`/api/transcripts/${transcriptId}/series`)
       .then((r) => (r.ok ? r.json() : null))
-      .then((d) => setSeriesMembership(d?.membership ?? null))
+      .then((d) => {
+        setSeriesMembership(d?.membership ?? null);
+        setSeriesCanEdit(d?.canEdit === true);
+      })
       .catch(() => setSeriesMembership(null));
   }, [transcriptId]);
   useEffect(() => {
@@ -3080,6 +3085,7 @@ function TranscriptDetailInner({ transcriptId }: { transcriptId: string }) {
               <SeriesBadge
                 assemblyaiId={transcriptId}
                 membership={seriesMembership}
+                canEdit={seriesCanEdit}
                 defaultTitle={title.trim() || row.original_filename}
                 onOpenSeries={setOpenSeriesId}
                 onChanged={loadSeriesInfo}

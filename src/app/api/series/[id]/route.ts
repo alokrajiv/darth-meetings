@@ -57,6 +57,8 @@ export const GET = withAuth(async ({ user }, { params }) => {
     labels: deco?.labels ?? [],
     followers: deco?.followers ?? [],
     permissions: deco?.permissions ?? null,
+    // Who is asking — the dialog marks "you" among the followers.
+    viewer: { email: user.email.trim().toLowerCase() },
     members,
     // Older darth-cli builds print these — the key bag, guesses and merge
     // prompts are gone with the key-based series.

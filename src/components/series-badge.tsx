@@ -1,17 +1,20 @@
 'use client';
 
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { Repeat, Plus, Check, X, Loader2 } from 'lucide-react';
+import { Repeat, Plus, X, Loader2 } from 'lucide-react';
 import { isNetworkFailure, NETWORK_ERROR_MESSAGE } from '@/lib/fetch-errors';
 
 /**
- * The "recurring call" badge.
+ * The series badge (curated series, docs/curated-series-spec.md).
  *
  * With a membership: a clickable chip (opens the series dialog via
- * onOpenSeries). Without one: a hover-revealed ghost affordance that opens a
- * popover with guessed candidate series ("is this also …?"), a picker over
- * existing series, and create-new. The popover is position:fixed so it
- * escapes the listing table's overflow-hidden container.
+ * onOpenSeries); on the transcript page (`variant='full'`) an owner or
+ * editor also gets "Not this series" — an exclusion the patterns never
+ * override. Without one: a hover-revealed ghost affordance that opens a
+ * popover with a picker over the curated series ("add to series" — a manual
+ * member) and create-new. There are no guesses any more: a pattern match IS
+ * membership. The popover is position:fixed so it escapes the listing
+ * table's overflow-hidden container.
  */
 
 export interface SeriesMembershipRef {
@@ -19,25 +22,18 @@ export interface SeriesMembershipRef {
   title: string;
 }
 
-interface Candidate {
-  series_id: number;
-  title: string;
-  matched_kinds: string[];
-  strong: boolean;
-}
-
 interface SeriesListEntry {
   id: number;
   title: string;
-  member_count: number;
+  description: string | null;
 }
 
 interface SeriesBadgeProps {
   assemblyaiId: string;
   membership: SeriesMembershipRef | null;
-  /** Weak-evidence guess for untagged rows — renders a dashed "title?" chip
-   * that opens the confirm/deny popover instead of the bare + affordance. */
-  suspected?: SeriesMembershipRef | null;
+  /** Owner or editor of the meeting: may change its series (the server
+   * enforces it; this only hides the "Not this series" control). */
+  canEdit?: boolean;
   /** Default title for "new series" (usually the transcript title). */
   defaultTitle?: string | null;
   onOpenSeries: (seriesId: number) => void;
@@ -49,7 +45,7 @@ interface SeriesBadgeProps {
 export function SeriesBadge({
   assemblyaiId,
   membership,
-  suspected,
+  canEdit = false,
   defaultTitle,
   onOpenSeries,
   onChanged,
@@ -58,7 +54,6 @@ export function SeriesBadge({
   const [open, setOpen] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [pos, setPos] = useState<{ top: number; left: number } | null>(null);
-  const [candidates, setCandidates] = useState<Candidate[] | null>(null);
   const [allSeries, setAllSeries] = useState<SeriesListEntry[] | null>(null);
   const [showPicker, setShowPicker] = useState(false);
   const [filter, setFilter] = useState('');
@@ -113,18 +108,6 @@ export function SeriesBadge({
     setOpen(true);
     setError(null);
     setNewTitle(defaultTitle?.trim() ?? '');
-    // A failed GET (network dropped) is an error, not "no
-    // candidates" — otherwise the popover silently offers nothing.
-    void fetch(`/api/transcripts/${assemblyaiId}/series`)
-      .then((r) => {
-        if (!r.ok) throw new Error(`Could not load candidates (${r.status})`);
-        return r.json();
-      })
-      .then((d) => setCandidates(d?.candidates ?? []))
-      .catch((err) => {
-        setCandidates([]);
-        setError(isNetworkFailure(err) ? NETWORK_ERROR_MESSAGE : 'Could not update the series');
-      });
   };
 
   const loadAllSeries = () => {
@@ -142,32 +125,56 @@ export function SeriesBadge({
       });
   };
 
-  const attach = async (seriesId: number, how: 'confirmed' | 'manual') => {
+  /** The server's own words for a refusal (403: only the owner or an editor
+   * can change a meeting's series). */
+  const failure = async (res: Response, fallback: string) => {
+    const j = (await res.json().catch(() => null)) as { error?: string } | null;
+    return new Error(j?.error ?? `${fallback} (${res.status})`);
+  };
+
+  const attach = async (seriesId: number) => {
     setBusy(true);
     setError(null);
     try {
       const res = await fetch(`/api/series/${seriesId}/members`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ transcriptId: assemblyaiId, how }),
+        body: JSON.stringify({ transcriptId: assemblyaiId }),
       });
-      if (!res.ok) throw new Error(`Attach failed (${res.status})`);
+      if (!res.ok) throw await failure(res, 'Could not add it to the series');
       close();
       onChanged();
     } catch (err) {
-      setError(isNetworkFailure(err) ? NETWORK_ERROR_MESSAGE : 'Could not update the series');
+      setError(isNetworkFailure(err) ? NETWORK_ERROR_MESSAGE : (err as Error).message);
     } finally {
       setBusy(false);
     }
   };
 
-  const rejectCandidate = async (seriesId: number) => {
-    // Remembered exclusion — this guess never comes back.
-    setCandidates((prev) => (prev ?? []).filter((c) => c.series_id !== seriesId));
-    await fetch(
-      `/api/series/${seriesId}/members?transcriptId=${encodeURIComponent(assemblyaiId)}&remember=1`,
-      { method: 'DELETE' }
-    ).catch(() => {});
+  /** "Not this series": out of it, and an exclusion so its patterns never
+   * pull the meeting back. */
+  const exclude = async () => {
+    if (!membership) return;
+    if (
+      !confirm(
+        `Not part of “${membership.title}”? The meeting leaves the series (with its default labels and follow shares), and the series’ patterns won’t pull it back.`
+      )
+    )
+      return;
+    setBusy(true);
+    setError(null);
+    try {
+      const res = await fetch(
+        `/api/series/${membership.series_id}/members?transcriptId=${encodeURIComponent(assemblyaiId)}&remember=1`,
+        { method: 'DELETE' }
+      );
+      if (!res.ok) throw await failure(res, 'Could not take it out of the series');
+      onChanged();
+    } catch (err) {
+      setError(isNetworkFailure(err) ? NETWORK_ERROR_MESSAGE : (err as Error).message);
+    } finally {
+      setBusy(false);
+    }
   };
 
   const createSeries = async () => {
@@ -181,11 +188,11 @@ export function SeriesBadge({
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ title, fromTranscriptId: assemblyaiId }),
       });
-      if (!res.ok) throw new Error(`Create failed (${res.status})`);
+      if (!res.ok) throw await failure(res, 'Could not create the series');
       close();
       onChanged();
     } catch (err) {
-      setError(isNetworkFailure(err) ? NETWORK_ERROR_MESSAGE : 'Could not update the series');
+      setError(isNetworkFailure(err) ? NETWORK_ERROR_MESSAGE : (err as Error).message);
     } finally {
       setBusy(false);
     }
@@ -193,50 +200,53 @@ export function SeriesBadge({
 
   if (membership) {
     return (
-      <button
-        type="button"
-        onClick={(e) => {
-          e.stopPropagation();
-          onOpenSeries(membership.series_id);
-        }}
-        title={`Recurring call: ${membership.title} — click to see the whole series`}
-        className="inline-flex max-w-44 shrink-0 items-center gap-1 rounded-full border border-primary/25 bg-primary/5 px-2 py-0.5 text-[11px] text-primary transition-colors hover:bg-primary/10 disabled:cursor-not-allowed disabled:opacity-60"
-      >
-        <Repeat className="h-3 w-3 shrink-0" />
-        <span className="truncate">{membership.title}</span>
-      </button>
+      <span className="inline-flex shrink-0 items-center gap-0.5">
+        <button
+          type="button"
+          onClick={(e) => {
+            e.stopPropagation();
+            onOpenSeries(membership.series_id);
+          }}
+          title={`Series: ${membership.title} — click to see the whole series`}
+          className="inline-flex max-w-44 shrink-0 items-center gap-1 rounded-full border border-primary/25 bg-primary/5 px-2 py-0.5 text-[11px] text-primary transition-colors hover:bg-primary/10 disabled:cursor-not-allowed disabled:opacity-60"
+        >
+          <Repeat className="h-3 w-3 shrink-0" />
+          <span className="truncate">{membership.title}</span>
+        </button>
+        {variant === 'full' && canEdit && (
+          <button
+            type="button"
+            disabled={busy}
+            onClick={(e) => {
+              e.stopPropagation();
+              void exclude();
+            }}
+            title="Not this series"
+            className="rounded p-0.5 text-muted-foreground/60 hover:text-destructive disabled:opacity-50"
+          >
+            {busy ? <Loader2 className="h-3 w-3 animate-spin" /> : <X className="h-3 w-3" />}
+          </button>
+        )}
+        {error && variant === 'full' && <span className="text-[11px] text-destructive">{error}</span>}
+      </span>
     );
   }
 
   return (
     <>
-      {suspected ? (
-        <button
-          ref={btnRef}
-          type="button"
-          onClick={openPopover}
-          title={`Looks like part of "${suspected.title}" — click to confirm or dismiss`}
-          className="inline-flex max-w-44 shrink-0 items-center gap-1 rounded-full border border-dashed border-primary/35 px-2 py-0.5 text-[11px] text-primary/70 transition-colors hover:bg-primary/5 hover:text-primary disabled:cursor-not-allowed disabled:opacity-60"
-        >
-          <Repeat className="h-3 w-3 shrink-0" />
-          <span className="truncate">{suspected.title}</span>
-          <span className="shrink-0 font-semibold">?</span>
-        </button>
-      ) : (
-        <button
-          ref={btnRef}
-          type="button"
-          onClick={openPopover}
-          title="Mark as a recurring call"
-          className={`inline-flex shrink-0 items-center gap-0.5 rounded-full border border-dashed border-muted-foreground/30 px-1.5 py-0.5 text-[11px] text-muted-foreground/70 transition-all hover:border-primary/40 hover:text-primary disabled:cursor-not-allowed disabled:opacity-50 ${
-            variant === 'row' ? 'opacity-0 group-hover:opacity-100' : ''
-          }`}
-        >
-          <Repeat className="h-3 w-3" />
-          <Plus className="h-2.5 w-2.5" />
-          {variant === 'full' && <span className="ml-0.5">Recurring call</span>}
-        </button>
-      )}
+      <button
+        ref={btnRef}
+        type="button"
+        onClick={openPopover}
+        title="Add to a series"
+        className={`inline-flex shrink-0 items-center gap-0.5 rounded-full border border-dashed border-muted-foreground/30 px-1.5 py-0.5 text-[11px] text-muted-foreground/70 transition-all hover:border-primary/40 hover:text-primary disabled:cursor-not-allowed disabled:opacity-50 ${
+          variant === 'row' ? 'opacity-0 group-hover:opacity-100' : ''
+        }`}
+      >
+        <Repeat className="h-3 w-3" />
+        <Plus className="h-2.5 w-2.5" />
+        {variant === 'full' && <span className="ml-0.5">Add to series</span>}
+      </button>
       {open && pos && (
         <div
           ref={popRef}
@@ -245,126 +255,81 @@ export function SeriesBadge({
           className="z-50 rounded-lg border bg-popover p-2 text-popover-foreground shadow-[0_4px_16px_-2px_rgb(0_0_0/0.12),0_1px_2px_0_rgb(0_0_0/0.04)]"
         >
           {error && <p className="px-1 pb-1 text-xs text-destructive">{error}</p>}
-          {candidates === null ? (
-            <div className="flex items-center gap-2 px-1 py-2 text-xs text-muted-foreground">
-              <Loader2 className="h-3.5 w-3.5 animate-spin" /> Looking for matching series…
+          {!showPicker && !creating && (
+            <div className="space-y-0.5">
+              <button
+                type="button"
+                onClick={loadAllSeries}
+                className="block w-full rounded px-1.5 py-1 text-left text-sm hover:bg-muted"
+              >
+                Add to a series…
+              </button>
+              <button
+                type="button"
+                onClick={() => setCreating(true)}
+                className="block w-full rounded px-1.5 py-1 text-left text-sm hover:bg-muted"
+              >
+                New series from this meeting
+              </button>
             </div>
-          ) : (
-            <>
-              {candidates.length > 0 && (
-                <div className="mb-1">
-                  <p className="px-1 pb-1 text-[10px] font-medium uppercase tracking-wider text-muted-foreground">
-                    Is this part of…
-                  </p>
-                  {candidates.map((c) => (
-                    <div
-                      key={c.series_id}
-                      className="flex items-center gap-1 rounded px-1.5 py-1 hover:bg-muted"
-                    >
-                      <Repeat className="h-3 w-3 shrink-0 text-primary/70" />
-                      <span className="min-w-0 flex-1 truncate text-sm">{c.title}</span>
-                      <button
-                        type="button"
-                        disabled={busy}
-                        onClick={() => void attach(c.series_id, 'confirmed')}
-                        title="Yes, add it"
-                        className="rounded p-1 text-status-ok hover:bg-status-ok/10"
-                      >
-                        <Check className="h-3.5 w-3.5" />
-                      </button>
-                      <button
-                        type="button"
-                        disabled={busy}
-                        onClick={() => void rejectCandidate(c.series_id)}
-                        title="No — don't suggest this again"
-                        className="rounded p-1 text-muted-foreground hover:bg-muted-foreground/10"
-                      >
-                        <X className="h-3.5 w-3.5" />
-                      </button>
-                    </div>
-                  ))}
-                </div>
-              )}
+          )}
 
-              {!showPicker && !creating && (
-                <div className="space-y-0.5">
-                  <button
-                    type="button"
-                    onClick={loadAllSeries}
-                    className="block w-full rounded px-1.5 py-1 text-left text-sm hover:bg-muted"
-                  >
-                    Choose an existing series…
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => setCreating(true)}
-                    className="block w-full rounded px-1.5 py-1 text-left text-sm hover:bg-muted"
-                  >
-                    New series from this meeting
-                  </button>
-                </div>
-              )}
-
-              {showPicker && (
-                <div>
-                  <input
-                    autoFocus
-                    value={filter}
-                    onChange={(e) => setFilter(e.target.value)}
-                    placeholder="Filter series…"
-                    className="mb-1 h-7 w-full rounded border bg-transparent px-2 text-sm outline-none focus:border-primary/50"
-                  />
-                  <div className="max-h-48 overflow-y-auto">
-                    {allSeries === null ? (
-                      <div className="flex items-center gap-2 px-1 py-2 text-xs text-muted-foreground">
-                        <Loader2 className="h-3.5 w-3.5 animate-spin" /> Loading…
-                      </div>
-                    ) : (
-                      allSeries
-                        .filter((s) => s.title.toLowerCase().includes(filter.toLowerCase()))
-                        .map((s) => (
-                          <button
-                            key={s.id}
-                            type="button"
-                            disabled={busy}
-                            onClick={() => void attach(s.id, 'manual')}
-                            className="flex w-full items-center gap-1.5 rounded px-1.5 py-1 text-left text-sm hover:bg-muted"
-                          >
-                            <Repeat className="h-3 w-3 shrink-0 text-primary/70" />
-                            <span className="min-w-0 flex-1 truncate">{s.title}</span>
-                            <span className="text-[10px] tabular-nums text-muted-foreground">
-                              {s.member_count}
-                            </span>
-                          </button>
-                        ))
-                    )}
+          {showPicker && (
+            <div>
+              <input
+                autoFocus
+                value={filter}
+                onChange={(e) => setFilter(e.target.value)}
+                placeholder="Filter series…"
+                className="mb-1 h-7 w-full rounded border bg-transparent px-2 text-sm outline-none focus:border-primary/50"
+              />
+              <div className="max-h-48 overflow-y-auto">
+                {allSeries === null ? (
+                  <div className="flex items-center gap-2 px-1 py-2 text-xs text-muted-foreground">
+                    <Loader2 className="h-3.5 w-3.5 animate-spin" /> Loading…
                   </div>
-                </div>
-              )}
+                ) : (
+                  allSeries
+                    .filter((s) => s.title.toLowerCase().includes(filter.toLowerCase()))
+                    .map((s) => (
+                      <button
+                        key={s.id}
+                        type="button"
+                        disabled={busy}
+                        onClick={() => void attach(s.id)}
+                        title={s.description ?? undefined}
+                        className="flex w-full items-center gap-1.5 rounded px-1.5 py-1 text-left text-sm hover:bg-muted"
+                      >
+                        <Repeat className="h-3 w-3 shrink-0 text-primary/70" />
+                        <span className="min-w-0 flex-1 truncate">{s.title}</span>
+                      </button>
+                    ))
+                )}
+              </div>
+            </div>
+          )}
 
-              {creating && (
-                <div className="space-y-1.5">
-                  <input
-                    autoFocus
-                    value={newTitle}
-                    onChange={(e) => setNewTitle(e.target.value)}
-                    onKeyDown={(e) => {
-                      if (e.key === 'Enter') void createSeries();
-                    }}
-                    placeholder="Series name"
-                    className="h-7 w-full rounded border bg-transparent px-2 text-sm outline-none focus:border-primary/50"
-                  />
-                  <button
-                    type="button"
-                    disabled={busy || !newTitle.trim()}
-                    onClick={() => void createSeries()}
-                    className="w-full rounded bg-primary px-2 py-1 text-sm text-primary-foreground disabled:opacity-50"
-                  >
-                    {busy ? 'Creating…' : 'Create series'}
-                  </button>
-                </div>
-              )}
-            </>
+          {creating && (
+            <div className="space-y-1.5">
+              <input
+                autoFocus
+                value={newTitle}
+                onChange={(e) => setNewTitle(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter') void createSeries();
+                }}
+                placeholder="Series name"
+                className="h-7 w-full rounded border bg-transparent px-2 text-sm outline-none focus:border-primary/50"
+              />
+              <button
+                type="button"
+                disabled={busy || !newTitle.trim()}
+                onClick={() => void createSeries()}
+                className="w-full rounded bg-primary px-2 py-1 text-sm text-primary-foreground disabled:opacity-50"
+              >
+                {busy ? 'Creating…' : 'Create series'}
+              </button>
+            </div>
           )}
         </div>
       )}

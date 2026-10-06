@@ -3,8 +3,19 @@
 import { useCallback, useEffect, useState } from 'react';
 import { AppHeader } from '@/components/app-header';
 import { SeriesDialog } from '@/components/series-dialog';
+import {
+  LabelChipsStatic,
+  SeriesDefinitionForm,
+  type SeriesDefinitionValues,
+} from '@/components/series-definition';
 import { Button } from '@/components/ui/button';
-import { Badge } from '@/components/ui/badge';
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogHeader,
+  DialogTitle,
+} from '@/components/ui/dialog';
 import {
   Table,
   TableBody,
@@ -13,94 +24,47 @@ import {
   TableHeader,
   TableRow,
 } from '@/components/ui/table';
-import { CornerDownRight, Loader2, Plus, Repeat, ScanSearch, Zap } from 'lucide-react';
+import { Loader2, Plus, Repeat, UserCheck, Zap } from 'lucide-react';
 import { isNetworkFailure, networkErrorMessage, NETWORK_ERROR_MESSAGE } from '@/lib/fetch-errors';
+import { describePattern, type SeriesPattern } from '@/lib/series-patterns';
 
 /**
- * The series index: every series in one comparative table (the surface that
- * makes dupes and stubs visible). Row click opens the existing SeriesDialog —
- * deliberately NOT a /series/:id page; the dialog already does sweep, mass
- * import, and membership edits.
+ * The series index (curated series, docs/curated-series-spec.md): every
+ * series — everyone sees every series — with its description, patterns,
+ * default labels, followers and the number of its meetings YOU can open.
+ * Row click opens the SeriesDialog (definition edit, followers, auto-import,
+ * occurrences); "New series" opens the definition form.
  */
-
-interface DupSibling {
-  id: number;
-  title: string;
-  member_count: number;
-  reason: string;
-}
 
 interface SeriesIndexEntry {
   id: number;
   title: string;
-  /** Imported meetings attached to this series. */
-  member_count: number;
+  description: string | null;
+  patterns: SeriesPattern[];
+  priority: number;
+  /** Members the caller can open — never the global count. */
+  visible_member_count: number;
   last_recorded_at: string | null;
   cadence: 'daily' | 'weekly' | 'biweekly' | 'monthly' | null;
-  /** Another series shares evidence with this one — probable dupe, merge me. */
-  dup: boolean;
-  dup_with: DupSibling[];
-  /** Auto-import is switched on for this series. */
   auto_enabled: boolean;
+  labels: Array<{ id: number; path: string; color: string | null }>;
+  followers: Array<{ email: string; name: string | null }>;
 }
 
 interface SeriesIndexResponse {
+  /** false until migration 053 is applied — no creating/editing yet. */
+  ready: boolean;
   series: SeriesIndexEntry[];
   totals: { memberships: number; unattached: number };
 }
 
-/** Per-series result of the occurrence sweep (calendar + Teams), fetched
- * after the list in small chunks so the Importable column fills in
- * progressively. 'error' = that sweep failed; undefined = not fetched yet. */
-interface OccCounts {
-  total: number;
-  imported: number;
-  importable: number;
-  bare: number;
-  upcoming: number;
-  external: number;
-  googleConnected: boolean;
-}
-type OccCell = OccCounts | 'error' | 'network' | undefined;
-
-const COUNTS_CHUNK = 4;
-
-/**
- * Row order: newest series first, but probable duplicates are pulled
- * together — when the first member of a dup group is reached, the whole
- * group is emitted (largest first), siblings marked so the table reads
- * "this one, and these are the same meeting".
- */
-function orderWithDupGroups(
-  series: SeriesIndexEntry[]
-): Array<{ s: SeriesIndexEntry; sibling: boolean }> {
-  const byId = new Map(series.map((s) => [s.id, s]));
-  const emitted = new Set<number>();
-  const out: Array<{ s: SeriesIndexEntry; sibling: boolean }> = [];
-  for (const s of series) {
-    if (emitted.has(s.id)) continue;
-    if (s.dup_with.length === 0) {
-      emitted.add(s.id);
-      out.push({ s, sibling: false });
-      continue;
-    }
-    // Transitive closure: A~B, B~C → one group.
-    const group: SeriesIndexEntry[] = [];
-    const stack = [s.id];
-    while (stack.length > 0) {
-      const id = stack.pop()!;
-      if (emitted.has(id)) continue;
-      const entry = byId.get(id);
-      if (!entry) continue;
-      emitted.add(id);
-      group.push(entry);
-      for (const d of entry.dup_with) if (!emitted.has(d.id)) stack.push(d.id);
-    }
-    group.sort((a, b) => b.member_count - a.member_count);
-    group.forEach((g, i) => out.push({ s: g, sibling: i > 0 }));
-  }
-  return out;
-}
+const EMPTY_DEFINITION: SeriesDefinitionValues = {
+  title: '',
+  description: '',
+  patterns: [],
+  priority: 100,
+  labels: [],
+};
 
 const dateLabel = (iso: string | null) =>
   iso
@@ -112,11 +76,7 @@ export default function SeriesIndexPage() {
   // null = fine; a string = why the index could not load.
   const [error, setError] = useState<string | null>(null);
   const [openSeriesId, setOpenSeriesId] = useState<number | null>(null);
-  const [sweeping, setSweeping] = useState(false);
-  const [sweepResult, setSweepResult] = useState<string | null>(null);
-  const [newSeriesError, setNewSeriesError] = useState<string | null>(null);
-  const [occ, setOcc] = useState<Record<number, OccCell>>({});
-  const [occLoading, setOccLoading] = useState(false);
+  const [creating, setCreating] = useState(false);
 
   const load = useCallback(async () => {
     try {
@@ -125,11 +85,7 @@ export default function SeriesIndexPage() {
       setData((await res.json()) as SeriesIndexResponse);
       setError(null);
     } catch (err) {
-      setError(
-        isNetworkFailure(err)
-          ? NETWORK_ERROR_MESSAGE
-          : 'Couldn’t load series.'
-      );
+      setError(isNetworkFailure(err) ? NETWORK_ERROR_MESSAGE : 'Couldn’t load series.');
     }
   }, []);
 
@@ -137,92 +93,35 @@ export default function SeriesIndexPage() {
     void load();
   }, [load]);
 
-  // Deep link: /series?series=<id> opens that series' dialog on load (the
-  // dup banner's "View it" link and anything else that wants to point at a
-  // series from another tab). Read once from the URL — no Suspense dance.
+  // Deep link: /series?series=<id> opens that series' dialog on load. Read
+  // once from the URL — no Suspense dance.
   useEffect(() => {
     const raw = new URLSearchParams(window.location.search).get('series');
     const id = raw ? Number(raw) : NaN;
     if (Number.isInteger(id) && id > 0) setOpenSeriesId(id);
   }, []);
 
-  // Importable column: sweep every series' occurrences in small chunks
-  // (server caches the external part per user for 6h, so re-visits are
-  // instant). Re-runs when the series set changes (new series / merge).
-  const seriesIds = data?.series.map((s) => s.id).join(',') ?? '';
-  useEffect(() => {
-    if (!seriesIds) return;
-    let cancelled = false;
-    const ids = seriesIds.split(',').map(Number);
-    (async () => {
-      setOccLoading(true);
-      for (let i = 0; i < ids.length; i += COUNTS_CHUNK) {
-        const chunk = ids.slice(i, i + COUNTS_CHUNK);
-        try {
-          const res = await fetch(`/api/series/occurrence-counts?ids=${chunk.join(',')}`);
-          if (cancelled) return;
-          if (!res.ok) throw new Error(String(res.status));
-          const j = (await res.json()) as { counts: Record<number, OccCounts | 'error' | null> };
-          setOcc((prev) => {
-            const next = { ...prev };
-            for (const id of chunk) next[id] = j.counts[id] ?? 'error';
-            return next;
-          });
-        } catch (err) {
-          if (cancelled) return;
-          const cell: OccCell =
-            isNetworkFailure(err) ? 'network' : 'error';
-          setOcc((prev) => {
-            const next = { ...prev };
-            for (const id of chunk) next[id] = cell;
-            return next;
-          });
-        }
-      }
-      if (!cancelled) setOccLoading(false);
-    })();
-    return () => {
-      cancelled = true;
-    };
-  }, [seriesIds]);
-
-  const runRetroAttach = async () => {
-    setSweeping(true);
-    setSweepResult(null);
-    try {
-      const res = await fetch('/api/series/retro-attach', { method: 'POST' });
-      if (!res.ok) throw new Error(String(res.status));
-      const r = (await res.json()) as { scanned: number; attached: number; suggestions: number };
-      setSweepResult(
-        r.attached === 0 && r.suggestions === 0
-          ? `No stray meetings found (${r.scanned} checked)`
-          : `Attached ${r.attached} meeting${r.attached === 1 ? '' : 's'}` +
-              (r.suggestions > 0 ? ` · ${r.suggestions} new suggestion${r.suggestions === 1 ? '' : 's'}` : '')
-      );
-      void load();
-    } catch (err) {
-      setSweepResult(isNetworkFailure(err) ? NETWORK_ERROR_MESSAGE : 'Sweep failed — try again');
-    } finally {
-      setSweeping(false);
-    }
-  };
-
-  const newSeries = async () => {
-    const title = prompt('Series name')?.trim();
-    if (!title) return;
-    setNewSeriesError(null);
+  const create = async (v: SeriesDefinitionValues): Promise<string | null> => {
     try {
       const res = await fetch('/api/series', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ title }),
+        body: JSON.stringify({
+          title: v.title,
+          description: v.description,
+          patterns: v.patterns,
+          priority: v.priority,
+          labels: v.labels,
+        }),
       });
-      if (!res.ok) throw new Error(`Could not create the series (${res.status})`);
-      const j = (await res.json()) as { series: { id: number } };
+      const j = (await res.json().catch(() => null)) as { series?: { id: number }; error?: string } | null;
+      if (!res.ok || !j?.series) return j?.error ?? `Could not create the series (${res.status})`;
+      setCreating(false);
       void load();
       setOpenSeriesId(j.series.id);
+      return null;
     } catch (err) {
-      setNewSeriesError(networkErrorMessage(err, 'Could not create the series'));
+      return networkErrorMessage(err, 'Could not create the series');
     }
   };
 
@@ -230,33 +129,17 @@ export default function SeriesIndexPage() {
     <div className="min-h-screen">
       <AppHeader>
         <Button
-          variant="outline"
           size="sm"
-          disabled={sweeping}
-          onClick={() => void runRetroAttach()}
-          title={"Re-match every meeting that belongs to no series against the existing series' evidence keys"}
+          onClick={() => setCreating(true)}
+          disabled={data !== null && !data.ready}
+          title={data && !data.ready ? 'Curated series are not switched on yet (migration 053)' : undefined}
         >
-          {sweeping ? <Loader2 className="h-4 w-4 animate-spin" /> : <ScanSearch className="h-4 w-4" />}
-          Re-scan attachments
-        </Button>
-        <Button size="sm" onClick={() => void newSeries()}>
           <Plus className="h-4 w-4" />
           New series
         </Button>
       </AppHeader>
 
-      <main className="mx-auto max-w-4xl px-6 py-4">
-        {sweepResult && (
-          <div className="mb-3 rounded-lg border border-primary/25 bg-primary/5 px-3 py-2 text-sm">
-            {sweepResult}
-          </div>
-        )}
-        {newSeriesError && (
-          <div className="mb-3 rounded-lg border border-destructive/30 bg-destructive/5 px-3 py-2 text-sm text-destructive">
-            {newSeriesError}
-          </div>
-        )}
-
+      <main className="mx-auto max-w-5xl px-6 py-4">
         {!data && !error ? (
           <div className="flex items-center justify-center py-16 text-muted-foreground">
             <Loader2 className="h-5 w-5 animate-spin" />
@@ -270,7 +153,8 @@ export default function SeriesIndexPage() {
           </div>
         ) : data && data.series.length === 0 ? (
           <div className="rounded-lg border py-16 text-center text-sm text-muted-foreground">
-            No series yet — recurring meetings create them automatically on import.
+            No series yet — a series is a hand-made group of recurring meetings: name it, give it
+            title patterns, and every matching meeting joins it.
           </div>
         ) : (
           data && (
@@ -280,161 +164,122 @@ export default function SeriesIndexPage() {
                   <TableHeader>
                     <TableRow>
                       <TableHead className="pl-4">Series</TableHead>
+                      <TableHead className="w-64">Patterns</TableHead>
+                      <TableHead className="w-48">Labels · followers</TableHead>
                       <TableHead
                         className="w-24 text-right"
-                        title="Meetings already imported into this app and attached to the series"
+                        title="Meetings in this series that you own or that are shared with you"
                       >
-                        Imported
+                        Yours
                       </TableHead>
-                      <TableHead
-                        className="w-28 text-right"
-                        title="Occurrences on your calendar / Teams that have a recording or transcript but aren’t imported yet. Swept from YOUR Google Calendar, so a meeting you weren’t invited to shows “—”."
-                      >
-                        Importable
-                      </TableHead>
-                      <TableHead className="w-24">Cadence</TableHead>
-                      <TableHead className="w-32">Last meeting</TableHead>
+                      <TableHead className="w-28">Last meeting</TableHead>
                     </TableRow>
                   </TableHeader>
                   <TableBody>
-                    {orderWithDupGroups(data.series).map(({ s, sibling }) => {
-                      const c = occ[s.id];
-                      const dupReason = s.dup_with[0]?.reason ?? null;
-                      const dupTitle =
-                        s.dup_with.length > 0
-                          ? `Probably the same meeting as ${s.dup_with
-                              .map((d) => `“${d.title}” (${d.member_count})`)
-                              .join(', ')} — ${dupReason}. Open one and use Merge.`
-                          : undefined;
-                      return (
-                        <TableRow
-                          key={s.id}
-                          className={`cursor-pointer ${sibling ? 'bg-amber-500/[0.04]' : ''}`}
-                          onClick={() => setOpenSeriesId(s.id)}
-                        >
-                          <TableCell className={`py-2.5 ${sibling ? 'pl-7' : 'pl-4'}`}>
-                            <div className="flex min-w-0 items-center gap-2">
-                              {sibling ? (
-                                <CornerDownRight
-                                  className="h-3.5 w-3.5 shrink-0 text-amber-600/70 dark:text-amber-500/70"
-                                  aria-label="duplicate of the series above"
-                                />
-                              ) : (
-                                <Repeat className="h-3.5 w-3.5 shrink-0 text-primary/70" />
-                              )}
-                              <span className="min-w-0 truncate text-sm font-medium">{s.title}</span>
-                              {s.auto_enabled && (
-                                <span
-                                  title="Auto-import is on — new occurrences import themselves"
-                                  className="shrink-0"
-                                >
-                                  <Zap className="h-3 w-3 text-blue-500" />
-                                </span>
-                              )}
-                              {s.dup_with.length > 0 && (
-                                <Badge
-                                  variant="outline"
-                                  className="shrink-0 border-amber-500/50 text-[10px] font-normal text-amber-600 dark:text-amber-500"
-                                  title={dupTitle}
-                                >
-                                  dup · {dupReason}
-                                </Badge>
-                              )}
-                            </div>
-                          </TableCell>
-                          <TableCell className="py-2.5 text-right text-sm tabular-nums">
-                            {s.member_count}
-                          </TableCell>
-                          <TableCell className="py-2.5 text-right text-sm tabular-nums">
-                            {c === undefined ? (
-                              occLoading ? (
-                                <Loader2 className="ml-auto h-3 w-3 animate-spin text-muted-foreground/50" />
-                              ) : (
-                                <span className="text-muted-foreground/50">—</span>
-                              )
-                            ) : c === 'error' || c === 'network' ? (
-                              <span className="text-xs text-muted-foreground/60" title={c === 'network' ? NETWORK_ERROR_MESSAGE : 'Sweep failed'}>
-                                ?
-                              </span>
-                            ) : !c.googleConnected ? (
+                    {data.series.map((s) => (
+                      <TableRow key={s.id} className="cursor-pointer align-top" onClick={() => setOpenSeriesId(s.id)}>
+                        <TableCell className="py-2.5 pl-4">
+                          <div className="flex min-w-0 items-center gap-2">
+                            <Repeat className="h-3.5 w-3.5 shrink-0 text-primary/70" />
+                            <span className="min-w-0 truncate text-sm font-medium">{s.title}</span>
+                            {s.auto_enabled && (
                               <span
-                                className="text-muted-foreground/50"
-                                title="Connect Google (Import meeting → Connect) to see importable occurrences"
+                                title="Auto-import is on — new occurrences import themselves"
+                                className="shrink-0"
                               >
-                                —
-                              </span>
-                            ) : c.external === 0 ? (
-                              <span
-                                className="text-muted-foreground/50"
-                                title="Not on your calendar — occurrences are swept from your own Google Calendar / Teams"
-                              >
-                                —
-                              </span>
-                            ) : (
-                              <span
-                                className={
-                                  c.importable > 0
-                                    ? 'font-medium text-amber-600 dark:text-amber-500'
-                                    : 'text-muted-foreground'
-                                }
-                                title={
-                                  `${c.external} occurrence${c.external === 1 ? '' : 's'} on your calendar in the last 12 months: ` +
-                                  `${c.imported} imported · ${c.importable} importable · ${c.bare} without artifacts` +
-                                  (c.upcoming > 0 ? ` · ${c.upcoming} upcoming` : '')
-                                }
-                              >
-                                {c.importable}
+                                <Zap className="h-3 w-3 text-blue-500" />
                               </span>
                             )}
-                          </TableCell>
-                          <TableCell className="py-2.5 text-xs text-muted-foreground">
-                            {s.cadence ?? '—'}
-                          </TableCell>
-                          <TableCell className="py-2.5 text-xs tabular-nums text-muted-foreground">
-                            {dateLabel(s.last_recorded_at)}
-                          </TableCell>
-                        </TableRow>
-                      );
-                    })}
+                          </div>
+                          {s.description && (
+                            <p className="mt-0.5 line-clamp-2 pl-5.5 text-xs text-muted-foreground">
+                              {s.description}
+                            </p>
+                          )}
+                        </TableCell>
+                        <TableCell className="py-2.5">
+                          {s.patterns.length === 0 ? (
+                            <span className="text-xs text-muted-foreground">manual only</span>
+                          ) : (
+                            <div className="space-y-0.5">
+                              {s.patterns.slice(0, 3).map((p, i) => (
+                                <p key={i} className="truncate font-mono text-[11px] text-foreground/80" title={describePattern(p)}>
+                                  {describePattern(p)}
+                                </p>
+                              ))}
+                              {s.patterns.length > 3 && (
+                                <p className="text-[11px] text-muted-foreground">+{s.patterns.length - 3} more</p>
+                              )}
+                            </div>
+                          )}
+                          {s.priority !== 100 && (
+                            <p className="text-[10px] text-muted-foreground">priority {s.priority}</p>
+                          )}
+                        </TableCell>
+                        <TableCell className="space-y-1 py-2.5">
+                          <LabelChipsStatic labels={s.labels} />
+                          {s.followers.length > 0 && (
+                            <p
+                              className="flex items-center gap-1 text-[11px] text-muted-foreground"
+                              title={s.followers.map((f) => f.email).join(', ')}
+                            >
+                              <UserCheck className="h-3 w-3" />
+                              <span className="truncate">
+                                {s.followers.map((f) => f.name || f.email.split('@')[0]).join(', ')}
+                              </span>
+                            </p>
+                          )}
+                        </TableCell>
+                        <TableCell className="py-2.5 text-right text-sm tabular-nums">
+                          {s.visible_member_count}
+                          {s.cadence && (
+                            <p className="text-[10px] text-muted-foreground">{s.cadence}</p>
+                          )}
+                        </TableCell>
+                        <TableCell className="py-2.5 text-xs tabular-nums text-muted-foreground">
+                          {dateLabel(s.last_recorded_at)}
+                        </TableCell>
+                      </TableRow>
+                    ))}
                   </TableBody>
                 </Table>
               </div>
               <p className="mt-2.5 px-1 text-[11px] text-muted-foreground">
-                {data.series.length} series · {data.totals.memberships} imported meeting
-                {data.totals.memberships === 1 ? '' : 's'} in series · {data.totals.unattached} meeting
-                {data.totals.unattached === 1 ? '' : 's'} in no series
-
-                {Object.values(occ).some((c) => c && c !== 'error' && c !== 'network' && c.googleConnected && c.external === 0) && (
-                  <>
-                    {' '}
-                    · Importable “—” = not on your calendar (occurrences are swept from your own
-                    Google Calendar / Teams)
-                  </>
-                )}
-                {(() => {
-                  const groups = orderWithDupGroups(data.series).filter((r) => r.sibling).length;
-                  return groups > 0 ? (
-                    <>
-                      {' '}
-                      · <span className="text-amber-600 dark:text-amber-500">{groups} probable duplicate{groups === 1 ? '' : 's'}</span> — open
-                      one and Merge
-                    </>
-                  ) : null;
-                })()}
+                {data.series.length} series · {data.totals.memberships} of your meeting
+                {data.totals.memberships === 1 ? '' : 's'} in a series · {data.totals.unattached} in
+                none
               </p>
             </>
           )
         )}
       </main>
 
+      <Dialog open={creating} onOpenChange={(o) => (!o ? setCreating(false) : null)}>
+        <DialogContent className="max-h-[85vh] overflow-y-auto rounded-xl sm:max-w-xl">
+          <DialogHeader>
+            <DialogTitle className="flex items-center gap-2">
+              <Repeat className="h-4 w-4 text-primary" /> New series
+            </DialogTitle>
+            <DialogDescription>
+              Every meeting matching a pattern joins the series and gets its default labels.
+              Followers are added by an auditor afterwards.
+            </DialogDescription>
+          </DialogHeader>
+          {creating && (
+            <SeriesDefinitionForm
+              initial={EMPTY_DEFINITION}
+              submitLabel="Create series"
+              onSubmit={(v) => create(v)}
+              onCancel={() => setCreating(false)}
+            />
+          )}
+        </DialogContent>
+      </Dialog>
+
       <SeriesDialog
         seriesId={openSeriesId}
         onClose={() => setOpenSeriesId(null)}
         onChanged={() => void load()}
-        onMerged={(targetId) => {
-          setOpenSeriesId(targetId);
-          void load();
-        }}
       />
     </div>
   );
