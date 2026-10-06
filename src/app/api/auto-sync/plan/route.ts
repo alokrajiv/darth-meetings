@@ -4,6 +4,7 @@ import { explainOccurrence } from '@/lib/server/auto-import-plan';
 import { callerInvolvedCodes, latestPastOccurrenceStart } from '@/db-ops/calendar-event-cache';
 import { getMeetingById, resolveMeetingByAnyTranscriptId } from '@/db-ops/meetings';
 import { teamsCacheCode } from '@/lib/server/teams-ids';
+import { seriesForCaller } from '@/lib/server/series-api';
 
 export const runtime = 'nodejs';
 
@@ -46,5 +47,18 @@ export const GET = withAuth(async ({ user, request }) => {
   if (!involved.has(code)) return NextResponse.json({ error: 'Not found' }, { status: 404 });
   const out = await explainOccurrence(code, start);
   if (!out) return NextResponse.json({ error: 'Bad start' }, { status: 400 });
+  // Curated series v2 (§11.6): never name a series the caller cannot see.
+  // The plan's effect (who imports, opt-out) is still explained — the
+  // series behind it stays anonymous.
+  if (out.plan.seriesId && !(await seriesForCaller(out.plan.seriesId, caller))) {
+    const title = out.plan.seriesTitle;
+    out.plan = {
+      ...out.plan,
+      seriesId: null,
+      seriesTitle: null,
+      reason: title ? out.plan.reason.split(`"${title}"`).join('(a series you cannot see)') : out.plan.reason,
+    };
+    if (out.ledger?.kind === 'series') out.ledger = { ...out.ledger, seriesId: 0, seriesTitle: null };
+  }
   return NextResponse.json(out);
 });

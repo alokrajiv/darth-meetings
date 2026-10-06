@@ -2,23 +2,27 @@ import { NextResponse } from 'next/server';
 import { withAuth } from '@/lib/auth/with-auth';
 import { validatePatterns } from '@/lib/series-patterns';
 import { previewPatterns } from '@/lib/server/curated-series';
-import { isAuditorEmail } from '@/lib/auditor-policy';
+import { isAuditor } from '@/db-ops/auditors';
+import { parseSeriesId, seriesForCaller } from '@/lib/server/series-api';
 
 export const runtime = 'nodejs';
 
 /**
- * POST /api/series/preview { patterns } → { matched, visibleToYou, sample }
+ * POST /api/series/preview { patterns, seriesId? } → { matched, visibleToYou, sample }
  *
- * What would these patterns catch? `sample` = up to 10 of the caller's own
- * or shared meetings that match, newest first; `visibleToYou` counts them.
- * `matched` — the ORG-WIDE count — goes to auditors only (null for everyone
- * else): an arbitrary regex plus a global count is an oracle ("is there a
- * meeting titled `alok <> terence`?"), and metadata is the leak
- * (.agent-memory/feedback_privacy_caller_scoping_gate.md). Raw matches:
- * priority and "not this series" answers are not applied.
+ * What would these patterns catch — within a REACH (§11.6), never org-wide:
+ *  - by default the CALLER's own reach: the meetings they can open (an
+ *    auditor's: every meeting), so `matched` == `visibleToYou` for most
+ *    people and the answer is no oracle;
+ *  - with `seriesId` of a series the caller OWNS or EDITS: that series'
+ *    OWNER's reach — an editor may know what the series matches. Any other
+ *    seriesId → 404 (a series the caller cannot see does not exist), or the
+ *    caller's own reach for a follower/auditor who cannot edit it.
+ * `sample` names only meetings the CALLER can open, whatever the reach.
+ * Raw matches: "not this series" answers are not applied.
  */
 export const POST = withAuth(async ({ user, request }) => {
-  let body: { patterns?: unknown };
+  let body: { patterns?: unknown; seriesId?: unknown };
   try {
     body = (await request.json()) as typeof body;
   } catch {
@@ -26,9 +30,31 @@ export const POST = withAuth(async ({ user, request }) => {
   }
   const v = validatePatterns(body.patterns ?? []);
   if (!v.ok) return NextResponse.json({ error: v.error }, { status: 400 });
-  if (v.patterns.length === 0) {
-    return NextResponse.json({ matched: isAuditorEmail(user.email) ? 0 : null, visibleToYou: 0, sample: [] });
+  const caller = { userId: user.userId, email: user.email };
+
+  let reach = {
+    ownerUserId: user.userId as string | null,
+    ownerEmail: user.email.trim().toLowerCase() as string | null,
+    ownerIsAuditor: await isAuditor(user.email),
+  };
+  let reachOf: 'you' | 'owner' = 'you';
+  if (body.seriesId !== undefined && body.seriesId !== null) {
+    const id = parseSeriesId(String(body.seriesId));
+    if (!id) return NextResponse.json({ error: 'Bad seriesId' }, { status: 400 });
+    const ctx = await seriesForCaller(id, caller);
+    if (!ctx) return NextResponse.json({ error: 'Not found' }, { status: 404 });
+    if (ctx.deco.permissions.edit) {
+      reach = {
+        ownerUserId: ctx.series.owner_user_id,
+        ownerEmail: ctx.series.owner_email,
+        ownerIsAuditor: ctx.facts.ownerIsAuditor,
+      };
+      reachOf = 'owner';
+    }
   }
-  const r = await previewPatterns(v.patterns, { userId: user.userId, email: user.email });
-  return NextResponse.json({ ...r, matched: isAuditorEmail(user.email) ? r.matched : null });
+  if (v.patterns.length === 0) {
+    return NextResponse.json({ matched: 0, visibleToYou: 0, sample: [], reachOf });
+  }
+  const r = await previewPatterns(v.patterns, reach, caller);
+  return NextResponse.json({ ...r, reachOf });
 });

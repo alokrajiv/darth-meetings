@@ -3,6 +3,7 @@ import { sql } from '@/lib/db';
 import { SCHEMAS } from '@/lib/constants/database';
 import { publishEvent } from '@/lib/server/event-bus';
 import { identitiesForUsers } from '@/db-ops/transcript-activity';
+import { listingSeriesSql } from '@/db-ops/series';
 import { teamsCacheCode } from '@/lib/server/teams-ids';
 import {
   cleanupMeetingIfOrphan,
@@ -146,6 +147,8 @@ export async function listVisibleToUser(
 ): Promise<TranscriptListRow[]> {
   const normEmail = email.trim().toLowerCase();
   const scratchOnly = !!opts?.scratch;
+  // The series chip: first CALLER-VISIBLE series (curated series v2 §11.6).
+  const series = await listingSeriesSql('t', { userId, email });
   const rows = await sql<
     Array<TranscriptListRow & { __access: 'owner' | 'edit' | 'read' }>
   >`
@@ -171,7 +174,7 @@ export async function listVisibleToUser(
            COALESCE(t.gmeet_context->'deferredImport'->>'error',
                     t.gmeet_context->'ingestFailure'->>'message') AS deferred_error,
            t.gmeet_context->'deferredImport'->>'background' AS deferred_background,
-           sm.series_id, se.title AS series_title,
+           ${series.cols()}
            -- Curated series (2026-10-06) have no "suspected" state: a pattern
            -- match IS membership, so "matches but not a member" can only mean
            -- excluded. The columns stay NULL so the API shape is stable.
@@ -184,8 +187,7 @@ export async function listVisibleToUser(
     LEFT JOIN ${sql(SCHEMA)}.transcript_shares s
       ON s.transcript_id = t.id
       AND s.shared_with_email = ${normEmail}
-    LEFT JOIN ${sql(SCHEMA)}.series_members sm ON sm.transcript_id = t.id
-    LEFT JOIN ${sql(SCHEMA)}.series se ON se.id = sm.series_id
+    ${series.join()}
     WHERE (t.user_id = ${userId} OR s.id IS NOT NULL)
       AND t.deleted_at IS NULL
       AND ${scratchOnly ? sql`t.scratch` : sql`NOT t.scratch`}
@@ -394,6 +396,8 @@ export async function listPagedForUser(
   const normEmail = email.trim().toLowerCase();
   const isTrash = tab === 'trash';
   const isScratch = tab === 'scratch';
+  // The series chip: first CALLER-VISIBLE series (curated series v2 §11.6).
+  const series = isTrash ? null : await listingSeriesSql('b', { userId, email });
   const pattern = q ? `%${q.replace(/[%_\\]/g, (m) => `\\${m}`)}%` : null;
 
   // Fragment builders (fresh fragment per use site).
@@ -597,7 +601,7 @@ export async function listPagedForUser(
              isTrash
                ? sql`NULL::int AS series_id, NULL::text AS series_title,
                      NULL::int AS suspected_series_id, NULL::text AS suspected_series_title,`
-               : sql`sm.series_id, se.title AS series_title,
+               : sql`${series!.cols()}
                      NULL::int AS suspected_series_id, NULL::text AS suspected_series_title,`
            }
            (SELECT count(*)::int FROM day_counts) AS __total_days,
@@ -614,11 +618,7 @@ export async function listPagedForUser(
       WHERE tl.transcript_id = b.id
     ) lbl ON true
     ${
-      isTrash
-        ? sql``
-        : sql`
-          LEFT JOIN ${sql(SCHEMA)}.series_members sm ON sm.transcript_id = b.id
-          LEFT JOIN ${sql(SCHEMA)}.series se ON se.id = sm.series_id`
+      isTrash || !series ? sql`` : series.join()
     }
     ORDER BY b.sort_key DESC, b.id DESC
   `;

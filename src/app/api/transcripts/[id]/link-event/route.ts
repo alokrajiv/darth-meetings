@@ -12,6 +12,7 @@ import {
 import { identityForUser, logActivity } from '@/db-ops/transcript-activity';
 import { relinkSharesToEvent, shareWithInternalInvitees } from '@/lib/server/auto-share';
 import { syncSeriesForTranscript } from '@/lib/server/curated-series';
+import { withVisibleSeriesProvenance } from '@/lib/server/series-api';
 import { registerPeopleFromMeeting } from '@/lib/server/import-helpers';
 import { resolveLinkedEventRef } from '@/lib/server/linked-event-ref';
 import { getServerAccessToken } from '@/lib/server/google-oauth';
@@ -380,7 +381,12 @@ export const POST = withAuth(async ({ user, request }, { params }) => {
   const updated = await getForUser(access.ownerUserId, id);
   return NextResponse.json({
     transcript: updated
-      ? { ...updated, access: access.access, owner_email: null, owner_name: null }
+      ? {
+          ...(await withVisibleSeriesProvenance(updated, { userId: user.userId, email: user.email })),
+          access: access.access,
+          owner_email: null,
+          owner_name: null,
+        }
       : null,
     event: {
       id: event.id ?? null,

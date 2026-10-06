@@ -1,64 +1,58 @@
 import { NextResponse } from 'next/server';
 import { normalizeReportPref, defaultReportPref } from '@/lib/report-pref';
 import { withAuth } from '@/lib/auth/with-auth';
-import {
-  getSeries,
-  listMembers,
-  setSeriesAutoImport,
-  updateSeries,
-  type SeriesAutoImportCfg,
-} from '@/db-ops/series';
-import { curatedSeriesReady, CURATED_SERIES_NOT_READY } from '@/db-ops/curated-series-schema';
+import { listMembers, setSeriesAutoImport, updateSeries, type SeriesAutoImportCfg } from '@/db-ops/series';
 import { validatePatterns } from '@/lib/series-patterns';
-import {
-  SERIES_DELETE_DENIED,
-  SERIES_MATCHING_AUDITOR_ONLY,
-} from '@/lib/series-permissions';
+import { SERIES_DELETE_DENIED, SERIES_EDIT_DENIED } from '@/lib/series-permissions';
 import { setSeriesLabels } from '@/lib/server/series-labels';
 import {
   bustCuratedSeriesCache,
   deleteSeriesFully,
   onSeriesMatchingChanged,
+  reconcileSeriesMembers,
 } from '@/lib/server/curated-series';
 import {
-  decorateSeries,
   parseDescription,
   parsePriority,
   parseSeriesId,
   parseTitle,
   resolveLabelPaths,
+  seriesForCaller,
   SeriesInputError,
 } from '@/lib/server/series-api';
 
 export const runtime = 'nodejs';
-// A patterns/priority edit re-matches every meeting.
+// A patterns edit re-matches every meeting.
 export const maxDuration = 120;
 
+const NOT_FOUND = () => NextResponse.json({ error: 'Not found' }, { status: 404 });
+
 /**
- * GET /api/series/:id — the series (everyone sees every series), its default
- * labels, followers, what the caller may do, and its MEMBERS — only the
- * meetings the caller owns or holds a share on (spec §6). Members the caller
+ * GET /api/series/:id — 404 unless the caller owns, edits, follows or
+ * audits the series (§11.6). Then: the series, its owner, editors, default
+ * labels, followers, what the caller may do, a reach note, and its MEMBERS —
+ * only the meetings the caller owns or holds a share on. Members the caller
  * cannot open are not listed, not counted, not dated.
  */
 export const GET = withAuth(async ({ user }, { params }) => {
   const id = parseSeriesId((await params).id);
   if (!id) return NextResponse.json({ error: 'Bad id' }, { status: 400 });
   const caller = { userId: user.userId, email: user.email };
-  const series = await getSeries(id);
-  if (!series) return NextResponse.json({ error: 'Not found' }, { status: 404 });
-  const ready = await curatedSeriesReady().catch(() => false);
-  const [members, deco] = await Promise.all([
-    listMembers(id, caller),
-    ready ? decorateSeries([series], caller).then((m) => m.get(id) ?? null) : Promise.resolve(null),
-  ]);
+  const ctx = await seriesForCaller(id, caller);
+  if (!ctx) return NOT_FOUND();
+  const members = await listMembers(id, caller);
   return NextResponse.json({
-    ready,
-    series,
-    labels: deco?.labels ?? [],
-    followers: deco?.followers ?? [],
-    permissions: deco?.permissions ?? null,
+    ready: true,
+    series: ctx.series,
+    owner: ctx.deco.owner,
+    editors: ctx.deco.editors,
+    labels: ctx.deco.labels,
+    followers: ctx.deco.followers,
+    permissions: ctx.deco.permissions,
+    // §11.11 reach note: what the series may match.
+    reach: ctx.facts.ownerIsAuditor ? 'all' : 'owner',
     // Who is asking — the dialog marks "you" among the followers.
-    viewer: { email: user.email.trim().toLowerCase() },
+    viewer: { email: user.email.trim().toLowerCase(), isAuditor: ctx.callerIsAuditor },
     members,
     // Older darth-cli builds print these — the key bag, guesses and merge
     // prompts are gone with the key-based series.
@@ -74,16 +68,22 @@ const AUTO_MODES = ['transcript', 'video', 'both'] as const;
  * PATCH /api/series/:id — edit the definition:
  *   { title?, description?, notes?, patterns?, priority?, labels?: string[],
  *     autoImport?: { enabled, mode?, report? } }
- * Anyone may edit name, description, labels and auto-import. Patterns and
- * priority decide who belongs — and so, on a followed series, who the
- * followers get — so on a series WITH followers only an auditor may change
- * them (403). A patterns/priority change re-matches every meeting.
+ * Owner and editors only (§11.1) — 404 for a caller who cannot see the
+ * series, 403 for a follower/auditor who can see but not edit it. The reach
+ * rule is the safety: whatever the patterns, the series only matches what
+ * its owner can open. Auto-import binds to the CALLER (§11.7). A patterns
+ * change re-matches every meeting; a labels change re-runs the members.
  */
 export const PATCH = withAuth(async ({ user, request }, { params }) => {
   const id = parseSeriesId((await params).id);
   if (!id) return NextResponse.json({ error: 'Bad id' }, { status: 400 });
-  const series = await getSeries(id);
-  if (!series) return NextResponse.json({ error: 'Not found' }, { status: 404 });
+  const caller = { userId: user.userId, email: user.email };
+  const ctx = await seriesForCaller(id, caller);
+  if (!ctx) return NOT_FOUND();
+  if (!ctx.deco.permissions.edit) {
+    return NextResponse.json({ error: SERIES_EDIT_DENIED }, { status: 403 });
+  }
+  const series = ctx.series;
 
   let body: Record<string, unknown> & {
     autoImport?: {
@@ -96,16 +96,6 @@ export const PATCH = withAuth(async ({ user, request }, { params }) => {
     body = (await request.json()) as typeof body;
   } catch {
     return NextResponse.json({ error: 'Invalid JSON body' }, { status: 400 });
-  }
-  const caller = { userId: user.userId, email: user.email };
-
-  const touchesDefinition =
-    body.description !== undefined ||
-    body.patterns !== undefined ||
-    body.priority !== undefined ||
-    body.labels !== undefined;
-  if (touchesDefinition && !(await curatedSeriesReady())) {
-    return NextResponse.json({ error: CURATED_SERIES_NOT_READY }, { status: 503 });
   }
 
   // ---- validate everything before writing anything ----------------------
@@ -129,17 +119,10 @@ export const PATCH = withAuth(async ({ user, request }, { params }) => {
     if (!v.ok) return NextResponse.json({ error: v.error }, { status: 400 });
     patch.patterns = v.patterns;
   }
+  // Priority is display order only since v2 (§11.2) — it never changes who
+  // belongs, so only a patterns change re-matches.
   const changesMatching =
-    (patch.patterns !== undefined && JSON.stringify(patch.patterns) !== JSON.stringify(series.patterns)) ||
-    (patch.priority !== undefined && patch.priority !== series.priority);
-  if (changesMatching) {
-    // PRIVACY GATE (spec §6): widening a followed series' patterns would
-    // pull more meetings to its followers.
-    const deco = (await decorateSeries([series], caller)).get(id);
-    if (!deco?.permissions.editMatching) {
-      return NextResponse.json({ error: SERIES_MATCHING_AUDITOR_ONLY }, { status: 403 });
-    }
-  }
+    patch.patterns !== undefined && JSON.stringify(patch.patterns) !== JSON.stringify(series.patterns);
 
   let ai: SeriesAutoImportCfg | null = null;
   if (body.autoImport !== undefined) {
@@ -186,32 +169,32 @@ export const PATCH = withAuth(async ({ user, request }, { params }) => {
     await updateSeries(id, patch);
     bustCuratedSeriesCache();
   }
-  if (labelIds) await setSeriesLabels(id, labelIds, caller);
   if (ai) await setSeriesAutoImport(id, ai);
-  if (changesMatching) await onSeriesMatchingChanged(id, 'patterns/priority edited');
+  if (labelIds) {
+    await setSeriesLabels(id, labelIds, caller);
+    if (!changesMatching) await reconcileSeriesMembers(id, caller);
+  }
+  if (changesMatching) await onSeriesMatchingChanged(id, 'patterns edited');
   return NextResponse.json({ ok: true, ...(ai ? { autoImport: ai } : {}) });
 });
 
 /**
  * DELETE /api/series/:id — remove the series: its labels and follow shares
- * come off every member, the members are freed (and re-matched — another
- * series may now win them); the meetings themselves are untouched. Only the
- * series' creator or an auditor may delete it (403 otherwise).
+ * come off every member (unless another series still gives them); the
+ * meetings themselves are untouched. The OWNER only (§11.1) — 404 for a
+ * caller who cannot see it, 403 for anyone else who can. No ledger rows:
+ * it is the owner's call, not a person's removal of one meeting (§11.4).
  */
 export const DELETE = withAuth(async ({ user }, { params }) => {
   const id = parseSeriesId((await params).id);
   if (!id) return NextResponse.json({ error: 'Bad id' }, { status: 400 });
   const caller = { userId: user.userId, email: user.email };
-  const series = await getSeries(id);
-  if (!series) return NextResponse.json({ error: 'Not found' }, { status: 404 });
-  if (!(await curatedSeriesReady())) {
-    return NextResponse.json({ error: CURATED_SERIES_NOT_READY }, { status: 503 });
-  }
-  const deco = (await decorateSeries([series], caller)).get(id);
-  if (!deco?.permissions.delete) {
+  const ctx = await seriesForCaller(id, caller);
+  if (!ctx) return NOT_FOUND();
+  if (!ctx.deco.permissions.delete) {
     return NextResponse.json({ error: SERIES_DELETE_DENIED }, { status: 403 });
   }
   await deleteSeriesFully(id);
-  console.log(`[series] deleted #${id} "${series.title}" by ${user.email}`);
+  console.log(`[series] deleted #${id} "${ctx.series.title}" by ${user.email}`);
   return NextResponse.json({ ok: true });
 });

@@ -2,10 +2,9 @@ import { NextResponse } from 'next/server';
 import { withAuth } from '@/lib/auth/with-auth';
 import { resolveAccess } from '@/db-ops/transcript-access';
 import { createSeries, listSeries, seriesTotals } from '@/db-ops/series';
-import { curatedSeriesReady, CURATED_SERIES_NOT_READY } from '@/db-ops/curated-series-schema';
+import { seriesOwnershipReady, SERIES_OWNERSHIP_NOT_READY } from '@/db-ops/series-ownership-schema';
+import { auditorEmails } from '@/db-ops/auditors';
 import { validatePatterns } from '@/lib/series-patterns';
-import { isAuditorEmail } from '@/lib/auditor-policy';
-import { SERIES_FOLLOWERS_AUDITOR_ONLY } from '@/lib/series-permissions';
 import { setSeriesLabels } from '@/lib/server/series-labels';
 import {
   attachManually,
@@ -15,6 +14,7 @@ import {
 } from '@/lib/server/curated-series';
 import {
   decorateSeries,
+  isInternalEmail,
   parseDescription,
   parsePriority,
   parseTitle,
@@ -40,63 +40,80 @@ function cadenceOf(medianGapSecs: number | null): SeriesCadence {
 }
 
 /**
- * GET /api/series — every series (everyone sees every series, spec §6):
- * name, description, patterns, priority, default labels, followers,
- * auto-import status, and what the caller may do with each. Member counts,
- * last-meeting date and cadence are over the meetings the CALLER can open —
- * never the global numbers. Totals for the footer are the caller's too.
+ * GET /api/series — the series the CALLER may see (§11.6: owner, editor,
+ * follower, auditor — nobody else learns a series exists): name,
+ * description, patterns, priority, owner, editors, default labels,
+ * followers, auto-import status, and what the caller may do with each.
+ * Member counts, last-meeting date and cadence are over the meetings the
+ * caller can open — never the global numbers. Totals for the footer are the
+ * caller's too.
  */
 export const GET = withAuth(async ({ user }) => {
   const caller = { userId: user.userId, email: user.email };
-  const [series, totals] = await Promise.all([listSeries(caller), seriesTotals(caller)]);
-  const ready = await curatedSeriesReady().catch(() => false);
-  const deco = ready ? await decorateSeries(series, caller) : new Map();
+  const ready = await seriesOwnershipReady().catch(() => false);
+  if (!ready) {
+    return NextResponse.json({ ready: false, isAuditor: false, series: [], totals: { memberships: 0, unattached: 0 } });
+  }
+  const auditors = await auditorEmails();
+  const callerIsAuditor = auditors.has(user.email.trim().toLowerCase());
+  const [series, totals] = await Promise.all([
+    listSeries(caller, callerIsAuditor),
+    seriesTotals(caller, callerIsAuditor),
+  ]);
+  const deco = await decorateSeries(series, caller, auditors);
   return NextResponse.json({
     ready,
-    series: series.map((s) => {
-      const d = deco.get(s.id);
-      return {
-        id: s.id,
-        title: s.title,
-        description: s.description,
-        patterns: s.patterns,
-        priority: s.priority,
-        created_by: s.created_by,
-        visible_member_count: s.visible_member_count,
-        // Kept for older clients (CLI, badge picker) — the same caller-
-        // visible count.
-        member_count: s.visible_member_count,
-        last_recorded_at: s.last_recorded_at,
-        cadence: cadenceOf(s.median_gap_secs),
-        auto_enabled: !!s.auto_import?.enabled,
-        auto_import: s.auto_import
-          ? { enabled: s.auto_import.enabled, byEmail: s.auto_import.byEmail, mode: s.auto_import.mode }
-          : null,
-        labels: d?.labels ?? [],
-        followers: d?.followers ?? [],
-        permissions: d?.permissions ?? null,
-        // Older darth-cli builds read these (merge prompt) — there are no
-        // duplicates to fold any more.
-        dup: false,
-        dup_with: [],
-      };
-    }),
+    isAuditor: callerIsAuditor,
+    series: series
+      .filter((s) => deco.get(s.id)?.permissions.see)
+      .map((s) => {
+        const d = deco.get(s.id)!;
+        return {
+          id: s.id,
+          title: s.title,
+          description: s.description,
+          patterns: s.patterns,
+          priority: s.priority,
+          created_by: s.created_by,
+          owner: d.owner,
+          editors: d.editors,
+          visible_member_count: s.visible_member_count,
+          // Kept for older clients (CLI, badge picker) — the same caller-
+          // visible count.
+          member_count: s.visible_member_count,
+          last_recorded_at: s.last_recorded_at,
+          cadence: cadenceOf(s.median_gap_secs),
+          auto_enabled: !!s.auto_import?.enabled,
+          auto_import: s.auto_import
+            ? { enabled: s.auto_import.enabled, byEmail: s.auto_import.byEmail, mode: s.auto_import.mode }
+            : null,
+          labels: d.labels,
+          followers: d.followers,
+          permissions: d.permissions,
+          // Older darth-cli builds read these (merge prompt) — there are no
+          // duplicates to fold any more.
+          dup: false,
+          dup_with: [],
+        };
+      }),
     totals,
   });
 });
 
 /**
- * POST /api/series — create a curated series:
+ * POST /api/series — create a curated series; the caller is its OWNER:
  *   { title, description?, patterns?, priority?, labels?: string[] (paths),
- *     followers?: [{ email, name? }] (auditors only), fromTranscriptId? }
- * Anyone may create a series. Followers grant read access, so only an
- * auditor may name them (403 otherwise). `fromTranscriptId` attaches that
- * meeting by hand — the caller must own or edit it. Every meeting is then
+ *     followers?: [{ email, name? }], fromTranscriptId? }
+ * Anyone may create a series. It reaches only the meetings the caller can
+ * open (an auditor's: every meeting — §11.2), and its followers only get
+ * the meetings the caller owns or edits (§11.4). Followers must be company
+ * addresses. `fromTranscriptId` attaches that meeting by hand — the caller
+ * must be able to open it (it is in their reach). Every meeting is then
  * re-matched against the new patterns.
  */
 export const POST = withAuth(async ({ user, request }) => {
-  if (!(await curatedSeriesReady())) {
-    return NextResponse.json({ error: CURATED_SERIES_NOT_READY }, { status: 503 });
+  if (!(await seriesOwnershipReady())) {
+    return NextResponse.json({ error: SERIES_OWNERSHIP_NOT_READY }, { status: 503 });
   }
   let body: Record<string, unknown>;
   try {
@@ -121,27 +138,21 @@ export const POST = withAuth(async ({ user, request }) => {
   if (!v.ok) return NextResponse.json({ error: v.error }, { status: 400 });
 
   const followers = Array.isArray(body.followers) ? body.followers : [];
-  if (followers.length > 0 && !isAuditorEmail(user.email)) {
-    return NextResponse.json({ error: SERIES_FOLLOWERS_AUDITOR_ONLY }, { status: 403 });
-  }
   const people: Array<{ email: string; name: string | null }> = [];
   for (const f of followers as Array<{ email?: unknown; name?: unknown }>) {
     const email = typeof f?.email === 'string' ? f.email.trim().toLowerCase() : '';
-    if (!email.includes('@')) return NextResponse.json({ error: 'follower email is required' }, { status: 400 });
+    if (!isInternalEmail(email)) {
+      return NextResponse.json({ error: `follower "${email}" must be a company address` }, { status: 400 });
+    }
     people.push({ email, name: typeof f.name === 'string' && f.name.trim() ? f.name.trim() : null });
   }
 
-  // The seed meeting is checked BEFORE anything is written.
+  // The seed meeting is checked BEFORE anything is written: it must be in
+  // the new owner's (= the caller's) reach — any access does.
   let seed: Awaited<ReturnType<typeof resolveAccess>> = null;
   if (typeof body.fromTranscriptId === 'string' && body.fromTranscriptId) {
     seed = await resolveAccess(user.userId, user.email, body.fromTranscriptId);
     if (!seed) return NextResponse.json({ error: 'Transcript not found' }, { status: 404 });
-    if (seed.access !== 'owner' && seed.access !== 'edit') {
-      return NextResponse.json(
-        { error: 'Only the owner or an editor can put this meeting in a series' },
-        { status: 403 }
-      );
-    }
   }
 
   let labelIds: number[] = [];
@@ -154,6 +165,7 @@ export const POST = withAuth(async ({ user, request }) => {
 
   const series = await createSeries({
     userId: user.userId,
+    email: user.email,
     title,
     description,
     patterns: v.patterns,

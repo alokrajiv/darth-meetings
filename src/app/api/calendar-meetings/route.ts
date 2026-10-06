@@ -387,9 +387,10 @@ export const GET = withAuth(async ({ user, request }) => {
   const [seriesMatched, uuids, log, predicted, recorder] = await Promise.all([
     // The curated matcher on each served row (title, organiser, recurring;
     // invitees from the CALLER's own calendar row when a series has an
-    // invite rule) — the same winner an import of the row would join.
+    // invite rule) — the first matching series the CALLER may see, by
+    // priority (curated series v2 §11.6: never name one they cannot see).
     seriesForOccurrences(
-      user.userId,
+      { userId: user.userId, email: user.email },
       allRows.map((r) => ({
         key: r.key,
         title: r.title,

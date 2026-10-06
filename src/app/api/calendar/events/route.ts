@@ -351,9 +351,10 @@ export const GET = withAuth(async ({ user, request }) => {
       console.warn('[calendar/events] occurrence uuid mint failed:', err);
       return new Map<string, string>();
     }),
-    // The curated matcher on the caller's own rows (they carry the invite).
+    // The curated matcher on the caller's own rows (they carry the invite) —
+    // only series the CALLER may see are ever named (curated series §11.6).
     seriesForOccurrences(
-      user.userId,
+      { userId: user.userId, email: user.email },
       served.map((r) => ({
         key: r.key,
         title: r.title,

@@ -7,7 +7,10 @@ import { sharingRefusal } from '@/lib/share-gate';
 import { identityForUser, logActivity, userIdForEmail } from '@/db-ops/transcript-activity';
 import { recordAutoShareRemoval } from '@/db-ops/auditor-shares';
 import { isAuditorShare, isAutoReadShare, SHARE_ORIGIN_AUDITOR, SHARE_ORIGIN_SERIES_FOLLOW } from '@/lib/auditor-policy';
-import { getMembership } from '@/db-ops/series';
+import { listVisibleMemberships } from '@/db-ops/series';
+import { isAuditor } from '@/db-ops/auditors';
+import { seriesOwnershipReady } from '@/db-ops/series-ownership-schema';
+import { syncSeriesAfterShareChange } from '@/lib/server/curated-series';
 import {
   addShare,
   listByTranscript,
@@ -45,16 +48,25 @@ export const GET = withAuth(async ({ user }, { params }) => {
   const access = await resolveAccess(user.userId, user.email, id);
   if (!access) return NextResponse.json({ error: 'Not found' }, { status: 404 });
 
-  const [shares, ownerIdentity, membership] = await Promise.all([
+  const [shares, ownerIdentity, memberships] = await Promise.all([
     listByTranscript(access.row.id),
     identityForUser(access.ownerUserId),
-    // The meeting's series names the "Following <series>" note on follow
-    // shares (series names are visible to everyone — spec §6).
-    getMembership(access.row.id).catch(() => null),
+    // The meeting's series name the "Following <series>" note on follow
+    // shares — only series the CALLER may see (curated series v2, §11.6).
+    (async () =>
+      (await seriesOwnershipReady().catch(() => false))
+        ? listVisibleMemberships(
+            access.row.id,
+            { userId: user.userId, email: user.email },
+            await isAuditor(user.email)
+          )
+        : [])().catch(() => []),
   ]);
+  const seriesList = memberships.map((m) => ({ id: m.series_id, title: m.title }));
   return NextResponse.json({
     shares,
-    series: membership ? { id: membership.series_id, title: membership.title } : null,
+    series: seriesList[0] ?? null,
+    seriesList,
     owner: {
       email: ownerIdentity?.email ?? null,
       name: ownerIdentity?.name ?? null,
@@ -127,6 +139,9 @@ export const POST = withAuth(async ({ user, request }, { params }) => {
     sharedWithPplId: typeof pplId === 'number' ? pplId : null,
     access: requestedAccess,
   });
+
+  // A share can bring the meeting into a series owner's reach (§11.2).
+  syncSeriesAfterShareChange(access.row.id);
 
   void logActivity({
     transcriptId: access.row.id,
@@ -235,6 +250,8 @@ export const PATCH = withAuth(async ({ user, request }, { params }) => {
       return NextResponse.json({ error: result.error }, { status: 409 });
     }
 
+    syncSeriesAfterShareChange(access.row.id);
+
     void logActivity({
       transcriptId: access.row.id,
       userId: user.userId,
@@ -254,6 +271,9 @@ export const PATCH = withAuth(async ({ user, request }, { params }) => {
   if (!share) {
     return NextResponse.json({ error: 'Share not found' }, { status: 404 });
   }
+
+  // edit ↔ read decides whether a series owner may share/label it (§11.4).
+  syncSeriesAfterShareChange(access.row.id);
 
   void logActivity({
     transcriptId: access.row.id,
@@ -316,6 +336,9 @@ export const DELETE = withAuth(async ({ user, request }, { params }) => {
       meetingTitle: access.row.title,
     }).catch((err) => console.warn('[auto-share] recording the removal failed:', err));
   }
+
+  // The removed person may own a series this meeting was in (§11.2).
+  syncSeriesAfterShareChange(access.row.id);
 
   void logActivity({
     transcriptId: access.row.id,

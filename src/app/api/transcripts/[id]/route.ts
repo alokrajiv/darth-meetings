@@ -1,4 +1,5 @@
 import type { GmeetContext } from '@/lib/format';
+import { withVisibleSeriesProvenance } from '@/lib/server/series-api';
 import { NextResponse } from 'next/server';
 import { withAuth } from '@/lib/auth/with-auth';
 import { syncSeriesForTranscript } from '@/lib/server/curated-series';
@@ -73,7 +74,10 @@ export const GET = withAuth(async ({ user }, { params }) => {
 
   return NextResponse.json({
     transcript: redactForReader({
-      ...withoutSplitSource(refreshed),
+      ...(await withVisibleSeriesProvenance(withoutSplitSource(refreshed), {
+        userId: user.userId,
+        email: user.email,
+      })),
       access: access.access,
       owner_email: owner?.email ?? null,
       owner_name: owner?.name ?? null,
@@ -176,7 +180,7 @@ export const PATCH = withAuth(async ({ user, request }, { params }) => {
     const after = await getForUser(access.ownerUserId, id);
     return NextResponse.json({
       transcript: after
-        ? { ...withoutSplitSource(after), access: access.access, owner_email: null, owner_name: null }
+        ? { ...(await withVisibleSeriesProvenance(withoutSplitSource(after), { userId: user.userId, email: user.email })), access: access.access, owner_email: null, owner_name: null }
         : null,
     });
   }
@@ -229,7 +233,7 @@ export const PATCH = withAuth(async ({ user, request }, { params }) => {
     const after = await getForUser(access.ownerUserId, id);
     return NextResponse.json({
       transcript: after
-        ? { ...withoutSplitSource(after), access: access.access, owner_email: null, owner_name: null }
+        ? { ...(await withVisibleSeriesProvenance(withoutSplitSource(after), { userId: user.userId, email: user.email })), access: access.access, owner_email: null, owner_name: null }
         : null,
       sharesRemoved,
     });
@@ -277,7 +281,14 @@ export const PATCH = withAuth(async ({ user, request }, { params }) => {
   });
 
   return NextResponse.json({
-    transcript: updated ? { ...withoutSplitSource(updated), access: access.access, owner_email: null, owner_name: null } : null,
+    transcript: updated
+      ? {
+          ...(await withVisibleSeriesProvenance(withoutSplitSource(updated), { userId: user.userId, email: user.email })),
+          access: access.access,
+          owner_email: null,
+          owner_name: null,
+        }
+      : null,
   });
 });
 

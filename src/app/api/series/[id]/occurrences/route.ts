@@ -4,6 +4,7 @@ import { sweepSeriesOccurrences, type SeriesOccurrence } from '@/lib/server/seri
 import { getSeries } from '@/db-ops/series';
 import { listAutoSyncUsers } from '@/db-ops/user-prefs';
 import { interestedAutoSyncUsers } from '@/lib/server/auto-import-plan';
+import { seriesForCaller } from '@/lib/server/series-api';
 import { strongestReport, type ReportPref } from '@/lib/auto-marker';
 
 export const runtime = 'nodejs';
@@ -21,11 +22,15 @@ export const GET = withAuth(async ({ user, request }, { params }) => {
   if (!Number.isInteger(id) || id <= 0) {
     return NextResponse.json({ error: 'Bad id' }, { status: 400 });
   }
-  // PRIVACY (curated series, spec §6/§7): every series is visible to
-  // everyone, and the sweep itself is caller-scoped — occurrences come only
+  // PRIVACY (curated series v2, spec §11.6): a series the caller cannot see
+  // (not its owner, an editor, a follower or an auditor) does not exist for
+  // them — 404. The sweep itself is caller-scoped: occurrences come only
   // from the CALLER's own calendar rows (Meet records and Graph artifacts
   // only for the codes / join URLs on those rows), and a member meeting is
   // named only when the caller can open it (lib/server/series-occurrences).
+  if (!(await seriesForCaller(id, { userId: user.userId, email: user.email }))) {
+    return NextResponse.json({ error: 'Not found' }, { status: 404 });
+  }
   const forceRefresh = new URL(request.url).searchParams.get('refresh') === '1';
   const result = await sweepSeriesOccurrences(
     id,

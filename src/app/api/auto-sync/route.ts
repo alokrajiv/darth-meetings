@@ -15,7 +15,9 @@ import {
 } from '@/db-ops/user-prefs';
 import { normalizeReportPref } from '@/lib/report-pref';
 import { getGoogleAccount } from '@/db-ops/google-accounts';
-import { listSeriesWithAutoImport, seriesWithCallerMembers } from '@/db-ops/series';
+import { listSeriesWithAutoImport, seriesWithCallerMembers, visibleSeriesIds } from '@/db-ops/series';
+import { isAuditor } from '@/db-ops/auditors';
+import { seriesOwnershipReady } from '@/db-ops/series-ownership-schema';
 
 export const runtime = 'nodejs';
 
@@ -32,12 +34,19 @@ export const GET = withAuth(async ({ user }) => {
     listSeriesWithAutoImport().catch(() => []),
     seriesWithCallerMembers({ userId: user.userId, email: user.email }).catch(() => new Set<number>()),
   ]);
+  // Curated series v2 (§11.6): only series the caller may SEE are named.
+  const canSee = (await seriesOwnershipReady().catch(() => false))
+    ? await visibleSeriesIds(
+        { userId: user.userId, email: user.email },
+        await isAuditor(user.email)
+      ).catch(() => new Set<number>())
+    : new Set<number>();
   // Series the caller is in (holds a meeting of) whose explicit setting
   // OVERRIDES this switch for their occurrences (on → that enabler imports
   // in the series' mode; off → nobody). Shown on the card so "why didn't
   // auto-sync…" is answerable.
   const overridingSeries = seriesWithCfg
-    .filter((s) => visible.has(s.id) && s.auto_import)
+    .filter((s) => visible.has(s.id) && canSee.has(s.id) && s.auto_import)
     .map((s) => ({
       id: s.id,
       title: s.title,
