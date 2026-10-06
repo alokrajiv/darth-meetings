@@ -264,3 +264,158 @@ Deviations from §1–§8 decided in review (all privacy-motivated):
 
 Not verified: the UI in a browser; the first auto-import sweep over the curated
 series (fire-once log was reset — watch for duplicate imports on the first pass).
+
+## 11. v2 — a series runs as its OWNER (Alok, 2026-10-06 evening; supersedes §6 and the §10 deviations)
+
+Why: v1 ran the matcher with system rights over every meeting and then patched the
+consequences — two edit tiers (followed vs not), "followed series wins" anti-steal
+precedence, an auditor-only preview count, every series + its follower list visible
+to everyone, auditors hard-coded. Alok: "daft". v2 removes the root cause: **a series
+can only ever reach what its owner can already reach**, exactly like every other
+object in the app. Auditors are the ONE deliberate exception, stated as policy.
+
+### 11.1 Roles
+
+Per series: one **owner**, any number of **editors**, any number of **followers**.
+
+| Who | Sees the series | Edits name/desc/patterns/labels/priority/auto-import | Manages editors + followers | Transfers ownership | Deletes |
+|---|---|---|---|---|---|
+| owner | yes | yes | yes | yes | yes |
+| editor | yes | yes | yes | no | no |
+| follower | yes | no | may remove THEMSELVES | no | no |
+| auditor (any series) | yes (oversight) | only if also owner/editor | only if also owner/editor | no | no |
+| anyone else | **no — 404, the series does not exist for them** | | | | |
+
+- Anyone can CREATE a series; the creator is its owner.
+- **Auditor-owned series** (owner is an auditor, §11.3) reach every meeting, so every
+  role that can change their reach or audience must be an auditor too: their editors
+  must be auditors (adding a non-auditor editor → 400), and making an auditor the
+  owner of a series (create-as / transfer-to) can only be done BY an auditor. A
+  non-auditor can never hand a broad pattern + follower list to an auditor's reach.
+- Ownership transfer: owner → an existing editor or any internal user; old owner becomes
+  an editor. Reach changes with the owner — run a rematch of that series afterwards.
+
+### 11.2 Reach — what a series may match
+
+`reach(owner)`:
+- **auditor owner** → every live, non-scratch meeting (today's behaviour);
+- **anyone else** → the meetings the owner can OPEN: owns, or has any share on
+  (same rule as `resolveAccess`). Includes meetings shared to the owner by a follow —
+  safe, because what flows on to *followers* is limited separately (§11.4).
+
+Membership = meetings in the owner's reach whose facts match ANY pattern, minus that
+series' exclusions, plus manual members. **A meeting can be in several series**
+(drop `series_members.transcript_id UNIQUE`; PK (series_id, transcript_id)). There is
+no cross-series competition any more: delete `compareSeriesPrecedence`/"followed wins",
+and `pickSeries` becomes `matchingSeries` (all matches). `priority` stays only as a
+display/tie-break order (which series chip shows first; which auto-import series owns
+an occurrence in `auto-import-plan`).
+
+Reach is re-evaluated: on rematch (10-min backstop already exists), when a share to
+the owner is added/removed (call `syncSeriesForTranscript` from the share writers —
+cheap), on ownership transfer. A meeting that leaves the owner's reach leaves the
+series (auto members AND manual members — a manual member outside reach is dropped).
+
+### 11.3 Auditors move to the DB
+
+- Migration 054: `auditors (email text PK lower-cased, name text NOT NULL, added_at,
+  added_by_email)`, seeded alok@trames.sg / Alok Rajiv and ivan@trames.sg / Ivan Seow.
+- Server: `loadAuditors()` cached ~60 s (`src/db-ops/auditors.ts`); `isAuditor(email)`
+  async. `AUDITORS` constant and sync `isAuditorEmail` are DELETED — every caller
+  (auto-share's shareWithAuditors, series routes, share routes) uses the DB loader.
+  Client code gets `isAuditor` / permissions from the API (it never decides).
+- `scripts/auditor-backfill.sql` reads the table instead of a VALUES list.
+- No UI to edit the table (psql by Alok is fine for now); note it in the spec.
+
+### 11.4 Followers get only what the owner may share
+
+A follow share (origin `series-follow`, unchanged writer + ledger + never-re-add) is
+written for a member meeting only if the **owner** of the series is the meeting's owner
+or has `edit` access on it — the same right that lets a person share a meeting by hand
+(`canManageShares`). **Auditor-owned series: every member** (policy). Members the owner
+can only read are in the series (labels permitting, §11.5) but give followers nothing.
+Followers see that difference: series detail shows each member only if the caller can
+open it (unchanged), and the follower count/"you get N of M" is honest.
+
+Who can add followers: owner + editors (no auditor gate any more — the reach rule is the
+safety). Follower removes self: always. Deleting a series removes its follow shares
+(the owner's call — no ledger rows for that, it is not a human removal of one meeting).
+
+### 11.5 Default labels follow the same rule
+
+Labels are global per meeting and the labels API lets only owner/editors change them,
+so a series applies its default labels to a member only where its owner is the
+meeting's owner/editor — or the series is auditor-owned. (Same predicate as §11.4:
+write one `ownerMayActOn(series, transcript)` helper and use it for both.)
+
+### 11.6 Visibility everywhere a series shows up
+
+`canSeeSeries(caller, series)` = owner | editor | follower | auditor. Every route and
+every embedded series field is gated by it:
+- `GET /api/series` lists only those; `GET/PATCH/DELETE /api/series/:id`,
+  occurrences, occurrence-counts, members, followers, editors → **404** otherwise.
+- Listing (`db-ops/transcripts.ts` series_id/series_title columns, ~174 and ~600),
+  `GET /api/transcripts/:id/series`, the series badge, calendar chips
+  (`calendar/events`, `calendar-meetings`): show only series the CALLER can see —
+  first by priority, then id. Never name a series the caller cannot see. (This is the
+  caller-scoping gate — feedback_privacy_caller_scoping_gate.md — read it.)
+- `POST /api/series/preview`: counts within the CALLER's reach (auditor → all). No
+  separate auditor-only org-wide number; `matched` == count in caller's reach.
+  When editing an existing series, preview within the series OWNER's reach if the
+  caller is an editor (they are allowed to know what the series matches).
+- Manual attach: caller is owner/editor of the series AND the meeting is in the owner's
+  reach. Detach: series owner/editor, or the meeting's owner/editor (their meeting —
+  they may take it out of someone's series); `remember` → exclusion; a detach that
+  costs followers access is still ledgered as today.
+
+### 11.7 Auto-import
+
+Only the series owner/editors may turn it on (binds to the caller, as today); a
+follower cannot. Unchanged otherwise (own calendar, own token).
+
+### 11.8 Data model — migration `054_series_ownership.sql` (additive + one constraint)
+
+```sql
+ALTER TABLE series ADD COLUMN IF NOT EXISTS owner_user_id uuid;
+ALTER TABLE series ADD COLUMN IF NOT EXISTS owner_email text;      -- lower-cased
+UPDATE series SET owner_user_id = created_by, owner_email = <creator email> WHERE owner_email IS NULL;
+CREATE TABLE IF NOT EXISTS series_editors (
+  series_id int NOT NULL REFERENCES series(id) ON DELETE CASCADE,
+  email text NOT NULL, name text,
+  added_by_email text NOT NULL, added_at timestamptz NOT NULL DEFAULT now(),
+  PRIMARY KEY (series_id, email));
+ALTER TABLE series_members DROP CONSTRAINT IF EXISTS <transcript_id unique>;
+-- + PK/unique (series_id, transcript_id) if not already there
+CREATE TABLE IF NOT EXISTS auditors (...);   -- §11.3, seeded
+```
+(Builder: resolve the creator-email backfill from how created_by maps to an email in
+this codebase — there is no users table; if no reliable map exists, backfill
+owner_email = 'alok@trames.sg' for the 18 seeded series, which Alok created, and
+leave the ownership seed (§11.10) to set the rest.) Code must keep working before 054
+is applied (gate like `curatedSeriesReady`).
+
+### 11.9 What gets deleted
+
+`series-permissions.ts`'s v1 rules (rewrite it around §11.1 — still pure, still
+client-safe, takes {ownerEmail, ownerIsAuditor, editorEmails, followerEmails,
+callerEmail, callerIsAuditor}); "followed wins" precedence; auditor-only follower gate;
+auditor-only matched count; one-series-per-meeting assumptions (engine, listing,
+badge, `seriesForFacts` → all matches, `transcripts/:id/series` returns a list).
+
+### 11.10 Seed ownership (orchestrator, after deploy + 054)
+
+A small script `scripts/series-ownership-seed.ts --dry-run|--apply` sets owner, editors
+and followers for #66–#83 from a table Alok confirms, then `rematchAll()` and prints per
+series: members before → after, follow shares added/removed. Removing follow shares
+here is a policy change, not a person's removal — no ledger rows.
+
+### 11.11 UI + CLI
+
+- Series page/dialog: "Owner", "Editors", "Followers" sections with add/remove per the
+  role table; a reach note under patterns ("matches meetings <owner> can open" /
+  "auditor series — matches every meeting"); followers note "followers get the
+  meetings <owner> owns or edits"; transfer-ownership action for the owner.
+- CLI (`cli-subcommand-src/index.ts`, unpublished 955f903 verbs): add
+  `series editors add|rm <id> <email>`, `series transfer <id> <email>`; follow/unfollow
+  help text loses "auditors only"; `series <id>` prints owner/editors. README rows
+  updated. (CLI tests live in ../cli — do not touch ../cli; the orchestrator runs them.)
