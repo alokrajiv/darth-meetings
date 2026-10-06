@@ -11,6 +11,7 @@ import {
 } from '@/db-ops/transcripts';
 import { identityForUser, logActivity } from '@/db-ops/transcript-activity';
 import { relinkSharesToEvent, shareWithInternalInvitees } from '@/lib/server/auto-share';
+import { syncSeriesForTranscript } from '@/lib/server/curated-series';
 import { registerPeopleFromMeeting } from '@/lib/server/import-helpers';
 import { resolveLinkedEventRef } from '@/lib/server/linked-event-ref';
 import { getServerAccessToken } from '@/lib/server/google-oauth';
@@ -347,6 +348,11 @@ export const POST = withAuth(async ({ user, request }, { params }) => {
       ...(access.row.scratch ? { scratch: false } : {}),
     },
   });
+
+  // An event link changes the facts a curated series matches on (event
+  // title, invite, recurring) and may have made a temporary row permanent —
+  // re-decide its series now rather than at the next 10-minute sweep.
+  await syncSeriesForTranscript(access.row.id);
 
   // Speaker re-guess: a scratch upload's ID pass ran with no attendee hints.
   // Now that the audience is known, run it again — but only while nobody

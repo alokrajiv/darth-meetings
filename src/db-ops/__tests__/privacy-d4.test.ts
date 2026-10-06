@@ -1,7 +1,7 @@
 /**
  * Tech-debt D4 (privacy holes) at the db-ops layer, over the fake postgres
- * tag (helpers/fake-sql): what the label catalog, the series delete/merge
- * gate and the unimported listing's series_count actually emit / return for
+ * tag (helpers/fake-sql): what the label catalog and the unimported
+ * listing's series_count actually emit / return for
  * a LOW-INVOLVEMENT caller (jacqueline-style: sees one shared transcript,
  * organised nothing, created nothing).
  */
@@ -88,43 +88,10 @@ describe('D4 #1 — /api/labels catalog hides Series/* the caller holds nothing 
   });
 });
 
-describe('D4 #4 — series delete/merge need ownership, not visibility', () => {
-  test('a visible-but-uninvolved attendee is refused; organiser and creator pass', async () => {
-    const { seriesManageVerdictFor } = await import('@/db-ops/series');
-    respond = (q) =>
-      q.text.includes('organizerEmail')
-        ? [{ created_by: 'c478bf8e-1e50-4a0d-8841-db774fb3b2d2', organizers: ['swaralee@trames.sg'] }]
-        : [];
-    const v = await seriesManageVerdictFor(42, jac);
-    expect(v?.ok).toBe(false);
-    expect(await seriesManageVerdictFor(42, { userId: 'u', email: 'SWARALEE@trames.sg' })).toEqual({
-      ok: true,
-      via: 'organizer',
-    });
-    expect(
-      await seriesManageVerdictFor(42, { userId: 'c478bf8e-1e50-4a0d-8841-db774fb3b2d2', email: 'a@x' })
-    ).toEqual({ ok: true, via: 'creator' });
-    // Facts come from LIVE members only, keyed by the series id.
-    const q = sql.executed.at(-1)!;
-    expect(q.text).toContain('t.deleted_at IS NULL');
-    expect(q.text).toContain('WHERE s.id = $1');
-    expect(q.params[0]).toBe(42);
-  });
-
-  test('a series with no organiser-bearing member: creator only', async () => {
-    const { seriesManageVerdictFor } = await import('@/db-ops/series');
-    respond = (q) =>
-      q.text.includes('organizerEmail') ? [{ created_by: 'creator-1', organizers: null }] : [];
-    expect((await seriesManageVerdictFor(7, jac))?.ok).toBe(false);
-    expect((await seriesManageVerdictFor(7, { userId: 'creator-1', email: 'z@x' }))?.ok).toBe(true);
-  });
-
-  test('unknown series → null (route answers 404, not 403)', async () => {
-    const { seriesManageVerdictFor } = await import('@/db-ops/series');
-    respond = () => [];
-    expect(await seriesManageVerdictFor(999, jac)).toBeNull();
-  });
-});
+// D4 #4 (series delete/merge = organiser-or-creator) is superseded by the
+// curated-series rules (2026-10-06): merge is gone (410) and delete is
+// creator-or-auditor — src/lib/__tests__/series-permissions.test.ts and the
+// route tests in src/lib/server/__tests__/curated-series-privacy.test.ts.
 
 describe('D4 #3 — unimported rows: series_count only counts caller-involved occurrences', () => {
   test('the g2 subquery carries the same involvement arms as the outer row', async () => {

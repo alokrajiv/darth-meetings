@@ -3,11 +3,13 @@ import { addShare, listByTranscript } from '@/db-ops/transcript-shares';
 import { removeLinkBornSharesNotIn, SHARE_ORIGIN_EVENT_LINK } from '@/db-ops/share-origin';
 import { addAuditorShares } from '@/db-ops/auditor-shares';
 import { AUDITORS, externalParties } from '@/lib/auditor-policy';
+import { INTERNAL_DOMAINS } from '@/lib/internal-domains';
 
 // Internal domains: invitees on these are the people a meeting tied to a
 // calendar invite is shared with (and the domains share suggestions are
-// drawn from).
-export const AUTO_SHARE_DOMAINS = new Set(['trames.sg', 'trames-engineering.com']);
+// drawn from). The set itself lives in the pure lib/internal-domains (the
+// curated-series matcher needs it client-side too).
+export const AUTO_SHARE_DOMAINS = INTERNAL_DOMAINS;
 
 /**
  * Why a meeting is being shared with its invite's internal people. Both arms

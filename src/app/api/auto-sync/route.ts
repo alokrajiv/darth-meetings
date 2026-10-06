@@ -15,7 +15,7 @@ import {
 } from '@/db-ops/user-prefs';
 import { normalizeReportPref } from '@/lib/report-pref';
 import { getGoogleAccount } from '@/db-ops/google-accounts';
-import { listSeriesWithAutoImport, visibleSeriesIds } from '@/db-ops/series';
+import { listSeriesWithAutoImport, seriesWithCallerMembers } from '@/db-ops/series';
 
 export const runtime = 'nodejs';
 
@@ -30,11 +30,12 @@ export const GET = withAuth(async ({ user }) => {
     getGoogleAccount(user.userId),
     listAutoSyncActivityFor({ userId: user.userId, email: user.email }, 20),
     listSeriesWithAutoImport().catch(() => []),
-    visibleSeriesIds({ userId: user.userId, email: user.email }).catch(() => new Set<number>()),
+    seriesWithCallerMembers({ userId: user.userId, email: user.email }).catch(() => new Set<number>()),
   ]);
-  // Series the caller is in whose explicit setting OVERRIDES this switch for
-  // their occurrences (on → that enabler imports in the series' mode; off →
-  // nobody). Shown on the card so "why didn't auto-sync…" is answerable.
+  // Series the caller is in (holds a meeting of) whose explicit setting
+  // OVERRIDES this switch for their occurrences (on → that enabler imports
+  // in the series' mode; off → nobody). Shown on the card so "why didn't
+  // auto-sync…" is answerable.
   const overridingSeries = seriesWithCfg
     .filter((s) => visible.has(s.id) && s.auto_import)
     .map((s) => ({

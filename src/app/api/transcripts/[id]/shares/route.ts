@@ -5,8 +5,9 @@ import { dm, headlines, meetingLine, openLink } from '@/lib/server/dm-copy';
 import { resolveAccess } from '@/db-ops/transcript-access';
 import { sharingRefusal } from '@/lib/share-gate';
 import { identityForUser, logActivity, userIdForEmail } from '@/db-ops/transcript-activity';
-import { recordAuditorRemoval } from '@/db-ops/auditor-shares';
-import { isAuditorShare } from '@/lib/auditor-policy';
+import { recordAutoShareRemoval } from '@/db-ops/auditor-shares';
+import { isAuditorShare, isAutoReadShare, SHARE_ORIGIN_AUDITOR, SHARE_ORIGIN_SERIES_FOLLOW } from '@/lib/auditor-policy';
+import { getMembership } from '@/db-ops/series';
 import {
   addShare,
   listByTranscript,
@@ -44,12 +45,16 @@ export const GET = withAuth(async ({ user }, { params }) => {
   const access = await resolveAccess(user.userId, user.email, id);
   if (!access) return NextResponse.json({ error: 'Not found' }, { status: 404 });
 
-  const [shares, ownerIdentity] = await Promise.all([
+  const [shares, ownerIdentity, membership] = await Promise.all([
     listByTranscript(access.row.id),
     identityForUser(access.ownerUserId),
+    // The meeting's series names the "Following <series>" note on follow
+    // shares (series names are visible to everyone — spec §6).
+    getMembership(access.row.id).catch(() => null),
   ]);
   return NextResponse.json({
     shares,
+    series: membership ? { id: membership.series_id, title: membership.title } : null,
     owner: {
       email: ownerIdentity?.email ?? null,
       name: ownerIdentity?.name ?? null,
@@ -294,18 +299,22 @@ export const DELETE = withAuth(async ({ user, request }, { params }) => {
     return NextResponse.json({ error: 'Share not found' }, { status: 404 });
   }
 
-  // Removing an auditor is allowed — and recorded, so the auditors can see
-  // who took them off which meeting; the auto-add never puts them back
-  // (lib/auditor-policy.ts).
-  const auditor = !!before && isAuditorShare(before as { origin?: string | null });
-  if (auditor) {
-    await recordAuditorRemoval({
+  // Removing an auditor or a series follower is allowed — and recorded, so
+  // the auditors can see who took whom off which meeting; no automation ever
+  // puts that person back on this meeting (lib/auditor-policy.ts, the
+  // ledger guard in db-ops/auditor-shares.ts).
+  const beforeOrigin = before as { origin?: string | null } | undefined;
+  const automatic = !!beforeOrigin && isAutoReadShare(beforeOrigin);
+  const auditor = !!beforeOrigin && isAuditorShare(beforeOrigin);
+  if (automatic) {
+    await recordAutoShareRemoval({
       transcriptId: access.row.id,
-      auditorEmail: normalized,
+      email: normalized,
+      origin: auditor ? SHARE_ORIGIN_AUDITOR : SHARE_ORIGIN_SERIES_FOLLOW,
       removedByUserId: user.userId,
       removedByEmail: user.email,
       meetingTitle: access.row.title,
-    }).catch((err) => console.warn('[auditor-share] recording the removal failed:', err));
+    }).catch((err) => console.warn('[auto-share] recording the removal failed:', err));
   }
 
   void logActivity({
@@ -313,7 +322,11 @@ export const DELETE = withAuth(async ({ user, request }, { params }) => {
     userId: user.userId,
     email: user.email,
     action: 'share_remove',
-    details: { withEmail: normalized, ...(auditor ? { auditor: true } : {}) },
+    details: {
+      withEmail: normalized,
+      ...(auditor ? { auditor: true } : {}),
+      ...(automatic && !auditor ? { seriesFollow: true } : {}),
+    },
   });
 
   return NextResponse.json({ ok: true });

@@ -28,6 +28,10 @@ export async function register() {
     startIngestRetrySweeper();
     const { startMediaSweeper } = await import('@/lib/server/media-sweeper');
     startMediaSweeper();
+    // Curated series: re-match every meeting every 10 min (catches retitles
+    // and links no hook saw — docs/curated-series-spec.md §3).
+    const { startCuratedSeriesSweeper } = await import('@/lib/server/curated-series');
+    startCuratedSeriesSweeper();
   }
 }
 

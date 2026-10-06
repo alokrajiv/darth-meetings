@@ -26,6 +26,21 @@ export const AUDITORS: ReadonlyArray<{ email: string; name: string }> = [
 /** `transcript_shares.origin` of an auditor share (migration 048's column). */
 export const SHARE_ORIGIN_AUDITOR = 'auditor-external';
 
+/**
+ * `transcript_shares.origin` of a follow share (docs/curated-series-spec.md
+ * §5): a series follower's read share of a member meeting. The same kind of
+ * automatic read share as an auditor's — same writer, same removal ledger,
+ * same "never re-added once removed" rule.
+ */
+export const SHARE_ORIGIN_SERIES_FOLLOW = 'series-follow';
+
+/** Is this address an auditor? (They alone add/remove series followers and
+ * edit a followed series' patterns — following grants read access.) */
+export function isAuditorEmail(email: string | null | undefined): boolean {
+  const e = (email ?? '').trim().toLowerCase();
+  return !!e && AUDITORS.some((a) => a.email === e);
+}
+
 /** Personal mailboxes: an outside party ONLY on these does not count. */
 export const PERSONAL_MAIL_DOMAINS: ReadonlySet<string> = new Set([
   'gmail.com',
@@ -67,4 +82,14 @@ export function externalParties(
 
 export function isAuditorShare(share: { origin?: string | null }): boolean {
   return share.origin === SHARE_ORIGIN_AUDITOR;
+}
+
+export function isSeriesFollowShare(share: { origin?: string | null }): boolean {
+  return share.origin === SHARE_ORIGIN_SERIES_FOLLOW;
+}
+
+/** An automatic read share (auditor or follow): removing one is recorded in
+ * the ledger, and the automation never puts that person back. */
+export function isAutoReadShare(share: { origin?: string | null }): boolean {
+  return isAuditorShare(share) || isSeriesFollowShare(share);
 }

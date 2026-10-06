@@ -6,7 +6,7 @@ import {
 } from '@/db-ops/transcripts';
 import { autoNameSpeakers, registerPeopleFromMeeting } from '@/lib/server/import-helpers';
 import { shareWithInternalInvitees } from '@/lib/server/auto-share';
-import { autoAttachSeries } from '@/lib/server/series-attach';
+import { syncSeriesForTranscript } from '@/lib/server/curated-series';
 import { onTranscriptCompleted } from '@/lib/server/post-completion';
 import { queueRecordingGraphSync } from '@/lib/server/recording-sync';
 import { synthesizeTranscriptResponse, type ParsedMeetTranscript } from '@/lib/server/gmeet';
@@ -183,14 +183,8 @@ export async function ingestParsedUtterances(
     });
   }
 
-  await autoAttachSeries({
-    id: row.id,
-    assemblyai_id: row.assemblyai_id,
-    gmeet_context: row.gmeet_context,
-    title: row.title,
-    user_id: row.user_id,
-    scratch: row.scratch,
-  });
+  // Curated series: its patterns may claim the new meeting (never throws).
+  await syncSeriesForTranscript(row.id);
 
   return { row, autoShared };
 }

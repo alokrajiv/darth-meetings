@@ -1,7 +1,7 @@
 import { NextResponse } from 'next/server';
 import { withAuth } from '@/lib/auth/with-auth';
 import { sweepSeriesOccurrences, type SeriesOccurrence } from '@/lib/server/series-occurrences';
-import { seriesVisibleToCaller, getSeries } from '@/db-ops/series';
+import { seriesWithCallerMembers, getSeries } from '@/db-ops/series';
 import { listAutoSyncUsers } from '@/db-ops/user-prefs';
 import { interestedAutoSyncUsers } from '@/lib/server/auto-import-plan';
 import { strongestReport, type ReportPref } from '@/lib/auto-marker';
@@ -23,7 +23,7 @@ export const GET = withAuth(async ({ user, request }, { params }) => {
   }
   // PRIVACY GATE (2026-08-24): the sweep reads other users' transcript
   // titles, app-only Graph artifacts and global-cache rows for the series.
-  if (!(await seriesVisibleToCaller(id, { userId: user.userId, email: user.email }))) {
+  if (!(await seriesWithCallerMembers({ userId: user.userId, email: user.email })).has(id)) {
     return NextResponse.json({ error: 'Not found' }, { status: 404 });
   }
   const forceRefresh = new URL(request.url).searchParams.get('refresh') === '1';

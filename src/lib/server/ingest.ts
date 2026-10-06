@@ -20,7 +20,7 @@ import { getCurrentPayload as getOrgVocabPayload } from '@/db-ops/org-vocab';
 import { mergeVocabs } from '@/lib/server/vocab-merge';
 import { sniffMediaExtension } from '@/lib/server/video-frames';
 import { normalizeMultiTrack } from '@/lib/server/multitrack';
-import { autoAttachSeries } from '@/lib/server/series-attach';
+import { syncSeriesForTranscript } from '@/lib/server/curated-series';
 import { prepareMediaForPlayback } from '@/lib/server/media-sweeper';
 import { queueRecordingGraphSync } from '@/lib/server/recording-sync';
 import { mintedIdsEnabled } from '@/db-ops/aai-job-id';
@@ -280,22 +280,16 @@ export async function createOrPromoteRow(
 }
 
 /**
- * Attach the new row to its recurring series. Outside `createOrPromoteRow` so
- * that the local path's "a failure here must not delete the temp file"
- * ordering is exactly what it has always been.
+ * Put the new row in its curated series, if its patterns pick one
+ * (lib/server/curated-series). Outside `createOrPromoteRow` so that the local
+ * path's "a failure here must not delete the temp file" ordering is exactly
+ * what it has always been.
  *
- * Uses the ROW's context, not opts — promoted placeholder rows carry the
- * linked-event context stamped at upload start.
+ * The engine reads the ROW (by id), not opts — promoted placeholder rows
+ * carry the linked-event context stamped at upload start. Never throws.
  */
 export async function attachSeriesForRow(row: TranscriptRow): Promise<void> {
-  await autoAttachSeries({
-    id: row.id,
-    assemblyai_id: row.assemblyai_id,
-    gmeet_context: row.gmeet_context,
-    title: row.title,
-    user_id: row.user_id,
-    scratch: row.scratch,
-  });
+  await syncSeriesForTranscript(row.id);
 }
 
 export async function ingestLocalAudio(

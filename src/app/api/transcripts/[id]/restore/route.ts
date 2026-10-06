@@ -3,6 +3,7 @@ import { withAuth } from '@/lib/auth/with-auth';
 import { restoreForUser } from '@/db-ops/transcripts';
 import { queueRecordingGraphSync } from '@/lib/server/recording-sync';
 import { resolveAccess } from '@/db-ops/transcript-access';
+import { syncSeriesForTranscript } from '@/lib/server/curated-series';
 
 export const runtime = 'nodejs';
 
@@ -32,5 +33,8 @@ export const POST = withAuth(async ({ user }, { params }) => {
   // Trash keeps the clips (nothing was deleted), so this is only a heal: a
   // row trashed while MW_RECORDINGS_WRITE was off gets its graph here.
   queueRecordingGraphSync(access.ownerUserId, id, 'restore');
+  // Trash took it out of its (auto) series, with the series' labels and
+  // follow shares; back in the archive, it rejoins.
+  await syncSeriesForTranscript(access.row.id);
   return NextResponse.json({ ok: true });
 });

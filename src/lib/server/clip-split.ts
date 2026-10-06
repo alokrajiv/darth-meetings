@@ -60,7 +60,7 @@ import { removeRecordingGraphForMeeting } from '@/lib/server/recording-sync';
 import { resolveLinkedEventRef } from '@/lib/server/linked-event-ref';
 import { registerPeopleFromMeeting } from '@/lib/server/import-helpers';
 import { shareWithInternalInvitees } from '@/lib/server/auto-share';
-import { autoAttachSeries } from '@/lib/server/series-attach';
+import { syncSeriesForTranscript } from '@/lib/server/curated-series';
 import type { GmeetAttendee, GmeetContext, StoredTranscript } from '@/lib/format';
 
 /**
@@ -595,16 +595,9 @@ export async function splitMeeting(input: SplitInput): Promise<ClipOpResult<Spli
       by.userId
     );
   }
-  if (linked) {
-    await autoAttachSeries({
-      id: created.id,
-      assemblyai_id: newId,
-      gmeet_context: context,
-      title,
-      user_id: access.ownerUserId,
-      scratch,
-    });
-  }
+  // Curated series: the split-off meeting is judged on its own title and
+  // invite like any other (never throws; a temporary row joins nothing).
+  await syncSeriesForTranscript(created.id);
 
   void logActivity({
     transcriptId: created.id,

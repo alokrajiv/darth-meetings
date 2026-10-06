@@ -2,74 +2,88 @@ import { NextResponse } from 'next/server';
 import { normalizeReportPref, defaultReportPref } from '@/lib/report-pref';
 import { withAuth } from '@/lib/auth/with-auth';
 import {
-  deleteSeries,
-  findDuplicateSeries,
   getSeries,
-  listKeys,
   listMembers,
-  listSuggestedMembers,
-  seriesManageVerdictFor,
   setSeriesAutoImport,
   updateSeries,
-  visibleSeriesIds,
-  seriesVisibleToCaller,
   type SeriesAutoImportCfg,
 } from '@/db-ops/series';
+import { curatedSeriesReady, CURATED_SERIES_NOT_READY } from '@/db-ops/curated-series-schema';
+import { validatePatterns } from '@/lib/series-patterns';
+import {
+  SERIES_DELETE_DENIED,
+  SERIES_MATCHING_AUDITOR_ONLY,
+} from '@/lib/series-permissions';
+import { setSeriesLabels } from '@/lib/server/series-labels';
+import {
+  bustCuratedSeriesCache,
+  deleteSeriesFully,
+  onSeriesMatchingChanged,
+} from '@/lib/server/curated-series';
+import {
+  decorateSeries,
+  parseDescription,
+  parsePriority,
+  parseSeriesId,
+  parseTitle,
+  resolveLabelPaths,
+  SeriesInputError,
+} from '@/lib/server/series-api';
 
 export const runtime = 'nodejs';
-
-function parseId(raw: string): number | null {
-  const id = Number(raw);
-  return Number.isInteger(id) && id > 0 ? id : null;
-}
+// A patterns/priority edit re-matches every meeting.
+export const maxDuration = 120;
 
 /**
- * GET /api/series/:id — the series, its evidence keys, members (with
- * caller-visibility flags), suggested members awaiting confirmation, and
- * probable-duplicate sibling series (the one-click merge prompt).
+ * GET /api/series/:id — the series (everyone sees every series), its default
+ * labels, followers, what the caller may do, and its MEMBERS — only the
+ * meetings the caller owns or holds a share on (spec §6). Members the caller
+ * cannot open are not listed, not counted, not dated.
  */
 export const GET = withAuth(async ({ user }, { params }) => {
-  const id = parseId((await params).id);
+  const id = parseSeriesId((await params).id);
   if (!id) return NextResponse.json({ error: 'Bad id' }, { status: 400 });
   const caller = { userId: user.userId, email: user.email };
-  // PRIVACY GATE (2026-08-24): a series the caller isn't in must not exist
-  // for them — its title is a meeting title and its keys carry live Teams
-  // join URLs (the exact input /api/teams/import accepts).
-  const visible = await visibleSeriesIds(caller);
-  if (!visible.has(id)) return NextResponse.json({ error: 'Not found' }, { status: 404 });
   const series = await getSeries(id);
   if (!series) return NextResponse.json({ error: 'Not found' }, { status: 404 });
-
-  const [keys, members, suggestions, dupMap] = await Promise.all([
-    listKeys(id),
+  const ready = await curatedSeriesReady().catch(() => false);
+  const [members, deco] = await Promise.all([
     listMembers(id, caller),
-    listSuggestedMembers(id, caller),
-    findDuplicateSeries(),
+    ready ? decorateSeries([series], caller).then((m) => m.get(id) ?? null) : Promise.resolve(null),
   ]);
   return NextResponse.json({
+    ready,
     series,
-    keys,
+    labels: deco?.labels ?? [],
+    followers: deco?.followers ?? [],
+    permissions: deco?.permissions ?? null,
     members,
-    suggestions,
-    dupes: (dupMap.get(id) ?? []).filter((d) => visible.has(d.id)),
+    // Older darth-cli builds print these — the key bag, guesses and merge
+    // prompts are gone with the key-based series.
+    keys: [],
+    suggestions: [],
+    dupes: [],
   });
 });
 
 const AUTO_MODES = ['transcript', 'video', 'both'] as const;
 
-/** PATCH /api/series/:id — rename / edit notes / configure auto-import. */
+/**
+ * PATCH /api/series/:id — edit the definition:
+ *   { title?, description?, notes?, patterns?, priority?, labels?: string[],
+ *     autoImport?: { enabled, mode?, report? } }
+ * Anyone may edit name, description, labels and auto-import. Patterns and
+ * priority decide who belongs — and so, on a followed series, who the
+ * followers get — so on a series WITH followers only an auditor may change
+ * them (403). A patterns/priority change re-matches every meeting.
+ */
 export const PATCH = withAuth(async ({ user, request }, { params }) => {
-  const id = parseId((await params).id);
+  const id = parseSeriesId((await params).id);
   if (!id) return NextResponse.json({ error: 'Bad id' }, { status: 400 });
-  if (!(await seriesVisibleToCaller(id, { userId: user.userId, email: user.email }))) {
-    return NextResponse.json({ error: 'Not found' }, { status: 404 });
-  }
   const series = await getSeries(id);
   if (!series) return NextResponse.json({ error: 'Not found' }, { status: 404 });
 
-  let body: {
-    title?: string;
-    notes?: string | null;
+  let body: Record<string, unknown> & {
     autoImport?: {
       enabled: boolean;
       mode?: SeriesAutoImportCfg['mode'];
@@ -81,61 +95,121 @@ export const PATCH = withAuth(async ({ user, request }, { params }) => {
   } catch {
     return NextResponse.json({ error: 'Invalid JSON body' }, { status: 400 });
   }
-  const title = body.title?.trim();
-  if (body.title !== undefined && !title) {
-    return NextResponse.json({ error: 'title cannot be empty' }, { status: 400 });
-  }
-  if (body.title !== undefined || body.notes !== undefined) {
-    await updateSeries(id, { title, notes: body.notes }, user.userId);
+  const caller = { userId: user.userId, email: user.email };
+
+  const touchesDefinition =
+    body.description !== undefined ||
+    body.patterns !== undefined ||
+    body.priority !== undefined ||
+    body.labels !== undefined;
+  if (touchesDefinition && !(await curatedSeriesReady())) {
+    return NextResponse.json({ error: CURATED_SERIES_NOT_READY }, { status: 503 });
   }
 
+  // ---- validate everything before writing anything ----------------------
+  const patch: Parameters<typeof updateSeries>[1] = {};
+  let labelPaths: unknown = undefined;
+  try {
+    if (body.title !== undefined) patch.title = parseTitle(body.title);
+    if (body.description !== undefined) patch.description = parseDescription(body.description);
+    if (body.notes !== undefined) {
+      if (body.notes !== null && typeof body.notes !== 'string') throw new SeriesInputError('notes must be text');
+      patch.notes = (body.notes as string | null) ?? null;
+    }
+    if (body.priority !== undefined) patch.priority = parsePriority(body.priority);
+    if (body.labels !== undefined) labelPaths = body.labels;
+  } catch (err) {
+    if (err instanceof SeriesInputError) return NextResponse.json({ error: err.message }, { status: 400 });
+    throw err;
+  }
+  if (body.patterns !== undefined) {
+    const v = validatePatterns(body.patterns);
+    if (!v.ok) return NextResponse.json({ error: v.error }, { status: 400 });
+    patch.patterns = v.patterns;
+  }
+  const changesMatching =
+    (patch.patterns !== undefined && JSON.stringify(patch.patterns) !== JSON.stringify(series.patterns)) ||
+    (patch.priority !== undefined && patch.priority !== series.priority);
+  if (changesMatching) {
+    // PRIVACY GATE (spec §6): widening a followed series' patterns would
+    // pull more meetings to its followers.
+    const deco = (await decorateSeries([series], caller)).get(id);
+    if (!deco?.permissions.editMatching) {
+      return NextResponse.json({ error: SERIES_MATCHING_AUDITOR_ONLY }, { status: 403 });
+    }
+  }
+
+  let ai: SeriesAutoImportCfg | null = null;
   if (body.autoImport !== undefined) {
-    const ai = body.autoImport;
-    if (typeof ai?.enabled !== 'boolean') {
+    const req = body.autoImport;
+    if (typeof req?.enabled !== 'boolean') {
       return NextResponse.json({ error: 'autoImport.enabled must be a boolean' }, { status: 400 });
     }
-    const mode = ai.mode ?? series.auto_import?.mode ?? 'both';
+    const mode = req.mode ?? series.auto_import?.mode ?? 'both';
     // Legacy 'summary' (old darth-cli, a series configured before
     // 2026-09-21) reads as the detailed default — summary-only is gone.
     const report =
-      normalizeReportPref(ai.report ?? series.auto_import?.report) ?? defaultReportPref(true);
-    if (!AUTO_MODES.includes(mode) || (ai.report !== undefined && !normalizeReportPref(ai.report))) {
+      normalizeReportPref(req.report ?? series.auto_import?.report) ?? defaultReportPref(true);
+    if (!AUTO_MODES.includes(mode) || (req.report !== undefined && !normalizeReportPref(req.report))) {
       return NextResponse.json({ error: 'Invalid autoImport mode/report' }, { status: 400 });
     }
     // Enabling (re)binds the sweep to the CALLER — their Google connection
     // does the imports and they own + get DMs for the resulting rows. The
     // watch window starts at first enablement and survives re-toggles (the
     // fire-once log prevents duplicates regardless).
-    const cfg: SeriesAutoImportCfg = {
-      enabled: ai.enabled,
-      byUserId: ai.enabled ? user.userId : (series.auto_import?.byUserId ?? user.userId),
-      byEmail: ai.enabled ? user.email : (series.auto_import?.byEmail ?? user.email),
+    ai = {
+      enabled: req.enabled,
+      byUserId: req.enabled ? user.userId : (series.auto_import?.byUserId ?? user.userId),
+      byEmail: req.enabled ? user.email : (series.auto_import?.byEmail ?? user.email),
       mode,
       report,
       since: series.auto_import?.since ?? new Date().toISOString(),
       lastSweepAt: series.auto_import?.lastSweepAt,
       lastError: null,
     };
-    await setSeriesAutoImport(id, cfg);
-    return NextResponse.json({ ok: true, autoImport: cfg });
   }
-  return NextResponse.json({ ok: true });
+
+  let labelIds: number[] | null = null;
+  if (labelPaths !== undefined) {
+    try {
+      labelIds = await resolveLabelPaths(labelPaths, caller);
+    } catch (err) {
+      if (err instanceof SeriesInputError) return NextResponse.json({ error: err.message }, { status: 400 });
+      throw err;
+    }
+  }
+
+  // ---- write -------------------------------------------------------------
+  if (Object.keys(patch).length > 0) {
+    await updateSeries(id, patch);
+    bustCuratedSeriesCache();
+  }
+  if (labelIds) await setSeriesLabels(id, labelIds, caller);
+  if (ai) await setSeriesAutoImport(id, ai);
+  if (changesMatching) await onSeriesMatchingChanged(id, 'patterns/priority edited');
+  return NextResponse.json({ ok: true, ...(ai ? { autoImport: ai } : {}) });
 });
 
-/** DELETE /api/series/:id — remove the series (members detach, transcripts
- * are untouched). OWNERSHIP GATE (tech-debt D4, 2026-09-18): after the
- * visibility 404, only the organiser of an attached occurrence or the
- * series' creator may delete (lib/series-owner) — 403 otherwise. */
+/**
+ * DELETE /api/series/:id — remove the series: its labels and follow shares
+ * come off every member, the members are freed (and re-matched — another
+ * series may now win them); the meetings themselves are untouched. Only the
+ * series' creator or an auditor may delete it (403 otherwise).
+ */
 export const DELETE = withAuth(async ({ user }, { params }) => {
-  const id = parseId((await params).id);
+  const id = parseSeriesId((await params).id);
   if (!id) return NextResponse.json({ error: 'Bad id' }, { status: 400 });
   const caller = { userId: user.userId, email: user.email };
-  if (!(await seriesVisibleToCaller(id, caller))) {
-    return NextResponse.json({ error: 'Not found' }, { status: 404 });
+  const series = await getSeries(id);
+  if (!series) return NextResponse.json({ error: 'Not found' }, { status: 404 });
+  if (!(await curatedSeriesReady())) {
+    return NextResponse.json({ error: CURATED_SERIES_NOT_READY }, { status: 503 });
   }
-  const verdict = await seriesManageVerdictFor(id, caller);
-  if (!verdict) return NextResponse.json({ error: 'Not found' }, { status: 404 });
-  if (!verdict.ok) return NextResponse.json({ error: verdict.reason }, { status: 403 });
-  await deleteSeries(id);
+  const deco = (await decorateSeries([series], caller)).get(id);
+  if (!deco?.permissions.delete) {
+    return NextResponse.json({ error: SERIES_DELETE_DENIED }, { status: 403 });
+  }
+  await deleteSeriesFully(id);
+  console.log(`[series] deleted #${id} "${series.title}" by ${user.email}`);
   return NextResponse.json({ ok: true });
 });

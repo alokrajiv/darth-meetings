@@ -136,8 +136,8 @@ export async function listForUser(userId: string): Promise<TranscriptRow[]> {
  *
  * Temporary (scratch, migration 042) rows are excluded by default; `opts.scratch`
  * flips the query to serve ONLY the caller's visible scratch rows (the
- * legacy-shape `?scratch=1` view) — same visibility, no suspected-series
- * hint (scratch rows never get sibling hints).
+ * legacy-shape `?scratch=1` view) — same visibility. suspected_series_* is
+ * always NULL (curated series have no "suspected" state).
  */
 export async function listVisibleToUser(
   userId: string,
@@ -172,7 +172,10 @@ export async function listVisibleToUser(
                     t.gmeet_context->'ingestFailure'->>'message') AS deferred_error,
            t.gmeet_context->'deferredImport'->>'background' AS deferred_background,
            sm.series_id, se.title AS series_title,
-           sus.series_id AS suspected_series_id, sus.title AS suspected_series_title,
+           -- Curated series (2026-10-06) have no "suspected" state: a pattern
+           -- match IS membership, so "matches but not a member" can only mean
+           -- excluded. The columns stay NULL so the API shape is stable.
+           NULL::int AS suspected_series_id, NULL::text AS suspected_series_title,
            CASE
              WHEN t.user_id = ${userId} THEN 'owner'
              ELSE s.access
@@ -183,43 +186,6 @@ export async function listVisibleToUser(
       AND s.shared_with_email = ${normEmail}
     LEFT JOIN ${sql(SCHEMA)}.series_members sm ON sm.transcript_id = t.id
     LEFT JOIN ${sql(SCHEMA)}.series se ON se.id = sm.series_id
-    -- Suspected series for untagged rows: any evidence-key match that hasn't
-    -- been excluded — surfaced as a dashed "…?" chip the user confirms/denies.
-    -- The row's normalized values are computed ONCE in a MATERIALIZED CTE:
-    -- without the fence the planner inlines them into the key predicates and
-    -- re-runs the regexps for every (row × key) pair — measured 194ms vs
-    -- 33ms for this whole listing query at 184 rows × 60 keys (2026-08-19).
-    LEFT JOIN LATERAL (
-      WITH norm AS MATERIALIZED (
-        SELECT
-          t.gmeet_context->>'meetingCode' AS meeting_code,
-          regexp_replace(COALESCE(t.gmeet_context->>'recurringEventId',''), '_R\\d{8}T\\d{6}Z?$', '') AS recurring_base,
-          regexp_replace(regexp_replace(COALESCE(t.gmeet_context->>'iCalUID',''), '@google\\.com$', ''), '_R\\d{8}T\\d{6}Z?$', '') AS ical_base,
-          t.gmeet_context->'teams'->>'joinWebUrl' AS teams_join_url,
-          t.gmeet_context->'teams'->>'graphMeetingId' AS graph_meeting_id,
-          btrim(lower(regexp_replace(
-            regexp_replace(COALESCE(NULLIF(t.gmeet_context->>'eventTitle',''), t.title, ''),
-                           '\\d{1,4}[/.-]\\d{1,2}[/.-]\\d{1,4}', ' ', 'g'),
-            '[^a-zA-Z0-9]+', ' ', 'g'))) AS norm_title
-      )
-      SELECT k.series_id, se2.title
-      FROM norm
-      JOIN ${sql(SCHEMA)}.series_keys k ON (
-        (k.kind = 'meeting-code' AND norm.meeting_code = k.value) OR
-        (k.kind = 'recurring-base-id' AND norm.recurring_base = k.value) OR
-        (k.kind = 'ical-uid-base' AND norm.ical_base = k.value) OR
-        (k.kind = 'teams-join-url' AND norm.teams_join_url = k.value) OR
-        (k.kind = 'graph-meeting-id' AND norm.graph_meeting_id = k.value) OR
-        (k.kind = 'normalized-title' AND norm.norm_title = k.value)
-      )
-      JOIN ${sql(SCHEMA)}.series se2 ON se2.id = k.series_id
-      WHERE NOT EXISTS (
-              SELECT 1 FROM ${sql(SCHEMA)}.series_exclusions x
-              WHERE x.series_id = k.series_id AND x.transcript_id = t.id
-            )
-      ORDER BY k.series_id
-      LIMIT 1
-    ) sus ON ${scratchOnly ? sql`false` : sql`sm.id IS NULL`}
     WHERE (t.user_id = ${userId} OR s.id IS NOT NULL)
       AND t.deleted_at IS NULL
       AND ${scratchOnly ? sql`t.scratch` : sql`NOT t.scratch`}
@@ -402,8 +368,8 @@ type PagedRawRow = Omit<TranscriptListRow, 'access' | 'owner_email' | 'owner_nam
 /**
  * Day-bucketed page of the listing (GET /api/transcripts?v=2). Same
  * visibility, skinny column set, and computed columns as listVisibleToUser
- * (incl. the MATERIALIZED suspected-series fence — applied only to the
- * page's rows here), but:
+ * (series membership joined for the page's rows only; suspected_series_*
+ * is always NULL since curated series, 2026-10-06), but:
  *  - sort key everywhere is COALESCE(recorded_at, created_at) DESC, id DESC;
  *  - rows are bucketed by that key's date in the caller's timezone and pages
  *    NEVER split a day: whole days are added until `minRows` rows or `days`
@@ -414,8 +380,8 @@ type PagedRawRow = Omit<TranscriptListRow, 'access' | 'owner_email' | 'owner_nam
  *  - tab=trash serves the caller's own soft-deleted rows (owner-only, no
  *    series joins) with the same bucketing;
  *  - tab=scratch serves the caller's visible temporary rows (owned + shared,
- *    migration 042) — same bucketing, series membership shown, no
- *    suspected-series hint. Every other tab excludes scratch rows.
+ *    migration 042) — same bucketing, series membership shown. Every other
+ *    tab excludes scratch rows.
  */
 export async function listPagedForUser(
   userId: string,
@@ -631,11 +597,8 @@ export async function listPagedForUser(
              isTrash
                ? sql`NULL::int AS series_id, NULL::text AS series_title,
                      NULL::int AS suspected_series_id, NULL::text AS suspected_series_title,`
-               : isScratch
-                 ? sql`sm.series_id, se.title AS series_title,
-                       NULL::int AS suspected_series_id, NULL::text AS suspected_series_title,`
-                 : sql`sm.series_id, se.title AS series_title,
-                       sus.series_id AS suspected_series_id, sus.title AS suspected_series_title,`
+               : sql`sm.series_id, se.title AS series_title,
+                     NULL::int AS suspected_series_id, NULL::text AS suspected_series_title,`
            }
            (SELECT count(*)::int FROM day_counts) AS __total_days,
            (SELECT count(*)::int FROM page_days) AS __page_days
@@ -653,48 +616,9 @@ export async function listPagedForUser(
     ${
       isTrash
         ? sql``
-        : isScratch
-          ? sql`
+        : sql`
           LEFT JOIN ${sql(SCHEMA)}.series_members sm ON sm.transcript_id = b.id
           LEFT JOIN ${sql(SCHEMA)}.series se ON se.id = sm.series_id`
-          : sql`
-          LEFT JOIN ${sql(SCHEMA)}.series_members sm ON sm.transcript_id = b.id
-          LEFT JOIN ${sql(SCHEMA)}.series se ON se.id = sm.series_id
-          -- Same suspected-series lookup as listVisibleToUser, applied only to
-          -- the page's rows. The MATERIALIZED fence is load-bearing (see the
-          -- perf note there): without it the planner re-runs the regexps for
-          -- every (row × key) pair.
-          LEFT JOIN LATERAL (
-            WITH norm AS MATERIALIZED (
-              SELECT
-                t.gmeet_context->>'meetingCode' AS meeting_code,
-                regexp_replace(COALESCE(t.gmeet_context->>'recurringEventId',''), '_R\\d{8}T\\d{6}Z?$', '') AS recurring_base,
-                regexp_replace(regexp_replace(COALESCE(t.gmeet_context->>'iCalUID',''), '@google\\.com$', ''), '_R\\d{8}T\\d{6}Z?$', '') AS ical_base,
-                t.gmeet_context->'teams'->>'joinWebUrl' AS teams_join_url,
-                t.gmeet_context->'teams'->>'graphMeetingId' AS graph_meeting_id,
-                btrim(lower(regexp_replace(
-                  regexp_replace(COALESCE(NULLIF(t.gmeet_context->>'eventTitle',''), t.title, ''),
-                                 '\\d{1,4}[/.-]\\d{1,2}[/.-]\\d{1,4}', ' ', 'g'),
-                  '[^a-zA-Z0-9]+', ' ', 'g'))) AS norm_title
-            )
-            SELECT k.series_id, se2.title
-            FROM norm
-            JOIN ${sql(SCHEMA)}.series_keys k ON (
-              (k.kind = 'meeting-code' AND norm.meeting_code = k.value) OR
-              (k.kind = 'recurring-base-id' AND norm.recurring_base = k.value) OR
-              (k.kind = 'ical-uid-base' AND norm.ical_base = k.value) OR
-              (k.kind = 'teams-join-url' AND norm.teams_join_url = k.value) OR
-              (k.kind = 'graph-meeting-id' AND norm.graph_meeting_id = k.value) OR
-              (k.kind = 'normalized-title' AND norm.norm_title = k.value)
-            )
-            JOIN ${sql(SCHEMA)}.series se2 ON se2.id = k.series_id
-            WHERE NOT EXISTS (
-                    SELECT 1 FROM ${sql(SCHEMA)}.series_exclusions x
-                    WHERE x.series_id = k.series_id AND x.transcript_id = b.id
-                  )
-            ORDER BY k.series_id
-            LIMIT 1
-          ) sus ON sm.id IS NULL`
     }
     ORDER BY b.sort_key DESC, b.id DESC
   `;

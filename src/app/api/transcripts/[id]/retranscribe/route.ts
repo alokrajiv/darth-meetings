@@ -6,7 +6,7 @@ import { resolveAccess, type ResolvedAccess } from '@/db-ops/transcript-access';
 import { mergeGmeetContextForUser } from '@/db-ops/transcripts';
 import { addShare, listByTranscript } from '@/db-ops/transcript-shares';
 import { SHARE_ORIGIN_EVENT_LINK } from '@/db-ops/share-origin';
-import { SHARE_ORIGIN_AUDITOR } from '@/lib/auditor-policy';
+import { SHARE_ORIGIN_AUDITOR, SHARE_ORIGIN_SERIES_FOLLOW } from '@/lib/auditor-policy';
 import { DEFAULT_SPEECH_MODEL, LEGACY_SPEECH_MODEL, type SpeechModel } from '@/lib/aai-language';
 import { resolveAudioPath } from '@/lib/server/audio-storage';
 import { ensureLocalMedia } from '@/lib/server/media-local';
@@ -272,7 +272,8 @@ async function legacyRetranscribeHeld(
 
 /** Copy one meeting's shares onto its re-run (same owner, same access; a
  * link-born share stays link-born so "Unlink from event" still takes it, an
- * auditor share stays an auditor share). */
+ * auditor share stays an auditor share, a series follower's stays a follow
+ * share — so leaving the series still takes it back). */
 async function carryShares(fromId: number, toId: number, ownerUserId: string): Promise<void> {
   const shares = await listByTranscript(fromId);
   for (const s of shares) {
@@ -285,7 +286,11 @@ async function carryShares(fromId: number, toId: number, ownerUserId: string): P
       sharedWithName: s.shared_with_name,
       sharedWithPplId: s.shared_with_ppl_id,
       access: s.access,
-      ...(origin === SHARE_ORIGIN_EVENT_LINK || origin === SHARE_ORIGIN_AUDITOR ? { origin } : {}),
+      ...(origin === SHARE_ORIGIN_EVENT_LINK ||
+      origin === SHARE_ORIGIN_AUDITOR ||
+      origin === SHARE_ORIGIN_SERIES_FOLLOW
+        ? { origin }
+        : {}),
     });
   }
 }

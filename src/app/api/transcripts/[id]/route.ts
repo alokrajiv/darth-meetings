@@ -1,6 +1,7 @@
 import type { GmeetContext } from '@/lib/format';
 import { NextResponse } from 'next/server';
 import { withAuth } from '@/lib/auth/with-auth';
+import { syncSeriesForTranscript } from '@/lib/server/curated-series';
 import {
   deleteForUser,
   getForUser,
@@ -223,6 +224,8 @@ export const PATCH = withAuth(async ({ user, request }, { params }) => {
         sharesRemoved: sharesRemoved.length,
       },
     });
+    // The event's title/invite were what a curated series may have matched.
+    await syncSeriesForTranscript(access.row.id);
     const after = await getForUser(access.ownerUserId, id);
     return NextResponse.json({
       transcript: after
@@ -254,6 +257,12 @@ export const PATCH = withAuth(async ({ user, request }, { params }) => {
     title: typeof title === 'string' ? title : undefined,
     description: typeof description === 'string' ? description : undefined,
   });
+
+  // A retitle or a temporary↔permanent flip can change the curated series
+  // (title patterns; temporary rows join none) — re-decide now.
+  if (typeof title === 'string' || typeof scratch === 'boolean') {
+    await syncSeriesForTranscript(access.row.id);
+  }
 
   void logActivity({
     transcriptId: access.row.id,
@@ -307,6 +316,9 @@ export const DELETE = withAuth(async ({ user, request }, { params }) => {
     new URL(request.url).searchParams.get('permanent') === '1';
   if (!permanent) {
     await softDeleteForUser(access.ownerUserId, id);
+    // Out of the archive → out of its auto series (with the series' labels
+    // and follow shares); restore puts it back.
+    await syncSeriesForTranscript(access.row.id);
     return NextResponse.json({ ok: true, trashed: true });
   }
 
