@@ -46,7 +46,9 @@ export function AutoProvenance({
             {m.seriesTitle ?? `#${m.seriesId}`}
           </button>
         ) : (
-          <span>{m.seriesTitle ?? `#${m.seriesId}`}</span>
+          // seriesId 0 = a series the viewer cannot see (the server redacts
+          // its name — curated series v2 §11.6).
+          <span>{m.seriesTitle ?? (m.seriesId ? `#${m.seriesId}` : '(one you can’t see)')}</span>
         )}
       </>
     ) : (

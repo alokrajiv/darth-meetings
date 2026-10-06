@@ -30,9 +30,10 @@ import { describePattern, type SeriesPattern } from '@/lib/series-patterns';
 import { LISTING_MAX_CONTENT_PX } from '@/lib/listing-layout';
 
 /**
- * The series index (curated series, docs/curated-series-spec.md): every
- * series — everyone sees every series — with its description, patterns,
- * default labels, followers and the number of its meetings YOU can open.
+ * The series index (curated series v2, docs/curated-series-spec.md §11): the
+ * series YOU may see — the ones you own, edit or follow (an auditor: all) —
+ * with owner, description, patterns, default labels, followers and the
+ * number of its meetings YOU can open.
  * Row click opens the SeriesDialog (definition edit, followers, auto-import,
  * occurrences); "New series" opens the definition form.
  */
@@ -50,10 +51,12 @@ interface SeriesIndexEntry {
   auto_enabled: boolean;
   labels: Array<{ id: number; path: string; color: string | null }>;
   followers: Array<{ email: string; name: string | null }>;
+  owner?: { email: string | null; name: string | null; isAuditor: boolean };
+  permissions?: { role: 'owner' | 'editor' | 'follower' | 'auditor' | null } | null;
 }
 
 interface SeriesIndexResponse {
-  /** false until migration 053 is applied — no creating/editing yet. */
+  /** false until migrations 053/054 are applied — no series yet. */
   ready: boolean;
   series: SeriesIndexEntry[];
   totals: { memberships: number; unattached: number };
@@ -133,7 +136,7 @@ export default function SeriesIndexPage() {
           size="sm"
           onClick={() => setCreating(true)}
           disabled={data !== null && !data.ready}
-          title={data && !data.ready ? 'Curated series are not switched on yet (migration 053)' : undefined}
+          title={data && !data.ready ? 'Series are not switched on yet (migrations 053/054)' : undefined}
         >
           <Plus className="h-4 w-4" />
           New series
@@ -187,6 +190,11 @@ export default function SeriesIndexPage() {
                           <div className="flex min-w-0 items-center gap-2">
                             <Repeat className="h-3.5 w-3.5 shrink-0 text-primary/70" />
                             <span className="min-w-0 truncate text-sm font-medium">{s.title}</span>
+                            {s.permissions?.role && s.permissions.role !== 'owner' && (
+                              <span className="shrink-0 rounded border px-1 text-[10px] text-muted-foreground">
+                                {s.permissions.role === 'auditor' ? 'oversight' : s.permissions.role}
+                              </span>
+                            )}
                             {s.auto_enabled && (
                               <span
                                 title="Auto-import is on — new occurrences import themselves"
@@ -199,6 +207,12 @@ export default function SeriesIndexPage() {
                           {s.description && (
                             <p className="mt-0.5 line-clamp-2 pl-5.5 text-xs text-muted-foreground">
                               {s.description}
+                            </p>
+                          )}
+                          {s.owner && (
+                            <p className="mt-0.5 pl-5.5 text-[11px] text-muted-foreground" title={s.owner.email ?? undefined}>
+                              owner {s.owner.name || s.owner.email || 'unknown'}
+                              {s.owner.isAuditor ? ' · auditor series (every meeting)' : ''}
                             </p>
                           )}
                         </TableCell>
@@ -266,8 +280,9 @@ export default function SeriesIndexPage() {
               <Repeat className="h-4 w-4 text-primary" /> New series
             </DialogTitle>
             <DialogDescription>
-              Every meeting matching a pattern joins the series and gets its default labels.
-              Followers are added by an auditor afterwards.
+              You own the series. It matches only the meetings you can open; its default labels
+              and its followers’ read shares go on the ones you own or edit. Add editors and
+              followers afterwards. Only you, its editors, its followers and the auditors see it.
             </DialogDescription>
           </DialogHeader>
           {creating && (

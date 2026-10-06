@@ -5,7 +5,10 @@ import { Repeat, Plus, X, Loader2 } from 'lucide-react';
 import { isNetworkFailure, NETWORK_ERROR_MESSAGE } from '@/lib/fetch-errors';
 
 /**
- * The series badge (curated series, docs/curated-series-spec.md).
+ * The series badge (curated series, docs/curated-series-spec.md; v2 §11).
+ * One badge per series the meeting is in that the viewer may see (the
+ * server never names any other) — the transcript page renders one per
+ * membership plus one "Add to series" ghost.
  *
  * With a membership: a clickable chip (opens the series dialog via
  * onOpenSeries); on the transcript page (`variant='full'`) an owner or
@@ -26,6 +29,8 @@ interface SeriesListEntry {
   id: number;
   title: string;
   description: string | null;
+  /** Server-decided (v2): only the owner/editors of a series add to it. */
+  permissions?: { edit?: boolean } | null;
 }
 
 interface SeriesBadgeProps {
@@ -118,7 +123,10 @@ export function SeriesBadge({
         if (!r.ok) throw new Error(`Could not load series (${r.status})`);
         return r.json();
       })
-      .then((d) => setAllSeries(d?.series ?? []))
+      // Only series the viewer owns or edits can take a meeting by hand.
+      .then((d) =>
+        setAllSeries(((d?.series ?? []) as SeriesListEntry[]).filter((s) => s.permissions?.edit))
+      )
       .catch((err) => {
         setAllSeries([]);
         setError(isNetworkFailure(err) ? NETWORK_ERROR_MESSAGE : 'Could not update the series');

@@ -336,8 +336,10 @@ function TranscriptDetailInner({ transcriptId }: { transcriptId: string }) {
   const [savingMeta, setSavingMeta] = useState(false);
 
   // --- recurring-call series (the badge in the meta row) ---
-  const [seriesMembership, setSeriesMembership] = useState<
-    { series_id: number; title: string } | null | 'loading'
+  // Every series the meeting is in that the viewer may see (v2: a meeting
+  // can be in several; the server never names one the viewer cannot see).
+  const [seriesMemberships, setSeriesMemberships] = useState<
+    Array<{ series_id: number; title: string }> | 'loading'
   >('loading');
   // Owner or editor: may change the meeting's series ("Not this series").
   const [seriesCanEdit, setSeriesCanEdit] = useState(false);
@@ -346,10 +348,12 @@ function TranscriptDetailInner({ transcriptId }: { transcriptId: string }) {
     fetch(`/api/transcripts/${transcriptId}/series`)
       .then((r) => (r.ok ? r.json() : null))
       .then((d) => {
-        setSeriesMembership(d?.membership ?? null);
+        setSeriesMemberships(
+          Array.isArray(d?.memberships) ? d.memberships : d?.membership ? [d.membership] : []
+        );
         setSeriesCanEdit(d?.canEdit === true);
       })
-      .catch(() => setSeriesMembership(null));
+      .catch(() => setSeriesMemberships([]));
   }, [transcriptId]);
   useEffect(() => {
     loadSeriesInfo();
@@ -3081,10 +3085,23 @@ function TranscriptDetailInner({ transcriptId }: { transcriptId: string }) {
               generated={row.auto_notes_status === 'completed' || row.auto_report_status === 'completed'}
               onOpenSeries={setOpenSeriesId}
             />
-            {seriesMembership !== 'loading' && (
+            {seriesMemberships !== 'loading' &&
+              seriesMemberships.map((m) => (
+                <SeriesBadge
+                  key={m.series_id}
+                  assemblyaiId={transcriptId}
+                  membership={m}
+                  canEdit={seriesCanEdit}
+                  defaultTitle={title.trim() || row.original_filename}
+                  onOpenSeries={setOpenSeriesId}
+                  onChanged={loadSeriesInfo}
+                  variant="full"
+                />
+              ))}
+            {seriesMemberships !== 'loading' && (
               <SeriesBadge
                 assemblyaiId={transcriptId}
-                membership={seriesMembership}
+                membership={null}
                 canEdit={seriesCanEdit}
                 defaultTitle={title.trim() || row.original_filename}
                 onOpenSeries={setOpenSeriesId}

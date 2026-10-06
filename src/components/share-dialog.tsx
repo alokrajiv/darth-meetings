@@ -41,9 +41,11 @@ export function ShareDialog({
 }: ShareDialogProps) {
   const [shares, setShares] = useState<TranscriptShare[]>([]);
   const [owner, setOwner] = useState<{ email: string | null; name: string | null } | null>(null);
-  // The meeting's curated series — names the "Following <series>" note on
-  // follow shares (origin 'series-follow').
+  // The meeting's curated series the VIEWER may see — names the "Following
+  // <series>" note on follow shares (origin 'series-follow'). A meeting can
+  // be in several series (v2); one the viewer cannot see is never named.
   const [series, setSeries] = useState<{ id: number; title: string } | null>(null);
+  const [seriesList, setSeriesList] = useState<Array<{ id: number; title: string }>>([]);
   const [loading, setLoading] = useState(false);
   const [pendingAccess, setPendingAccess] = useState<'edit' | 'read'>('edit');
   const [pickerKey, setPickerKey] = useState(0); // bump to reset the picker after add
@@ -73,14 +75,16 @@ export function ShareDialog({
         credentials: 'include',
       });
       if (!res.ok) throw new Error(`Failed (${res.status})`);
-      const { shares: rows, owner: ownerInfo, series: seriesInfo } = (await res.json()) as {
+      const { shares: rows, owner: ownerInfo, series: seriesInfo, seriesList: list } = (await res.json()) as {
         shares: TranscriptShare[];
         owner?: { email: string | null; name: string | null };
         series?: { id: number; title: string } | null;
+        seriesList?: Array<{ id: number; title: string }>;
       };
       setShares(rows);
       setOwner(ownerInfo ?? null);
       setSeries(seriesInfo ?? null);
+      setSeriesList(list ?? (seriesInfo ? [seriesInfo] : []));
       onSharesChangedRef.current?.(rows);
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to load');
@@ -378,7 +382,9 @@ export function ShareDialog({
                 .join(' and ')}{' '}
               {shares.filter(isSeriesFollowShare).length === 1 ? 'reads' : 'read'} this meeting because they
               follow the series{' '}
-              <span className="font-medium">{series ? `“${series.title}”` : 'it belongs to'}</span>.
+              <span className="font-medium">
+                {seriesList.length > 0 ? seriesList.map((x) => `“${x.title}”`).join(' / ') : 'it belongs to'}
+              </span>.
               {canManage && ' You can remove them — the removal is recorded and they are not added back.'}
             </p>
           </div>

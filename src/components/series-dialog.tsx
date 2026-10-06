@@ -38,8 +38,11 @@ import {
   PatternList,
   SeriesDefinitionForm,
   SeriesFollowersSection,
+  SeriesOwnershipSection,
+  reachNote,
   type SeriesDefinitionValues,
   type SeriesFollowerView,
+  type SeriesOwnerView,
   type SeriesPermissionsView,
 } from '@/components/series-definition';
 import type { SeriesPattern } from '@/lib/series-patterns';
@@ -47,10 +50,13 @@ import type { SeriesPattern } from '@/lib/series-patterns';
 /**
  * The series view (curated series, docs/curated-series-spec.md): the
  * definition — description, patterns, default labels, priority — with an
- * edit mode, the followers, auto-import, and the occurrence sweep over the
- * caller's own calendar with per-occurrence and mass import. Occurrences
- * are computed server-side on every open — nothing about them is persisted.
- * Members are only ever the meetings the caller can open (spec §6).
+ * edit mode (owner + editors), the owner / editors / followers (v2 — a
+ * series runs as its OWNER, spec §11), auto-import, and the occurrence sweep
+ * over the caller's own calendar with per-occurrence and mass import.
+ * Occurrences are computed server-side on every open — nothing about them is
+ * persisted. Members are only ever the meetings the caller can open. The
+ * dialog only ever opens on a series the caller may see (the API 404s the
+ * rest); what they may do comes from the server's `permissions`.
  */
 
 interface AutoImportCfg {
@@ -77,12 +83,13 @@ interface SeriesDetail {
     created_by: string;
     auto_import: AutoImportCfg | null;
   };
-  /** false until migration 053 is applied — the definition is read-only. */
   ready: boolean;
+  owner?: SeriesOwnerView | null;
+  editors?: SeriesFollowerView[];
   labels: Array<{ id: number; path: string; name: string; color: string | null }>;
   followers: SeriesFollowerView[];
   permissions: SeriesPermissionsView | null;
-  viewer?: { email: string };
+  viewer?: { email: string; isAuditor?: boolean };
   /** Caller-visible members only (owned or shared). */
   members: Array<{
     transcript_id: number;
@@ -495,6 +502,7 @@ export function SeriesDialog({ seriesId, onClose, onChanged }: SeriesDialogProps
     setDetailError(null);
     try {
       const res = await fetch(`/api/series/${seriesId}`);
+      if (res.status === 404) throw new Error('This series does not exist or is not shared with you');
       if (!res.ok) throw new Error(`Couldn't load this series (${res.status})`);
       setDetail((await res.json()) as SeriesDetail);
     } catch (err) {
@@ -570,8 +578,9 @@ export function SeriesDialog({ seriesId, onClose, onChanged }: SeriesDialogProps
     );
     if (ok) refresh();
   };
-  /** Save the edited definition. Patterns/priority are only sent when they
-   * changed (on a followed series they are auditor-only — spec §6). */
+  /** Save the edited definition (owner + editors — §11.1). Patterns and
+   * priority are only sent when they changed (a patterns change re-matches
+   * every meeting server-side). */
   const saveDefinition = async (
     v: SeriesDefinitionValues,
     changed: { matching: boolean }
@@ -828,7 +837,7 @@ export function SeriesDialog({ seriesId, onClose, onChanged }: SeriesDialogProps
           <DialogTitle className="flex items-center gap-2 pr-8">
             <Repeat className="h-4 w-4 shrink-0 text-primary" />
             <span className="min-w-0 truncate">{detail?.series.title ?? 'Series'}</span>
-            {detail?.ready && !editing && (
+            {detail?.ready && detail.permissions?.edit && !editing && (
               <Button
                 variant="ghost"
                 size="sm"
@@ -876,7 +885,8 @@ export function SeriesDialog({ seriesId, onClose, onChanged }: SeriesDialogProps
                     priority: detail.series.priority,
                     labels: detail.labels.map((l) => l.path),
                   }}
-                  matchingLocked={!detail.permissions?.editMatching}
+                  seriesId={detail.series.id}
+                  reach={reachNote(detail.owner)}
                   submitLabel="Save"
                   onSubmit={saveDefinition}
                   onCancel={() => setEditing(false)}
@@ -892,6 +902,7 @@ export function SeriesDialog({ seriesId, onClose, onChanged }: SeriesDialogProps
                     Patterns <span className="normal-case tracking-normal">· priority {detail.series.priority}</span>
                   </p>
                   <PatternList patterns={detail.series.patterns} />
+                  <p className="mt-0.5 text-[11px] text-muted-foreground">{reachNote(detail.owner)}</p>
                 </div>
                 {detail.labels.length > 0 && (
                   <div className="flex flex-wrap items-center gap-1.5">
@@ -901,21 +912,32 @@ export function SeriesDialog({ seriesId, onClose, onChanged }: SeriesDialogProps
                     <LabelChipsStatic labels={detail.labels} />
                   </div>
                 )}
-                {!detail.ready && (
+                {!detail.permissions?.edit && (
                   <p className="text-[11px] text-muted-foreground">
-                    Curated series aren’t switched on yet (migration 053) — read-only.
+                    Only the owner or an editor can change this series.
                   </p>
                 )}
               </div>
             )}
             {detail.ready && (
-              <SeriesFollowersSection
-                seriesId={detail.series.id}
-                followers={detail.followers}
-                permissions={detail.permissions}
-                viewerEmail={detail.viewer?.email ?? null}
-                onChanged={refresh}
-              />
+              <div className="space-y-3 rounded-lg border p-2.5">
+                <SeriesOwnershipSection
+                  seriesId={detail.series.id}
+                  owner={detail.owner ?? null}
+                  editors={detail.editors ?? []}
+                  permissions={detail.permissions}
+                  viewerEmail={detail.viewer?.email ?? null}
+                  onChanged={refresh}
+                />
+                <SeriesFollowersSection
+                  seriesId={detail.series.id}
+                  followers={detail.followers}
+                  permissions={detail.permissions}
+                  owner={detail.owner ?? null}
+                  viewerEmail={detail.viewer?.email ?? null}
+                  onChanged={refresh}
+                />
+              </div>
             )}
 
             {/* ---- auto-import ----------------------------------------- */}
@@ -968,6 +990,12 @@ export function SeriesDialog({ seriesId, onClose, onChanged }: SeriesDialogProps
                       size="sm"
                       variant={on ? 'outline' : 'default'}
                       className="h-6 px-2 text-xs"
+                      disabled={!detail.permissions?.edit}
+                      title={
+                        detail.permissions?.edit
+                          ? undefined
+                          : 'Only the owner or an editor of this series can switch auto-import'
+                      }
                       onClick={() =>
                         void saveAutoImport({
                           enabled: !on,
@@ -986,6 +1014,7 @@ export function SeriesDialog({ seriesId, onClose, onChanged }: SeriesDialogProps
                           <span className="text-muted-foreground">Import</span>
                           <select
                             className="rounded border bg-background px-1 py-0.5 text-xs"
+                            disabled={!detail.permissions?.edit}
                             value={mode}
                             onChange={(e) =>
                               void saveAutoImport({
@@ -1020,6 +1049,7 @@ export function SeriesDialog({ seriesId, onClose, onChanged }: SeriesDialogProps
                           <span className="text-muted-foreground">then generate</span>
                           <select
                             className="rounded border bg-background px-1 py-0.5 text-xs"
+                            disabled={!detail.permissions?.edit}
                             value={report}
                             onChange={(e) =>
                               void saveAutoImport({
@@ -1391,7 +1421,11 @@ export function SeriesDialog({ seriesId, onClose, onChanged }: SeriesDialogProps
                                         <Check className="h-3 w-3" /> imported
                                         <ExternalLink className="h-2.5 w-2.5" />
                                       </a>
-                                      {detail.members.some((m) => m.assemblyai_id === imp.assemblyai_id) && (
+                                      {detail.members.some(
+                                        (m) =>
+                                          m.assemblyai_id === imp.assemblyai_id &&
+                                          (!!detail.permissions?.edit || m.access !== 'read')
+                                      ) && (
                                         <button
                                           type="button"
                                           className="rounded p-0.5 text-muted-foreground/50 opacity-0 transition-opacity hover:text-destructive group-hover/imp:opacity-100"
@@ -1575,7 +1609,7 @@ export function SeriesDialog({ seriesId, onClose, onChanged }: SeriesDialogProps
                           manual
                         </span>
                       )}
-                      {m.access !== 'read' && (
+                      {(!!detail.permissions?.edit || m.access !== 'read') && (
                         <Button
                           size="sm"
                           variant="ghost"

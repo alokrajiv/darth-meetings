@@ -94,15 +94,19 @@ READ
   attachment-get <id> <attId> [--out <file>]   Download one attachment
   labels                          Org-wide label tree with visible-to-you counts
                                   (subtree-inclusive) and #ids; --json = flat rows
-  series                          Every curated series: id, title, patterns,
-                                  default labels, followers, auto-import, and
-                                  how many of its meetings YOU can open
-  series <id>                     One series: description, patterns, labels,
-                                  followers, auto-import, members you can open
+  series                          The curated series YOU can see (you own, edit
+                                  or follow them; auditors: all): id, title,
+                                  owner, patterns, default labels, followers,
+                                  auto-import, how many of its meetings YOU
+                                  can open
+  series <id>                     One series: owner, editors, description,
+                                  patterns, labels, followers, auto-import,
+                                  members you can open (404 = not yours to see)
   series preview --pattern <regex> [--pattern …] [--invite-all a@x,b@y]
-                                  What these patterns would catch among the
-                                  meetings YOU can open (auditors also get the
-                                  org-wide count). Changes nothing
+             [--series <id>]      What these patterns would catch among the
+                                  meetings YOU can open — or, with --series of
+                                  a series you own/edit, among the meetings
+                                  its OWNER can open. Changes nothing
   notify                          Your Slack DM notification switches, one
                                   line per kind (opt-out: on unless turned off)
   offline plan [<id,…>]           What the web app keeps offline for you under
@@ -228,27 +232,35 @@ WRITE (needs read+write for meetings)
                                   title matches ANY --pattern (case-insensitive
                                   JS regex) joins it and gets every --label
                                   (missing label paths are created). Anyone can
-                                  create; --follower is auditors only
+                                  create; YOU own it, so it matches only the
+                                  meetings you can open (an auditor: every
+                                  meeting), and followers get only the ones you
+                                  own or edit
   series set <id> [--title <t>] [--description <d>] [--notes <md>]
              [--pattern <regex>]… [--clear-patterns] [--label <path>]…
              [--clear-labels] [--priority N]
              [--auto-import on|off] [--mode transcript|video|both]
              [--report detailed-video|detailed-text|later]
-                                  Edit a series. --pattern REPLACES all its
-                                  patterns, --label REPLACES its default labels.
-                                  A series WITH followers: only an auditor may
-                                  change patterns/priority (403 otherwise).
+                                  Edit a series (owner + editors). --pattern
+                                  REPLACES all its patterns, --label REPLACES
+                                  its default labels; priority = display order.
                                   Auto-import on = future occurrences import on
                                   their own under YOUR Google link
-  series follow <id> <email> [--name <n>]   Auditors only: <email> gets a
-                                  read share of every meeting in the series,
+  series follow <id> <email> [--name <n>]   Owner/editors: <email> gets a
+                                  read share of every meeting in the series
+                                  the OWNER owns or edits (auditor series: all),
                                   past and future
-  series unfollow <id> <email>    Auditors: anyone; everyone else: themselves
-  series delete <id>              Delete a series (its creator while nobody
-                                  follows it, or an auditor). The meetings stay
-  series attach <id> <transcript-id>   Put a meeting you own or edit in the
-                                  series by hand (stays even when its patterns
-                                  stop matching)
+  series unfollow <id> <email>    Owner/editors: anyone; a follower: themselves
+  series editors add|rm <id> <email> [--name <n>]   Owner/editors manage who
+                                  may edit (an auditor series: auditors only);
+                                  an editor may rm themselves
+  series transfer <id> <email>    Owner only: hand the series to <email> (they
+                                  must have opened Darth Meetings); you stay
+                                  on as an editor. Its reach becomes THEIRS
+  series delete <id>              Delete a series (its owner). The meetings stay
+  series attach <id> <transcript-id>   Put a meeting the series' owner can open
+                                  in a series you own or edit, by hand (stays
+                                  even when its patterns stop matching)
   series detach <id> <transcript-id> [--remember]   Take it out of THAT series;
                                   --remember = "not this series" (the patterns
                                   never pull it back)
@@ -2565,8 +2577,10 @@ const meetings: Subcommand = {
                   `${String(r.visible_member_count ?? r.member_count ?? 0).padStart(3)} yours`,
                   r.auto_enabled ? "auto" : "    ",
                 ];
-                console.log(`${bits.join("  ")}  ${r.title}`);
+                const role = r.permissions?.role && r.permissions.role !== "owner" ? `  [${r.permissions.role}]` : "";
+                console.log(`${bits.join("  ")}  ${r.title}${role}`);
                 if (r.description) console.log(`        ${r.description}`);
+                if (r.owner?.email) console.log(`        owner:    ${r.owner.email}${r.owner.isAuditor ? " (auditor — every meeting)" : ""}`);
                 const pats = (r.patterns ?? []).map((p: any) => p.kind === "title" ? `/${p.regex}/i` : `invite:${(p.all ?? []).join("+")}`);
                 if (pats.length) console.log(`        patterns: ${pats.join("  ")}`);
                 if (r.labels?.length) console.log(`        labels:   ${r.labels.map((l: any) => l.path).join(", ")}`);
@@ -2582,6 +2596,9 @@ const meetings: Subcommand = {
             const sr = data.series;
             console.log(`series:      #${sr.id}  ${sr.title}`);
             if (sr.description) console.log(`about:       ${sr.description}`);
+            console.log(`owner:       ${data.owner?.email ?? sr.owner_email ?? "(unknown)"}${data.owner?.isAuditor ? "  (auditor — matches every meeting)" : "  (matches only meetings the owner can open)"}`);
+            console.log(`editors:     ${(data.editors ?? []).map((e: any) => e.email).join(", ") || "(none)"}`);
+            if (data.permissions?.role) console.log(`you:         ${data.permissions.role}${data.permissions.edit ? " (can edit)" : ""}`);
             const ai = sr.auto_import;
             console.log(`auto-import: ${ai?.enabled ? `ON (mode ${ai.mode}, report ${ai.report}, by ${ai.byEmail})` : "off"}`);
             console.log(`priority:    ${sr.priority ?? 100}`);
@@ -2605,11 +2622,12 @@ const meetings: Subcommand = {
         if (sub === "preview") {
           const patterns = patternsFromFlags(argv, flags);
           if (!patterns?.length) { console.error("usage: darth-cli meetings series preview --pattern <regex> [--pattern …] [--invite-all a@x,b@y …]"); return 1; }
-          const data = await ctx.expectJson<any>(ctx.api("meetings", `/api/series/preview`, { method: "POST", body: JSON.stringify({ patterns }) }));
+          const seriesId = asId(str(flags.series));
+          const data = await ctx.expectJson<any>(ctx.api("meetings", `/api/series/preview`, { method: "POST", body: JSON.stringify({ patterns, ...(seriesId ? { seriesId } : {}) }) }));
           ctx.print(data, () => {
-            console.log(data.matched !== null && data.matched !== undefined
-              ? `${data.matched} meeting(s) match org-wide · ${data.visibleToYou} you can open`
-              : `${data.visibleToYou} of the meetings you can open match`);
+            console.log(data.reachOf === "owner"
+              ? `${data.matched} meeting(s) the series' owner can open match · ${data.visibleToYou} you can open`
+              : `${data.matched} of the meetings you can open match`);
             for (const m of data.sample ?? []) console.log(`  ${m.assemblyai_id}  ${String(m.when ?? "").slice(0, 10)}  ${m.title ?? ""}`);
           });
           return 0;
@@ -2649,6 +2667,27 @@ const meetings: Subcommand = {
             const r = await ctx.expectJson<any>(ctx.api("meetings", `/api/series/${id}/followers?${new URLSearchParams({ email })}`, { method: "DELETE" }));
             ctx.print(r, () => console.log(`${email} unfollowed series #${id} — ${r.shares} follow share(s) removed.`));
           }
+          return 0;
+        }
+        if (sub === "editors") {
+          const op = args[1]; const id = asId(args[2]); const email = args[3]?.trim().toLowerCase();
+          if ((op !== "add" && op !== "rm") || !id || !email) { console.error("usage: darth-cli meetings series editors add|rm <series-id> <email> [--name <n>]"); return 1; }
+          if (op === "add") {
+            const r = await ctx.expectJson<any>(ctx.api("meetings", `/api/series/${id}/editors`, {
+              method: "POST", body: JSON.stringify({ email, ...(str(flags.name) ? { name: str(flags.name) } : {}) }) }));
+            ctx.print(r, () => console.log(r.added ? `${email} can now edit series #${id}.` : `${email} already edits series #${id}.`));
+          } else {
+            const r = await ctx.expectJson<any>(ctx.api("meetings", `/api/series/${id}/editors?${new URLSearchParams({ email })}`, { method: "DELETE" }));
+            ctx.print(r, () => console.log(`${email} no longer edits series #${id}.`));
+          }
+          return 0;
+        }
+        if (sub === "transfer") {
+          const id = asId(args[1]); const email = args[2]?.trim().toLowerCase();
+          if (!id || !email) { console.error("usage: darth-cli meetings series transfer <series-id> <email>"); return 1; }
+          const r = await ctx.expectJson<any>(ctx.api("meetings", `/api/series/${id}/transfer`, {
+            method: "POST", body: JSON.stringify({ email }) }));
+          ctx.print(r, () => console.log(`Series #${id} now belongs to ${email} — you stay on as an editor. It matches what THEY can open from now on.`));
           return 0;
         }
         if (sub === "set") {
@@ -2696,7 +2735,7 @@ const meetings: Subcommand = {
           }
           return 0;
         }
-        console.error(`unknown series subcommand '${sub}' — try: series | series <id> | preview | create | set | attach | detach | follow | unfollow | delete`);
+        console.error(`unknown series subcommand '${sub}' — try: series | series <id> | preview | create | set | attach | detach | follow | unfollow | editors | transfer | delete`);
         return 1;
       }
 

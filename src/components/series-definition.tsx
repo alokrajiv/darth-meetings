@@ -15,14 +15,15 @@ import {
   type PatternEditorState,
   type SeriesPattern,
 } from '@/lib/series-patterns';
-import { Eye, Loader2, Lock, Plus, Tag, UserCheck, X } from 'lucide-react';
+import { ArrowRightLeft, Crown, Eye, Loader2, PenLine, Plus, Tag, UserCheck, X } from 'lucide-react';
 
 /**
  * The curated-series definition, shared by the /series "New series" form and
  * the series dialog's edit mode (docs/curated-series-spec.md §2, §4, §6):
  * name, description, the patterns editor (one title regex per line + an
  * optional invite rule) with a server Preview, default labels by path
- * (created on save if missing), and priority. Plus the followers section.
+ * (created on save if missing), and priority. Plus the owner / editors /
+ * followers sections (v2 — a series runs as its OWNER, spec §11.11).
  *
  * Validation runs here with the same pure function the server runs
  * (lib/series-patterns validatePatterns), so a bad regex is caught as you
@@ -38,12 +39,21 @@ export interface SeriesDefinitionValues {
   labels: string[];
 }
 
+/** lib/series-permissions SeriesPermissions, as the API serves it. The
+ * server decides every one of these (it alone knows who is an auditor). */
 export interface SeriesPermissionsView {
-  isAuditor: boolean;
-  editMatching: boolean;
+  role: 'owner' | 'editor' | 'follower' | 'auditor' | null;
+  see: boolean;
+  edit: boolean;
+  manageEditors: boolean;
   manageFollowers: boolean;
-  isFollower: boolean;
+  transfer: boolean;
   delete: boolean;
+  isOwner: boolean;
+  isEditor: boolean;
+  isFollower: boolean;
+  isAuditor: boolean;
+  ownerIsAuditor: boolean;
 }
 
 export interface SeriesFollowerView {
@@ -53,8 +63,20 @@ export interface SeriesFollowerView {
   added_at: string;
 }
 
-const MATCHING_LOCKED_NOTE =
-  'This series has followers, so only an auditor can change its patterns or priority — the followers get every meeting it matches.';
+export interface SeriesOwnerView {
+  email: string | null;
+  name: string | null;
+  isAuditor: boolean;
+}
+
+const firstName = (o: SeriesOwnerView | null | undefined) =>
+  o ? (o.name || o.email || 'the owner') : 'the owner';
+
+/** §11.11 reach note under the patterns. */
+export function reachNote(owner: SeriesOwnerView | null | undefined): string {
+  if (owner?.isAuditor) return 'Auditor series — matches every meeting.';
+  return `Matches only meetings ${firstName(owner)} can open.`;
+}
 
 // ---------------------------------------------------------------------------
 // Label paths
@@ -151,22 +173,27 @@ export function LabelPathsInput({
 // ---------------------------------------------------------------------------
 
 interface PreviewResult {
-  /** Org-wide count — auditors only, null for everyone else. */
-  matched: number | null;
+  /** Matches within the reach previewed — the caller's own, or (editing an
+   * existing series) its owner's. Never org-wide. */
+  matched: number;
   visibleToYou: number;
   sample: Array<{ assemblyai_id: string; title: string | null; when: string }>;
+  reachOf?: 'you' | 'owner';
 }
 
 export function SeriesDefinitionForm({
   initial,
-  matchingLocked = false,
+  seriesId,
+  reach,
   submitLabel,
   onSubmit,
   onCancel,
 }: {
   initial: SeriesDefinitionValues;
-  /** Patterns + priority are read-only for this caller (followed series). */
-  matchingLocked?: boolean;
+  /** Editing an existing series: the preview runs within its owner's reach. */
+  seriesId?: number;
+  /** One line under the patterns: what this series can match. */
+  reach?: string;
   submitLabel: string;
   /** Resolves to an error message, or null on success. */
   onSubmit: (values: SeriesDefinitionValues, changed: { matching: boolean }) => Promise<string | null>;
@@ -193,7 +220,7 @@ export function SeriesDefinitionForm({
       const res = await fetch('/api/series/preview', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ patterns: validated.patterns }),
+        body: JSON.stringify({ patterns: validated.patterns, ...(seriesId ? { seriesId } : {}) }),
       });
       const j = (await res.json().catch(() => null)) as (PreviewResult & { error?: string }) | null;
       if (!res.ok || !j) throw new Error(j?.error ?? `Preview failed (${res.status})`);
@@ -256,16 +283,12 @@ export function SeriesDefinitionForm({
           <span className="text-[11px] font-medium uppercase tracking-wider text-muted-foreground">
             Patterns
           </span>
-          {matchingLocked && (
-            <span className="inline-flex items-center gap-1 text-[11px] text-amber-700 dark:text-amber-400">
-              <Lock className="h-3 w-3" /> auditors only
-            </span>
-          )}
         </div>
-        {matchingLocked && <p className="text-[11px] text-muted-foreground">{MATCHING_LOCKED_NOTE}</p>}
+        <p className="text-[11px] text-muted-foreground">
+          {reach ?? 'Matches only meetings you can open (an auditor’s series: every meeting).'}
+        </p>
         <Textarea
           value={editor.titles}
-          disabled={matchingLocked}
           onChange={(e) => setEditor((s) => ({ ...s, titles: e.target.value }))}
           placeholder={'One title regex per line (case-insensitive), e.g.\n^AI - Daily\n^Data (weekly|QA)\\b'}
           className="min-h-20 font-mono text-xs"
@@ -274,12 +297,11 @@ export function SeriesDefinitionForm({
           Matched against the calendar event’s title (else the meeting’s own title). A meeting
           matching ANY pattern belongs to the series.
         </p>
-        <div className={`rounded-md border p-2 ${matchingLocked ? 'opacity-60' : ''}`}>
+        <div className="rounded-md border p-2">
           <label className="flex items-center gap-2 text-xs">
             <input
               type="checkbox"
               checked={inv.enabled}
-              disabled={matchingLocked}
               onChange={(e) => setInv({ enabled: e.target.checked })}
             />
             Also match by who is on the invite
@@ -288,14 +310,12 @@ export function SeriesDefinitionForm({
             <div className="mt-2 grid gap-1.5 text-xs">
               <Input
                 value={inv.all}
-                disabled={matchingLocked}
                 onChange={(e) => setInv({ all: e.target.value })}
                 placeholder="Everyone of these is invited (emails, comma-separated)"
                 className="h-7 text-xs"
               />
               <Input
                 value={inv.any}
-                disabled={matchingLocked}
                 onChange={(e) => setInv({ any: e.target.value })}
                 placeholder="…and at least one of these (optional)"
                 className="h-7 text-xs"
@@ -305,7 +325,6 @@ export function SeriesDefinitionForm({
                   <input
                     type="checkbox"
                     checked={inv.internalOnly}
-                    disabled={matchingLocked}
                     onChange={(e) => setInv({ internalOnly: e.target.checked })}
                   />
                   Nobody from outside Tramés
@@ -314,7 +333,6 @@ export function SeriesDefinitionForm({
                   <input
                     type="checkbox"
                     checked={inv.recurringOnly}
-                    disabled={matchingLocked}
                     onChange={(e) => setInv({ recurringOnly: e.target.checked })}
                   />
                   Recurring events only
@@ -323,7 +341,6 @@ export function SeriesDefinitionForm({
                   At most
                   <Input
                     value={inv.maxPeople}
-                    disabled={matchingLocked}
                     onChange={(e) => setInv({ maxPeople: e.target.value.replace(/[^\d]/g, '') })}
                     className="h-6 w-12 px-1 text-xs"
                   />
@@ -342,16 +359,16 @@ export function SeriesDefinitionForm({
             className="h-7 px-2 text-xs"
             disabled={!validated.ok || validated.patterns.length === 0 || previewBusy}
             onClick={() => void runPreview()}
-            title="What would these patterns match among the meetings you can open?"
+            title="What would these patterns match within this series' reach?"
           >
             {previewBusy ? <Loader2 className="h-3 w-3 animate-spin" /> : <Eye className="h-3 w-3" />}
             Preview
           </Button>
           {preview && (
             <span className="text-[11px] text-muted-foreground">
-              {preview.matched !== null
-                ? `${preview.matched} meeting${preview.matched === 1 ? '' : 's'} match · ${preview.visibleToYou} you can open`
-                : `${preview.visibleToYou} of the meetings you can open match`}
+              {preview.reachOf === 'owner'
+                ? `${preview.matched} meeting${preview.matched === 1 ? '' : 's'} the owner can open match · ${preview.visibleToYou} you can open`
+                : `${preview.matched} of the meetings you can open match`}
             </span>
           )}
         </div>
@@ -392,12 +409,12 @@ export function SeriesDefinitionForm({
         </span>
         <Input
           value={priority}
-          disabled={matchingLocked}
           onChange={(e) => setPriority(e.target.value.replace(/[^\d]/g, ''))}
           className="h-8 w-24"
         />
         <span className="block text-[11px] text-muted-foreground">
-          When several series match one meeting, a followed series wins first; then the lowest number.
+          Display order only: a meeting can be in several series — the lowest number shows first (and
+          decides which series’ auto-import owns an occurrence).
         </span>
       </label>
 
@@ -449,23 +466,237 @@ export function LabelChipsStatic({ labels }: { labels: Array<{ path: string; col
 }
 
 // ---------------------------------------------------------------------------
-// Followers
+// People: owner, editors, followers (§11.1 role table, §11.11)
 // ---------------------------------------------------------------------------
 
+/** POST/DELETE helper for the people routes — the server's own words on a
+ * refusal (e.g. "its editors must be auditors too"). */
+async function peopleCall(url: string, init: RequestInit, fallback: string): Promise<void> {
+  const res = await fetch(url, init);
+  const j = (await res.json().catch(() => null)) as { error?: string } | null;
+  if (!res.ok) throw new Error(j?.error ?? `${fallback} (${res.status})`);
+}
+
+function PersonChip({
+  label,
+  title,
+  onRemove,
+  removeTitle,
+  busy,
+}: {
+  label: string;
+  title: string;
+  onRemove?: () => void;
+  removeTitle?: string;
+  busy?: boolean;
+}) {
+  return (
+    <span
+      className="inline-flex items-center gap-1 rounded-full border bg-muted/40 px-2 py-0.5 text-[11px]"
+      title={title}
+    >
+      {label}
+      {onRemove && (
+        <button
+          type="button"
+          disabled={busy}
+          className="rounded text-muted-foreground hover:text-destructive"
+          onClick={onRemove}
+          title={removeTitle}
+        >
+          <X className="h-3 w-3" />
+        </button>
+      )}
+    </span>
+  );
+}
+
 /**
- * Who follows the series — everyone sees it. Auditors add and remove anyone;
- * a follower may remove themselves (spec §6). The server enforces both.
+ * Owner + editors. Everyone who can see the series sees who runs it; the
+ * owner and editors add/remove editors; the owner hands the series on
+ * (transfer — the old owner becomes an editor). On an auditor-owned series
+ * the server refuses non-auditor editors and explains why.
+ */
+export function SeriesOwnershipSection({
+  seriesId,
+  owner,
+  editors,
+  permissions,
+  viewerEmail,
+  onChanged,
+}: {
+  seriesId: number;
+  owner: SeriesOwnerView | null;
+  editors: SeriesFollowerView[];
+  permissions: SeriesPermissionsView | null;
+  viewerEmail: string | null;
+  onChanged: () => void;
+}) {
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [pickerKey, setPickerKey] = useState(0);
+  const [transferring, setTransferring] = useState(false);
+  const me = viewerEmail?.trim().toLowerCase() ?? null;
+
+  const run = async (fn: () => Promise<void>, fallback: string) => {
+    setBusy(true);
+    setError(null);
+    try {
+      await fn();
+      setPickerKey((k) => k + 1);
+      onChanged();
+    } catch (err) {
+      setError(networkErrorMessage(err, fallback));
+    } finally {
+      setBusy(false);
+    }
+  };
+  const addEditor = (email: string, name: string | null) =>
+    run(
+      () =>
+        peopleCall(
+          `/api/series/${seriesId}/editors`,
+          { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ email, name }) },
+          "Couldn't add the editor"
+        ),
+      "Couldn't add the editor"
+    );
+  const removeEditor = (email: string) => {
+    if (!confirm(me === email ? 'Stop editing this series?' : `Remove ${email} as an editor?`)) return;
+    void run(
+      () =>
+        peopleCall(
+          `/api/series/${seriesId}/editors?email=${encodeURIComponent(email)}`,
+          { method: 'DELETE' },
+          "Couldn't remove the editor"
+        ),
+      "Couldn't remove the editor"
+    );
+  };
+  const transfer = (email: string, name: string | null) => {
+    if (
+      !confirm(
+        `Hand this series to ${name || email}? They become its owner — it will then match only the meetings THEY can open, and their followers get only what they own or edit. You stay on as an editor.`
+      )
+    )
+      return;
+    void run(
+      () =>
+        peopleCall(
+          `/api/series/${seriesId}/transfer`,
+          { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ email, name }) },
+          "Couldn't transfer the series"
+        ).then(() => setTransferring(false)),
+      "Couldn't transfer the series"
+    );
+  };
+
+  return (
+    <div className="space-y-1.5">
+      <div className="flex flex-wrap items-center gap-2">
+        <Crown className="h-3.5 w-3.5 text-muted-foreground" />
+        <span className="text-[11px] font-medium uppercase tracking-wider text-muted-foreground">Owner</span>
+        <PersonChip
+          label={`${owner?.name || owner?.email || 'unknown'}${owner?.email && owner.email === me ? ' (you)' : ''}`}
+          title={owner?.email ?? 'No owner recorded'}
+        />
+        {owner?.isAuditor && (
+          <span className="text-[11px] text-amber-700 dark:text-amber-400">auditor — reaches every meeting</span>
+        )}
+        {permissions?.transfer && !transferring && (
+          <Button
+            type="button"
+            variant="ghost"
+            size="sm"
+            className="h-6 px-2 text-[11px] text-muted-foreground"
+            onClick={() => setTransferring(true)}
+          >
+            <ArrowRightLeft className="h-3 w-3" /> Transfer ownership
+          </Button>
+        )}
+      </div>
+      {transferring && (
+        <div className="flex max-w-md items-center gap-2">
+          <div className="flex-1">
+            <UserPicker
+              key={`t-${pickerKey}`}
+              mode="strict"
+              placeholder="New owner — name or email…"
+              autoFocus
+              openOnFocus={false}
+              compact
+              onSelect={(sel) => {
+                if (sel.type === 'person' && sel.person.email) transfer(sel.person.email, sel.person.name);
+              }}
+            />
+          </div>
+          <Button type="button" variant="ghost" size="sm" className="h-7 text-xs" onClick={() => setTransferring(false)}>
+            Cancel
+          </Button>
+        </div>
+      )}
+      <div className="flex flex-wrap items-center gap-2">
+        <PenLine className="h-3.5 w-3.5 text-muted-foreground" />
+        <span className="text-[11px] font-medium uppercase tracking-wider text-muted-foreground">Editors</span>
+        {editors.length === 0 ? (
+          <span className="text-xs text-muted-foreground">none</span>
+        ) : (
+          editors.map((e) => (
+            <PersonChip
+              key={e.email}
+              label={e.name || e.email}
+              title={`${e.email} · added by ${e.added_by_email}`}
+              busy={busy}
+              onRemove={
+                permissions?.manageEditors || (me && me === e.email) ? () => removeEditor(e.email) : undefined
+              }
+              removeTitle={me === e.email ? 'Stop editing' : 'Remove editor'}
+            />
+          ))
+        )}
+        <span className="text-[11px] text-muted-foreground">
+          edit the definition, manage editors and followers
+          {permissions?.ownerIsAuditor ? ' · must be auditors on an auditor series' : ''}
+        </span>
+      </div>
+      {permissions?.manageEditors && (
+        <div className="max-w-sm">
+          <UserPicker
+            key={`e-${pickerKey}`}
+            mode="strict"
+            placeholder="Add an editor — name or email…"
+            autoFocus={false}
+            openOnFocus={false}
+            compact
+            onSelect={(sel) => {
+              if (sel.type === 'person' && sel.person.email) void addEditor(sel.person.email, sel.person.name);
+            }}
+          />
+        </div>
+      )}
+      {error && <p className="text-xs text-destructive">{error}</p>}
+    </div>
+  );
+}
+
+/**
+ * Who follows the series — seen by everyone who can see the series. The
+ * owner and editors add and remove followers; a follower may remove
+ * themselves (§11.1). Followers get only the members the OWNER owns or
+ * edits (an auditor series: every member) — §11.4. The server enforces all.
  */
 export function SeriesFollowersSection({
   seriesId,
   followers,
   permissions,
+  owner,
   viewerEmail,
   onChanged,
 }: {
   seriesId: number;
   followers: SeriesFollowerView[];
   permissions: SeriesPermissionsView | null;
+  owner?: SeriesOwnerView | null;
   viewerEmail: string | null;
   onChanged: () => void;
 }) {
@@ -478,13 +709,11 @@ export function SeriesFollowersSection({
     setBusy(true);
     setError(null);
     try {
-      const res = await fetch(`/api/series/${seriesId}/followers`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ email, name }),
-      });
-      const j = (await res.json().catch(() => null)) as { error?: string } | null;
-      if (!res.ok) throw new Error(j?.error ?? `Couldn't add the follower (${res.status})`);
+      await peopleCall(
+        `/api/series/${seriesId}/followers`,
+        { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ email, name }) },
+        "Couldn't add the follower"
+      );
       setPickerKey((k) => k + 1);
       onChanged();
     } catch (err) {
@@ -506,11 +735,11 @@ export function SeriesFollowersSection({
     setBusy(true);
     setError(null);
     try {
-      const res = await fetch(`/api/series/${seriesId}/followers?email=${encodeURIComponent(email)}`, {
-        method: 'DELETE',
-      });
-      const j = (await res.json().catch(() => null)) as { error?: string } | null;
-      if (!res.ok) throw new Error(j?.error ?? `Couldn't remove the follower (${res.status})`);
+      await peopleCall(
+        `/api/series/${seriesId}/followers?email=${encodeURIComponent(email)}`,
+        { method: 'DELETE' },
+        "Couldn't remove the follower"
+      );
       onChanged();
     } catch (err) {
       setError(networkErrorMessage(err, "Couldn't remove the follower"));
@@ -527,36 +756,27 @@ export function SeriesFollowersSection({
           Followers
         </span>
         <span className="text-[11px] text-muted-foreground">
-          read every meeting in the series{permissions?.manageFollowers ? '' : ' · auditors add followers'}
+          {owner?.isAuditor
+            ? 'read every meeting in the series (auditor series)'
+            : `get the meetings ${firstName(owner)} owns or edits`}
         </span>
       </div>
       {followers.length === 0 ? (
         <p className="text-xs text-muted-foreground">Nobody follows this series.</p>
       ) : (
         <div className="flex flex-wrap gap-1">
-          {followers.map((f) => {
-            const canRemove = !!permissions?.manageFollowers || (!!me && me === f.email);
-            return (
-              <span
-                key={f.email}
-                className="inline-flex items-center gap-1 rounded-full border bg-muted/40 px-2 py-0.5 text-[11px]"
-                title={`${f.email} · added by ${f.added_by_email}`}
-              >
-                {f.name || f.email}
-                {canRemove && (
-                  <button
-                    type="button"
-                    disabled={busy}
-                    className="rounded text-muted-foreground hover:text-destructive"
-                    onClick={() => void remove(f.email)}
-                    title={me === f.email ? 'Unfollow' : 'Remove follower'}
-                  >
-                    <X className="h-3 w-3" />
-                  </button>
-                )}
-              </span>
-            );
-          })}
+          {followers.map((f) => (
+            <PersonChip
+              key={f.email}
+              label={f.name || f.email}
+              title={`${f.email} · added by ${f.added_by_email}`}
+              busy={busy}
+              onRemove={
+                permissions?.manageFollowers || (!!me && me === f.email) ? () => void remove(f.email) : undefined
+              }
+              removeTitle={me === f.email ? 'Unfollow' : 'Remove follower'}
+            />
+          ))}
         </div>
       )}
       {permissions?.manageFollowers && (
