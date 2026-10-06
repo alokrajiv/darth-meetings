@@ -100,7 +100,10 @@ let actions: Actions;
 let currentUser: typeof OWNER | typeof BEA = OWNER;
 
 const SHARE_INSERT = /INSERT INTO "[a-z_]+"\.transcript_shares\b/;
-const shareWrites = () => sql.executed.filter((q) => SHARE_INSERT.test(q.text));
+// Invitee shares only: the auditor policy's insert (auditor-shares.test.ts)
+// rides the same calls and is asserted there.
+const shareWrites = () =>
+  sql.executed.filter((q) => SHARE_INSERT.test(q.text) && !q.text.includes('auditor_share_removals'));
 const emailOf = (q: RenderedQuery) =>
   q.params.find((p): p is string => typeof p === 'string' && p.includes('@'));
 

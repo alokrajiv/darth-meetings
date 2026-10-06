@@ -851,6 +851,9 @@ export interface TranscriptListRow {
    * (docs/labels-design.md §7). Absent on the legacy (no-params) listing,
    * which stays byte-identical. */
   labels?: LabelRef[];
+  /** v2 listing only: shared with the caller, who was not on the meeting's
+   * invite (e.g. an auditor share) — the row is tinted. */
+  not_invited?: boolean;
 }
 
 /** One day bucket of the paginated v2 listing. `key` is the day in the
@@ -892,6 +895,9 @@ export interface TranscriptShare {
   shared_with_ppl_id: number | null;
   access: 'edit' | 'read';
   shared_at: string;
+  /** Why the share exists (migration 048): 'event-link', 'auditor-external'
+   * (lib/auditor-policy.ts), or null for a person's own share. */
+  origin?: string | null;
 }
 
 /**

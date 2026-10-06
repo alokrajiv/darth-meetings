@@ -752,6 +752,16 @@ export async function listPagedForUser(
       access: __access ?? 'read',
       owner_email: null,
       owner_name: null,
+      // Shared with the caller, who was NOT on the meeting's invite (an
+      // auditor share, a forward) — the listing tints these rows. Rows with
+      // no invite at all (plain uploads) are never flagged: there is no one
+      // to have been "there".
+      not_invited:
+        __access !== 'owner' &&
+        !isTrash &&
+        Array.isArray(r.participants) &&
+        r.participants.length > 0 &&
+        !r.participants.includes(normEmail),
     };
     if (!current || current.key !== day_key) {
       current = { key: day_key, rows: [], totalSecs: 0 };

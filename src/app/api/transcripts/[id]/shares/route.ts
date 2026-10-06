@@ -5,6 +5,8 @@ import { dm, headlines, meetingLine, openLink } from '@/lib/server/dm-copy';
 import { resolveAccess } from '@/db-ops/transcript-access';
 import { sharingRefusal } from '@/lib/share-gate';
 import { identityForUser, logActivity, userIdForEmail } from '@/db-ops/transcript-activity';
+import { recordAuditorRemoval } from '@/db-ops/auditor-shares';
+import { isAuditorShare } from '@/lib/auditor-policy';
 import {
   addShare,
   listByTranscript,
@@ -283,9 +285,27 @@ export const DELETE = withAuth(async ({ user, request }, { params }) => {
     return NextResponse.json({ error: 'email is required' }, { status: 400 });
   }
 
+  const normalized = email.trim().toLowerCase();
+  const before = (await listByTranscript(access.row.id)).find(
+    (s) => s.shared_with_email.trim().toLowerCase() === normalized
+  );
   const removed = await removeShare(access.row.id, email);
   if (!removed) {
     return NextResponse.json({ error: 'Share not found' }, { status: 404 });
+  }
+
+  // Removing an auditor is allowed — and recorded, so the auditors can see
+  // who took them off which meeting; the auto-add never puts them back
+  // (lib/auditor-policy.ts).
+  const auditor = !!before && isAuditorShare(before as { origin?: string | null });
+  if (auditor) {
+    await recordAuditorRemoval({
+      transcriptId: access.row.id,
+      auditorEmail: normalized,
+      removedByUserId: user.userId,
+      removedByEmail: user.email,
+      meetingTitle: access.row.title,
+    }).catch((err) => console.warn('[auditor-share] recording the removal failed:', err));
   }
 
   void logActivity({
@@ -293,7 +313,7 @@ export const DELETE = withAuth(async ({ user, request }, { params }) => {
     userId: user.userId,
     email: user.email,
     action: 'share_remove',
-    details: { withEmail: email.toLowerCase() },
+    details: { withEmail: normalized, ...(auditor ? { auditor: true } : {}) },
   });
 
   return NextResponse.json({ ok: true });

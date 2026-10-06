@@ -2028,7 +2028,14 @@ export function TranscriptTable({
         }}
         className={`group transition-colors hover:bg-accent/40 ${
           placeholder ? 'cursor-default' : 'cursor-pointer'
-        } ${isSelected ? 'bg-primary/5' : ''}`}
+        } ${isSelected ? 'bg-primary/5' : ''} ${
+          // Shared with me, but I wasn't on the invite (an auditor share).
+          t.not_invited && !isSelected
+            ? 'bg-amber-50/70 shadow-[inset_3px_0_0_0_rgb(245_158_11/0.55)] dark:bg-amber-950/20'
+            : ''
+        }`}
+        data-not-invited={t.not_invited ? '' : undefined}
+        title={t.not_invited ? "Shared with you — you weren't in this meeting" : undefined}
       >
         {leadCols.map((key) => (
           <TableCell key={key} className={`py-1.5 pl-4 align-top ${COL_RESPONSIVE[key]}`}>

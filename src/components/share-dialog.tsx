@@ -11,9 +11,10 @@ import {
 } from '@/components/ui/dialog';
 import { Button } from '@/components/ui/button';
 import { Badge } from '@/components/ui/badge';
-import { Check, Crown, Loader2, Trash2, Users } from 'lucide-react';
+import { Check, Crown, Loader2, ShieldCheck, Trash2, Users } from 'lucide-react';
 import { UserPicker, type PickerPerson } from '@/components/user-picker';
 import type { TranscriptShare, TranscriptAccess } from '@/lib/format';
+import { isAuditorShare } from '@/lib/auditor-policy';
 
 interface ShareDialogProps {
   open: boolean;
@@ -340,6 +341,25 @@ export function ShareDialog({
           </div>
         )}
 
+        {shares.some(isAuditorShare) && (
+          <div
+            className="mt-2 flex gap-2 rounded-md border border-amber-300/60 bg-amber-50 px-3 py-2 text-xs leading-5 text-amber-900 dark:border-amber-500/30 dark:bg-amber-950/30 dark:text-amber-200"
+            data-auditor-note
+          >
+            <ShieldCheck className="mt-0.5 h-3.5 w-3.5 shrink-0" />
+            <p>
+              {shares
+                .filter(isAuditorShare)
+                .map((s) => s.shared_with_name || s.shared_with_email.split('@')[0])
+                .join(' and ')}{' '}
+              {shares.filter(isAuditorShare).length === 1 ? 'was' : 'were'} added automatically as{' '}
+              <span className="font-medium">auditors</span> because someone from outside Tramés was in
+              this meeting.
+              {canManage && ' You can remove them — the removal is recorded.'}
+            </p>
+          </div>
+        )}
+
         <div className="mt-2 rounded-md border">
           <div className="border-b px-3 py-2 text-xs font-medium text-muted-foreground">
             {shares.length === 0
@@ -377,8 +397,17 @@ export function ShareDialog({
                   {(s.shared_with_name || s.shared_with_email).charAt(0).toUpperCase()}
                 </div>
                 <div className="min-w-0 flex-1">
-                  <div className="truncate font-medium">
-                    {s.shared_with_name || s.shared_with_email}
+                  <div className="flex items-center gap-1.5 truncate font-medium">
+                    <span className="truncate">{s.shared_with_name || s.shared_with_email}</span>
+                    {isAuditorShare(s) && (
+                      <Badge
+                        variant="outline"
+                        className="shrink-0 gap-1 border-amber-300/70 px-1 py-0 text-[10px] font-normal text-amber-800 dark:text-amber-300"
+                        title="Added automatically: someone from outside Tramés was in this meeting"
+                      >
+                        <ShieldCheck className="h-3 w-3" /> Auditor
+                      </Badge>
+                    )}
                   </div>
                   <div className="truncate text-xs text-muted-foreground">
                     {s.shared_with_email}

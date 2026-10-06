@@ -1,6 +1,8 @@
 import 'server-only';
 import { addShare, listByTranscript } from '@/db-ops/transcript-shares';
 import { removeLinkBornSharesNotIn, SHARE_ORIGIN_EVENT_LINK } from '@/db-ops/share-origin';
+import { addAuditorShares } from '@/db-ops/auditor-shares';
+import { AUDITORS, externalParties } from '@/lib/auditor-policy';
 
 // Internal domains: invitees on these are the people a meeting tied to a
 // calendar invite is shared with (and the domains share suggestions are
@@ -62,7 +64,10 @@ export function internalInvitees(
  * a person made (or downgraded to read) keeps its access and stays
  * un-stamped, so an unlink never takes it.
  *
- * Returns how many shares this call created.
+ * Every call also runs the auditor policy (`shareWithAuditors` below): an
+ * outside party on the invite shares the meeting read-only with the auditors.
+ *
+ * Returns how many invitee shares this call created (auditors not counted).
  */
 export async function shareWithInternalInvitees(
   arm: AutoShareArm,
@@ -73,8 +78,51 @@ export async function shareWithInternalInvitees(
 ): Promise<number> {
   if (arm !== 'cloud-import' && arm !== 'event-link') return 0;
   const wanted = internalInvitees(ownerEmail, candidates);
-  if (wanted.size === 0) return 0;
+  // The internal invitees go first, so an auditor who is ON the invite gets
+  // the invitee's edit share, not the auditor's read one.
+  const shared = wanted.size === 0 ? 0 : await shareWithInvitees(arm, transcriptId, ownerUserId, wanted);
+  await shareWithAuditors(transcriptId, ownerUserId, ownerEmail, candidates).catch((err) =>
+    console.warn('[auditor-share] failed for transcript', transcriptId, err)
+  );
+  return shared;
+}
 
+/**
+ * The auditor policy (lib/auditor-policy.ts): a meeting with an outside party
+ * on its invite (or among who joined) is shared read-only with every auditor
+ * who is not its owner. Runs wherever the invite policy runs — every import
+ * and every link to an event. Never touches an existing share, never re-adds
+ * an auditor the meeting was taken away from. Returns the auditors added.
+ */
+export async function shareWithAuditors(
+  transcriptId: number,
+  ownerUserId: string,
+  ownerEmail: string,
+  candidates: ReadonlyArray<{ email?: string | null; name?: string | null }>
+): Promise<string[]> {
+  const outside = externalParties(
+    candidates.map((c) => c?.email),
+    AUTO_SHARE_DOMAINS
+  );
+  if (outside.length === 0) return [];
+  const self = ownerEmail.trim().toLowerCase();
+  const auditors = AUDITORS.filter((a) => a.email !== self);
+  const added = await addAuditorShares(transcriptId, ownerUserId, auditors);
+  if (added.length > 0) {
+    console.log(
+      `[auditor-share] transcript ${transcriptId}: added ${added.join(', ')} ` +
+        `(outside party: ${outside.slice(0, 3).join(', ')}${outside.length > 3 ? ', …' : ''})`
+    );
+  }
+  return added;
+}
+
+async function shareWithInvitees(
+  arm: AutoShareArm,
+  transcriptId: number,
+  ownerUserId: string,
+  wanted: Map<string, string | null>
+): Promise<number> {
   if (arm === 'event-link') {
     const existing = await listByTranscript(transcriptId);
     for (const s of existing) wanted.delete(s.shared_with_email.trim().toLowerCase());

@@ -2,6 +2,7 @@ import 'server-only';
 import { sql } from '@/lib/db';
 import { SCHEMAS } from '@/lib/constants/database';
 import { publishEvent } from '@/lib/server/event-bus';
+import { SHARE_ORIGIN_AUDITOR } from '@/lib/auditor-policy';
 
 /**
  * `transcript_shares.origin` (migration 048) — why a share exists, and the
@@ -26,7 +27,9 @@ import { publishEvent } from '@/lib/server/event-bus';
 const SCHEMA = SCHEMAS.MEETING_WHISPERER;
 
 export const SHARE_ORIGIN_EVENT_LINK = 'event-link';
-export type ShareOrigin = typeof SHARE_ORIGIN_EVENT_LINK;
+/** Second value (2026-10-06): an auditor share — lib/auditor-policy.ts. Never
+ * taken by an unlink; only a person removes it (and that is recorded). */
+export type ShareOrigin = typeof SHARE_ORIGIN_EVENT_LINK | typeof SHARE_ORIGIN_AUDITOR;
 
 const g = globalThis as unknown as { __mwShareOriginColumn?: Promise<boolean> };
 
