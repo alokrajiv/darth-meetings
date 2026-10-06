@@ -62,3 +62,12 @@ export async function deleteFollower(seriesId: number, email: string): Promise<b
   `;
   return rows.length > 0;
 }
+
+/** Ids of the series that have at least one follower (the matcher ranks them
+ * first — lib/series-patterns compareSeriesPrecedence). */
+export async function followedSeriesIds(): Promise<Set<number>> {
+  const rows = await sql<Array<{ series_id: number }>>`
+    SELECT DISTINCT series_id FROM ${sql(SCHEMA)}.series_followers
+  `;
+  return new Set(rows.map((r) => r.series_id));
+}

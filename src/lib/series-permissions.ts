@@ -13,7 +13,7 @@
  *    priority fight) and pull every meeting to its followers;
  *  - a series without followers: anyone may edit name, description,
  *    patterns, priority and labels (labels grant nothing);
- *  - delete a series: its creator or an auditor;
+ *  - delete a series: an auditor, or its creator while it has no followers;
  *  - everyone SEES every series.
  *
  * Pure + client-safe: the routes enforce it, the dialog greys out what the
@@ -49,7 +49,8 @@ export const SERIES_FOLLOWERS_AUDITOR_ONLY =
   'Only an auditor can add or remove followers — following gives read access to every meeting in the series';
 export const SERIES_MATCHING_AUDITOR_ONLY =
   'This series has followers, so only an auditor can change its patterns or priority (the followers get every meeting it matches)';
-export const SERIES_DELETE_DENIED = 'Only the person who created this series or an auditor can delete it';
+export const SERIES_DELETE_DENIED =
+  'Only an auditor, or the person who created this series while nobody follows it, can delete it';
 
 const norm = (e: string | null | undefined) => (e ?? '').trim().toLowerCase();
 
@@ -62,7 +63,9 @@ export function seriesPermissions(facts: SeriesPermissionFacts, caller: SeriesCa
     editMatching: facts.followerEmails.length === 0 || isAuditor,
     manageFollowers: isAuditor,
     isFollower,
-    delete: isAuditor || (!!facts.createdBy && facts.createdBy === caller.userId),
+    // A followed series is an auditor's: deleting it would drop every
+    // follower's access as surely as unfollowing them.
+    delete: isAuditor || (facts.followerEmails.length === 0 && !!facts.createdBy && facts.createdBy === caller.userId),
   };
 }
 

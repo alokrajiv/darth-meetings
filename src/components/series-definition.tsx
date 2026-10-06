@@ -151,7 +151,8 @@ export function LabelPathsInput({
 // ---------------------------------------------------------------------------
 
 interface PreviewResult {
-  matched: number;
+  /** Org-wide count — auditors only, null for everyone else. */
+  matched: number | null;
   visibleToYou: number;
   sample: Array<{ assemblyai_id: string; title: string | null; when: string }>;
 }
@@ -341,15 +342,16 @@ export function SeriesDefinitionForm({
             className="h-7 px-2 text-xs"
             disabled={!validated.ok || validated.patterns.length === 0 || previewBusy}
             onClick={() => void runPreview()}
-            title="What would these patterns match? (Counts are org-wide; only your own or shared meetings are listed)"
+            title="What would these patterns match among the meetings you can open?"
           >
             {previewBusy ? <Loader2 className="h-3 w-3 animate-spin" /> : <Eye className="h-3 w-3" />}
             Preview
           </Button>
           {preview && (
             <span className="text-[11px] text-muted-foreground">
-              {preview.matched} meeting{preview.matched === 1 ? '' : 's'} match · {preview.visibleToYou} you can
-              open
+              {preview.matched !== null
+                ? `${preview.matched} meeting${preview.matched === 1 ? '' : 's'} match · ${preview.visibleToYou} you can open`
+                : `${preview.visibleToYou} of the meetings you can open match`}
             </span>
           )}
         </div>

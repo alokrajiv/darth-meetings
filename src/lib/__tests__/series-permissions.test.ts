@@ -33,6 +33,11 @@ describe('seriesPermissions', () => {
     expect(seriesPermissions(facts, jac).delete).toBe(false);
     expect(seriesPermissions({ createdBy: null, followerEmails: [] }, jac).delete).toBe(false);
   });
+  test('delete: a FOLLOWED series is auditor-only — not even its creator (it would drop the followers)', () => {
+    const facts = { createdBy: creator.userId, followerEmails: ['alok@trames.sg'] };
+    expect(seriesPermissions(facts, creator).delete).toBe(false);
+    expect(seriesPermissions(facts, ivan).delete).toBe(true);
+  });
   test('isFollower is case-insensitive', () => {
     const p = seriesPermissions({ createdBy: null, followerEmails: ['jacqueline.ng@trames.sg'] }, {
       userId: 'x',

@@ -17,8 +17,8 @@ import {
   upsertManualMembership,
   type SeriesRow,
 } from '@/db-ops/series';
-import { deleteFollower, insertFollower, listFollowers } from '@/db-ops/series-followers';
-import { addAutoReadShares, removeAutoReadShares } from '@/db-ops/auditor-shares';
+import { deleteFollower, followedSeriesIds, insertFollower, listFollowers } from '@/db-ops/series-followers';
+import { addAutoReadShares, recordAutoShareRemoval, removeAutoReadShares } from '@/db-ops/auditor-shares';
 import {
   applySeriesLabels,
   dropSeriesLabelRules,
@@ -73,6 +73,7 @@ export interface CuratedSeries {
   priority: number;
   patterns: SeriesPattern[];
   auto_import: SeriesRow['auto_import'];
+  followed: boolean;
 }
 
 const g = globalThis as unknown as {
@@ -85,13 +86,14 @@ const g = globalThis as unknown as {
 export async function loadCuratedSeries(): Promise<CuratedSeries[]> {
   const hit = g.__mwCuratedSeriesCache;
   if (hit && Date.now() - hit.at < CACHE_TTL_MS) return hit.series;
-  const rows = await listAllSeries();
+  const [rows, followed] = await Promise.all([listAllSeries(), followedSeriesIds()]);
   const series = rows.map((r) => ({
     id: r.id,
     title: r.title,
     priority: r.priority,
     patterns: r.patterns,
     auto_import: r.auto_import,
+    followed: followed.has(r.id),
   }));
   g.__mwCuratedSeriesCache = { at: Date.now(), series };
   return series;
@@ -242,18 +244,51 @@ async function joinEffects(
   );
 }
 
-async function leaveEffects(seriesId: number, transcriptIds: number[]): Promise<void> {
-  if (transcriptIds.length === 0) return;
+async function leaveEffects(seriesId: number, transcriptIds: number[]): Promise<FollowShareRef[]> {
+  if (transcriptIds.length === 0) return [];
   await removeSeriesRuleLabels(seriesId, transcriptIds).catch((err) =>
     console.warn(`[curated-series] labels on leave failed (series ${seriesId}):`, err)
   );
   const followers = await listFollowers([seriesId]).catch(() => []);
-  if (followers.length > 0) {
-    await removeAutoReadShares({
-      transcriptIds,
-      emails: followers.map((f) => f.email),
+  if (followers.length === 0) return [];
+  return removeAutoReadShares({
+    transcriptIds,
+    emails: followers.map((f) => f.email),
+    origin: SHARE_ORIGIN_SERIES_FOLLOW,
+  }).catch((err) => {
+    console.warn(`[curated-series] follow shares on leave failed (series ${seriesId}):`, err);
+    return [];
+  });
+}
+
+type FollowShareRef = { transcript_id: number; shared_with_email: string };
+
+/**
+ * A PERSON took a meeting out of a followed series (moved it to another
+ * series by hand, or "not this series") and its followers lost their shares.
+ * That is a removal like deleting the share in the Share dialog — allowed,
+ * and recorded in the same ledger (owner, 2026-10-06: "if they remove it I
+ * want it captured"), which also keeps automation from re-adding them.
+ */
+async function recordHumanFollowRemovals(
+  gone: FollowShareRef[],
+  by: { userId: string; email: string }
+): Promise<void> {
+  if (gone.length === 0) return;
+  const titles = await sql<Array<{ id: number; title: string | null }>>`
+    SELECT id, title FROM ${sql(SCHEMA)}.transcripts
+    WHERE id = ANY(${[...new Set(gone.map((g) => g.transcript_id))]}::int[])
+  `;
+  const titleOf = new Map(titles.map((t) => [t.id, t.title]));
+  for (const g of gone) {
+    await recordAutoShareRemoval({
+      transcriptId: g.transcript_id,
+      email: g.shared_with_email,
       origin: SHARE_ORIGIN_SERIES_FOLLOW,
-    }).catch((err) => console.warn(`[curated-series] follow shares on leave failed (series ${seriesId}):`, err));
+      removedByUserId: by.userId,
+      removedByEmail: by.email,
+      meetingTitle: titleOf.get(g.transcript_id) ?? null,
+    }).catch((err) => console.warn('[curated-series] recording a follow removal failed:', err));
   }
 }
 
@@ -346,7 +381,9 @@ export async function attachManually(
 ): Promise<void> {
   const prev = await getMembership(row.id);
   await upsertManualMembership(seriesId, row.id, by.userId);
-  if (prev && prev.series_id !== seriesId) await leaveEffects(prev.series_id, [row.id]);
+  if (prev && prev.series_id !== seriesId) {
+    await recordHumanFollowRemovals(await leaveEffects(prev.series_id, [row.id]), by);
+  }
   if (!prev || prev.series_id !== seriesId) {
     await joinEffects(seriesId, [{ transcript_id: row.id, user_id: row.user_id }], by);
   }
@@ -363,14 +400,20 @@ export async function attachManually(
 export async function detachFromSeries(
   seriesId: number,
   row: { id: number; assemblyai_id: string },
-  opts: { remember: boolean; userId: string }
+  opts: { remember: boolean; userId: string; email: string }
 ): Promise<boolean> {
   const was = await deleteMembershipIn(seriesId, row.id);
-  if (was) await leaveEffects(seriesId, [row.id]);
+  const gone = was ? await leaveEffects(seriesId, [row.id]) : [];
   if (opts.remember) await addExclusion(seriesId, row.id, opts.userId);
   if (!was && !opts.remember) return false;
   publishEvent({ kind: 'meta', assemblyaiId: row.assemblyai_id });
   await syncSeriesForTranscript(row.id);
+  // Only a removal that STICKS is recorded: without `remember` a pattern
+  // match usually puts the meeting straight back (and the followers' shares
+  // with it) — ledgering that would wrongly block them forever.
+  if (gone.length > 0 && (await getMembership(row.id))?.series_id !== seriesId) {
+    await recordHumanFollowRemovals(gone, { userId: opts.userId, email: opts.email });
+  }
   return was;
 }
 
@@ -395,6 +438,8 @@ export async function followSeries(
   by: { userId: string; email: string }
 ): Promise<{ added: boolean; shares: number }> {
   const added = await insertFollower(seriesId, person, by);
+  // A first follower changes precedence (followed series win matches).
+  if (added) await onSeriesMatchingChanged(seriesId, 'follower added');
   const members = await listMemberRefs(seriesId);
   const shares = await addFollowShares(seriesId, members, [person.email]);
   return { added, shares };
@@ -409,6 +454,8 @@ export async function unfollowSeries(seriesId: number, email: string): Promise<{
     emails: [email],
     origin: SHARE_ORIGIN_SERIES_FOLLOW,
   });
+  // The last follower gone changes precedence back.
+  if (removed) await onSeriesMatchingChanged(seriesId, 'follower removed');
   return { removed, shares: gone.length };
 }
 

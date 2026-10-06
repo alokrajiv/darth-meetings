@@ -19,8 +19,11 @@
  * function must judge a stored meeting, a calendar row and the browser's
  * preview identically.
  *
- * Several series match → the lowest `priority` wins, then the lowest id
- * (`pickSeries`). A meeting is in at most one series.
+ * Several series match → a FOLLOWED series beats an unfollowed one, then the
+ * lowest `priority` wins, then the lowest id (`pickSeries`). A meeting is in
+ * at most one series. Followed-first is a privacy rule, not a preference:
+ * without it anyone could create an unfollowed series with the same pattern
+ * and a lower priority and quietly pull meetings away from their followers.
  *
  * Pure + client-safe (unit-tested in src/lib/__tests__/series-patterns.test.ts).
  */
@@ -270,12 +273,16 @@ export interface MatchableSeries {
   id: number;
   priority: number;
   patterns: readonly SeriesPattern[];
+  /** Has at least one follower. Only an auditor can change who follows or
+   * what a followed series matches (lib/series-permissions). */
+  followed?: boolean;
 }
 
-/** Lowest priority wins, then the lowest id — one total order, so every
- * caller (membership, calendar chips, auto-import) picks the same series. */
+/** Followed first, then the lowest priority, then the lowest id — one total
+ * order, so every caller (membership, calendar chips, auto-import) picks the
+ * same series. */
 export function compareSeriesPrecedence(a: MatchableSeries, b: MatchableSeries): number {
-  return a.priority - b.priority || a.id - b.id;
+  return Number(!!b.followed) - Number(!!a.followed) || a.priority - b.priority || a.id - b.id;
 }
 
 /**

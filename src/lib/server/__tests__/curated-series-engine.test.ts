@@ -49,6 +49,8 @@ interface World {
   ownerEmails: string[];
   /** Emails the removal ledger blocks on TID. */
   ledgered: string[];
+  /** What getMembership answers after an action (null = in no series). */
+  membershipAfter: { series_id: number; title: string; how: string } | null;
 }
 let world: World;
 
@@ -73,6 +75,7 @@ const freshWorld = (): World => ({
   followers: [{ series_id: 1, email: 'alok@trames.sg', name: 'Alok Rajiv' }],
   ownerEmails: ['kawen.koh@trames.sg'],
   ledgered: [],
+  membershipAfter: null,
 });
 
 const MEMBERSHIP_INSERT = /INSERT INTO "[a-z_]+"\.series_members\b/;
@@ -112,6 +115,9 @@ function respond(q: RenderedQuery): unknown[] {
     ];
   }
   if (LABEL_REMOVE.test(t)) return [{ transcript_id: TID, assemblyai_id: 'm-501' }];
+  if (/SELECT DISTINCT series_id FROM "[a-z_]+"\.series_followers/.test(t)) {
+    return [...new Set(world.followers.map((f) => f.series_id))].map((series_id) => ({ series_id }));
+  }
   if (/FROM "[a-z_]+"\.series_followers/.test(t) && t.startsWith('SELECT')) {
     const ids = q.params[0] as number[];
     return world.followers.filter((f) => ids.includes(f.series_id)).map((f) => ({ ...f, added_by_email: 'alok@trames.sg', added_at: '' }));
@@ -125,6 +131,8 @@ function respond(q: RenderedQuery): unknown[] {
     return email && world.ledgered.includes(email) ? [] : [{ id: 99 }];
   }
   if (SHARE_DELETE.test(t)) return [{ transcript_id: TID, shared_with_email: 'alok@trames.sg' }];
+  if (/SELECT m\.series_id, s\.title, m\.how/.test(t)) return world.membershipAfter ? [world.membershipAfter] : [];
+  if (/SELECT id, title FROM "[a-z_]+"\.transcripts/.test(t)) return [{ id: TID, title: 'AI - Daily' }];
   if (/SELECT transcript_id FROM "[a-z_]+"\.series_members WHERE series_id/.test(t)) {
     return [{ transcript_id: TID }];
   }
@@ -285,6 +293,37 @@ describe('syncSeriesForTranscript', () => {
     world.ready = false;
     await engine.syncSeriesForTranscript(TID);
     expect(sql.executed.every((q) => !/INSERT|DELETE/.test(q.text))).toBe(true);
+  });
+});
+
+describe('a person takes a meeting out of a followed series', () => {
+  const LEDGER = /INSERT INTO "[a-z_]+"\.auditor_share_removals\b/;
+  const JAC = { userId: 'cccccccc-0000-4000-8000-000000000003', email: 'jacqueline.ng@trames.sg' };
+
+  test('"not this series" → the followers lose their shares AND it is recorded, by whom', async () => {
+    // The row as the follow-up sync reads it: membership already deleted,
+    // the exclusion already written.
+    world.row = { ...world.row, series_id: null, how: null, excluded: [1] };
+    await engine.detachFromSeries(1, { id: TID, assemblyai_id: 'm-501' }, { remember: true, ...JAC });
+    expect(ran(SHARE_DELETE)).toHaveLength(1);
+    const led = ran(LEDGER);
+    expect(led).toHaveLength(1);
+    expect(led[0]!.params).toContain('alok@trames.sg');
+    expect(led[0]!.params).toContain(SHARE_ORIGIN_SERIES_FOLLOW);
+    expect(led[0]!.params).toContain(JAC.email);
+  });
+
+  test('a detach the patterns undo at once (meeting back in the series) is NOT recorded', async () => {
+    world.row = { ...world.row, series_id: null, how: null };
+    world.membershipAfter = { series_id: 1, title: 'AI - Daily', how: 'auto' };
+    await engine.detachFromSeries(1, { id: TID, assemblyai_id: 'm-501' }, { remember: false, ...JAC });
+    expect(ran(LEDGER)).toHaveLength(0);
+  });
+
+  test('moving it by hand into another series records the lost follow shares', async () => {
+    world.membershipAfter = { series_id: 1, title: 'AI - Daily', how: 'auto' }; // getMembership BEFORE the move
+    await engine.attachManually(2, { id: TID, user_id: OWNER, assemblyai_id: 'm-501' }, JAC);
+    expect(ran(LEDGER)).toHaveLength(1);
   });
 });
 

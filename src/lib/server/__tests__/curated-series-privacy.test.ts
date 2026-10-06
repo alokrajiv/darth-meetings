@@ -60,6 +60,11 @@ function respond(q: RenderedQuery): unknown[] {
     const id = q.params[0] as number;
     return id === 1 || id === 2 ? [SERIES(id)] : [];
   }
+  if (/SELECT DISTINCT series_id FROM "[a-z_]+"\.series_followers/.test(t)) {
+    return Object.entries(world.followers)
+      .filter(([, emails]) => emails.length > 0)
+      .map(([id]) => ({ series_id: Number(id) }));
+  }
   if (/FROM "[a-z_]+"\.series_followers/.test(t) && t.startsWith('SELECT')) {
     const ids = q.params[0] as number[];
     return ids.flatMap((id) =>
@@ -237,7 +242,7 @@ describe('what a caller sees', () => {
     expect(body.permissions.editMatching).toBe(false);
   });
 
-  test('preview: the global count is a number; only the caller’s meetings are named', async () => {
+  test('preview: a non-auditor gets NO org-wide count (a regex + count is an oracle); only their meetings are named', async () => {
     world.previewRows = [
       { id: 1, assemblyai_id: 'mine-1', title: 'AI AM', visible: true },
       { id: 2, assemblyai_id: 'theirs-2', title: 'AI AM', visible: false },
@@ -249,11 +254,11 @@ describe('what a caller sees', () => {
       req('/api/series/preview', json({ patterns: [{ kind: 'title', regex: '^AI AM$' }] }))
     );
     const body = (await res.json()) as {
-      matched: number;
+      matched: number | null;
       visibleToYou: number;
       sample: Array<{ assemblyai_id: string }>;
     };
-    expect(body.matched).toBe(4);
+    expect(body.matched).toBeNull();
     expect(body.visibleToYou).toBe(2);
     expect(body.sample.map((s) => s.assemblyai_id).sort()).toEqual(['mine-1', 'shared-4']);
     expect(JSON.stringify(body)).not.toContain('theirs');
@@ -261,6 +266,20 @@ describe('what a caller sees', () => {
     const q = sql.executed.find((x) => x.text.includes('AS visible'))!;
     expect(q.params).toContain(JAC.userId);
     expect(q.params).toContain('jacqueline.ng@trames.sg');
+  });
+
+  test('preview: an auditor gets the org-wide count (still only their own meetings named)', async () => {
+    currentUser = ALOK;
+    world.previewRows = [
+      { id: 1, assemblyai_id: 'mine-1', title: 'AI AM', visible: true },
+      { id: 2, assemblyai_id: 'theirs-2', title: 'AI AM', visible: false },
+    ];
+    const res = await preview.POST!(
+      req('/api/series/preview', json({ patterns: [{ kind: 'title', regex: '^AI AM$' }] }))
+    );
+    const body = (await res.json()) as { matched: number | null; sample: Array<{ assemblyai_id: string }> };
+    expect(body.matched).toBe(2);
+    expect(JSON.stringify(body)).not.toContain('theirs');
   });
 });
 

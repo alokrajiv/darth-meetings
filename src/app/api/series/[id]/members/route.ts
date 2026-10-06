@@ -84,7 +84,7 @@ export const DELETE = withAuth(async ({ user, request }, { params }) => {
   await detachFromSeries(
     id,
     { id: access.row.id, assemblyai_id: access.row.assemblyai_id },
-    { remember, userId: user.userId }
+    { remember, userId: user.userId, email: user.email }
   );
   return NextResponse.json({ ok: true });
 });
