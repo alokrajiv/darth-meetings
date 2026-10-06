@@ -11,7 +11,7 @@ import {
   MAX_PATTERNS,
   patternMatches,
   patternsToEditor,
-  pickSeries,
+  matchingSeries,
   seriesMatches,
   validatePatterns,
   type SeriesFacts,
@@ -90,28 +90,25 @@ describe('invite patterns', () => {
   });
 });
 
-describe('pickSeries — several series match', () => {
+describe('matchingSeries — v2: a meeting is in EVERY matching series (§11.2)', () => {
   const series = [
     { id: 4, priority: 100, patterns: [{ kind: 'title', regex: '^Data' }] as SeriesPattern[] },
     { id: 9, priority: 50, patterns: [{ kind: 'title', regex: 'Data scrum' }] as SeriesPattern[] },
     { id: 2, priority: 50, patterns: [{ kind: 'title', regex: 'scrum' }] as SeriesPattern[] },
   ];
-  test('lowest priority wins, then the lowest id', () => {
-    expect(pickSeries(series, facts({ title: 'Data scrum' }))?.id).toBe(2);
-    expect(pickSeries(series, facts({ title: 'Data weekly' }))?.id).toBe(4);
-    expect(pickSeries(series, facts({ title: 'Lunch' }))).toBeNull();
+  test('all matches, ordered by priority then id (display order only)', () => {
+    expect(matchingSeries(series, facts({ title: 'Data scrum' })).map((s) => s.id)).toEqual([2, 9, 4]);
+    expect(matchingSeries(series, facts({ title: 'Data weekly' })).map((s) => s.id)).toEqual([4]);
+    expect(matchingSeries(series, facts({ title: 'Lunch' }))).toEqual([]);
   });
-  test('a FOLLOWED series beats any unfollowed one, whatever its priority (no stealing members from followers)', () => {
-    const followed = { id: 7, priority: 100, followed: true, patterns: [{ kind: 'title', regex: 'spanish' }] as SeriesPattern[] };
-    const thief = { id: 8, priority: 1, patterns: [{ kind: 'title', regex: 'spanish' }] as SeriesPattern[] };
-    expect(pickSeries([thief, followed], facts({ title: 'Good spanish perfumes (week 1)' }))?.id).toBe(7);
-    // two followed series: priority decides between them as before
-    const followed2 = { ...thief, id: 9, followed: true };
-    expect(pickSeries([followed, followed2], facts({ title: 'spanish' }))?.id).toBe(9);
+  test('no competition: a low-priority same-pattern series does not take members from another', () => {
+    const a = { id: 7, priority: 100, patterns: [{ kind: 'title', regex: 'spanish' }] as SeriesPattern[] };
+    const b = { id: 8, priority: 1, patterns: [{ kind: 'title', regex: 'spanish' }] as SeriesPattern[] };
+    expect(matchingSeries([a, b], facts({ title: 'Good spanish perfumes (week 1)' })).map((s) => s.id)).toEqual([8, 7]);
   });
-  test('an excluded series is skipped — the next winner takes it', () => {
-    expect(pickSeries(series, facts({ title: 'Data scrum' }), new Set([2]))?.id).toBe(9);
-    expect(pickSeries(series, facts({ title: 'Data scrum' }), new Set([2, 9, 4]))).toBeNull();
+  test('an excluded series is skipped — the others still match', () => {
+    expect(matchingSeries(series, facts({ title: 'Data scrum' }), new Set([2])).map((s) => s.id)).toEqual([9, 4]);
+    expect(matchingSeries(series, facts({ title: 'Data scrum' }), new Set([2, 9, 4]))).toEqual([]);
   });
 });
 

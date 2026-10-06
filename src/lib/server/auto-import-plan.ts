@@ -2,7 +2,7 @@ import 'server-only';
 import { listAutoSyncUsers, getAutoSyncLog, type AutoSyncUser, type AutoSyncLogRow } from '@/db-ops/user-prefs';
 import { getSeries, findAutoImportLogByStart, type SeriesRow, type AutoImportLogRow } from '@/db-ops/series';
 import { mergedCalendarOccurrence } from '@/db-ops/calendar-event-cache';
-import { seriesForFacts } from '@/lib/server/curated-series';
+import { autoImportSeriesForFacts } from '@/lib/server/curated-series';
 import { factsFromCalendarRow } from '@/lib/series-patterns';
 import { strongestReport, type ReportPref } from '@/lib/auto-marker';
 
@@ -87,15 +87,16 @@ export function interestedAutoSyncUsers(
 }
 
 /** The series (if any) holding an explicit auto-import setting for this
- * occurrence: the curated matcher's winner for its facts (title, invite,
- * organiser, recurring — lib/series-patterns, the same rule membership
- * uses, so the import lands in exactly this series), and only when THAT
- * series carries a setting. Curated series, 2026-10-06 (spec §7) — this
- * used to match the old evidence keys (Meet code / join URL / base id). */
+ * occurrence: among every series whose patterns match its facts (title,
+ * invite, organiser, recurring — lib/series-patterns), the first BY
+ * PRIORITY (then id) that carries a setting. v2 (spec §11.2): a meeting can
+ * be in several series, so priority is what decides which auto-import series
+ * owns an occurrence. NOT caller-scoped — automation only; whoever serves
+ * its title to a person checks canSeeSeries first. */
 export async function seriesOwnerFor(
   occ: Pick<OccurrenceFacts, 'title' | 'organizerEmail' | 'attendees' | 'recurringEventId'>
 ): Promise<SeriesRow | null> {
-  const winner = await seriesForFacts(
+  const winner = await autoImportSeriesForFacts(
     factsFromCalendarRow({
       title: occ.title ?? null,
       organizer_email: occ.organizerEmail ?? null,
@@ -103,7 +104,7 @@ export async function seriesOwnerFor(
       attendees: (occ.attendees ?? []).map((email) => ({ email })),
     })
   );
-  if (!winner?.auto_import) return null;
+  if (!winner) return null;
   return getSeries(winner.id);
 }
 

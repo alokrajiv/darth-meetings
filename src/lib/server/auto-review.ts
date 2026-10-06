@@ -73,7 +73,12 @@ export async function maybeAutoReview(
   const auto = {
     byUserId: marker.byUserId,
     byEmail: marker.byEmail,
-    source: autoSourceLabel(marker),
+    // Curated series v2 (§11.6): only the enabler (an owner/editor of the
+    // series) is told its NAME — a watcher may not be able to see it.
+    source: (to: string) =>
+      marker.source === 'series' && to.trim().toLowerCase() !== marker.byEmail.trim().toLowerCase()
+        ? 'a series auto-import'
+        : autoSourceLabel(marker),
     recipients: autoRecipients(marker),
   };
   if (row.gmeet_context?.autoReview) return; // evaluated once, ever
@@ -132,7 +137,7 @@ export async function maybeAutoReview(
         text: dm(
           `👀 *Speakers need a quick look before the notes can be written*`,
           meetingLine({ title, when: row.recorded_at ?? row.created_at, duration: row.duration, speakerCount: row.speaker_count }),
-          `Auto-imported via ${auto.source}. What blocked the automatic pass: ${blocker}.`,
+          `Auto-imported via ${auto.source(to)}. What blocked the automatic pass: ${blocker}.`,
           `Confirm the names (usually 30 seconds) and the ${pref === 'later' ? 'notes' : 'summary + detailed report'} generates itself → <${url}|Review speakers>`
         ),
         dedupeKey: `mw-needs-review:${assemblyaiId}${runKey(transcriptionId)}:${to}`,
@@ -191,7 +196,7 @@ export async function maybeAutoReview(
           `📝 *Summary + detailed report ready*`,
           meetingLine({ title, when: row.recorded_at ?? row.created_at, duration: row.duration, speakerCount: row.speaker_count }),
           ...gist,
-          `Auto-imported via ${auto.source}, ${applied.length > 0 ? `${applied.length} speaker${applied.length === 1 ? '' : 's'} identified by voice` : 'speakers already named'} → <${url}|Read the full notes>`
+          `Auto-imported via ${auto.source(to)}, ${applied.length > 0 ? `${applied.length} speaker${applied.length === 1 ? '' : 's'} identified by voice` : 'speakers already named'} → <${url}|Read the full notes>`
         ),
         dedupeKey: `mw-report-ready:${assemblyaiId}${runKey(transcriptionId)}:${to}`,
       });

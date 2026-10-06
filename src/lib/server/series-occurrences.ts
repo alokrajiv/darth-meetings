@@ -31,8 +31,7 @@ import { listConferenceRecordsByCode } from '@/lib/server/gmeet';
 import { getSeries } from '@/db-ops/series';
 import { listEmptyTranscriptDocIds } from '@/db-ops/empty-transcripts';
 import { listOwnCalendarRows, type OwnCalendarRow } from '@/db-ops/calendar-event-cache';
-import { loadCuratedSeries } from '@/lib/server/curated-series';
-import { factsFromCalendarRow, pickSeries } from '@/lib/series-patterns';
+import { factsFromCalendarRow, seriesMatches, type SeriesPattern } from '@/lib/series-patterns';
 import { importedOccurrenceMatches } from '@/lib/imported-occurrence';
 import type { GmeetAttendee } from '@/lib/format';
 
@@ -302,14 +301,15 @@ export async function sweepSeriesOccurrences(
   // Serve the external skeleton from cache when it's warm — the DB
   // cross-reference below always runs fresh, so an import made from the
   // dialog shows as imported on the very next (instant) refresh.
-  const cacheKey = `${seriesId}:${caller.userId}`;
+  // The patterns are part of the key: an edit must not serve the old grep.
+  const cacheKey = `${seriesId}:${caller.userId}:${JSON.stringify(series.patterns)}`;
   let entry = sweepCache.get(cacheKey);
   const stale = opts.forceRefresh || !entry || Date.now() - entry.at > SWEEP_TTL_MS;
   if (stale) {
     entry = {
       at: Date.now(),
       refreshedAt: Date.now(),
-      ...(await computeSweepSkeleton(series.title, seriesId, caller)),
+      ...(await computeSweepSkeleton(series.title, series.patterns, caller)),
     };
     sweepCache.set(cacheKey, entry);
   }
@@ -599,9 +599,9 @@ function attachmentsOf(row: OwnCalendarRow) {
 /**
  * The expensive external enumeration (cached ~6h per series+user):
  *
- *  1. the caller's OWN calendar rows in the sweep window whose facts the
- *     curated matcher gives to this series (same winner rule as membership,
- *     so priority fights resolve identically everywhere);
+ *  1. the caller's OWN calendar rows in the sweep window whose facts this
+ *     series' patterns match (v2: no cross-series competition — a meeting
+ *     can be in several series, spec §11.2);
  *  2. Meet conference records for those rows' codes — they ENRICH the
  *     matched rows only. A record no own-calendar row claims is dropped:
  *     Meet codes get reused (personal rooms), and "own-calendar rows only"
@@ -613,7 +613,7 @@ function attachmentsOf(row: OwnCalendarRow) {
  */
 async function computeSweepSkeleton(
   seriesTitle: string,
-  seriesId: number,
+  patterns: readonly SeriesPattern[],
   caller: { userId: string; email: string }
 ): Promise<{
   googleConnected: boolean;
@@ -628,11 +628,8 @@ async function computeSweepSkeleton(
   // ---- the caller's own calendar, through the curated matcher -------------
   const minted = await getServerAccessToken(caller.userId).catch(() => null);
   const googleConnected = Boolean(minted);
-  const [rows, allSeries] = await Promise.all([
-    listOwnCalendarRows(caller.userId, timeMin, timeMax),
-    loadCuratedSeries(),
-  ]);
-  const matched = rows.filter((r) => pickSeries(allSeries, factsFromCalendarRow(r))?.id === seriesId);
+  const rows = await listOwnCalendarRows(caller.userId, timeMin, timeMax);
+  const matched = rows.filter((r) => seriesMatches(patterns, factsFromCalendarRow(r)));
   // One occurrence per calendar instance (a re-keyed start leaves the newest).
   const byEvent = new Map<string, OwnCalendarRow>();
   for (const r of matched) byEvent.set(r.event_id, r);

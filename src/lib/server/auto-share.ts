@@ -2,8 +2,10 @@ import 'server-only';
 import { addShare, listByTranscript } from '@/db-ops/transcript-shares';
 import { removeLinkBornSharesNotIn, SHARE_ORIGIN_EVENT_LINK } from '@/db-ops/share-origin';
 import { addAuditorShares } from '@/db-ops/auditor-shares';
-import { AUDITORS, externalParties } from '@/lib/auditor-policy';
+import { externalParties } from '@/lib/auditor-policy';
 import { INTERNAL_DOMAINS } from '@/lib/internal-domains';
+import { loadAuditors } from '@/db-ops/auditors';
+import { syncSeriesForTranscript } from '@/lib/server/curated-series';
 
 // Internal domains: invitees on these are the people a meeting tied to a
 // calendar invite is shared with (and the domains share suggestions are
@@ -69,6 +71,10 @@ export function internalInvitees(
  * Every call also runs the auditor policy (`shareWithAuditors` below): an
  * outside party on the invite shares the meeting read-only with the auditors.
  *
+ * Shares move meetings into series owners' reach (docs/curated-series-spec.md
+ * §11.2), so the meeting's series are re-decided afterwards
+ * (syncSeriesForTranscript — never throws).
+ *
  * Returns how many invitee shares this call created (auditors not counted).
  */
 export async function shareWithInternalInvitees(
@@ -86,13 +92,15 @@ export async function shareWithInternalInvitees(
   await shareWithAuditors(transcriptId, ownerUserId, ownerEmail, candidates).catch((err) =>
     console.warn('[auditor-share] failed for transcript', transcriptId, err)
   );
+  await syncSeriesForTranscript(transcriptId);
   return shared;
 }
 
 /**
  * The auditor policy (lib/auditor-policy.ts): a meeting with an outside party
  * on its invite (or among who joined) is shared read-only with every auditor
- * who is not its owner. Runs wherever the invite policy runs — every import
+ * who is not its owner. Who the auditors are is the `auditors` table
+ * (migration 054, db-ops/auditors.ts) — before it exists nobody is added. Runs wherever the invite policy runs — every import
  * and every link to an event. Never touches an existing share, never re-adds
  * an auditor the meeting was taken away from. Returns the auditors added.
  */
@@ -108,7 +116,8 @@ export async function shareWithAuditors(
   );
   if (outside.length === 0) return [];
   const self = ownerEmail.trim().toLowerCase();
-  const auditors = AUDITORS.filter((a) => a.email !== self);
+  const auditors = (await loadAuditors()).filter((a) => a.email !== self);
+  if (auditors.length === 0) return [];
   const added = await addAuditorShares(transcriptId, ownerUserId, auditors);
   if (added.length > 0) {
     console.log(

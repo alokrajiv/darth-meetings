@@ -7,7 +7,9 @@
  *   - the owner is never added to their own meeting;
  *   - an existing share is never touched (ON CONFLICT DO NOTHING) and an
  *     auditor removed from the meeting is never re-added (the ledger guard);
- *   - no ledger (migration 052 not applied) → nobody is added.
+ *   - no ledger (migration 052 not applied) → nobody is added;
+ *   - WHO the auditors are is the `auditors` table (migration 054, v2 §11.3):
+ *     the policy reads it — no table, or an empty one → nobody is added.
  *
  * Over the fake postgres tag: assertions are on the SQL actually run.
  */
@@ -50,6 +52,11 @@ describe('externalParties', () => {
 
 let sql: FakeSql;
 let ledger = true;
+let auditorsTable = true;
+let auditorRows = [
+  { email: 'alok@trames.sg', name: 'Alok Rajiv' },
+  { email: 'ivan@trames.sg', name: 'Ivan Seow' },
+];
 type AutoShare = typeof import('@/lib/server/auto-share');
 let autoShare: AutoShare;
 
@@ -61,6 +68,11 @@ const emailOf = (q: RenderedQuery) =>
 
 beforeAll(async () => {
   sql = createFakeSql((q) => {
+    // 054 probe (series ownership + auditors).
+    if (q.text.includes('AS auditors') && q.text.includes('information_schema')) {
+      return [{ owner_email: 1, editors: 1, auditors: auditorsTable ? 1 : 0 }];
+    }
+    if (/FROM "[a-z_]+"\.auditors/.test(q.text)) return auditorRows;
     if (q.text.includes('information_schema.tables')) return [{ n: ledger ? 1 : 0 }];
     if (q.text.includes('information_schema.columns')) return [{ n: 1 }];
     if (SHARE_INSERT.test(q.text)) return [{ id: 1 }];
@@ -71,18 +83,33 @@ beforeAll(async () => {
   autoShare = await import('@/lib/server/auto-share');
 });
 
+function resetCaches() {
+  const g = globalThis as Record<string, unknown>;
+  for (const k of [
+    '__mwAuditorLedger',
+    '__mwShareOriginColumn',
+    '__mwSeries054',
+    '__mwAuditors',
+    '__mwCuratedSeries053',
+    '__mwCuratedSeriesCache',
+  ]) {
+    g[k] = undefined;
+  }
+}
+
 beforeEach(() => {
   sql.executed.length = 0;
   ledger = true;
-  (globalThis as { __mwAuditorLedger?: unknown }).__mwAuditorLedger = undefined;
+  auditorsTable = true;
+  auditorRows = [
+    { email: 'alok@trames.sg', name: 'Alok Rajiv' },
+    { email: 'ivan@trames.sg', name: 'Ivan Seow' },
+  ];
+  resetCaches();
 });
 
 // The probes cache on globalThis — leave nothing behind for the next file.
-afterAll(() => {
-  const g = globalThis as { __mwAuditorLedger?: unknown; __mwShareOriginColumn?: unknown };
-  g.__mwAuditorLedger = undefined;
-  g.__mwShareOriginColumn = undefined;
-});
+afterAll(() => resetCaches());
 
 describe('shareWithAuditors', () => {
   test('outside party → every auditor but the owner gets a read auditor share', async () => {
@@ -120,6 +147,24 @@ describe('shareWithAuditors', () => {
 
   test('no ledger (052 not applied) → nobody is added', async () => {
     ledger = false;
+    expect(
+      await autoShare.shareWithAuditors(42, OWNER_ID, 'kawen.koh@trames.sg', [{ email: 'x@geodis.com' }])
+    ).toEqual([]);
+    expect(shareWrites()).toHaveLength(0);
+  });
+
+  test('the auditors come from the TABLE: a third row is added, a removed row is not', async () => {
+    auditorRows = [
+      { email: 'ivan@trames.sg', name: 'Ivan Seow' },
+      { email: 'new.auditor@trames.sg', name: 'New Auditor' },
+    ];
+    const added = await autoShare.shareWithAuditors(42, OWNER_ID, 'kawen.koh@trames.sg', [{ email: 'x@geodis.com' }]);
+    expect(added).toEqual(['ivan@trames.sg', 'new.auditor@trames.sg']);
+    expect(shareWrites().map(emailOf)).not.toContain('alok@trames.sg');
+  });
+
+  test('before migration 054 (no auditors table) → nobody is added', async () => {
+    auditorsTable = false;
     expect(
       await autoShare.shareWithAuditors(42, OWNER_ID, 'kawen.koh@trames.sg', [{ email: 'x@geodis.com' }])
     ).toEqual([]);

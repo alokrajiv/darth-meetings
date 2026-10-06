@@ -1,17 +1,18 @@
 /**
- * Curated series over CALENDAR occurrences (docs/curated-series-spec.md §7),
- * over the fake postgres tag:
+ * Curated series over CALENDAR occurrences (docs/curated-series-spec.md §7,
+ * v2 §11), over the fake postgres tag:
  *
  *   - the occurrence sweep reads the caller's OWN calendar_event_cache rows
- *     and keeps the ones the matcher gives to this series (same winner rule
- *     as membership — priority decides);
+ *     and keeps the ones THIS series' patterns match (v2: no competition — a
+ *     lower-priority series matching too takes nothing away);
  *   - its imported cross-reference is the series' members: a member the
  *     caller cannot open still marks its occurrence imported (no re-import)
  *     but carries no id or title, and is never folded in as a row;
- *   - seriesOwnerFor = the matcher's winner, and only when THAT series has
- *     an auto-import setting;
- *   - seriesForOccurrences reads invitees only from the caller's own rows,
- *     and only when some series has an invite rule.
+ *   - seriesOwnerFor = the first matching series BY PRIORITY that has an
+ *     auto-import setting;
+ *   - seriesForOccurrences (the calendar chips) names only series the CALLER
+ *     may see (§11.6), and reads invitees only from the caller's own rows,
+ *     only when some visible series has an invite rule.
  */
 import { afterAll, beforeAll, beforeEach, describe, expect, mock, test } from 'bun:test';
 import {
@@ -20,6 +21,7 @@ import {
   type RenderedQuery,
 } from '../../../db-ops/__tests__/helpers/fake-sql';
 import type { SeriesPattern } from '@/lib/series-patterns';
+import { seriesWorldResponder } from './helpers/series-world';
 
 const CALLER = { userId: 'bf547379-4c7e-4e17-932e-0246e50bfe54', email: 'alok@trames.sg' };
 
@@ -65,26 +67,41 @@ const member = (id: number, eventId: string | null, accessible: boolean, start: 
   is_member: true,
 });
 
+// Every series is owned by the caller (an auditor), unless a test says
+// otherwise — visibility (§11.6) is evaluated by the world helper.
+let owners: Record<number, { email: string; userId: string; followers?: string[] }> = {};
+const world = () => ({
+  ready053: true,
+  ready054: true,
+  auditors: [CALLER.email],
+  identities: {},
+  transcripts: [],
+  series: series.map((s) => ({
+    ...s,
+    owner_email: owners[s.id]?.email ?? CALLER.email,
+    owner_user_id: owners[s.id]?.userId ?? CALLER.userId,
+    editors: [],
+    followers: owners[s.id]?.followers ?? [],
+    rules: [],
+  })),
+});
+
 function respond(q: RenderedQuery): unknown[] {
   const t = q.text;
-  if (/SELECT \* FROM "[a-z_]+"\.series WHERE id = \$1/.test(t)) {
-    const s = series.find((x) => x.id === q.params[0]);
-    return s ? [{ ...s, created_by: 'x', notes: null, description: null }] : [];
-  }
-  if (/SELECT \* FROM "[a-z_]+"\.series ORDER BY id/.test(t)) {
-    return series.map((s) => ({ ...s, created_by: 'x', notes: null, description: null }));
-  }
   if (/FROM "[a-z_]+"\.calendar_event_cache/.test(t) && t.includes('attachment_gemini_notes')) {
     return calRows;
   }
   if (t.includes('AS attendee_emails') || t.includes('AS emails')) return ownAttendees;
   if (t.includes('AS is_member')) return members;
-  return [];
+  return seriesWorldResponder(world())(q) ?? [];
 }
 
 function resetCaches() {
   const g = globalThis as Record<string, unknown>;
   g.__mwCuratedSeriesCache = undefined;
+  g.__mwCuratedSeries053 = undefined;
+  g.__mwSeries054 = undefined;
+  g.__mwAuditors = undefined;
   (g.__mwSeriesSweepCache as Map<string, unknown> | undefined)?.clear();
 }
 
@@ -117,6 +134,7 @@ beforeEach(() => {
   ];
   members = [];
   ownAttendees = [];
+  owners = {};
   sql.executed.length = 0;
   resetCaches();
 });
@@ -137,10 +155,10 @@ describe('sweepSeriesOccurrences — own calendar through the matcher', () => {
     expect(r?.occurrences.every((o) => o.hasTranscript)).toBe(true);
   });
 
-  test('priority decides which series an occurrence belongs to', async () => {
+  test('v2: another (higher-priority) series matching too takes NOTHING away — no competition', async () => {
     series.push({ id: 3, title: 'AM', patterns: [{ kind: 'title', regex: 'Daily' }], priority: 50, auto_import: null });
     const r = await occ.sweepSeriesOccurrences(1, CALLER);
-    expect(r?.occurrences).toHaveLength(0);
+    expect(r?.occurrences).toHaveLength(2);
   });
 
   test('members: an inaccessible one marks its occurrence imported with no id/title, and is never folded in', async () => {
@@ -168,15 +186,20 @@ describe('sweepSeriesOccurrences — own calendar through the matcher', () => {
 
 describe('seriesOwnerFor — the matcher decides who owns an occurrence', () => {
   const on = { enabled: true, byUserId: CALLER.userId, byEmail: CALLER.email, mode: 'both', report: 'detailed-video', since: '2026-08-01T00:00:00Z' };
-  test('the winner with a setting owns it', async () => {
+  test('the first matching series with a setting owns it', async () => {
     series[0]!.auto_import = on;
     const s = await plan.seriesOwnerFor({ title: 'AI - Daily', attendees: [], organizerEmail: null });
     expect(s?.id).toBe(1);
   });
-  test('a winner WITHOUT a setting owns nothing — a lower-priority series with one does not take over', async () => {
+  test('v2: a matching series WITHOUT a setting no longer blocks one that has a setting', async () => {
     series.push({ id: 3, title: 'All dailies', patterns: [{ kind: 'title', regex: 'Daily' }], priority: 200, auto_import: on });
     const s = await plan.seriesOwnerFor({ title: 'AI - Daily', attendees: [] });
-    expect(s).toBeNull();
+    expect(s?.id).toBe(3);
+  });
+  test('two with a setting: priority decides', async () => {
+    series[0]!.auto_import = on;
+    series.push({ id: 3, title: 'All dailies', patterns: [{ kind: 'title', regex: 'Daily' }], priority: 20, auto_import: on });
+    expect((await plan.seriesOwnerFor({ title: 'AI - Daily', attendees: [] }))?.id).toBe(3);
   });
   test('no match → no owner', async () => {
     series[0]!.auto_import = on;
@@ -184,9 +207,33 @@ describe('seriesOwnerFor — the matcher decides who owns an occurrence', () => 
   });
 });
 
+describe('seriesForOccurrences — calendar chips name only series the CALLER may see (§11.6)', () => {
+  const RADHIKA = { userId: 'cccccccc-0000-4000-8000-00000000000d', email: 'radhika@trames.sg' };
+  test('PRIVACY: a stranger to the series gets no chip — the series is never named', async () => {
+    owners = { 1: { email: 'kawen.koh@trames.sg', userId: 'kawen-id' }, 2: { email: 'kawen.koh@trames.sg', userId: 'kawen-id' } };
+    const m = await engine.seriesForOccurrences(RADHIKA, [
+      { key: 'k1', title: 'AI - Daily' },
+      { key: 'k2', title: 'Data Cadence' },
+    ]);
+    expect(m.size).toBe(0);
+    const q = sql.executed.find((x) => /^SELECT s\.id FROM/.test(x.text))!;
+    expect(q.text).toContain('owner_email = $');
+    expect(q.text).toContain('ed.email = $');
+    expect(q.text).toContain('fo.email = $');
+    expect(q.params).toContain(RADHIKA.email);
+  });
+  test('a follower sees the chip; the first VISIBLE match by priority wins', async () => {
+    owners = { 1: { email: 'kawen.koh@trames.sg', userId: 'kawen-id', followers: [RADHIKA.email] }, 2: { email: 'kawen.koh@trames.sg', userId: 'kawen-id' } };
+    series.push({ id: 3, title: 'Hidden dailies', patterns: [{ kind: 'title', regex: 'Daily' }], priority: 1, auto_import: null });
+    owners[3] = { email: 'kawen.koh@trames.sg', userId: 'kawen-id' };
+    const m = await engine.seriesForOccurrences(RADHIKA, [{ key: 'k1', title: 'AI - Daily' }]);
+    expect(m.get('k1')?.id).toBe(1); // #3 has a better priority but she cannot see it
+  });
+});
+
 describe('seriesForOccurrences — invitees only from the caller’s own calendar', () => {
   test('no invite rule anywhere → no attendee lookup at all', async () => {
-    const m = await engine.seriesForOccurrences(CALLER.userId, [
+    const m = await engine.seriesForOccurrences(CALLER, [
       { key: 'k1', title: 'AI - Daily', code: 'abc-defg-hij', startIso: '2026-10-01T01:00:00.000Z' },
     ]);
     expect(m.get('k1')?.id).toBe(1);
@@ -207,7 +254,7 @@ describe('seriesForOccurrences — invitees only from the caller’s own calenda
         emails: ['ivan@trames.sg', 'jacqueline.ng@trames.sg'],
       },
     ];
-    const m = await engine.seriesForOccurrences(CALLER.userId, [
+    const m = await engine.seriesForOccurrences(CALLER, [
       { key: 'k1', title: 'Catch-up', code: 'xyz-1', startIso: '2026-10-01T01:00:00.000Z' },
       { key: 'k2', title: 'Catch-up', attendees: ['ivan@trames.sg'] },
     ]);

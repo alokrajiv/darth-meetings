@@ -31,6 +31,7 @@ import { kickDeferredImportPoller } from '@/lib/server/deferred-import-poller';
 import { randomUUID } from 'node:crypto';
 import { identityForUser, userIdForEmail } from '@/db-ops/transcript-activity';
 import { seriesOwnerFor } from '@/lib/server/auto-import-plan';
+import { syncSeriesForTranscript } from '@/lib/server/curated-series';
 import { strongestReport, reportLabel } from '@/lib/auto-marker';
 import { getServerAccessToken } from '@/lib/server/google-oauth';
 import { executeGmeetImport } from '@/lib/server/gmeet-import-core';
@@ -618,6 +619,8 @@ export async function ensureSharedWith(assemblyaiId: string, emails: string[]): 
       console.warn('[auto-sync] share failed for', email, err);
     }
   }
+  // Shares move meetings into series owners' reach (curated series §11.2).
+  await syncSeriesForTranscript(row.id);
 }
 
 /**

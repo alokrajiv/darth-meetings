@@ -1,78 +1,171 @@
 /**
- * Who may do what to a curated series (docs/curated-series-spec.md §6, owner
- * 2026-10-06). Replaces lib/series-owner (D4's organiser-or-creator rule for
- * delete/merge of the key-based series — merge no longer exists).
+ * Who may do what to a curated series — v2, "a series runs as its OWNER"
+ * (docs/curated-series-spec.md §11.1). Replaces the v1 auditor-gated rules
+ * (followed-series edit tier, auditor-only followers).
  *
- * Following a series grants READ ACCESS to other people's meetings, so
- * everything that decides who receives that access is an auditor's act:
+ * | Who       | Sees | Edits definition | Editors + followers | Transfer | Delete |
+ * |-----------|------|------------------|---------------------|----------|--------|
+ * | owner     | yes  | yes              | yes                 | yes      | yes    |
+ * | editor    | yes  | yes              | yes                 | no       | no     |
+ * | follower  | yes  | no               | removes THEMSELVES  | no       | no     |
+ * | auditor   | yes  | only as owner/editor                   | no       | no     |
+ * | else      | NO — the series does not exist for them (404)                  |
  *
- *  - add / remove followers: auditors only (lib/auditor-policy AUDITORS);
- *    any follower may remove THEMSELVES;
- *  - edit the patterns or priority of a series that HAS followers: auditors
- *    only — otherwise anyone could widen a followed series to `.*` (or win a
- *    priority fight) and pull every meeting to its followers;
- *  - a series without followers: anyone may edit name, description,
- *    patterns, priority and labels (labels grant nothing);
- *  - delete a series: an auditor, or its creator while it has no followers;
- *  - everyone SEES every series.
+ * The safety is the REACH rule (engine): a series only matches meetings its
+ * owner can open, and followers only get the members its owner may share.
+ * Auditor-owned series reach EVERY meeting, so everyone who can change their
+ * reach or audience must be an auditor too:
+ *  - a non-auditor editor of an auditor-owned series is treated as having no
+ *    edit rights (the routes also refuse to ADD one — 400);
+ *  - only an auditor can make an auditor the owner (transfer-to).
  *
- * Pure + client-safe: the routes enforce it, the dialog greys out what the
- * caller cannot do. Unit-tested in src/lib/__tests__/series-permissions.test.ts.
+ * Pure + client-safe: the facts come from the server (who is an auditor is
+ * a DB table the client never reads — it gets `isAuditor` and these
+ * permissions from the API). Unit-tested in
+ * src/lib/__tests__/series-permissions.test.ts.
  */
 
-import { isAuditorEmail } from '@/lib/auditor-policy';
-
-export interface SeriesCaller {
-  userId: string;
-  email: string;
-}
-
-export interface SeriesPermissionFacts {
-  /** series.created_by. */
-  createdBy: string | null;
-  /** Lower-cased follower emails. */
+export interface SeriesRoleFacts {
+  ownerEmail: string | null;
+  ownerUserId?: string | null;
+  ownerIsAuditor: boolean;
+  /** Lower-cased. */
+  editorEmails: readonly string[];
+  /** Lower-cased. */
   followerEmails: readonly string[];
 }
 
-export interface SeriesPermissions {
-  isAuditor: boolean;
-  /** Patterns + priority. */
-  editMatching: boolean;
-  /** Add/remove anyone as a follower. */
-  manageFollowers: boolean;
-  /** The caller follows the series (and so may unfollow). */
-  isFollower: boolean;
-  delete: boolean;
+export interface SeriesCallerFacts {
+  callerEmail: string;
+  callerUserId?: string | null;
+  callerIsAuditor: boolean;
 }
 
-export const SERIES_FOLLOWERS_AUDITOR_ONLY =
-  'Only an auditor can add or remove followers — following gives read access to every meeting in the series';
-export const SERIES_MATCHING_AUDITOR_ONLY =
-  'This series has followers, so only an auditor can change its patterns or priority (the followers get every meeting it matches)';
-export const SERIES_DELETE_DENIED =
-  'Only an auditor, or the person who created this series while nobody follows it, can delete it';
+export type SeriesRole = 'owner' | 'editor' | 'follower' | 'auditor';
+
+export interface SeriesPermissions {
+  /** The caller's strongest role; null = cannot see the series. */
+  role: SeriesRole | null;
+  see: boolean;
+  /** Name, description, patterns, labels, priority, auto-import. */
+  edit: boolean;
+  manageEditors: boolean;
+  /** Add anyone / remove anyone as a follower. */
+  manageFollowers: boolean;
+  transfer: boolean;
+  delete: boolean;
+  isOwner: boolean;
+  isEditor: boolean;
+  isFollower: boolean;
+  isAuditor: boolean;
+  /** Auditor-owned: the series reaches every meeting (policy). */
+  ownerIsAuditor: boolean;
+}
+
+export const SERIES_EDIT_DENIED = 'Only the owner or an editor of this series can change it';
+export const SERIES_MANAGE_DENIED =
+  'Only the owner or an editor of this series can add or remove its editors and followers';
+export const SERIES_TRANSFER_DENIED = 'Only the owner of this series can hand it to someone else';
+export const SERIES_DELETE_DENIED = 'Only the owner of this series can delete it';
+export const SERIES_AUDITOR_EDITOR_ONLY =
+  'This series is owned by an auditor and reaches every meeting — its editors must be auditors too';
+export const SERIES_AUDITOR_OWNER_ONLY =
+  'Only an auditor can make an auditor the owner of a series (an auditor-owned series reaches every meeting)';
 
 const norm = (e: string | null | undefined) => (e ?? '').trim().toLowerCase();
 
-export function seriesPermissions(facts: SeriesPermissionFacts, caller: SeriesCaller): SeriesPermissions {
-  const isAuditor = isAuditorEmail(caller.email);
-  const me = norm(caller.email);
-  const isFollower = !!me && facts.followerEmails.some((f) => norm(f) === me);
+export function seriesPermissions(facts: SeriesRoleFacts, caller: SeriesCallerFacts): SeriesPermissions {
+  const me = norm(caller.callerEmail);
+  const isOwner =
+    (!!me && norm(facts.ownerEmail) === me) ||
+    (!!caller.callerUserId && !!facts.ownerUserId && caller.callerUserId === facts.ownerUserId);
+  const isEditor = !!me && facts.editorEmails.some((e) => norm(e) === me);
+  const isFollower = !!me && facts.followerEmails.some((e) => norm(e) === me);
+  const isAuditor = caller.callerIsAuditor;
+  const role: SeriesRole | null = isOwner
+    ? 'owner'
+    : isEditor
+      ? 'editor'
+      : isFollower
+        ? 'follower'
+        : isAuditor
+          ? 'auditor'
+          : null;
+  // An auditor-owned series reaches every meeting: an editor who is not an
+  // auditor (possible only if the auditors table changed under it) loses
+  // the editing rights rather than steering an org-wide reach.
+  const editorCounts = isEditor && (!facts.ownerIsAuditor || isAuditor);
+  const edit = isOwner || editorCounts;
   return {
-    isAuditor,
-    editMatching: facts.followerEmails.length === 0 || isAuditor,
-    manageFollowers: isAuditor,
+    role,
+    see: role !== null,
+    edit,
+    manageEditors: edit,
+    manageFollowers: edit,
+    transfer: isOwner,
+    delete: isOwner,
+    isOwner,
+    isEditor,
     isFollower,
-    // A followed series is an auditor's: deleting it would drop every
-    // follower's access as surely as unfollowing them.
-    delete: isAuditor || (facts.followerEmails.length === 0 && !!facts.createdBy && facts.createdBy === caller.userId),
+    isAuditor,
+    ownerIsAuditor: facts.ownerIsAuditor,
   };
 }
 
-/** May the caller remove `followerEmail` from the series? Auditors anyone,
- * everybody else only themselves. */
-export function canRemoveFollower(caller: SeriesCaller, followerEmail: string): boolean {
-  if (isAuditorEmail(caller.email)) return true;
-  const me = norm(caller.email);
-  return !!me && me === norm(followerEmail);
+/** canSeeSeries (§11.6) = owner | editor | follower | auditor. */
+export function canSeeSeries(facts: SeriesRoleFacts, caller: SeriesCallerFacts): boolean {
+  return seriesPermissions(facts, caller).see;
+}
+
+/** May the caller remove `followerEmail`? Owner/editors anyone; a follower
+ * only themselves. */
+export function canRemoveFollower(
+  facts: SeriesRoleFacts,
+  caller: SeriesCallerFacts,
+  followerEmail: string
+): boolean {
+  const p = seriesPermissions(facts, caller);
+  if (p.manageFollowers) return true;
+  const me = norm(caller.callerEmail);
+  return p.see && !!me && me === norm(followerEmail);
+}
+
+export type Verdict = { ok: true } | { ok: false; status: 403 | 400; error: string };
+
+/** May the caller make someone (auditor or not) an editor? */
+export function canAddEditor(
+  facts: SeriesRoleFacts,
+  caller: SeriesCallerFacts,
+  editorIsAuditor: boolean
+): Verdict {
+  if (!seriesPermissions(facts, caller).manageEditors) {
+    return { ok: false, status: 403, error: SERIES_MANAGE_DENIED };
+  }
+  if (facts.ownerIsAuditor && !editorIsAuditor) {
+    return { ok: false, status: 400, error: SERIES_AUDITOR_EDITOR_ONLY };
+  }
+  return { ok: true };
+}
+
+/**
+ * May the caller hand the series to a target? Owner only; an auditor target
+ * only by an auditor, and only when every editor afterwards (the old owner
+ * becomes one) is an auditor too — otherwise a non-auditor would keep
+ * editing a series that now reaches every meeting.
+ */
+export function canTransferTo(
+  facts: SeriesRoleFacts,
+  caller: SeriesCallerFacts,
+  target: { isAuditor: boolean; nonAuditorEditorsAfter: number }
+): Verdict {
+  if (!seriesPermissions(facts, caller).transfer) {
+    return { ok: false, status: 403, error: SERIES_TRANSFER_DENIED };
+  }
+  if (target.isAuditor && !caller.callerIsAuditor) {
+    return { ok: false, status: 403, error: SERIES_AUDITOR_OWNER_ONLY };
+  }
+  if (target.isAuditor && target.nonAuditorEditorsAfter > 0) {
+    return { ok: false, status: 400, error: SERIES_AUDITOR_EDITOR_ONLY };
+  }
+  return { ok: true };
 }

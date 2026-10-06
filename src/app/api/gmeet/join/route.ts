@@ -1,4 +1,5 @@
 import { NextResponse } from 'next/server';
+import { syncSeriesAfterShareChange } from '@/lib/server/curated-series';
 import { withAuth } from '@/lib/auth/with-auth';
 import { findImportedByMeetingCodes } from '@/db-ops/gmeet-sync';
 import { getAnyByAssemblyaiId } from '@/db-ops/transcripts';
@@ -116,6 +117,8 @@ export const POST = withAuth(async ({ user, request }) => {
     sharedWithPplId: null,
     access: 'edit',
   });
+  // A share can bring the meeting into a series owner's reach (§11.2).
+  syncSeriesAfterShareChange(row.id);
   console.log(
     `[gmeet/join] ${user.email} joined ${row.assemblyai_id} (proof: ${proof})`
   );

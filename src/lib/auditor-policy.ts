@@ -13,15 +13,14 @@
  *    (`auditor_share_removals`, migration 052), and an auditor removed from a
  *    meeting is never added back to it automatically.
  *
+ * WHO the auditors are lives in the database since curated series v2
+ * (migration 054 `auditors`, read through db-ops/auditors.ts loadAuditors —
+ * server only; docs/curated-series-spec.md §11.3). Edited by hand (psql).
+ *
  * Pure — shared by the server policy (lib/server/auto-share.ts), the backfill
- * (scripts/auditor-backfill.sql mirrors these lists) and the share dialog.
+ * (scripts/auditor-backfill.sql mirrors the domain lists) and the share
+ * dialog.
  */
-
-/** Who is auto-added (email lower-cased; the name is what the share row shows). */
-export const AUDITORS: ReadonlyArray<{ email: string; name: string }> = [
-  { email: 'alok@trames.sg', name: 'Alok Rajiv' },
-  { email: 'ivan@trames.sg', name: 'Ivan Seow' },
-];
 
 /** `transcript_shares.origin` of an auditor share (migration 048's column). */
 export const SHARE_ORIGIN_AUDITOR = 'auditor-external';
@@ -33,13 +32,6 @@ export const SHARE_ORIGIN_AUDITOR = 'auditor-external';
  * same "never re-added once removed" rule.
  */
 export const SHARE_ORIGIN_SERIES_FOLLOW = 'series-follow';
-
-/** Is this address an auditor? (They alone add/remove series followers and
- * edit a followed series' patterns — following grants read access.) */
-export function isAuditorEmail(email: string | null | undefined): boolean {
-  const e = (email ?? '').trim().toLowerCase();
-  return !!e && AUDITORS.some((a) => a.email === e);
-}
 
 /** Personal mailboxes: an outside party ONLY on these does not count. */
 export const PERSONAL_MAIL_DOMAINS: ReadonlySet<string> = new Set([

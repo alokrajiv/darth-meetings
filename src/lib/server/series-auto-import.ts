@@ -17,6 +17,32 @@ import { ensureSharedWith } from '@/lib/server/account-auto-sync';
 import { planForOccurrence } from '@/lib/server/auto-import-plan';
 import { reportLabel, type ReportPref } from '@/lib/auto-marker';
 import { storedReportPref } from '@/lib/report-pref';
+import { listEditors } from '@/db-ops/series-editors';
+import { auditorEmails } from '@/db-ops/auditors';
+import { seriesOwnershipReady } from '@/db-ops/series-ownership-schema';
+
+/**
+ * Curated series v2 (spec §11.7): only the series' owner or an editor may
+ * turn auto-import on, and it binds to them. A binding whose enabler has
+ * since stopped being owner/editor (removed, or the series was handed on)
+ * stops firing — the sweep records why on the series instead. On an
+ * auditor-owned series the enabling editor must be an auditor too.
+ */
+export async function enablerStillEntitled(series: SeriesRow): Promise<boolean> {
+  const cfg = series.auto_import;
+  if (!cfg) return false;
+  const by = cfg.byEmail.trim().toLowerCase();
+  if (series.owner_user_id && series.owner_user_id === cfg.byUserId) return true;
+  if (series.owner_email && series.owner_email === by) return true;
+  const editors = await listEditors([series.id]);
+  if (!editors.some((e) => e.email === by)) return false;
+  const auditors = await auditorEmails();
+  const ownerIsAuditor = !!series.owner_email && auditors.has(series.owner_email);
+  return !ownerIsAuditor || auditors.has(by);
+}
+
+export const ENABLER_NOT_ENTITLED =
+  'auto-import paused: the person who switched it on is no longer the owner or an editor of this series — one of them must switch it on again';
 
 /**
  * Series auto-import: for every series with auto_import enabled, re-run the
@@ -70,8 +96,18 @@ export async function sweepAutoImportSeries(): Promise<void> {
     console.warn('[series-auto-import] listing enabled series failed:', err);
     return;
   }
+  // Before migration 054 there are no owners/editors to check the binding
+  // against — nothing fires (the restrictive answer).
+  if (!(await seriesOwnershipReady().catch(() => false))) return;
   for (const s of list) {
     try {
+      if (!(await enablerStillEntitled(s))) {
+        if (s.auto_import && s.auto_import.lastError !== ENABLER_NOT_ENTITLED) {
+          await setSeriesAutoImport(s.id, { ...s.auto_import, lastError: ENABLER_NOT_ENTITLED });
+          console.warn(`[series-auto-import] series ${s.id}: ${ENABLER_NOT_ENTITLED} (${s.auto_import.byEmail})`);
+        }
+        continue;
+      }
       await sweepOne(s);
     } catch (err) {
       console.warn(`[series-auto-import] sweep failed for series ${s.id}:`, err);
@@ -370,7 +406,9 @@ async function notifyAutoSyncWatchers(
         kind === 'imported'
           ? `Imported — speakers are being identified; the ${reportLabel(report)} follows once they're confirmed.`
           : `Queued — the recording/transcript is still being generated. It lands on its own; nothing to do.`,
-        `Imported once, via ${cfg.byEmail}'s "${series.title}" series auto-import, and shared with you — no duplicate needed.`,
+        // Curated series v2 (§11.6): the watcher may not be able to see the
+        // series — say what happened without naming it.
+        `Imported once, via ${cfg.byEmail}'s series auto-import, and shared with you — no duplicate needed.`,
         link
       ),
       dedupeKey: `mw-autoimport:${series.id}:${o.key}:${w}`,

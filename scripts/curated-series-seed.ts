@@ -44,7 +44,7 @@ import { userIdForEmail } from '@/db-ops/transcript-activity';
 import { setSeriesLabels } from '@/lib/server/series-labels';
 import { followSeries, rematchAll } from '@/lib/server/curated-series';
 import { resolveLabelPaths } from '@/lib/server/series-api';
-import { factsFromContext, pickSeries, validatePatterns, type SeriesPattern } from '@/lib/series-patterns';
+import { factsFromContext, matchingSeries, validatePatterns, type SeriesPattern } from '@/lib/series-patterns';
 
 const argv = process.argv.slice(2);
 const APPLY = argv.includes('--apply');
@@ -279,7 +279,9 @@ async function main(): Promise<number> {
   let unmatched = 0;
   for (const r of rows) {
     const facts = factsFromContext({ title: r.title, gmeet_context: r.ctx });
-    const w = pickSeries(matchable, facts);
+    // v2 (spec §11.2): a meeting is in every matching series; the dry run
+    // counts it under the first by priority.
+    const w = matchingSeries(matchable, facts)[0];
     if (!w) {
       unmatched++;
       continue;
@@ -310,7 +312,7 @@ async function main(): Promise<number> {
       const prior = await getSeriesByTitle(s.title);
       const id = prior
         ? (await updateSeries(prior.id, { description: s.description, patterns: pats, priority: s.priority }), prior.id)
-        : (await createSeries({ userId: ACTOR.userId, title: s.title, description: s.description, patterns: pats, priority: s.priority })).id;
+        : (await createSeries({ userId: ACTOR.userId, email: ACTOR.email, title: s.title, description: s.description, patterns: pats, priority: s.priority })).id;
       ids.set(s.title, id);
       const labelIds = await resolveLabelPaths(s.labels, ACTOR);
       await setSeriesLabels(id, labelIds, ACTOR);
@@ -325,7 +327,7 @@ async function main(): Promise<number> {
   }
 
   const r = await rematchAll('seed');
-  console.log(`rematch: +${r.joined} −${r.left} moved ${r.moved}`);
+  console.log(`rematch: +${r.joined} −${r.left} (${r.changed} changed)`);
 
   const counts = await sql<Array<{ series_id: number; n: number; manual: number }>>`
     SELECT series_id, count(*)::int AS n, count(*) FILTER (WHERE how <> 'auto')::int AS manual

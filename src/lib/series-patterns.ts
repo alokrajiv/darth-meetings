@@ -19,11 +19,12 @@
  * function must judge a stored meeting, a calendar row and the browser's
  * preview identically.
  *
- * Several series match → a FOLLOWED series beats an unfollowed one, then the
- * lowest `priority` wins, then the lowest id (`pickSeries`). A meeting is in
- * at most one series. Followed-first is a privacy rule, not a preference:
- * without it anyone could create an unfollowed series with the same pattern
- * and a lower priority and quietly pull meetings away from their followers.
+ * v2 (spec §11.2): there is no competition between series. A meeting is in
+ * EVERY series whose patterns match it (and whose owner can open it — the
+ * reach rule lives in the engine, lib/server/curated-series.ts);
+ * `matchingSeries` returns all of them, ordered by `priority` then id —
+ * that order only decides which chip shows first and which auto-import
+ * series owns an occurrence.
  *
  * Pure + client-safe (unit-tested in src/lib/__tests__/series-patterns.test.ts).
  */
@@ -273,35 +274,27 @@ export interface MatchableSeries {
   id: number;
   priority: number;
   patterns: readonly SeriesPattern[];
-  /** Has at least one follower. Only an auditor can change who follows or
-   * what a followed series matches (lib/series-permissions). */
-  followed?: boolean;
 }
 
-/** Followed first, then the lowest priority, then the lowest id — one total
- * order, so every caller (membership, calendar chips, auto-import) picks the
- * same series. */
-export function compareSeriesPrecedence(a: MatchableSeries, b: MatchableSeries): number {
-  return Number(!!b.followed) - Number(!!a.followed) || a.priority - b.priority || a.id - b.id;
+/** Display / tie-break order: the lowest priority, then the lowest id. */
+export function compareSeriesOrder(a: MatchableSeries, b: MatchableSeries): number {
+  return a.priority - b.priority || a.id - b.id;
 }
 
 /**
- * The series a meeting belongs to by its patterns: the winner among every
- * matching series, skipping the ones it was excluded from ("not this
- * series" — a human answer that beats the patterns). null = none.
+ * Every series whose patterns match these facts, skipping the ones the
+ * meeting was excluded from ("not this series" — a human answer that beats
+ * the patterns), in `compareSeriesOrder`. Reach (whose meetings a series may
+ * hold) is NOT applied here — that is the engine's job.
  */
-export function pickSeries<T extends MatchableSeries>(
+export function matchingSeries<T extends MatchableSeries>(
   series: readonly T[],
   facts: SeriesFacts,
   excluded?: ReadonlySet<number>
-): T | null {
-  let best: T | null = null;
-  for (const s of series) {
-    if (excluded?.has(s.id)) continue;
-    if (!seriesMatches(s.patterns, facts)) continue;
-    if (!best || compareSeriesPrecedence(s, best) < 0) best = s;
-  }
-  return best;
+): T[] {
+  return series
+    .filter((s) => !excluded?.has(s.id) && seriesMatches(s.patterns, facts))
+    .sort(compareSeriesOrder);
 }
 
 /** The slice of gmeet_context the matcher reads. */
