@@ -237,3 +237,30 @@ occurrence-counts, retro-attach), app/api/transcripts/[id]/series; UI app/series
 components/series-dialog.tsx, components/series-badge.tsx, transcript page 344/3080/4196,
 transcript-table 2082/2666, calendar-meeting-rows 621; CLI cli-subcommand-src/index.ts
 2497-2574.
+
+## 10. As built (2026-10-06, rolled out 19:29–19:40 SGT)
+
+Commits 96f111f (A) · 420f8ad (B) · bee50a3 (C) · 38a8ad2 (D) · e8bd385 (review fixes).
+Migration 053 applied 19:29 SGT; deployed e8bd385 (blue); reset removed 57 series /
+383 members / 221 keys / 42 `Series/*` labels (365 assignments) / 40 rules; seed
+created #66–#83 (318 members, 82 new follow shares for alok@, 315 rule labels — the
+18 LP-Global rows already carried the same label by hand).
+
+Deviations from §1–§8 decided in review (all privacy-motivated):
+- A FOLLOWED series beats any unfollowed series in a match, regardless of priority
+  (`compareSeriesPrecedence`) — otherwise anyone could steal members from followers
+  with a same-pattern, lower-priority series. Follow/unfollow re-runs matching.
+- Deleting a followed series is auditor-only (its creator could otherwise drop the
+  followers' access).
+- A person taking a meeting out of a followed series ("not this series", or moving it
+  by hand) records the lost follow shares in `auditor_share_removals`
+  (origin `series-follow`, removed_by = that person). A detach the patterns undo at
+  once is not recorded.
+- `POST /api/series/preview`: the org-wide `matched` count goes to auditors only
+  (null for others) — a regex + a global count is an existence oracle.
+- Builder's own (see its commit messages): catastrophic-backtracking regexes refused;
+  merge / retro-attach answer 410; suspected-series columns always NULL; `Series` root
+  label removed by the reset.
+
+Not verified: the UI in a browser; the first auto-import sweep over the curated
+series (fire-once log was reset — watch for duplicate imports on the first pass).
