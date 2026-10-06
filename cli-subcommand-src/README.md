@@ -33,6 +33,13 @@ back) and the calling agent brings the intelligence with its own tokens.
 | `speakers <id>` | `GET /api/transcripts/:id` + `GET /api/transcripts/:id/speakers` → one line per diarized speaker: confirmed name or guess (name, confidence, source, id-pass) + the pass status |
 | `set-speakers <id> A=Name …  [--clear]` | `GET` then `PUT /api/transcripts/:id/speakers {speakerLabels}` — merges into the existing labels (`--clear` drops them first); the server enrols voiceprints from confirmed names |
 | `notify` / `notify <kind> on\|off` | `GET` / `PUT /api/notify-prefs` — settings writes (this and `auto-sync off\|mine\|all`) require `--i-have-got-consent-from-human-user` |
+| `series` / `series <id>` | `GET /api/series` / `GET /api/series/:id` — every curated series (everyone sees every series); members listed only when the caller can open them |
+| `series preview --pattern <re>… [--invite-all …]` | `POST /api/series/preview {patterns}` → `{matched, visibleToYou, sample}`; `matched` (org-wide) is null unless the caller is an auditor |
+| `series create --title … [--pattern <re>]… [--label <path>]… [--priority N] [--follower <email>]… [--from <id>]` | `POST /api/series {title, description?, patterns, priority?, labels?, followers?, fromTranscriptId?}` — `--pattern` values are NOT comma-split (regexes contain commas); `--invite-all/--invite-any/--internal-only/--recurring-only/--max-people` build one invite pattern; followers = auditors only (403) |
+| `series set <id> [--pattern …|--clear-patterns] [--label …|--clear-labels] [--priority N] [--title/--description/--notes] [--auto-import on\|off …]` | `PATCH /api/series/:id` — `--pattern` REPLACES all patterns, `--label` REPLACES the default labels; patterns/priority of a FOLLOWED series: auditors only (403) |
+| `series follow <id> <email> [--name]` / `series unfollow <id> <email>` | `POST /api/series/:id/followers {email,name?}` (auditors only) / `DELETE /api/series/:id/followers?email=` (auditors: anyone; others: themselves) |
+| `series delete <id>` | `DELETE /api/series/:id` — creator while unfollowed, or an auditor |
+| `series attach\|detach <id> <transcript-id> [--remember]` | `POST /api/series/:id/members {transcriptId}` / `DELETE /api/series/:id/members?transcriptId=&remember=1` — owner or editor of the meeting |
 | `labels` | `GET /api/labels?counts=1` — human = indented tree (`name (count_visible · n direct) #id color`), `--json` = the flat `labels` array verbatim |
 | `label <id> <label>` | resolve `<label>` against `GET /api/labels`; if the path is new → `POST /api/labels {path}` (prints `created …` per segment); then `POST /api/transcripts/:id/labels {labelId}` |
 | `unlabel <id> <label>` | resolve → `DELETE /api/transcripts/:id/labels/:labelId` |

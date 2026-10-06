@@ -99,6 +99,10 @@ READ
                                   how many of its meetings YOU can open
   series <id>                     One series: description, patterns, labels,
                                   followers, auto-import, members you can open
+  series preview --pattern <regex> [--pattern …] [--invite-all a@x,b@y]
+                                  What these patterns would catch among the
+                                  meetings YOU can open (auditors also get the
+                                  org-wide count). Changes nothing
   notify                          Your Slack DM notification switches, one
                                   line per kind (opt-out: on unless turned off)
   offline plan [<id,…>]           What the web app keeps offline for you under
@@ -216,13 +220,32 @@ WRITE (needs read+write for meetings)
                                   Prints the transcript id + the stable
                                   /m/<uuid> link. --wait polls until the
                                   import completes (default cap 30 min)
+  series create --title <t> [--description <d>] [--pattern <regex>]…
+             [--invite-all a@x,b@y [--invite-any …] [--internal-only]
+              [--recurring-only] [--max-people N]] [--label <path>]…
+             [--priority N] [--follower <email>]… [--from <transcript-id>]
+                                  A curated series: every meeting whose calendar
+                                  title matches ANY --pattern (case-insensitive
+                                  JS regex) joins it and gets every --label
+                                  (missing label paths are created). Anyone can
+                                  create; --follower is auditors only
   series set <id> [--title <t>] [--description <d>] [--notes <md>]
+             [--pattern <regex>]… [--clear-patterns] [--label <path>]…
+             [--clear-labels] [--priority N]
              [--auto-import on|off] [--mode transcript|video|both]
              [--report detailed-video|detailed-text|later]
-                                  Rename / describe / configure auto-import
-                                  (on = future occurrences import on their own
-                                  under YOUR Google link). Patterns, labels and
-                                  followers are edited in the web UI (/series)
+                                  Edit a series. --pattern REPLACES all its
+                                  patterns, --label REPLACES its default labels.
+                                  A series WITH followers: only an auditor may
+                                  change patterns/priority (403 otherwise).
+                                  Auto-import on = future occurrences import on
+                                  their own under YOUR Google link
+  series follow <id> <email> [--name <n>]   Auditors only: <email> gets a
+                                  read share of every meeting in the series,
+                                  past and future
+  series unfollow <id> <email>    Auditors: anyone; everyone else: themselves
+  series delete <id>              Delete a series (its creator while nobody
+                                  follows it, or an auditor). The meetings stay
   series attach <id> <transcript-id>   Put a meeting you own or edit in the
                                   series by hand (stays even when its patterns
                                   stop matching)
@@ -1607,6 +1630,43 @@ function allFlagValues(argv: string[], name: string): string[] {
   return out;
 }
 
+/** Like allFlagValues but WITHOUT the comma split — a title regex such as
+ * `^Weekly MCAP, SL` is one value. */
+function allFlagValuesRaw(argv: string[], name: string): string[] {
+  const out: string[] = [];
+  for (let i = 0; i < argv.length; i++) {
+    const a = argv[i];
+    if (a === "--") break;
+    if (a === `--${name}`) { const n = argv[i + 1]; if (n !== undefined && !n.startsWith("--")) { out.push(n); i++; } }
+    else if (a.startsWith(`--${name}=`)) out.push(a.slice(name.length + 3));
+  }
+  return out;
+}
+
+/**
+ * Series patterns from the command line: every `--pattern <regex>` is a title
+ * pattern; `--invite-all a@x,b@y` (+ `--invite-any`, `--internal-only`,
+ * `--recurring-only`, `--max-people N`) adds ONE invite pattern. Returns null
+ * when no pattern flag was given at all (= leave the patterns alone).
+ */
+function patternsFromFlags(argv: string[], flags: Record<string, string | boolean>): any[] | null {
+  const titles = allFlagValuesRaw(argv, "pattern").map((regex) => ({ kind: "title", regex }));
+  const all = allFlagValues(argv, "invite-all");
+  const pats: any[] = [...titles];
+  if (all.length) {
+    const inv: any = { kind: "invite", all };
+    const any = allFlagValues(argv, "invite-any");
+    if (any.length) inv.any = any;
+    if (flags["internal-only"] === true) inv.internalOnly = true;
+    if (flags["recurring-only"] === true) inv.recurringOnly = true;
+    const max = str(flags["max-people"]);
+    if (max !== undefined) inv.maxPeople = Number(max);
+    pats.push(inv);
+  }
+  if (!pats.length && flags["clear-patterns"] !== true) return null;
+  return pats;
+}
+
 const MAX_SHARED_CALENDARS = 5;
 
 async function calendarAll(ctx: Ctx, flags: Record<string, string | boolean>, calendars: string[] = []): Promise<number> {
@@ -2541,15 +2601,69 @@ const meetings: Subcommand = {
           });
           return 0;
         }
+        // -- preview (read-only) -------------------------------------------
+        if (sub === "preview") {
+          const patterns = patternsFromFlags(argv, flags);
+          if (!patterns?.length) { console.error("usage: darth-cli meetings series preview --pattern <regex> [--pattern …] [--invite-all a@x,b@y …]"); return 1; }
+          const data = await ctx.expectJson<any>(ctx.api("meetings", `/api/series/preview`, { method: "POST", body: JSON.stringify({ patterns }) }));
+          ctx.print(data, () => {
+            console.log(data.matched !== null && data.matched !== undefined
+              ? `${data.matched} meeting(s) match org-wide · ${data.visibleToYou} you can open`
+              : `${data.visibleToYou} of the meetings you can open match`);
+            for (const m of data.sample ?? []) console.log(`  ${m.assemblyai_id}  ${String(m.when ?? "").slice(0, 10)}  ${m.title ?? ""}`);
+          });
+          return 0;
+        }
         // -- mutations ----------------------------------------------------
         ctx.requireWrite();
+        if (sub === "create") {
+          const title = str(flags.title);
+          if (!title) { console.error("usage: darth-cli meetings series create --title <t> [--description <d>] [--pattern <regex>]… [--label <path>]… [--priority N] [--follower <email>]… [--from <transcript-id>]"); return 1; }
+          const body: any = { title, patterns: patternsFromFlags(argv, flags) ?? [] };
+          if (str(flags.description) !== undefined) body.description = str(flags.description);
+          if (str(flags.priority) !== undefined) body.priority = Number(str(flags.priority));
+          const labels = allFlagValuesRaw(argv, "label");
+          if (labels.length) body.labels = labels;
+          const followers = allFlagValues(argv, "follower");
+          if (followers.length) body.followers = followers.map((email) => ({ email }));
+          if (str(flags.from)) body.fromTranscriptId = str(flags.from);
+          const data = await ctx.expectJson<any>(ctx.api("meetings", `/api/series`, { method: "POST", body: JSON.stringify(body) }));
+          ctx.print(data, () => console.log(`Created series #${data.series.id} "${data.series.title}" — 'series ${data.series.id}' shows what it caught.`));
+          return 0;
+        }
+        if (sub === "delete") {
+          const id = asId(args[1]);
+          if (!id) { console.error("usage: darth-cli meetings series delete <id>"); return 1; }
+          await ctx.expectJson(ctx.api("meetings", `/api/series/${id}`, { method: "DELETE" }));
+          if (!ctx.json) console.log("Deleted — its meetings are untouched; their series labels and follow shares came off.");
+          return 0;
+        }
+        if (sub === "follow" || sub === "unfollow") {
+          const id = asId(args[1]); const email = args[2]?.trim().toLowerCase();
+          if (!id || !email) { console.error(`usage: darth-cli meetings series ${sub} <series-id> <email>${sub === "follow" ? " [--name <n>]" : ""}`); return 1; }
+          if (sub === "follow") {
+            const r = await ctx.expectJson<any>(ctx.api("meetings", `/api/series/${id}/followers`, {
+              method: "POST", body: JSON.stringify({ email, ...(str(flags.name) ? { name: str(flags.name) } : {}) }) }));
+            ctx.print(r, () => console.log(`${email} follows series #${id} — ${r.shares} meeting(s) shared read-only.`));
+          } else {
+            const r = await ctx.expectJson<any>(ctx.api("meetings", `/api/series/${id}/followers?${new URLSearchParams({ email })}`, { method: "DELETE" }));
+            ctx.print(r, () => console.log(`${email} unfollowed series #${id} — ${r.shares} follow share(s) removed.`));
+          }
+          return 0;
+        }
         if (sub === "set") {
           const id = asId(args[1]);
-          if (!id) { console.error("usage: darth-cli meetings series set <id> [--title <t>] [--description <d>] [--notes <md>] [--auto-import on|off] [--mode ...] [--report detailed-video|detailed-text|later]"); return 1; }
+          if (!id) { console.error("usage: darth-cli meetings series set <id> [--title <t>] [--description <d>] [--notes <md>] [--pattern <regex>]… [--clear-patterns] [--label <path>]… [--clear-labels] [--priority N] [--auto-import on|off] [--mode ...] [--report detailed-video|detailed-text|later]"); return 1; }
           const body: any = {};
           if (str(flags.title) !== undefined) body.title = str(flags.title);
           if (str(flags.description) !== undefined) body.description = str(flags.description);
           if (str(flags.notes) !== undefined) body.notes = str(flags.notes);
+          const patterns = patternsFromFlags(argv, flags);
+          if (patterns) body.patterns = patterns; // replaces ALL patterns
+          const labels = allFlagValuesRaw(argv, "label");
+          if (labels.length) body.labels = labels; // replaces the default labels
+          else if (flags["clear-labels"] === true) body.labels = [];
+          if (str(flags.priority) !== undefined) body.priority = Number(str(flags.priority));
           const ai = str(flags["auto-import"]);
           if (ai !== undefined) {
             if (ai !== "on" && ai !== "off") { console.error("--auto-import must be on or off"); return 1; }
@@ -2558,7 +2672,7 @@ const meetings: Subcommand = {
             if (mode) body.autoImport.mode = mode;
             if (report) body.autoImport.report = report;
           }
-          if (!Object.keys(body).length) { console.error("nothing to change — pass --title/--description/--notes/--auto-import"); return 1; }
+          if (!Object.keys(body).length) { console.error("nothing to change — pass --title/--description/--notes/--pattern/--label/--priority/--auto-import"); return 1; }
           await ctx.expectJson(ctx.api("meetings", `/api/series/${id}`, { method: "PATCH", body: JSON.stringify(body) }));
           if (!ctx.json) console.log("Updated.");
           return 0;
@@ -2582,7 +2696,7 @@ const meetings: Subcommand = {
           }
           return 0;
         }
-        console.error(`unknown series subcommand '${sub}' — try: series | series <id> | set | attach | detach`);
+        console.error(`unknown series subcommand '${sub}' — try: series | series <id> | preview | create | set | attach | detach | follow | unfollow | delete`);
         return 1;
       }
 
