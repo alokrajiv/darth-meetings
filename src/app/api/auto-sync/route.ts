@@ -18,6 +18,7 @@ import { getGoogleAccount } from '@/db-ops/google-accounts';
 import { listSeriesWithAutoImport, seriesWithCallerMembers, visibleSeriesIds } from '@/db-ops/series';
 import { isAuditor } from '@/db-ops/auditors';
 import { seriesOwnershipReady } from '@/db-ops/series-ownership-schema';
+import { gateCliSettingsWrite } from '@/lib/auth/consent';
 
 export const runtime = 'nodejs';
 
@@ -85,8 +86,10 @@ export const GET = withAuth(async ({ user }) => {
  *     tiers since 2026-09-21),
  *   providers?: { gmeet?: bool, teams?: bool } }
  * Turning it on stamps `since = now()` — history is never backfilled.
+ * A darth-cli (dth_) caller needs a `meetings:settings` consent
+ * (x-darth-consent-id + x-darth-consent; lib/auth/consent.ts).
  */
-export const PUT = withAuth(async ({ user, request }) => {
+export const PUT = withAuth(async ({ user, request, cliScope }) => {
   let body: {
     scope?: unknown;
     mode?: unknown;
@@ -132,6 +135,10 @@ export const PUT = withAuth(async ({ user, request }) => {
     if (typeof p.teams === 'boolean') providers.teams = p.teams;
     patch.providers = providers;
   }
+  // darth-cli callers need a human-approved `meetings:settings` consent
+  // (consents CONTRACT §4); the web UI (cookie) is not gated.
+  const refused = await gateCliSettingsWrite({ request, user, cliScope }, 'auto-sync');
+  if (refused) return refused;
   if (body.setupReviewed === true) {
     await markSetupReviewed({ userId: user.userId, email: user.email });
   } else if (body.dismissAnnounce === true) {

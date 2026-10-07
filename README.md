@@ -45,6 +45,17 @@ old bearer bypass; read-scope tokens stay GET-only. `/login` forwards to auth,
 link (`${DARTH_AUTH_URL}/logout?returnTo=`). No clonetrooper, no kenoby JWT,
 no `CLONETROOPER_*` env; grants are edited in darth-admin.
 
+**Consents (2026-10-07, family consents CONTRACT §4).** The account-settings
+writes — `PUT /api/auto-sync`, `PUT /api/notify-prefs`, `PUT /api/offline/prefs`
+— from a darth-cli (`dth_`) caller need a human-approved `meetings:settings`
+consent (target `-`): headers `x-darth-consent-id` + `x-darth-consent` (darth-cli
+sends them from `--consent '<dcon_id>: <text>'`), verified on every request at
+`${DARTH_AUTH_INTERNAL_URL}/api/consents/verify` (5 s, never cached). Missing →
+400 `consent_required` with the ready `darth-cli consent request …` command;
+refused → 409 `consent_refused` (auth's reason/text/scope); auth unreachable →
+503 `consent_unverifiable` (fail closed). Web (cookie) callers are not gated.
+Helper: `src/lib/auth/consent.ts`.
+
 What **this** member owns / consumes:
 
 - **Owns** the Google account link (per-user OAuth, Settings page) and the

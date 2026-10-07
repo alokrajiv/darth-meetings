@@ -306,10 +306,15 @@ WRITE (needs read+write for meetings)
   skill                           Print the agent workflow guide
 
 ACCOUNT-SETTINGS writes ('auto-sync off|mine|all', 'notify <kind> on|off',
-'offline prefs --set')
-additionally require --i-have-got-consent-from-human-user: pass it ONLY when
-the human user explicitly asked for that exact settings change — never on
-your own initiative (same contract as the slack-* verbs).
+'offline prefs --set') need a consent the human approved on darth-auth:
+  --consent '<dcon_id>: <approved text>'   (ONE argument, the sentence verbatim)
+Without it the verb prints the request command and exits 6:
+  darth-cli consent request --service meetings --action settings --target - \\
+    --text 'Change my Darth Meetings settings (<area>) as <you> asked'
+Ask for one ONLY when the human explicitly asked for that exact settings
+change — never on your own initiative. The old
+--i-have-got-consent-from-human-user flag is retired (exit 6).
+'darth-cli consent skill' explains the whole flow.
 
 FILTERS (list / search / export / calendar — all AND together; a comma
 inside one value = OR; matching is case-insensitive substring)
@@ -552,6 +557,17 @@ Use them in set-report markdown to produce rich, clickable reports.
   leaves everyone's listings. Permanent delete is web-only, on purpose.
 - Write commands need a read+write token for meetings; on a 403, tell your
   human to re-run 'darth-cli login' and pick Read + write.
+- ACCOUNT SETTINGS ('auto-sync off|mine|all', 'notify <kind> on|off',
+  'offline prefs --set') change how the service behaves for your human long
+  after this session. Never touch them on your own initiative. When the human
+  explicitly asks for one, the verb (without a consent) exits 6 and prints
+    darth-cli consent request --service meetings --action settings --target - --text '…'
+  Run that, tell the human what you asked for and where to approve it, then
+  'darth-cli consent check <id> --wait 600', and re-run the verb with the
+  EXACT --consent '<id>: <approved text>' the request printed (the human may
+  have edited the sentence — use theirs; a revoked/denied consent means stop).
+  Never paraphrase it, never put it in an env var or a file. The old
+  --i-have-got-consent-from-human-user flag is retired (exit 6).
 `;
 
 /** "754000" | "12:34" | "1:02:03" → milliseconds. */
@@ -648,16 +664,55 @@ function localTz(ctx: Ctx): string {
  * false, anything else was a swallowed positional → hand it back to `pos`
  * and set the flag true.
  */
-const CONSENT_FLAG = "i-have-got-consent-from-human-user";
+/** The pre-consents bare flag. Retired (consents CONTRACT §5): kept only so
+ * the boolean lift still frees a swallowed positional and the verb can say
+ * the flag is gone instead of failing on something else. */
+const RETIRED_CONSENT_FLAG = "i-have-got-consent-from-human-user";
+/** Family-wide exit code for "a human-approved consent is needed" (CONTRACT §0). */
+const CONSENT_EXIT = 6;
 
-/** Account-settings writes (auto-sync, notify) change how the service
- * behaves for the human LONG after this session — an agent must never flip
- * them on its own initiative. Same contract as darth-cli's slack-* verbs. */
-function requireConsent(flags: Record<string, string | boolean>, what: string): boolean {
-  if (flags[CONSENT_FLAG] === true) return true;
+type SettingsArea = "auto-sync" | "notifications" | "offline prefs";
+
+/** `ctx.consent` — set by darth-cli core (≥0.77.0) from `--consent '<id>: <text>'`;
+ * read defensively so this file still builds against an older core. */
+function consentOf(ctx: Ctx): { id: string; text: string } | null {
+  return (ctx as Ctx & { consent?: { id: string; text: string } | null }).consent ?? null;
+}
+
+/** Same sentence the server suggests (src/lib/auth/consent.ts settingsSuggestedText):
+ * first word of the caller's mailbox, capitalised. */
+function settingsConsentText(ctx: Ctx, area: SettingsArea): string {
+  const first = ((ctx.config.email || "").split("@")[0] || "").split(/[._+-]/)[0] || "";
+  const who = first ? first[0].toUpperCase() + first.slice(1) : "the user";
+  return `Change my Darth Meetings settings (${area}) as ${who} asked`;
+}
+
+function settingsConsentRequest(ctx: Ctx, area: SettingsArea): string {
+  const text = settingsConsentText(ctx, area).replace(/'/g, `'\\''`);
+  return `darth-cli consent request --service meetings --action settings --target - --text '${text}'`;
+}
+
+/** Account-settings writes (auto-sync, notify, offline prefs) change how the
+ * service behaves for the human LONG after this session — they need a consent
+ * the human approved on darth-auth (`meetings:settings`). With `--consent`
+ * (ctx.consent) the request goes out and the server verifies it; without one
+ * (or with the retired bare flag) print the request command and exit 6. */
+function requireConsent(ctx: Ctx, flags: Record<string, string | boolean>, area: SettingsArea): boolean {
+  const request = settingsConsentRequest(ctx, area);
+  if (flags[RETIRED_CONSENT_FLAG] !== undefined) {
+    console.error(
+      `--${RETIRED_CONSENT_FLAG}: this flag is retired — this verb now needs ` +
+        `--consent '<dcon_id>: <text>' (run: ${request})\n` +
+        `then re-run this command with --consent '<id>: <approved text>' exactly as the request printed it.`
+    );
+    return false;
+  }
+  if (consentOf(ctx)) return true;
   console.error(
-    `Changing ${what} is an account-settings write. Re-run with --${CONSENT_FLAG}\n` +
-      `ONLY if the human user explicitly asked for this exact change.`
+    `Changing ${area} is an account-settings write: this verb needs --consent '<dcon_id>: <text>' ` +
+      `(run: ${request})\n` +
+      `then re-run this command with --consent '<id>: <approved text>' exactly as the request printed it. ` +
+      `Ask for it ONLY when the human explicitly asked for this exact change.`
   );
   return false;
 }
@@ -2161,7 +2216,7 @@ const meetings: Subcommand = {
   help: HELP,
   async run(ctx, argv) {
     const { pos, flags } = parseArgs(argv);
-    liftBoolFlags(pos, flags, ["cascade", "exact", "cached", "details", "wait", "clear", "scratch", "resume", "separate", CONSENT_FLAG]);
+    liftBoolFlags(pos, flags, ["cascade", "exact", "cached", "details", "wait", "clear", "scratch", "resume", "separate", RETIRED_CONSENT_FLAG]);
     const [, cmd, ...args] = pos.length && pos[0] === "meetings" ? pos : ["", ...pos];
     if (cmd === "recordings") return recordingsCmd(ctx, flags, args);
     if (!cmd || flags.help === true) { console.log(HELP); return 0; }
@@ -2220,7 +2275,7 @@ const meetings: Subcommand = {
         }
         ctx.requireWrite();
         if (!["off", "mine", "all"].includes(sub)) { console.error("usage: darth-cli meetings auto-sync [explain <ref>] [off|mine|all] [--mode ...] [--report detailed-video|detailed-text|later] [--gmeet on|off] [--teams on|off]"); return 1; }
-        if (!requireConsent(flags, "account auto-sync")) return 1;
+        if (!requireConsent(ctx, flags, "auto-sync")) return CONSENT_EXIT;
         const body: any = { scope: sub };
         const mode = str(flags.mode); const report = str(flags.report);
         if (mode) body.mode = mode;
@@ -2259,7 +2314,7 @@ const meetings: Subcommand = {
           console.error(`usage: darth-cli meetings notify [<kind> on|off]   kinds: ${kinds.join(", ")}`);
           return 1;
         }
-        if (!requireConsent(flags, `the '${sub}' notification setting`)) return 1;
+        if (!requireConsent(ctx, flags, "notifications")) return CONSENT_EXIT;
         const data = await ctx.expectJson<any>(
           ctx.api("meetings", "/api/notify-prefs", {
             method: "PUT",
@@ -2324,7 +2379,7 @@ const meetings: Subcommand = {
             ctx.print(data, () => {
               console.log(`offline auto-pin counts (newest N meetings every device of this account keeps offline):`);
               for (const k of OFFLINE_KEYS) console.log(`  ${k.padEnd(12)} ${String(data.prefs?.[k] ?? "?").padStart(4)}   (default ${data.defaults?.[k] ?? "?"}, max ${data.max?.[k] ?? "?"})`);
-              console.log(`change: darth-cli meetings offline prefs --set transcripts=200,audio=20 --${CONSENT_FLAG}`);
+              console.log(`change: darth-cli meetings offline prefs --set transcripts=200,audio=20 --consent '<dcon_id>: <approved text>'   (get one: ${settingsConsentRequest(ctx, "offline prefs")})`);
             });
             return 0;
           }
@@ -2341,7 +2396,7 @@ const meetings: Subcommand = {
           }
           if (!Object.keys(patch).length) { console.error(`usage: darth-cli meetings offline prefs --set <key>=<count>[,…]   keys: ${OFFLINE_KEYS.join(", ")}`); return 1; }
           ctx.requireWrite();
-          if (!requireConsent(flags, "the offline auto-pin counts")) return 1;
+          if (!requireConsent(ctx, flags, "offline prefs")) return CONSENT_EXIT;
           const data = await ctx.expectJson<any>(ctx.api("meetings", "/api/offline/prefs", { method: "PUT", body: JSON.stringify(patch) }));
           ctx.print(data, () => console.log(`offline auto-pin counts: ${fmtPrefs(data.prefs)}  (values above the cap are clamped: max ${fmtPrefs(data.max)})`));
           return 0;

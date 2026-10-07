@@ -6,6 +6,7 @@ import {
   DEFAULT_OFFLINE_PREFS,
   OFFLINE_PREFS_MAX,
 } from '@/db-ops/user-prefs';
+import { gateCliSettingsWrite } from '@/lib/auth/consent';
 
 export const runtime = 'nodejs';
 
@@ -21,13 +22,16 @@ export const runtime = 'nodejs';
  * removed 2026-10-02"). Callers: darth-cli `offline prefs`
  * (cli-subcommand-src/index.ts) and, later, the desktop shell's replica.
  * The keys live in user_prefs.offline_prefs (migration 040).
+ *
+ * The PUT from darth-cli (dth_) needs a `meetings:settings` consent
+ * (x-darth-consent-id + x-darth-consent; lib/auth/consent.ts).
  */
 export const GET = withAuth(async ({ user }) => {
   const prefs = await getOfflinePrefs(user.userId);
   return NextResponse.json({ prefs, defaults: DEFAULT_OFFLINE_PREFS, max: OFFLINE_PREFS_MAX });
 });
 
-export const PUT = withAuth(async ({ user, request }) => {
+export const PUT = withAuth(async ({ user, request, cliScope }) => {
   let body: Record<string, unknown>;
   try {
     body = (await request.json()) as Record<string, unknown>;
@@ -43,6 +47,8 @@ export const PUT = withAuth(async ({ user, request }) => {
     }
     patch[k] = n;
   }
+  const refused = await gateCliSettingsWrite({ request, user, cliScope }, 'offline prefs');
+  if (refused) return refused;
   const prefs = await setOfflinePrefs({ userId: user.userId, email: user.email }, patch);
   return NextResponse.json({ prefs, defaults: DEFAULT_OFFLINE_PREFS, max: OFFLINE_PREFS_MAX });
 });
