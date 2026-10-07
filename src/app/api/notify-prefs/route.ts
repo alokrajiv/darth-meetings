@@ -7,6 +7,7 @@ import {
   NOTIFY_KIND_LABELS,
   type NotifyPrefs,
 } from '@/db-ops/notify-prefs';
+import { gateCliSettingsWrite } from '@/lib/auth/consent';
 
 export const runtime = 'nodejs';
 
@@ -16,8 +17,12 @@ export const GET = withAuth(async ({ user }) => {
   return NextResponse.json({ prefs, kinds: NOTIFY_KINDS, labels: NOTIFY_KIND_LABELS });
 });
 
-/** PUT /api/notify-prefs — partial update, body { prefs: { kind: bool } }. */
-export const PUT = withAuth(async ({ user, request }) => {
+/**
+ * PUT /api/notify-prefs — partial update, body { prefs: { kind: bool } }.
+ * A darth-cli (dth_) caller needs a `meetings:settings` consent
+ * (x-darth-consent-id + x-darth-consent; lib/auth/consent.ts).
+ */
+export const PUT = withAuth(async ({ user, request, cliScope }) => {
   let body: { prefs?: Partial<NotifyPrefs> };
   try {
     body = (await request.json()) as typeof body;
@@ -27,6 +32,8 @@ export const PUT = withAuth(async ({ user, request }) => {
   if (!body.prefs || typeof body.prefs !== 'object') {
     return NextResponse.json({ error: 'prefs object required' }, { status: 400 });
   }
+  const refused = await gateCliSettingsWrite({ request, user, cliScope }, 'notifications');
+  if (refused) return refused;
   const prefs = await setNotifyPrefs(user.email, body.prefs);
   return NextResponse.json({ prefs });
 });
