@@ -5,7 +5,7 @@ import ServiceManagement
 import RecorderCore
 import TrayLogic
 
-let VERSION = "0.3.23"
+let VERSION = "0.3.24"
 let WS_PORT: UInt16 = 47800
 let PWA_URL = URL(string: "https://meetings.darth-internal.trames.io/")!
 /// Seconds between "the call ended" and an automatic stop.
@@ -260,6 +260,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     let micProcessingItem: NSMenuItem = {
         let i = NSMenuItem(title: "Cancel speaker echo in the mic (voice processing) — mutes you in the call, keep off", action: #selector(toggleMicProcessing), keyEquivalent: "")
         i.toolTip = "Apple's echo cancellation takes over the microphone: Slack, Teams and Meet stop hearing you while it runs. Off by default since 0.3.23 — leave it off unless you are testing. Takes effect on the next recording."
+        return i
+    }()
+    /// 0.3.24: the post-recording echo cleanup (speexdsp on the finished file, before upload).
+    let echoCleanupItem: NSMenuItem = {
+        let i = NSMenuItem(title: "Remove speaker echo after recording", action: #selector(toggleEchoCleanup), keyEquivalent: "")
+        i.toolTip = "When the recording stops, the other people's voices picked up from the speakers are removed from the microphone track and the mix is re-rendered, on this Mac, in a few seconds per hour of audio. The raw microphone stays in the file. Nothing touches the microphone during the call."
         return i
     }()
     /// 0.3.20: Settings ▸ Telemetry ▸ Full / Partial — a quiet setting, never a prompt.
@@ -810,6 +816,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         discreetItem.target = self; m.addItem(discreetItem)
         autoHideItem.target = self; m.addItem(autoHideItem)
         micProcessingItem.target = self; m.addItem(micProcessingItem)
+        echoCleanupItem.target = self; m.addItem(echoCleanupItem)
         telemetryFullItem.target = self
         telemetryPartialItem.target = self
         let telemetryMenu = NSMenu(title: "Telemetry")
@@ -894,6 +901,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         discreetItem.state = discreet ? .on : .off
         autoHideItem.state = bannerAutoHide ? .on : .off
         micProcessingItem.state = micVoiceProcessing ? .on : .off
+        echoCleanupItem.state = EchoCleanupStage.shared.enabled ? .on : .off
         let level = Telemetry.level
         telemetryFullItem.state = level == .full ? .on : .off
         telemetryPartialItem.state = level == .partial ? .on : .off
@@ -1422,6 +1430,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     @objc func toggleDiscreet() { discreet = !discreet }
     @objc func toggleBannerAutoHide() { bannerAutoHide = !bannerAutoHide }
     @objc func toggleMicProcessing() { micVoiceProcessing = !micVoiceProcessing }
+    @objc func toggleEchoCleanup() {
+        EchoCleanupStage.shared.enabled.toggle()
+        EventLog.shared.log("echo_cleanup_pref", ["enabled": EchoCleanupStage.shared.enabled],
+                            summary: "echo cleanup after recording → \(EchoCleanupStage.shared.enabled ? "ON" : "off")")
+        refreshMenu(); broadcast("status")
+    }
 
     // MARK: diagnostics + telemetry level (0.3.20)
 
@@ -1562,7 +1576,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         refreshMenu()
     }
 
-    func recordingStopped(_ saved: [String: Any]) {
+    func recordingStopped(_ saved: [String: Any], cleaned: Bool = false) {
         lastSaved = saved
         ResourceSampler.shared.recordingStateChanged()
         updateDiagnostics()
@@ -1571,6 +1585,31 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         refreshMenu()
         let id = (saved["recording_id"] as? String) ?? ""
         let keepLocal = (saved["upload"] as? Bool) == false
+        // 0.3.24: the echo cleanup runs on the finished parts BEFORE anything hashes or
+        // uploads them (and before the saved card, so its numbers are final). Not on the way
+        // out of the app — those parts go up as captured at the next launch.
+        let files = (saved["files"] as? [String]) ?? []
+        if !cleaned, !terminating, EchoCleanupStage.shared.enabled, !id.isEmpty, !files.isEmpty {
+            let secsNow = (saved["seconds"] as? Int) ?? 0
+            banner.showMessage(title: "Recording saved (\(secsNow / 60)m \(secsNow % 60)s) — removing speaker echo…",
+                               sub: "A few seconds per hour of audio, on this Mac. The upload follows.", accent: .info, autoHide: nil)
+            broadcast("recording_stopped", ["saved": saved, "echo_cleanup": "running"])
+            EchoCleanupStage.shared.run(recordingId: id, files: files) { [weak self] reports in
+                guard let self else { return }
+                var s = saved
+                s["echo_cleanup"] = reports.map { r in
+                    ["segment": r["segment"] ?? NSNull(), "outcome": r["outcome"] ?? NSNull(), "reason": r["reason"] ?? NSNull(),
+                     "delay_ms": r["delay_ms"] ?? NSNull(), "echo_peak_before": r["echo_peak_before"] ?? NSNull(),
+                     "echo_peak_after": r["echo_peak_after"] ?? NSNull(), "took_ms": r["took_ms"] ?? NSNull()] as [String: Any]
+                }
+                // Sizes may have changed (a cleaned part carries one more track).
+                let bytes = files.reduce(0) { $0 + ((try? FileManager.default.attributesOfItem(atPath: $1)[.size] as? Int) ?? 0) }
+                s["bytes"] = bytes
+                Registry.shared.update(id, ["bytes": bytes])
+                self.recordingStopped(s, cleaned: true)
+            }
+            return
+        }
         let willUpload = autoUpload && auth.signedIn && !id.isEmpty && !keepLocal
         let path = (saved["path"] as? String).map { URL(fileURLWithPath: $0) }
         let secs = (saved["seconds"] as? Int) ?? 0
@@ -1731,6 +1770,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             // 0.3.10: `enabled` = the preference, `active` = what the last recording's mic
             // really ran with (null until a recording has had a microphone).
             "mic_processing": ["enabled": micVoiceProcessing, "active": recorder.micProcessingActive ?? NSNull()] as [String: Any],
+            "echo_cleanup": EchoCleanupStage.shared.statusJSON,
             // 0.3.16: the pick (`mode` auto|manual, `uid`), what the live mic is on (`current`,
             // null when idle) and every input device to pick from.
             // 0.3.17: per-track on/off — the running recording's (with `in_recording` = the
@@ -1863,6 +1903,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 broadcast("source_changed", ["outcome": recorder.switchSource(to: .audio, title: "audio only", how: "pwa")])
             }
         case "set_mic_processing": if let v = obj["enabled"] as? Bool { micVoiceProcessing = v }
+        case "set_echo_cleanup":
+            if let v = obj["enabled"] as? Bool, v != EchoCleanupStage.shared.enabled { toggleEchoCleanup() }
         case "set_mic_device":                               // 0.3.16: {uid} | {uid: null} = automatic
             let uid = obj["uid"] as? String
             let name = uid.flatMap { u in AudioDevices.inputs().first { $0.uid == u }?.name } ?? (uid ?? "Automatic")

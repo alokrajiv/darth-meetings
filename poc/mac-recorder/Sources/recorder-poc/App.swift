@@ -10,6 +10,8 @@ import RecorderCore
 //   recorder-poc [--window <substr>] [--seconds N] [--fps N] [--out file.mp4] [--no-audio]
 //   recorder-poc --display | --display-id <id> ...
 //   recorder-poc --selftest-mix <out.m4a>   (no capture at all — see selfTestMix)
+//   recorder-poc --clean <part.mp4|m4a> [--dry-run] [--force]   (offline echo cleanup, prints the JSON report)
+//   recorder-poc --selftest-echo <system.wav> <mic.wav> <out.m4a>   (a tray-shaped 3-track file from two wavs — cleanup fixtures)
 
 struct Opts {
     var list = false
@@ -21,6 +23,10 @@ struct Opts {
     var noAudio = false
     var out: String = "recording.mp4"
     var selfTestMix: String? = nil
+    var clean: String? = nil
+    var selfTestEcho: (String, String, String)? = nil
+    var dryRun = false
+    var force = false
 }
 
 /// The mix track, proven WITHOUT capturing anything (0.3.12).
@@ -74,6 +80,64 @@ func selfTestMix(out path: String) async -> Int32 {
     return rec.mixHealthy ? 0 : 1
 }
 
+/// A tray-shaped file (mix `qmx` first, then `mul` system and `eng` mic, all written by
+/// `Recorder` through AVAssetWriter exactly as a recording is) from two wav files, so the
+/// echo cleanup can be measured on the real container layout without a call (0.3.24). System
+/// is folded to stereo 48 kHz, mic to mono 48 kHz; both fed in 100 ms buffers on the host clock.
+func selfTestEcho(system sysPath: String, mic micPath: String, out path: String) async -> Int32 {
+    let url = URL(fileURLWithPath: path)
+    let rec: Recorder
+    do { rec = try Recorder(audioOnlyURL: url, audioTracks: [.system, .mic(channels: 1, sampleRate: 48_000)]) } catch {
+        rlog("selftest-echo: writer setup failed: \(error)"); return 1
+    }
+    func load(_ p: String, channels: AVAudioChannelCount) -> AVAudioPCMBuffer? {
+        guard let f = try? AVAudioFile(forReading: URL(fileURLWithPath: p)) else { return nil }
+        let fmt = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: 48_000, channels: channels, interleaved: false)!
+        guard let conv = AVAudioConverter(from: f.processingFormat, to: fmt) else { return nil }
+        let frames = AVAudioFrameCount(Double(f.length) * 48_000 / f.processingFormat.sampleRate) + 4_800
+        guard let src = AVAudioPCMBuffer(pcmFormat: f.processingFormat, frameCapacity: AVAudioFrameCount(f.length)),
+              let dst = AVAudioPCMBuffer(pcmFormat: fmt, frameCapacity: frames) else { return nil }
+        try? f.read(into: src)
+        var fed = false
+        var err: NSError?
+        conv.convert(to: dst, error: &err) { _, status in
+            if fed { status.pointee = .endOfStream; return nil }
+            fed = true; status.pointee = .haveData; return src
+        }
+        return err == nil ? dst : nil
+    }
+    guard let sys = load(sysPath, channels: 2), let mic = load(micPath, channels: 1) else { rlog("selftest-echo: could not read the wavs"); return 1 }
+    let start = CMClockGetTime(CMClockGetHostTimeClock())
+    let block = 4_800
+    let total = Int(max(sys.frameLength, mic.frameLength))
+    func slice(_ b: AVAudioPCMBuffer, from: Int) -> AVAudioPCMBuffer? {
+        let n = min(block, Int(b.frameLength) - from)
+        guard n > 0, let out = AVAudioPCMBuffer(pcmFormat: b.format, frameCapacity: AVAudioFrameCount(block)),
+              let src = b.floatChannelData, let dst = out.floatChannelData else { return nil }
+        out.frameLength = AVAudioFrameCount(n)
+        for c in 0..<Int(b.format.channelCount) { dst[c].update(from: src[c] + from, count: n) }
+        return out
+    }
+    // The writer inputs expect real time; feed at ~4× real time and never while an input is
+    // not ready, or samples are dropped (`audioNotReady`) and the fixture is full of holes.
+    var at = 0
+    while at < total {
+        let pts = CMTimeAdd(start, CMTime(value: Int64(at), timescale: 48_000))
+        for (track, src) in [(0, sys), (1, mic)] {
+            guard let b = slice(src, from: at), let sb = LiveMix.sampleBuffer(b, pts: pts) else { continue }
+            var spins = 0
+            while !rec.audioIns[track].isReadyForMoreMediaData && spins < 2_000 { usleep(1_000); spins += 1 }
+            rec.appendAudio(sb, track: track)
+        }
+        usleep(25_000)
+        at += block
+    }
+    usleep(1_500_000)        // let the live mix's 1 s emit delay drain before the file closes
+    await rec.finish()
+    rlog("selftest-echo: \(rec.stats) · mix healthy = \(rec.mixHealthy) → \(url.path)")
+    return rec.mixHealthy ? 0 : 1
+}
+
 func parseArgs() -> Opts {
     var o = Opts()
     var it = CommandLine.arguments.dropFirst().makeIterator()
@@ -88,6 +152,10 @@ func parseArgs() -> Opts {
         case "--no-audio": o.noAudio = true
         case "--out": o.out = it.next() ?? o.out
         case "--selftest-mix": o.selfTestMix = it.next()
+        case "--clean": o.clean = it.next()
+        case "--selftest-echo": o.selfTestEcho = (it.next() ?? "", it.next() ?? "", it.next() ?? "")
+        case "--dry-run": o.dryRun = true
+        case "--force": o.force = true
         default: fputs("unknown arg \(a)\n", stderr); exit(64)
         }
     }
@@ -121,6 +189,19 @@ struct App {
         if let out = o.selfTestMix {
             let code = await selfTestMix(out: out)
             exit(code)
+        }
+        if let (sysPath, micPath, outPath) = o.selfTestEcho {
+            exit(await selfTestEcho(system: sysPath, mic: micPath, out: outPath))
+        }
+        // Offline echo cleanup of a finished part (0.3.24): no capture, no permission.
+        if let path = o.clean {
+            var opts = EchoCleanup.Options()
+            opts.dryRun = o.dryRun; opts.force = o.force
+            opts.log = { fputs($0 + "\n", stderr) }
+            let report = await EchoCleanup.run(file: URL(fileURLWithPath: path), options: opts)
+            let data = try! JSONSerialization.data(withJSONObject: report, options: [.prettyPrinted, .sortedKeys])
+            print(String(decoding: data, as: UTF8.self))
+            exit(report["outcome"] as? String == "failed" ? 1 : 0)
         }
         // Window-server connection (window filters assert CGS_REQUIRE_INIT without it).
         NSApplication.shared.setActivationPolicy(.prohibited)

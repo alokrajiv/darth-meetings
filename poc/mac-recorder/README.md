@@ -14,6 +14,55 @@ Native macOS side of Darth Meetings recording (the "Swift tray" angle from Darth
 the user switched it off in the menu (`loginItemUserChoice` in UserDefaults records an explicit choice;
 the default never overrides it). macOS may show "Darth Recorder was added as a login item" once.
 
+**0.3.24 (2026-10-07) — speaker echo is removed AFTER the recording, on this Mac, from the file.**
+0.3.23 took Apple's voice processing off the microphone because it silenced the recorder in the call; the
+echo it used to remove (the far end, out of the speakers, into the mic, a few tens of ms late — the mix then
+carries the other people twice) comes back for anyone on speakers. Alok's rule for the replacement: never
+touch the microphone during the call, tax the laptop as little as possible, keep everything raw and decide
+afterwards. So the tray now cleans the finished file:
+
+- **`EchoCleanup` (RecorderCore) + vendored speexdsp 1.2.1 (`Sources/CSpeexDSP`, BSD).** For each part,
+  once the recording has stopped and before the upload: (1) find the echo — the mic and system tracks are
+  decoded to 16 kHz mono in up to 12 eight-second windows spread over the part and cross-correlated across
+  −50…+500 ms; windows with a normalised peak ≥ 0.12 have echo, the delay is their median lag; fewer than a
+  quarter of the windows (headphones, AirPods, muted mic) → `skipped: no echo`, file untouched. (2) cancel
+  it — speex's MDF canceller (16 ms frames, 256 ms filter) with the system track as the far end, shifted so
+  the measured delay lands 32 ms into the filter, then the speex preprocessor for residual-echo suppression
+  (−40 dB, −15 dB during near-end speech) and mild denoise (−10 dB); warmed up on the first 20 s so the
+  opening is cleaned too. (3) rewrite the file next to itself: video, system and the RAW mic track are
+  stream-copied, the `qmx` mix is re-rendered from system + cleaned mic with LiveMix's limiter, and the
+  cleaned mic is added as a new `qmc` "mic-clean" track; verified (one more audio track, same duration,
+  video kept), then swapped in atomically. Nothing is lost: the raw microphone stays in the file.
+  (4) measure — the same correlation on the result gives `echo_peak_after`.
+- **Numbers (synthetic 40 s part through the tray's own writer: far end on the speakers at −6 dB, 140 ms,
+  4 kHz low-pass; a second voice from 4 s):** delay found 140.1 ms; echo peak 0.73 → 0.03; the echo's
+  correlation with the cleaned mic 0.62 → 0.016; the near-end voice's correlation 0.78 → 0.93 (higher,
+  because the echo is gone); 0.5 s of CPU for 40 s of audio ≈ 45 s per hour on an M3 Max, utility QoS.
+  Reproduce: `recorder-poc --selftest-echo system.wav mic.wav part.m4a && recorder-poc --clean part.m4a`
+  (`--dry-run` reports without rewriting, `--force` rewrites even without echo).
+- **Two decode facts that cost an evening.** AVFoundation's sample-rate conversion in `AVAssetReader` is
+  NOT sample-exact: 2 731 output samples per 8 192 input samples where 2 730.67 are due, a 122 ppm stretch
+  that walks the cleaned track 0.4 s per hour away from the system track and decorrelates it from itself in
+  a minute. Tracks are decoded at their native rate and decimated here (`Decimator`, 95-tap windowed
+  sinc, `vDSP_desamp`), and upsampled back the same way (`Upsampler3`), the two filters' 94-sample delay
+  skipped once. And decoded packets must be appended as a continuous stream: placing each by its rounded
+  timestamp inserted a zero every few packets.
+- **Known quirk:** a stream-copied AAC track loses its priming trim in `ffprobe`'s eyes, so the raw mic
+  track sits ~44 ms later in the rewritten file than it did (the system track already did). The mix and
+  the cleaned track are rendered from decoded PCM and sit where the raw tracks really are; the raw mic is
+  kept for re-processing, not for playback.
+- **Tray:** `EchoCleanupStage` runs the parts in order on a utility task; banner "Recording saved —
+  removing speaker echo…" until it is done, then the usual saved/upload card; registry row `echo_cleanup
+  {status, parts, cleaned, failed, delay_ms, echo_peak_before/after, took_ms}`; `echo_cleanup` event per
+  part (telemetry); Settings toggle "Remove speaker echo after recording" (default on, pref
+  `echoCleanup`), ws `set_echo_cleanup {enabled}`, status `echo_cleanup {enabled, running[]}`. Skipped
+  when the app is quitting (those parts upload as captured at the next launch) and on parts already
+  carrying a `qmc` track. The server needs nothing: it already takes the first audio track (the mix) and
+  treats everything after it as raw.
+- Not done: a server-side pass for recordings made before 0.3.24 or uploaded raw; AssemblyAI multichannel
+  (system + clean as two channels) and utterance de-duplication for a colleague sitting beside the recorder
+  (room copy + Teams copy — not an echo, no canceller removes it).
+
 **0.3.23 (2026-10-07) — voice processing off by default: the far side could not hear the recorder.**
 Atira, Kawen and Ivan (and Alok, 00:10 SGT in a Slack huddle with Ameya) reported that the people on the
 other side of a call stop hearing them the moment the tray records; muting the tray's mic track changes

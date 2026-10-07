@@ -5,10 +5,21 @@ let package = Package(
     name: "recorder-poc",
     platforms: [.macOS(.v14)],
     targets: [
+        // speexdsp 1.2.1 (BSD, vendored): the MDF echo canceller + preprocessor that
+        // `EchoCleanup` runs over a finished recording (0.3.24). Float build, kiss FFT.
+        .target(
+            name: "CSpeexDSP",
+            path: "Sources/CSpeexDSP",
+            exclude: ["COPYING"],
+            publicHeadersPath: "include",
+            cSettings: [.define("HAVE_CONFIG_H"), .headerSearchPath(".")]
+        ),
         .target(
             name: "RecorderCore",
+            dependencies: ["CSpeexDSP"],
             path: "Sources/RecorderCore",
             linkerSettings: [
+                .linkedFramework("Accelerate"),
                 .linkedFramework("ScreenCaptureKit"),
                 .linkedFramework("AVFoundation"),
                 .linkedFramework("CoreMedia"),

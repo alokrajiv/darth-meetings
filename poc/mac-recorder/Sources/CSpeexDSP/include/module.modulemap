@@ -1,0 +1,4 @@
+module CSpeexDSP {
+    umbrella header "CSpeexDSP.h"
+    export *
+}
