@@ -92,3 +92,20 @@ addresses they appear under in `calendar_event_cache.attendees` /
 - Ankit (`ankit@trames.sg`) has never opened Darth Meetings under either address, so
   his series (#68–#70) wait on him signing in once — unrelated to aliases, but check
   his addresses while you're here.
+
+## Addendum (2026-10-07 ~14:00 SGT): organizers are not shared their own meetings
+
+Alok decided `@trames.sg` is the true identity, and series owners may now be addresses
+that never signed in (7f52596). With Preet as `preet.singh@trames.sg`, Integration
+Cadence (#67) would still drop **61 → 30**: the 30 older occurrences (2025-08 → early
+2026) have Preet as calendar ORGANIZER but not in the attendee list, and
+`shareWithInternalInvitees` only shares with attendees — so the organizer of a meeting
+got no share of it. (One more member has no invite at all — a tray/manual upload.)
+
+Fix together with the alias work: treat the internal organizer as an invitee in
+`lib/server/auto-share.ts`, plus a backfill of organizer shares for existing linked
+meetings (origin like the invitee arm). Then re-run the ownership seed dry run for #67
+(`OWNERSHIP` row already says Preet) and apply only if members stay 61.
+
+Applied as of this addendum: every seeded series except #67, which stays owned by
+alok@trames.sg (its members and labels untouched).

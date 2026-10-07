@@ -73,6 +73,8 @@ export interface OwnershipRow {
 // ===========================================================================
 const OWNERSHIP: OwnershipRow[] = [
   { seriesId: 66, ownerEmail: 'ameya@trames.sg', editors: ['ivan@trames.sg', 'alok@trames.sg'], followers: ['alok@trames.sg', 'radhika.rungta@trames-engineering.com', 'varadraj.sharma@trames.sg', 'indresh.upadhyay@trames-engineering.com'] },
+  // #67 NOT applied yet (2026-10-07): Preet is not shared the 30 older occurrences she
+  // organised (organizer not in attendees) — see docs/tech-debt/2026-10-07-one-person-several-emails.md.
   { seriesId: 67, ownerEmail: 'preet.singh@trames.sg', editors: ['ankit@trames.sg', 'ameya@trames.sg', 'kawen.koh@trames.sg', 'jacqueline.ng@trames.sg', 'ivan@trames.sg', 'alok@trames.sg'], followers: ['alok@trames.sg', 'swaralee@trames.sg'] },
   { seriesId: 68, ownerEmail: 'ankit@trames.sg', editors: ['chaitanya.konkar@trames.sg', 'ivan@trames.sg', 'alok@trames.sg'], followers: ['alok@trames.sg', 'kawen.koh@trames.sg', 'jacqueline.ng@trames.sg'] },
   { seriesId: 69, ownerEmail: 'ankit@trames.sg', editors: ['chaitanya.konkar@trames.sg', 'ivan@trames.sg', 'alok@trames.sg'], followers: ['alok@trames.sg', 'aniket.gore@trames-engineering.com', 'hitesh.ambaliya@trames-engineering.com', 'karnica.katiyar@trames-engineering.com', 'shridhar.tirthkar@trames-engineering.com', 'meghana.uppaluri@trames-engineering.com', 'komuravelly.nikhil@trames.sg'] },
