@@ -52,6 +52,8 @@ import {
   type CuratedSeries,
 } from '@/lib/server/curated-series';
 import { INTERNAL_DOMAINS } from '@/lib/internal-domains';
+import { resolveLabelPaths } from '@/lib/server/series-api';
+import { setSeriesLabels } from '@/lib/server/series-labels';
 import { SHARE_ORIGIN_SERIES_FOLLOW } from '@/lib/auditor-policy';
 
 export interface OwnershipRow {
@@ -59,15 +61,35 @@ export interface OwnershipRow {
   ownerEmail: string;
   editors: string[];
   followers: string[];
+  /** Optional: REPLACE the series' default labels with these label paths
+   * (missing paths are created). Omitted = labels left as they are. */
+  labels?: string[];
 }
 
 // ===========================================================================
-// PLACEHOLDER — the orchestrator fills this in with the table Alok confirms
-// (or passes --table <file.json>). Left EMPTY on purpose: an empty table is
-// refused, so nothing runs by accident.
+// The table Alok confirmed 2026-10-07: the lead who chairs each call owns it,
+// co-chairs/leads edit (KB company/org-chart.md), Ivan and Alok edit everything
+// (Alok's auto-imports need owner/editor), Alok follows all (as an auditor he gets every member).
 // ===========================================================================
 const OWNERSHIP: OwnershipRow[] = [
-  // { seriesId: 66, ownerEmail: 'alok@trames.sg', editors: [], followers: ['alok@trames.sg'] },
+  { seriesId: 66, ownerEmail: 'ameya@trames.sg', editors: ['ivan@trames.sg', 'alok@trames.sg'], followers: ['alok@trames.sg', 'radhika.rungta@trames-engineering.com', 'varadraj.sharma@trames.sg', 'indresh.upadhyay@trames-engineering.com'] },
+  { seriesId: 67, ownerEmail: 'preet.singh@trames.sg', editors: ['ankit@trames.sg', 'ameya@trames.sg', 'kawen.koh@trames.sg', 'jacqueline.ng@trames.sg', 'ivan@trames.sg', 'alok@trames.sg'], followers: ['alok@trames.sg', 'swaralee@trames.sg'] },
+  { seriesId: 68, ownerEmail: 'ankit@trames.sg', editors: ['chaitanya.konkar@trames.sg', 'ivan@trames.sg', 'alok@trames.sg'], followers: ['alok@trames.sg', 'kawen.koh@trames.sg', 'jacqueline.ng@trames.sg'] },
+  { seriesId: 69, ownerEmail: 'ankit@trames.sg', editors: ['chaitanya.konkar@trames.sg', 'ivan@trames.sg', 'alok@trames.sg'], followers: ['alok@trames.sg', 'aniket.gore@trames-engineering.com', 'hitesh.ambaliya@trames-engineering.com', 'karnica.katiyar@trames-engineering.com', 'shridhar.tirthkar@trames-engineering.com', 'meghana.uppaluri@trames-engineering.com', 'komuravelly.nikhil@trames.sg'] },
+  { seriesId: 70, ownerEmail: 'ankit@trames.sg', editors: ['chaitanya.konkar@trames.sg', 'ivan@trames.sg', 'alok@trames.sg'], followers: ['alok@trames.sg', 'ayush.agarwal@trames-engineering.com', 'sandip.singh@trames.sg', 'preet.singh@trames.sg'], labels: ['Team/Integration'] },
+  { seriesId: 71, ownerEmail: 'chaitanya.konkar@trames.sg', editors: ['ankit@trames.sg', 'ivan@trames.sg', 'alok@trames.sg'], followers: ['alok@trames.sg', 'shridhar.tirthkar@trames-engineering.com', 'komuravelly.nikhil@trames.sg', 'meghana.uppaluri@trames-engineering.com'] },
+  { seriesId: 72, ownerEmail: 'yadu.nm@trames.sg', editors: ['ivan@trames.sg', 'alok@trames.sg'], followers: ['alok@trames.sg', 'pratiksha.mali@trames.sg', 'vignesh.sanmugam@trames-engineering.com'] },
+  { seriesId: 73, ownerEmail: 'preet.singh@trames.sg', editors: ['kawen.koh@trames.sg', 'jacqueline.ng@trames.sg', 'ivan@trames.sg', 'alok@trames.sg'], followers: ['alok@trames.sg', 'swaralee@trames.sg'] },
+  { seriesId: 74, ownerEmail: 'jacqueline.ng@trames.sg', editors: ['kawen.koh@trames.sg', 'ivan@trames.sg', 'alok@trames.sg'], followers: ['alok@trames.sg', 'chirag.anand@trames-engineering.com', 'ashey.sharma@trames-engineering.com'] },
+  { seriesId: 75, ownerEmail: 'jacqueline.ng@trames.sg', editors: ['ivan@trames.sg', 'alok@trames.sg'], followers: ['alok@trames.sg'] },
+  { seriesId: 76, ownerEmail: 'kawen.koh@trames.sg', editors: ['ivan@trames.sg', 'alok@trames.sg'], followers: ['alok@trames.sg'] },
+  { seriesId: 77, ownerEmail: 'aniq.danial@trames.sg', editors: ['ivan@trames.sg', 'alok@trames.sg'], followers: ['alok@trames.sg'] },
+  { seriesId: 78, ownerEmail: 'swaralee@trames.sg', editors: ['ivan@trames.sg', 'alok@trames.sg'], followers: ['alok@trames.sg'] },
+  { seriesId: 79, ownerEmail: 'siqian.loh@trames.sg', editors: ['ivan@trames.sg', 'alok@trames.sg'], followers: ['alok@trames.sg'] },
+  { seriesId: 80, ownerEmail: 'iman.sani@trames.sg', editors: ['ivan@trames.sg', 'alok@trames.sg'], followers: ['alok@trames.sg'] },
+  { seriesId: 81, ownerEmail: 'aniq.danial@trames.sg', editors: ['ain.abdullah@trames.sg', 'ivan@trames.sg', 'alok@trames.sg'], followers: ['alok@trames.sg', 'nina.ghazzi@trames.sg'] },
+  { seriesId: 82, ownerEmail: 'swaralee@trames.sg', editors: ['ivan@trames.sg', 'alok@trames.sg'], followers: ['alok@trames.sg'] },
+  { seriesId: 83, ownerEmail: 'kawen.koh@trames.sg', editors: ['ivan@trames.sg', 'alok@trames.sg'], followers: ['alok@trames.sg'] },
 ];
 // ===========================================================================
 
@@ -105,7 +127,9 @@ async function main(): Promise<number> {
     ownerEmail: norm(String(r.ownerEmail ?? '')),
     editors: [...new Set((r.editors ?? []).map(norm))],
     followers: [...new Set((r.followers ?? []).map(norm))],
+    labels: Array.isArray(r.labels) ? r.labels.map((x) => String(x).trim()).filter(Boolean) : undefined,
   }));
+  for (const r of table) if (r.labels) console.log(`labels   #${r.seriesId} → ${list(r.labels)}`);
   if (table.length === 0) {
     console.error('refused: the ownership table is empty (fill OWNERSHIP in this script, or pass --table file.json)');
     return 2;
@@ -250,6 +274,10 @@ async function main(): Promise<number> {
         if (!curFollowers.includes(e)) {
           await insertFollower(r.seriesId, { email: e, name: null }, { userId: actorId, email: ACTOR_EMAIL });
         }
+      }
+      if (r.labels) {
+        const actor = { userId: actorId, email: ACTOR_EMAIL };
+        await setSeriesLabels(r.seriesId, await resolveLabelPaths(r.labels, actor), actor);
       }
       console.log(`set      #${r.seriesId}  owner ${r.ownerEmail}`);
     } catch (err) {
