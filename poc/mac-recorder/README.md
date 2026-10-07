@@ -14,6 +14,29 @@ Native macOS side of Darth Meetings recording (the "Swift tray" angle from Darth
 the user switched it off in the menu (`loginItemUserChoice` in UserDefaults records an explicit choice;
 the default never overrides it). macOS may show "Darth Recorder was added as a login item" once.
 
+**0.3.23 (2026-10-07) — voice processing off by default: the far side could not hear the recorder.**
+Atira, Kawen and Ivan (and Alok, 00:10 SGT in a Slack huddle with Ameya) reported that the people on the
+other side of a call stop hearing them the moment the tray records; muting the tray's mic track changes
+nothing, only ending the call and re-joining helps. Cause: `MicCapture`'s Apple voice-processing unit
+(0.3.10, on by default) reconfigures the microphone for every other client. Slack, Teams and Chrome/Meet
+read the mic through the plain HAL path, get a configuration change and simply stop — or limp on with
+their echo canceller's reference gone (Ameya heard himself). Proven on Alok's Mac the same day: a raw
+`AVAudioEngine` input client received 0 buffers from the tray's start onward with processing on
+(`AVAudioEngineConfigurationChange`, engine stopped, never recovered — not even when the tray stopped),
+and was untouched with it off. A voice-processing client of the same mic survives, which is why a
+VPIO-based probe missed it twice. The MacBook Airs' memory pressure (4–15 GB swap during their
+recordings) is real but a separate matter.
+
+- `micVoiceProcessing` defaults to **false**; a stored ON from an earlier version is cleared once at
+  launch (`micVoiceProcessingCleared0323`, logged as `mic_processing_pref` with a reason). The menu item
+  stays, retitled "… — mutes you in the call, keep off", for A/B tests only.
+- The speaker echo the unit removed comes back for speaker users (the mix carries the far end twice).
+  That is now a server problem: transcribe the two tracks separately and de-duplicate utterances, which
+  also covers colleagues sitting beside the recorder (room copy + Teams copy), something the unit never
+  handled.
+- Not changed: the raw path's channel pick, AGC (+36 dB cap) and expander (0.3.2); device follow and
+  restarts (0.3.16); the dead-mic detector (0.3.18).
+
 **0.3.22 (2026-10-02) — local disk accounting: how much of this Mac the recorder holds, and why.**
 Alok's Mac had ~491 MiB under `~/Movies/Darth Recorder` while the registry knew of 5.1 MB still to upload;
 the rest were files no registry row referenced (pre-registry recordings from 2026-09-15 and the like). The

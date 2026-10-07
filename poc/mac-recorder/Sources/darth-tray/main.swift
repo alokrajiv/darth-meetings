@@ -5,7 +5,7 @@ import ServiceManagement
 import RecorderCore
 import TrayLogic
 
-let VERSION = "0.3.22"
+let VERSION = "0.3.23"
 let WS_PORT: UInt16 = 47800
 let PWA_URL = URL(string: "https://meetings.darth-internal.trames.io/")!
 /// Seconds between "the call ended" and an automatic stop.
@@ -84,12 +84,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     var pressureObservers: [NSObjectProtocol] = []
 
     /// 0.3.10: Apple's voice processing (VPIO) on the mic input — acoustic echo cancellation
-    /// against the system's own output, noise suppression, Apple's AGC. ON by default: without
-    /// it a call on the speakers puts the far end in BOTH tracks and the server's mix carries
-    /// the other people twice. Read when a recording's mic starts, so a change takes effect on
-    /// the next recording.
+    /// against the system's own output, noise suppression, Apple's AGC. Was ON by default so a
+    /// call on the speakers would not put the far end in BOTH tracks.
+    /// **0.3.23: OFF by default, and a stored ON is cleared once at launch.** Starting the
+    /// voice-processing unit reconfigures the microphone for every other client of it: Slack,
+    /// Teams and Chrome read the mic through the plain HAL path and their stream simply stops
+    /// (proven 2026-10-07 on Alok's Mac: a raw AVAudioEngine client got a configuration change
+    /// and 0 buffers from the moment the tray started; untouched with processing off). The far
+    /// side stops hearing the recorder — Atira, Kawen, Ivan and Alok all hit it. The echo the
+    /// unit removed is handled on the server instead. Read when a recording's mic starts.
     var micVoiceProcessing: Bool {
-        get { UserDefaults.standard.object(forKey: "micVoiceProcessing") as? Bool ?? true }
+        get { UserDefaults.standard.object(forKey: "micVoiceProcessing") as? Bool ?? false }
         set {
             UserDefaults.standard.set(newValue, forKey: "micVoiceProcessing")
             recorder.micVoiceProcessing = newValue
@@ -253,8 +258,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     let discreetItem = NSMenuItem(title: "Discreet menu bar icon (no red while recording)", action: #selector(toggleDiscreet), keyEquivalent: "")
     let autoHideItem = NSMenuItem(title: "Hide the recording banner after 10 s", action: #selector(toggleBannerAutoHide), keyEquivalent: "")
     let micProcessingItem: NSMenuItem = {
-        let i = NSMenuItem(title: "Cancel speaker echo in the mic (voice processing)", action: #selector(toggleMicProcessing), keyEquivalent: "")
-        i.toolTip = "Apple's echo cancellation keeps the other people's voices out of your microphone track, so a call on the speakers is not recorded twice. Takes effect on the next recording."
+        let i = NSMenuItem(title: "Cancel speaker echo in the mic (voice processing) — mutes you in the call, keep off", action: #selector(toggleMicProcessing), keyEquivalent: "")
+        i.toolTip = "Apple's echo cancellation takes over the microphone: Slack, Teams and Meet stop hearing you while it runs. Off by default since 0.3.23 — leave it off unless you are testing. Takes effect on the next recording."
         return i
     }()
     /// 0.3.20: Settings ▸ Telemetry ▸ Full / Partial — a quiet setting, never a prompt.
@@ -360,6 +365,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         recorder.api = api
         recorder.deviceId = auth.deviceId
+        // 0.3.23: voice processing is off by default and a stored ON from an earlier version is
+        // cleared once — it silenced the recorder in Slack/Teams/Meet calls (see micVoiceProcessing).
+        if UserDefaults.standard.object(forKey: "micVoiceProcessing") as? Bool == true,
+           !UserDefaults.standard.bool(forKey: "micVoiceProcessingCleared0323") {
+            UserDefaults.standard.removeObject(forKey: "micVoiceProcessing")
+            UserDefaults.standard.set(true, forKey: "micVoiceProcessingCleared0323")
+            EventLog.shared.log("mic_processing_pref", ["enabled": false, "reason": "0.3.23 clears a stored ON once"],
+                                summary: "mic: voice processing was ON from an earlier version — off now (0.3.23: it silences you in Slack/Teams/Meet)")
+        }
         recorder.micVoiceProcessing = micVoiceProcessing
         // 0.3.17: a persisted pick of a virtual device (Teams' loopback driver was chosen by
         // hand on 2026-09-25 and silenced a whole call) is cleared at launch.

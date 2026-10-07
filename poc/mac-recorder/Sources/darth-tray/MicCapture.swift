@@ -25,6 +25,16 @@ import RecorderCore
 /// stays silent for the health meter. Gain is applied to EVERY mic buffer (a normal 1-channel
 /// mic at a healthy level gets gain 1 — the AGC never attenuates).
 ///
+/// **0.3.23 — voice processing is OFF by default.** Enabling the unit below reconfigures the
+/// microphone device for every other client of it. Slack, Teams and Chrome/Meet read the mic
+/// through the plain HAL path; the moment this unit comes up their stream gets a configuration
+/// change and stops, so the far side cannot hear the person recording (Atira, Kawen, Ivan,
+/// Alok with Ameya, 2026-10-06/07). Measured on Alok's Mac 2026-10-07: a raw AVAudioEngine
+/// client received 0 buffers from the tray's start onward with processing on, and was
+/// untouched with it off. A voice-processing client of the mic survives — which is why a
+/// VPIO-based probe missed it. The raw path is the default again; the speaker echo it used to
+/// remove is a server-side problem now (utterance dedupe across the two tracks).
+///
 /// **Echo (0.3.10).** On speakers the mic also hears the far end, tens of milliseconds late,
 /// and the server's mix (system track + mic track) then carries the other people TWICE —
 /// diarization smears and the transcript doubles. So the input node now runs Apple's voice

@@ -238,7 +238,8 @@ final class RecordingController {
     /// 0.3.10: the `micVoiceProcessing` preference, copied in by the AppDelegate. Read ONCE,
     /// when a recording's mic starts — changing it mid-recording would mean tearing the input
     /// engine down and rolling a segment, so it takes effect on the next recording.
-    var micVoiceProcessing = true
+    /// 0.3.23: false by default — the voice-processing unit silences the recorder in the call itself.
+    var micVoiceProcessing = false
     /// 0.3.16: the `micDeviceUID` preference (nil = automatic / system default), copied in by
     /// the AppDelegate. Read when a recording's mic starts; a change mid-recording goes through
     /// `switchMicDevice`, which restarts the live capture at once.
