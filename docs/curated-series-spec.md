@@ -337,6 +337,11 @@ can only read are in the series (labels permitting, §11.5) but give followers n
 Followers see that difference: series detail shows each member only if the caller can
 open it (unchanged), and the follower count/"you get N of M" is honest.
 
+**Auditor followers (Alok, 2026-10-07):** an auditor who follows a series gets a follow
+share of EVERY member, not only those the owner may share — the same policy as the
+outside-party auditor shares. Membership is still bounded by the owner's reach, and
+default labels still follow the owner rule (§11.5).
+
 Who can add followers: owner + editors (no auditor gate any more — the reach rule is the
 safety). Follower removes self: always. Deleting a series removes its follow shares
 (the owner's call — no ledger rows for that, it is not a human removal of one meeting).

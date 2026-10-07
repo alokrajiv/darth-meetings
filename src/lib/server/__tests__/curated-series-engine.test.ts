@@ -7,7 +7,8 @@
  *     manual member outside reach is dropped; several series at once;
  *   - FOLLOW SHARES + LABELS (§11.4/§11.5): only on members the owner OWNS or
  *     EDITS (auditor series: all) — a member the owner can only read gives
- *     followers nothing and gets no labels;
+ *     followers nothing and gets no labels; an AUDITOR follower gets every
+ *     member regardless (Alok, 2026-10-07);
  *   - a meeting in two series carries BOTH label sets; leaving one keeps a
  *     label the other still wants (re-pointed, not deleted);
  *   - nothing a person did by hand is touched; the ledger blocks re-adds;
@@ -122,6 +123,39 @@ describe('follow shares + labels only where the owner may act (§11.4, §11.5)',
     expect(p.join).toEqual([1]);
     expect(p.shareInserts).toEqual([]);
     expect(p.labelInserts).toEqual([]);
+  });
+
+  test('AUDITOR follower gets a READ-only member anyway; a non-auditor follower of the same series does not; no labels', () => {
+    const s = withRules(
+      series({ id: 1, followers: [{ email: JAC, name: null }, { email: ALOK.email, name: null, isAuditor: true }] })
+    );
+    const p = plan(meeting({ shares: [{ email: KAWEN.email, access: 'read', origin: null }] }), [s]);
+    expect(p.join).toEqual([1]);
+    expect(p.shareInserts).toEqual([{ email: ALOK.email, name: null }]);
+    expect(p.labelInserts).toEqual([]);
+  });
+
+  test("PRIVACY: an auditor follower gets nothing OUTSIDE the owner's reach (the member must exist first)", () => {
+    const s = series({ id: 1, followers: [{ email: ALOK.email, name: null, isAuditor: true }] });
+    const p = plan(meeting(), [s]);
+    expect(p.join).toEqual([]);
+    expect(p.shareInserts).toEqual([]);
+  });
+
+  test("an auditor follower's share stays while the member is read-only (not swept as unwanted)", () => {
+    const s = series({ id: 1, followers: [{ email: ALOK.email, name: null, isAuditor: true }] });
+    const p = plan(
+      meeting({
+        memberships: new Map([[1, 'auto']]),
+        shares: [
+          { email: KAWEN.email, access: 'read', origin: null },
+          { email: ALOK.email, access: 'read', origin: SHARE_ORIGIN_SERIES_FOLLOW },
+        ],
+      }),
+      [s]
+    );
+    expect(p.shareDeletes).toEqual([]);
+    expect(p.shareInserts).toEqual([]);
   });
 
   test('owner has EDIT → followers get a read follow share, labels apply', () => {

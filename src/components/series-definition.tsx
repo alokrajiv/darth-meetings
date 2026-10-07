@@ -758,7 +758,7 @@ export function SeriesFollowersSection({
         <span className="text-[11px] text-muted-foreground">
           {owner?.isAuditor
             ? 'read every meeting in the series (auditor series)'
-            : `get the meetings ${firstName(owner)} owns or edits`}
+            : `get the meetings ${firstName(owner)} owns or edits (auditors: every meeting in the series)`}
         </span>
       </div>
       {followers.length === 0 ? (

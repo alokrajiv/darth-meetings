@@ -97,7 +97,9 @@ export interface CuratedSeries {
   ownerIsAuditor: boolean;
   /** Lower-cased. */
   editors: string[];
-  followers: Array<{ email: string; name: string | null }>;
+  /** `isAuditor`: an auditor follower gets EVERY member (§11.4, Alok
+   * 2026-10-07), not only those the owner may share. */
+  followers: Array<{ email: string; name: string | null; isAuditor?: boolean }>;
   /** Default labels: the series' label_rules. */
   rules: Array<{ ruleId: number; labelId: number }>;
 }
@@ -132,7 +134,7 @@ export async function loadCuratedSeries(): Promise<CuratedSeries[]> {
     editors: editors.filter((e) => e.series_id === r.id).map((e) => e.email),
     followers: followers
       .filter((f) => f.series_id === r.id)
-      .map((f) => ({ email: f.email.toLowerCase(), name: f.name })),
+      .map((f) => ({ email: f.email.toLowerCase(), name: f.name, isAuditor: auditors.has(f.email.toLowerCase()) })),
     rules: rules.filter((x) => x.series_id === r.id).map((x) => ({ ruleId: x.id, labelId: x.label_id })),
   }));
   g.__mwCuratedSeriesCache = { at: Date.now(), series };
@@ -298,9 +300,15 @@ export function planTranscript(state: TranscriptState, series: readonly CuratedS
   }
 
   // ---- follow shares: every acting series' followers ----------------------
+  // A follower gets a member when the series' owner may share it — or, if
+  // the follower is an AUDITOR, always: auditors see what they follow, the
+  // same policy as their outside-party shares (§11.4, Alok 2026-10-07). The
+  // member itself is still bounded by the owner's reach.
+  const actingIds = new Set(acting.map((s) => s.id));
   const wanted = new Map<string, string | null>();
-  for (const s of acting) {
+  for (const s of members) {
     for (const f of s.followers) {
+      if (!actingIds.has(s.id) && !f.isAuditor) continue;
       if (state.meetingOwnerEmails.has(f.email)) continue;
       if (!wanted.has(f.email)) wanted.set(f.email, f.name);
     }
