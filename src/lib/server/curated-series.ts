@@ -13,6 +13,7 @@ import {
   insertAutoMembership,
   listAllMemberIds,
   listAllSeries,
+  fillMissingOwnerIds,
   setSeriesOwner,
   upsertManualMembership,
   visibleSeriesIds,
@@ -115,13 +116,24 @@ export async function loadCuratedSeries(): Promise<CuratedSeries[]> {
   const hit = g.__mwCuratedSeriesCache;
   if (hit && Date.now() - hit.at < CACHE_TTL_MS) return hit.series;
   if (!(await seriesOwnershipReady())) return [];
-  const [rows, editors, followers, rules, auditors] = await Promise.all([
+  const [listed, editors, followers, rules, auditors] = await Promise.all([
     listAllSeries(),
     listAllEditors(),
     listAllFollowers(),
     listAllSeriesLabelRules(),
     auditorEmails(),
   ]);
+  // An owner seeded before they ever signed in gets their user id once they
+  // have (their OWN meetings then count toward the reach). Writes only when
+  // some owner still lacks one.
+  let rows = listed;
+  if (rows.some((r) => !r.owner_user_id && r.owner_email)) {
+    const filled = await fillMissingOwnerIds().catch((err: unknown) => {
+      console.warn('[curated-series] owner id fill failed:', err);
+      return 0;
+    });
+    if (filled > 0) rows = await listAllSeries();
+  }
   const series: CuratedSeries[] = rows.map((r) => ({
     id: r.id,
     title: r.title,

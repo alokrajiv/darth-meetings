@@ -207,12 +207,35 @@ export async function createSeries(input: {
 }
 
 /** Hand the series to a new owner (the route checked who may, §11.1). */
-export async function setSeriesOwner(id: number, owner: { userId: string; email: string }): Promise<void> {
+/** `userId` may be null: an owner who has not opened Darth Meetings yet
+ * (Alok 2026-10-07 — the @trames.sg address is the true identity). Their
+ * reach is then the meetings shared to that address; the id is filled in
+ * by `fillMissingOwnerIds` once they sign in under it. */
+export async function setSeriesOwner(id: number, owner: { userId: string | null; email: string }): Promise<void> {
   await sql`
     UPDATE ${sql(SCHEMA)}.series
     SET owner_user_id = ${owner.userId}, owner_email = ${normEmail(owner.email)}, updated_at = NOW()
     WHERE id = ${id}
   `;
+}
+
+/** Series owners without a user id whose address has since signed in:
+ * set the id (from the activity log — written by authenticated sessions
+ * only). Returns how many rows changed. */
+export async function fillMissingOwnerIds(): Promise<number> {
+  const rows = await sql`
+    UPDATE ${sql(SCHEMA)}.series s
+    SET owner_user_id = a.user_id, updated_at = NOW()
+    FROM (
+      SELECT DISTINCT ON (lower(user_email)) lower(user_email) AS email, user_id
+      FROM ${sql(SCHEMA)}.transcript_activity
+      WHERE user_email IS NOT NULL
+      ORDER BY lower(user_email), at DESC
+    ) a
+    WHERE s.owner_user_id IS NULL AND s.owner_email = a.email
+    RETURNING s.id
+  `;
+  return rows.length;
 }
 
 export async function getSeries(id: number): Promise<SeriesRow | null> {

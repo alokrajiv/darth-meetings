@@ -161,7 +161,9 @@ async function main(): Promise<number> {
     if (!ownerIds.has(r.ownerEmail)) {
       const id = await userIdForEmail(r.ownerEmail);
       if (id) ownerIds.set(r.ownerEmail, id);
-      else problems.push(`#${r.seriesId}: owner ${r.ownerEmail} has never opened Darth Meetings (no user id)`);
+      // Allowed (Alok 2026-10-07: @trames.sg is the true identity): reach is
+      // what is shared to that address; the id fills in when they sign in.
+      else console.log(`note     #${r.seriesId}: owner ${r.ownerEmail} has not opened Darth Meetings yet — no user id until they do`);
     }
     if (auditors.has(r.ownerEmail)) {
       const bad = r.editors.filter((e) => !auditors.has(e));
@@ -262,7 +264,7 @@ async function main(): Promise<number> {
   let failed = 0;
   for (const r of table) {
     try {
-      await setSeriesOwner(r.seriesId, { userId: ownerIds.get(r.ownerEmail)!, email: r.ownerEmail });
+      await setSeriesOwner(r.seriesId, { userId: ownerIds.get(r.ownerEmail) ?? null, email: r.ownerEmail });
       const curEditors = editorsNow.filter((e) => e.series_id === r.seriesId).map((e) => e.email);
       for (const e of curEditors) if (!r.editors.includes(e)) await deleteEditor(r.seriesId, e);
       for (const e of r.editors) {
