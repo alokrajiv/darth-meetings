@@ -41,6 +41,8 @@ export interface AiRunRow {
   cache_creation_tokens: string | null;
   prompt_chars: number | null;
   result_chars: number | null;
+  /** Shared Claude login the run used (migration 056); null = the host's own login. */
+  claude_profile: string | null;
   created_at: string;
 }
 
@@ -70,7 +72,7 @@ export async function recordAiRun(input: RecordAiRunInput): Promise<void> {
         model, session_id, status, error,
         cost_usd, duration_ms, api_duration_ms, num_turns,
         input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens,
-        prompt_chars, result_chars
+        prompt_chars, result_chars, claude_profile
       ) VALUES (
         ${input.transcriptId ?? null},
         ${input.assemblyaiId ?? null},
@@ -90,7 +92,8 @@ export async function recordAiRun(input: RecordAiRunInput): Promise<void> {
         ${m?.cacheReadTokens ?? null},
         ${m?.cacheCreationTokens ?? null},
         ${input.promptChars ?? null},
-        ${input.resultChars ?? null}
+        ${input.resultChars ?? null},
+        ${m?.profile ?? null}
       )
     `;
   } catch (err) {

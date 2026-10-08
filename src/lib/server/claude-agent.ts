@@ -4,6 +4,11 @@ import {
   type Options,
   type SDKMessage,
 } from '@anthropic-ai/claude-agent-sdk';
+import {
+  classifyClaudeFailure,
+  invalidateClaudeProfileCache,
+  resolveClaudeProfiles,
+} from './claude-profile';
 
 /**
  * Headless Claude via the Claude Agent SDK. Successor to the old
@@ -40,6 +45,7 @@ export interface ClaudeRunMeta {
   outputTokens: number | null;
   cacheReadTokens: number | null;
   cacheCreationTokens: number | null;
+  profile?: string | null;
 }
 
 export interface ClaudeRunResult {
@@ -76,7 +82,7 @@ export async function runClaudeWithMeta(
       ? (opts.effort as Effort)
       : CLAUDE_EFFORT;
 
-  const options: Options = {
+  const baseOptions: Options = {
     model: opts.model || CLAUDE_MODEL,
     effort,
     // Run from the storage dir, not the repo — headless mode denies tool
@@ -89,23 +95,41 @@ export async function runClaudeWithMeta(
     systemPrompt: opts.systemPrompt,
   };
 
+  // The shared Claude logins (Darth Chat's allocation + .token files). Empty
+  // → the host's own login, exactly as before. Otherwise try each candidate
+  // in order, moving on only for an auth / rate-limit failure of that login.
+  const candidates = await resolveClaudeProfiles();
+  const attempts: Array<{ profile: string | null; env?: Record<string, string> }> = candidates.length
+    ? candidates.map((c) => ({
+        profile: c.profile,
+        env: { ...(process.env as Record<string, string>), CLAUDE_CODE_OAUTH_TOKEN: c.token },
+      }))
+    : [{ profile: null }];
+
   try {
-    let result: Extract<SDKMessage, { type: 'result' }> | undefined;
-    for await (const msg of query({ prompt, options })) {
-      if (msg.type === 'result') result = msg;
+    let lastErr: unknown;
+    for (let i = 0; i < attempts.length; i++) {
+      const attempt = attempts[i];
+      const options: Options = attempt.env ? { ...baseOptions, env: attempt.env } : baseOptions;
+      try {
+        const res = await runOnce(prompt, options);
+        if (attempt.profile) {
+          console.log(`[claude-agent] ran on shared login ${attempt.profile} (${candidates[i].source})`);
+        }
+        return { text: res.text, meta: { ...res.meta, profile: attempt.profile } };
+      } catch (err) {
+        lastErr = err;
+        if (abort.signal.aborted) throw err;
+        const kind = classifyClaudeFailure((err as Error).message ?? String(err));
+        const next = attempts[i + 1];
+        if (!attempt.profile || !kind || !next) throw err;
+        invalidateClaudeProfileCache();
+        console.warn(
+          `[claude-agent] shared login ${attempt.profile} failed (${kind}): ${(err as Error).message.slice(0, 200)} — retrying on ${next.profile}`
+        );
+      }
     }
-    if (!result) {
-      throw new Error('agent run produced no result message');
-    }
-    const text = result.subtype === 'success' ? result.result.trim() : '';
-    if (result.is_error || !text) {
-      const detail =
-        result.subtype !== 'success' && result.errors?.length
-          ? result.errors.join('; ').slice(0, 500)
-          : text.slice(0, 500) || '(empty result)';
-      throw new Error(`agent run failed (${result.subtype}): ${detail}`);
-    }
-    return { text, meta: extractMeta(result) };
+    throw lastErr instanceof Error ? lastErr : new Error(String(lastErr));
   } catch (err) {
     if (abort.signal.aborted) {
       throw new Error(`agent run timed out after ${timeoutMs / 1000}s`);
@@ -114,6 +138,25 @@ export async function runClaudeWithMeta(
   } finally {
     clearTimeout(timer);
   }
+}
+
+async function runOnce(prompt: string, options: Options): Promise<ClaudeRunResult> {
+  let result: Extract<SDKMessage, { type: 'result' }> | undefined;
+  for await (const msg of query({ prompt, options })) {
+    if (msg.type === 'result') result = msg;
+  }
+  if (!result) {
+    throw new Error('agent run produced no result message');
+  }
+  const text = result.subtype === 'success' ? result.result.trim() : '';
+  if (result.is_error || !text) {
+    const detail =
+      result.subtype !== 'success' && result.errors?.length
+        ? result.errors.join('; ').slice(0, 500)
+        : text.slice(0, 500) || '(empty result)';
+    throw new Error(`agent run failed (${result.subtype}): ${detail}`);
+  }
+  return { text, meta: extractMeta(result) };
 }
 
 /** Back-compat string-returning wrapper. */
