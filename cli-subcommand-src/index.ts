@@ -127,6 +127,25 @@ RECORDINGS (yours only, never shared — see 'darth-cli meetings recordings')
                                   the invite's Trames colleagues) or make a
                                   meeting of it, then share the MEETING
 
+SEGMENTS (a meeting is a TIMELINE of segments — see 'darth-cli meetings segments')
+  segments <meeting>              The timeline: each segment = a window of one
+                                  recording placed at a time, with a text
+                                  policy; plus holes, siblings, what you may do
+  segments add|edit|rm|candidates|propose|align
+                                  Add a window of YOUR recording to a meeting
+                                  ("this recording, 12:40 → 41:05, at 0:00"),
+                                  move/trim/re-policy it, remove it, list what
+                                  you could add, ask for split proposals,
+                                  measure the offset between two recordings
+  split <meeting> --from T --to T [--title "…"] [--event <ref>] [--keep-in-both]
+                                  Make that window of the meeting a meeting of
+                                  its own on the SAME recording — no file cut,
+                                  no re-transcription; the source keeps a hole
+                                  there (or both keep it with --keep-in-both).
+                                  --event links + shares the new meeting like
+                                  'link' does. T = mm:ss, h:mm:ss or ms
+  unsplit <split-off-id>          Put a split-off meeting back into its source
+
 LABELS (org-wide, hierarchical 'Customers/LP Global/QBR', many per transcript;
 <label> = a path, case-insensitive, or '#<id>' from 'labels')
   label <id> <label>              Add a label to a transcript — missing path
@@ -516,6 +535,38 @@ verbs apply (speakers, set-speakers, set-notes, …). A recording is never
 shared; the owner shares the meeting from the web UI. 'recordings list'
 shows everything still private (--temporary / --unlinked; --json
 --envelope pages like the tasks list).
+
+## Segments (one recording, several meetings — or several recordings, one meeting)
+
+A meeting is a TIMELINE of segments; a segment is a window of one recording
+placed at a time on it. Nothing is ever cut or re-transcribed: a segment is a
+pointer, and the meeting's text, player and AI notes are built from its
+segments. So NEVER reach for ffmpeg to split or join recordings — do it here.
+
+One recording that covers two meetings (a 1:1 that became a wider call at
+43:03):
+
+    darth-cli meetings recordings make-meeting <rid> --title "Call, part 1"    # → meeting A (whole recording)
+    darth-cli meetings segments propose A                                     # optional: server suggests split points
+    darth-cli meetings split A --from 43:03 --to 1:54:29 --title "Call, part 2" [--event <ref>]
+                                                                              # → meeting B holds 43:03→end; A keeps 0:00→43:03 with a hole
+    darth-cli meetings segments A                                             # the timeline, holes, siblings
+    darth-cli meetings unsplit B                                              # undo
+
+Several recordings of one call (a phone in the room + the Teams file; two
+colleagues' Macs):
+
+    darth-cli meetings segments candidates <meeting>                          # what you could add (your own bytes only)
+    darth-cli meetings segments align <rid> --against <rid-of-first-segment>  # measures the offset; applies nothing
+    darth-cli meetings segments add <meeting> <rid> --at 1:12 [--from T --to T] [--text gap-fill]
+    darth-cli meetings segments edit <meeting> 1 --at 1:15                    # nudge it
+    darth-cli meetings segments rm <meeting> 1
+
+Text policy per segment: include (words merge by time), gap-fill (its words
+only where no other segment has speech), exclude (playable, no text). The
+server never guesses where a segment sits: --at defaults to 0:00, measure it
+with 'segments align' or set it by ear. Speaker names and text edits move
+with a split and come back with unsplit.
 
 ## Labels (org-wide taxonomy, many per meeting)
 
@@ -2029,6 +2080,355 @@ async function waitForRecording(ctx: Ctx, rid: string, capMin: number, say: (l: 
   return null;
 }
 
+// ---------------------------------------------------------------------------
+// segments — a meeting is a timeline of segments (server name: clips).
+// A segment = [from, to) of ONE recording placed at `at` on the meeting's
+// timeline, with a text policy. Thin wrappers over /api/transcripts/:id/clips*,
+// /split, /unsplit and /api/recordings/:id/align (lib/clips.ts contracts).
+// ---------------------------------------------------------------------------
+
+const SEGMENTS_HELP = `darth-cli meetings segments — a meeting is a TIMELINE of segments; a segment is a
+window of one recording placed at a time on that timeline (server name: clip)
+
+USAGE
+  darth-cli meetings segments <meeting> [--json]
+  darth-cli meetings segments <verb> <meeting> … [--json]
+
+READ
+  segments <meeting>              The timeline: every segment (#n, recording,
+                                  window from→to, placed at, text policy,
+                                  source, owner), the meeting's span, holes,
+                                  sibling meetings on the same recording and
+                                  what you may do next (split / add / unsplit)
+  segments candidates <meeting> [--all]
+                                  Recordings you could add: your own, linked
+                                  or not (only your OWN bytes are addable — a
+                                  recording is private to its owner); --all
+                                  also lists colleagues' recordings of
+                                  meetings you edit, which they must add
+  segments propose <meeting> [--instruction "…"]
+                                  Ask the server for split windows: speaker
+                                  joins/leaves, long silences, calendar
+                                  boundaries, then an agent reads them.
+                                  Proposals only — nothing changes
+
+WRITE (needs read+write for meetings; you must be able to EDIT the meeting)
+  segments add <meeting> <rid> [--from T] [--to T] [--at T] [--text include|gap-fill|exclude]
+                                  Add a window of one of YOUR recordings
+                                  (default: all of it), placed at --at on the
+                                  meeting's timeline (default 0:00 = starts
+                                  with the meeting). The server never guesses
+                                  the place — measure it with 'segments align'.
+                                  --text include = its words merge by time
+                                  (two mics, one room); gap-fill = its words
+                                  only where no other segment has speech;
+                                  exclude = playable audio, contributes no text
+  segments edit <meeting> <n> [--from T] [--to T] [--at T] [--text …]
+                                  Change segment #n's window, place or policy
+  segments rm <meeting> <n>       Remove segment #n (the last one cannot go)
+  segments align <rid> --against <rid2> [--near T] [--window T]
+                                  Measure how far <rid> starts AFTER <rid2> by
+                                  cross-correlating the audio (negative = it
+                                  started first). Prints offset + confidence;
+                                  applies NOTHING — pass the offset as --at
+                                  when <rid2> is the meeting's first segment.
+                                  --near = where to look first, --window =
+                                  half-width of the search (default ±2 min
+                                  with --near, ±30 min without). Slow on
+                                  long files (minutes)
+
+  split <meeting> --from T --to T [--title …] [--event <ref>] [--keep-in-both]
+  unsplit <meeting>               Top-level verbs — 'darth-cli meetings --help'
+
+T = mm:ss, h:mm:ss or plain ms. <rid> = recording uuid ('rec-<uuid>' accepted).
+<meeting> = a meeting id (the ids 'list' prints). Segments of a meeting are
+numbered #0, #1, … in the order 'segments <meeting>' prints them.`;
+
+/** ms → m:ss, or h:mm:ss past the hour (what the web UI prints). */
+function fmtMs(ms: number | null | undefined): string {
+  if (ms === null || ms === undefined || !Number.isFinite(ms)) return "?";
+  const neg = ms < 0;
+  const total = Math.round(Math.abs(ms) / 1000);
+  const h = Math.floor(total / 3600), m = Math.floor((total % 3600) / 60), s = total % 60;
+  const body = h > 0 ? `${h}:${String(m).padStart(2, "0")}:${String(s).padStart(2, "0")}` : `${m}:${String(s).padStart(2, "0")}`;
+  return neg ? `-${body}` : body;
+}
+
+/** A --from/--to/--at value as the server takes it: mm:ss / h:mm:ss / ms strings pass through. */
+function timeFlag(flags: Record<string, string | boolean>, name: string): string | null | undefined {
+  const raw = flags[name];
+  if (raw === undefined) return undefined;
+  if (raw === true) { console.error(`--${name} needs a value (mm:ss, h:mm:ss or ms)`); return null; }
+  const v = String(raw).trim();
+  if (!/^([0-9]+|[0-9]{1,3}:[0-5]?[0-9](:[0-5]?[0-9])?(\.[0-9]{1,3})?)$/.test(v)) { console.error(`--${name}: '${v}' is not mm:ss, h:mm:ss or ms`); return null; }
+  return v;
+}
+
+/** --text include|gap-fill|exclude → the server's policy name. */
+function textPolicyFlag(flags: Record<string, string | boolean>): string | null | undefined {
+  const raw = flags.text;
+  if (raw === undefined) return undefined;
+  const v = String(raw).trim().toLowerCase().replace("-", "_");
+  if (!["include", "gap_fill", "exclude"].includes(v)) { console.error("--text must be include, gap-fill or exclude"); return null; }
+  return v;
+}
+
+/** Non-2xx on a segments/split write → a readable line; returns the exit code. */
+function segmentWriteError(verb: string, status: number, data: any): number {
+  const msg = data?.error ?? `HTTP ${status}`;
+  const code = data?.code ? ` [${data.code}]` : "";
+  if (status === 401) console.error(`Unauthorized: ${msg}\nYour token may be expired/revoked — run: darth-cli login`);
+  else if (status === 403) console.error(`Forbidden: ${msg}\nYou need EDIT access to the meeting and a read+write token (re-run 'darth-cli login' and pick Read + write).`);
+  else if (status === 404 && data?.code === "disabled") console.error(`${verb} is not available on this server (${msg}).`);
+  else if (status === 404) console.error(`${verb} failed: not found (${msg})${code} — the meeting id, the recording, or the segment number.`);
+  else console.error(`${verb} refused (HTTP ${status}): ${msg}${code}`);
+  return status === 401 ? 3 : 1;
+}
+
+function printSegmentEntries(entries: any[], spanMs: number | null): void {
+  for (const e of entries) {
+    const win = `${fmtMs(e.fromMs)} → ${e.toMs === null || e.toMs === undefined ? "end" : fmtMs(e.toMs)}`;
+    const dur = e.durationMs != null ? ` (${fmtMs(e.durationMs)})` : "";
+    const who = e.mine ? "yours" : (e.ownerName || e.ownerEmail || "someone else's");
+    const tags = [e.primary ? "primary" : null, e.transcribed === false ? "text pending" : null, e.alignment ? e.alignment : null].filter(Boolean);
+    console.log(`#${e.ord}  rec ${e.recordingId}  ${win}${dur}  at ${fmtMs(e.offsetMs)}  ${String(e.textPolicy ?? "include").replace("_", "-")}  ${e.sourceLabel ?? ""}  (${who})${tags.length ? `  [${tags.join(", ")}]` : ""}`);
+  }
+  if (spanMs != null) console.log(`span: ${fmtMs(spanMs)}`);
+}
+
+function printSegmentsView(mid: string, v: any, ctx: Ctx): void {
+  if (v.enabled === false) {
+    console.log(`meeting ${mid}: segments are not enabled for this meeting on this server (legacy row without a recording, or the feature is off).`);
+    return;
+  }
+  const entries: any[] = Array.isArray(v.entries) && v.entries.length ? v.entries : (v.clips ?? []).map((c: any) => ({ ...c, sourceLabel: "", mine: true }));
+  console.log(`meeting ${mid}  ${v.canEdit ? "(you can edit)" : "(read-only)"}  recordings: ${v.recordingCount ?? 1}  web: ${webBase(ctx)}/transcript/${mid}`);
+  if (v.recording) console.log(`recording: ${v.recording.id}  ${fmtMs(v.recording.durationMs)}${v.recording.startedAt ? `  started ${fmtLocalDateTime(v.recording.startedAt, localTz(ctx))}` : ""}`);
+  printSegmentEntries(entries, v.spanMs ?? null);
+  if (v.window) console.log(`plays: ${fmtMs(v.window.fromMs)} → ${v.window.toMs === null ? "end" : fmtMs(v.window.toMs)} of the recording`);
+  for (const h of v.holes ?? []) console.log(`hole: ${fmtMs(h.fromMs)} → ${fmtMs(h.toMs)}  (split off, not in this meeting)`);
+  if (v.splitFrom) console.log(`split from: ${v.splitFrom.meetingId ?? "?"} ${v.splitFrom.title ? `"${v.splitFrom.title}"` : ""}  ${v.splitFrom.url ? (String(v.splitFrom.url).startsWith("/") ? webBase(ctx) + v.splitFrom.url : v.splitFrom.url) : ""}`);
+  for (const s of v.siblings ?? []) {
+    const rel = s.isSplitOff ? "split off this one" : s.isSource ? "this one was split off it" : "same recording";
+    console.log(`sibling: ${s.id} ${s.title ? `"${s.title}"` : "(untitled)"}  ${fmtMs(s.fromMs)} → ${s.toMs === null ? "end" : fmtMs(s.toMs)}  (${rel}${s.trashed ? ", trashed" : ""})`);
+  }
+  for (const p of v.pendingAttach ?? []) console.log(`pending: a recording is being added (${p.sourceLabel ?? p.status ?? "upload"})`);
+  const next: string[] = [];
+  next.push(v.splittable ? `split: ok  (darth-cli meetings split ${mid} --from T --to T)` : `split: no — ${v.splitBlockedReason ?? "not splittable"}`);
+  if (v.combineEnabled !== undefined) next.push(v.canAddRecording ? `add a recording: ok  (darth-cli meetings segments add ${mid} <rid>)` : `add a recording: no — ${v.addBlockedReason ?? (v.combineEnabled ? "not now" : "combining is off on this server")}`);
+  next.push(v.canUnsplit ? `unsplit: ok  (darth-cli meetings unsplit ${mid})` : `unsplit: no${v.unsplitBlockedReason ? ` — ${v.unsplitBlockedReason}` : ""}`);
+  for (const n of next) console.log(n);
+}
+
+async function segmentsCmd(ctx: Ctx, flags: Record<string, string | boolean>, pos: string[]): Promise<number> {
+  liftBoolFlags(pos, flags, ["all"]);
+  const [first, ...rest] = pos;
+  if (!first || first === "help" || flags.help === true) { console.log(SEGMENTS_HELP); return 0; }
+  const VERBS = ["list", "ls", "candidates", "propose", "add", "edit", "rm", "align"];
+  // 'segments <meeting>' = list; 'segments <verb> <meeting> …' otherwise.
+  const sub = VERBS.includes(first) ? first : "list";
+  const args = VERBS.includes(first) ? rest : [first, ...rest];
+  const need = (n: number, usage: string): boolean => {
+    if (args.length < n || args.slice(0, n).some(a => !a)) { console.error(`usage: darth-cli meetings segments ${usage}`); return false; }
+    return true;
+  };
+
+  switch (sub) {
+    case "list":
+    case "ls": {
+      if (!need(1, "<meeting>")) return 1;
+      const mid = args[0]!;
+      const r = await recordingRequest(ctx, `/api/transcripts/${mid}/clips`, { method: "GET" });
+      if (!r.ok) return segmentWriteError("segments", r.status, r.data);
+      ctx.print(r.data, () => printSegmentsView(mid, r.data, ctx));
+      return 0;
+    }
+
+    case "candidates": {
+      if (!need(1, "candidates <meeting>")) return 1;
+      const mid = args[0]!;
+      const r = await recordingRequest(ctx, `/api/transcripts/${mid}/clips/candidates`, { method: "GET" });
+      if (!r.ok) return segmentWriteError("segments candidates", r.status, r.data);
+      ctx.print(r.data, () => {
+        const v = r.data;
+        if (v.enabled === false) { console.log("Adding recordings is not available for this meeting (combining off, or the meeting has no segment yet)."); return; }
+        const all: any[] = v.candidates ?? [];
+        const addable = all.filter((c: any) => c.addable);
+        const shown = flags.all === true ? all : addable;
+        console.log(`meeting ${mid}: ${addable.length} addable recording(s) of yours${all.length > addable.length ? ` (+${all.length - addable.length} of colleagues — only their owner can add those${flags.all === true ? "" : "; --all lists them"})` : ""}, ${v.slotsLeft ?? "?"} slot(s) left${v.canEdit ? "" : "  (read-only — you cannot add)"}`);
+        for (const c of shown) {
+          const who = c.mine ? "yours" : (c.ownerName || c.ownerEmail || "someone else's");
+          const where = c.meeting ? `in meeting ${c.meeting.id} ${c.meeting.title ? `"${c.meeting.title}"` : ""}` : (c.unlinked ? "not in any meeting" : "");
+          const nominal = c.nominalOffsetMs != null ? `  nominal at ${fmtMs(c.nominalOffsetMs)}` : "";
+          console.log(`${c.recordingId}  ${fmtMs(c.durationMs)}  ${c.startedAt ? fmtLocalDateTime(c.startedAt, localTz(ctx)) : "?"}  ${c.sourceLabel ?? ""}  (${who}${c.transcribed ? "" : ", not transcribed"})  ${where}${nominal}${c.addable ? "" : `  — cannot add: ${c.blockedReason ?? "not yours"}`}`);
+        }
+      });
+      return 0;
+    }
+
+    case "propose": {
+      if (!need(1, "propose <meeting> [--instruction \"…\"]")) return 1;
+      const mid = args[0]!;
+      const instruction = str(flags.instruction);
+      const r = await recordingRequest(ctx, `/api/transcripts/${mid}/clips/propose`, { method: "POST", body: JSON.stringify(instruction ? { instruction } : {}) });
+      if (!r.ok) return segmentWriteError("segments propose", r.status, r.data);
+      ctx.print(r.data, () => {
+        const v = r.data;
+        console.log(`${v.candidates ?? 0} boundary candidate(s) found${v.ranAgent ? ", agent ran" : ", no agent call"}; ${v.proposals?.length ?? 0} proposal(s):`);
+        for (const p of v.proposals ?? []) {
+          console.log(`  ${fmtMs(p.fromMs)} → ${fmtMs(p.toMs)}  "${p.title}"  (${Math.round((p.confidence ?? 0) * 100)}%${p.basis ? `, ${p.basis}` : ""})  ${p.reason ?? ""}`);
+          console.log(`    darth-cli meetings split ${mid} --from ${fmtMs(p.fromMs)} --to ${fmtMs(p.toMs)} --title ${JSON.stringify(p.title)}${p.eventRef ? ` --event '${p.eventRef}'` : ""}`);
+        }
+        if (!(v.proposals?.length)) console.log("  (none — no strong boundary; give an --instruction or pick the window by hand from 'text')");
+      });
+      return 0;
+    }
+
+    case "add": {
+      if (!need(2, "add <meeting> <rid> [--from T] [--to T] [--at T] [--text include|gap-fill|exclude]")) return 1;
+      ctx.requireWrite();
+      const mid = args[0]!, rid = recId(args[1]!);
+      const from = timeFlag(flags, "from"), to = timeFlag(flags, "to"), at = timeFlag(flags, "at"), text = textPolicyFlag(flags);
+      if (from === null || to === null || at === null || text === null) return 1;
+      const body: Record<string, unknown> = { recordingId: rid };
+      if (from !== undefined) body.from = from;
+      if (to !== undefined) body.to = to;
+      if (at !== undefined) body.offset = at;
+      if (text !== undefined) body.textPolicy = text;
+      const r = await recordingRequest(ctx, `/api/transcripts/${mid}/clips`, { method: "POST", body: JSON.stringify(body) });
+      if (!r.ok) return segmentWriteError("segments add", r.status, r.data);
+      ctx.print(r.data, () => {
+        console.log(`added → meeting ${mid} now holds ${r.data.recordingCount ?? "?"} recording(s), ${r.data.clips?.length ?? "?"} segment(s); text re-built: ${r.data.materialised?.utterances ?? "?"} utterances, ${r.data.materialised?.speakerCount ?? "?"} speakers`);
+        printSegmentEntries(r.data.clips ?? [], r.data.spanMs ?? null);
+      });
+      return 0;
+    }
+
+    case "edit": {
+      if (!need(2, "edit <meeting> <n> [--from T] [--to T] [--at T] [--text …]")) return 1;
+      ctx.requireWrite();
+      const mid = args[0]!, ord = args[1]!.replace(/^#/, "");
+      if (!/^\d+$/.test(ord)) { console.error("segment number must be the #n from 'segments <meeting>'"); return 1; }
+      const from = timeFlag(flags, "from"), to = timeFlag(flags, "to"), at = timeFlag(flags, "at"), text = textPolicyFlag(flags);
+      if (from === null || to === null || at === null || text === null) return 1;
+      const body: Record<string, unknown> = {};
+      if (from !== undefined) body.from = from;
+      if (to !== undefined) body.to = to;
+      if (at !== undefined) body.offset = at;
+      if (text !== undefined) body.textPolicy = text;
+      if (!Object.keys(body).length) { console.error("nothing to change — give --from, --to, --at or --text"); return 1; }
+      const r = await recordingRequest(ctx, `/api/transcripts/${mid}/clips/${ord}`, { method: "PATCH", body: JSON.stringify(body) });
+      if (!r.ok) return segmentWriteError("segments edit", r.status, r.data);
+      ctx.print(r.data, () => {
+        console.log(`segment #${ord} updated; text re-built: ${r.data.materialised?.utterances ?? "?"} utterances`);
+        printSegmentEntries(r.data.clips ?? [], r.data.spanMs ?? null);
+      });
+      return 0;
+    }
+
+    case "rm": {
+      if (!need(2, "rm <meeting> <n>")) return 1;
+      ctx.requireWrite();
+      const mid = args[0]!, ord = args[1]!.replace(/^#/, "");
+      if (!/^\d+$/.test(ord)) { console.error("segment number must be the #n from 'segments <meeting>'"); return 1; }
+      const r = await recordingRequest(ctx, `/api/transcripts/${mid}/clips/${ord}`, { method: "DELETE" });
+      if (!r.ok) return segmentWriteError("segments rm", r.status, r.data);
+      ctx.print(r.data, () => {
+        console.log(`segment #${ord} removed; meeting ${mid} now holds ${r.data.recordingCount ?? "?"} recording(s), ${r.data.clips?.length ?? "?"} segment(s)`);
+        printSegmentEntries(r.data.clips ?? [], r.data.spanMs ?? null);
+      });
+      return 0;
+    }
+
+    case "align": {
+      if (!need(1, "align <rid> --against <rid2> [--near T] [--window T]")) return 1;
+      const rid = recId(args[0]!);
+      const against = str(flags.against);
+      if (!against) { console.error("usage: darth-cli meetings segments align <rid> --against <rid2> [--near T] [--window T]"); return 1; }
+      const near = timeFlag(flags, "near"), window = timeFlag(flags, "window");
+      if (near === null || window === null) return 1;
+      const body: Record<string, unknown> = { against: recId(against) };
+      // the align route takes ms numbers only
+      const toMs = (v: string): number => {
+        if (/^[0-9]+$/.test(v)) return Number(v);
+        const p = v.split(":").map(Number);
+        const [h, m, s] = p.length === 3 ? p : [0, p[0], p[1]];
+        return Math.round(((h! * 60 + m!) * 60 + s!) * 1000);
+      };
+      if (near !== undefined) body.nominalOffsetMs = toMs(near);
+      if (window !== undefined) body.searchWindowMs = toMs(window);
+      console.error("Measuring (decoding both recordings — minutes on long files)…");
+      const r = await recordingRequest(ctx, `/api/recordings/${rid}/align`, { method: "POST", body: JSON.stringify(body) });
+      if (!r.ok) return segmentWriteError("segments align", r.status, r.data);
+      ctx.print(r.data, () => {
+        const v = r.data;
+        const pct = Math.round((v.confidence ?? 0) * 100);
+        const verdict = (v.confidence ?? 0) >= 0.4 ? "usable" : "too weak — set it by ear";
+        console.log(`${rid} starts ${fmtMs(Math.abs(v.offsetMs))} ${v.offsetMs < 0 ? "BEFORE" : "after"} ${recId(against)}  (offset ${v.offsetMs} ms, confidence ${pct}% ${verdict}${v.driftPpm != null ? `, drift ${v.driftPpm} ppm` : ""}${v.overlapMs != null ? `, overlap ${fmtMs(v.overlapMs)}` : ""})`);
+        if (v.advice) console.log(v.advice);
+        if (v.offsetMs >= 0) console.log(`If ${recId(against)} is the meeting's first segment at 0:00: darth-cli meetings segments add <meeting> ${rid} --at ${fmtMs(v.offsetMs)}`);
+        else console.log(`It started first: add it at 0:00 and move the other segment to --at ${fmtMs(-v.offsetMs)} ('segments edit').`);
+      });
+      return 0;
+    }
+
+    default:
+      console.error(`Unknown segments command: ${sub}\n`);
+      console.log(SEGMENTS_HELP);
+      return 1;
+  }
+}
+
+/** darth-cli meetings split <meeting> --from T --to T [--title] [--event <ref>] [--keep-in-both] */
+async function splitCmd(ctx: Ctx, flags: Record<string, string | boolean>, args: string[]): Promise<number> {
+  const mid = args[0];
+  const usage = "usage: darth-cli meetings split <meeting> --from T --to T [--title \"…\"] [--event <meeting-code|event-key>] [--keep-in-both]   (T = mm:ss, h:mm:ss or ms, on the MEETING's timeline)";
+  if (!mid) { console.error(usage); return 1; }
+  const from = timeFlag(flags, "from"), to = timeFlag(flags, "to");
+  if (from === null || to === null) return 1;
+  if (from === undefined || to === undefined) { console.error(usage); return 1; }
+  ctx.requireWrite();
+  const body: Record<string, unknown> = { from, to };
+  const title = str(flags.title);
+  if (title) body.title = title;
+  const ev = str(flags.event);
+  if (ev) body.eventRef = ev;
+  if (flags["keep-in-both"] === true) body.keepInBoth = true;
+  const r = await recordingRequest(ctx, `/api/transcripts/${mid}/split`, { method: "POST", body: JSON.stringify(body) });
+  if (!r.ok) {
+    const code = segmentWriteError("split", r.status, r.data);
+    if (r.status === 404 && ev) console.error("Tip: 'darth-cli meetings calendar --view all --json' lists your events with their [meeting-code] and exact 'key'.");
+    return code;
+  }
+  ctx.print(r.data, () => {
+    const m = r.data.meeting ?? {};
+    console.log(`split → new meeting ${m.id} ${m.title ? `"${m.title}"` : "(untitled)"}  ${fmtMs(m.fromMs)} → ${fmtMs(m.toMs)} of the recording (${fmtMs(m.durationMs)})`);
+    console.log(`Web: ${webBase(ctx)}/transcript/${m.id}`);
+    const mv = r.data.moved ?? {};
+    if (mv.edits || mv.speakerNames) console.log(`moved with it: ${mv.edits ?? 0} text edit(s), ${mv.speakerNames ?? 0} speaker name(s)`);
+    if (r.data.linkedEvent) console.log(`linked to "${r.data.linkedEvent.title ?? "(untitled)"}" ${r.data.linkedEvent.startTime ? fmtLocalDateTime(r.data.linkedEvent.startTime, localTz(ctx)) : ""} — shared with ${r.data.linkedEvent.shared ?? 0} Trames invitee(s)`);
+    if (flags["keep-in-both"] === true) console.log(`source ${mid} keeps the window too (--keep-in-both)`);
+    else console.log(`source ${mid} now has a hole there${r.data.source?.notesStale ? " — its notes/report were written before the split; regenerate them in the web UI" : ""}`);
+    console.log(`undo: darth-cli meetings unsplit ${m.id}`);
+  });
+  return 0;
+}
+
+/** darth-cli meetings unsplit <meeting> — from the SPLIT-OFF meeting. */
+async function unsplitCmd(ctx: Ctx, args: string[]): Promise<number> {
+  const mid = args[0];
+  if (!mid) { console.error("usage: darth-cli meetings unsplit <split-off-meeting-id>   (the id 'split' printed; the window goes back into its source meeting)"); return 1; }
+  ctx.requireWrite();
+  const r = await recordingRequest(ctx, `/api/transcripts/${mid}/unsplit`, { method: "POST" });
+  if (!r.ok) return segmentWriteError("unsplit", r.status, r.data);
+  ctx.print(r.data, () => {
+    const m = r.data.meeting ?? {};
+    console.log(`put back → ${mid} is gone; its window is part of ${m.id} ${m.title ? `"${m.title}"` : ""} again${r.data.restored?.edits ? ` (${r.data.restored.edits} edit(s) restored)` : ""}`);
+    console.log(`Web: ${webBase(ctx)}/transcript/${m.id}`);
+  });
+  return 0;
+}
+
 async function recordingsCmd(ctx: Ctx, flags: Record<string, string | boolean>, pos: string[]): Promise<number> {
   liftBoolFlags(pos, flags, ["all", "envelope", "unlinked", "temporary", "regex", "separate"]);
   const [sub, ...args] = pos;
@@ -2216,9 +2616,12 @@ const meetings: Subcommand = {
   help: HELP,
   async run(ctx, argv) {
     const { pos, flags } = parseArgs(argv);
-    liftBoolFlags(pos, flags, ["cascade", "exact", "cached", "details", "wait", "clear", "scratch", "resume", "separate", RETIRED_CONSENT_FLAG]);
+    liftBoolFlags(pos, flags, ["cascade", "exact", "cached", "details", "wait", "clear", "scratch", "resume", "separate", "keep-in-both", RETIRED_CONSENT_FLAG]);
     const [, cmd, ...args] = pos.length && pos[0] === "meetings" ? pos : ["", ...pos];
     if (cmd === "recordings") return recordingsCmd(ctx, flags, args);
+    if (cmd === "segments" || cmd === "clips") return segmentsCmd(ctx, flags, args);
+    if (cmd === "split") return splitCmd(ctx, flags, args);
+    if (cmd === "unsplit") return unsplitCmd(ctx, args);
     if (!cmd || flags.help === true) { console.log(HELP); return 0; }
 
     switch (cmd) {
