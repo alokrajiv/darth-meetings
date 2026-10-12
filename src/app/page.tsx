@@ -125,9 +125,9 @@ export default function Home() {
     void getGoogleAccessToken().catch(() => {});
   }, []);
 
-  // Post-connect landing: the Google callback returns to /?meet=1|sync
-  // (&google=connected) so the import dialog the user came from reopens —
-  // now with silent server-minted tokens.
+  // Post-connect landing: auth's Connections page returns to /?meet=1|sync
+  // (&connected=google; legacy &google=connected) so the import dialog the
+  // user came from reopens — now with silent server-served tokens.
   const urlParamsHandledRef = useRef(false);
   useEffect(() => {
     if (urlParamsHandledRef.current) return;
@@ -145,9 +145,10 @@ export default function Home() {
       setGmeetFocus({ meetingCode: importCode, eventStart: params.get('start') });
       setGmeetOpen(true);
     }
-    if (meet || importCode || params.get('google')) {
+    if (meet || importCode || params.get('google') || params.get('connected')) {
       params.delete('meet');
       params.delete('google');
+      params.delete('connected');
       params.delete('reason');
       params.delete('import');
       params.delete('start');

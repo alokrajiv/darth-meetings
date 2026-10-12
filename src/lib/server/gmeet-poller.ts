@@ -7,6 +7,7 @@ import {
   type GoogleAccountRow,
 } from '@/db-ops/google-accounts';
 import { getServerAccessToken } from '@/lib/server/google-oauth';
+import { syncGoogleAccountsFromAuth } from '@/lib/server/google-link-sync';
 import { getSyncState, findImportedByMeetingCodes } from '@/db-ops/gmeet-sync';
 import {
   upsertReminder,
@@ -712,6 +713,16 @@ async function sweepAll(): Promise<void> {
   if (sweeping) return; // a slow sweep must not stack onto the next tick
   sweeping = true;
   try {
+    // Who to visit comes from darth-auth (it owns the Google links since
+    // 2026-10-12): mirror its listing into google_accounts first, so people
+    // who linked on auth get swept and unlinked people stop being visited.
+    // Auth unreachable → null, rows untouched, sweep the ones we have.
+    const mirror = await syncGoogleAccountsFromAuth();
+    if (mirror) {
+      console.log(
+        `[gmeet-poller] auth links: ${mirror.linked} linked, ${mirror.added} added, ${mirror.marked} marked not-linked`
+      );
+    }
     const accounts = await listPollableGoogleAccounts();
     for (const account of accounts) {
       try {
@@ -779,10 +790,12 @@ export function triggerGmeetPoll(): Promise<void> {
 }
 
 /**
- * Immediate first sweep for a just-connected account. The 30-minute tick is
- * far too slow for the post-connect experience — until last_poll_at lands,
- * the listing shows a "still syncing" banner and the calendar layers look
- * misleadingly empty. Fire-and-forget from the OAuth callback.
+ * Immediate sweep for ONE account — the "Sync now" route
+ * (/api/calendar/sync). The 30-minute tick is far too slow right after a
+ * person links Google — until last_poll_at lands, the listing shows a "still
+ * syncing" banner and the calendar layers look misleadingly empty. (Its old
+ * caller, the OAuth callback, is gone: the link is made on darth-auth now; the
+ * route mirrors the caller's row from auth before calling this.)
  */
 export async function sweepNewAccount(userId: string): Promise<void> {
   try {

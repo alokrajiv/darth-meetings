@@ -4,8 +4,8 @@ import { useEffect, useState } from 'react';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
 import { MessageSquare, CheckCircle2, AlertTriangle, ExternalLink } from 'lucide-react';
-import { DARTH_TASKS_MS_PAGE } from '@/lib/darth-family';
-import { isNetworkFailure, networkErrorMessage, NETWORK_ERROR_MESSAGE } from '@/lib/fetch-errors';
+import { connectionsHref, DARTH_AUTH_CONNECTIONS_URL, DARTH_TASKS_URL } from '@/lib/darth-family';
+import { isNetworkFailure, NETWORK_ERROR_MESSAGE } from '@/lib/fetch-errors';
 
 interface MsStatus {
   available: boolean;
@@ -25,16 +25,16 @@ interface MsStatus {
 /**
  * Settings card for the Microsoft (Teams chat) account link.
  *
- * This link is OWNED by Darth Tasks (darth-plagueis) — it powers
- * `darth-cli tasks teams-*` chat reads — and is only SURFACED here so all of
- * a user's connected accounts show in one place. Meeting transcripts do not
- * need it (they use the tenant-wide app-only "Darth Meetings" registration).
- * Connect/Reconnect round-trip through Darth Tasks and land back here via
- * `?return=`; the banner reads `?ms=connected|error`.
+ * This link is HELD by darth-auth since 2026-10-12 (Darth Tasks reads tokens
+ * from it to power `darth-cli tasks teams-*` chat reads) and is only SURFACED
+ * here so all of a user's connected accounts show in one place. Meeting
+ * transcripts do not need it (they use the tenant-wide app-only "Darth
+ * Meetings" registration). Connect / Reconnect / Manage go to auth's
+ * Connections page and land back here via `?return=`; the banner reads
+ * `?connected=microsoft` (and the legacy `?ms=connected|error`).
  */
 export function MicrosoftAccountCard() {
   const [status, setStatus] = useState<MsStatus | null>(null);
-  const [busy, setBusy] = useState(false);
   const [banner, setBanner] = useState<{ ok: boolean; text: string } | null>(null);
 
   const load = () => {
@@ -56,7 +56,7 @@ export function MicrosoftAccountCard() {
 
   useEffect(() => {
     const params = new URLSearchParams(window.location.search);
-    const outcome = params.get('ms');
+    const outcome = params.get('connected') === 'microsoft' ? 'connected' : params.get('ms');
     if (outcome === 'connected') {
       setBanner({ ok: true, text: 'Microsoft account connected — Teams chat reads via darth-cli are on.' });
     } else if (outcome === 'error') {
@@ -65,45 +65,25 @@ export function MicrosoftAccountCard() {
     if (outcome) {
       params.delete('ms');
       params.delete('reason');
+      if (params.get('connected') === 'microsoft') params.delete('connected');
       const qs = params.toString();
       window.history.replaceState(null, '', `${window.location.pathname}${qs ? `?${qs}` : ''}${window.location.hash}`);
     }
   }, []);
 
+  /** auth's Connections page, returning to this card. Used for connect,
+   * reconnect and manage alike (disconnect lives there too). */
   const connect = () => {
     const ret = new URL(window.location.href);
     ret.searchParams.delete('ms');
     ret.searchParams.delete('reason');
+    if (ret.searchParams.get('connected') === 'microsoft') ret.searchParams.delete('connected');
     ret.hash = 'microsoft';
-    const base = status?.connectUrl ?? `${DARTH_TASKS_MS_PAGE.replace(/\/ms$/, '')}/api/ms/connect`;
-    window.location.href = `${base}?return=${encodeURIComponent(ret.toString())}`;
+    const page = status?.connectUrl ?? DARTH_AUTH_CONNECTIONS_URL;
+    window.location.href = connectionsHref(ret.toString(), window.location.origin, page);
   };
 
-  const disconnect = async () => {
-    if (
-      !window.confirm(
-        'Disconnect Microsoft? Teams chat reads via darth-cli will stop until you reconnect. Meeting transcript imports are not affected.'
-      )
-    )
-      return;
-    setBusy(true);
-    try {
-      const res = await fetch('/api/ms/status', { method: 'DELETE' });
-      if (!res.ok) {
-        const d = (await res.json().catch(() => null)) as { error?: string } | null;
-        setBanner({ ok: false, text: d?.error ?? `Disconnect failed (${res.status})` });
-      } else {
-        setBanner(null);
-      }
-      load();
-    } catch (err) {
-      setBanner({ ok: false, text: networkErrorMessage(err, 'Disconnect failed') });
-    } finally {
-      setBusy(false);
-    }
-  };
-
-  const manageUrl = status?.manageUrl ?? DARTH_TASKS_MS_PAGE;
+  const manageUrl = status?.manageUrl ?? DARTH_AUTH_CONNECTIONS_URL;
   const needsReconnect = status?.available && !status.connected && status.status === 'revoked';
 
   return (
@@ -112,7 +92,7 @@ export function MicrosoftAccountCard() {
         <CardTitle className="flex items-center gap-2">
           <MessageSquare className="h-4 w-4 text-primary" />
           Microsoft account
-          <span className="text-xs font-normal text-muted-foreground">· Teams chat, via Darth Tasks</span>
+          <span className="text-xs font-normal text-muted-foreground">· Teams chat, used by Darth Tasks</span>
         </CardTitle>
       </CardHeader>
       <CardContent className="space-y-3">
@@ -134,8 +114,8 @@ export function MicrosoftAccountCard() {
         <p className="text-xs text-muted-foreground">
           Not needed for meeting transcripts or recordings — those import through the tenant-wide Darth Meetings
           app with no per-user step. This link lets <code className="rounded bg-muted px-1">darth-cli tasks teams-chats</code>{' '}
-          read <span className="font-medium">your own</span> Teams chats as you. It is held by Darth Tasks and shown
-          here so all your connected accounts are in one place.
+          read <span className="font-medium">your own</span> Teams chats as you. It is held by Darth Auth (one
+          Connections page for every Darth tool) and shown here so all your connected accounts are in one place.
         </p>
 
         {status !== null && status.available && status.configured !== false && (
@@ -161,10 +141,10 @@ export function MicrosoftAccountCard() {
             {status.reason === 'network'
               ? NETWORK_ERROR_MESSAGE
               : status.reason === 'no_tasks_access'
-                ? 'Your account has no access to Darth Tasks, which holds this link — ask an admin there.'
+                ? 'Your account has no access to Darth Tasks, which reports this link\'s status — ask an admin there.'
                 : 'Darth Tasks is unreachable right now — status unavailable.'}{' '}
             <a
-              href={manageUrl}
+              href={DARTH_TASKS_URL}
               target="_blank"
               rel="noreferrer"
               className="underline"
@@ -174,7 +154,7 @@ export function MicrosoftAccountCard() {
           </p>
         ) : !status.configured ? (
           <p className="text-sm text-muted-foreground">
-            The Microsoft integration isn&apos;t configured on Darth Tasks yet.
+            The Microsoft integration isn&apos;t configured on Darth Auth yet.
           </p>
         ) : !status.connected ? (
           <>
@@ -190,11 +170,13 @@ export function MicrosoftAccountCard() {
               </Button>
               <a
                 href={manageUrl}
-                target="_blank"
-                rel="noreferrer"
+                onClick={(e) => {
+                  e.preventDefault();
+                  connect();
+                }}
                 className="inline-flex items-center gap-1 text-xs text-muted-foreground underline"
               >
-                Manage on Darth Tasks <ExternalLink className="h-3 w-3" />
+                Manage on Connections <ExternalLink className="h-3 w-3" />
               </a>
             </div>
           </>
@@ -216,16 +198,15 @@ export function MicrosoftAccountCard() {
               </p>
             </div>
             <div className="flex flex-wrap items-center gap-2">
-              <Button size="sm" variant="outline" disabled={busy} onClick={disconnect}>
-                Disconnect
-              </Button>
               <a
                 href={manageUrl}
-                target="_blank"
-                rel="noreferrer"
+                onClick={(e) => {
+                  e.preventDefault();
+                  connect();
+                }}
                 className="inline-flex items-center gap-1 text-xs text-muted-foreground underline"
               >
-                Manage on Darth Tasks <ExternalLink className="h-3 w-3" />
+                Manage on Connections <ExternalLink className="h-3 w-3" />
               </a>
             </div>
           </>

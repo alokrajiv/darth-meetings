@@ -4,22 +4,23 @@ import { useCallback, useEffect, useState } from 'react';
 import { usePathname } from 'next/navigation';
 import { Button } from '@/components/ui/button';
 import { CalendarDays, MessageSquare, X } from 'lucide-react';
-import { DARTH_TASKS_URL } from '@/lib/darth-family';
+import { connectionsHref, DARTH_AUTH_CONNECTIONS_URL } from '@/lib/darth-family';
 
 /**
  * Connect nudge — "Darth tools work best with access to your calendar and
  * Teams chats" — shown at the top of the listing when the caller lacks the
  * Google link (calendar sweep, Meet imports) OR the Microsoft link (Teams
  * chat evidence: was the call held, was it recorded — read through the
- * Darth Tasks-owned per-user link).
+ * auth-held per-user link that Darth Tasks reads).
  *
  *  - Hidden while either status is still loading, and never on /login.
  *  - Dismiss is per service: localStorage `mw:nudge:<service>:until` (7d),
  *    plus `mw:nudge:<service>:state` so a link that later turns *revoked*
  *    re-surfaces the nudge even inside the snooze window.
- *  - Google → the existing /api/google/connect flow (returns to this page);
- *    Microsoft → Darth Tasks /api/ms/connect?return=<this page> — the same
- *    round-trip the Settings card uses (microsoft-account-card.tsx).
+ *  - Both links are held by darth-auth (since 2026-10-12): Google and
+ *    Microsoft both go to auth's Connections page with ?return=<this page> —
+ *    the same round-trip the Settings cards use. Auth comes back with
+ *    `?connected=<provider>`, cleaned up on landing.
  *
  * This file also hosts the page-wide Microsoft link-status cache
  * (`useMsLinkStatus`) so calendar rows / the import dialog can say "Connect
@@ -97,20 +98,26 @@ export function msLinkMissing(s: MsLinkStatus | null): s is MsLinkStatus {
   return !!s && s.available && s.configured !== false && !s.connected;
 }
 
-/** Where "Connect Microsoft" goes: Darth Tasks' connect flow, returning to
- * the current page (`?ms=connected|error` bounce, cleaned up on landing). */
-export function msConnectHref(status: MsLinkStatus | null, returnTo?: string): string {
+/** The current page minus the params a connect round-trip leaves on it. */
+function returnHere(returnTo?: string): string {
   const ret = new URL(returnTo ?? window.location.href);
   ret.searchParams.delete('ms');
+  ret.searchParams.delete('google');
   ret.searchParams.delete('reason');
-  const base = status?.connectUrl ?? `${DARTH_TASKS_URL}/api/ms/connect`;
-  return `${base}?return=${encodeURIComponent(ret.toString())}`;
+  ret.searchParams.delete('connected');
+  return ret.toString();
 }
 
-/** Where "Connect Google" goes: our own auth-code flow, returning here. */
+/** Where "Connect Microsoft" goes: auth's Connections page (the bare URL the
+ * status payload names, else the constant), returning to the current page. */
+export function msConnectHref(status: MsLinkStatus | null, returnTo?: string): string {
+  const page = status?.connectUrl ?? DARTH_AUTH_CONNECTIONS_URL;
+  return connectionsHref(returnHere(returnTo), window.location.origin, page);
+}
+
+/** Where "Connect Google" goes: auth's Connections page, returning here. */
 export function googleConnectHref(): string {
-  const ret = `${window.location.pathname}${window.location.search}`;
-  return `/api/google/connect?return=${encodeURIComponent(ret)}`;
+  return connectionsHref(returnHere(), window.location.origin);
 }
 
 // ---- dismiss / snooze --------------------------------------------------
@@ -156,18 +163,23 @@ export function ConnectNudgeBanner({ className = '' }: { className?: string }) {
       .catch(() => setGoogle({ connected: false }));
   }, []);
 
-  // Post-connect bounce from Darth Tasks: /?ms=connected|error&reason=…
+  // Post-connect bounce: /?connected=microsoft|google from auth's
+  // Connections page, or the legacy Darth Tasks /?ms=connected|error&reason=…
   useEffect(() => {
     const params = new URLSearchParams(window.location.search);
-    const outcome = params.get('ms');
-    if (!outcome) return;
+    const connected = params.get('connected');
+    const outcome = connected === 'microsoft' ? 'connected' : params.get('ms');
+    if (!outcome && connected !== 'google') return;
     if (outcome === 'error') {
       setMsError(params.get('reason') ?? 'unknown');
     } else if (outcome === 'connected') {
       void refreshMsLinkStatus();
     }
+    // connected=google needs no action: /api/google/status (fetched above)
+    // re-mirrors the link from auth on every read.
     params.delete('ms');
     params.delete('reason');
+    if (connected === 'microsoft' || connected === 'google') params.delete('connected');
     const qs = params.toString();
     window.history.replaceState(
       window.history.state,

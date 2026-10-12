@@ -3,8 +3,9 @@
 import { useEffect, useState } from 'react';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
-import { Video, CheckCircle2, AlertTriangle } from 'lucide-react';
-import { isNetworkFailure, networkErrorMessage, NETWORK_ERROR_MESSAGE } from '@/lib/fetch-errors';
+import { Video, CheckCircle2, AlertTriangle, ExternalLink } from 'lucide-react';
+import { isNetworkFailure, NETWORK_ERROR_MESSAGE } from '@/lib/fetch-errors';
+import { connectionsHref, DARTH_AUTH_CONNECTIONS_URL } from '@/lib/darth-family';
 
 interface GoogleStatus {
   connected: boolean;
@@ -13,18 +14,37 @@ interface GoogleStatus {
   lastError?: string | null;
   connectedAt?: string;
   lastPollAt?: string | null;
+  /** darth-auth's Connections page (bare) — where the link is managed. */
+  manageUrl?: string;
+  /** Connections with `?return=` /settings (we build our own return). */
+  connectUrl?: string;
+}
+
+/** Query params the connect round-trip leaves on this page. */
+const BOUNCE_PARAMS = ['google', 'reason', 'connected'];
+
+/** auth's Connections page with `?return=` the current page (bounce params
+ * stripped), using the page URL the status payload named when it has one. */
+function connectHref(status: GoogleStatus | null | 'unknown'): string {
+  const ret = new URL(window.location.href);
+  for (const k of BOUNCE_PARAMS) ret.searchParams.delete(k);
+  const page = status && status !== 'unknown' && status.manageUrl ? status.manageUrl : DARTH_AUTH_CONNECTIONS_URL;
+  return connectionsHref(ret.toString(), window.location.origin, page);
 }
 
 /**
- * Settings card for the backend Google connection (refresh-token flow that
- * powers the background sync-and-remind poller and kills the GIS popup).
+ * Settings card for the Google account link that powers the background
+ * sync-and-remind poller and every server-side Google read. Since 2026-10-12
+ * the link is HELD by darth-auth: Connect / Reconnect / Manage all go to
+ * auth's Connections page with `?return=` back here; this card only shows
+ * the state (GET /api/google/status re-mirrors it from auth first).
  */
 export function GoogleAccountCard() {
   // 'unknown' = network down: never show the not-connected copy
   // (and its Connect button) for a status we could not read.
   const [status, setStatus] = useState<GoogleStatus | 'unknown' | null>(null);
-  const [busy, setBusy] = useState(false);
-  // Post-callback banner: /settings?google=connected|error&reason=…
+  // Post-connect banner: /settings?connected=google (auth's Connections
+  // round-trip) or the legacy ?google=connected|error&reason=…
   const [banner, setBanner] = useState<{ ok: boolean; text: string } | null>(null);
 
   const load = () => {
@@ -46,34 +66,24 @@ export function GoogleAccountCard() {
 
   useEffect(() => {
     const params = new URLSearchParams(window.location.search);
-    const outcome = params.get('google');
+    const outcome = params.get('connected') === 'google' ? 'connected' : params.get('google');
     if (outcome === 'connected') {
       setBanner({ ok: true, text: 'Google account connected — background sync is on.' });
     } else if (outcome === 'error') {
       setBanner({ ok: false, text: `Google connect failed (${params.get('reason') ?? 'unknown'}). Try again.` });
     }
     if (outcome) {
-      params.delete('google');
-      params.delete('reason');
+      for (const k of BOUNCE_PARAMS) params.delete(k);
       const qs = params.toString();
-      window.history.replaceState(null, '', `${window.location.pathname}${qs ? `?${qs}` : ''}`);
+      window.history.replaceState(null, '', `${window.location.pathname}${qs ? `?${qs}` : ''}${window.location.hash}`);
     }
   }, []);
 
-  const disconnect = async () => {
-    if (!window.confirm('Disconnect Google? Background sync and reminders will stop.')) return;
-    setBusy(true);
-    try {
-      const res = await fetch('/api/google/status', { method: 'DELETE' });
-      if (!res.ok) throw new Error(`Disconnect failed (${res.status})`);
-      setBanner(null);
-      load();
-    } catch (err) {
-      setBanner({ ok: false, text: networkErrorMessage(err, 'Disconnect failed') });
-    } finally {
-      setBusy(false);
-    }
+  const goConnect = () => {
+    window.location.href = connectHref(status);
   };
+  const manageUrl =
+    status && status !== 'unknown' && status.manageUrl ? status.manageUrl : DARTH_AUTH_CONNECTIONS_URL;
 
   const needsReconnect = status !== null && status !== 'unknown' && status.connected && status.status === 'revoked';
 
@@ -113,14 +123,11 @@ export function GoogleAccountCard() {
               Connect your Google account so the server can watch your calendar in the
               background: it reminds you about meetings with recordings you haven&apos;t
               imported, nudges you when auto-record is off for meetings you organize, and
-              removes the Google popup from Meet imports. Read-only access; you can
-              disconnect any time.
+              removes the Google popup from Meet imports. Read-only access; the link is
+              held by Darth Auth (one Connections page for every Darth tool) and you can
+              disconnect it there any time.
             </p>
-            <Button
-              onClick={() => (window.location.href = '/api/google/connect')}
-            >
-              Connect Google
-            </Button>
+            <Button onClick={goConnect}>Connect Google</Button>
           </>
         ) : (
           <>
@@ -143,18 +150,24 @@ export function GoogleAccountCard() {
                 {status.status === 'error' && status.lastError ? ` · last error: ${status.lastError}` : ''}
               </p>
             </div>
-            <div className="flex gap-2">
+            <div className="flex flex-wrap items-center gap-2">
               {needsReconnect && (
-                <Button
-                  size="sm"
-                  onClick={() => (window.location.href = '/api/google/connect')}
-                >
+                <Button size="sm" onClick={goConnect}>
                   Reconnect
                 </Button>
               )}
-              <Button size="sm" variant="outline" disabled={busy} onClick={disconnect}>
-                Disconnect
-              </Button>
+              {/* Disconnect / change account happen on Connections; same tab,
+                  `?return=` brings the person back here. */}
+              <a
+                href={manageUrl}
+                onClick={(e) => {
+                  e.preventDefault();
+                  goConnect();
+                }}
+                className="inline-flex items-center gap-1 text-xs text-muted-foreground underline"
+              >
+                Manage on Connections <ExternalLink className="h-3 w-3" />
+              </a>
             </div>
           </>
         )}

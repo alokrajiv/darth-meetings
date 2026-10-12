@@ -1,15 +1,15 @@
 import { NextResponse } from 'next/server';
 import { withAuth } from '@/lib/auth/with-auth';
 import { getServerAccessToken, invalidateServerToken } from '@/lib/server/google-oauth';
-import { getGoogleAccount } from '@/db-ops/google-accounts';
+import { getGoogleAccount, isNotLinkedOnAuth } from '@/db-ops/google-accounts';
 
 export const runtime = 'nodejs';
 
 /**
- * Server-minted Google access token for the browser. Lets connected users
- * skip the GIS popup entirely — google-token.ts tries this before falling
- * back to the popup. Only ever returns the CALLER's own token; short-lived
- * (~1h) and read-only scoped, same as what the popup would have minted.
+ * Google access token for the browser (lib/google-token.ts). Only ever
+ * returns the CALLER's own token, short-lived (~1h) and read-only scoped.
+ * Since 2026-10-12 it is fetched from darth-auth, which holds the link
+ * (lib/server/google-oauth.ts); 404 = no usable link.
  */
 export const GET = withAuth(async ({ user, request, cliScope }) => {
   if (cliScope) {
@@ -23,8 +23,9 @@ export const GET = withAuth(async ({ user, request, cliScope }) => {
   const minted = await getServerAccessToken(user.userId);
   if (!minted) {
     const account = await getGoogleAccount(user.userId);
+    const linked = !!account && !isNotLinkedOnAuth(account);
     return NextResponse.json(
-      { connected: !!account, status: account?.status ?? null },
+      { connected: linked, status: linked ? account!.status : null },
       { status: 404 }
     );
   }

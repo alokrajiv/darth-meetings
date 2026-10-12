@@ -1,42 +1,33 @@
 import 'server-only';
-import crypto from 'crypto';
 import { config } from '@/config';
-import {
-  getGoogleAccount,
-  markGoogleAccountStatus,
-} from '@/db-ops/google-accounts';
+import { markGoogleAccountStatus, NOT_LINKED_ON_AUTH } from '@/db-ops/google-accounts';
+import { connectionsHref, DARTH_AUTH_CONNECTIONS_URL } from '@/lib/darth-family';
 
 /**
- * Server-side Google OAuth (auth-code flow with offline access).
+ * Server-side Google access tokens — FETCHED FROM darth-auth (since
+ * 2026-10-12, plans/connectors/SWITCH-2026-10-12.md).
  *
- * The browser GIS popup mints ~1h tokens with no server involvement; this
- * module is the durable counterpart: per-user refresh tokens, encrypted at
- * rest (AES-256-GCM, key = GOOGLE_TOKEN_ENC_KEY), from which the server
- * mints short-lived access tokens for the background poller and for the
- * frontend (so connected users never see the popup again).
+ * darth-auth owns every Google account link: the person connects, reconnects
+ * and disconnects on `auth…/connections`, auth holds the refresh token and
+ * refreshes it. This app no longer runs an OAuth flow, holds a client secret
+ * or decrypts anything — it asks auth for a short-lived access token,
+ * service-to-service:
  *
- * Scopes are strictly read-only + `openid email` for identifying which
- * Google account got connected.
+ *   POST {DARTH_AUTH_INTERNAL_URL}/api/links/google/token {userId, group:"calendar"}
+ *   Authorization: Bearer <DARTH_APP_TOKEN>   (the darth-meetings dapp_)
+ *
+ * `userId` is auth's `users.id` (= DarthUser.userId here). `group` is only
+ * auth's allow-list key — darth-meetings is listed for calendar, drive and
+ * directory, and the served token carries every scope the person granted, so
+ * "calendar" is always passed. `google_accounts` stays as this app's POLL
+ * BOOKKEEPING, mirrored from auth (`google-link-sync.ts`); its
+ * `refresh_token_enc` is dead (migration 057).
  */
 
-export const OFFLINE_SCOPES = [
-  'openid',
-  'email',
-  'https://www.googleapis.com/auth/drive.readonly',
-  'https://www.googleapis.com/auth/calendar.events.readonly',
-  'https://www.googleapis.com/auth/meetings.space.readonly',
-  'https://www.googleapis.com/auth/directory.readonly',
-].join(' ');
-
-const AUTH_ENDPOINT = 'https://accounts.google.com/o/oauth2/v2/auth';
-const TOKEN_ENDPOINT = 'https://oauth2.googleapis.com/token';
-const REVOKE_ENDPOINT = 'https://oauth2.googleapis.com/revoke';
-
 /**
- * One Internal OAuth client per Workspace org (Internal consent can't span
- * orgs): 'sg' = trames.sg, 'eng' = trames-engineering.com. Refresh tokens
- * are client-bound at Google, so the issuing client is persisted on the
- * account row and reused for every refresh.
+ * One Internal OAuth client per Workspace org at Google: 'sg' = trames.sg,
+ * 'eng' = trames-engineering.com. Auth picks the client the same way; we only
+ * keep the value on the mirror row (google_accounts.client_key) for the record.
  */
 export type GoogleClientKey = 'sg' | 'eng';
 
@@ -44,281 +35,138 @@ export function clientKeyForEmail(email: string): GoogleClientKey {
   return email.toLowerCase().endsWith('@trames-engineering.com') ? 'eng' : 'sg';
 }
 
-function clientCreds(key: GoogleClientKey): { id: string; secret: string } {
-  const id = key === 'eng' ? config.google.clientIdEng : config.google.clientId;
-  const secret = key === 'eng' ? config.google.clientSecretEng : config.google.clientSecret;
-  if (!id || !secret) {
-    throw new Error(`Google OAuth client '${key}' is not configured on the server`);
-  }
-  return { id, secret };
-}
-
-export function isClientConfigured(key: GoogleClientKey): boolean {
-  try {
-    clientCreds(key);
-    return true;
-  } catch {
-    return false;
-  }
-}
-
-/** Thrown when Google says the refresh token is dead (user revoked it). */
-export class GoogleGrantRevokedError extends Error {
-  constructor(detail: string) {
-    super(`Google grant revoked: ${detail}`);
-    this.name = 'GoogleGrantRevokedError';
-  }
-}
-
-// ---------------------------------------------------------------------------
-// Encryption: AES-256-GCM, blob format "iv.ciphertext.tag" (base64url).
-
-function encKey(): Buffer {
-  const hex = config.google.tokenEncKey;
-  if (!/^[0-9a-fA-F]{64}$/.test(hex)) {
-    throw new Error('GOOGLE_TOKEN_ENC_KEY must be 64 hex chars (openssl rand -hex 32)');
-  }
-  return Buffer.from(hex, 'hex');
-}
-
-export function encryptToken(plain: string): string {
-  const iv = crypto.randomBytes(12);
-  const cipher = crypto.createCipheriv('aes-256-gcm', encKey(), iv);
-  const ct = Buffer.concat([cipher.update(plain, 'utf8'), cipher.final()]);
-  return [iv, ct, cipher.getAuthTag()].map((b) => b.toString('base64url')).join('.');
-}
-
-export function decryptToken(blob: string): string {
-  const [iv, ct, tag] = blob.split('.').map((p) => Buffer.from(p, 'base64url'));
-  if (!iv || !ct || !tag) throw new Error('Malformed encrypted token blob');
-  const decipher = crypto.createDecipheriv('aes-256-gcm', encKey(), iv);
-  decipher.setAuthTag(tag);
-  return Buffer.concat([decipher.update(ct), decipher.final()]).toString('utf8');
-}
-
-// ---------------------------------------------------------------------------
-// Signed state for the connect round-trip. HMAC key derived from the enc key
-// so no extra secret to manage; callback checks signature, age, and that the
-// state was minted for the SAME SSO user now completing it.
-
-const STATE_MAX_AGE_MS = 10 * 60 * 1000;
-
-function stateSig(payload: string): string {
-  return crypto.createHmac('sha256', encKey()).update(payload).digest('base64url');
-}
-
-export function mintState(userId: string, returnPath?: string): string {
-  const payload = Buffer.from(
-    JSON.stringify({
-      u: userId,
-      t: Date.now(),
-      n: crypto.randomBytes(8).toString('hex'),
-      // App-relative post-connect destination; leading '/' enforced at both
-      // mint and verify so the callback can never open-redirect.
-      r: returnPath?.startsWith('/') ? returnPath : undefined,
-    })
-  ).toString('base64url');
-  return `${payload}.${stateSig(payload)}`;
-}
-
-export function verifyState(
-  state: string,
-  expectedUserId: string
-): { ok: boolean; returnPath?: string } {
-  const dot = state.lastIndexOf('.');
-  if (dot < 0) return { ok: false };
-  const payload = state.slice(0, dot);
-  const sig = state.slice(dot + 1);
-  const expected = stateSig(payload);
-  const a = Buffer.from(sig);
-  const b = Buffer.from(expected);
-  if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) return { ok: false };
-  try {
-    const parsed = JSON.parse(Buffer.from(payload, 'base64url').toString('utf8')) as {
-      u?: string;
-      t?: number;
-      r?: string;
-    };
-    if (parsed.u !== expectedUserId || Date.now() - (parsed.t ?? 0) > STATE_MAX_AGE_MS) {
-      return { ok: false };
-    }
-    return { ok: true, returnPath: parsed.r?.startsWith('/') ? parsed.r : undefined };
-  } catch {
-    return { ok: false };
-  }
-}
-
-// ---------------------------------------------------------------------------
-// OAuth endpoints.
-
-export function redirectUri(): string {
-  return `${config.google.appBaseUrl.replace(/\/$/, '')}/api/google/callback`;
-}
-
-export function buildAuthUrl(state: string, clientKey: GoogleClientKey): string {
-  const params = new URLSearchParams({
-    client_id: clientCreds(clientKey).id,
-    redirect_uri: redirectUri(),
-    response_type: 'code',
-    scope: OFFLINE_SCOPES,
-    access_type: 'offline',
-    // consent: forces re-issue of a refresh token even for prior grants.
-    // select_account: always show the account chooser — this doubles as the
-    // "wrong calendar? switch account" path, connect being a rare act.
-    prompt: 'select_account consent',
-    include_granted_scopes: 'true',
-    state,
-  });
-  return `${AUTH_ENDPOINT}?${params}`;
-}
-
-export interface CodeExchangeResult {
-  refreshToken: string;
-  accessToken: string;
-  expiresIn: number;
-  scope: string;
-  /** Email from the id_token payload (unverified decode — it came straight
-   * from Google's token endpoint over TLS, so no signature check needed). */
-  email: string | null;
-}
-
-export async function exchangeCode(
-  code: string,
-  clientKey: GoogleClientKey
-): Promise<CodeExchangeResult> {
-  const creds = clientCreds(clientKey);
-  const res = await fetch(TOKEN_ENDPOINT, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-    body: new URLSearchParams({
-      code,
-      client_id: creds.id,
-      client_secret: creds.secret,
-      redirect_uri: redirectUri(),
-      grant_type: 'authorization_code',
-    }),
-  });
-  const json = (await res.json()) as {
-    access_token?: string;
-    refresh_token?: string;
-    expires_in?: number;
-    scope?: string;
-    id_token?: string;
-    error?: string;
-    error_description?: string;
-  };
-  if (!res.ok || !json.access_token) {
-    throw new Error(`Code exchange failed: ${json.error ?? res.status} ${json.error_description ?? ''}`);
-  }
-  if (!json.refresh_token) {
-    // access_type=offline + prompt=consent should always yield one.
-    throw new Error('Google did not return a refresh token');
-  }
-  let email: string | null = null;
-  if (json.id_token) {
-    try {
-      const payload = json.id_token.split('.')[1];
-      email = (JSON.parse(Buffer.from(payload!, 'base64url').toString('utf8')) as { email?: string }).email ?? null;
-    } catch {
-      // cosmetic only
-    }
-  }
-  return {
-    refreshToken: json.refresh_token,
-    accessToken: json.access_token,
-    expiresIn: json.expires_in ?? 3600,
-    scope: json.scope ?? OFFLINE_SCOPES,
-    email,
-  };
-}
-
-export async function refreshAccessToken(
-  refreshToken: string,
-  clientKey: GoogleClientKey
-): Promise<{ accessToken: string; expiresIn: number }> {
-  const creds = clientCreds(clientKey);
-  const res = await fetch(TOKEN_ENDPOINT, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-    body: new URLSearchParams({
-      refresh_token: refreshToken,
-      client_id: creds.id,
-      client_secret: creds.secret,
-      grant_type: 'refresh_token',
-    }),
-  });
-  const json = (await res.json()) as {
-    access_token?: string;
-    expires_in?: number;
-    error?: string;
-    error_description?: string;
-  };
-  if (!res.ok || !json.access_token) {
-    const detail = `${json.error ?? res.status} ${json.error_description ?? ''}`.trim();
-    if (json.error === 'invalid_grant') throw new GoogleGrantRevokedError(detail);
-    throw new Error(`Token refresh failed: ${detail}`);
-  }
-  return { accessToken: json.access_token, expiresIn: json.expires_in ?? 3600 };
-}
-
-/** Best-effort revocation at Google when the user disconnects. */
-export async function revokeToken(refreshToken: string): Promise<void> {
-  try {
-    await fetch(REVOKE_ENDPOINT, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-      body: new URLSearchParams({ token: refreshToken }),
-    });
-  } catch {
-    // deleting our row is the part that matters
-  }
-}
-
-// ---------------------------------------------------------------------------
-// Access-token cache: minted tokens live in process memory only (single pm2
-// process), keyed by user, dropped 2 min before expiry.
-
-const tokenCache = new Map<string, { token: string; expiresAt: number }>();
-
-export function invalidateServerToken(userId: string): void {
-  tokenCache.delete(userId);
-}
+export { DARTH_AUTH_CONNECTIONS_URL };
 
 /**
- * Mint (or reuse) an access token for a connected user. Returns null when the
- * user has no usable connection. On invalid_grant the account row is marked
- * revoked so the poller stops visiting and the UI can prompt a reconnect.
+ * auth's Connections page with `?return=` back to this app. A relative
+ * `returnTo` ('/settings') is made absolute on APP_BASE_URL — auth only
+ * honours same-site absolute URLs.
+ */
+export function connectionsUrl(returnTo: string): string {
+  return connectionsHref(returnTo, config.google.appBaseUrl);
+}
+
+const TOKEN_TIMEOUT_MS = 5000;
+/** auth answered without an expiry (should not happen for Google) — cache
+ * briefly rather than not at all. */
+const FALLBACK_TTL_MS = 10 * 60 * 1000;
+/** How long a "no usable link" answer is remembered. Before the switch an
+ * unlinked user cost a local row read; now it is an auth call, and auth's
+ * token route allows 60 calls/min for the whole app — so routes that ask on
+ * every request for a person without a link must not burn that window. */
+const NEGATIVE_TTL_MS = 60 * 1000;
+
+// ---------------------------------------------------------------------------
+// Caches live in process memory only (single pm2 process), keyed by user:
+// served tokens until 2 min before expiry, "not linked" answers for a minute,
+// and one app-wide back-off after a 429.
+
+const tokenCache = new Map<string, { token: string; expiresAt: number }>();
+const negativeCache = new Map<string, number>();
+let rateLimitedUntil = 0;
+
+/** Forget the user's cached token AND any cached "not linked" answer — after
+ * a Google 401, or when the auth sync just saw them (re)link. */
+export function invalidateServerToken(userId: string): void {
+  tokenCache.delete(userId);
+  negativeCache.delete(userId);
+}
+
+/** Drop only the cached "not linked" answer — the auth sync just saw the
+ * person linked, so the next token ask goes to auth instead of waiting out
+ * the minute. A live cached token is kept. */
+export function clearNotLinkedCache(userId: string): void {
+  negativeCache.delete(userId);
+}
+
+type AuthTokenBody = {
+  token?: string;
+  expiresAt?: string | null;
+  error?: string;
+  retryAfterMs?: number;
+};
+
+/**
+ * Fetch (or reuse) an access token for a linked user. Returns null when the
+ * user has no usable link, and mirrors why onto their google_accounts row
+ * (an UPDATE — a user without a row stays without one):
+ *  - 404 not linked / 410 link expired / 403 group not granted / 403 user
+ *    disabled → 'revoked' (the poller stops visiting; the UI says reconnect
+ *    on Connections). The next auth sync flips it back once they relink.
+ *  - 401 / 403 app not allowed / 429 / 5xx / transport → 'error' (transient
+ *    or operator-side; the poller keeps retrying).
+ * Never logs the token.
  */
 export async function getServerAccessToken(
   userId: string
 ): Promise<{ token: string; expiresAt: number } | null> {
   const hit = tokenCache.get(userId);
   if (hit && hit.expiresAt - Date.now() > 120_000) return hit;
+  const negativeUntil = negativeCache.get(userId);
+  if (negativeUntil && negativeUntil > Date.now()) return null;
+  if (rateLimitedUntil > Date.now()) return null;
 
-  const account = await getGoogleAccount(userId);
-  if (!account || account.status === 'revoked') return null;
-
-  let refreshToken: string;
-  try {
-    refreshToken = decryptToken(account.refresh_token_enc);
-  } catch (err) {
-    await markGoogleAccountStatus(userId, 'error', `decrypt failed: ${String(err)}`);
+  const appToken = process.env.DARTH_APP_TOKEN;
+  if (!appToken) {
+    await markGoogleAccountStatus(userId, 'error', 'DARTH_APP_TOKEN not set on darth-meetings');
     return null;
   }
 
+  let res: Response;
+  let body: AuthTokenBody | null;
   try {
-    const minted = await refreshAccessToken(refreshToken, account.client_key);
-    const entry = { token: minted.accessToken, expiresAt: Date.now() + minted.expiresIn * 1000 };
+    res = await fetch(`${config.auth.internalUrl}/api/links/google/token`, {
+      method: 'POST',
+      headers: {
+        authorization: `Bearer ${appToken}`,
+        'content-type': 'application/json',
+        accept: 'application/json',
+      },
+      body: JSON.stringify({ userId, group: 'calendar' }),
+      cache: 'no-store',
+      signal: AbortSignal.timeout(TOKEN_TIMEOUT_MS),
+    });
+    body = (await res.json().catch(() => null)) as AuthTokenBody | null;
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    await markGoogleAccountStatus(userId, 'error', `darth-auth unreachable: ${msg}`);
+    return null;
+  }
+
+  if (res.ok && typeof body?.token === 'string') {
+    const parsed = body.expiresAt ? Date.parse(body.expiresAt) : NaN;
+    const entry = {
+      token: body.token,
+      expiresAt: Number.isFinite(parsed) ? parsed : Date.now() + FALLBACK_TTL_MS,
+    };
     tokenCache.set(userId, entry);
+    negativeCache.delete(userId);
     await markGoogleAccountStatus(userId, 'ok', null);
     return entry;
-  } catch (err) {
-    if (err instanceof GoogleGrantRevokedError) {
-      await markGoogleAccountStatus(userId, 'revoked', err.message);
-      return null;
-    }
-    // transient (network, 5xx) — keep status, let the caller retry later
-    await markGoogleAccountStatus(userId, 'error', String(err));
+  }
+
+  tokenCache.delete(userId);
+  const authError = body?.error ?? `HTTP ${res.status}`;
+  const deadLink =
+    res.status === 404 ||
+    res.status === 410 ||
+    (res.status === 403 && (authError === 'group not granted' || authError === 'user disabled'));
+  if (deadLink) {
+    negativeCache.set(userId, Date.now() + NEGATIVE_TTL_MS);
+    await markGoogleAccountStatus(
+      userId,
+      'revoked',
+      res.status === 404 ? NOT_LINKED_ON_AUTH : `darth-auth: ${authError}`
+    );
     return null;
   }
+  let detail = authError;
+  if (res.status === 429) {
+    const wait = typeof body?.retryAfterMs === 'number' ? body.retryAfterMs : 60_000;
+    rateLimitedUntil = Date.now() + wait;
+    detail = `${authError} (retry in ${Math.ceil(wait / 1000)}s)`;
+    console.warn(`[google-oauth] darth-auth rate-limited token fetches for ${Math.ceil(wait / 1000)}s`);
+  }
+  await markGoogleAccountStatus(userId, 'error', `darth-auth ${res.status}: ${detail}`);
+  return null;
 }

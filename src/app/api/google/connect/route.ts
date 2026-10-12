@@ -1,29 +1,22 @@
 import { NextResponse } from 'next/server';
 import { withAuth } from '@/lib/auth/with-auth';
-import {
-  mintState,
-  buildAuthUrl,
-  clientKeyForEmail,
-  isClientConfigured,
-} from '@/lib/server/google-oauth';
+import { connectionsUrl } from '@/lib/server/google-oauth';
 
 export const runtime = 'nodejs';
 
 /**
- * Kick off the Google auth-code flow: signed state → Google consent screen.
+ * "Connect Google" — since 2026-10-12 the link is made on darth-auth, not
+ * here: 302 to auth's Connections page with `?return=` back to the caller's
+ * page (relative `?return=` made absolute on APP_BASE_URL; default
+ * /settings). Kept as a route so old links and bookmarks still land right.
  * Browser navigation target (window.location), not a fetch.
  */
-export const GET = withAuth(async ({ user, request, cliScope }) => {
+export const GET = withAuth(async ({ request, cliScope }) => {
   if (cliScope) {
     return NextResponse.json({ error: 'Google connect requires a browser session' }, { status: 403 });
   }
-  const clientKey = clientKeyForEmail(user.email);
-  if (!isClientConfigured(clientKey)) {
-    return NextResponse.json(
-      { error: `Google OAuth client for your workspace ('${clientKey}') is not configured` },
-      { status: 500 }
-    );
-  }
-  const returnPath = request.nextUrl.searchParams.get('return') ?? undefined;
-  return NextResponse.redirect(buildAuthUrl(mintState(user.userId, returnPath), clientKey));
+  const ret = request.nextUrl.searchParams.get('return');
+  // App-relative only — never bounce through auth to someone else's site.
+  const returnPath = ret && ret.startsWith('/') && !ret.startsWith('//') ? ret : '/settings';
+  return NextResponse.redirect(connectionsUrl(returnPath));
 });

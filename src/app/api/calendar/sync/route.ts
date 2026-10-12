@@ -1,7 +1,8 @@
 import { NextResponse } from 'next/server';
 import { withAuth } from '@/lib/auth/with-auth';
-import { getGoogleAccount } from '@/db-ops/google-accounts';
+import { getGoogleAccount, isNotLinkedOnAuth } from '@/db-ops/google-accounts';
 import { sweepNewAccount } from '@/lib/server/gmeet-poller';
+import { syncOneGoogleAccountFromAuth } from '@/lib/server/google-link-sync';
 
 export const runtime = 'nodejs';
 
@@ -24,8 +25,12 @@ const g = globalThis as unknown as {
 const inflight = (g.__mwManualCalSync ??= new Map<string, Promise<void>>());
 
 export const POST = withAuth(async ({ user }) => {
+  // The link lives on darth-auth: mirror the caller's row first, so a person
+  // who just linked on Connections can "Sync now" before the next sweep has
+  // created their row. Auth unreachable → go on with the row we have.
+  await syncOneGoogleAccountFromAuth(user.userId, user.email).catch(() => null);
   const account = await getGoogleAccount(user.userId);
-  if (!account) {
+  if (!account || isNotLinkedOnAuth(account)) {
     return NextResponse.json(
       { error: 'Google account not connected' },
       { status: 409 }

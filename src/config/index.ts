@@ -71,28 +71,14 @@ export const config = {
     },
   },
 
+  /**
+   * Google. Since 2026-10-12 darth-auth holds the account links and this app
+   * fetches access tokens from it (`@/lib/server/google-oauth`) — no OAuth
+   * client or encryption key is read here any more.
+   */
   google: {
-    get clientId() {
-      return process.env.NEXT_PUBLIC_GOOGLE_CLIENT_ID || '';
-    },
-    get clientSecret() {
-      return process.env.GOOGLE_CLIENT_SECRET || '';
-    },
-    /** Second Internal OAuth client, owned by the trames-engineering.com
-     * Workspace org — Internal consent can't span orgs, so each workspace
-     * needs its own client. */
-    get clientIdEng() {
-      return process.env.NEXT_PUBLIC_GOOGLE_CLIENT_ID_ENG || '';
-    },
-    get clientSecretEng() {
-      return process.env.GOOGLE_CLIENT_SECRET_ENG || '';
-    },
-    /** 32-byte hex key for AES-256-GCM encryption of stored refresh tokens. */
-    get tokenEncKey() {
-      return process.env.GOOGLE_TOKEN_ENC_KEY || '';
-    },
-    /** External origin of this deployment — the OAuth redirect URI is built
-     * from it and must exactly match a URI registered on the GCP client. */
+    /** External origin of this deployment — absolute `?return=` URLs to
+     * auth's Connections page are built from it. */
     get appBaseUrl() {
       return process.env.APP_BASE_URL || 'https://meetings.darth-internal.trames.io';
     },

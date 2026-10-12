@@ -1,6 +1,6 @@
 import { NextResponse } from 'next/server';
 import { withAuth } from '@/lib/auth/with-auth';
-import { getGoogleAccount } from '@/db-ops/google-accounts';
+import { getGoogleAccount, isNotLinkedOnAuth } from '@/db-ops/google-accounts';
 import {
   countCalendarMeetings,
   listCalendarMeetingsPage,
@@ -435,14 +435,16 @@ export const GET = withAuth(async ({ user, request }) => {
     counts,
     nextCursor: page.nextCursor,
     hasMore: page.hasMore,
-    connected: !!account,
+    connected: !!account && !isNotLinkedOnAuth(account),
     sync: {
       connectedAt: account?.connected_at ?? null,
       lastPollAt: account?.last_poll_at ?? null,
       // No completed sweep since (re)connecting → the first sweep is still
-      // running (or queued); calendar layers may be missing events.
+      // running (or queued); calendar layers may be missing events. A
+      // revoked row (mirrored from auth, possibly never polled) is not.
       syncing:
         !!account &&
+        account.status !== 'revoked' &&
         (account.last_poll_at === null ||
           (account.connected_at !== null &&
             new Date(account.last_poll_at) < new Date(account.connected_at))),

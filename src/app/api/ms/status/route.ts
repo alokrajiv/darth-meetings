@@ -1,19 +1,23 @@
 import { NextResponse } from 'next/server';
 import { withAuth } from '@/lib/auth/with-auth';
+import { DARTH_AUTH_CONNECTIONS_URL } from '@/lib/darth-family';
 
 export const runtime = 'nodejs';
 
 /**
- * Microsoft (Teams chat) account link — SURFACED here, OWNED by Darth Tasks.
+ * Microsoft (Teams chat) account link — SURFACED here, held by darth-auth.
  *
- * The per-user delegated Microsoft connection (`darth-cli tasks teams-*`)
- * lives in darth-plagueis (`ms_accounts`, /ms page). Meeting transcripts do
- * NOT need it — those come through the tenant-wide app-only "Darth Meetings"
- * Entra registration. We only show the link's state on our Settings page so
- * users have one place to see all their connected accounts; connect /
- * reconnect deep-link into Darth Tasks with `?return=` back here.
+ * Since 2026-10-12 the per-user delegated Microsoft connection
+ * (`darth-cli tasks teams-*`) is held by darth-auth: people connect,
+ * reconnect and disconnect on auth's Connections page
+ * (DARTH_AUTH_CONNECTIONS_URL), and Darth Tasks reads tokens from auth.
+ * Meeting transcripts do NOT need it — those come through the tenant-wide
+ * app-only "Darth Meetings" Entra registration. We only show the link's state
+ * on our Settings page so users have one place to see all their connected
+ * accounts; connect / manage go to Connections with `?return=` back here.
  *
- * Auth model: the browser's `darth_session` cookie is scoped to
+ * The STATUS still comes from Darth Tasks' `/api/ms/status` (same JSON shape,
+ * now answered from auth): the browser's `darth_session` cookie is scoped to
  * `.darth-internal.trames.io`, so we forward the caller's Cookie header
  * verbatim to plagueis and it resolves the same darth-auth session (requiring
  * its own `tasks` module). No shared secret, no token material ever touches
@@ -35,10 +39,9 @@ type PlagueisStatus = {
   last_used_at?: string | null;
 };
 
-async function plagueis(path: string, cookie: string, init?: RequestInit) {
+async function plagueis(path: string, cookie: string) {
   return fetch(`${TASKS_BASE}${path}`, {
-    ...init,
-    headers: { ...(init?.headers ?? {}), cookie, accept: 'application/json' },
+    headers: { cookie, accept: 'application/json' },
     cache: 'no-store',
     signal: AbortSignal.timeout(6000),
   });
@@ -69,8 +72,9 @@ export const GET = withAuth(async ({ request, cliScope }) => {
       msName: d.ms_name ?? null,
       connectedAt: d.connected_at ?? null,
       lastUsedAt: d.last_used_at ?? null,
-      manageUrl: `${TASKS_BASE}/ms`,
-      connectUrl: `${TASKS_BASE}/api/ms/connect`,
+      // Both the bare page: callers append `?return=<their page>`.
+      manageUrl: DARTH_AUTH_CONNECTIONS_URL,
+      connectUrl: DARTH_AUTH_CONNECTIONS_URL,
     });
   } catch (e) {
     console.error('[ms-status] plagueis unreachable:', e instanceof Error ? e.message : e);
@@ -78,24 +82,14 @@ export const GET = withAuth(async ({ request, cliScope }) => {
   }
 });
 
-/** Disconnect — proxied to plagueis under the same forwarded session. */
-export const DELETE = withAuth(async ({ request, cliScope }) => {
+/** Disconnect happens on darth-auth's Connections page now (Darth Tasks no
+ * longer has a disconnect route). */
+export const DELETE = withAuth(async ({ cliScope }) => {
   if (cliScope) {
     return NextResponse.json({ error: 'Requires a browser session' }, { status: 403 });
   }
-  const cookie = request.headers.get('cookie') ?? '';
-  try {
-    const res = await plagueis('/api/ms/disconnect', cookie, { method: 'POST' });
-    if (!res.ok) {
-      const body = (await res.json().catch(() => null)) as { error?: string } | null;
-      return NextResponse.json(
-        { error: body?.error ?? `Darth Tasks returned ${res.status}` },
-        { status: res.status === 401 || res.status === 403 ? 403 : 502 }
-      );
-    }
-    return NextResponse.json({ connected: false });
-  } catch (e) {
-    console.error('[ms-status] disconnect failed:', e instanceof Error ? e.message : e);
-    return NextResponse.json({ error: 'Darth Tasks unreachable' }, { status: 502 });
-  }
+  return NextResponse.json(
+    { error: 'Disconnect Microsoft on the Connections page', manageUrl: DARTH_AUTH_CONNECTIONS_URL },
+    { status: 410 }
+  );
 });

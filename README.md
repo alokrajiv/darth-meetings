@@ -58,13 +58,23 @@ Helper: `src/lib/auth/consent.ts`.
 
 What **this** member owns / consumes:
 
-- **Owns** the Google account link (per-user OAuth, Settings page) and the
-  app-only "Darth Meetings" Entra registration used for Teams *meeting*
-  transcripts/recordings (no per-user step).
-- **Surfaces** the Microsoft *Teams chat* link owned by Darth Tasks on its
-  Settings page (status / connect / disconnect proxied to
-  `tasks…/api/ms/*` with the caller's darth session cookie; connect round-trips back via
-  `?return=`). Meeting imports never need that link.
+- **Consumes** the Google account link held by darth-auth (since 2026-10-12;
+  `plans/connectors/SWITCH-2026-10-12.md`): people connect / disconnect on
+  `auth…/connections?return=<here>`; the server fetches access tokens with
+  `POST ${DARTH_AUTH_INTERNAL_URL}/api/links/google/token {userId, group:"calendar"}`
+  (`DARTH_APP_TOKEN`, `src/lib/server/google-oauth.ts`). `google_accounts` is
+  this app's POLL BOOKKEEPING, mirrored from auth's
+  `/api/links/google/lookup` at the top of every poller sweep and on every
+  Settings status read (`src/lib/server/google-link-sync.ts`) — who to sweep,
+  `last_poll_at`, `teams_chat_backfilled_at`; `refresh_token_enc` is dead
+  (migration 057, rollback snapshot only). `/api/google/connect` is a redirect
+  to Connections, `/api/google/callback` a redirect to `/settings`.
+- **Owns** the app-only "Darth Meetings" Entra registration used for Teams
+  *meeting* transcripts/recordings (no per-user step).
+- **Surfaces** the Microsoft *Teams chat* link (held by darth-auth, read by
+  Darth Tasks) on its Settings page: status proxied to `tasks…/api/ms/status`
+  with the caller's darth session cookie; connect / manage go to auth's
+  Connections page with `?return=`. Meeting imports never need that link.
 - **Calls** Darth Tasks `POST /api/notify` (`DARTH_APP_TOKEN`) for Slack DMs,
   and reads `darth_plagueis.ppl/emails` read-only for people lookups.
 

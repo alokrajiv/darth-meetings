@@ -1,17 +1,19 @@
 'use client';
 
+import { connectionsHref } from '@/lib/darth-family';
+
 /**
- * Google access tokens for the browser — server-minted ONLY.
+ * Google access tokens for the browser — server-served ONLY.
  *
- * There is exactly one "Connect Google" in the app: the auth-code flow at
- * /api/google/connect, which stores a per-user encrypted refresh token
- * server-side (and powers the background sync-and-remind poller). This
- * module fetches short-lived access tokens minted from that refresh token
- * via /api/google/token. The old GIS popup path is gone — no more repeated
- * popups, no user-gesture constraints; token fetches can run in effects.
+ * The Google account link is held by darth-auth (since 2026-10-12): people
+ * connect on auth's Connections page (`connectGoogle()` goes there with
+ * `?return=` back here), and the server fetches short-lived access tokens
+ * from auth. This module fetches them via /api/google/token. The old GIS
+ * popup path is gone — no repeated popups, no user-gesture constraints;
+ * token fetches can run in effects.
  */
 
-/** Thrown when the user hasn't connected Google yet — callers show a
+/** Thrown when the user has no usable Google link — callers show a
  * Connect button that calls connectGoogle(). */
 export class GoogleNotConnectedError extends Error {
   constructor() {
@@ -24,6 +26,20 @@ let cached: { token: string; expiresAt: number } | null = null;
 /** Set by invalidateGoogleToken(): the next fetch asks the server to re-mint
  * instead of serving its own cache (which may hold the token that just 401d). */
 let forceNextMint = false;
+
+// Landing back from auth's Connections page (`?connected=google`): the
+// server may still remember "not linked" for this person for up to a minute
+// (google-oauth's negative cache), so the first fetch asks it to forget.
+// Read once at module load — pages strip the param in their own effects.
+if (typeof window !== 'undefined') {
+  try {
+    if (new URLSearchParams(window.location.search).get('connected') === 'google') {
+      forceNextMint = true;
+    }
+  } catch {
+    // no location (tests) — nothing to do
+  }
+}
 
 const STORAGE_KEY = 'mw_google_token_v2';
 
@@ -80,19 +96,19 @@ export async function getGoogleAccessToken(): Promise<string> {
 }
 
 /**
- * Navigate to the one-time connect flow. `returnPath` (must be app-relative,
- * e.g. '/?meet=1') is where the callback drops the user afterwards.
+ * Navigate to auth's Connections page to link (or relink) Google.
+ * `returnPath` (app-relative, e.g. '/?meet=1') is where auth sends the user
+ * back afterwards (with `?connected=google` appended); default = here.
  */
 export function connectGoogle(returnPath?: string): void {
-  const url = new URL('/api/google/connect', window.location.origin);
-  if (returnPath) url.searchParams.set('return', returnPath);
-  window.location.href = url.toString();
+  const ret = returnPath ?? window.location.pathname + window.location.search;
+  window.location.href = connectionsHref(ret, window.location.origin);
 }
 
 /**
- * "Wrong calendar?" escape hatch: re-runs the connect flow, which forces
- * Google's account chooser. Full-page navigation — the returned promise
- * never resolves, the callback redirect takes over.
+ * "Wrong calendar?" escape hatch: goes to auth's Connections page, where a
+ * reconnect shows Google's account chooser. Full-page navigation — the
+ * returned promise never resolves.
  */
 export function switchGoogleAccount(returnPath?: string): Promise<never> {
   invalidateGoogleToken();

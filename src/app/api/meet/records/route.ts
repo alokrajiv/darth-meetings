@@ -1,6 +1,6 @@
 import { NextResponse } from 'next/server';
 import { withAuth } from '@/lib/auth/with-auth';
-import { getGoogleAccount } from '@/db-ops/google-accounts';
+import { getGoogleAccount, isNotLinkedOnAuth } from '@/db-ops/google-accounts';
 import { getServerAccessToken } from '@/lib/server/google-oauth';
 import { listMeetRecordRows } from '@/lib/server/meeting-discovery';
 import type { MeetRecordsResponse } from '@/lib/meeting-discovery-types';
@@ -35,8 +35,9 @@ export const GET = withAuth(async ({ user, request }) => {
   const minted = await getServerAccessToken(user.userId);
   if (!minted) {
     const account = await getGoogleAccount(user.userId);
+    const linked = !!account && !isNotLinkedOnAuth(account);
     return NextResponse.json(
-      { connected: !!account, status: account?.status ?? null, error: 'Google account not connected' },
+      { connected: linked, status: linked ? account!.status : null, error: 'Google account not connected' },
       { status: 404 }
     );
   }
