@@ -219,3 +219,86 @@ language (never `--language id` without `--merge` or `--keep-active` on a mixed 
 
 Automatic second pass at ingest when `mixedLanguageSuspected` (needs a per-org/series default
 language — which one to try is a guess today); a UI button for merge; non-AAI providers.
+
+## As-built — server (§1–§3), 2026-10-13
+
+Built on branch `merge-server` against this spec **plus Amendment A** (commit `44501d8`, read from that
+commit; it was not cherry-picked into this branch, so merge the two spec edits together). Route paths,
+bodies and response shapes are as specified; the additions below are all additive.
+
+**Files.** Pure: `src/lib/transcript-merge.ts` (§1), `src/lib/transcript-health.ts` (§2),
+`src/lib/transcription-merge-plan.ts` (mode/option parsing, Amendment A orientation + warnings, label
+spaces, content rows). Server: `src/lib/server/transcription-runs.ts` (modes, merge landing, explicit
+merge), `src/lib/server/recording-transcriptions.ts` (§3c), `src/lib/server/transcription-content.ts`
+(version content), `src/lib/server/merge-request.ts`. DB: `src/db-ops/transcriptions.ts`. No migration.
+
+**Deviations and decisions (read these before building on it):**
+
+1. **Orientation by language (Amendment A §2).** A merge-mode run stores `requested.mergeBase` = the
+   active id at start, but on landing `orientMerge` picks base = the `en*` one of {active-at-start, new
+   run}; both or neither English → helper + log line. The merged version's `requested.merge` records
+   `{ base, fill, fillLanguage, options, stats, fromRun }`. The 3.5-Pro preference has nothing to choose
+   between when exactly one side is English, so it only shows up in the explicit-merge warnings.
+2. **`'auto-en'`** (Amendment A §1) is accepted by both run routes: `language_detection: true`,
+   `language_detection_options: { expected_languages: ["en"] }`, `speech_models: ["universal-3-5-pro"]`
+   (no Universal-2 fallback), keyterms kept; the model is forced to 3.5 Pro whatever was asked.
+   `TranscriptionVersion.languageRequested` (new) is what lets `sameTranscriptionSettings` tell
+   `auto-en` from `auto`. **Not verified against AssemblyAI from this branch** (no AAI calls allowed) —
+   the SDK is assumed to pass `language_detection_options` through untouched (`as never` cast).
+3. **Run-start responses** keep `mode: 'version'` (it names the PATH); the run's own mode is a new
+   `runMode` field. `running.mode` is also on the marker / `RunningTranscription`.
+4. **Strict parsing:** an unknown `mode` or a bad `mergeOptions` / `options` field is a 400 naming the
+   field (never a silent `replace`). `mode` ≠ `replace` on a meeting that falls back to the pre-Phase-2
+   new-row path is a 409 (that path IS a replace).
+5. **Merged versions are never "brand new"** (`TranscriptionFacts.derived`, `planActivate`): activating
+   one does not reset `speaker_id_status`, re-run speaker ID/voiceprints, or send the "transcript ready"
+   DM — its labels are its base's. Consequence: a merge-mode run that lands sends no ready DM.
+6. **Meeting row model** after activating a merged version = `COALESCE(speech_model,
+   payload.speech_model_used)` (the base's model), not NULL; `aai_job_id` becomes NULL (it ran nowhere).
+7. **Annotation carry-over is a snapshot** taken when the merged version is written. Edits/names made
+   on the base after that stay with the base. All-empty (no edits, no mapping) pairs are not copied.
+8. **DEC-4 for unactivated jobs:** helper runs, merge fills and every bare-recording run delete their own
+   AAI job on landing (`deleteRunJobAtAai`, behind `MW_AAI_DELETE_ON_COMPLETE`) and stamp
+   `provider_deleted_at` — the meeting-side delete only ever sees the meeting row's job.
+9. **Bare-recording runs are found by `requested.scope = 'recording'`**, not by "no meeting clips it":
+   a run started before the owner made a meeting of the recording is still polled to the end; it then
+   lands as a version (and, for merge, a merged version) but is NOT switched to — the meeting's routes
+   own that. Double-start guard = conditional insert under a row lock on `recordings`.
+10. **Versions GETs poll an in-flight run once** before answering (meeting route via
+    `pollTranscriptionRun`, recording route via `pollRecordingRun`; both deduped with the sweeper), so
+    `transcribe-again --wait` sees a landing within one 10-s tick instead of the 5-min sweeper.
+11. **Health:** `lowConfidenceShare` denominator = speech time (sum of utterance durations), not file
+    length; "CJK" includes Hangul and kana; a payload carrying `merge` is never
+    `mixedLanguageSuspected` (it is the remedy; its shares are still reported). Row 1134 is flagged by
+    its detection confidence alone (auto `en` at 0.28 < 0.5); verified only with a synthetic fixture of
+    that shape — no customer data was read.
+12. **Version content goes through the meeting's clips** (`resolveMeetingContentForVersion`): a meeting
+    holding a window of a recording never serves the rest of it on another version. In compat (one
+    whole-recording clip) it is the version's payload verbatim. Names = the owner's confirmed names (what
+    `/speakers` shows readers) only when label spaces match (merge chains walk to their root base).
+13. **Explicit merge extras:** `warnings` also say "base and fill are in the same language" and "base
+    ran on <model>, not universal-3-5-pro". With `activate: true`, a failed activation still answers 201
+    with `activated: false` and a `not activated: …` warning (the merged version was written). A dry run
+    on a recording a meeting holds is allowed (it writes nothing); `activate` is refused (409) while a
+    run is in flight, like "Use this version".
+14. **Recording activate** answers the meeting shape with zero `setAside` / `restored`; 409 for "already
+    active" and for anything that is not a completed version of the recording.
+15. **Graph safety (verified by reading):** the only re-derivation delete (`applyRecordingGraph`
+    promotion, `db-ops/recordings.ts`) skips recordings holding a transcription with `requested IS NOT
+    NULL`, which every merged row has. The two deletes that DO take merged rows are a permanent meeting
+    delete of the last clip holder and a standalone purge — both delete the whole recording on purpose.
+
+**Verified on a scratch Postgres** (`scripts/scratch-db.sh`, 000…057, synthetic rows, AssemblyAI not
+called): versions list with `health` / `asrConfidence` / `languageRequested` / `merge`; dry run writes
+nothing; explicit merge writes the `merge` row (no job, base language + covers) and carries the base's LIVE
+edits + names over; version content applies names on the merged version and not on the fill, and 404s a
+version of another recording; activating the merged version leaves the live edits identical, parks the
+base's copy, nulls `aai_job_id`, keeps the base model, moves the pointer; a landed merge-mode run on an
+Indonesian active version takes the auto-en run as base, and refuses both-non-English; two concurrent
+`insertRecordingRun` calls → exactly one wins; the in-flight list needs a job id;
+`setRecordingActiveTranscription` moves the pointer, speaker count and `superseded_by`, and refuses a
+foreign version and a recording a meeting holds.
+
+**Not verified:** the pollers end to end (they need an AssemblyAI job); no live AssemblyAI call for
+`auto-en`; the route handlers themselves were built, not curl-ed; no browser pass of the
+"Merged — X + Y" Versions line.
