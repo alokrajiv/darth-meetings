@@ -54,7 +54,13 @@ export interface MergeStats {
 
 export const DEFAULT_MERGE_OPTIONS: Required<MergeOptions> = {
   utteranceThreshold: 0.75,
-  wordThreshold: 0.75,
+  // Stricter than the whole-utterance bar on purpose. Partial spans sit inside
+  // lines that are mostly fine, where the base pass is merely unsure of a few
+  // English words ("fixed" 0.50, "and" 0.47 on row 1134) and the fill pass
+  // would hand back their Indonesian TRANSLATION. At 0.65 every real English
+  // span on that call stayed English and the garbled ones still swapped
+  // (probe 2026-10-13, spec Amendment B).
+  wordThreshold: 0.65,
   window: 6,
   minRun: 6,
   island: 4,
@@ -191,7 +197,24 @@ function spansOf(u: MergeUtterance, o: Required<MergeOptions>): Span[] {
   // so the gap after the last bad word belongs to the span, and a fill word
   // spoken in it is not lost. At the utterance edges the utterance's own
   // bounds stand in.
-  return badRuns(bad, o.minRun).map(([i, j]) => ({
+  // A run found by the rolling mean starts and ends where the window first
+  // dips, which is a word or two INSIDE the garbled stretch (its edge words
+  // are averaged with their confident neighbours). Grow each run outward over
+  // words that are individually below the bar so those edge words go too —
+  // never past another run, never past the utterance.
+  const runs = badRuns(bad, o.minRun);
+  const grown = runs.map(([i, j], r) => {
+    const floor = r > 0 ? runs[r - 1]![1] : 0;
+    const ceil = r + 1 < runs.length ? runs[r + 1]![0] : n;
+    while (i > floor && conf(ws[i - 1]!) < o.wordThreshold) i--;
+    while (j < ceil && conf(ws[j]!) < o.wordThreshold) j++;
+    return [i, j] as const;
+  });
+  // A span runs from its first bad word's start to the NEXT word's start —
+  // so the gap after the last bad word belongs to the span, and a fill word
+  // spoken in it is not lost. At the utterance edges the utterance's own
+  // bounds stand in.
+  return grown.map(([i, j]) => ({
     from: i,
     to: j,
     lo: i === 0 ? u.start : ws[i]!.start,
