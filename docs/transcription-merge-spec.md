@@ -219,3 +219,30 @@ language (never `--language id` without `--merge` or `--keep-active` on a mixed 
 
 Automatic second pass at ingest when `mixedLanguageSuspected` (needs a per-org/series default
 language — which one to try is a guess today); a UI button for merge; non-AAI providers.
+
+## Amendment A (2026-10-13, after live probes — BINDING, overrides §3a/§4 where they differ)
+
+Probes on a synthetic 70-s en+id clip and a real Indonesian-heavy 5-min slice of row 1134:
+
+| request | result on Indonesian speech |
+|---|---|
+| auto-detect, Indonesian majority | lands on `id` → Universal-2 → English turns TRANSLATED or DROPPED (synthetic: opening English line vanished) |
+| 3.5 Pro forced `language_code:"en"` | DROPS speech: 351 words, 201 s of 280 s covered (−28%) → holes the merge cannot fill |
+| 3.5 Pro `language_detection:true` + `language_detection_options:{expected_languages:["en"]}` | 959 words, 280 s covered, Indonesian garbled but present → the right BASE |
+
+1. **New language choice `'auto-en'`** (accepted by retranscribe / recording transcribe, stored in
+   `requested.languageCode`): submit `speech_models:["universal-3-5-pro"]`, `language_detection:true`,
+   `language_detection_options:{expected_languages:["en"]}`, keyterms allowed (English). This is the
+   English base pass. Never recommend forced `en` for a mixed call.
+2. **Merge orientation is by language, not by "active at start".** When a `merge`-mode run completes,
+   among {the version active at start, the new version}: base = the one whose `language_code` starts
+   with `en` (prefer the one that RAN on universal-3-5-pro); fill = the other. Both en / neither en →
+   do not merge: keep the new one as a helper and log why. Store the chosen ids in
+   `requested.merge`. So both of these work:
+   - active is English (auto landed on en): `transcribe-again <id> --language id --merge`
+   - active is Indonesian (auto landed on id, e.g. row 920): `transcribe-again <id> --language auto-en --merge`
+3. The explicit merge route keeps `base`/`fill` as given, but `dryRun` (and the 201) return
+   `warnings: string[]` — e.g. "base is not an English version", "fill is English".
+4. CLI: `--language` accepts `auto-en`; `transcriptions` suggests `--language <code> --merge` when the
+   active version is en*, `--language auto-en --merge` when it is not; skill text says forced `en`
+   drops the other language's speech (−28% in the probe) and forced `<other>` translates English.
