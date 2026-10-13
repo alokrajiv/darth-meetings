@@ -81,3 +81,33 @@ export const TRANSCRIPTION_LANGUAGE_OPTIONS: Array<{ code: string; label: string
 export function speechModelsRequest(model: SpeechModel): string[] {
   return model === 'universal-3-5-pro' ? ['universal-3-5-pro', 'universal-2'] : [model];
 }
+
+/**
+ * The English-first detection choice (docs/transcription-merge-spec.md
+ * Amendment A). Probed live on an English + Indonesian call:
+ *   - auto-detect on an Indonesian majority lands on `id` → Universal-2 →
+ *     the English turns come back translated or dropped;
+ *   - forced `en` on 3.5 Pro DROPS the Indonesian speech (−28% of the time
+ *     covered) — holes no merge can fill;
+ *   - detection told to EXPECT English keeps every second, Indonesian
+ *     garbled but present — the right BASE for a merge.
+ */
+export const AUTO_EN = 'auto-en';
+
+/** What a language CHOICE ('auto' | 'auto-en' | a code) sends to AssemblyAI. */
+export interface SubmitLanguage {
+  /** Forced language; undefined = detection. */
+  languageCode: string | undefined;
+  /** `language_detection_options.expected_languages`, only for 'auto-en'. */
+  expectedLanguages?: string[];
+  /** 'auto-en' pins Universal-3.5 Pro (and no Universal-2 fallback: English
+   * is covered, and a fallback would be the downgrade we are avoiding). */
+  model: SpeechModel;
+}
+
+export function submitLanguageFor(choice: string, model: SpeechModel): SubmitLanguage {
+  if (choice === AUTO_EN) {
+    return { languageCode: undefined, expectedLanguages: ['en'], model: 'universal-3-5-pro' };
+  }
+  return { languageCode: choice === 'auto' ? undefined : choice, model };
+}

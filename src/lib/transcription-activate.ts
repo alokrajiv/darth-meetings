@@ -62,6 +62,15 @@ export interface TranscriptionFacts {
    * again on a version whose labels are already known.
    */
   activatedBefore: boolean;
+  /**
+   * A MERGED version (`provider = 'merge'`, docs/transcription-merge-spec.md
+   * §3b): its utterances and speaker letters are its base's by construction,
+   * so it is never "brand new" — the speakers are already worked out, the
+   * review gate has already been passed, and there is no AssemblyAI job of
+   * its own to delete. Optional so facts built before the merge spec read as
+   * an ordinary version.
+   */
+  derived?: boolean;
 }
 
 export interface ActivateInput {
@@ -237,7 +246,8 @@ export function planActivate(input: ActivateInput): ActivateDecision {
   // older version is never brand new, and neither is switching forward a
   // second time to a version whose speakers have already been worked out.
   const newer = msOf(target.createdAt) > msOf(current?.createdAt ?? null);
-  const brandNew = newer && !target.activatedBefore && input.archived.length === 0;
+  const brandNew =
+    newer && !target.activatedBefore && input.archived.length === 0 && target.derived !== true;
 
   const setAside = total(archive.sets);
   const restored = total(restore);

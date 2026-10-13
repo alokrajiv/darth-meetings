@@ -9,7 +9,14 @@ import type {
   AnnotationSet,
   TranscriptionFacts,
 } from '@/lib/transcription-activate';
-import type { TranscriptionVersion } from '@/lib/transcriptions';
+import type {
+  TranscriptionMergeInfo,
+  TranscriptionRunMode,
+  TranscriptionVersion,
+} from '@/lib/transcriptions';
+import { transcriptHealth, type TranscriptHealth } from '@/lib/transcript-health';
+import type { MergeOptions, MergeStats } from '@/lib/transcript-merge';
+import type { MergeCandidate } from '@/lib/transcription-merge-plan';
 
 /**
  * Transcription VERSIONS of a meeting (migration 046, Phase 2 —
@@ -187,9 +194,17 @@ interface VersionRow {
     languageCode?: string;
     reason?: string | null;
     activatedAt?: string;
+    merge?: {
+      base?: string;
+      fill?: string;
+      fillLanguage?: string | null;
+      stats?: MergeStats;
+    };
   } | null;
   /** `payload.speech_model_used` — the model that actually ran. */
   model_used: string | null;
+  /** `payload.confidence` — mean word confidence. */
+  asr_confidence: number | null;
   language_detected: boolean | null;
   language_confidence: number | null;
   speakers: number | null;
@@ -211,14 +226,23 @@ const iso = (v: Date | string | null): string | null => {
  * set aside", not "12 of your edits". The content of another user's
  * annotations never leaves the server.
  */
+/** How many versions per call get a `health` (each needs its payload loaded). */
+export const HEALTH_VERSIONS_PER_CALL = 6;
+
 export async function listTranscriptionVersions(
   recordingId: string,
-  activeTranscriptionId: string | null
+  activeTranscriptionId: string | null,
+  opts: {
+    /** Compute `health` for the newest completed versions (default true).
+     * The start-a-run path only needs the settings and passes false. */
+    health?: boolean;
+  } = {}
 ): Promise<TranscriptionVersion[]> {
   const rows = await sql<VersionRow[]>`
     SELECT t.id, t.provider, t.provider_job_id, t.speech_model, t.language_code, t.status,
            t.created_at, t.completed_at, t.superseded_by, t.error, t.requested,
            t.payload->>'speech_model_used' AS model_used,
+           (t.payload->>'confidence')::float8 AS asr_confidence,
            (t.payload->>'language_detection')::boolean AS language_detected,
            (t.payload->>'language_confidence')::float8 AS language_confidence,
            (
@@ -251,8 +275,49 @@ export async function listTranscriptionVersions(
     ORDER BY t.created_at DESC, t.id
   `;
 
+  // Health needs the utterances, which the query above deliberately does not
+  // pull. The list is small (a handful of versions per recording), so the
+  // newest few COMPLETED payloads are loaded in one more round trip — minus
+  // the top-level `words`, which duplicate the utterances' and are half the
+  // bytes. Capped, so a recording someone re-ran thirty times does not load
+  // thirty payloads to draw a disclosure.
+  const health = new Map<string, TranscriptHealth>();
+  if (opts.health !== false) {
+    const ids = rows
+      .filter((r) => r.status === 'completed')
+      .slice(0, HEALTH_VERSIONS_PER_CALL)
+      .map((r) => r.id);
+    if (ids.length > 0) {
+      const payloads = await sql<Array<{ id: string; payload: TranscriptResponse | null }>>`
+        SELECT id, payload - 'words' AS payload
+        FROM ${sql(SCHEMA)}.recording_transcriptions
+        WHERE id = ANY(${ids}::uuid[]) AND payload IS NOT NULL
+      `;
+      for (const p of payloads) {
+        if (p.payload) health.set(p.id, transcriptHealth(p.payload));
+      }
+    }
+  }
+
   return rows.map((r) => {
     const requestedModel = r.requested?.speechModel ?? r.speech_model ?? null;
+    const m = r.requested?.merge;
+    const merge: TranscriptionMergeInfo | null =
+      r.provider === 'merge' && m?.base && m.fill
+        ? {
+            base: m.base,
+            fill: m.fill,
+            fillLanguage: m.fillLanguage ?? null,
+            stats: m.stats ?? {
+              utterances: 0,
+              utterancesTouched: 0,
+              utterancesWhole: 0,
+              swappedMs: 0,
+              durationMs: 0,
+              fillWordsUsed: 0,
+            },
+          }
+        : null;
     return {
       id: r.id,
       active: activeTranscriptionId === r.id,
@@ -281,6 +346,10 @@ export async function listTranscriptionVersions(
       editsSetAside: r.edits_set_aside,
       speakerNamesSetAside: r.names_set_aside,
       error: r.error,
+      languageRequested: r.requested?.languageCode ?? null,
+      asrConfidence: r.asr_confidence ?? null,
+      health: health.get(r.id) ?? null,
+      merge,
     };
   });
 }
@@ -293,9 +362,22 @@ export interface RunRequest {
   by: { userId: string; email: string | null; name: string | null };
   at: string;
   speechModel: string;
-  /** What was ASKED for: 'auto' or a language code. */
+  /** What was ASKED for: 'auto', 'auto-en' or a language code. */
   languageCode: string;
   reason: string | null;
+  /** What happens when it lands (docs/transcription-merge-spec.md §3a).
+   * Absent on runs started before the merge spec = 'replace'. */
+  mode?: TranscriptionRunMode;
+  /** mode 'merge': the active version at the start — one of the two merge
+   * candidates (which one is the base is decided by language on landing). */
+  mergeBase?: string | null;
+  mergeOptions?: MergeOptions;
+  /**
+   * 'recording' = a run on a recording that belongs to no meeting (§3c). Such
+   * a run has no meeting row to carry the `retranscribing` marker, so this
+   * stamp is how the sweeper finds it. Absent = a meeting's run.
+   */
+  scope?: 'recording';
 }
 
 /**
@@ -410,6 +492,7 @@ interface FactsRow {
   duration_sec: number | null;
   speakers: number | null;
   activated_before: boolean;
+  derived: boolean;
 }
 
 const factsOf = (r: FactsRow): TranscriptionFacts => ({
@@ -426,6 +509,7 @@ const factsOf = (r: FactsRow): TranscriptionFacts => ({
   durationSec: r.duration_sec,
   speakerCount: r.speakers,
   activatedBefore: r.activated_before,
+  derived: r.derived,
 });
 
 /**
@@ -446,8 +530,13 @@ export async function loadActivateFacts(
   const wanted = currentId && currentId !== targetId ? [currentId, targetId] : [targetId];
   const [txns, edits, mappings, archived, row] = await Promise.all([
     sql<FactsRow[]>`
-      SELECT t.id, t.status, t.created_at, t.provider_job_id, t.speech_model,
+      -- A merged version has no model of its own (it ran nowhere); the
+      -- meeting row then carries the model its base ACTUALLY ran, which the
+      -- merged payload inherits verbatim, instead of going blank.
+      SELECT t.id, t.status, t.created_at, t.provider_job_id,
+             COALESCE(t.speech_model, t.payload->>'speech_model_used') AS speech_model,
              t.language_code, t.completed_at,
+             (t.provider = 'merge') AS derived,
              (t.payload->>'audio_duration')::float8 AS duration_sec,
              (
                SELECT count(DISTINCT u->>'speaker')::int
@@ -870,4 +959,410 @@ export async function meetingCopyCount(assemblyaiId: string): Promise<number> {
     WHERE assemblyai_id = ${assemblyaiId}
   `;
   return rows[0]?.n ?? 0;
+}
+
+// ---------------------------------------------------------------------------
+// Run modes, merged versions, recording-level runs
+// (docs/transcription-merge-spec.md §3)
+// ---------------------------------------------------------------------------
+
+/** What a landing run was asked to do, read off its own row. */
+export interface RunRecord {
+  recordingId: string;
+  status: string;
+  providerJobId: string | null;
+  requested: (RunRequest & Record<string, unknown>) | null;
+}
+
+/**
+ * INTERNAL-ONLY — the run's own `requested`, the authority on its mode. The
+ * meeting's marker carries a copy for the UI; this row is what the poller
+ * trusts (a marker written before the merge spec has no `mode` at all).
+ */
+export async function getRunRecord(transcriptionId: string): Promise<RunRecord | null> {
+  const rows = await sql<
+    Array<{ recording_id: string; status: string; provider_job_id: string | null; requested: RunRecord['requested'] }>
+  >`
+    SELECT recording_id, status, provider_job_id, requested
+    FROM ${sql(SCHEMA)}.recording_transcriptions
+    WHERE id = ${transcriptionId}::uuid
+  `;
+  const r = rows[0];
+  return r
+    ? { recordingId: r.recording_id, status: r.status, providerJobId: r.provider_job_id, requested: r.requested }
+    : null;
+}
+
+/** A version as orientation and the version-content route see it. */
+export interface VersionHead extends MergeCandidate {
+  provider: string;
+  /** `requested.merge.base` on a merged version, else null. */
+  mergeBase: string | null;
+}
+
+/**
+ * INTERNAL-ONLY (gate first) — the light facts of EVERY version of a
+ * recording: status, language, model that ran, and where a merged one came
+ * from. Small rows, no payload; the label-space walk needs the whole set.
+ */
+export async function listVersionHeads(recordingId: string): Promise<VersionHead[]> {
+  const rows = await sql<
+    Array<{
+      id: string;
+      status: string;
+      provider: string;
+      language_code: string | null;
+      model_used: string | null;
+      merge_base: string | null;
+    }>
+  >`
+    SELECT id, status, provider, language_code,
+           payload->>'speech_model_used' AS model_used,
+           requested->'merge'->>'base' AS merge_base
+    FROM ${sql(SCHEMA)}.recording_transcriptions
+    WHERE recording_id = ${recordingId}::uuid
+  `;
+  return rows.map((r) => ({
+    id: r.id,
+    status: (r.status === 'completed' || r.status === 'error' ? r.status : 'processing') as
+      | 'processing'
+      | 'completed'
+      | 'error',
+    provider: r.provider,
+    languageCode: r.language_code,
+    modelUsed: r.model_used,
+    mergeBase: r.provider === 'merge' ? r.merge_base : null,
+  }));
+}
+
+/**
+ * INTERNAL-ONLY (gate first) — full payloads of some versions of ONE
+ * recording. The recording id is part of the predicate on purpose: a
+ * transcription id from a request is only ever honoured when it belongs to
+ * the recording the caller was gated on.
+ */
+export async function loadVersionPayloads(
+  recordingId: string,
+  ids: string[]
+): Promise<Map<string, TranscriptResponse>> {
+  const out = new Map<string, TranscriptResponse>();
+  if (ids.length === 0) return out;
+  const rows = await sql<Array<{ id: string; payload: TranscriptResponse | null }>>`
+    SELECT id, payload FROM ${sql(SCHEMA)}.recording_transcriptions
+    WHERE recording_id = ${recordingId}::uuid AND id = ANY(${ids}::uuid[])
+      AND status = 'completed' AND payload IS NOT NULL
+  `;
+  for (const r of rows) if (r.payload) out.set(r.id, r.payload);
+  return out;
+}
+
+/** `requested` of a merged version (spec §3b). */
+export interface MergedRequest {
+  by: { userId: string; email: string | null; name: string | null } | null;
+  at: string;
+  reason: string | null;
+  merge: {
+    base: string;
+    fill: string;
+    fillLanguage: string | null;
+    options: Required<MergeOptions>;
+    stats: MergeStats;
+    /** The run whose landing produced this merge, when it was automatic. */
+    fromRun?: string;
+  };
+}
+
+/**
+ * INTERNAL-ONLY (gate first) — write a MERGED version, and carry its base's
+ * annotations over to it, in ONE transaction.
+ *
+ * The row: `provider = 'merge'`, born `completed`, no job (it ran nowhere, so
+ * there is nothing at AssemblyAI to poll or delete), `language_code` and
+ * `covers` copied from the base inside Postgres. `requested` is always set —
+ * which is also what keeps a graph re-derivation from ever deleting it
+ * (db-ops/recordings.ts: a transcription with `requested` is a version).
+ *
+ * The carry-over is what keeps speaker names and edits when the merged
+ * version goes live. Its utterances are the base's — same count, order,
+ * speaker letters (lib/transcript-merge.ts) — so the base's index-keyed edits
+ * and label-keyed names apply to it unchanged. They are copied as PARKED rows
+ * under the merged id; activation then restores them through the existing
+ * path. Where from:
+ *  - base is the recording's active version → its annotations are LIVE:
+ *    every user's `transcript_edits` + `speaker_mappings`, for every meeting
+ *    with a clip on the recording (the shape `applyActivatePlan` parks);
+ *  - otherwise → the base's own parked `transcription_annotations` rows.
+ * A snapshot: edits made on the base after this point stay with the base.
+ *
+ * Returns false (nothing written) when the base is not a completed version
+ * of this recording.
+ */
+export async function insertMergedTranscription(input: {
+  id: string;
+  recordingId: string;
+  baseId: string;
+  payload: TranscriptResponse;
+  requested: MergedRequest;
+}): Promise<boolean> {
+  return sql.begin(async (tx) => {
+    const inserted = await tx<Array<{ id: string }>>`
+      INSERT INTO ${tx(SCHEMA)}.recording_transcriptions
+        (id, recording_id, provider, provider_job_id, speech_model, language_code,
+         status, payload, covers, completed_at, requested)
+      SELECT ${input.id}::uuid, b.recording_id, 'merge', NULL, NULL, b.language_code,
+             'completed', ${tx.json(input.payload as never)}, b.covers, now(),
+             ${tx.json(input.requested as never)}
+      FROM ${tx(SCHEMA)}.recording_transcriptions b
+      WHERE b.id = ${input.baseId}::uuid AND b.recording_id = ${input.recordingId}::uuid
+        AND b.status = 'completed'
+      RETURNING id
+    `;
+    if (inserted.length === 0) return false;
+
+    const active = await tx<Array<{ active_transcription_id: string | null }>>`
+      SELECT active_transcription_id FROM ${tx(SCHEMA)}.recordings
+      WHERE id = ${input.recordingId}::uuid
+    `;
+    if (active[0]?.active_transcription_id === input.baseId) {
+      // Live → parked under the merged id, every user, every meeting on the
+      // recording. Users are the union of both tables (one may have named
+      // speakers and edited nothing). An all-empty pair is not parked — the
+      // planner would skip it anyway, and it would linger in the archive.
+      await tx`
+        INSERT INTO ${tx(SCHEMA)}.transcription_annotations
+          (transcription_id, transcript_id, user_id, edits, speaker_labels, archived_at)
+        SELECT ${input.id}::uuid, m.id, u.user_id,
+               e.edits,
+               CASE WHEN sm.user_id IS NOT NULL
+                    THEN jsonb_build_object('labels', COALESCE(sm.speaker_labels, '[]'::jsonb),
+                                            'suggestions', sm.suggestions)
+               END,
+               now()
+        FROM ${tx(SCHEMA)}.transcripts m
+        JOIN (SELECT DISTINCT transcript_id FROM ${tx(SCHEMA)}.meeting_clips
+               WHERE recording_id = ${input.recordingId}::uuid) c ON c.transcript_id = m.id
+        CROSS JOIN LATERAL (
+          SELECT user_id FROM ${tx(SCHEMA)}.transcript_edits WHERE assemblyai_id = m.assemblyai_id
+          UNION
+          SELECT user_id FROM ${tx(SCHEMA)}.speaker_mappings WHERE assemblyai_id = m.assemblyai_id
+        ) u
+        LEFT JOIN ${tx(SCHEMA)}.transcript_edits e
+               ON e.assemblyai_id = m.assemblyai_id AND e.user_id = u.user_id
+        LEFT JOIN ${tx(SCHEMA)}.speaker_mappings sm
+               ON sm.assemblyai_id = m.assemblyai_id AND sm.user_id = u.user_id
+        WHERE (e.edits IS NOT NULL AND e.edits <> '{}'::jsonb) OR sm.user_id IS NOT NULL
+        ON CONFLICT (transcription_id, transcript_id, user_id) DO NOTHING
+      `;
+    } else {
+      await tx`
+        INSERT INTO ${tx(SCHEMA)}.transcription_annotations
+          (transcription_id, transcript_id, user_id, edits, speaker_labels, archived_at)
+        SELECT ${input.id}::uuid, a.transcript_id, a.user_id, a.edits, a.speaker_labels, now()
+        FROM ${tx(SCHEMA)}.transcription_annotations a
+        WHERE a.transcription_id = ${input.baseId}::uuid
+        ON CONFLICT (transcription_id, transcript_id, user_id) DO NOTHING
+      `;
+    }
+    return true;
+  });
+}
+
+/**
+ * INTERNAL-ONLY — DEC-4 for a version that was NOT activated (a helper run,
+ * or the fill of a merge): its job is on no meeting row, so the meeting-side
+ * delete (`deleteAtAaiIfSafe`) never sees it. Stamped on the transcription
+ * only after AssemblyAI confirmed.
+ */
+export async function stampRunProviderDeleted(transcriptionId: string): Promise<void> {
+  await sql`
+    UPDATE ${sql(SCHEMA)}.recording_transcriptions
+    SET provider_deleted_at = now()
+    WHERE id = ${transcriptionId}::uuid AND provider_deleted_at IS NULL
+  `;
+}
+
+// --- Recordings that belong to no meeting (§3c) ----------------------------
+
+/** INTERNAL-ONLY — the canonical stored file of a recording (what a run uploads). */
+export async function recordingCanonicalMedia(recordingId: string): Promise<{
+  id: string;
+  filename: string | null;
+  blob_name: string | null;
+  sha256: string | null;
+  has_video: boolean | null;
+} | null> {
+  const rows = await sql<
+    Array<{ id: string; filename: string | null; blob_name: string | null; sha256: string | null; has_video: boolean | null }>
+  >`
+    SELECT id, filename, blob_name, sha256, has_video
+    FROM ${sql(SCHEMA)}.recording_media
+    WHERE recording_id = ${recordingId}::uuid AND kind = 'canonical'
+    ORDER BY ord LIMIT 1
+  `;
+  return rows[0] ?? null;
+}
+
+/** INTERNAL-ONLY — does any meeting (live or trashed) hold a clip on it? */
+export async function recordingHasMeeting(recordingId: string): Promise<boolean> {
+  const rows = await sql<Array<{ n: number }>>`
+    SELECT 1 AS n FROM ${sql(SCHEMA)}.meeting_clips
+    WHERE recording_id = ${recordingId}::uuid LIMIT 1
+  `;
+  return rows.length > 0;
+}
+
+/** A recording-scoped run in flight. */
+export interface RecordingRunRow {
+  transcription_id: string;
+  recording_id: string;
+  owner_user_id: string;
+  provider_job_id: string | null;
+  requested: (RunRequest & Record<string, unknown>) | null;
+  created_at: string;
+}
+
+/**
+ * INTERNAL-ONLY (gate first) — the recording-scoped run in flight on this
+ * recording, if any (with or without a job yet).
+ */
+export async function recordingRunInFlight(recordingId: string): Promise<RecordingRunRow | null> {
+  const rows = await sql<RecordingRunRow[]>`
+    SELECT t.id AS transcription_id, t.recording_id, r.owner_user_id, t.provider_job_id,
+           t.requested, t.created_at::text AS created_at
+    FROM ${sql(SCHEMA)}.recording_transcriptions t
+    JOIN ${sql(SCHEMA)}.recordings r ON r.id = t.recording_id
+    WHERE t.recording_id = ${recordingId}::uuid
+      AND t.status = 'processing' AND t.requested->>'scope' = 'recording'
+    ORDER BY t.created_at DESC
+    LIMIT 1
+  `;
+  return rows[0] ?? null;
+}
+
+/**
+ * INTERNAL-ONLY — open a run on a recording that belongs to no meeting.
+ * Conditional insert: refused (false) when a recording-scoped run is already
+ * processing on it, so two clicks in two processes cannot both start a job —
+ * the same guarantee `claimRetranscribeMarker` gives a meeting, held by the
+ * transcription rows themselves since there is no meeting row to hold it.
+ */
+export async function insertRecordingRun(input: {
+  id: string;
+  recordingId: string;
+  speechModel: string;
+  languageCode: string | null;
+  requested: RunRequest;
+}): Promise<boolean> {
+  return sql.begin(async (tx) => {
+    // Serialise starters on the recording row; the NOT EXISTS below is then
+    // race-free.
+    await tx`SELECT id FROM ${tx(SCHEMA)}.recordings WHERE id = ${input.recordingId}::uuid FOR UPDATE`;
+    const rows = await tx<Array<{ id: string }>>`
+      INSERT INTO ${tx(SCHEMA)}.recording_transcriptions
+        (id, recording_id, provider, provider_job_id, speech_model, language_code,
+         status, covers, requested)
+      SELECT ${input.id}::uuid, ${input.recordingId}::uuid, 'assemblyai', NULL,
+             ${input.speechModel}, ${input.languageCode}, 'processing',
+             ${tx.json({ media: [], timeline: 'wall' } as never)},
+             ${tx.json(input.requested as never)}
+      WHERE NOT EXISTS (
+        SELECT 1 FROM ${tx(SCHEMA)}.recording_transcriptions
+        WHERE recording_id = ${input.recordingId}::uuid
+          AND status = 'processing' AND requested->>'scope' = 'recording'
+      )
+      RETURNING id
+    `;
+    return rows.length > 0;
+  });
+}
+
+/**
+ * INTERNAL-ONLY — every recording-scoped run AssemblyAI has a job for, oldest
+ * first: the sweeper's work list. Found by the `requested.scope` stamp, not
+ * by "no meeting clips it": a run started on a bare recording that the owner
+ * then makes a meeting of must still be polled to the end (nobody else would
+ * — that meeting has no `retranscribing` marker).
+ */
+export async function listRecordingRunsInFlight(limit: number): Promise<RecordingRunRow[]> {
+  return sql<RecordingRunRow[]>`
+    SELECT t.id AS transcription_id, t.recording_id, r.owner_user_id, t.provider_job_id,
+           t.requested, t.created_at::text AS created_at
+    FROM ${sql(SCHEMA)}.recording_transcriptions t
+    JOIN ${sql(SCHEMA)}.recordings r ON r.id = t.recording_id
+    WHERE t.status = 'processing' AND t.provider_job_id IS NOT NULL
+      AND t.requested IS NOT NULL AND t.requested->>'scope' = 'recording'
+      AND r.deleted_at IS NULL
+    ORDER BY t.created_at
+    LIMIT ${limit}
+  `;
+}
+
+/**
+ * INTERNAL-ONLY (gate first) — make `targetId` the version a recording that
+ * belongs to NO meeting shows. There are no meeting rows and no annotations
+ * to move, so this is the pointer, the `superseded_by` chain (only when the
+ * target is newer, as for a meeting) and the facts the recording page reads
+ * (duration, speaker count). Refused (false) when the target is not a
+ * completed version of this recording, or when a meeting has started
+ * holding the recording — a meeting's switch must go through its own route,
+ * which moves its annotations.
+ */
+export async function setRecordingActiveTranscription(
+  recordingId: string,
+  targetId: string
+): Promise<boolean> {
+  return sql.begin(async (tx) => {
+    const rec = await tx<Array<{ active_transcription_id: string | null }>>`
+      SELECT active_transcription_id FROM ${tx(SCHEMA)}.recordings
+      WHERE id = ${recordingId}::uuid AND deleted_at IS NULL
+      FOR UPDATE
+    `;
+    if (rec.length === 0) return false;
+    const clipped = await tx<Array<{ n: number }>>`
+      SELECT 1 AS n FROM ${tx(SCHEMA)}.meeting_clips WHERE recording_id = ${recordingId}::uuid LIMIT 1
+    `;
+    if (clipped.length > 0) return false;
+    const target = await tx<Array<{ created_at: string; secs: number | null; speakers: number | null }>>`
+      SELECT created_at::text AS created_at,
+             (payload->>'audio_duration')::float8 AS secs,
+             (SELECT count(DISTINCT u->>'speaker')::int
+                FROM jsonb_array_elements(
+                  CASE WHEN jsonb_typeof(payload->'utterances') = 'array' THEN payload->'utterances' END
+                ) u) AS speakers
+      FROM ${tx(SCHEMA)}.recording_transcriptions
+      WHERE id = ${targetId}::uuid AND recording_id = ${recordingId}::uuid AND status = 'completed'
+    `;
+    if (target.length === 0) return false;
+    const currentId = rec[0]!.active_transcription_id;
+    if (currentId === targetId) return true;
+
+    const t = target[0]!;
+    await tx`
+      UPDATE ${tx(SCHEMA)}.recordings
+      SET active_transcription_id = ${targetId}::uuid,
+          duration_ms = COALESCE(${t.secs !== null ? Math.round(t.secs * 1000) : null}::bigint, duration_ms),
+          upload_state = CASE WHEN ${t.speakers}::int IS NULL THEN upload_state
+                              ELSE COALESCE(upload_state, '{}'::jsonb)
+                                   || jsonb_build_object('speakerCount', ${t.speakers}::int) END,
+          updated_at = now()
+      WHERE id = ${recordingId}::uuid
+    `;
+    if (currentId) {
+      await tx`
+        UPDATE ${tx(SCHEMA)}.recording_transcriptions c
+        SET superseded_by = ${targetId}::uuid
+        WHERE c.id = ${currentId}::uuid
+          AND c.created_at < ${t.created_at}::timestamptz
+      `;
+    }
+    // Same "has been live" stamp a meeting's activate writes (the ::text cast
+    // is load-bearing — see applyActivatePlan).
+    await tx`
+      UPDATE ${tx(SCHEMA)}.recording_transcriptions
+      SET requested = COALESCE(requested, '{}'::jsonb)
+                      || jsonb_build_object('activatedAt', ${new Date().toISOString()}::text)
+      WHERE id = ${targetId}::uuid AND requested->>'activatedAt' IS NULL
+    `;
+    return true;
+  });
 }

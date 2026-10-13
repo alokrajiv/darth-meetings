@@ -6,16 +6,22 @@ import {
   clearRetranscribeMarker,
   completeRunTranscription,
   failRunTranscription,
+  getRunRecord,
+  insertMergedTranscription,
   insertRunTranscription,
   listTranscriptionVersions,
+  listVersionHeads,
   loadActivateFacts,
+  loadVersionPayloads,
   meetingCopyCount,
   meetingRecordingRef,
   setRetranscribeMarkerJob,
   setRunJobId,
+  stampRunProviderDeleted,
   transcriptionVersionsEnabled,
   type MeetingRecordingRef,
   type RetranscribingRow,
+  type RunRequest,
 } from '@/db-ops/transcriptions';
 import { getForUser } from '@/db-ops/transcripts';
 import { planActivate } from '@/lib/transcription-activate';
@@ -23,11 +29,26 @@ import {
   sameTranscriptionSettings,
   type RunningTranscription,
   type TranscriptionLanguageChoice,
+  type TranscriptionRunMode,
   type TranscriptionVersion,
 } from '@/lib/transcriptions';
-import type { SpeechModel } from '@/lib/aai-language';
+import { submitLanguageFor, type SpeechModel } from '@/lib/aai-language';
+import {
+  mergePreview,
+  mergeTranscripts,
+  type MergeOptions,
+  type MergeStats,
+} from '@/lib/transcript-merge';
+import { mergeWarnings, orientMerge, type MergeCandidate } from '@/lib/transcription-merge-plan';
+import { deleteOnCompleteEnabled } from '@/lib/server/aai-retention';
 import { decideRunPoll, type RunPollObservation } from '@/lib/transcription-run-state';
-import { getTranscript, isAaiNotFound, submitTranscription, uploadFile } from '@/lib/server/assemblyai';
+import {
+  deleteTranscript,
+  getTranscript,
+  isAaiNotFound,
+  submitTranscription,
+  uploadFile,
+} from '@/lib/server/assemblyai';
 import { vocabForSubmit } from '@/lib/server/ingest';
 import { storedFileSource, withHeldStoredFiles } from '@/lib/server/stored-media';
 import { rematerialiseMeetingsOnRecording } from '@/lib/server/clip-materialise';
@@ -76,6 +97,9 @@ export interface StartRunInput {
   languageCode: TranscriptionLanguageChoice;
   reason: string | null;
   force: boolean;
+  /** docs/transcription-merge-spec.md §3a. Default 'replace'. */
+  mode?: TranscriptionRunMode;
+  mergeOptions?: MergeOptions;
 }
 
 export type StartRunResult =
@@ -92,6 +116,7 @@ function runningFrom(marker: NonNullable<StoredTranscript['gmeet_context']>['ret
     by: marker.by,
     speechModel: marker.speechModel,
     languageCode: marker.languageCode,
+    ...(marker.mode ? { mode: marker.mode } : {}),
   };
 }
 
@@ -170,13 +195,30 @@ export async function startTranscriptionRun(input: StartRunInput): Promise<Start
   if (!ref) return { kind: 'unavailable', why: 'no clip' };
   if (ref.clips !== 1) return { kind: 'unavailable', why: `${ref.clips} clips` };
 
+  const mode: TranscriptionRunMode = input.mode ?? 'replace';
+  // A merge needs something to merge WITH: the version being read now is one
+  // of the two candidates (which one ends up the base is decided by language
+  // when the run lands — Amendment A).
+  if (mode === 'merge' && !ref.activeTranscriptionId) {
+    return {
+      kind: 'refused',
+      status: 409,
+      body: { error: 'This meeting has no current transcription to merge the new one with.' },
+    };
+  }
+  // 'auto-en' runs on Universal-3.5 Pro whatever was asked for — the probe
+  // that justified it was on 3.5 Pro, and Universal-2 has no such option.
+  const speechModel = submitLanguageFor(input.languageCode, input.speechModel).model;
+
   // "Asking again would reproduce what you are reading" — legitimate on
   // purpose (a flaky job, a model that has changed under the same name), so it
   // is a confirm, not a refusal.
   if (!input.force) {
-    const versions = await listTranscriptionVersions(ref.recordingId, ref.activeTranscriptionId);
+    const versions = await listTranscriptionVersions(ref.recordingId, ref.activeTranscriptionId, {
+      health: false,
+    });
     const active = versions.find((v) => v.active) ?? null;
-    if (sameTranscriptionSettings(active, { speechModel: input.speechModel, languageCode: input.languageCode })) {
+    if (sameTranscriptionSettings(active, { speechModel, languageCode: input.languageCode })) {
       return {
         kind: 'refused',
         status: 409,
@@ -195,8 +237,11 @@ export async function startTranscriptionRun(input: StartRunInput): Promise<Start
     jobId: null,
     startedAt,
     by: { email: input.by.email, name: input.by.name },
-    speechModel: input.speechModel,
+    speechModel,
     languageCode: input.languageCode,
+    // A copy for the UI / CLI; the run's own `requested.mode` is what the
+    // poller acts on.
+    mode,
   };
   // Atomic claim: two "Transcribe again" clicks, in two processes, cannot both
   // get past this (the UPDATE only fires when no marker is there).
@@ -217,17 +262,11 @@ export async function startTranscriptionRun(input: StartRunInput): Promise<Start
       id: transcriptionId,
       recordingId: ref.recordingId,
       providerJobId: null,
-      speechModel: input.speechModel,
-      languageCode: input.languageCode === 'auto' ? null : input.languageCode,
+      speechModel,
+      languageCode: submitLanguageFor(input.languageCode, speechModel).languageCode ?? null,
       // One recording = one job (DEC-1); the job hears the canonical file.
       coversMedia: [],
-      requested: {
-        by: input.by,
-        at: startedAt,
-        speechModel: input.speechModel,
-        languageCode: input.languageCode,
-        reason: input.reason,
-      },
+      requested: runRequest(input, startedAt, speechModel, mode, ref.activeTranscriptionId),
     });
   } catch (err) {
     await clearRetranscribeMarker(ownerUserId, row.assemblyai_id, transcriptionId).catch(() => {});
@@ -235,7 +274,7 @@ export async function startTranscriptionRun(input: StartRunInput): Promise<Start
     return { kind: 'refused', status: 500, body: { error: 'Could not start the re-transcription.' } };
   }
 
-  void submitInBackground(input, transcriptionId, row.local_audio_path);
+  void submitInBackground({ ...input, speechModel }, transcriptionId, row.local_audio_path);
 
   return {
     kind: 'started',
@@ -244,9 +283,31 @@ export async function startTranscriptionRun(input: StartRunInput): Promise<Start
       transcriptionId,
       startedAt,
       by: { email: input.by.email, name: input.by.name },
-      speechModel: input.speechModel,
+      speechModel,
       languageCode: input.languageCode,
+      mode,
     },
+  };
+}
+
+/** `recording_transcriptions.requested` for a run, both scopes. */
+function runRequest(
+  input: Pick<StartRunInput, 'by' | 'languageCode' | 'reason' | 'mergeOptions'>,
+  at: string,
+  speechModel: SpeechModel,
+  mode: TranscriptionRunMode,
+  activeAtStart: string | null,
+  scope?: 'recording'
+): RunRequest {
+  return {
+    by: input.by,
+    at,
+    speechModel,
+    languageCode: input.languageCode,
+    reason: input.reason,
+    mode,
+    ...(mode === 'merge' ? { mergeBase: activeAtStart, mergeOptions: input.mergeOptions ?? {} } : {}),
+    ...(scope ? { scope } : {}),
   };
 }
 
@@ -263,7 +324,7 @@ async function submitInBackground(
 ): Promise<void> {
   const { row, ownerUserId } = input;
   try {
-    const languageCode = input.languageCode === 'auto' ? undefined : input.languageCode;
+    const lang = submitLanguageFor(input.languageCode, input.speechModel);
     const { keytermsPrompt, customSpelling } = await vocabForSubmit(ownerUserId);
     // The stored file's own bytes (never the audio-only extract), HELD for the
     // whole upload so Stage D cannot evict it mid-stream; pulled into the
@@ -281,10 +342,11 @@ async function submitInBackground(
     // `language_codes` probe was byte-identical to plain detection, and naming
     // the fallback is what makes a Universal-2 downgrade deliberate.
     const submitted = await submitTranscription(audioUrl, {
-      languageCode,
+      languageCode: lang.languageCode,
+      expectedLanguages: lang.expectedLanguages,
       keytermsPrompt,
       customSpelling,
-      model: input.speechModel,
+      model: lang.model,
     });
     await setRunJobId(transcriptionId, submitted.id, submitted.model);
     await setRetranscribeMarkerJob(ownerUserId, row.assemblyai_id, transcriptionId, submitted.id);
@@ -421,6 +483,17 @@ async function pollOnce(target: RunPollRow): Promise<void> {
   // The payload is stored in the SAME write that says 'completed' (DEC-4: this
   // is the last time we ever see it), and only then does the meeting move.
   await completeRunTranscription(target.transcriptionId, aai);
+
+  // What the run was asked to do when it landed — read off its own row
+  // (docs/transcription-merge-spec.md §3a). No record / no mode = 'replace',
+  // which is every run started before the merge spec.
+  const record = await getRunRecord(target.transcriptionId);
+  const mode: TranscriptionRunMode = record?.requested?.mode ?? 'replace';
+  if (mode !== 'replace') {
+    await landNonReplaceRun(target, aai, mode, record?.requested ?? null, record?.recordingId ?? null);
+    return;
+  }
+
   const outcome = await activateTranscription({
     ownerUserId: target.user_id,
     assemblyaiId: target.assemblyai_id,
@@ -599,4 +672,233 @@ export async function meetingTranscriptionVersions(
   if (!ref) return null;
   const versions = await listTranscriptionVersions(ref.recordingId, ref.activeTranscriptionId);
   return { ref, versions };
+}
+
+// ---------------------------------------------------------------------------
+// Helper and merge runs (docs/transcription-merge-spec.md §3a/§3b)
+// ---------------------------------------------------------------------------
+
+/**
+ * DEC-4 for a job whose payload is stored but which is on NO meeting row (a
+ * helper, the fill of a merge, any run on a bare recording): nothing else
+ * would ever delete it at AssemblyAI. Same switch as the meeting-side delete;
+ * never throws.
+ */
+export async function deleteRunJobAtAai(
+  transcriptionId: string,
+  jobId: string | null,
+  storedUtterances: number
+): Promise<void> {
+  if (!jobId || !deleteOnCompleteEnabled() || storedUtterances === 0) return;
+  try {
+    if (!(await deleteTranscript(jobId))) return; // a later sweep may retry
+    await stampRunProviderDeleted(transcriptionId);
+    console.log(`[transcription-run] deleted ${jobId} at AAI (${storedUtterances} utterances kept)`);
+  } catch (err) {
+    console.warn(`[transcription-run] AAI delete of ${jobId} failed:`, err);
+  }
+}
+
+export type MergedFromRun =
+  | { ok: true; mergedId: string; base: string; fill: string; stats: MergeStats }
+  | { ok: false; why: string };
+
+/**
+ * A merge-mode run has landed: orient the two candidates BY LANGUAGE
+ * (Amendment A — the English one is the base, whichever was active), merge,
+ * and write the merged version with its base's annotations carried over.
+ * Activation is the caller's (a meeting's and a bare recording's differ).
+ *
+ * Every refusal is `ok: false` with the reason for the log, and the caller
+ * then keeps the new run as a helper. The raw fill is NEVER activated
+ * instead: a forced other-language pass shown raw translates the English.
+ */
+export async function mergeFromLandedRun(input: {
+  recordingId: string;
+  runId: string;
+  requested: (RunRequest & Record<string, unknown>) | null;
+}): Promise<MergedFromRun> {
+  const activeAtStart = input.requested?.mergeBase ?? null;
+  const heads = await listVersionHeads(input.recordingId);
+  const byId = new Map(heads.map((h) => [h.id, h]));
+  const fresh = byId.get(input.runId);
+  if (!fresh) return { ok: false, why: 'the new version is gone' };
+  const orient = orientMerge(activeAtStart ? (byId.get(activeAtStart) ?? null) : null, fresh);
+  if (orient.kind === 'helper') return { ok: false, why: orient.why };
+
+  const payloads = await loadVersionPayloads(input.recordingId, [orient.base, orient.fill]);
+  const base = payloads.get(orient.base);
+  const fill = payloads.get(orient.fill);
+  if (!base || !fill) return { ok: false, why: 'a payload to merge is missing' };
+
+  const { payload, stats } = mergeTranscripts(base, fill, input.requested?.mergeOptions);
+  payload.merge = { ...payload.merge!, baseTranscriptionId: orient.base, fillTranscriptionId: orient.fill };
+  const mergedId = randomUUID();
+  const written = await insertMergedTranscription({
+    id: mergedId,
+    recordingId: input.recordingId,
+    baseId: orient.base,
+    payload,
+    requested: {
+      by: input.requested?.by ?? null,
+      at: new Date().toISOString(),
+      reason: input.requested?.reason ?? null,
+      merge: {
+        base: orient.base,
+        fill: orient.fill,
+        fillLanguage: byId.get(orient.fill)?.languageCode ?? null,
+        options: payload.merge!.options,
+        stats,
+        fromRun: input.runId,
+      },
+    },
+  });
+  if (!written) return { ok: false, why: 'the base stopped being a completed version' };
+  return { ok: true, mergedId, base: orient.base, fill: orient.fill, stats };
+}
+
+/**
+ * A meeting's run that is NOT 'replace' has landed (§3a). The payload is
+ * already stored on the version.
+ *  - helper → kept as a version, not shown; the marker goes.
+ *  - merge  → merged with the version active at the start, and the MERGED
+ *             version is activated through the ordinary path (which parks
+ *             the base's live annotations and restores the carried-over
+ *             copy — the same edits and names, on the merged text). Anything
+ *             that stops the merge falls back to helper, with the reason in
+ *             the log.
+ * Either way the new job leaves AssemblyAI (DEC-4): it is on no meeting row.
+ */
+async function landNonReplaceRun(
+  target: RunPollRow,
+  aai: Awaited<ReturnType<typeof getTranscript>>,
+  mode: TranscriptionRunMode,
+  requested: (RunRequest & Record<string, unknown>) | null,
+  recordingId: string | null
+): Promise<void> {
+  await deleteRunJobAtAai(target.transcriptionId, target.jobId, aai.utterances?.length ?? 0);
+
+  if (mode === 'merge' && recordingId) {
+    const merged = await mergeFromLandedRun({ recordingId, runId: target.transcriptionId, requested }).catch(
+      (err): MergedFromRun => {
+        console.warn(`[transcription-run] ${target.assemblyai_id}: merge failed:`, err);
+        return { ok: false, why: 'the merge threw (see the error above)' };
+      }
+    );
+    if (merged.ok) {
+      const outcome = await activateTranscription({
+        ownerUserId: target.user_id,
+        assemblyaiId: target.assemblyai_id,
+        targetTranscriptionId: merged.mergedId,
+      });
+      if (outcome.ok) {
+        console.log(
+          `[transcription-run] ${target.assemblyai_id}: version ${target.transcriptionId} merged ` +
+            `(base ${merged.base}, fill ${merged.fill}, ${merged.stats.utterancesTouched}/` +
+            `${merged.stats.utterances} utterances touched) → ${merged.mergedId} is live`
+        );
+        return;
+      }
+      console.warn(
+        `[transcription-run] ${target.assemblyai_id}: merged version ${merged.mergedId} written but ` +
+          `not activated — ${outcome.error}`
+      );
+      await clearRetranscribeMarker(target.user_id, target.assemblyai_id, target.transcriptionId);
+      return;
+    }
+    console.warn(
+      `[transcription-run] ${target.assemblyai_id}: merge of ${target.transcriptionId} not done — ` +
+        `${merged.why}; kept as helper`
+    );
+  }
+
+  await clearRetranscribeMarker(target.user_id, target.assemblyai_id, target.transcriptionId);
+  console.log(
+    `[transcription-run] ${target.assemblyai_id}: version ${target.transcriptionId} completed — kept as helper ` +
+      '(not activated)'
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Explicit merges (POST …/transcriptions/merge — meeting and recording routes)
+// ---------------------------------------------------------------------------
+
+export type MergeVersionsResult =
+  | {
+      kind: 'dry-run';
+      stats: MergeStats;
+      preview: ReturnType<typeof mergePreview>;
+      warnings: string[];
+    }
+  | { kind: 'created'; transcriptionId: string; stats: MergeStats; warnings: string[] }
+  | { kind: 'refused'; status: number; error: string };
+
+/**
+ * INTERNAL (the caller has gated on the meeting or the recording's owner and
+ * resolved `recordingId` itself) — merge two versions of ONE recording exactly
+ * as given. Unlike a merge-mode run, nothing is re-oriented: the caller named
+ * base and fill on purpose; Amendment A only asks that a suspicious pair be
+ * SAID (`warnings`). Activation is the caller's.
+ */
+export async function mergeVersions(input: {
+  recordingId: string;
+  baseId: string;
+  fillId: string;
+  options: MergeOptions;
+  by: { userId: string; email: string | null; name: string | null };
+  reason: string | null;
+  dryRun: boolean;
+}): Promise<MergeVersionsResult> {
+  if (input.baseId === input.fillId) {
+    return { kind: 'refused', status: 400, error: 'base and fill must be two different versions.' };
+  }
+  const heads = await listVersionHeads(input.recordingId);
+  const base = heads.find((h) => h.id === input.baseId);
+  const fill = heads.find((h) => h.id === input.fillId);
+  // One answer for "not this recording's" and "not finished": both are 400 to
+  // the caller, and neither says whether the id exists elsewhere.
+  if (!base || !fill || base.status !== 'completed' || fill.status !== 'completed') {
+    return {
+      kind: 'refused',
+      status: 400,
+      error: 'base and fill must both be completed versions of this recording.',
+    };
+  }
+  const payloads = await loadVersionPayloads(input.recordingId, [base.id, fill.id]);
+  const basePayload = payloads.get(base.id);
+  const fillPayload = payloads.get(fill.id);
+  if (!basePayload || !fillPayload) {
+    return { kind: 'refused', status: 400, error: 'One of the versions has no stored text.' };
+  }
+
+  const warnings = mergeWarnings(base as MergeCandidate, fill as MergeCandidate);
+  const { payload, stats } = mergeTranscripts(basePayload, fillPayload, input.options);
+  if (input.dryRun) {
+    return { kind: 'dry-run', stats, preview: mergePreview(basePayload, payload), warnings };
+  }
+
+  payload.merge = { ...payload.merge!, baseTranscriptionId: base.id, fillTranscriptionId: fill.id };
+  const id = randomUUID();
+  const written = await insertMergedTranscription({
+    id,
+    recordingId: input.recordingId,
+    baseId: base.id,
+    payload,
+    requested: {
+      by: input.by,
+      at: new Date().toISOString(),
+      reason: input.reason,
+      merge: {
+        base: base.id,
+        fill: fill.id,
+        fillLanguage: fill.languageCode,
+        options: payload.merge!.options,
+        stats,
+      },
+    },
+  });
+  if (!written) {
+    return { kind: 'refused', status: 409, error: 'The base version changed while merging — try again.' };
+  }
+  return { kind: 'created', transcriptionId: id, stats, warnings };
 }
