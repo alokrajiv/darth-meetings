@@ -41,6 +41,7 @@ export function whenStamp(iso: string | null | undefined): string | null {
 /** "English" / "language auto-detected" — what a run was ASKED for. */
 function askedLanguage(choice: TranscriptionLanguageChoice): string {
   if (!choice || choice === 'auto') return 'language auto-detected';
+  if (choice === 'auto-en') return 'English-first auto-detect';
   return languageLabel(choice) ?? choice;
 }
 
@@ -91,7 +92,14 @@ export function versionCopy(v: TranscriptionVersion, selfEmail?: string | null):
   const ran = canonicalSpeechModel(v.speechModel);
   const asked = canonicalSpeechModel(v.speechModelRequested);
   let model: string;
-  if (ran && asked && ran !== asked) {
+  if (v.provider === 'merge') {
+    // A merged version ran nowhere: it is the base (its language is the
+    // version's) with the fill's words on the stretches the base was unsure
+    // of (docs/transcription-merge-spec.md §3b).
+    const baseLang = languageLabel(v.languageCode) ?? v.languageCode ?? '?';
+    const fillLang = languageLabel(v.merge?.fillLanguage ?? null) ?? v.merge?.fillLanguage ?? '?';
+    model = `Merged — ${baseLang} + ${fillLang}`;
+  } else if (ran && asked && ran !== asked) {
     model = `${speechModelLabel(ran)} — asked for ${speechModelLabel(asked)}`;
   } else if (ran || asked) {
     model = speechModelLabel(ran ?? asked);
@@ -100,7 +108,8 @@ export function versionCopy(v: TranscriptionVersion, selfEmail?: string | null):
   }
 
   const lang = languageLabel(v.languageCode);
-  const language = lang ? `${lang} (${v.languageDetected ? 'auto' : 'chosen'})` : null;
+  const language =
+    v.provider === 'merge' ? null : lang ? `${lang} (${v.languageDetected ? 'auto' : 'chosen'})` : null;
 
   const parked: string[] = [];
   if (v.editsSetAside > 0) parked.push(countPhrase(v.editsSetAside, 'edit'));

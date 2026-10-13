@@ -32,6 +32,10 @@ const version = (over: Partial<TranscriptionVersion> = {}): TranscriptionVersion
   editsSetAside: 0,
   speakerNamesSetAside: 0,
   error: null,
+  languageRequested: null,
+  asrConfidence: null,
+  health: null,
+  merge: null,
   ...over,
 });
 
@@ -50,6 +54,12 @@ describe('runningLine — the calm line while a re-run is in flight', () => {
     );
   });
 
+  test("'auto-en' is said as English-first detection", () => {
+    expect(runningLine({ ...base, languageCode: 'auto-en' })).toBe(
+      'Transcribing again — Universal-3.5 Pro, English-first auto-detect · started 14:02 · you can keep reading'
+    );
+  });
+
   test("'auto' is said as detection, not as a language code", () => {
     expect(runningLine({ ...base, languageCode: 'auto' })).toBe(
       'Transcribing again — Universal-3.5 Pro, language auto-detected · started 14:02 · you can keep reading'
@@ -64,6 +74,31 @@ describe('runningLine — the calm line while a re-run is in flight', () => {
 });
 
 describe('versionCopy — one line per version', () => {
+  test('a merged version names its two languages and no model', () => {
+    const c = versionCopy(
+      version({
+        provider: 'merge',
+        speechModelRequested: null,
+        languageDetected: true,
+        merge: {
+          base: 'b',
+          fill: 'f',
+          fillLanguage: 'id',
+          stats: {
+            utterances: 10,
+            utterancesTouched: 3,
+            utterancesWhole: 1,
+            swappedMs: 1000,
+            durationMs: 60000,
+            fillWordsUsed: 20,
+          },
+        },
+      })
+    );
+    expect(c.model).toBe('Merged — English + Indonesian');
+    expect(c.language).toBeNull();
+  });
+
   test('a plain completed version', () => {
     const c = versionCopy(version());
     expect(c.model).toBe('Universal-3.5 Pro');
