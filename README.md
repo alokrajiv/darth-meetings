@@ -180,6 +180,24 @@ on the same contract as Darth Chat (its SPEC §20.76):
   textarea. The web app has no header search on a meeting page, so the
   in-meeting scope is shell-only; in a browser the transcript's own ⌘F
   find (editors) and the browser's find cover it.
+- **Open in Darth** (web → shell, family contract C1 in
+  `darth/plans/holocrons-shell-synergy/README.md`) — in a desktop browser
+  (macOS / Windows / Linux UA; never inside the shell, never under
+  `navigator.webdriver`, never on a phone or tablet) the app header's right
+  cluster starts with a ghost **Open in Darth** button, so it sits in the
+  same spot on the listing, a meeting page, Settings and every other page
+  (hidden below 768 px). Click → `location.href =
+  darth://meetings<pathname><search><hash>` of the current page (no
+  `?window=new`: the shell shows it in its Meetings view). After 1.5 s, if
+  the page is still visible and never blurred / hidden (chat's
+  `appOpenVerdict`), the button becomes "Darth didn't open — install it"
+  linking the desktop download page
+  (`https://cli.darth-internal.trames.io/darth-desktop/index.html`, desktop
+  `docs/DISTRIBUTION.md`). One probe per page load; nothing is rendered
+  during SSR / hydration. Rule: `src/lib/open-in-darth.ts` (pure, tested in
+  `src/lib/__tests__/open-in-darth.test.ts`); UI:
+  `src/components/open-in-darth.tsx`. No remembered "always open" choice in
+  v1.
 - **Layout rules** (`src/lib/listing-layout.ts`) — ONE layout, designed for
   the shell's window (900–1300 px of content, the shell's title band with its
   own search above, its 64 px rail on the left); the browser mirrors it at

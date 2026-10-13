@@ -5,6 +5,7 @@ import { usePathname } from 'next/navigation';
 import { AudioLines, ChevronRight } from 'lucide-react';
 import type { ReactNode } from 'react';
 import { AccountMenu } from '@/components/account-menu';
+import { OpenInDarth } from '@/components/open-in-darth';
 import { RecorderChip } from '@/components/recorder-chip';
 import { APP_NAV, navItemActive } from '@/lib/app-nav';
 import { LISTING_MAX_CONTENT_PX } from '@/lib/listing-layout';
@@ -23,7 +24,9 @@ interface AppHeaderProps {
  * Right side (README "Darth desktop shell" → Layout rules): the page's
  * actions, then the live-status chip that always stays visible (Recorder ●),
  * then the account menu at the far right (Settings, theme, Sign out). Same
- * layout in the shell and the browser.
+ * layout in the shell and the browser. In a desktop browser (never in the
+ * shell, never on a phone) the cluster starts with "Open in Darth"
+ * (components/open-in-darth.tsx), so it sits in the same spot on every page.
  */
 export function AppHeader({ children, breadcrumb }: AppHeaderProps) {
   const pathname = usePathname();
@@ -86,6 +89,7 @@ export function AppHeader({ children, breadcrumb }: AppHeaderProps) {
           </nav>
         )}
         <div className="ml-auto flex items-center gap-2">
+          <OpenInDarth />
           {children}
           <RecorderChip />
           <AccountMenu />
