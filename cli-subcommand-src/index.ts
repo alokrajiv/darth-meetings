@@ -2842,7 +2842,7 @@ async function versionsCmd(ctx: Ctx, flags: Record<string, string | boolean>, ki
       if (reason) body.reason = reason;
       if (flags.force === true) body.force = true;
       if (mode !== "replace") body.mode = mode;
-      if (threshold !== undefined) body.mergeOptions = { utteranceThreshold: threshold, wordThreshold: threshold };
+      if (threshold !== undefined) body.mergeOptions = { utteranceThreshold: threshold, wordThreshold: Math.max(0, Math.round((threshold - 0.1) * 100) / 100) }; // partial spans stay 0.10 stricter (server: 0.75 / 0.65)
       let capMin = 30;
       if (flags.timeout !== undefined) {
         if (flags.wait !== true) { console.error("--timeout only applies with --wait"); return 1; }
@@ -2922,7 +2922,7 @@ async function versionsCmd(ctx: Ctx, flags: Record<string, string | boolean>, ki
       const dryRun = flags["dry-run"] === true;
       if (dryRun && flags.activate === true) { console.error("--activate does nothing with --dry-run (nothing is written)"); return 1; }
       const body: Record<string, unknown> = { base, fill };
-      if (threshold !== undefined) body.options = { utteranceThreshold: threshold, wordThreshold: threshold };
+      if (threshold !== undefined) body.options = { utteranceThreshold: threshold, wordThreshold: Math.max(0, Math.round((threshold - 0.1) * 100) / 100) }; // partial spans stay 0.10 stricter (server: 0.75 / 0.65)
       const reason = str(flags.reason)?.trim();
       if (reason) body.reason = reason;
       if (dryRun) body.dryRun = true;
