@@ -40,6 +40,9 @@ READ
                                   ('scratch: yes' marks a temporary row)
   text <id>                       Full transcript as "[mm:ss] Speaker: …" lines
                                   (confirmed speaker names applied; grep/regex this)
+  text <id> --version <tid>       The same for a version that is NOT active (see
+                                  TRANSCRIPTION VERSIONS); lines whose words came
+                                  from a merge's fill pass end with ⟨merged⟩
   notes <id>                      Print the meeting-notes markdown
   report <id>                     Print the detailed-report markdown
   search <query> [FILTERS]        Server-side deep search (title, filename,
@@ -119,6 +122,7 @@ READ
 
 RECORDINGS (yours only, never shared — see 'darth-cli meetings recordings')
   recordings list|get|text|audio|link|make-meeting|keep|rm
+  recordings transcriptions|transcribe-again|merge-transcriptions|use-transcription
                                   Your private recordings that belong to no
                                   meeting (unlinked uploads, temporary ones,
                                   Darth Recorder files still on a Mac). A
@@ -145,6 +149,58 @@ SEGMENTS (a meeting is a TIMELINE of segments — see 'darth-cli meetings segmen
                                   --event links + shares the new meeting like
                                   'link' does. T = mm:ss, h:mm:ss or ms
   unsplit <split-off-id>          Put a split-off meeting back into its source
+
+TRANSCRIPTION VERSIONS (one recording, several transcriptions; ▶ = the one the
+meeting shows — mixed-language calls: 'darth-cli meetings skill' → "Mixed-
+language recordings")
+  transcriptions <id>             Every version, newest first: ▶ active, the
+                                  provider/model that actually ran, language
+                                  (detected + confidence | forced | merged),
+                                  ASR confidence, speakers, status, merge
+                                  info, reason; a run in flight; then a HEALTH
+                                  line for the active version and, when it
+                                  looks mixed-language, the exact command to
+                                  run next
+  transcribe-again <id> [--language <code|auto|auto-en>] [--model <m>]
+         [--reason "…"] [--keep-active | --merge] [--merge-threshold 0.75]
+         [--force] [--wait [--timeout <mins>]]
+                                  Run another transcription of the recording.
+                                  Default: it REPLACES the active version when
+                                  done (the fix for a call in ONE language
+                                  that was detected wrong). --keep-active =
+                                  keep it as a helper (not active). --merge =
+                                  merge it with the active version (English =
+                                  the base, the other language fills its
+                                  low-confidence spans) and activate the merge
+                                  — the one-shot fix for a mixed call:
+                                    English detected: --language id --merge
+                                    other detected:   --language auto-en --merge
+                                  auto-en = English base pass that keeps the
+                                  other language's speech. NEVER --language
+                                  alone on a mixed call: forced en DROPS the
+                                  other language's speech, a forced other
+                                  language TRANSLATES the English. --force =
+                                  repeat the active version's model+language.
+                                  --wait polls every 10 s until the run is
+                                  done (default cap 30 min), prints the
+                                  versions + HEALTH; exit 0 completed, 1
+                                  error (or no merge made), 3 timeout (still
+                                  running server-side). ~$0.17/h per pass
+  merge-transcriptions <id> --base <tid> --fill <tid> [--threshold 0.75]
+         [--reason "…"] [--dry-run] [--activate]
+                                  Merge two completed versions you already
+                                  have (no new transcription): base keeps
+                                  speakers/turns, fill's words replace base
+                                  spans whose confidence is < --threshold.
+                                  --dry-run = stats + before/after preview,
+                                  nothing written; --activate = switch to the
+                                  merged version at once. Server warnings
+                                  (e.g. "base is not an English version") are
+                                  printed as WARNING lines
+  use-transcription <id> <tid>    Make <tid> the active version (speaker names
+                                  and edits of the version left are set aside
+                                  and come back when you switch back)
+  (write verbs need read+write and EDIT access to the meeting)
 
 LABELS (org-wide, hierarchical 'Customers/LP Global/QBR', many per transcript;
 <label> = a path, case-insensitive, or '#<id>' from 'labels')
@@ -567,6 +623,57 @@ only where no other segment has speech), exclude (playable, no text). The
 server never guesses where a segment sits: --at defaults to 0:00, measure it
 with 'segments align' or set it by ear. Speaker names and text edits move
 with a split and come back with unsplit.
+
+## Mixed-language recordings
+
+AssemblyAI picks ONE language per file. On a call in two languages (English +
+Indonesian, English + Mandarin, …) one pass is always wrong somewhere:
+
+- detected/forced English → the other language comes out as invented text in
+  a foreign script (Vietnamese, Thai, Hindi…) or low-confidence gibberish;
+  FORCED en is worse — it DROPS the other language's speech (−28% of the
+  audio covered in a probe), leaving holes nothing can fill;
+- forced other language (or auto-detect landing on it) → that language is
+  clean, but the English turns are TRANSLATED into it (or dropped).
+
+Symptoms: garbled foreign-script lines in 'text', a report that says it
+"relied on the English parts", or a HEALTH line saying MIXED LANGUAGE
+SUSPECTED. The fix is a second pass plus a MERGE: the English version stays
+the skeleton (speakers, turns, names, edits), and the other version's words
+replace it only where the English pass had low confidence.
+
+    darth-cli meetings transcriptions <id>        # versions + HEALTH + the exact next command
+    # active version is English (en*):
+    darth-cli meetings transcribe-again <id> --language id --merge --wait
+    # active version is the OTHER language (auto-detect landed on id):
+    darth-cli meetings transcribe-again <id> --language auto-en --merge --wait
+    darth-cli meetings text <id>                  # spot-check the merged (now active) text
+    darth-cli meetings use-transcription <id> <previous tid>   # back, if it is worse
+
+<code> is the language YOU suspect from the garbage (id for Indonesian, zh for
+Chinese, …) — the CLI cannot know it. auto-en is an English pass that keeps the
+other language's speech present (garbled) so the merge has something to swap.
+The server puts the English version as the base whichever side you start
+from; --wait exits 0 when done, 1 on an error (or if no merge was made — it
+then prints the merge-transcriptions command), 3 if still running at
+--timeout. Already have both versions? Merge without a new pass:
+
+    darth-cli meetings merge-transcriptions <id> --base <en tid> --fill <other tid> --dry-run
+    darth-cli meetings merge-transcriptions <id> --base <en tid> --fill <other tid> --activate
+
+--dry-run prints what would change (before/after per touched utterance) and
+any WARNING (e.g. "base is not an English version"); --threshold (default
+0.75) is the confidence below which the base's words are swapped. 'text <id>
+--version <tid>' reads any version without switching to it.
+
+RULES: on a mixed call NEVER run 'transcribe-again --language <code>' without
+--merge or --keep-active — forced en drops the other language's speech and a
+forced other language translates the English, and either would REPLACE the
+active version. Each extra pass costs ~$0.17 per hour of audio (AssemblyAI) —
+fine for a real meeting, but don't loop. After switching versions the notes /
+report were written from the old text: a human regenerates them in the web UI
+(or you write new ones with 'set-notes' / 'set-report'). A recording in no
+meeting has the same verbs under 'recordings' (owner only).
 
 ## Labels (org-wide taxonomy, many per meeting)
 
@@ -1946,6 +2053,22 @@ WRITE (needs read+write for meetings)
                                   (it stays a private recording)
   recordings rm <rid>             Delete it (refused while a meeting uses it)
 
+TRANSCRIPTION VERSIONS of a recording that is in no meeting (same verbs and
+flags as 'darth-cli meetings transcriptions|text --version|transcribe-again|
+merge-transcriptions|use-transcription' — see 'darth-cli meetings --help'):
+  recordings transcriptions <rid> Versions, ▶ active, HEALTH + next command
+  recordings text <rid> --version <tid>
+                                  Read a version that is not active
+  recordings transcribe-again <rid> [--language <code|auto|auto-en>] [--model <m>]
+         [--reason "…"] [--keep-active | --merge] [--merge-threshold 0.75]
+         [--force] [--wait [--timeout <mins>]]
+  recordings merge-transcriptions <rid> --base <tid> --fill <tid> [--threshold 0.75]
+         [--reason "…"] [--dry-run] [--activate]
+  recordings use-transcription <rid> <tid>
+                                  The writes are refused (409) once a meeting
+                                  uses the recording — the CLI prints the
+                                  meeting id; use the meeting verbs there
+
 <rid> = the recording uuid; 'rec-<uuid>' is accepted too.`;
 
 /** 'rec-<uuid>' | '<uuid>' → '<uuid>'. */
@@ -2429,6 +2552,433 @@ async function unsplitCmd(ctx: Ctx, args: string[]): Promise<number> {
   return 0;
 }
 
+// ---------------------------------------------------------------------------
+// Transcription versions (docs/transcription-merge-spec.md §4). A recording
+// holds many transcriptions (versions); one is active and the meeting shows
+// it. These verbs list them (with a health signal), read a non-active one,
+// run another pass (replace / keep as helper / merge), merge two versions,
+// and switch the active one. Same five verbs on a meeting
+// (/api/transcripts/:id/…) and on a bare recording (/api/recordings/:rid/…,
+// owner only; 409 {meetingId} when a meeting uses it).
+// ---------------------------------------------------------------------------
+
+/** Where a family of version verbs points: a meeting or a bare recording. */
+interface VersionScope {
+  kind: "meeting" | "recording";
+  id: string;
+  /** '/api/transcripts/<id>' | '/api/recordings/<rid>' */
+  base: string;
+  /** The run route under base: 'retranscribe' (meeting) | 'transcribe' (recording). */
+  runRoute: string;
+  /** Command prefix for printed next steps. */
+  cmd: string;
+}
+
+function versionScope(kind: "meeting" | "recording", rawId: string): VersionScope {
+  if (kind === "meeting") {
+    return { kind, id: rawId, base: `/api/transcripts/${encodeURIComponent(rawId)}`, runRoute: "retranscribe", cmd: "darth-cli meetings" };
+  }
+  const id = recId(rawId);
+  return { kind, id, base: `/api/recordings/${encodeURIComponent(id)}`, runRoute: "transcribe", cmd: "darth-cli meetings recordings" };
+}
+
+const VERSION_VERBS = ["transcriptions", "transcribe-again", "merge-transcriptions", "use-transcription"] as const;
+const VERSION_BOOL_FLAGS = ["keep-active", "merge", "force", "dry-run", "activate", "wait"] as const;
+/** Default merge threshold (spec §1: utterance + rolling word mean). */
+const MERGE_THRESHOLD_DEFAULT = 0.75;
+
+const fmt2 = (n: number | null | undefined): string => (typeof n === "number" && Number.isFinite(n) ? n.toFixed(2) : "?");
+const pct = (n: number | null | undefined): string => (typeof n === "number" && Number.isFinite(n) ? `${Math.round(n * 100)}%` : "?");
+
+/** Non-2xx on a version route → a readable line; returns the exit code. */
+function versionError(sc: VersionScope, verb: string, status: number, data: any): number {
+  // A non-JSON body (Next's HTML 404 page for a route this server lacks) is noise, not a message.
+  const raw = data?.error;
+  const msg = typeof raw === "string" && !/^\s*</.test(raw) ? raw : `HTTP ${status}${typeof raw === "string" ? ", no such route" : ""}`;
+  if (status === 401) console.error(`Unauthorized: ${msg}\nYour token may be expired/revoked — run: darth-cli login`);
+  else if (status === 403) console.error(`Forbidden: ${msg}\n${sc.kind === "meeting" ? "You need EDIT access to the meeting and" : "You need"} a read+write token for meetings (re-run 'darth-cli login' and pick Read + write).`);
+  else if (status === 409 && data?.meetingId) {
+    console.error(`${verb} refused: recording ${sc.id} is used by meeting ${data.meetingId} (${msg}).`);
+    console.error(`Use the meeting's verbs — switching versions there moves the meeting's speaker names and edits too:  darth-cli meetings ${verb} ${data.meetingId} …`);
+  } else if (status === 409 && data?.sameSettings) console.error(`${verb} refused: ${msg}\nThat would repeat the active version (same model + language) — add --force to run it anyway.`);
+  else if (status === 409 && data?.running) {
+    const r = data.running;
+    console.error(`${verb} refused: a run is already in flight — version ${r.transcriptionId} (${r.speechModel ?? "?"}, language ${r.languageCode ?? "?"}) since ${r.startedAt ?? "?"}.`);
+    console.error(`Follow it with: ${sc.cmd} transcriptions ${sc.id}`);
+  } else if (status === 404) {
+    console.error(sc.kind === "recording"
+      ? `${verb} failed: no such recording of yours, or no such version of it (${msg}) — or this server does not have the recording-level transcription routes yet.`
+      : `${verb} failed: not found (${msg}) — the meeting id or the version id; an older server may not have this route yet.`);
+  } else if (status === 501) console.error(`${verb} is not available on this server yet (${msg}).`);
+  else if (status === 400) console.error(`${verb} refused: ${msg}`);
+  else console.error(`${verb} failed (HTTP ${status}): ${msg}${data?.code ? ` [${data.code}]` : ""}`);
+  return status === 401 ? 3 : 1;
+}
+
+/** en, en_us, en-GB … (the side of a mixed call that is the merge BASE). */
+function isEnglish(code: unknown): boolean {
+  return typeof code === "string" && /^en([_-]|$)/i.test(code);
+}
+
+/** "en (detected 0.28)" | "id (forced)" | "en + id (merged)". */
+function versionLanguage(v: any): string {
+  const code = v.languageCode ?? "?";
+  if (v.provider === "merge") return `${code} + ${v.merge?.fillLanguage ?? "?"} (merged)`;
+  if (v.provider !== "assemblyai") return code;
+  return v.languageDetected ? `${code} (detected ${fmt2(v.languageConfidence)})` : `${code} (forced)`;
+}
+
+/** "assemblyai universal-2 (asked universal-3-pro)" | "merge" | "teams-vtt". */
+function versionEngine(v: any): string {
+  if (v.provider !== "assemblyai") return String(v.provider ?? "?");
+  const asked = v.speechModelRequested && v.speechModelRequested !== v.speechModel ? ` (asked ${v.speechModelRequested})` : "";
+  return `assemblyai ${v.speechModel ?? "?"}${asked}`;
+}
+
+function mergeSummary(m: any): string {
+  const s = m?.stats ?? {};
+  const parts = [`base ${m?.base ?? "?"} + fill ${m?.fill ?? "?"} (${m?.fillLanguage ?? "?"})`];
+  if (typeof s.utterances === "number") parts.push(`${s.utterancesTouched ?? "?"} of ${s.utterances} utterances replaced (${s.utterancesWhole ?? 0} whole)`);
+  if (typeof s.swappedMs === "number") parts.push(`${fmtMs(s.swappedMs)} of ${fmtMs(s.durationMs)} audio swapped`);
+  return parts.join(" · ");
+}
+
+function printVersionLine(v: any, tz: string): void {
+  const who = v.requestedBy ? (v.requestedBy.name || v.requestedBy.email) : null;
+  const when = v.completedAt || v.createdAt;
+  const head = [
+    `${v.active ? "▶" : " "} ${v.id}`,
+    String(v.status ?? "?"),
+    versionEngine(v),
+    versionLanguage(v),
+    `ASR ${fmt2(v.asrConfidence)}`,
+    `${v.speakerCount ?? "?"} speakers`,
+    when ? fmtLocalDateTime(when, tz) : "?",
+  ];
+  console.log(`${head.join("  ")}${who ? `  by ${who}` : ""}${v.reason ? `  — "${v.reason}"` : ""}`);
+  if (v.merge) console.log(`      merge: ${mergeSummary(v.merge)}`);
+  if (v.editsSetAside || v.speakerNamesSetAside) console.log(`      set aside with it: ${v.editsSetAside ?? 0} edit(s), ${v.speakerNamesSetAside ?? 0} speaker name(s) — they come back when it is active again`);
+  if (v.status === "error" && v.error) console.log(`      error: ${v.error}`);
+}
+
+/** HEALTH line for the active version + the exact next command when it looks mixed-language. */
+function printVersionHealth(sc: VersionScope, data: any): void {
+  const versions: any[] = data.versions ?? [];
+  const active = versions.find((v) => v.active);
+  if (!active) { console.log("HEALTH: no active version"); return; }
+  const h = active.health;
+  if (!h) {
+    console.log(`HEALTH (active ${active.id}): not reported${active.status !== "completed" ? ` — the version is ${active.status}` : " by this server for this version"}${active.asrConfidence != null ? ` (ASR ${fmt2(active.asrConfidence)})` : ""}`);
+    return;
+  }
+  const facts = [
+    `ASR ${fmt2(h.asrConfidence)}`,
+    `language ${active.languageCode ?? "?"} conf ${fmt2(h.languageConfidence)}`,
+    `low-confidence audio ${pct(h.lowConfidenceShare)}`,
+    `foreign-script lines ${pct(h.foreignScriptShare)}`,
+  ];
+  console.log(`HEALTH (active ${active.id}): ${facts.join(" · ")} → ${h.mixedLanguageSuspected ? "MIXED LANGUAGE SUSPECTED" : "looks clean"}`);
+  if (!h.mixedLanguageSuspected) return;
+  if (active.provider === "merge" && active.merge) {
+    console.log(`  the active version is already a merge — spot-check it ('${sc.cmd} text ${sc.id}'); to try another threshold:`);
+    console.log(`  next: ${sc.cmd} merge-transcriptions ${sc.id} --base ${active.merge.base} --fill ${active.merge.fill} --threshold 0.8 --dry-run`);
+    return;
+  }
+  const activeEn = isEnglish(active.languageCode);
+  // A completed version on the other side of the language line already exists → merging it costs
+  // nothing. Base = the English one (amendment A), fill = the other.
+  const helper = versions.find((v) => !v.active && v.status === "completed" && v.provider !== "merge" && v.languageCode && isEnglish(v.languageCode) !== activeEn);
+  if (helper) {
+    const [b, f] = activeEn ? [active.id, helper.id] : [helper.id, active.id];
+    console.log(`  a completed ${helper.languageCode} version already exists — merge it (no new transcription; base = the English one):`);
+    console.log(`  next: ${sc.cmd} merge-transcriptions ${sc.id} --base ${b} --fill ${f} --dry-run`);
+    return;
+  }
+  if (activeEn) {
+    console.log(`  next: ${sc.cmd} transcribe-again ${sc.id} --language <code> --merge --wait`);
+    console.log(`        <code> = the language you suspect besides English (e.g. id for Indonesian, zh for Chinese).`);
+  } else {
+    console.log(`  next: ${sc.cmd} transcribe-again ${sc.id} --language auto-en --merge --wait`);
+    console.log(`        auto-en = an English base pass that keeps the ${active.languageCode ?? "other"} speech present; the merge then fills it from this version.`);
+  }
+  console.log(`        Never --language alone on a mixed call: forced en DROPS the other language's speech, a forced`);
+  console.log(`        other language TRANSLATES the English. ~$0.17 per hour of audio per extra pass.`);
+}
+
+function printVersionsView(sc: VersionScope, data: any, tz: string): void {
+  const versions: any[] = data.versions ?? [];
+  const what = sc.kind === "meeting" ? `meeting ${sc.id}` : `recording ${sc.id}`;
+  console.log(`transcriptions of ${what} — ${versions.length} version(s), newest first, ▶ = active${data.canEdit === false ? "  (read-only: you cannot run or switch versions)" : ""}`);
+  if (data.versioned === false) console.log(`versions are not enabled for this ${sc.kind} (legacy path) — 'transcribe-again' would make a NEW meeting row here`);
+  const tz2 = tz;
+  for (const v of versions) printVersionLine(v, tz2);
+  if (!versions.length) console.log("  (none)");
+  const r = data.running;
+  if (r) {
+    const who = r.by ? (r.by.name || r.by.email) : null;
+    console.log(`running: ${r.transcriptionId} — ${r.speechModel ?? "?"}, language ${r.languageCode ?? "?"}, since ${r.startedAt ? fmtLocalDateTime(r.startedAt, tz) : "?"}${who ? ` by ${who}` : ""}`);
+  }
+  if (data.notesStale) console.log(`notes/report: ${data.notesStale.reason ?? "written from the previous transcription"} — regenerate them in the web UI`);
+  printVersionHealth(sc, data);
+}
+
+async function fetchVersions(ctx: Ctx, sc: VersionScope): Promise<{ ok: boolean; status: number; data: any }> {
+  return recordingRequest(ctx, `${sc.base}/transcriptions`, { method: "GET" });
+}
+
+/** A threshold flag as a number in (0, 1); undefined when absent, null (printed) when bad. */
+function thresholdFlag(flags: Record<string, string | boolean>, name: string): number | null | undefined {
+  const raw = flags[name];
+  if (raw === undefined) return undefined;
+  const n = Number(raw === true ? NaN : raw);
+  if (!Number.isFinite(n) || n <= 0 || n >= 1) { console.error(`--${name} must be a number between 0 and 1 (default ${MERGE_THRESHOLD_DEFAULT})`); return null; }
+  return n;
+}
+
+/** Diarization label ('A', 'B', '1') → "Speaker A"; a name passes through. */
+function speakerDisplay(s: unknown): string {
+  const t = String(s ?? "?");
+  return /^[A-Z0-9]{1,2}$/.test(t) ? `Speaker ${t}` : t;
+}
+
+interface RunWaitResult { code: number; outcome: "completed" | "error" | "timeout" | "merge-missing" | "gone"; final: any; mergedId: string | null }
+
+/** Poll the versions list every 10 s until run `tid` is no longer running. */
+async function waitForVersionRun(ctx: Ctx, sc: VersionScope, tid: string, mode: string, capMin: number): Promise<RunWaitResult> {
+  const deadline = Date.now() + capMin * 60_000;
+  let final: any = null;
+  let graceUntil = 0; // merge: the merged version may land a poll after the fill completes
+  console.error(`Waiting for version ${tid} (up to ${capMin} min, poll 10s)…`);
+  while (Date.now() < deadline) {
+    await sleep(10_000);
+    const r = await fetchVersions(ctx, sc);
+    if (!r.ok) {
+      if ([401, 403, 404].includes(r.status)) return { code: versionError(sc, "transcriptions", r.status, r.data), outcome: "gone", final, mergedId: null };
+      continue; // 5xx / network hiccup: keep polling
+    }
+    final = r.data;
+    const versions: any[] = final.versions ?? [];
+    const v = versions.find((x) => x.id === tid);
+    if (!v || v.status === "processing" || final.running?.transcriptionId === tid) continue;
+    if (v.status === "error") return { code: 1, outcome: "error", final, mergedId: null };
+    if (mode !== "merge") return { code: 0, outcome: "completed", final, mergedId: null };
+    // The server orients base/fill by LANGUAGE (amendment A): the new run is the fill (it forced
+    // the other language) or the base (an auto-en pass over a non-English active version).
+    const merged = versions.find((x) => x.provider === "merge" && (x.merge?.fill === tid || x.merge?.base === tid));
+    if (merged) return { code: 0, outcome: "completed", final, mergedId: merged.id };
+    if (!graceUntil) graceUntil = Date.now() + 30_000;
+    if (Date.now() >= graceUntil) return { code: 1, outcome: "merge-missing", final, mergedId: null };
+  }
+  return { code: 3, outcome: "timeout", final, mergedId: null };
+}
+
+/**
+ * The five version verbs, on a meeting or a recording:
+ * transcriptions | text --version | transcribe-again | merge-transcriptions | use-transcription.
+ */
+async function versionsCmd(ctx: Ctx, flags: Record<string, string | boolean>, kind: "meeting" | "recording", verb: string, args: string[]): Promise<number> {
+  liftBoolFlags(args, flags, VERSION_BOOL_FLAGS);
+  const tz = localTz(ctx);
+  const prefix = kind === "meeting" ? "darth-cli meetings" : "darth-cli meetings recordings";
+  const idWord = kind === "meeting" ? "<id>" : "<rid>";
+  if (!args[0]) {
+    const usage: Record<string, string> = {
+      transcriptions: `transcriptions ${idWord} [--json]`,
+      text: `text ${idWord} --version <tid>`,
+      "transcribe-again": `transcribe-again ${idWord} [--language <code|auto>] [--model <m>] [--reason "…"] [--keep-active | --merge] [--merge-threshold 0.75] [--force] [--wait [--timeout <mins>]]`,
+      "merge-transcriptions": `merge-transcriptions ${idWord} --base <tid> --fill <tid> [--threshold 0.75] [--reason "…"] [--dry-run] [--activate]`,
+      "use-transcription": `use-transcription ${idWord} <tid>`,
+    };
+    console.error(`usage: ${prefix} ${usage[verb] ?? verb}`);
+    return 1;
+  }
+  const sc = versionScope(kind, args[0]);
+
+  switch (verb) {
+    case "transcriptions": {
+      const r = await fetchVersions(ctx, sc);
+      if (!r.ok) return versionError(sc, "transcriptions", r.status, r.data);
+      ctx.print(r.data, () => printVersionsView(sc, r.data, tz));
+      return 0;
+    }
+
+    case "text": {
+      const tid = str(flags.version)?.trim();
+      if (!tid) { console.error(`usage: ${prefix} text ${idWord} --version <tid>   (<tid> = a version id from '${prefix} transcriptions ${idWord}')`); return 1; }
+      const r = await recordingRequest(ctx, `${sc.base}/transcriptions/${encodeURIComponent(tid)}/content`, { method: "GET" });
+      if (r.status === 202) { console.error(`version ${tid} is still transcribing — try again later ('${prefix} transcriptions ${sc.id}').`); return 1; }
+      if (!r.ok) return versionError(sc, "text --version", r.status, r.data);
+      const d = r.data ?? {};
+      if (ctx.json) { console.log(JSON.stringify(d, null, 2)); return 0; }
+      const utterances: any[] = d.utterances ?? [];
+      const mergedCount = utterances.filter((u) => u.merged).length;
+      // Header on stderr: stdout stays the same "[mm:ss] Speaker: …" shape as 'text'.
+      console.error(`version ${d.transcriptionId ?? tid}${d.active ? " (active)" : " (not active)"} · ${d.provider ?? "?"} · language ${d.languageCode ?? "?"} · ${utterances.length} utterances${mergedCount ? ` · ${mergedCount} marked ⟨merged⟩ (words from the fill pass)` : ""}`);
+      console.log(utterances.length
+        ? utterances.map((u) => `[${fmtMs(u.start)}] ${speakerDisplay(u.speaker)}: ${u.text}${u.merged ? "  ⟨merged⟩" : ""}`).join("\n")
+        : "(empty transcript)");
+      return 0;
+    }
+
+    case "transcribe-again": {
+      if (flags["keep-active"] === true && flags.merge === true) { console.error("pick one of --keep-active (keep it as a helper) and --merge (merge it into the active version)"); return 1; }
+      const mode = flags.merge === true ? "merge" : flags["keep-active"] === true ? "helper" : "replace";
+      const threshold = thresholdFlag(flags, "merge-threshold");
+      if (threshold === null) return 1;
+      if (threshold !== undefined && mode !== "merge") { console.error("--merge-threshold only applies with --merge"); return 1; }
+      const body: Record<string, unknown> = {};
+      if (flags.language !== undefined) {
+        const lang = str(flags.language)?.trim().toLowerCase();
+        if (!lang || !(lang === "auto" || lang === "auto-en" || /^[a-z]{2,3}([_-][a-z]{2,4})?$/.test(lang))) { console.error("--language must be a language code (id, zh, en_us, …), 'auto' or 'auto-en' (the English base pass of a mixed call)"); return 1; }
+        body.languageCode = lang;
+      }
+      if (flags.model !== undefined) {
+        const model = str(flags.model)?.trim();
+        if (!model) { console.error("--model needs a value (e.g. universal-2)"); return 1; }
+        body.speechModel = model;
+      }
+      const reason = str(flags.reason)?.trim();
+      if (flags.reason !== undefined && !reason) { console.error('--reason needs a value ("wrong language", "English + Indonesian call")'); return 1; }
+      if (reason) body.reason = reason;
+      if (flags.force === true) body.force = true;
+      if (mode !== "replace") body.mode = mode;
+      if (threshold !== undefined) body.mergeOptions = { utteranceThreshold: threshold, wordThreshold: threshold };
+      let capMin = 30;
+      if (flags.timeout !== undefined) {
+        if (flags.wait !== true) { console.error("--timeout only applies with --wait"); return 1; }
+        capMin = Number(str(flags.timeout));
+        if (!Number.isFinite(capMin) || capMin <= 0) { console.error(`--timeout must be a number of minutes (got '${str(flags.timeout) ?? ""}')`); return 1; }
+      }
+      ctx.requireWrite();
+      if (mode === "replace" && typeof body.languageCode === "string" && body.languageCode !== "auto") {
+        console.error(`note: --language ${body.languageCode} without --merge/--keep-active REPLACES the active version. Right for a call in ONE language that was detected wrong; on a MIXED call it is wrong: forced en DROPS the other language's speech, a forced other language TRANSLATES the English — use --merge there.`);
+      }
+      const r = await recordingRequest(ctx, `${sc.base}/${sc.runRoute}`, { method: "POST", body: JSON.stringify(body) });
+      if (!r.ok) return versionError(sc, "transcribe-again", r.status, r.data);
+      const d = r.data ?? {};
+      if (d.mode === "new-row" || d.already === true) {
+        // Pre-Phase-2 path (meeting rows only): a whole new meeting row, no versions.
+        ctx.print(d, () => {
+          console.log(`${d.already ? "already re-transcribed the old way" : "transcribing again as a NEW meeting row (versions are not enabled here)"} → ${d.newId}`);
+          console.log(`follow it with: darth-cli meetings get ${d.newId}`);
+        });
+        if (flags.wait === true) console.error("--wait is not supported on the legacy path — poll 'get' instead.");
+        return 0;
+      }
+      const tid: string | undefined = d.transcriptionId ?? d.running?.transcriptionId;
+      if (!tid) { console.error(`transcribe-again: the server accepted the run but named no version id — check '${sc.cmd} transcriptions ${sc.id}'.`); ctx.print(d, () => {}); return 1; }
+      const run = d.running ?? {};
+      const what = mode === "merge" ? "when it finishes it is MERGED into the active version and the merged version becomes active"
+        : mode === "helper" ? "kept as a helper — the active version stays active"
+        : "when it finishes it becomes the active version";
+      if (flags.wait !== true) {
+        ctx.print(d, () => {
+          console.log(`transcribing again → version ${tid}  (${run.speechModel ?? body.speechModel ?? "default model"}, language ${run.languageCode ?? body.languageCode ?? "auto"}) — ${what}`);
+          console.log(`follow it with: ${sc.cmd} transcriptions ${sc.id}   (or re-run with --wait)`);
+        });
+        return 0;
+      }
+      if (!ctx.json) console.error(`transcribing again → version ${tid}  (${run.speechModel ?? body.speechModel ?? "default model"}, language ${run.languageCode ?? body.languageCode ?? "auto"}) — ${what}`);
+      const w = await waitForVersionRun(ctx, sc, tid, mode, capMin);
+      if (w.outcome === "gone") return w.code;
+      if (ctx.json) {
+        console.log(JSON.stringify({ outcome: w.outcome, transcriptionId: tid, mode, mergedTranscriptionId: w.mergedId, run: d, transcriptions: w.final }, null, 2));
+        return w.code;
+      }
+      if (w.final) printVersionsView(sc, w.final, tz);
+      if (w.outcome === "timeout") {
+        console.error(`Still running after ${capMin} min — it keeps going server-side; check later with '${sc.cmd} transcriptions ${sc.id}'.`);
+      } else if (w.outcome === "error") {
+        const v = (w.final?.versions ?? []).find((x: any) => x.id === tid);
+        console.error(`version ${tid} failed: ${v?.error ?? "see the web app"} — the active version is unchanged.`);
+      } else if (w.outcome === "merge-missing") {
+        const active = (w.final?.versions ?? []).find((x: any) => x.active);
+        const v = (w.final?.versions ?? []).find((x: any) => x.id === tid);
+        const [b, f] = isEnglish(v?.languageCode) && !isEnglish(active?.languageCode) ? [tid, active?.id ?? "<active tid>"] : [active?.id ?? "<active tid>", tid];
+        console.error(`version ${tid} completed, but no merged version was made — the server kept it as a helper (both versions English or both not, or the version active at the start is gone). Look at both, then merge by hand (base = the English one):`);
+        console.error(`  ${sc.cmd} merge-transcriptions ${sc.id} --base ${b} --fill ${f} --dry-run`);
+      } else if (mode === "merge") {
+        // The version active before the run is the merge's other side (base or fill, by language).
+        const m = (w.final?.versions ?? []).find((x: any) => x.id === w.mergedId)?.merge;
+        const prev = m ? (m.base === tid ? m.fill : m.base) : "<previous tid>";
+        console.log(`done: version ${tid} completed; merged version ${w.mergedId} is now active — spot-check '${sc.cmd} text ${sc.id}'; go back with '${sc.cmd} use-transcription ${sc.id} ${prev}' if it is worse.`);
+      } else if (mode === "helper") {
+        const active = (w.final?.versions ?? []).find((x: any) => x.active);
+        const v = (w.final?.versions ?? []).find((x: any) => x.id === tid);
+        const [b, f] = isEnglish(v?.languageCode) && !isEnglish(active?.languageCode) ? [tid, active?.id ?? "<active tid>"] : [active?.id ?? "<active tid>", tid];
+        console.log(`done: version ${tid} completed and kept as a helper (not active). Read it: '${sc.cmd} text ${sc.id} --version ${tid}'; merge it (base = the English one): '${sc.cmd} merge-transcriptions ${sc.id} --base ${b} --fill ${f} --dry-run'.`);
+      } else {
+        console.log(`done: version ${tid} completed and is now active.`);
+      }
+      return w.code;
+    }
+
+    case "merge-transcriptions": {
+      const base = str(flags.base)?.trim(), fill = str(flags.fill)?.trim();
+      if (!base || !fill) { console.error(`usage: ${prefix} merge-transcriptions ${idWord} --base <tid> --fill <tid> [--threshold 0.75] [--reason "…"] [--dry-run] [--activate]   (tids from '${prefix} transcriptions ${idWord}')`); return 1; }
+      if (base === fill) { console.error("--base and --fill must be two different versions"); return 1; }
+      const threshold = thresholdFlag(flags, "threshold");
+      if (threshold === null) return 1;
+      const dryRun = flags["dry-run"] === true;
+      if (dryRun && flags.activate === true) { console.error("--activate does nothing with --dry-run (nothing is written)"); return 1; }
+      const body: Record<string, unknown> = { base, fill };
+      if (threshold !== undefined) body.options = { utteranceThreshold: threshold, wordThreshold: threshold };
+      const reason = str(flags.reason)?.trim();
+      if (reason) body.reason = reason;
+      if (dryRun) body.dryRun = true;
+      if (flags.activate === true) body.activate = true;
+      ctx.requireWrite();
+      const r = await recordingRequest(ctx, `${sc.base}/transcriptions/merge`, { method: "POST", body: JSON.stringify(body) });
+      if (!r.ok) return versionError(sc, "merge-transcriptions", r.status, r.data);
+      const d = r.data ?? {};
+      ctx.print(d, () => {
+        const s = d.stats ?? {};
+        const warnings: string[] = Array.isArray(d.warnings) ? d.warnings.map(String) : [];
+        for (const w of warnings) console.log(`WARNING: ${w}`);
+        const touched = `${s.utterancesTouched ?? "?"} of ${s.utterances ?? "?"} utterances (${s.utterancesWhole ?? 0} whole), ${fmtMs(s.swappedMs)} of ${fmtMs(s.durationMs)} audio, ${s.fillWordsUsed ?? "?"} fill words`;
+        if (d.dryRun) {
+          console.log(`dry run — nothing written. Merging fill ${fill} into base ${base}${threshold !== undefined ? ` at threshold ${threshold}` : ""} would replace ${touched}.`);
+          const preview: any[] = d.preview ?? [];
+          for (const p of preview) {
+            console.log(`[${fmtMs(p.start)}] ${speakerDisplay(p.speaker)}`);
+            console.log(`    before: ${p.before}`);
+            console.log(`    after:  ${p.after}`);
+          }
+          if (!preview.length) console.log("  (no utterance would change — the base is confident everywhere at this threshold)");
+          console.log(`create it: ${sc.cmd} merge-transcriptions ${sc.id} --base ${base} --fill ${fill}${threshold !== undefined ? ` --threshold ${threshold}` : ""} --activate`);
+          return;
+        }
+        console.log(`merged version ${d.transcriptionId} created — ${touched} replaced from ${fill}.`);
+        console.log(d.activated
+          ? `It is now ACTIVE (speaker names and edits of the base came with it). Spot-check: ${sc.cmd} text ${sc.id}`
+          : `Not active. Read it: ${sc.cmd} text ${sc.id} --version ${d.transcriptionId}; switch to it: ${sc.cmd} use-transcription ${sc.id} ${d.transcriptionId}`);
+      });
+      return 0;
+    }
+
+    case "use-transcription": {
+      const tid = args[1]?.trim();
+      if (!tid) { console.error(`usage: ${prefix} use-transcription ${idWord} <tid>   (tid from '${prefix} transcriptions ${idWord}')`); return 1; }
+      ctx.requireWrite();
+      const r = await recordingRequest(ctx, `${sc.base}/transcriptions/${encodeURIComponent(tid)}/activate`, { method: "POST" });
+      if (!r.ok) return versionError(sc, "use-transcription", r.status, r.data);
+      const d = r.data ?? {};
+      ctx.print(d, () => {
+        console.log(`active version is now ${d.activeId ?? tid}`);
+        const sa = d.setAside, re = d.restored;
+        if (sa && (sa.edits || sa.speakerNames)) console.log(`set aside with the previous version: ${sa.edits ?? 0} edit(s), ${sa.speakerNames ?? 0} speaker name(s)`);
+        if (re && (re.edits || re.speakerNames)) console.log(`restored with this version: ${re.edits ?? 0} edit(s), ${re.speakerNames ?? 0} speaker name(s)`);
+        if (sc.kind === "meeting") console.log(`notes/report may have been written from another version — '${sc.cmd} transcriptions ${sc.id}' says; regenerate them in the web UI if so`);
+      });
+      return 0;
+    }
+
+    default:
+      console.error(`Unknown transcription command: ${verb}`);
+      return 1;
+  }
+}
+
 async function recordingsCmd(ctx: Ctx, flags: Record<string, string | boolean>, pos: string[]): Promise<number> {
   liftBoolFlags(pos, flags, ["all", "envelope", "unlinked", "temporary", "regex", "separate"]);
   const [sub, ...args] = pos;
@@ -2505,6 +3055,7 @@ async function recordingsCmd(ctx: Ctx, flags: Record<string, string | boolean>, 
     }
 
     case "text": {
+      if (flags.version !== undefined) return versionsCmd(ctx, flags, "recording", "text", args);
       const rid = needRid("text <rid>");
       if (!rid) return 1;
       const res = await ctx.api("meetings", `/api/recordings/${rid}/content`);
@@ -2518,6 +3069,12 @@ async function recordingsCmd(ctx: Ctx, flags: Record<string, string | boolean>, 
         : content.text || "(empty transcript)");
       return 0;
     }
+
+    case "transcriptions":
+    case "transcribe-again":
+    case "merge-transcriptions":
+    case "use-transcription":
+      return versionsCmd(ctx, flags, "recording", sub, args);
 
     case "audio": {
       const rid = needRid("audio <rid> [--out <file>]");
@@ -2623,6 +3180,8 @@ const meetings: Subcommand = {
     if (cmd === "split") return splitCmd(ctx, flags, args);
     if (cmd === "unsplit") return unsplitCmd(ctx, args);
     if (!cmd || flags.help === true) { console.log(HELP); return 0; }
+    if ((VERSION_VERBS as readonly string[]).includes(cmd)) return versionsCmd(ctx, flags, "meeting", cmd, args);
+    if (cmd === "text" && flags.version !== undefined) return versionsCmd(ctx, flags, "meeting", "text", args);
 
     switch (cmd) {
       case "skill": {
