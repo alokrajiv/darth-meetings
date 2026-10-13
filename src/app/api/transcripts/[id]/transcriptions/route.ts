@@ -2,7 +2,12 @@ import { NextResponse } from 'next/server';
 import { withAuth } from '@/lib/auth/with-auth';
 import { resolveAccess } from '@/db-ops/transcript-access';
 import { transcriptionVersionsEnabled } from '@/db-ops/transcriptions';
-import { meetingTranscriptionVersions } from '@/lib/server/transcription-runs';
+import { getForUser } from '@/db-ops/transcripts';
+import {
+  meetingTranscriptionVersions,
+  pollTranscriptionRun,
+  runPollTarget,
+} from '@/lib/server/transcription-runs';
 import type { TranscriptionsResponse } from '@/lib/transcriptions';
 
 export const runtime = 'nodejs';
@@ -33,7 +38,17 @@ export const GET = withAuth(async ({ user }, { params }) => {
   if (!access) return NextResponse.json({ error: 'Not found' }, { status: 404 });
 
   const canEdit = access.access !== 'read';
-  const marker = access.row.gmeet_context?.retranscribing ?? null;
+  // A run in flight is asked about once before answering (deduped with the
+  // listing poll and the sweeper inside `pollTranscriptionRun`): an agent
+  // waiting on `transcribe-again --wait` reads THIS route, and without the
+  // ask it would sit out the five-minute sweeper tick after the job is done.
+  let row = access.row;
+  const pollTarget = runPollTarget(row);
+  if (pollTarget && (await transcriptionVersionsEnabled())) {
+    await pollTranscriptionRun(pollTarget);
+    row = (await getForUser(access.ownerUserId, row.assemblyai_id)) ?? row;
+  }
+  const marker = row.gmeet_context?.retranscribing ?? null;
   const running = marker
     ? {
         transcriptionId: marker.transcriptionId,
@@ -41,9 +56,10 @@ export const GET = withAuth(async ({ user }, { params }) => {
         by: marker.by,
         speechModel: marker.speechModel,
         languageCode: marker.languageCode,
+        ...(marker.mode ? { mode: marker.mode } : {}),
       }
     : null;
-  const notesStale = access.row.gmeet_context?.notesStale ?? null;
+  const notesStale = row.gmeet_context?.notesStale ?? null;
 
   const off: TranscriptionsResponse = {
     versioned: false,
@@ -58,7 +74,7 @@ export const GET = withAuth(async ({ user }, { params }) => {
   };
   if (!(await transcriptionVersionsEnabled())) return NextResponse.json(off);
 
-  const found = await meetingTranscriptionVersions(access.row.id);
+  const found = await meetingTranscriptionVersions(row.id);
   if (!found) return NextResponse.json(off);
 
   const body: TranscriptionsResponse = {

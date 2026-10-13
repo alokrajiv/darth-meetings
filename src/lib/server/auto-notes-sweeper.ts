@@ -18,6 +18,7 @@ import {
   transcriptionVersionsEnabled,
 } from '@/db-ops/transcriptions';
 import { pollTargetFromRow, pollTranscriptionRun } from '@/lib/server/transcription-runs';
+import { sweepRecordingRuns } from '@/lib/server/recording-transcriptions';
 import { AAI_STUCK_HOURS, AAI_STUCK_REASON } from '@/lib/aai-job-state';
 import { giveUpOnAaiJob } from '@/lib/server/aai-giveup';
 import { refreshPendingAgainstAai } from '@/lib/server/aai-pending-refresh';
@@ -317,6 +318,12 @@ async function sweep(): Promise<void> {
   } catch (err) {
     console.warn('[notes-sweeper] re-transcription poll failed:', err);
   }
+
+  // …and runs on recordings that belong to no meeting
+  // (docs/transcription-merge-spec.md §3c). They have no meeting row to carry
+  // a marker, so this tick is their ONLY observer besides the owner's own
+  // versions read. Self-gated on the versions flag; never throws.
+  await sweepRecordingRuns(RETRANSCRIBE_PER_SWEEP);
 
   // DEC-4: jobs that should already be gone from AssemblyAI. deleteAtAaiIfSafe
   // re-verifies each row itself, so this query only has to narrow the field.

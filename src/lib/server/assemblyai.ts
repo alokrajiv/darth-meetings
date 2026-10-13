@@ -63,6 +63,15 @@ export interface SubmitOptions {
   customSpelling?: Array<{ to: string; from: string[] }>;
   /** Defaults to DEFAULT_SPEECH_MODEL; 'universal' is the pre-2026-09 path. */
   model?: SpeechModel;
+  /**
+   * Detection steered towards these languages
+   * (`language_detection_options.expected_languages`) — the 'auto-en' base
+   * pass of a mixed-language call (lib/aai-language `submitLanguageFor`).
+   * Ignored when `languageCode` forces a language. With it, `speech_models`
+   * names ONLY the primary: the fallback would be the Universal-2 downgrade
+   * this option exists to avoid.
+   */
+  expectedLanguages?: string[];
 }
 
 export async function submitTranscription(
@@ -81,6 +90,7 @@ export async function submitTranscription(
     speech_models?: string[];
     language_code?: string;
     language_detection?: boolean;
+    language_detection_options?: { expected_languages: string[] };
     keyterms_prompt?: string[];
     custom_spelling?: Array<{ to: string; from: string[] }>;
   } = {
@@ -107,7 +117,13 @@ export async function submitTranscription(
   // + detection on a zh/en recording is byte-identical to explicit `zh`,
   // and detection makes AAI ignore keyterms_prompt for non-English instead
   // of rejecting the submit, so the bias list can stay on this path.
-  else params.language_detection = true;
+  else {
+    params.language_detection = true;
+    if (options.expectedLanguages && options.expectedLanguages.length > 0) {
+      params.language_detection_options = { expected_languages: options.expectedLanguages };
+      if (model !== 'universal') params.speech_models = [model];
+    }
+  }
   // AAI rejects the whole submit (400) when keyterms_prompt accompanies a
   // non-English language_code on the universal model, so only attach the
   // bias list for English (or unset, which AAI defaults to en). Vocab is

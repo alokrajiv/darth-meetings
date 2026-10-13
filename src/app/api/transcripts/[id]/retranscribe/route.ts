@@ -14,7 +14,7 @@ import { storedFileSource } from '@/lib/server/stored-media';
 import { finalizeUpload, openUpload, type LinkedEventInput } from '@/lib/server/upload-pipeline';
 import { startTranscriptionRun } from '@/lib/server/transcription-runs';
 import type { DarthUser } from '@/lib/auth/session';
-import type { RetranscribeRequest, TranscriptionLanguageChoice } from '@/lib/transcriptions';
+import { parseRunBody } from '@/lib/transcription-merge-plan';
 
 export const runtime = 'nodejs';
 
@@ -42,26 +42,6 @@ export const runtime = 'nodejs';
  * is `src/lib/transcriptions.ts`.
  */
 
-const SPEECH_MODELS: SpeechModel[] = ['universal', 'universal-3-5-pro'];
-/** AssemblyAI language codes are 'en', 'zh', 'en_us' — never free text. */
-const LANGUAGE_RE = /^[a-z]{2}(_[a-z]{2})?$/i;
-
-function parseBody(raw: unknown): RetranscribeRequest {
-  const b = (raw ?? {}) as Record<string, unknown>;
-  const model = typeof b.speechModel === 'string' ? b.speechModel : null;
-  const lang = typeof b.languageCode === 'string' ? b.languageCode.trim() : null;
-  const reason = typeof b.reason === 'string' ? b.reason.trim().slice(0, 200) : undefined;
-  return {
-    speechModel: SPEECH_MODELS.includes(model as SpeechModel) ? (model as SpeechModel) : undefined,
-    languageCode:
-      lang === 'auto' || (lang && LANGUAGE_RE.test(lang))
-        ? (lang as TranscriptionLanguageChoice)
-        : undefined,
-    reason: reason || undefined,
-    force: b.force === true,
-  };
-}
-
 export const POST = withAuth(async ({ user, request }, { params }) => {
   const { id } = await params;
   const access = await resolveAccess(user.userId, user.email, id);
@@ -71,8 +51,12 @@ export const POST = withAuth(async ({ user, request }, { params }) => {
   }
 
   // Every existing caller (the detail page's old button, darth-cli) posts no
-  // body at all; an unparseable one is read as "the defaults".
-  const body = parseBody(await request.json().catch(() => null));
+  // body at all; an unparseable one is read as "the defaults". `mode` and
+  // `mergeOptions` are the exception (lib/transcription-merge-plan
+  // `parseRunBody`): wrong there is a 400, never a silent replace.
+  const parsed = parseRunBody(await request.json().catch(() => null));
+  if (!parsed.ok) return NextResponse.json({ error: parsed.error }, { status: 400 });
+  const body = parsed.body;
 
   const started = await startTranscriptionRun({
     row: access.row,
@@ -82,16 +66,38 @@ export const POST = withAuth(async ({ user, request }, { params }) => {
     languageCode: body.languageCode ?? 'auto',
     reason: body.reason ?? null,
     force: body.force === true,
+    mode: body.mode,
+    mergeOptions: body.mergeOptions,
   });
 
   if (started.kind === 'started') {
     return NextResponse.json(
-      { ok: true, mode: 'version', transcriptionId: started.transcriptionId, running: started.running },
+      {
+        ok: true,
+        mode: 'version',
+        transcriptionId: started.transcriptionId,
+        running: started.running,
+        // `mode` on this response predates run modes and names the PATH
+        // ('version' | 'new-row'); the run's own mode is `runMode`.
+        runMode: body.mode,
+      },
       { status: 202 }
     );
   }
   if (started.kind === 'refused') {
     return NextResponse.json(started.body, { status: started.status });
+  }
+  // The new-row fallback IS a replace: it would show a forced other-language
+  // pass raw, which is exactly what 'helper' / 'merge' were asked to avoid.
+  if (body.mode !== 'replace') {
+    return NextResponse.json(
+      {
+        error:
+          'Keeping a run as a helper or merging it needs transcription versions, which are not ' +
+          `available for this meeting (${started.why}).`,
+      },
+      { status: 409 }
+    );
   }
   console.log(`[retranscribe] ${id}: version mode unavailable (${started.why}) — new-row fallback`);
   return legacyRetranscribe(user, access);

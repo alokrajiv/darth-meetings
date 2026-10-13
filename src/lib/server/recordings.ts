@@ -563,6 +563,47 @@ export async function resolveMeetingContent(
 }
 
 /**
+ * The meeting's text as it WOULD read on another version of one of its
+ * recordings (docs/transcription-merge-spec.md §3b — "read a non-active
+ * version before deciding"). Exactly `resolveMeetingContent`'s clip
+ * resolution, with `version.payload` standing in for whatever the clips on
+ * `recordingId` would otherwise read.
+ *
+ * Going through the clips is a PRIVACY rule, not a nicety: a meeting that
+ * holds only a window of its recording (a split) must never hand a reader
+ * the rest of it just because they asked for another version. In compat (one
+ * clip over the whole recording — every row on prod) this is the version's
+ * payload verbatim.
+ *
+ * null = the meeting has no clips (no recording graph — versions do not apply).
+ */
+export async function resolveMeetingContentForVersion(
+  row: ResolvableMeetingRow,
+  recordingId: string,
+  version: { id: string; payload: TranscriptResponse }
+): Promise<TranscriptResponse | null> {
+  const graph = await loadMeetingRecordingGraph(row.id);
+  if (graph.clips.length === 0) return null;
+  const resolvable: ResolvableClip[] = graph.clips.map((c) => ({
+    ord: c.ord,
+    recordingId: c.recording_id,
+    fromMs: c.from_ms,
+    toMs: c.to_ms,
+    offsetMs: c.offset_ms,
+    textPolicy: clipPolicy(c.text_policy),
+    payload:
+      c.recording_id === recordingId
+        ? version.payload
+        : (activeTranscriptionFor(graph, c.recording_id, c.transcription_id)?.payload ?? null),
+  }));
+  return resolveClips(resolvable, {
+    id: row.assemblyai_id,
+    createdAt: row.created_at,
+    completedAt: row.completed_at,
+  }).content;
+}
+
+/**
  * Phase 1 privacy guard. Two meetings can sit on ONE recording (two users
  * holding the same AssemblyAI job), and only one of them may ever have held
  * the bytes. While the meeting row is still the source of truth, a meeting
