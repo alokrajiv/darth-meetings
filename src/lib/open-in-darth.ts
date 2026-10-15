@@ -109,7 +109,7 @@ export function decideOpenInDarth(f: OpenInDarthFacts): OpenInDarthDecision {
 // ---------------------------------------------------------------- "did it open?"
 
 /** How long to wait after the scheme navigation before deciding the shell is not there (chat's value). */
-export const OPEN_IN_APP_TIMEOUT_MS = 1500;
+export const OPEN_IN_APP_TIMEOUT_MS = 4000; // was 1500 (chat's); 4 s so Chrome's own "Open Darth?" prompt is not mistaken for "not installed" (2026-10-15)
 
 /** What the page looked like when the timer fired. */
 export interface AppOpenProbe {

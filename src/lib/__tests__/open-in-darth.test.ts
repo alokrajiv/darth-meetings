@@ -144,7 +144,7 @@ describe('appOpenVerdict (copied from chat)', () => {
     expect(appOpenVerdict({ visibility: 'prerender', leftPage: false })).toBe('opened');
   });
   test('the wait is the usual 1.5 s', () => {
-    expect(OPEN_IN_APP_TIMEOUT_MS).toBe(1500);
+    expect(OPEN_IN_APP_TIMEOUT_MS).toBe(4000);
   });
 });
 
