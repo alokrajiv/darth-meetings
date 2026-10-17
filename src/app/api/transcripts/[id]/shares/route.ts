@@ -4,7 +4,14 @@ import { notifyUser } from '@/lib/server/darth-notify';
 import { dm, headlines, meetingLine, openLink } from '@/lib/server/dm-copy';
 import { resolveAccess } from '@/db-ops/transcript-access';
 import { sharingRefusal } from '@/lib/share-gate';
-import { identityForUser, logActivity, userIdForEmail } from '@/db-ops/transcript-activity';
+import {
+  identitiesForUsers,
+  identityForUser,
+  logActivity,
+  shareProvenanceFor,
+  userIdForEmail,
+} from '@/db-ops/transcript-activity';
+import { shareSource } from '@/lib/share-source';
 import { recordAutoShareRemoval } from '@/db-ops/auditor-shares';
 import { isAuditorShare, isAutoReadShare, SHARE_ORIGIN_AUDITOR, SHARE_ORIGIN_SERIES_FOLLOW } from '@/lib/auditor-policy';
 import { listVisibleMemberships } from '@/db-ops/series';
@@ -21,8 +28,13 @@ import {
 
 export const runtime = 'nodejs';
 
-// Share management for a single transcript.
-//   GET    — list collaborators + owner identity (any access)
+// Share management for a single transcript. The web Share dialog and
+// `darth-cli meetings share` (dth_ bearer, via withAuth) are both clients of
+// exactly these handlers — one permission model.
+//   GET    — list collaborators + owner identity + the caller's own access
+//            (any access). Each share also carries `source` (why it exists,
+//            lib/share-source.ts) and `shared_by` ({email,name} of whoever
+//            added it, or null) — additive, best-effort.
 //   POST   — add a collaborator (owner or editor)
 //   PATCH  — update a collaborator's access level (owner or editor), or
 //            transfer ownership with access: 'owner' (owner only)
@@ -63,8 +75,23 @@ export const GET = withAuth(async ({ user }, { params }) => {
         : [])().catch(() => []),
   ]);
   const seriesList = memberships.map((m) => ({ id: m.series_id, title: m.title }));
+  // Provenance never fails the listing: without it a share just has no
+  // source / shared_by.
+  const [prov, sharers] = await Promise.all([
+    shareProvenanceFor(access.row.id).catch(() => null),
+    identitiesForUsers(shares.map((s) => s.shared_by_user_id)).catch(() => null),
+  ]);
+  const described = shares.map((s) => {
+    const by = sharers?.get(s.shared_by_user_id);
+    return {
+      ...s,
+      ...(prov ? { source: shareSource(s, prov) } : {}),
+      shared_by: by ? { email: by.email, name: by.name } : null,
+    };
+  });
   return NextResponse.json({
-    shares,
+    shares: described,
+    access: access.access,
     series: seriesList[0] ?? null,
     seriesList,
     owner: {

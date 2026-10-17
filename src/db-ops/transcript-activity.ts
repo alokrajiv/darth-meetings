@@ -163,6 +163,30 @@ export async function identitiesForUsers(userIds: string[]): Promise<Map<string,
 }
 
 /**
+ * The activity rows that tell a meeting's share sources apart
+ * (lib/share-source.ts): who was added with Share (`share_add`
+ * details.withEmail) and who handed the meeting over (`owner_transfer`
+ * actors). Lower-cased.
+ */
+export async function shareProvenanceFor(
+  transcriptId: number
+): Promise<{ manual: Set<string>; previousOwners: Set<string> }> {
+  const rows = await sql<Array<{ action: string; user_email: string; with_email: string | null }>>`
+    SELECT action, lower(user_email) AS user_email, lower(details->>'withEmail') AS with_email
+    FROM ${sql(SCHEMA)}.transcript_activity
+    WHERE transcript_id = ${transcriptId}
+      AND action IN ('share_add', 'owner_transfer')
+  `;
+  const manual = new Set<string>();
+  const previousOwners = new Set<string>();
+  for (const r of rows) {
+    if (r.action === 'share_add' && r.with_email) manual.add(r.with_email.trim());
+    if (r.action === 'owner_transfer' && r.user_email) previousOwners.add(r.user_email.trim());
+  }
+  return { manual, previousOwners };
+}
+
+/**
  * Inverse lookup: SSO user id for an email, again via the activity log.
  * Returns null for people who have never opened the app — they have no
  * user id yet, so e.g. ownership can't be transferred to them.
