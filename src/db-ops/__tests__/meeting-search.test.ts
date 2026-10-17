@@ -13,7 +13,7 @@ let sql: FakeSql;
 let respond: (q: RenderedQuery) => unknown[] = () => [];
 const identityCalls: string[][] = [];
 
-beforeAll(() => {
+beforeAll(async () => {
   sql = createFakeSql((q) => respond(q));
   mock.module('server-only', () => ({}));
   mock.module('@/lib/db', () => ({ sql, default: sql }));
@@ -24,7 +24,12 @@ beforeAll(() => {
       (request: Request) =>
         h({ user: me, request }),
   }));
+  // Keep every other export real: mock.module is process-wide, and a
+  // one-function stub breaks any later file that imports a route needing
+  // the rest of this module (shares-route.test.ts).
+  const realActivity = await import('@/db-ops/transcript-activity');
   mock.module('@/db-ops/transcript-activity', () => ({
+    ...realActivity,
     identitiesForUsers: async (ids: string[]) => {
       identityCalls.push(ids);
       return new Map([['owner-2', { userId: 'owner-2', email: 'atira@trames.sg', name: 'Atira' }]]);

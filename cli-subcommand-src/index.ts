@@ -37,7 +37,10 @@ READ
                                   uploads are recordings → 'recordings list
                                   --temporary'
   get <id>                        One transcript's metadata + AI-notes/report status
-                                  ('scratch: yes' marks a temporary row)
+                                  ('scratch: yes' marks a temporary row), its
+                                  owner and a 'shared with:' line (--json:
+                                  "shared_with": [{email,name,access,source,
+                                  shared_at,shared_by}])
   text <id>                       Full transcript as "[mm:ss] Speaker: …" lines
                                   (confirmed speaker names applied; grep/regex this)
   notes <id>                      Print the meeting-notes markdown
@@ -126,6 +129,7 @@ RECORDINGS (yours only, never shared — see 'darth-cli meetings recordings')
                                   event (the MEETING it makes is shared with
                                   the invite's Trames colleagues) or make a
                                   meeting of it, then share the MEETING
+                                  ('share <meeting-id> --add <email>')
 
 SEGMENTS (a meeting is a TIMELINE of segments — see 'darth-cli meetings segments')
   segments <meeting>              The timeline: each segment = a window of one
@@ -310,6 +314,35 @@ WRITE (needs read+write for meetings)
                                   (transcripts / audio / video; capped
                                   server-side). Applies to every device of
                                   this account
+  share <id>[,<id>…] [<id> …] [--add <email>]… [--remove <email>]… [--access edit|read]
+                                  Who has access to a meeting, and changing
+                                  it. No flags = LIST (reading needs no
+                                  write token): the owner, then every share
+                                  — edit|read, the email, why it exists
+                                  (shared by hand / calendar invite (import)
+                                  / calendar invite (linked event) / auditor
+                                  / series follower / previous owner) and
+                                  when + by whom it was added. --add shares
+                                  it with someone in the Trames people
+                                  directory (the people the web Share dialog
+                                  offers; any other address is refused,
+                                  exit 1, with "did you mean") at edit
+                                  (the dialog's default) or --access read;
+                                  someone who already has a share keeps
+                                  their level unless --access says
+                                  otherwise. A NEW share Slack-DMs the
+                                  person, exactly like a web share.
+                                  --remove takes a share off (removing an
+                                  auditor or series follower is recorded,
+                                  as in the web UI; the owner and people it
+                                  is not shared with are refused, exit 1).
+                                  Owner or editors only (readers: refused,
+                                  exit 1). Several ids = the same change on
+                                  each, then each meeting's list; --json =
+                                  {id,title,url,your_access,owner,
+                                  shared_with[],changes[]} (an array for
+                                  several ids). Ownership transfer stays in
+                                  the web dialog ('Make owner…')
   set-title <id> <title>          Update the title
   set-notes <id> --file <md|->    Replace the notes markdown ('-' = stdin)
   set-report <id> --file <md|->   Replace the report markdown ('-' = stdin)
@@ -498,7 +531,8 @@ colleagues) — nothing is re-run.
     #    the human agreed to, and leave the rest as guesses):
     darth-cli meetings set-speakers <id> A="Wei Lin" B="Alok Rajiv"
     # 6. Then the normal loop: read 'text <id>', write notes with your model,
-    #    'set-notes <id> --file notes.md'; 'label' it; share via the web UI.
+    #    'set-notes <id> --file notes.md'; 'label' it; and if the human asked,
+    #    'share <id> --add <email>' (see "Sharing a meeting" below).
 
 Notes: media goes to AssemblyAI; .vtt/.srt/.txt/.docx/.pdf transcripts go
 through the text importer (same verb, no transcription). Media over 8 MB is
@@ -532,7 +566,7 @@ set-*) do not take its id. Steps 2-4 above then read:
 
 Linking / make-meeting prints the new MEETING id — from there the normal
 verbs apply (speakers, set-speakers, set-notes, …). A recording is never
-shared; the owner shares the meeting from the web UI. 'recordings list'
+shared; share the MEETING ('share <meeting-id> --add <email>'). 'recordings list'
 shows everything still private (--temporary / --unlinked; --json
 --envelope pages like the tasks list).
 
@@ -590,6 +624,27 @@ from 'labels' works wherever a label is expected. Before inventing a new
 top-level label, run 'labels' and reuse an existing branch — it is a shared
 taxonomy, not a personal tag list. label-rename / label-mv / label-rm
 change it for everyone (the server logs who did it).
+
+## Sharing a meeting (who has access)
+
+    darth-cli meetings share <id>                           # owner + every share, why, when, by whom
+    darth-cli meetings share <id> --add ivan@trames.sg      # edit (the web dialog's default)
+    darth-cli meetings share <id> --add bea@trames.sg --access read
+    darth-cli meetings share <id> --remove bob@trames.sg
+    darth-cli meetings share id1,id2,id3 --add ivan@trames.sg   # same change on several meetings
+
+It is the web Share dialog's own server path: the owner or an editor may
+change shares (a reader is refused), only people in the Trames directory
+can be added (an unknown or misspelt address changes nothing, exit 1, and
+names the closest matches), and a NEW share sends that person the same
+Slack DM a web share does — so share only when your human asked for it,
+with whom they named. "Only me and Ivan should see this": run 'share <id>',
+then '--remove' everyone else — but tell the human first what the list
+holds: calendar-invite shares are the colleagues on the invite, auditor
+shares come from the outside-party rule (removing one is recorded and the
+auditors can see it), series-follower shares are the series' followers. 'get
+<id>' prints the same people on one line. Recordings are never shared; share
+the meeting. Ownership transfer stays in the web dialog.
 
 ## Report markdown conventions
 
@@ -1898,7 +1953,7 @@ A recording is an upload (or a Darth Recorder file) that belongs to no
 meeting. It is PRIVATE to you and is never shared: link it to a calendar
 event (the MEETING it makes is shared with the invite's Trames colleagues,
 as a Meet/Teams import is) or make a meeting of it and share that MEETING
-(web UI). Once the server runs born-bare uploads, 'meetings upload' without
+('darth-cli meetings share <meeting-id> --add <email>'). Once the server runs born-bare uploads, 'meetings upload' without
 --event lands here instead of in 'meetings list'.
 
   recordings list [--section mac|uploaded|temporary|linked | --unlinked | --temporary]
@@ -2429,6 +2484,197 @@ async function unsplitCmd(ctx: Ctx, args: string[]): Promise<number> {
   return 0;
 }
 
+// ---------------------------------------------------------------------------
+// share — who has access to a meeting; add / remove people. The same server
+// handlers as the web Share dialog (GET/POST/PATCH/DELETE
+// /api/transcripts/:id/shares): owner or editors manage shares, anyone with
+// access may list them, a fresh share Slack-DMs the person exactly as a web
+// share does. People come from the Trames directory (/api/users/search, the
+// dialog's picker) — an address not in it is refused.
+// ---------------------------------------------------------------------------
+
+const SHARE_USAGE = "usage: darth-cli meetings share <id>[,<id>…] [<id> …] [--add <email>]… [--remove <email>]… [--access edit|read] [--json]";
+const SHARE_EMAIL_RE = /^[^\s@,]+@[^\s@,]+\.[^\s@,]+$/;
+
+/** `source` of a share row (server lib/share-source.ts) → words. */
+const SHARE_SOURCE_WORDS: Record<string, string> = {
+  manual: "shared by hand",
+  invite: "calendar invite (import)",
+  "event-link": "calendar invite (linked event)",
+  auditor: "auditor (outside party on the invite)",
+  "series-follow": "series follower",
+  "previous-owner": "previous owner",
+};
+
+type ShareEntry = { email: string; name: string | null; access: string; source: string | null; shared_at: string | null; shared_by: string | null };
+type ShareChange = { op: "add" | "remove"; email: string; result: "added" | "updated" | "removed" | "already" | "refused"; access?: string; error?: string };
+type ShareView = { id: string; title: string | null; url: string; your_access: string | null; owner: { email: string | null; name: string | null }; shared_with: ShareEntry[]; changes?: ShareChange[] };
+
+/** The share rows of GET /api/transcripts/:id/shares, flattened for print + --json. */
+function shareEntries(data: any): ShareEntry[] {
+  return (data?.shares ?? []).map((s: any) => ({
+    email: String(s.shared_with_email ?? ""),
+    name: s.shared_with_name ?? null,
+    access: String(s.access ?? "?"),
+    source: s.source ?? null,
+    shared_at: s.shared_at ?? null,
+    shared_by: s.shared_by?.email ?? null,
+  }));
+}
+
+function shareView(ctx: Ctx, id: string, title: string | null, data: any): ShareView {
+  return {
+    id,
+    title,
+    url: `${webBase(ctx)}/transcript/${id}`,
+    your_access: data?.access ?? (data?.owner?.isMe ? "owner" : null),
+    owner: { email: data?.owner?.email ?? null, name: data?.owner?.name ?? null },
+    shared_with: shareEntries(data),
+  };
+}
+
+/** One-line summary for 'get': "ivan@trames.sg (edit), bea@trames.sg (read, auditor)". */
+function sharedWithLine(rows: ShareEntry[]): string {
+  if (!rows.length) return "nobody else";
+  return rows.map(r => `${r.email} (${r.access}${r.source && r.source !== "manual" ? `, ${SHARE_SOURCE_WORDS[r.source] ?? r.source}` : ""})`).join(", ");
+}
+
+function printShareView(ctx: Ctx, v: ShareView): void {
+  const tz = localTz(ctx);
+  const me = (ctx.config.email ?? "").toLowerCase();
+  console.log(`${v.id}${v.title ? `  "${v.title}"` : ""}`);
+  console.log(`  owner  ${v.owner.email ?? "?"}${v.owner.name ? ` (${v.owner.name})` : ""}${v.your_access === "owner" ? "  ← you" : ""}`);
+  if (!v.shared_with.length) console.log("  shared with nobody else");
+  for (const s of v.shared_with) {
+    const why = s.source ? SHARE_SOURCE_WORDS[s.source] ?? s.source : "";
+    const when = s.shared_at ? `added ${fmtLocalDateTime(s.shared_at, tz)}` : "";
+    const by = s.shared_by ? `by ${s.shared_by}` : "";
+    const tail = [why, [when, by].filter(Boolean).join(" ")].filter(Boolean).join(" · ");
+    console.log(`  ${s.access.padEnd(5)}  ${s.email}${s.name ? ` (${s.name})` : ""}${s.email.toLowerCase() === me ? "  ← you" : ""}${tail ? `  — ${tail}` : ""}`);
+  }
+  if (v.your_access && v.your_access !== "owner" && v.your_access !== "edit") console.log(`  (you have ${v.your_access} access: only the owner or an editor can change who it is shared with)`);
+}
+
+/** A failed share request → stderr; 401 → 3, everything else → 1. */
+function shareRequestError(id: string, status: number, data: any): number {
+  const msg = data?.error ?? `HTTP ${status}`;
+  if (status === 401) console.error(`Unauthorized: ${msg}\nYour token may be expired/revoked — run: darth-cli login`);
+  else if (status === 404) console.error(`No meeting ${id} visible to you (${msg}).${id.startsWith("rec-") ? " That is a recording id — recordings are never shared; share the MEETING it is in ('recordings get' names it)." : ""}`);
+  else if (status === 403) console.error(`${id}: ${msg}${/token is read-only/.test(msg) ? "" : " — ask its owner"}`);
+  else console.error(`${id}: ${msg} (HTTP ${status})`);
+  return status === 401 ? 3 : 1;
+}
+
+/** An email → the directory person the web Share dialog would pick, or a refusal. */
+async function resolveSharePerson(ctx: Ctx, email: string): Promise<{ ok: true; name: string | null; pplId: number | null } | { ok: false; code: number }> {
+  const r = await recordingRequest(ctx, `/api/users/search?${new URLSearchParams({ q: email, limit: "10" })}`, { method: "GET" });
+  if (!r.ok) {
+    console.error(`Looking up ${email} in the people directory failed (HTTP ${r.status}): ${r.data?.error ?? ""}`.trim());
+    return { ok: false, code: r.status === 401 ? 3 : 1 };
+  }
+  const people: any[] = Array.isArray(r.data?.people) ? r.data.people : [];
+  const hit = people.find(p => typeof p?.email === "string" && p.email.trim().toLowerCase() === email);
+  if (hit) return { ok: true, name: hit.name ?? null, pplId: hit.source === "trames" && typeof hit.id === "number" ? hit.id : null };
+  const near = people.filter(p => typeof p?.email === "string").slice(0, 5).map(p => `${p.email}${p.name ? ` (${p.name})` : ""}`);
+  console.error(`${email} is not in the Trames people directory (the people the web Share dialog offers) — nothing was shared.${near.length ? ` Did you mean: ${near.join(", ")}?` : ""}`);
+  return { ok: false, code: 1 };
+}
+
+async function shareCmd(ctx: Ctx, flags: Record<string, string | boolean>, argv: string[], args: string[]): Promise<number> {
+  const ids = [...new Set(args.flatMap(a => a.split(",")).map(s => s.trim()).filter(Boolean))];
+  if (!ids.length) { console.error(SHARE_USAGE); return 1; }
+  if (flags.add === true || flags.remove === true) { console.error(`--add / --remove need an email\n${SHARE_USAGE}`); return 1; }
+  const adds = [...new Set(allFlagValues(argv, "add").map(e => e.toLowerCase()))];
+  const removes = [...new Set(allFlagValues(argv, "remove").map(e => e.toLowerCase()))];
+  const access = flags.access === undefined ? undefined : str(flags.access);
+  if (flags.access !== undefined && access !== "edit" && access !== "read") { console.error(`--access must be edit or read\n${SHARE_USAGE}`); return 1; }
+  if (access && !adds.length) { console.error(`--access goes with --add (it sets the level of the people you add, or changes theirs if they already have a share)\n${SHARE_USAGE}`); return 1; }
+  const bad = [...adds, ...removes].filter(e => !SHARE_EMAIL_RE.test(e));
+  if (bad.length) { console.error(`not an email address: ${bad.join(", ")}\n${SHARE_USAGE}`); return 1; }
+  const both = adds.filter(e => removes.includes(e));
+  if (both.length) { console.error(`both --add and --remove for ${both.join(", ")} — pick one`); return 1; }
+  const changing = adds.length + removes.length > 0;
+  if (changing) ctx.requireWrite();
+
+  // Every address is checked against the directory BEFORE any meeting is
+  // touched, so a typo changes nothing anywhere.
+  const people = new Map<string, { name: string | null; pplId: number | null }>();
+  for (const e of adds) {
+    const p = await resolveSharePerson(ctx, e);
+    if (!p.ok) return p.code;
+    people.set(e, p);
+  }
+
+  const views: ShareView[] = [];
+  let exit = 0;
+  const fail = (code: number) => { if (code === 3 || exit === 0) exit = code; };
+  const sharesPath = (id: string) => `/api/transcripts/${id}/shares`;
+
+  for (const id of ids) {
+    const [before, meta] = await Promise.all([
+      recordingRequest(ctx, sharesPath(id), { method: "GET" }),
+      recordingRequest(ctx, `/api/transcripts/${id}`, { method: "GET" }).catch(() => null),
+    ]);
+    if (!before.ok) { fail(shareRequestError(id, before.status, before.data)); continue; }
+    const t = meta?.ok ? meta.data?.transcript : null;
+    const title: string | null = t ? (t.title || t.original_filename || null) : null;
+    if (!changing) { views.push(shareView(ctx, id, title, before.data)); continue; }
+
+    const owner = String(before.data?.owner?.email ?? "").toLowerCase();
+    const current = new Map<string, ShareEntry>(shareEntries(before.data).map(s => [s.email.toLowerCase(), s]));
+    const changes: ShareChange[] = [];
+    const refuse = (c: ShareChange, status?: number) => {
+      changes.push(c);
+      console.error(`${id}: ${c.op} ${c.email} refused — ${c.error}`);
+      fail(status === 401 ? 3 : 1);
+    };
+    const write = async (method: string, body: Record<string, unknown>) => recordingRequest(ctx, sharesPath(id), { method, body: JSON.stringify(body) });
+
+    for (const e of removes) {
+      if (owner && e === owner) { refuse({ op: "remove", email: e, result: "refused", error: "that is the owner; a meeting always has its owner (ownership is handed over with 'Make owner…' in the web Share dialog)" }); continue; }
+      if (!current.has(e)) { refuse({ op: "remove", email: e, result: "refused", error: "the meeting is not shared with them, nothing to remove" }); continue; }
+      const r = await write("DELETE", { email: e });
+      if (r.ok) changes.push({ op: "remove", email: e, result: "removed" });
+      else refuse({ op: "remove", email: e, result: "refused", error: r.data?.error ?? `HTTP ${r.status}` }, r.status);
+    }
+    for (const e of adds) {
+      if (owner && e === owner) { changes.push({ op: "add", email: e, result: "already", access: "owner" }); continue; }
+      const cur = current.get(e);
+      if (cur) {
+        if (!access || cur.access === access) { changes.push({ op: "add", email: e, result: "already", access: cur.access }); continue; }
+        const r = await write("PATCH", { email: e, access });
+        if (r.ok) changes.push({ op: "add", email: e, result: "updated", access });
+        else refuse({ op: "add", email: e, result: "refused", error: r.data?.error ?? `HTTP ${r.status}` }, r.status);
+        continue;
+      }
+      const p = people.get(e)!;
+      const level = access ?? "edit";
+      const r = await write("POST", { email: e, ...(p.name ? { name: p.name } : {}), ...(p.pplId !== null ? { pplId: p.pplId } : {}), access: level });
+      if (r.ok) changes.push({ op: "add", email: e, result: "added", access: level });
+      else refuse({ op: "add", email: e, result: "refused", error: r.data?.error ?? `HTTP ${r.status}` }, r.status);
+    }
+
+    const wrote = changes.some(c => c.result === "added" || c.result === "updated" || c.result === "removed");
+    const after = wrote ? await recordingRequest(ctx, sharesPath(id), { method: "GET" }) : before;
+    views.push({ ...shareView(ctx, id, title, after.ok ? after.data : before.data), changes });
+  }
+
+  if (!views.length) return exit || 1;
+  ctx.print(views.length === 1 && ids.length === 1 ? views[0] : views, () => {
+    views.forEach((v, i) => {
+      if (i) console.log("");
+      for (const c of v.changes ?? []) {
+        if (c.result === "added") console.log(`+ shared with ${c.email} (${c.access}) — they get a Slack DM, as from the web Share dialog`);
+        else if (c.result === "updated") console.log(`~ ${c.email} now has ${c.access} access`);
+        else if (c.result === "removed") console.log(`- removed ${c.email}`);
+        else if (c.result === "already") console.log(c.access === "owner" ? `= ${c.email} is the owner` : `= ${c.email} already has ${c.access} access${access ? "" : " (--access edit|read changes the level)"}`);
+      }
+      printShareView(ctx, v);
+    });
+  });
+  return exit;
+}
+
 async function recordingsCmd(ctx: Ctx, flags: Record<string, string | boolean>, pos: string[]): Promise<number> {
   liftBoolFlags(pos, flags, ["all", "envelope", "unlinked", "temporary", "regex", "separate"]);
   const [sub, ...args] = pos;
@@ -2577,7 +2823,7 @@ async function recordingsCmd(ctx: Ctx, flags: Record<string, string | boolean>, 
       if (!r.ok) return recordingWriteError("make-meeting", r.status, r.data);
       const m = r.data?.meeting ?? {};
       ctx.print(r.data, () => {
-        console.log(`meeting ${m.id ?? "?"} "${m.title ?? title}" made from recording ${rid} — not shared (share it from the meeting when you want to)`);
+        console.log(`meeting ${m.id ?? "?"} "${m.title ?? title}" made from recording ${rid} — not shared ('darth-cli meetings share ${m.id ?? "<id>"} --add <email>' when the human wants it shared)`);
         if (m.id) console.log(`Web: ${webBase(ctx)}/transcript/${m.id}`);
       });
       return 0;
@@ -2960,17 +3206,28 @@ const meetings: Subcommand = {
         return 0;
       }
 
+      case "share":
+        return shareCmd(ctx, flags, argv, args);
+
       case "get": {
         if (!args[0]) { console.error("usage: darth-cli meetings get <id>"); return 1; }
-        const data = await ctx.expectJson<{ transcript: any }>(ctx.api("meetings", `/api/transcripts/${args[0]}`));
+        // Who has access rides along (GET …/shares, any access): best-effort —
+        // a failure there never fails 'get', the line just says so.
+        const [data, sh] = await Promise.all([
+          ctx.expectJson<{ transcript: any }>(ctx.api("meetings", `/api/transcripts/${args[0]}`)),
+          recordingRequest(ctx, `/api/transcripts/${args[0]}/shares`, { method: "GET" }).catch((e: any) => ({ ok: false, status: 0, data: { error: String(e?.message ?? e) } })),
+        ]);
         const t = data.transcript;
-        ctx.print(t, () => {
+        const shared = sh.ok ? shareEntries(sh.data) : null;
+        ctx.print(shared ? { ...t, shared_with: shared } : t, () => {
           console.log(`id:          ${t.assemblyai_id}`);
           console.log(`title:       ${t.title || t.original_filename || "(untitled)"}`);
           if (t.description) console.log(`description: ${t.description}`);
           console.log(`date:        ${t.recorded_at || t.completed_at || t.created_at}`);
           console.log(`duration:    ${fmtDuration(t.duration)}  speakers: ${t.speaker_count ?? "?"}  status: ${t.status}`);
           console.log(`access:      ${t.access}  source: ${t.source}${t.local_audio_path ? "  (audio stored locally)" : ""}`);
+          console.log(`owner:       ${(sh.ok ? sh.data?.owner?.email : null) ?? t.owner_email ?? "?"}`);
+          console.log(`shared with: ${shared ? sharedWithLine(shared) : `(could not read: ${sh.data?.error ?? `HTTP ${sh.status}`})`}${shared?.length ? `  — details: 'darth-cli meetings share ${t.assemblyai_id}'` : ""}`);
           if (t.scratch === true) console.log(`scratch:     yes  (temporary — trashed 30 days after creation unless kept in the web UI or linked)`);
           console.log(`notes:       ${t.auto_notes_status ?? "never run"}${t.auto_notes ? ` (${t.auto_notes.length} chars)` : ""}`);
           console.log(`report:      ${t.auto_report_status ?? "never run"}${t.auto_report ? ` (${t.auto_report.length} chars)` : ""}`);
