@@ -82,7 +82,7 @@ export function CompanionBanner() {
       <div
         role="status"
         data-companion-recording
-        className={`${shell} border-red-300 bg-red-50 text-red-900 dark:border-red-700/60 dark:bg-red-950/80 dark:text-red-200`}
+        className={`${shell} border-red-300 bg-red-50 text-red-900 dark:border-red-700/60 dark:bg-red-950 dark:text-red-200`}
       >
         <CircleDot className="h-4 w-4 shrink-0 animate-pulse" />
         <div className="min-w-0 flex-1">
@@ -109,8 +109,8 @@ export function CompanionBanner() {
         data-companion-offer={offer ? '1' : undefined}
         className={`${shell} ${
           failed
-            ? 'border-amber-300 bg-amber-50 text-amber-900 dark:border-amber-700/60 dark:bg-amber-950/80 dark:text-amber-200'
-            : 'border-sky-300 bg-sky-50 text-sky-900 dark:border-sky-700/60 dark:bg-sky-950/80 dark:text-sky-200'
+            ? 'border-amber-300 bg-amber-50 text-amber-900 dark:border-amber-700/60 dark:bg-amber-950 dark:text-amber-200'
+            : 'border-sky-300 bg-sky-50 text-sky-900 dark:border-sky-700/60 dark:bg-sky-950 dark:text-sky-200'
         }`}
       >
         <CheckCircle2 className="h-4 w-4 shrink-0" />
@@ -197,7 +197,7 @@ export function CompanionBanner() {
       role="status"
       data-companion-signin
       data-companion-signin-prompt={prompt ? '1' : undefined}
-      className={`${shell} border-amber-300 bg-amber-50 text-amber-900 dark:border-amber-700/60 dark:bg-amber-950/80 dark:text-amber-200`}
+      className={`${shell} border-amber-300 bg-amber-50 text-amber-900 dark:border-amber-700/60 dark:bg-amber-950 dark:text-amber-200`}
     >
       <UserRoundCheck className="h-4 w-4 shrink-0" />
       <div className="min-w-0 flex-1">
@@ -234,7 +234,7 @@ export function CompanionBanner() {
 
   if (!body && !signIn) return null;
   return (
-    <div className="pointer-events-none fixed inset-x-0 top-14 z-30 px-6" data-companion-banner>
+    <div className="pointer-events-none fixed inset-x-0 top-14 z-[35] px-6" data-companion-banner>
       <div className="mx-auto max-w-[1400px]">
         {body}
         {signIn}

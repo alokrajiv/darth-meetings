@@ -68,11 +68,11 @@ export function MaintenanceBanner() {
   };
 
   return (
-    <div className="pointer-events-none fixed inset-x-0 top-14 z-30 px-6" data-maintenance-banner>
+    <div className="pointer-events-none fixed inset-x-0 top-14 z-[35] px-6" data-maintenance-banner>
       <div className="mx-auto max-w-[1400px]">
         <div
           role="status"
-          className="pointer-events-auto mt-2 flex items-start gap-3 rounded-lg border border-violet-300 bg-violet-50 px-4 py-2.5 text-sm text-violet-900 shadow-[0_4px_16px_-2px_rgb(0_0_0/0.08),0_1px_2px_0_rgb(0_0_0/0.04)] dark:border-violet-700/60 dark:bg-violet-950/80 dark:text-violet-200"
+          className="pointer-events-auto mt-2 flex items-start gap-3 rounded-lg border border-violet-300 bg-violet-50 px-4 py-2.5 text-sm text-violet-900 shadow-[0_4px_16px_-2px_rgb(0_0_0/0.08),0_1px_2px_0_rgb(0_0_0/0.04)] dark:border-violet-700/60 dark:bg-violet-950 dark:text-violet-200"
         >
           <Megaphone className="mt-0.5 h-4 w-4 shrink-0" />
           <div className="min-w-0 flex-1">
