@@ -41,12 +41,12 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 [[ -d "$CLI/scripts" ]] || { echo "ERROR: $CLI not found"; exit 1; }
-FAMILIES=(plagueis artifacts meetings chat gmail kb admin)
+FAMILIES=(plagueis artifacts meetings chat gmail kb admin directory)
 case " ${FAMILIES[*]} " in *" $FAMILY "*) ;; *) echo "ERROR: unknown family '$FAMILY' (one of: ${FAMILIES[*]})"; exit 2;; esac
 [[ -n "$SRC" ]] || SRC="$ROOT/cli-subcommand-src"
 SRC=$(cd "$SRC" && pwd)
 [[ -n "$MSG" ]] || MSG="darth-cli $FAMILY"
-envvar() { case "$1" in plagueis) echo PLAGUEIS_SRC;; artifacts) echo ARTIFACTS_SRC;; meetings) echo MEETINGS_SRC;; chat) echo CHAT_SRC;; gmail) echo CONNECTORS_SRC;; kb) echo KB_SRC;; admin) echo ADMIN_SRC;; esac; }
+envvar() { case "$1" in plagueis) echo PLAGUEIS_SRC;; artifacts) echo ARTIFACTS_SRC;; meetings) echo MEETINGS_SRC;; chat) echo CHAT_SRC;; gmail) echo CONNECTORS_SRC;; kb) echo KB_SRC;; admin) echo ADMIN_SRC;; directory) echo DIRECTORY_SRC;; esac; }
 
 say() { printf '==> %s\n' "$*"; }
 
