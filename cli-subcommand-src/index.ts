@@ -445,7 +445,11 @@ and "labels": [{id,name,path,color}]; filtered 'list' lines show a
 {path,path} column when a row has labels.
 
 IDS: <id> is the transcript id shown by 'list' (also in web URLs:
-/transcript/<id>). Timestamps in 'text' output are utterance starts — feed
+/transcript/<id>). A pasted meetings link works anywhere an id does — both
+https://meetings…/transcript/<id> and the permanent https://meetings…/m/<uuid>
+(Slack DMs, calendar rows, 'import'; its uuid is NOT the transcript id, the
+CLI looks it up). Pass the link as-is rather than cutting the uuid out.
+Timestamps in 'text' output are utterance starts — feed
 them to 'frame' to see what was on screen at that moment. 'calendar' rows
 show [meeting-code] — feed it to 'import' to import the occurrence from
 here (server-side, your backend Google link; Teams runs app-only).
@@ -466,6 +470,7 @@ own tokens, then write results back so humans see them in the web UI.
 ## The core loop: summarize / analyze a meeting
 
     darth-cli meetings list --json          # find the transcript id
+                                            # (or pass a pasted meetings link as <id>)
     darth-cli meetings text <id>            # full transcript, speaker-named
     # ...you read/analyze/summarize with YOUR model...
     darth-cli meetings set-notes <id> --file summary.md    # write it back
@@ -840,6 +845,79 @@ function readMarkdownFlag(fileFlag: string | undefined): string | null {
 /** Web-app base for printable links — same host the meetings API lives on. */
 function webBase(ctx: Ctx): string {
   return (ctx.config.meetingsUrl || "https://meetings.darth-internal.trames.io").replace(/\/+$/, "");
+}
+
+// ---------------------------------------------------------------------------
+// Meeting links → transcript ids
+// ---------------------------------------------------------------------------
+
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+/** `https://meetings…/m/<uuid>`, `…/transcript/<id>`, scheme or host optional. */
+const MEETING_URL_RE = /^(?:https?:\/\/)?([^\/\s?#]*)\/(m|transcript)\/([^\/?#\s]+)\/?(?:[?#]\S*)?$/i;
+
+/** Verbs whose first argument is a meeting (transcript) id. */
+const MEETING_ID_VERBS = new Set([
+  "get", "text", "notes", "report", "audio", "frame", "attachments", "attachment-get", "link", "set-date",
+  "speakers", "set-speakers", "set-title", "set-notes", "set-report", "trash", "restore", "label", "unlabel", "share",
+]);
+
+/** The transcript id behind a /m/<uuid> permalink. `status` 404 = the caller
+ * cannot open it (unknown, not shared, or not imported yet — one answer);
+ * 0 = the server was not reachable. */
+async function transcriptIdForMeetingUuid(ctx: Ctx, uuid: string): Promise<{ tid: string | null; status: number }> {
+  try {
+    const res = await ctx.api("meetings", `/api/meetings/resolve?m=${encodeURIComponent(uuid)}`);
+    const j: any = await res.json().catch(() => null);
+    return { tid: res.ok && typeof j?.transcriptId === "string" ? j.transcriptId : null, status: res.status };
+  } catch {
+    return { tid: null, status: 0 };
+  }
+}
+
+/**
+ * Every verb takes the TRANSCRIPT id, but the web app hands out two link
+ * forms: /transcript/<id> and the permanent /m/<uuid> (Slack DMs, calendar
+ * rows, import), whose uuid is the meetings row — a different id. A browser
+ * gets the redirect; here: a pasted link of either form (alone or inside a
+ * comma list) becomes the transcript id, and a bare uuid given as a meeting
+ * verb's id that turns out to be an /m/ uuid is swapped for its transcript id
+ * with a note on stderr. An /m/ link the caller cannot open stops the run
+ * with the reason instead of a bare "Not found" further down.
+ */
+async function resolveMeetingRefs(ctx: Ctx, pos: string[]): Promise<string[]> {
+  const out: string[] = [];
+  for (const arg of pos) {
+    const parts = arg.split(",");
+    if (!parts.some(p => MEETING_URL_RE.test(p.trim()))) { out.push(arg); continue; }
+    const mapped: string[] = [];
+    for (const raw of parts) {
+      const p = raw.trim();
+      const m = MEETING_URL_RE.exec(p);
+      const host = m?.[1] ?? "";
+      if (!m || (host && host !== new URL(webBase(ctx)).host && !/meetings/i.test(host))) { mapped.push(p); continue; }
+      const id = decodeURIComponent(m[3]);
+      if (m[2].toLowerCase() === "transcript") { mapped.push(id); continue; }
+      const r = UUID_RE.test(id) ? await transcriptIdForMeetingUuid(ctx, id) : { tid: null, status: 404 };
+      if (!r.tid) {
+        if (r.status === 404) console.error(`${p}: no meeting you can open behind this link (unknown, not shared with you, or not imported yet). Ask the owner to share it, or check the link.`);
+        else if (r.status === 401) console.error(`${p}: Unauthorized — your token may be expired/revoked — run: darth-cli login`);
+        else console.error(`${p}: could not resolve the link (${r.status ? `HTTP ${r.status}` : "server unreachable — off the VPN/tailnet?"}).`);
+        process.exit(r.status === 401 ? 3 : 1);
+      }
+      mapped.push(r.tid);
+    }
+    out.push(mapped.join(","));
+  }
+  const [, cmd, ...args] = out.length && out[0] === "meetings" ? out : ["", ...out];
+  const first = args[0];
+  if (first && UUID_RE.test(first) && (MEETING_ID_VERBS.has(cmd) || (VERSION_VERBS as readonly string[]).includes(cmd))) {
+    const { tid } = await transcriptIdForMeetingUuid(ctx, first);
+    if (tid && tid !== first) {
+      console.error(`note: ${first} is a meeting link id (/m/${first}) — using its transcript id ${tid}`);
+      out[out.length - args.length] = tid;
+    }
+  }
+  return out;
 }
 
 // ---------------------------------------------------------------------------
@@ -3418,8 +3496,9 @@ const meetings: Subcommand = {
   summary: "Meeting transcripts, notes & recordings (darth-meetings)",
   help: HELP,
   async run(ctx, argv) {
-    const { pos, flags } = parseArgs(argv);
-    liftBoolFlags(pos, flags, ["cascade", "exact", "cached", "details", "wait", "clear", "scratch", "resume", "separate", "keep-in-both", RETIRED_CONSENT_FLAG]);
+    const { pos: rawPos, flags } = parseArgs(argv);
+    liftBoolFlags(rawPos, flags, ["cascade", "exact", "cached", "details", "wait", "clear", "scratch", "resume", "separate", "keep-in-both", RETIRED_CONSENT_FLAG]);
+    const pos = flags.help === true ? rawPos : await resolveMeetingRefs(ctx, rawPos);
     const [, cmd, ...args] = pos.length && pos[0] === "meetings" ? pos : ["", ...pos];
     if (cmd === "recordings") return recordingsCmd(ctx, flags, args);
     if (cmd === "segments" || cmd === "clips") return segmentsCmd(ctx, flags, args);
