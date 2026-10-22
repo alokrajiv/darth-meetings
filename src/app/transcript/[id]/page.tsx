@@ -75,7 +75,7 @@ import { safeDate, usesEventRange, whenLine } from '@/lib/when';
 import { countVoices, speakerNameStates } from '@/lib/speaker-name-state';
 import { isNetworkFailure, networkErrorMessage } from '@/lib/fetch-errors';
 import { OfflineMeeting } from '@/components/offline-meeting';
-import { rememberOpenedMeeting, replicaAvailable } from '@/lib/offline/replica-client';
+import { rememberOpenedMeeting, useReplicaAvailable } from '@/lib/offline/replica-client';
 import { isOfflineState, useShellConnectivity } from '@/lib/offline/shell-offline';
 import type { PickerPerson } from '@/components/user-picker';
 import {
@@ -173,8 +173,7 @@ export default function TranscriptDetailPage({ params }: TranscriptDetailPagePro
   const { id } = use(params);
   const connectivity = useShellConnectivity();
   const shellOffline = isOfflineState(connectivity);
-  const [storeOn, setStoreOn] = useState(false);
-  useEffect(() => setStoreOn(replicaAvailable()), []);
+  const storeOn = useReplicaAvailable();
   const [netFailed, setNetFailed] = useState(false);
   useEffect(() => {
     if (connectivity === 'online') setNetFailed(false);

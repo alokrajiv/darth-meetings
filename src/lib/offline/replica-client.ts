@@ -19,6 +19,7 @@
  * step stops at the first network failure (no retry loops).
  */
 
+import { useSyncExternalStore } from 'react';
 import type {
   LabelRef,
   SpeakerLabel,
@@ -82,6 +83,14 @@ function doFetch(input: string, init?: RequestInit): Promise<Response> {
 /** True inside a shell that has a store bridge (the replica can exist). */
 export function replicaAvailable(): boolean {
   return bridge() !== null;
+}
+
+const noSubscribe = () => () => {};
+/** `replicaAvailable()` for render: false at SSR and during hydration (the
+ * server cannot know), the real answer on the client right after — and at
+ * once on a client-side navigation, so no live screen flashes first. */
+export function useReplicaAvailable(): boolean {
+  return useSyncExternalStore(noSubscribe, replicaAvailable, () => false);
 }
 
 class HttpError extends Error {

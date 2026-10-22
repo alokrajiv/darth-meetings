@@ -19,7 +19,7 @@ import { CircleAlert } from 'lucide-react';
 import { LISTING_MAX_CONTENT_PX } from '@/lib/listing-layout';
 import { labelFilterToParams, parseLabelFilter, type LabelFilter } from '@/lib/labels';
 import { OfflineListing } from '@/components/offline-listing';
-import { replicaAvailable, syncReplicaSoon } from '@/lib/offline/replica-client';
+import { replicaAvailable, syncReplicaSoon, useReplicaAvailable } from '@/lib/offline/replica-client';
 import { useShellConnectivity, isOfflineState } from '@/lib/offline/shell-offline';
 import { NOT_AVAILABLE_OFFLINE, readIdFromHash } from '@/lib/offline/offline-copy';
 
@@ -66,21 +66,23 @@ export default function Home() {
   // changes: the web has no offline mode.
   const connectivity = useShellConnectivity();
   const shellOffline = isOfflineState(connectivity);
-  const [storeOn, setStoreOn] = useState(false);
-  useEffect(() => setStoreOn(replicaAvailable()), []);
+  const storeOn = useReplicaAvailable();
   const [netFailed, setNetFailed] = useState(false);
   // Back online: the live table again (it refetches; no retry loop while offline).
   useEffect(() => {
     if (connectivity === 'online') setNetFailed(false);
   }, [connectivity]);
   const showOffline = storeOn && (shellOffline || netFailed);
-  // A `#read=<id>` link (the replica's in-place reader) while online opens
-  // the live meeting page instead.
+  // A `#read=<id>` link (the replica's in-place reader) opens the live
+  // meeting page instead — only once the shell has affirmatively said
+  // online (never on a first render that does not know yet), or on the web.
   useEffect(() => {
-    if (showOffline) return;
     const id = readIdFromHash(window.location.hash);
-    if (id) router.replace(`/transcript/${encodeURIComponent(id)}`);
-  }, [showOffline, router]);
+    if (!id) return;
+    if (!replicaAvailable() || (connectivity === 'online' && !netFailed)) {
+      router.replace(`/transcript/${encodeURIComponent(id)}`);
+    }
+  }, [connectivity, netFailed, router]);
 
   // Meeting reminders (the poller's findings). The page owns the data: it
   // feeds the top banner (dismissable for good, localStorage), the header
