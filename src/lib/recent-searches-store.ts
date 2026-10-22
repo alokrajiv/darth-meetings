@@ -32,6 +32,22 @@ function desktopStore(): DesktopStore | null {
 }
 
 let ownerPromise: Promise<string> | null = null;
+
+/** Offline (the session cannot be asked): the owner the desktop replica was
+ * keyed for (lib/offline/replica-db.ts, same store file), so the person's
+ * recents still show. '' when there is none. */
+async function storedOwner(): Promise<string> {
+  const store = desktopStore();
+  if (!store) return '';
+  try {
+    const r = await store.query("SELECT v FROM meta WHERE k = 'owner'");
+    const v = r?.rows?.[0]?.v;
+    return !r?.error && typeof v === 'string' ? v : '';
+  } catch {
+    return '';
+  }
+}
+
 /** The signed-in person's id ('' when unknown — still usable, just unkeyed). */
 function owner(): Promise<string> {
   if (!ownerPromise) {
@@ -43,7 +59,7 @@ function owner(): Promise<string> {
       })
       .catch(() => {
         ownerPromise = null; // ask again next time
-        return '';
+        return storedOwner();
       });
   }
   return ownerPromise;

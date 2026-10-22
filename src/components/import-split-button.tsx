@@ -21,11 +21,16 @@ const HINTS: Record<ImportAction, string> = {
 export function ImportSplitButton({
   onAction,
   defaultOpen = false,
+  disabledReason = null,
 }: {
   onAction: (action: ImportAction) => void;
   /** Tests render the menu open. */
   defaultOpen?: boolean;
+  /** Set (e.g. "Not available offline"): both halves disabled, the reason as
+   * their tooltip, the menu closed. */
+  disabledReason?: string | null;
 }) {
+  const disabled = !!disabledReason;
   const { open, toggle, close, ref } = usePopover(defaultOpen);
   const half =
     'inline-flex h-8 items-center bg-primary text-primary-foreground text-sm font-medium transition-colors hover:bg-primary/90 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:pointer-events-none disabled:opacity-50';
@@ -34,7 +39,8 @@ export function ImportSplitButton({
       <div className="flex items-stretch">
         <button
           type="button"
-          title={HINTS[IMPORT_PRIMARY]}
+          title={disabledReason ?? HINTS[IMPORT_PRIMARY]}
+          disabled={disabled}
           data-import-primary
           onClick={() => onAction(IMPORT_PRIMARY)}
           className={`${half} gap-1.5 rounded-l-md px-3`}
@@ -45,9 +51,10 @@ export function ImportSplitButton({
         </button>
         <button
           type="button"
-          title="More ways to import"
+          title={disabledReason ?? 'More ways to import'}
           aria-label="More ways to import"
-          aria-expanded={open}
+          disabled={disabled}
+          aria-expanded={open && !disabled}
           aria-haspopup="menu"
           data-import-more
           onClick={toggle}
@@ -56,7 +63,7 @@ export function ImportSplitButton({
           <ChevronDown className="h-4 w-4" />
         </button>
       </div>
-      {open && (
+      {open && !disabled && (
         <div
           role="menu"
           className="absolute right-0 top-full z-50 mt-1.5 w-64 rounded-lg border bg-popover p-1 text-popover-foreground shadow-[0_4px_16px_-2px_rgb(0_0_0/0.08),0_1px_2px_0_rgb(0_0_0/0.04)]"

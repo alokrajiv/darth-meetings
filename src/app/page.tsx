@@ -18,6 +18,10 @@ import { ImportSplitButton } from '@/components/import-split-button';
 import { CircleAlert } from 'lucide-react';
 import { LISTING_MAX_CONTENT_PX } from '@/lib/listing-layout';
 import { labelFilterToParams, parseLabelFilter, type LabelFilter } from '@/lib/labels';
+import { OfflineListing } from '@/components/offline-listing';
+import { replicaAvailable, syncReplicaSoon } from '@/lib/offline/replica-client';
+import { useShellConnectivity, isOfflineState } from '@/lib/offline/shell-offline';
+import { NOT_AVAILABLE_OFFLINE, readIdFromHash } from '@/lib/offline/offline-copy';
 
 const REMINDERS_COLLAPSED_KEY = 'mw-reminders-collapsed';
 
@@ -55,6 +59,29 @@ export default function Home() {
   } | null>(null);
   const [textImportOpen, setTextImportOpen] = useState(false);
 
+  // Offline in the Darth desktop shell (README "Offline in the Darth desktop
+  // shell"): while the shell says offline — or the listing's own load never
+  // reached the server — the page shows the desktop replica instead of the
+  // live table, read only. Outside the shell (no store bridge) nothing
+  // changes: the web has no offline mode.
+  const connectivity = useShellConnectivity();
+  const shellOffline = isOfflineState(connectivity);
+  const [storeOn, setStoreOn] = useState(false);
+  useEffect(() => setStoreOn(replicaAvailable()), []);
+  const [netFailed, setNetFailed] = useState(false);
+  // Back online: the live table again (it refetches; no retry loop while offline).
+  useEffect(() => {
+    if (connectivity === 'online') setNetFailed(false);
+  }, [connectivity]);
+  const showOffline = storeOn && (shellOffline || netFailed);
+  // A `#read=<id>` link (the replica's in-place reader) while online opens
+  // the live meeting page instead.
+  useEffect(() => {
+    if (showOffline) return;
+    const id = readIdFromHash(window.location.hash);
+    if (id) router.replace(`/transcript/${encodeURIComponent(id)}`);
+  }, [showOffline, router]);
+
   // Meeting reminders (the poller's findings). The page owns the data: it
   // feeds the top banner (dismissable for good, localStorage), the header
   // badge count, and the header dropdown that the badge icon opens.
@@ -66,12 +93,13 @@ export default function Home() {
     setRemindersCollapsed(localStorage.getItem(REMINDERS_COLLAPSED_KEY) === '1');
   }, []);
   useEffect(() => {
+    if (shellOffline) return;
     fetch('/api/gmeet/reminders')
       .then((r) => (r.ok ? r.json() : null))
       .then((data) => setReminders(data?.reminders ?? []))
       .catch(() => {});
-  }, [refreshTrigger]);
-  const reminderCount = reminders.length;
+  }, [refreshTrigger, shellOffline]);
+  const reminderCount = showOffline ? 0 : reminders.length;
   const actOnReminder = (r: Reminder, action: 'dismiss' | 'mute') => {
     setReminders((prev) => prev.filter((x) => x.id !== r.id));
     void fetch('/api/gmeet/reminders', {
@@ -234,6 +262,7 @@ export default function Home() {
           Recorder chip and the account menu at the far right. */}
       <AppHeader>
         <ImportSplitButton
+          disabledReason={showOffline ? NOT_AVAILABLE_OFFLINE : null}
           onAction={(a) => {
             if (a === 'import-meeting') setGmeetOpen(true);
             else if (a === 'import-file') setTextImportOpen(true);
@@ -282,8 +311,8 @@ export default function Home() {
       <main className="mx-auto px-6 py-4" style={{ maxWidth: LISTING_MAX_CONTENT_PX }}>
         {/* Renders the page-wide drag-drop overlay, the hidden file input the
             header button clicks, and in-flight upload progress rows. */}
-        <AudioUpload onTranscriptCreated={handleTranscriptCreated} />
-        {!remindersCollapsed && (
+        <AudioUpload onTranscriptCreated={handleTranscriptCreated} disabled={showOffline} />
+        {!remindersCollapsed && !showOffline && (
           <GmeetRemindersCard
             reminders={reminders}
             onOpenSync={() => {
@@ -299,36 +328,48 @@ export default function Home() {
         {/* Missing Google / Microsoft link, or the one-time auto-sync +
             notifications review → ONE modal, snoozable 24h (replaces the old
             connect-nudge banner + announce banner; see setup-review-dialog). */}
-        <SetupReviewDialog />
+        {!showOffline && <SetupReviewDialog />}
 
-        <div className="flex items-start gap-4">
-          {!railCollapsed && (
-            <LabelRail
-              filter={labelFilter}
-              onFilter={setLabelFilter}
-              onChanged={handleTranscriptCreated}
-              onCollapse={() => toggleRail(true)}
-              variant={railNarrow ? 'drawer' : 'inline'}
-              className={railNarrow ? '' : 'sticky top-4 max-h-[calc(100vh-2rem)]'}
-            />
-          )}
-          <div className="min-w-0 flex-1">
-            <TranscriptTable
-              refreshTrigger={refreshTrigger}
-              labelFilter={labelFilter}
-              labelFilterReady={labelReady}
-              onLabelFilter={setLabelFilter}
-              labelRailOpen={!railCollapsed}
-              onToggleLabelRail={() => toggleRail(!railCollapsed)}
-              onImportMeeting={(m) => {
-                // Same focus mechanism as reminder rows: open the import dialog
-                // scrolled to that meeting's day, highlighting the meeting.
-                setGmeetFocus({ meetingCode: m.meetingCode, eventStart: m.eventStart });
-                setGmeetOpen(true);
-              }}
-            />
+        {showOffline ? (
+          <OfflineListing online={!shellOffline} onRetry={() => setNetFailed(false)} />
+        ) : (
+          <div className="flex items-start gap-4">
+            {!railCollapsed && (
+              <LabelRail
+                filter={labelFilter}
+                onFilter={setLabelFilter}
+                onChanged={handleTranscriptCreated}
+                onCollapse={() => toggleRail(true)}
+                variant={railNarrow ? 'drawer' : 'inline'}
+                className={railNarrow ? '' : 'sticky top-4 max-h-[calc(100vh-2rem)]'}
+              />
+            )}
+            <div className="min-w-0 flex-1">
+              <TranscriptTable
+                refreshTrigger={refreshTrigger}
+                labelFilter={labelFilter}
+                labelFilterReady={labelReady}
+                onLabelFilter={setLabelFilter}
+                labelRailOpen={!railCollapsed}
+                onToggleLabelRail={() => toggleRail(!railCollapsed)}
+                onImportMeeting={(m) => {
+                  // Same focus mechanism as reminder rows: open the import dialog
+                  // scrolled to that meeting's day, highlighting the meeting.
+                  setGmeetFocus({ meetingCode: m.meetingCode, eventStart: m.eventStart });
+                  setGmeetOpen(true);
+                }}
+                onArchiveLoaded={() => {
+                  // Keep the desktop replica fresh (no-op on the web, offline,
+                  // or within 15 min of the last sync).
+                  void syncReplicaSoon();
+                }}
+                onArchiveNetworkError={() => {
+                  if (storeOn) setNetFailed(true);
+                }}
+              />
+            </div>
           </div>
-        </div>
+        )}
       </main>
 
       <GmeetImportDialog

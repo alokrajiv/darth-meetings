@@ -123,6 +123,13 @@ interface TranscriptTableProps {
   labelFilterReady?: boolean;
   /** Row chips / picker set the filter through this (the page writes the URL). */
   onLabelFilter?: (f: LabelFilter | null) => void;
+  /** The archive's first page arrived (a reset load answered): the desktop
+   * replica's background sync hangs off this (README "Offline in the Darth
+   * desktop shell"). */
+  onArchiveLoaded?: () => void;
+  /** A reset load never reached the server (fetch TypeError): the page may
+   * show the desktop replica instead of the error. */
+  onArchiveNetworkError?: () => void;
 }
 
 /** Meetings tabs only. Recordings and Temporary are not meetings: they
@@ -444,8 +451,14 @@ export function TranscriptTable({
   labelFilter = null,
   labelFilterReady = true,
   onLabelFilter,
+  onArchiveLoaded,
+  onArchiveNetworkError,
 }: TranscriptTableProps) {
   const router = useRouter();
+  // Read at call time: the page passes fresh closures every render, and the
+  // archive fetch must not be re-created (and re-run) because of them.
+  const archiveCallbacks = useRef({ onArchiveLoaded, onArchiveNetworkError });
+  archiveCallbacks.current = { onArchiveLoaded, onArchiveNetworkError };
   // Darth Recorder on this Mac: while it is pushing a recording up, its socket
   // knows the real byte counts long before the server does (the server only
   // learns them at `complete`), so an uploading row borrows them.
@@ -664,6 +677,7 @@ export function TranscriptTable({
         if (!res.ok) throw new Error(`Failed to load transcripts (${res.status})`);
         const data = (await res.json()) as TranscriptListV2Response;
         if (gen !== archiveGenRef.current) return; // superseded by a newer reset
+        if (mode === 'reset') archiveCallbacks.current.onArchiveLoaded?.();
         setError(null);
         setCounts(data.counts);
         setNextCursor(data.nextCursor);
@@ -680,6 +694,7 @@ export function TranscriptTable({
         if (gen !== archiveGenRef.current) return;
         if (mode === 'reset') {
           setError(networkErrorMessage(err, 'Failed to load transcripts'));
+          if (isNetworkFailure(err)) archiveCallbacks.current.onArchiveNetworkError?.();
         }
         // more/silent failures are quiet — the loaded window stays usable
       } finally {

@@ -39,7 +39,10 @@ import { loadRecentSearches, saveRecentSearches } from '@/lib/recent-searches-st
 import { shellSearchAction, useShellSignals, type ShellSearchDetail } from '@/lib/shell-signals';
 import { bandRemovedScope, createBandEchoer } from '@/lib/shell-search-echo';
 import { cn } from '@/lib/utils';
-import { NETWORK_ERROR_MESSAGE, networkErrorMessage } from '@/lib/fetch-errors';
+import { NETWORK_ERROR_MESSAGE, isNetworkFailure, networkErrorMessage } from '@/lib/fetch-errors';
+import { replicaAvailable, searchStored } from '@/lib/offline/replica-client';
+import { isShellOffline } from '@/lib/offline/shell-offline';
+import { NOT_AVAILABLE_OFFLINE, OFFLINE_READ_EVENT, readHashOf } from '@/lib/offline/offline-copy';
 
 /**
  * Darth desktop shell search (README "Darth desktop shell").
@@ -519,6 +522,11 @@ export function MeetingSearchPanel({
   const list = useRef<HTMLDivElement>(null);
   const [hits, setHits] = useState<MeetingSearchHit[]>([]);
   const [terms, setTerms] = useState<string[]>([]);
+  // Offline in the desktop shell: the hits came from the replica (README
+  // "Offline in the Darth desktop shell"); `localSaved` = the meetings whose
+  // text is stored (the others can only show their title: not openable).
+  const [local, setLocal] = useState(false);
+  const [localSaved, setLocalSaved] = useState<Set<string>>(() => new Set());
   const text = query.trim();
   const usable = shapeMeetingSearch(text) !== null;
   const runNow = submitted !== null && submitted === text;
@@ -574,8 +582,36 @@ export function MeetingSearchPanel({
     }
     setStatus('loading');
     const controller = new AbortController();
+    // The replica answers: offline (never asks the network), or when the
+    // network read failed. Resolves false when there is no replica.
+    const answerLocally = async (): Promise<boolean> => {
+      if (!replicaAvailable()) return false;
+      const r = await searchStored(text).catch(() => null);
+      if (controller.signal.aborted || !r) return false;
+      setHits(r.hits);
+      setTerms(r.terms);
+      setLocal(true);
+      setLocalSaved(r.saved);
+      setSelected(0);
+      setError(null);
+      setStatus('done');
+      setAnsweredSeq(seq);
+      return true;
+    };
+    const failed = (err: unknown) => {
+      setHits([]);
+      setError(networkErrorMessage(err, NETWORK_ERROR_MESSAGE));
+      setStatus('error');
+      setAnsweredSeq(seq);
+    };
     const timer = setTimeout(
       () => {
+        if (isShellOffline() && replicaAvailable()) {
+          void answerLocally().then((ok) => {
+            if (!ok && !controller.signal.aborted) failed(new TypeError('offline'));
+          });
+          return;
+        }
         fetch(`/api/search?q=${encodeURIComponent(text)}`, {
           credentials: 'include',
           signal: controller.signal,
@@ -591,6 +627,7 @@ export function MeetingSearchPanel({
             if (controller.signal.aborted) return;
             setHits(r.hits);
             setTerms(r.terms);
+            setLocal(false);
             setSelected(0);
             setError(null);
             setStatus('done');
@@ -598,10 +635,13 @@ export function MeetingSearchPanel({
           })
           .catch((err: unknown) => {
             if (controller.signal.aborted) return;
-            setHits([]);
-            setError(networkErrorMessage(err, NETWORK_ERROR_MESSAGE));
-            setStatus('error');
-            setAnsweredSeq(seq);
+            if (isNetworkFailure(err)) {
+              void answerLocally().then((ok) => {
+                if (!ok && !controller.signal.aborted) failed(err);
+              });
+              return;
+            }
+            failed(err);
           });
       },
       runNow ? 0 : PANEL_DEBOUNCE_MS
@@ -666,11 +706,25 @@ export function MeetingSearchPanel({
 
   const go = useCallback(
     (hit: MeetingSearchHit) => {
+      if (local) {
+        // From the replica: only a stored meeting opens, and it opens in the
+        // listing's in-place reader (no document load — the shell may not
+        // hold that meeting's page).
+        if (!localSaved.has(hit.id)) return;
+        if (text) onRemember(text, null);
+        if (window.location.pathname === '/') {
+          window.dispatchEvent(new CustomEvent(OFFLINE_READ_EVENT, { detail: { id: hit.id } }));
+        } else {
+          router.push(`/${readHashOf(hit.id)}`);
+        }
+        onClose();
+        return;
+      }
       if (text) onRemember(text, null);
       router.push(`/transcript/${encodeURIComponent(hit.id)}`);
       onClose();
     },
-    [router, onClose, onRemember, text]
+    [router, onClose, onRemember, text, local, localSaved]
   );
 
   const jump = useCallback(
@@ -781,6 +835,7 @@ export function MeetingSearchPanel({
         ? `${hits.length >= SEARCH_HIT_LIMIT ? `${SEARCH_HIT_LIMIT}+` : hits.length} result${hits.length === 1 ? '' : 's'} for `
         : 'Searching for '}
       <span className="font-medium text-foreground">“{text}”</span>
+      {status === 'done' && local && ' in what was saved on this Mac'}
     </>
   ) : (
     'Search meeting titles, notes and transcripts'
@@ -933,6 +988,7 @@ export function MeetingSearchPanel({
                       hit={hit}
                       terms={terms}
                       selected={i === sel}
+                      unavailable={local && !localSaved.has(hit.id)}
                       onSelect={() => go(hit)}
                       onHover={() => setSelected(i)}
                     />
@@ -1132,6 +1188,7 @@ export function MeetingHitRow({
   selected,
   onSelect,
   onHover,
+  unavailable = false,
 }: {
   hit: MeetingSearchHit;
   index: number;
@@ -1139,6 +1196,8 @@ export function MeetingHitRow({
   selected: boolean;
   onSelect: () => void;
   onHover: () => void;
+  /** Offline hit whose text is not stored on this Mac: dimmed, does nothing. */
+  unavailable?: boolean;
 }) {
   const { byId } = useLabelCatalog();
   const title = meetingTitleOf({
@@ -1155,7 +1214,12 @@ export function MeetingHitRow({
   });
   const titleRanges = title.kind === 'title' ? matchRanges(title.primary, terms) : [];
   const owner = hit.owner ? hit.owner.name || hit.owner.email : hit.access === 'owner' ? 'You' : 'Shared with you';
-  const meta = [owner, hit.duration ? formatDuration(hit.duration) : null, `in ${MATCHED_IN_LABEL[hit.matched_in]}`]
+  const meta = [
+    owner,
+    hit.duration ? formatDuration(hit.duration) : null,
+    `in ${MATCHED_IN_LABEL[hit.matched_in]}`,
+    unavailable ? NOT_AVAILABLE_OFFLINE : null,
+  ]
     .filter(Boolean)
     .join(' · ');
   const shownLabels = hit.labels.slice(0, 2);
@@ -1170,11 +1234,14 @@ export function MeetingHitRow({
       data-hit-index={index}
       data-item-index={index}
       data-meeting-id={hit.id}
+      aria-disabled={unavailable || undefined}
+      title={unavailable ? NOT_AVAILABLE_OFFLINE : undefined}
       onClick={onSelect}
       onMouseEnter={onHover}
       tabIndex={-1}
       className={cn(
-        'flex w-full cursor-pointer flex-col gap-0.5 rounded-lg px-3 py-2 text-left transition-colors',
+        'flex w-full flex-col gap-0.5 rounded-lg px-3 py-2 text-left transition-colors',
+        unavailable ? 'cursor-default opacity-50' : 'cursor-pointer',
         selected ? 'bg-accent text-accent-foreground' : 'hover:bg-muted'
       )}
     >

@@ -76,6 +76,9 @@ export function requestMediaUpload(prefill?: MediaUploadPrefill): void {
 
 interface AudioUploadProps {
   onTranscriptCreated?: () => void;
+  /** Offline (the desktop replica is showing): no drop overlay, no picker —
+   * an upload cannot start. Uploads already in flight keep their rows. */
+  disabled?: boolean;
 }
 
 /**
@@ -223,7 +226,7 @@ function fmtEventDay(e: CalendarEventLite): string {
   });
 }
 
-export function AudioUpload({ onTranscriptCreated }: AudioUploadProps) {
+export function AudioUpload({ onTranscriptCreated, disabled = false }: AudioUploadProps) {
   const [uploads, setUploads] = useState<UploadStatus[]>([]);
   const [isDragging, setIsDragging] = useState(false);
   const [pendingFiles, setPendingFiles] = useState<File[]>([]);
@@ -1087,7 +1090,7 @@ export function AudioUpload({ onTranscriptCreated }: AudioUploadProps) {
     const hasFiles = (e: DragEvent) =>
       Array.from(e.dataTransfer?.types ?? []).includes('Files');
     const onEnter = (e: DragEvent) => {
-      if (!hasFiles(e)) return;
+      if (disabled || !hasFiles(e)) return;
       depth += 1;
       setIsDragging(true);
     };
@@ -1105,6 +1108,7 @@ export function AudioUpload({ onTranscriptCreated }: AudioUploadProps) {
       // Always swallow the drop — otherwise the browser navigates the tab
       // to the file.
       e.preventDefault();
+      if (disabled) return;
       if (e.dataTransfer && e.dataTransfer.files.length > 0) {
         handleFilesSelected(e.dataTransfer.files);
       }
@@ -1119,7 +1123,7 @@ export function AudioUpload({ onTranscriptCreated }: AudioUploadProps) {
       window.removeEventListener('dragleave', onLeave);
       window.removeEventListener('drop', onDrop);
     };
-  }, [handleFilesSelected]);
+  }, [handleFilesSelected, disabled]);
 
   // Closing the tab kills the in-flight XHR and everything sent so far —
   // there is no resume. Once the POST returns (status 'transcribing') the

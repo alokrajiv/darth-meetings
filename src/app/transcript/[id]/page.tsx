@@ -73,7 +73,10 @@ import {
 import { PersonChip } from '@/components/person-chip';
 import { safeDate, usesEventRange, whenLine } from '@/lib/when';
 import { countVoices, speakerNameStates } from '@/lib/speaker-name-state';
-import { networkErrorMessage } from '@/lib/fetch-errors';
+import { isNetworkFailure, networkErrorMessage } from '@/lib/fetch-errors';
+import { OfflineMeeting } from '@/components/offline-meeting';
+import { rememberOpenedMeeting, replicaAvailable } from '@/lib/offline/replica-client';
+import { isOfflineState, useShellConnectivity } from '@/lib/offline/shell-offline';
 import type { PickerPerson } from '@/components/user-picker';
 import {
   Dialog,
@@ -159,13 +162,48 @@ interface TranscriptDetailPageProps {
 // timers and the <audio> element) would survive the navigation and show A's
 // title/audio on B's URL until B's fetch landed. Keying on the id forces a
 // full remount per transcript.
+//
+// Offline in the Darth desktop shell (README "Offline in the Darth desktop
+// shell"): while the shell says offline — or this page's own load never
+// reached the server — the meeting is read from the desktop replica instead
+// (components/offline-meeting.tsx), read only. The live page comes back when
+// the shell says online again (or "Try again"). Outside the shell (no store
+// bridge) nothing changes: the web has no offline mode.
 export default function TranscriptDetailPage({ params }: TranscriptDetailPageProps) {
   const { id } = use(params);
-  return <TranscriptDetailInner key={id} transcriptId={id} />;
+  const connectivity = useShellConnectivity();
+  const shellOffline = isOfflineState(connectivity);
+  const [storeOn, setStoreOn] = useState(false);
+  useEffect(() => setStoreOn(replicaAvailable()), []);
+  const [netFailed, setNetFailed] = useState(false);
+  useEffect(() => {
+    if (connectivity === 'online') setNetFailed(false);
+  }, [connectivity]);
+  useEffect(() => setNetFailed(false), [id]);
+  if (storeOn && (shellOffline || netFailed)) {
+    return <OfflineMeeting key={id} id={id} online={!shellOffline} onRetry={() => setNetFailed(false)} />;
+  }
+  return (
+    <TranscriptDetailInner
+      key={id}
+      transcriptId={id}
+      onNetworkFailure={storeOn ? () => setNetFailed(true) : undefined}
+    />
+  );
 }
 
-function TranscriptDetailInner({ transcriptId }: { transcriptId: string }) {
+function TranscriptDetailInner({
+  transcriptId,
+  onNetworkFailure,
+}: {
+  transcriptId: string;
+  /** The first load never reached the server (desktop shell only): the
+   * wrapper shows the replica's copy instead of the error. */
+  onNetworkFailure?: () => void;
+}) {
   const router = useRouter();
+  const onNetworkFailureRef = useRef(onNetworkFailure);
+  onNetworkFailureRef.current = onNetworkFailure;
   // Stale-response guard: an in-flight fetch (or a debounced live-reload
   // timer) started for a previous id must never setRow() onto this page.
   const liveIdRef = useRef(transcriptId);
@@ -679,6 +717,7 @@ function TranscriptDetailInner({ transcriptId }: { transcriptId: string }) {
     } catch (err) {
       if (!opts?.silent) {
         setError(err instanceof Error ? err.message : 'Failed to load transcript');
+        if (isNetworkFailure(err)) onNetworkFailureRef.current?.();
       }
     } finally {
       if (!opts?.silent) setLoading(false);
@@ -692,6 +731,24 @@ function TranscriptDetailInner({ transcriptId }: { transcriptId: string }) {
       if (liveReloadTimer.current) clearTimeout(liveReloadTimer.current);
     };
   }, [loadAll]);
+
+  // Desktop replica write-through (README "Offline in the Darth desktop
+  // shell"): what this page shows — names, edits, notes, labels — is kept as
+  // compact text for offline reading. Debounced (edits arrive in bursts);
+  // a no-op on the web and while offline.
+  useEffect(() => {
+    if (loading || !row || !content || row.status !== 'completed') return;
+    const timer = setTimeout(() => {
+      void rememberOpenedMeeting({
+        row,
+        speakerLabels,
+        edits: transcriptEdits,
+        content,
+        labels: labelInfo?.labels ?? null,
+      });
+    }, 1500);
+    return () => clearTimeout(timer);
+  }, [loading, row, content, speakerLabels, transcriptEdits, labelInfo]);
 
   // Transcription versions of this meeting (Phase 2). Loaded once here: the
   // Sources card renders twice (rail + phone drawer), and the notes/report

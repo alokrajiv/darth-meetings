@@ -155,19 +155,14 @@ export async function searchStored(q: string): Promise<LocalSearchResult | null>
 
 // ---- Write-through from the meeting page -----------------------------------
 
-const lastWrite = new Map<string, number>();
-const WRITE_THROTTLE_MS = 5_000;
-
-/** The meeting page loaded (or reloaded) this meeting online: keep its text.
- * Throttled per meeting; the rev comes from the offline plan (one small
+/** The meeting page loaded (or changed) this meeting online: keep its text
+ * (the page debounces). The rev comes from the offline plan (one small
  * request) so the background sync does not fetch it again. Never throws. */
 export async function rememberOpenedMeeting(src: MeetingSources): Promise<void> {
   try {
-    if (src.row.status !== 'completed' || !src.content) return;
+    if (src.row.status !== 'completed' || !src.content || isShellOffline()) return;
     const id = src.row.assemblyai_id;
     const now = Date.now();
-    if (now - (lastWrite.get(id) ?? 0) < WRITE_THROTTLE_MS) return;
-    lastWrite.set(id, now);
     const db = await replicaDb();
     if (!db || db.owner === null) return;
     const outcome = await saveDoc(db, compactMeeting(src), null, { now });
