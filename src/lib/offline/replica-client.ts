@@ -281,10 +281,15 @@ async function runSync(force: boolean): Promise<SyncReport> {
   }
   if (await saveListing(db, rows)) report.listed = rows.length;
 
-  // 2. Their pages, kept by the shell.
+  // 2. Their pages (and the listing's own, which the shell prewarms anyway),
+  // kept by the shell's page cache.
   const completed = rows.filter((r) => r.status === 'completed' && !r.deleted_at);
   if (typeof window !== 'undefined') {
-    report.warmed = await warmPages(completed.map((r) => meetingPageUrl(window.location.origin, r.assemblyai_id)));
+    const origin = window.location.origin;
+    report.warmed = await warmPages([
+      `${origin}/`,
+      ...completed.slice(0, LISTING_KEEP).map((r) => meetingPageUrl(origin, r.assemblyai_id)),
+    ]);
   }
 
   // 3. Which meetings need their text (missing or stale).

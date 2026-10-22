@@ -175,8 +175,8 @@ describe('background sync', () => {
     const net = fakeNet(standardRoutes(), { delayMs: 2 });
     useEnv(net);
     const r = await syncReplicaSoon();
-    expect(r).toMatchObject({ ran: true, listed: 5, warmed: 4, fetched: 4, failed: 0 });
-    expect(warmed).toEqual([['m5', 'm4', 'm2', 'm1'].map((id) => meetingPageUrl(ORIGIN, id))]);
+    expect(r).toMatchObject({ ran: true, listed: 5, warmed: 5, fetched: 4, failed: 0 });
+    expect(warmed).toEqual([[`${ORIGIN}/`, ...['m5', 'm4', 'm2', 'm1'].map((id) => meetingPageUrl(ORIGIN, id))]]);
     expect(net.calls.filter((c) => /^\/api\/transcripts\/[^/]+\?replica=1$/.test(c))).toHaveLength(4);
     expect(net.calls.some((c) => /^\/api\/transcripts\/[^/?]+$/.test(c))).toBe(false); // never a logged "view"
     expect(net.calls.find((c) => c.startsWith('/api/offline/plan'))).toBe('/api/offline/plan?ids=m5,m4,m2,m1');

@@ -229,13 +229,90 @@ on the same contract as Darth Chat (its SPEC §20.76):
     (always visible on touch screens), and the unlinked-recordings notice is
     one slim line.
 
+## Offline in the Darth desktop shell (2026-10-22)
+
+The WEBSITE still has no offline mode (below: removed 2026-10-02). Inside the
+Darth desktop shell, Meetings keeps a text-only REPLICA in the shell's
+per-app SQLite store (`window.darthDesktop.store`, `desktop/docs/OFFLINE.md`)
+and reads from it while the shell says offline. The shell side — caching the
+app's documents, flights and static assets and serving them with no network,
+plus `window.darthDesktop.offlineCache` — is
+`plans/offline/2026-10-22-shell-offline-cache-contract.md`. Everything here
+is feature-detected: in a browser, or a shell without the store bridge,
+nothing is stored and nothing changes.
+
+**What is kept** (`src/lib/offline/`, schema v1 in `replica-db.ts`):
+
+- *The listing*: the newest 100 meetings of the default listing (all tabs,
+  no filter) as the API served them — title, date, owner, duration,
+  speakers count, labels.
+- *Meeting text*, for every meeting opened online (write-through from
+  `/transcript/<id>`, debounced) and, in the background, the newest 100:
+  metadata (title, description, dates, owner, attendees/organizer, speaker
+  names, labels, outline), the AI summary + detailed report markdown, and the
+  transcript as compact turns `[speaker name, start ms, text]` with custom
+  speaker names and text edits applied as the page shows them. Never the raw
+  AssemblyAI JSON (avg 0.9 MB, max 8.7 MB, mostly word timings), never
+  audio/video/frames, never cookies or tokens.
+- *Search*: one fts5 row per meeting over title / description / notes /
+  transcript text (`search`); on shells that deny FTS5 (≤ 0.4: its internal
+  `data_version` pragma) a plain `search_lite` table + LIKE instead.
+- *Owner*: keyed by the darth user id from `/api/auth/session`
+  (`ensureOwner`: another person's rows are wiped first). Offline the store
+  opens unkeyed and is read only. The shell deletes the store on Sign out.
+
+**Size**: each meeting carries a byte estimate (columns + the indexed copy);
+docs share a 30 MB budget inside the shell's 50 MB cap, the OLDEST meetings
+are evicted first (never the one being saved), a single meeting's turns are
+cut beyond 4 MB (the notes stay; the reader says it was cut), and a `QUOTA`
+answer from the shell evicts a quarter of the rest and retries, then keeps
+the notes without the turns.
+
+**Sync** (`replica-client.ts` `syncReplicaSoon`, hung off the listing's first
+page while online, at most once per 15 min — the time is kept in the store):
+the newest 100 rows → the store; their page URLs (+ `/`) →
+`offlineCache.warm`; `GET /api/offline/plan?ids=…` → each meeting's `rev`;
+the missing or stale ones fetched two at a time through the page's own read
+routes (`/api/transcripts/<id>?replica=1` — the flag skips `last_accessed`
+and the 'view' activity row, a sync is not a person viewing — plus
+`/speakers`, `/edits`, `/content`). Nothing while the shell says offline;
+the first network failure stops the run (no retry loop).
+
+**Offline screens** (shell state ≠ `online`, or the page's own first read
+never reached the server — a fetch TypeError):
+
+- `/`: `components/offline-listing.tsx` — the saved listing by day,
+  "Showing what was saved at <time>". A meeting with stored text opens IN
+  PLACE at `/#read=<id>` (no document load, so it opens whether or not the
+  shell cached its page); one without it is dimmed "Not available offline".
+  Import, the upload drop, reminders, the setup dialog and the labels rail
+  are off.
+- `/transcript/<id>`: `components/offline-meeting.tsx` — the stored meeting;
+  Play / Share / Ask AI disabled with "Not available offline" (the live
+  page's controls are not rendered at all); timestamp chips in the notes
+  scroll to that moment; the band's "Search in <title>" runs over the stored
+  turns.
+- The band's results panel answers from the replica ("… in what was saved
+  on this Mac"); a hit opens in the listing's reader; a hit without stored
+  text (a listing-only row) is dimmed. FTS5 matches word PREFIXES (the live
+  search matches any substring).
+- No offline banner (the shell's band pill says Offline), no spinner that
+  waits on the network, the SSE stream is closed while offline, and "Try
+  again" appears only when the shell says online. Back online the live
+  screens return and refetch.
+
+**Not offline (v1)**: audio/video (the 50 MB store is not for media — see
+the design notes in `plans/offline/meetings-offline-design.md`), Recordings
+and Series pages, attachments, frames in the notes, every write.
+
 ## Offline and PWA — removed 2026-10-02
 
 The website no longer has an offline mode and is no longer an installable
 PWA. Offline is the Darth desktop shell's job: `desktop/src/connectivity.js`
 (Work Offline + network detection) and its local store bridge
 (`window.darthDesktop.store`), documented in `desktop/docs/OFFLINE.md`
-("The web/PWA builds should drop their own offline modes").
+("The web/PWA builds should drop their own offline modes"). The desktop
+replica above (2026-10-22) is that job's Meetings half.
 
 **Removed:** the mode-aware service worker and its registration; the
 IndexedDB pin ledger (`darth-offline`), pins, sync scheduler, outbox, the
@@ -257,8 +334,9 @@ connection." (`src/lib/fetch-errors.ts`).
   shell).
 - `GET /api/offline/plan` and `GET/PUT /api/offline/prefs`
   (`src/db-ops/offline-plan.ts`, the `user_prefs.offline_prefs` counts from
-  migration 040) — darth-cli's `offline plan|prefs` uses them, and a future
-  desktop-shell replica can. Only the web UI that edited the counts is gone.
+  migration 040) — darth-cli's `offline plan|prefs` uses them, and the
+  desktop replica's sync reads `rev` from the plan (with `ids`, so the
+  counts do not limit it). Only the web UI that edited the counts is gone.
 - `?variant=audio` on the audio route (`src/lib/server/audio-only.ts`) — the
   player streams the audio-only extract whenever its video toggle is off.
 - **One release only (2026-10):** `public/sw.js` is now a kill-switch worker
