@@ -274,6 +274,18 @@ describe('write-through, offline reads, search', () => {
     expect((await loadStoredMeeting('m8'))?.doc).toBeNull();
   });
 
+  test('reads never wait on the network, even while the shell still says online', async () => {
+    const net = fakeNet(standardRoutes());
+    useEnv(net);
+    await syncReplicaSoon();
+    // A new page load whose own reads failed (stalled network, shell online).
+    setReplicaEnvForTests({ bridge: store as unknown as DesktopStoreBridge, fetch: net.fetch });
+    const before = net.calls.length;
+    expect((await loadStoredListing())?.rows).toHaveLength(5);
+    expect((await searchStored('zebra'))?.hits.length).toBe(4);
+    expect(net.calls.length).toBe(before);
+  });
+
   test('a pending meeting (no content yet) is not written', async () => {
     const net = fakeNet(standardRoutes());
     useEnv(net);

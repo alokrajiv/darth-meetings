@@ -141,24 +141,42 @@ export async function replicaDb(): Promise<ReplicaDb | null> {
   return db;
 }
 
+/** A handle for READING: whatever is open, else an unkeyed open — never a
+ * session probe (the offline screens must not wait on a network that stalls;
+ * a keyed open, which wipes another person's rows, happens on the first
+ * write made online). */
+async function readDb(): Promise<ReplicaDb | null> {
+  const b = bridge();
+  if (!b) return null;
+  if (opened) {
+    const db = await opened;
+    if (db) return db;
+  }
+  const p = openReplicaDb(b, null);
+  opened = p;
+  const db = await p;
+  if (!db) opened = null;
+  return db;
+}
+
 // ---- Reads ----------------------------------------------------------------
 
 export async function loadStoredListing(): Promise<StoredListing | null> {
-  const db = await replicaDb();
+  const db = await readDb();
   return db ? readListing(db) : null;
 }
 
 export async function loadStoredMeeting(
   id: string
 ): Promise<{ doc: StoredReplicaDoc | null; row: TranscriptListRow | null } | null> {
-  const db = await replicaDb();
+  const db = await readDb();
   if (!db) return null;
   const [doc, row] = await Promise.all([readDoc(db, id), readListRow(db, id)]);
   return { doc, row };
 }
 
 export async function searchStored(q: string): Promise<LocalSearchResult | null> {
-  const db = await replicaDb();
+  const db = await readDb();
   return db ? searchReplica(db, q) : null;
 }
 
