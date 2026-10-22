@@ -52,21 +52,28 @@ function withoutSplitSource<T extends { gmeet_context: GmeetContext | null }>(ro
   return { ...row, gmeet_context: { ...ctx, splitFrom: { ...rest, meetingId: '' } } };
 }
 
-export const GET = withAuth(async ({ user }, { params }) => {
+export const GET = withAuth(async ({ user, request }, { params }) => {
   const { id } = await params;
   const access = await resolveAccess(user.userId, user.email, id);
   if (!access) {
     return NextResponse.json({ error: 'Not found' }, { status: 404 });
   }
   const refreshed = await refreshIfPending(access.ownerUserId, access.row);
-  await touchLastAccessedForUser(access.ownerUserId, id);
 
-  void logActivity({
-    transcriptId: access.row.id,
-    userId: user.userId,
-    email: user.email,
-    action: 'view',
-  });
+  // `?replica=1`: the desktop shell's offline replica refreshing its copy in
+  // the background (src/lib/offline/replica-client.ts) — not a person looking
+  // at the meeting, so neither "last accessed" nor a 'view' in the activity
+  // bar. The payload (and its reader redaction) is exactly the same.
+  const replicaSync = new URL(request.url).searchParams.get('replica') === '1';
+  if (!replicaSync) {
+    await touchLastAccessedForUser(access.ownerUserId, id);
+    void logActivity({
+      transcriptId: access.row.id,
+      userId: user.userId,
+      email: user.email,
+      action: 'view',
+    });
+  }
 
   // Shared rows say who owns them ("Recorded on Atira's Mac" in the
   // Recording card) — same identity source as the listing.
