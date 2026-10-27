@@ -697,7 +697,10 @@ export interface GmeetContext {
    * and the owner got a needs-review DM. */
   autoReview?: {
     evaluatedAt: string;
-    passed: boolean;
+    /** null while a grace-window claim is pending (`pending: true`): the
+     * evaluation is running in one process and nobody else may start it. */
+    passed: boolean | null;
+    pending?: true;
     reason?: string;
     /** What was generated unattended (mirrors uploadPrefs.report). Rows
      * from before 2026-09-21 may carry the retired 'summary'. */

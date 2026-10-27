@@ -123,6 +123,8 @@ describe('autoProceedFactsOf — a full row to the facts', () => {
     const ctx = (c: Record<string, unknown>) => ({ ...row, gmeet_context: c }) as unknown as StoredTranscript;
     expect(autoProceedFactsOf(ctx({ autoReview: { evaluatedAt: 'x', passed: false, mode: 'held' } })).autoReviewed).toBe(true);
     expect(autoProceedFactsOf(ctx({ autoReview: { evaluatedAt: 'x', passed: false, mode: 'grace', reason: 'r' } })).autoReviewed).toBe(true);
+    // A pending claim (another process is evaluating right now) counts as present.
+    expect(autoProceedFactsOf(ctx({ autoReview: { evaluatedAt: 'x', passed: null, mode: 'grace', pending: true } })).autoReviewed).toBe(true);
     expect(autoProceedFactsOf(ctx({ autoReview: null })).autoReviewed).toBe(false);
     expect(autoProceedFactsOf(ctx({ autoImport: { seriesId: 1, occKey: 'k', byUserId: 'u', byEmail: 'test-a@example.com', at: 'x' } })).autoMarked).toBe(true);
     expect(autoProceedFactsOf(ctx({ autoSync: { occKey: 'k', byUserId: 'u', byEmail: 'test-a@example.com', watchers: [], at: 'x' } })).autoMarked).toBe(true);

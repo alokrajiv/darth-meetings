@@ -1,5 +1,10 @@
 import 'server-only';
-import { getForUser, mergeGmeetContextForUser } from '@/db-ops/transcripts';
+import {
+  claimAutoReview,
+  getForUser,
+  mergeGmeetContextForUser,
+  removeGmeetContextKeysForUser,
+} from '@/db-ops/transcripts';
 import {
   getForUser as getMappingsForUser,
   upsertForUser as upsertMappingsForUser,
@@ -173,7 +178,12 @@ export async function maybeAutoReview(
  *
  * `listAutoProceedBacklog` (db-ops) picks candidates; `autoProceedDue` is
  * re-checked here on the fresh row because a person may have clicked
- * Generate, Hold or named someone since the query ran.
+ * Generate, Hold or named someone since the query ran — and then the row is
+ * CLAIMED with one conditional write (`claimAutoReview`: a pending autoReview,
+ * only where none exists) before anything else is touched, so two sweepers
+ * or a Hold landing in another process at the same minute cannot both act.
+ * A claim that cannot be evaluated yet (no utterances) or that throws is
+ * released, so the row stays pickable inside the window.
  */
 export async function autoProceedAfterGrace(
   ownerUserId: string,
@@ -182,21 +192,42 @@ export async function autoProceedAfterGrace(
   const row = await getForUser(ownerUserId, assemblyaiId);
   if (!row || !autoProceedDue(autoProceedFactsOf(row))) return 'skipped';
 
+  const nowIso = new Date().toISOString();
+  const claimed = await claimAutoReview(ownerUserId, assemblyaiId, {
+    evaluatedAt: nowIso,
+    passed: null,
+    mode: 'grace',
+    pending: true,
+  });
+  if (!claimed) return 'skipped'; // somebody else owns this row's one evaluation
+  const release = () =>
+    removeGmeetContextKeysForUser(ownerUserId, assemblyaiId, ['autoReview']).catch((err) =>
+      console.warn(`[auto-proceed] ${assemblyaiId}: releasing the claim failed:`, err)
+    );
+
   const pref = storedReportPref(row.gmeet_context?.uploadPrefs?.report);
   const url = `${APP_URL}/transcript/${assemblyaiId}`;
   const title = row.title?.trim() || row.original_filename?.trim() || 'Untitled meeting';
-  const nowIso = new Date().toISOString();
 
-  const content = await getContentCached(ownerUserId, row);
-  const utterances = content?.utterances ?? [];
-  if (utterances.length === 0) return 'skipped'; // nothing to evaluate yet; stays pickable inside the window
-
-  const mappings = await getMappingsForUser(ownerUserId, assemblyaiId);
-  const ev = evaluateAutoReview({
-    utterances,
-    labels: mappings?.speaker_labels ?? [],
-    suggestions: mappings?.suggestions,
-  });
+  let content: Awaited<ReturnType<typeof getContentCached>>;
+  let ev: ReturnType<typeof evaluateAutoReview>;
+  try {
+    content = await getContentCached(ownerUserId, row);
+    const utterances = content?.utterances ?? [];
+    if (utterances.length === 0) {
+      await release(); // nothing to evaluate yet; stays pickable inside the window
+      return 'skipped';
+    }
+    const mappings = await getMappingsForUser(ownerUserId, assemblyaiId);
+    ev = evaluateAutoReview({
+      utterances,
+      labels: mappings?.speaker_labels ?? [],
+      suggestions: mappings?.suggestions,
+    });
+  } catch (err) {
+    await release();
+    throw err;
+  }
 
   if (!ev.passed) {
     await mergeGmeetContextForUser(ownerUserId, assemblyaiId, {
@@ -208,10 +239,14 @@ export async function autoProceedAfterGrace(
 
   if (ev.applied.length > 0) {
     await upsertMappingsForUser(ownerUserId, assemblyaiId, ev.merged);
+    // Only the APPLIED strong names: a human-confirmed name was enrolled by
+    // the PUT …/speakers that confirmed it, and would double-count this
+    // meeting if enrolled again.
     if (ev.enroll.length > 0) {
+      const enroll = ev.enroll;
       void (async () => {
         const resolved = await resolveMeetingContent(row);
-        await enrollFromTranscript(resolved.media /* every file: a combined meeting embeds each recording's voices from ITS OWN file (mediaForSpeaker) */, content, ev.enroll);
+        await enrollFromTranscript(resolved.media /* every file: a combined meeting embeds each recording's voices from ITS OWN file (mediaForSpeaker) */, content, enroll);
       })().catch((err) => console.warn('[auto-proceed] voiceprint enroll failed:', err));
     }
   }

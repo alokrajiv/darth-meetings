@@ -1,7 +1,7 @@
 import { NextResponse } from 'next/server';
 import { withAuth } from '@/lib/auth/with-auth';
 import { resolveAccess } from '@/db-ops/transcript-access';
-import { getForUser, mergeGmeetContextForUser } from '@/db-ops/transcripts';
+import { claimAutoReview, getForUser } from '@/db-ops/transcripts';
 import { autoProceedAt, autoProceedFactsOf } from '@/lib/auto-proceed';
 
 export const runtime = 'nodejs';
@@ -16,10 +16,12 @@ export const runtime = 'nodejs';
  * the one-evaluation marker the sweeper's query excludes — so the human gate
  * stays and the line disappears (`autoProceedAt` reads null from then on).
  *
- * Idempotent: a row already held, or already evaluated and blocked, is left
- * as it is (200). A row the sweeper already wrote the summary for is a 409 —
- * there is nothing left to hold. Opening the review dialog does NOT hold;
- * only this button does.
+ * The stamp is the same conditional write the sweeper claims with
+ * (`claimAutoReview`: only where no autoReview exists), so a Hold and a
+ * sweeper landing in the same minute cannot both win. Losing is a 409 that
+ * says why — the summary is being written right now, or was already — except
+ * that pressing Hold twice is idempotent (200). Opening the review dialog
+ * does NOT hold; only this button does.
  */
 export const POST = withAuth(async ({ user }, { params }) => {
   const { id } = await params;
@@ -29,25 +31,25 @@ export const POST = withAuth(async ({ user }, { params }) => {
     return NextResponse.json({ error: 'Read-only access' }, { status: 403 });
   }
 
-  const existing = access.row.gmeet_context?.autoReview;
-  if (existing?.passed) {
-    return NextResponse.json(
-      { error: 'The summary was already written automatically — nothing left to hold.' },
-      { status: 409 }
-    );
-  }
-  if (!existing) {
-    await mergeGmeetContextForUser(access.ownerUserId, id, {
-      autoReview: {
-        evaluatedAt: new Date().toISOString(),
-        passed: false,
-        mode: 'held',
-        reason: 'held on the detail page',
-        by: { userId: user.userId, email: user.email },
-      },
-    });
-  }
+  const won = await claimAutoReview(access.ownerUserId, id, {
+    evaluatedAt: new Date().toISOString(),
+    passed: false,
+    mode: 'held',
+    reason: 'held on the detail page',
+    by: { userId: user.userId, email: user.email },
+  });
   const after = (await getForUser(access.ownerUserId, id)) ?? access.row;
+  if (!won) {
+    const existing = after.gmeet_context?.autoReview;
+    if (existing?.mode !== 'held') {
+      const why = existing?.pending
+        ? 'The summary is being written right now.'
+        : existing?.passed
+          ? 'The summary was already written automatically.'
+          : 'The automatic pass already ran on this meeting; the review gate stays.';
+      return NextResponse.json({ error: `${why} Nothing left to hold.` }, { status: 409 });
+    }
+  }
   return NextResponse.json({
     ok: true,
     held: true,

@@ -84,8 +84,9 @@ describe('evaluateAutoReview', () => {
     expect(ev.passed).toBe(true);
     expect(ev.applied.map((l) => l.originalSpeaker)).toEqual(['B']);
     expect(ev.merged.find((l) => l.originalSpeaker === 'A')?.customName).toBe('Confirmed Person A');
-    // …and a confirmed name is always enrolment-safe.
-    expect(ev.enroll.find((l) => l.originalSpeaker === 'A')?.customName).toBe('Confirmed Person A');
+    // …and the confirmed name is NOT re-enrolled: the PUT that confirmed it
+    // already enrolled this meeting. Only the strong applied one is.
+    expect(ev.enroll.map((l) => l.originalSpeaker)).toEqual(['B']);
   });
 
   test('a blank saved label does not count as named', () => {
@@ -97,7 +98,45 @@ describe('evaluateAutoReview', () => {
   test('everyone already named → passed with nothing to apply', () => {
     const labels = [label('A', 'Test Person A'), label('B', 'Test Person B')];
     const ev = evaluateAutoReview({ utterances: utt(['A', 3], ['B', 2]), labels, suggestions: {} });
-    expect(ev).toEqual({ passed: true, blocker: null, applied: [], merged: labels, enroll: labels });
+    expect(ev).toEqual({ passed: true, blocker: null, applied: [], merged: labels, enroll: [] });
+  });
+
+  test('two speakers ending up with the same name block — the AI put one person on two voices', () => {
+    const ev = evaluateAutoReview({
+      utterances: utt(['A', 4], ['B', 3]),
+      labels: [],
+      suggestions: { A: voice('Test Person A', 0.9), B: idPass('test person a', 0.95) },
+    });
+    expect(ev.passed).toBe(false);
+    expect(ev.blocker).toBe('two speakers both identified as Test Person A');
+    expect(ev.applied).toEqual([]);
+    expect(ev.enroll).toEqual([]);
+  });
+
+  test('a guess colliding with a human-confirmed name blocks too (case-insensitive)', () => {
+    const labels = [label('A', 'Confirmed Person')];
+    const ev = evaluateAutoReview({
+      utterances: utt(['A', 4], ['B', 3]),
+      labels,
+      suggestions: { B: voice('confirmed person', 0.9) },
+    });
+    expect(ev.passed).toBe(false);
+    expect(ev.blocker).toBe('two speakers both identified as Confirmed Person');
+    expect(ev.merged).toEqual(labels); // nothing applied
+  });
+
+  test('two human-confirmed speakers sharing a name block as well — the rule reads the merged set', () => {
+    const labels = [label('A', 'Test Person A'), label('B', 'Test Person A')];
+    const ev = evaluateAutoReview({ utterances: utt(['A', 3], ['B', 3]), labels, suggestions: {} });
+    expect(ev.passed).toBe(false);
+    expect(ev.blocker).toBe('two speakers both identified as Test Person A');
+  });
+
+  test('a stale label for a speaker with no utterances in this meeting does not count as a duplicate', () => {
+    const labels = [label('Z', 'Test Person A')];
+    const ev = evaluateAutoReview({ utterances: utt(['A', 3]), labels, suggestions: { A: voice('Test Person A', 0.9) } });
+    expect(ev.passed).toBe(true);
+    expect(ev.applied.map((l) => l.originalSpeaker)).toEqual(['A']);
   });
 
   test('a label that is already a real name (transcript-mode imports) needs no resolution', () => {
@@ -152,14 +191,14 @@ describe('enrolment gating — a weak guess is named but never fed into a print'
     expect(ev.enroll.map((l) => l.originalSpeaker)).toEqual(['B']);
   });
 
-  test('enroll is always a subset of merged and only carries named labels', () => {
+  test('enroll is a subset of applied — never a confirmed name, never a blank one', () => {
     const ev = evaluateAutoReview({
       utterances: utt(['A', 3], ['B', 3], ['C', 3]),
       labels: [label('C', 'Confirmed Person C'), label('Z', '')],
       suggestions: { A: voice('Test Person A', 0.65), B: idPass('Test Person B', 0.95) },
     });
     expect(ev.passed).toBe(true);
-    for (const l of ev.enroll) expect(ev.merged).toContainEqual(l);
-    expect(ev.enroll.map((l) => l.originalSpeaker).sort()).toEqual(['B', 'C']);
+    for (const l of ev.enroll) expect(ev.applied).toContainEqual(l);
+    expect(ev.enroll.map((l) => l.originalSpeaker)).toEqual(['B']);
   });
 });

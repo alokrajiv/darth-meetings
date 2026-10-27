@@ -60,9 +60,10 @@ export interface AutoReviewEvaluation {
   /** The saved labels with `applied` merged in — what gets upserted. */
   merged: SpeakerLabel[];
   /**
-   * The labels safe to ENROL voiceprints from: every human-confirmed name,
-   * plus the applied names whose suggestion met the stricter enrolment
-   * thresholds. Always a subset of `merged`.
+   * The APPLIED names safe to ENROL voiceprints from — those whose suggestion
+   * met the stricter enrolment thresholds. Human-confirmed names are not in
+   * it: the PUT …/speakers that confirmed them enrolled this meeting already,
+   * and enrolling it again would double-count. Always a subset of `applied`.
    */
   enroll: SpeakerLabel[];
 }
@@ -70,6 +71,11 @@ export interface AutoReviewEvaluation {
 /**
  * Pure. `passed` with an empty `applied` means everyone was already named (or
  * a real name) — nothing to apply, nothing in the way.
+ *
+ * One more blocker after the merge: two diarized speakers of this meeting
+ * ending up with the SAME name (case-insensitive) — the AI putting one person
+ * on two voices, or a guess colliding with a confirmed name. That is a
+ * question for a human, on both paths.
  */
 export function evaluateAutoReview(input: AutoReviewInput): AutoReviewEvaluation {
   const suggestions = input.suggestions ?? {};
@@ -112,9 +118,28 @@ export function evaluateAutoReview(input: AutoReviewInput): AutoReviewEvaluation
     if (i >= 0) merged[i] = { ...merged[i]!, customName: l.customName };
     else merged.push(l);
   }
-  const appliedSpeakers = new Set(applied.map((l) => l.originalSpeaker));
-  const enroll = merged.filter(
-    (l) => l.customName.trim() && (!appliedSpeakers.has(l.originalSpeaker) || strong.has(l.originalSpeaker))
-  );
+
+  // Duplicate names among the speakers of THIS meeting (a stale label for a
+  // speaker with no utterances here does not count).
+  const firstSpelling = new Map<string, string>();
+  for (const l of merged) {
+    if (!counts.has(l.originalSpeaker)) continue;
+    const name = l.customName.trim();
+    if (!name) continue;
+    const key = name.toLowerCase();
+    const seen = firstSpelling.get(key);
+    if (seen !== undefined) {
+      return {
+        passed: false,
+        blocker: `two speakers both identified as ${seen}`,
+        applied: [],
+        merged: existing,
+        enroll: [],
+      };
+    }
+    firstSpelling.set(key, name);
+  }
+
+  const enroll = applied.filter((l) => strong.has(l.originalSpeaker));
   return { passed: true, blocker: null, applied, merged, enroll };
 }

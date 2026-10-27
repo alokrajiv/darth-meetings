@@ -63,12 +63,33 @@ describe('autoProceedAfterGrace — the manual-row path', () => {
   const src = read('lib/server/auto-review.ts');
   const fn = fnBody(src, 'export async function autoProceedAfterGrace(');
 
-  test('re-checks eligibility on the fresh row before anything else', () => {
+  test('re-checks eligibility on the fresh row, then CLAIMS before any other write', () => {
     const check = fn.indexOf("if (!row || !autoProceedDue(autoProceedFactsOf(row))) return 'skipped';");
+    const claim = fn.indexOf('await claimAutoReview(ownerUserId, assemblyaiId, {');
+    const lost = fn.indexOf("if (!claimed) return 'skipped';");
     expect(check).toBeGreaterThan(0);
-    for (const write of ['mergeGmeetContextForUser(', 'upsertMappingsForUser(', 'generateAutoReport(', 'notifyUser(']) {
-      expect(fn.indexOf(write), write).toBeGreaterThan(check);
+    expect(claim).toBeGreaterThan(check);
+    expect(lost).toBeGreaterThan(claim);
+    expect(fn).toContain("passed: null,\n    mode: 'grace',\n    pending: true,");
+    for (const write of ['getContentCached(', 'mergeGmeetContextForUser(', 'upsertMappingsForUser(', 'generateAutoReport(', 'notifyUser(']) {
+      expect(fn.indexOf(write), write).toBeGreaterThan(lost);
     }
+  });
+
+  test('a claim that cannot be evaluated (no utterances) or that throws is released', () => {
+    expect(fn).toContain("removeGmeetContextKeysForUser(ownerUserId, assemblyaiId, ['autoReview'])");
+    const empty = fn.slice(fn.indexOf('if (utterances.length === 0) {'), fn.indexOf("return 'skipped';", fn.indexOf('if (utterances.length === 0) {')));
+    expect(empty).toContain('await release();');
+    expect(fn).toContain('} catch (err) {\n    await release();\n    throw err;\n  }');
+  });
+
+  test('the claim is one conditional UPDATE where no autoReview exists, RETURNING a row to the winner', () => {
+    const claim = fnBody(read('db-ops/transcripts.ts'), 'export async function claimAutoReview(');
+    expect(claim).toContain("AND jsonb_typeof(gmeet_context->'autoReview') IS DISTINCT FROM 'object'");
+    expect(claim).toContain('RETURNING 1');
+    expect(claim).toContain('if (rows.length === 0) return false;');
+    // The series path does not claim: it owns the post-completion hook's one run.
+    expect(fnBody(src, 'export async function maybeAutoReview(')).not.toContain('claimAutoReview(');
   });
 
   test('blocked: stores mode grace + reason, sends no DM', () => {
@@ -78,9 +99,10 @@ describe('autoProceedAfterGrace — the manual-row path', () => {
     expect(fn).not.toContain("kind: 'needs_review'");
   });
 
-  test('passed: names applied, only the strict subset enrolled, mode grace, the row pref, one DM to the owner', () => {
+  test('passed: names applied, only the applied strong names enrolled, mode grace, the row pref, one DM to the owner', () => {
     expect(fn).toContain('await upsertMappingsForUser(ownerUserId, assemblyaiId, ev.merged);');
-    expect(fn).toMatch(/enrollFromTranscript\([^;]*, content, ev\.enroll\)/);
+    expect(fn).toContain('const enroll = ev.enroll;');
+    expect(fn).toMatch(/enrollFromTranscript\([^;]*, content, enroll\)/);
     expect(fn).not.toMatch(/enrollFromTranscript\([^;]*, content, ev\.merged\)/);
     expect(fn).toContain("autoReview: { evaluatedAt: nowIso, passed: true, mode: 'grace', generated: pref }");
     expect(fn).toContain("useVideo: pref === 'detailed-video'");
@@ -168,21 +190,22 @@ describe('the API: autoProceedAt on GET, the hold route', () => {
     expect(get).toContain('autoProceedAt: autoProceedAt(autoProceedFactsOf(refreshed))');
   });
 
-  test('POST …/notes/hold: 404 / 403 before any write; writes mode held with who; 409 once written', () => {
+  test('POST …/notes/hold: 404 / 403 before the write; the write IS the claim; 409 when it loses', () => {
     const src = read('app/api/transcripts/[id]/notes/hold/route.ts');
     const notFound = src.indexOf("{ error: 'Not found' }, { status: 404 }");
     const readOnly = src.indexOf("{ error: 'Read-only access' }, { status: 403 }");
-    const write = src.indexOf('await mergeGmeetContextForUser(');
+    const write = src.indexOf('await claimAutoReview(access.ownerUserId, id, {');
     expect(notFound).toBeGreaterThan(0);
     expect(readOnly).toBeGreaterThan(notFound);
     expect(write).toBeGreaterThan(readOnly);
+    expect(src).not.toContain('mergeGmeetContextForUser'); // never an unconditional write
     expect(src).toContain("mode: 'held'");
     expect(src).toContain('by: { userId: user.userId, email: user.email }');
     expect(src).toContain('passed: false,');
-    expect(src).toContain('if (existing?.passed) {');
+    expect(src).toContain('if (!won) {');
     expect(src).toContain('{ status: 409 }');
-    // Idempotent: an existing evaluation (held or blocked) is left alone.
-    expect(src).toContain('if (!existing) {');
+    // Pressing Hold twice is the one lost claim that is not an error.
+    expect(src).toContain("if (existing?.mode !== 'held') {");
     expect(src).toContain('autoProceedAt: autoProceedAt(autoProceedFactsOf(after))');
   });
 });

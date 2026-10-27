@@ -1781,6 +1781,34 @@ export async function updateStatusForUser(
   return rows[0] ?? null;
 }
 
+/**
+ * The automatic review's one-shot claim: write `gmeet_context.autoReview`
+ * ONLY where none exists (the same `jsonb_typeof … IS DISTINCT FROM 'object'`
+ * test `listAutoProceedBacklog` and the TS rule use, so a JSON null counts as
+ * absent), in one statement. Two sweepers, or a Hold / Generate landing in
+ * another process at the same minute, cannot both get through: exactly one
+ * caller sees a RETURNING row and owns the evaluation. The winner overwrites
+ * the claim with its final object (or removes the key to release it).
+ */
+export async function claimAutoReview(
+  userId: string,
+  assemblyaiId: string,
+  review: NonNullable<GmeetContext['autoReview']>
+): Promise<boolean> {
+  const rows = await sql`
+    UPDATE ${sql(SCHEMA)}.transcripts
+    SET gmeet_context = COALESCE(gmeet_context, '{}'::jsonb)
+                        || jsonb_build_object('autoReview', ${sql.json(review as unknown as never)}::jsonb)
+    WHERE user_id = ${userId}
+      AND assemblyai_id = ${assemblyaiId}
+      AND jsonb_typeof(gmeet_context->'autoReview') IS DISTINCT FROM 'object'
+    RETURNING 1
+  `;
+  if (rows.length === 0) return false;
+  publishEvent({ kind: 'meta', assemblyaiId });
+  return true;
+}
+
 export async function updateMetaForUser(
   userId: string,
   assemblyaiId: string,
