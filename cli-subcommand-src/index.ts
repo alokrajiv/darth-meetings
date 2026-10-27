@@ -145,13 +145,17 @@ SEGMENTS (a meeting is a TIMELINE of segments — see 'darth-cli meetings segmen
                                   move/trim/re-policy it, remove it, list what
                                   you could add, ask for split proposals,
                                   measure the offset between two recordings
-  split <meeting> --from T --to T [--title "…"] [--event <ref>] [--keep-in-both]
+  split <meeting> --from T --to T [--title "…"] [--event <ref>] [--keep-in-both] [--no-wait]
                                   Make that window of the meeting a meeting of
                                   its own on the SAME recording — no file cut,
                                   no re-transcription; the source keeps a hole
                                   there (or both keep it with --keep-in-both).
                                   --event links + shares the new meeting like
-                                  'link' does. T = mm:ss, h:mm:ss or ms
+                                  'link' does. T = mm:ss, h:mm:ss or ms.
+                                  While the speaker-ID pass still runs on the
+                                  meeting the server refuses (409
+                                  speaker_check_running); the CLI retries every
+                                  10 s for up to 3 min — --no-wait fails at once
   unsplit <split-off-id>          Put a split-off meeting back into its source
 
 TRANSCRIPTION VERSIONS (one recording, several transcriptions; ▶ = the one the
@@ -662,6 +666,13 @@ only where no other segment has speech), exclude (playable, no text). The
 server never guesses where a segment sits: --at defaults to 0:00, measure it
 with 'segments align' or set it by ear. Speaker names and text edits move
 with a split and come back with unsplit.
+
+Splitting right after a recording landed: the speaker-ID pass runs for about
+a minute after transcription, and the server refuses to split while it does
+(409 speaker_check_running) — a half born mid-pass would wait for names
+forever. 'split' waits for you (retries every 10 s, up to 3 min); pass
+--no-wait to fail at once instead. Naming EVERY speaker with set-speakers
+also ends the pass, so a meeting you have fully named is splittable at once.
 
 ## Mixed-language recordings
 
@@ -2393,7 +2404,7 @@ WRITE (needs read+write for meetings; you must be able to EDIT the meeting)
                                   with --near, ±30 min without). Slow on
                                   long files (minutes)
 
-  split <meeting> --from T --to T [--title …] [--event <ref>] [--keep-in-both]
+  split <meeting> --from T --to T [--title …] [--event <ref>] [--keep-in-both] [--no-wait]
   unsplit <meeting>               Top-level verbs — 'darth-cli meetings --help'
 
 T = mm:ss, h:mm:ss or plain ms. <rid> = recording uuid ('rec-<uuid>' accepted).
@@ -2635,10 +2646,43 @@ async function segmentsCmd(ctx: Ctx, flags: Record<string, string | boolean>, po
   }
 }
 
-/** darth-cli meetings split <meeting> --from T --to T [--title] [--event <ref>] [--keep-in-both] */
+/**
+ * The server answers 409 `speaker_check_running` while the speaker-ID pass
+ * runs on the meeting (a half split off mid-pass would inherit 'running' and
+ * wait for names forever). The pass takes about a minute, so `split` waits:
+ * one line, retry every `intervalMs`, give up after `maxMs`. Exported so the
+ * tests can shorten the clock; the CLI itself never changes these.
+ */
+export const SPLIT_RETRY = { intervalMs: 10_000, maxMs: 180_000 };
+
+type SplitReply = { ok: boolean; status: number; data: { code?: unknown; error?: unknown } | null };
+
+const isSpeakerCheckRunning = (r: SplitReply): boolean =>
+  r.status === 409 && (r.data?.code === "speaker_check_running" || r.data?.error === "speaker_check_running");
+
+/**
+ * Sends the split; on 409 speaker_check_running waits and re-sends until the
+ * server accepts, answers something else, or `SPLIT_RETRY.maxMs` has passed
+ * (the last reply — the 409 — is returned, so the caller prints the server's
+ * own sentence). `wait: false` returns the first reply as is.
+ */
+async function splitWithRetry(mid: string, send: () => Promise<SplitReply>, wait: boolean): Promise<SplitReply> {
+  const started = Date.now();
+  let r = await send();
+  while (wait && isSpeakerCheckRunning(r)) {
+    const elapsed = Date.now() - started;
+    if (elapsed + SPLIT_RETRY.intervalMs > SPLIT_RETRY.maxMs) break;
+    console.error(`speaker identification is still running on ${mid} — retrying in ${Math.round(SPLIT_RETRY.intervalMs / 1000)} s (up to ${Math.round(SPLIT_RETRY.maxMs / 60_000)} min in all; --no-wait fails at once)`);
+    await sleep(SPLIT_RETRY.intervalMs);
+    r = await send();
+  }
+  return r;
+}
+
+/** darth-cli meetings split <meeting> --from T --to T [--title] [--event <ref>] [--keep-in-both] [--no-wait] */
 async function splitCmd(ctx: Ctx, flags: Record<string, string | boolean>, args: string[]): Promise<number> {
   const mid = args[0];
-  const usage = "usage: darth-cli meetings split <meeting> --from T --to T [--title \"…\"] [--event <meeting-code|event-key>] [--keep-in-both]   (T = mm:ss, h:mm:ss or ms, on the MEETING's timeline)";
+  const usage = "usage: darth-cli meetings split <meeting> --from T --to T [--title \"…\"] [--event <meeting-code|event-key>] [--keep-in-both] [--no-wait]   (T = mm:ss, h:mm:ss or ms, on the MEETING's timeline)";
   if (!mid) { console.error(usage); return 1; }
   const from = timeFlag(flags, "from"), to = timeFlag(flags, "to");
   if (from === null || to === null) return 1;
@@ -2650,8 +2694,13 @@ async function splitCmd(ctx: Ctx, flags: Record<string, string | boolean>, args:
   const ev = str(flags.event);
   if (ev) body.eventRef = ev;
   if (flags["keep-in-both"] === true) body.keepInBoth = true;
-  const r = await recordingRequest(ctx, `/api/transcripts/${mid}/split`, { method: "POST", body: JSON.stringify(body) });
+  const r = await splitWithRetry(
+    mid,
+    () => recordingRequest(ctx, `/api/transcripts/${mid}/split`, { method: "POST", body: JSON.stringify(body) }),
+    flags["no-wait"] !== true
+  );
   if (!r.ok) {
+    if (isSpeakerCheckRunning(r) && flags["no-wait"] !== true) console.error(`gave up after ${Math.round(SPLIT_RETRY.maxMs / 60_000)} min — the speaker pass is still running on ${mid}; 'darth-cli meetings speakers ${mid}' shows it, or name every speaker with set-speakers to end it.`);
     const code = segmentWriteError("split", r.status, r.data);
     if (r.status === 404 && ev) console.error("Tip: 'darth-cli meetings calendar --view all --json' lists your events with their [meeting-code] and exact 'key'.");
     return code;

@@ -1,6 +1,7 @@
 import 'server-only';
 import { randomUUID } from 'node:crypto';
 import {
+  childSpeakerIdStatus,
   countEdits,
   holesOf,
   meetingSpanMs,
@@ -110,10 +111,19 @@ export interface SplitInput {
 
 export type ClipOpResult<T> =
   | { ok: true; body: T }
-  | { ok: false; status: number; body: { error: string; code?: string } };
+  | { ok: false; status: number; body: { error: string; code?: string; message?: string } };
 
+/**
+ * `error` is the sentence (what the dialog and the CLI's generic error line
+ * print), `code` the key a client branches on; `message` repeats the sentence
+ * under the name the 2026-10-27 split brief gave it.
+ */
 function refuse<T>(refusal: SplitRefusal, status = 409): ClipOpResult<T> {
-  return { ok: false, status, body: { error: refusal.message, code: refusal.code } };
+  return {
+    ok: false,
+    status,
+    body: { error: refusal.message, code: refusal.code, message: refusal.message },
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -208,6 +218,7 @@ async function splitPreconditionFor(
     trashed: !!row.deleted_at,
     status: row.status,
     retranscribing: !!row.gmeet_context?.retranscribing,
+    speakerIdRunning: row.speaker_id_status === 'running',
     // The one legacy pair of meetings that share an AssemblyAI job: two rows,
     // one set of bytes, and a split would rewrite `imported_content` on one of
     // them while the other kept showing the old text under the same id.
@@ -514,9 +525,10 @@ export async function splitMeeting(input: SplitInput): Promise<ClipOpResult<Spli
   // The ID pass does not have to run again: same recording, same diarization
   // space, and its answers have just been copied. Saying so is also what keeps
   // `listSpeakerIdBacklog` (which sweeps completed meetings that have neither
-  // notes nor a pass) from spending a model call on it.
-  const idStatus =
-    row.speaker_id_status ?? (speakerRows.length > 0 ? 'completed' : null);
+  // notes nor a pass) from spending a model call on it. `childSpeakerIdStatus`
+  // is also what guarantees the half is never born 'running' (the
+  // precondition refused that case before anything was written).
+  const idStatus = childSpeakerIdStatus(row.speaker_id_status, speakerRows.length);
   if (idStatus) await setSpeakerIdForUser(access.ownerUserId, newId, { status: idStatus });
 
   // Edits, every user's, re-keyed both ways (landmine #2).

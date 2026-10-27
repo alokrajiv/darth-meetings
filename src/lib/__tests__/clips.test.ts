@@ -25,6 +25,7 @@ import {
   silenceBoundaries,
   speakerBoundaries,
   splitPrecondition,
+  childSpeakerIdStatus,
   validateSplitWindow,
   windowBoundsFor,
   type ClipWindow,
@@ -681,6 +682,30 @@ describe('the file-deletion rule (spec §Media — "test it hard")', () => {
 });
 
 
+describe('the speaker_id_status a split-off half is born with', () => {
+  test('a finished or errored source hands its status on as is', () => {
+    expect(childSpeakerIdStatus('completed', 0)).toBe('completed');
+    expect(childSpeakerIdStatus('completed', 3)).toBe('completed');
+    expect(childSpeakerIdStatus('error', 0)).toBe('error');
+  });
+
+  test('a source with no pass: completed when names were copied, else nothing', () => {
+    expect(childSpeakerIdStatus(null, 0)).toBeNull();
+    expect(childSpeakerIdStatus(undefined, 0)).toBeNull();
+    expect(childSpeakerIdStatus(null, 2)).toBe('completed');
+  });
+
+  test("a running source NEVER yields a running half — nobody would end that wait", () => {
+    expect(childSpeakerIdStatus('running', 0)).toBeNull();
+    expect(childSpeakerIdStatus('running', 1)).toBe('completed');
+    for (const n of [0, 1, 5]) {
+      for (const s of [null, undefined, 'running', 'completed', 'error']) {
+        expect(childSpeakerIdStatus(s, n)).not.toBe('running');
+      }
+    }
+  });
+});
+
 describe('split preconditions — one answer for the menu and the route', () => {
   /** A meeting nothing is wrong with. */
   const ok = {
@@ -688,6 +713,7 @@ describe('split preconditions — one answer for the menu and the route', () => 
     trashed: false,
     status: 'completed',
     retranscribing: false,
+    speakerIdRunning: false,
     sharedJob: false,
     videoParts: 0,
     hasClip: true,
@@ -708,12 +734,23 @@ describe('split preconditions — one answer for the menu and the route', () => 
     expect(splitPrecondition({ ...ok, hasClip: false })?.code).toBe('no-clip');
   });
 
+  test('a running speaker pass refuses with the code darth-cli waits on', () => {
+    const refusal = splitPrecondition({ ...ok, speakerIdRunning: true })!;
+    expect(refusal.code).toBe('speaker_check_running');
+    expect(refusal.message).toMatch(/retry in about a minute/);
+    // "still being transcribed" is the earlier truth when both hold.
+    expect(splitPrecondition({ ...ok, speakerIdRunning: true, status: 'processing' })?.code).toBe(
+      'not-completed'
+    );
+  });
+
   test('every refusal says something — a greyed item always has a tooltip', () => {
     for (const over of [
       { enabled: false },
       { trashed: true },
       { status: 'error' },
       { retranscribing: true },
+      { speakerIdRunning: true },
       { sharedJob: true },
       { videoParts: 1 },
       { hasClip: false },

@@ -233,7 +233,8 @@ export type SplitRefusalCode =
   | 'multi-recording'
   | 'shared-job'
   | 'no-clip'
-  | 'disabled';
+  | 'disabled'
+  | 'speaker_check_running';
 
 export interface SplitRefusal {
   code: SplitRefusalCode;
@@ -256,6 +257,10 @@ const REFUSAL_TEXT: Record<SplitRefusalCode, string> = {
     'This meeting shares its transcription with another person’s copy of the same call, so it cannot be split.',
   'no-clip': 'This meeting has no recording to take a part of.',
   disabled: 'Splitting is not available on this server.',
+  // Underscored, unlike its neighbours: darth-cli matches this exact string
+  // to decide that waiting is worth it (`splitWithRetry`).
+  speaker_check_running:
+    'Speaker identification is still running on this meeting — retry in about a minute.',
 };
 
 export function splitRefusal(code: SplitRefusalCode, message?: string): SplitRefusal {
@@ -289,6 +294,13 @@ export interface SplitPreconditionInput {
   status: string;
   /** A re-transcription is in flight (`gmeet_context.retranscribing`). */
   retranscribing: boolean;
+  /**
+   * The speaker-identification pass is running (`speaker_id_status`).
+   * A half split off now would inherit 'running' and nothing would ever
+   * finish it: the pass writes only to the source, and the detail page hides
+   * Generate behind "Identifying speakers first…" until the status moves.
+   */
+  speakerIdRunning: boolean;
   /** The legacy pair: two meeting rows over ONE AssemblyAI job. */
   sharedJob: boolean;
   /** Playable videos beyond the first (a stop/restart Meet meeting). */
@@ -304,6 +316,7 @@ export function splitPrecondition(input: SplitPreconditionInput): SplitRefusal |
   if (input.trashed) return splitRefusal('not-completed', 'This meeting is in the trash.');
   if (input.status !== 'completed') return splitRefusal('not-completed');
   if (input.retranscribing) return splitRefusal('transcribing');
+  if (input.speakerIdRunning) return splitRefusal('speaker_check_running');
   if (input.sharedJob) return splitRefusal('shared-job');
   if (input.videoParts > 0) {
     return splitRefusal(
@@ -313,6 +326,27 @@ export function splitPrecondition(input: SplitPreconditionInput): SplitRefusal |
   }
   if (!input.hasClip || !(input.spanMs > 0)) return splitRefusal('no-clip');
   return null;
+}
+
+/**
+ * The `speaker_id_status` a split-off half is born with.
+ *
+ * Same recording, same diarization space, and the source's answers have just
+ * been copied onto it — so the pass need not run again, and saying so keeps
+ * `listSpeakerIdBacklog` from spending a model call on it. The one value it
+ * must never inherit is 'running': the route refuses to split while the pass
+ * runs (`speakerIdRunning`), and should a 'running' row reach here anyway,
+ * the half reads 'completed' when names were copied and null when there was
+ * nothing to copy — never a wait nobody will end.
+ */
+export function childSpeakerIdStatus(
+  sourceStatus: string | null | undefined,
+  copiedSpeakerRows: number
+): string | null {
+  if (sourceStatus === 'running' || sourceStatus === undefined || sourceStatus === null) {
+    return copiedSpeakerRows > 0 ? 'completed' : null;
+  }
+  return sourceStatus;
 }
 
 /**

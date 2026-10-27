@@ -10,6 +10,7 @@ import {
 import { enrollFromTranscript } from '@/lib/server/voiceprint';
 import { getContentCached } from '@/lib/server/auto-notes';
 import { resolveMeetingContent } from '@/lib/server/recordings';
+import { settleSpeakerIdAfterNaming } from '@/lib/server/speaker-id-settle';
 
 export const runtime = 'nodejs';
 
@@ -82,15 +83,26 @@ export const PUT = withAuth(async ({ user, request }, { params }) => {
 
   const row = await upsertMappingsForUser(access.ownerUserId, id, labels);
 
+  // One content read serves both of the follow-ups below.
+  const content = await getContentCached(access.ownerUserId, access.row).catch((err) => {
+    console.warn('[speakers PUT] content read failed:', err);
+    return null;
+  });
+
+  // Naming everyone answers the question the speaker-ID pass was asking: a
+  // null / running / errored pass is marked completed, so the detail page
+  // stops waiting ("Identifying speakers first…") and the sweeper never
+  // spends a model call re-running it. Best-effort — the names are saved.
+  await settleSpeakerIdAfterNaming(access.ownerUserId, access.row, labels, content).catch((err) =>
+    console.warn('[speakers PUT] speaker_id_status settle failed:', err)
+  );
+
   // Every confirmed name is free enrollment data: update that person's
   // voiceprint from this meeting's audio (fire-and-forget, best-effort).
   // Text and media both come from the resolver, so the utterance ms and the
   // file they are sliced out of always belong to the same timeline.
   void (async () => {
-    const [content, resolved] = await Promise.all([
-      getContentCached(access.ownerUserId, access.row),
-      resolveMeetingContent(access.row),
-    ]);
+    const resolved = await resolveMeetingContent(access.row);
     await enrollFromTranscript(resolved.media /* every file: a combined meeting embeds each recording's voices from ITS OWN file (mediaForSpeaker) */, content, labels);
   })().catch((err) => console.warn('[speakers PUT] voiceprint enroll failed:', err));
 
