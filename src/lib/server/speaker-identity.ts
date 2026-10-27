@@ -17,25 +17,35 @@ import type { GmeetAttendee, SpeakerLabel, SpeakerSuggestionMap } from '@/lib/fo
  * suggestions get their email before they are stored.
  */
 
+export interface ResolveIdentityOpts {
+  attendees: ReadonlyArray<GmeetAttendee> | null | undefined;
+  /** The meeting's current suggestions — a same-email guess lends its
+   * spelling to a nameless `A=email` label. */
+  suggestions?: SpeakerSuggestionMap | null;
+  createdBy: string;
+}
+
 /**
  * Labels as the PUT …/speakers route stores them. A label with an email is
- * normalised and its `customName` becomes the canonical display name —
- * directory row (`findPersonByEmail`) → this meeting's invitee → the sent
- * name — and when no directory row exists one is created with that name,
- * exactly as the "+ Person" dialog's POST does. An email that already
- * belongs to someone (a race with another writer) reuses that record's
- * name; a second record is never forked. Labels without an email, and labels
- * whose email is not an address, pass through untouched (the latter with the
- * bad value dropped — the route already refused it with a 400 when sent).
+ * normalised; its `customName` is KEPT when the client sent one (the email
+ * is identity only — renaming to the directory spelling would start a new
+ * name-keyed voiceprint). A nameless label (`A=email`) gets a name: the
+ * speaker's own suggestion when it carries the same email → directory row
+ * (`findPersonByEmail`) → this meeting's invitee → the email's local part.
+ * Either way, when no directory row exists one is created with the kept
+ * name, exactly as the "+ Person" dialog's POST does; an email that already
+ * belongs to someone (a race with another writer) reuses that record — a
+ * second one is never forked. Labels without an email, and labels whose
+ * email is not an address, pass through (the latter with the bad value
+ * dropped — the route already refused it with a 400 when sent).
  *
- * Best-effort per label: a directory failure keeps the sent name and logs.
+ * Best-effort per label: a directory failure keeps the name and logs.
  */
 export async function resolveLabelIdentities(
   labels: ReadonlyArray<SpeakerLabel>,
-  opts: { attendees: ReadonlyArray<GmeetAttendee> | null | undefined; createdBy: string }
+  opts: ResolveIdentityOpts
 ): Promise<SpeakerLabel[]> {
   const out: SpeakerLabel[] = [];
-  const cache = new Map<string, string>(); // email → canonical name, per call
   for (const l of labels) {
     const email = normalizeEmail(l.email);
     if (!email || !isEmailShape(email)) {
@@ -43,28 +53,27 @@ export async function resolveLabelIdentities(
       out.push(rest);
       continue;
     }
-    let name = cache.get(email);
-    if (name === undefined) {
-      name = await canonicalNameFor(email, l.customName, opts).catch((err) => {
-        console.warn(`[speaker-identity] directory lookup failed for ${email}:`, err);
-        return canonicalSpeakerName({ sent: l.customName }, email);
-      });
-      cache.set(email, name);
-    }
+    const suggestion = opts.suggestions?.[l.originalSpeaker];
+    const suggestionName = suggestion?.email && normalizeEmail(suggestion.email) === email ? suggestion.name : null;
+    const name = await nameAndDirectoryRow(email, { sent: l.customName, suggestionName }, opts).catch((err) => {
+      console.warn(`[speaker-identity] directory lookup failed for ${email}:`, err);
+      return canonicalSpeakerName({ sent: l.customName, suggestionName }, email);
+    });
     out.push({ ...l, customName: name, email });
   }
   return out;
 }
 
-async function canonicalNameFor(
+/** The name to store, with the directory row ensured. */
+async function nameAndDirectoryRow(
   email: string,
-  sent: string,
-  opts: { attendees: ReadonlyArray<GmeetAttendee> | null | undefined; createdBy: string }
+  input: { sent: string; suggestionName: string | null },
+  opts: ResolveIdentityOpts
 ): Promise<string> {
   const inviteeName = opts.attendees?.find((a) => normalizeEmail(a.email) === email)?.name ?? null;
   const person = await findPersonByEmail(email);
-  if (person) return canonicalSpeakerName({ sent, directoryName: person.name, inviteeName }, email);
-  const name = canonicalSpeakerName({ sent, inviteeName }, email);
+  if (person) return canonicalSpeakerName({ ...input, directoryName: person.name, inviteeName }, email);
+  const name = canonicalSpeakerName({ ...input, inviteeName }, email);
   try {
     await createCustomPerson({ name, email, createdBy: opts.createdBy });
     return name;
@@ -72,7 +81,7 @@ async function canonicalNameFor(
     // The email became taken between the lookup and the INSERT: use what is
     // there now — never a second record for one address.
     const now = await findPersonByEmail(email);
-    if (now) return canonicalSpeakerName({ sent, directoryName: now.name, inviteeName }, email);
+    if (now) return canonicalSpeakerName({ ...input, directoryName: now.name, inviteeName }, email);
     throw err;
   }
 }

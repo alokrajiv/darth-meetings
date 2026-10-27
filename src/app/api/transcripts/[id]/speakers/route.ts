@@ -95,11 +95,16 @@ export const PUT = withAuth(async ({ user, request }, { params }) => {
     );
   }
 
-  // A label with an email names a PERSON: the stored name is the canonical
-  // one (directory → invitee → sent) and a missing directory row is created
-  // — the same as "+ Person". The reply carries what was stored.
+  // A label with an email names a PERSON. The sent name is kept (the email
+  // never renames — voiceprints are keyed by spelling); a nameless label
+  // (`A=email`) takes the same-email suggestion → directory → invitee; a
+  // missing directory row is created — the same as "+ Person". The reply
+  // carries what was stored.
   const labels = await resolveLabelIdentities(sent, {
     attendees: access.row.gmeet_context?.attendees,
+    suggestions: sent.some((l) => l.email && !l.customName.trim())
+      ? ((await getMappingsForUser(access.ownerUserId, id))?.suggestions ?? null)
+      : null,
     createdBy: user.userId,
   });
   const row = await upsertMappingsForUser(access.ownerUserId, id, labels);

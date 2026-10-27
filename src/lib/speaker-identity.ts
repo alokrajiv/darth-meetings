@@ -11,13 +11,19 @@ import { personNameKey } from '@/lib/person-identity';
  *    exact match against the candidates (invitees, directory), or a
  *    "First Last" prefix of exactly one longer name; two candidates → null,
  *    never a guess.
- *  - `canonicalSpeakerName`: which spelling a label with an email stores
- *    (directory → invitee → what was sent).
+ *  - `canonicalSpeakerName`: which spelling a label with an email stores. A
+ *    name the client SENT is kept as is — the email is identity only, never a
+ *    rename: voiceprints are keyed by the name's spelling (`personNameKey`,
+ *    which does not fold spacing inside a name), and the directory spelling
+ *    differs from the enrolled one for a good share of the heaviest prints,
+ *    so "canonicalising" would start a new print and split a voice. Only a
+ *    label with NO name (`A=email`) gets one: the same-email suggestion's
+ *    spelling (it came from the print) → directory → invitee → local part.
  *
  * The server half (lib/server/speaker-identity.ts) looks the directory up and
  * creates the custom person row; the CLI parses `A=email`, `A="Name <email>"`.
- * Voiceprints are still keyed by name — re-keying them by email is a later,
- * separate migration.
+ * Re-keying voiceprints by email is a later, separate migration — by an alias
+ * (print ↔ email), never by renaming, for the same spelling reason.
  */
 
 const EMAIL_RE = /^[^\s@<>]+@[^\s@<>]+\.[^\s@<>]+$/;
@@ -68,8 +74,11 @@ export function matchEmailByName(name: string, candidates: ReadonlyArray<NamedEm
 }
 
 export interface CanonicalNameInput {
-  /** What the client sent (may be empty for `A=email`). */
+  /** What the client sent (empty for `A=email`). Non-empty = kept as is. */
   sent: string | null | undefined;
+  /** The speaker's current suggestion name, only when that suggestion
+   * carries the SAME email — the spelling the voiceprint knows. */
+  suggestionName?: string | null;
   /** The directory's name for the email, when a row exists. */
   directoryName?: string | null;
   /** This meeting's invitee name for the email, when on the invite. */
@@ -77,12 +86,13 @@ export interface CanonicalNameInput {
 }
 
 /**
- * The display name a label with an email stores: directory → invitee → the
- * sent name → (last resort, nothing anywhere) the email's local part, so a
- * directory row can always be created with SOME name.
+ * The display name a label with an email stores. A sent name wins outright
+ * (the email never renames). With no sent name: the same-email suggestion →
+ * directory → invitee → (last resort) the email's local part, so a directory
+ * row can always be created with SOME name.
  */
 export function canonicalSpeakerName(input: CanonicalNameInput, email: string): string {
-  for (const n of [input.directoryName, input.inviteeName, input.sent]) {
+  for (const n of [input.sent, input.suggestionName, input.directoryName, input.inviteeName]) {
     const t = (n ?? '').trim();
     if (t) return t;
   }

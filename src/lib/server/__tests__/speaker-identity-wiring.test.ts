@@ -35,6 +35,8 @@ describe('PUT …/speakers', () => {
     expect(upsert).toBeGreaterThan(resolve);
     expect(put).toContain('createdBy: user.userId');
     expect(put).toContain('attendees: access.row.gmeet_context?.attendees');
+    // The suggestions are read only when a nameless `A=email` label needs a spelling.
+    expect(put).toContain('suggestions: sent.some((l) => l.email && !l.customName.trim())');
     expect(put).toContain('settleSpeakerIdAfterNaming(access.ownerUserId, access.row, labels, content)');
     expect(put).toMatch(/enrollFromTranscript\([^;]*, content, labels\)/);
     expect(put).toContain('return NextResponse.json({ speakerLabels: row.speaker_labels });');
@@ -44,23 +46,26 @@ describe('PUT …/speakers', () => {
 describe('resolveLabelIdentities', () => {
   const src = read('lib/server/speaker-identity.ts');
 
-  test('directory → invitee → sent; a missing row is created; a taken email reuses the record', () => {
-    const fn = src.slice(src.indexOf('async function canonicalNameFor('), src.indexOf('\n}\n', src.indexOf('async function canonicalNameFor(')));
+  test('the sent name is kept (canonicalSpeakerName puts `sent` first); the same-email suggestion lends its spelling to a nameless label', () => {
+    const pure = read('lib/speaker-identity.ts');
+    expect(pure).toContain('for (const n of [input.sent, input.suggestionName, input.directoryName, input.inviteeName])');
+    const fn = src.slice(src.indexOf('export async function resolveLabelIdentities('), src.indexOf('\n/** The name to store'));
+    expect(fn).toContain("const suggestionName = suggestion?.email && normalizeEmail(suggestion.email) === email ? suggestion.name : null;");
+    expect(fn).toContain('if (!email || !isEmailShape(email)) {');
+    expect(fn).toContain('out.push({ ...l, customName: name, email });');
+  });
+
+  test('the directory row is ensured with the kept name; a taken email reuses the record, never a second one', () => {
+    const fn = src.slice(src.indexOf('async function nameAndDirectoryRow('), src.indexOf('\n}\n', src.indexOf('async function nameAndDirectoryRow(')));
     const lookup = fn.indexOf('await findPersonByEmail(email)');
     const create = fn.indexOf('await createCustomPerson({ name, email, createdBy: opts.createdBy })');
     const retry = fn.indexOf('const now = await findPersonByEmail(email);');
     expect(lookup).toBeGreaterThan(0);
     expect(create).toBeGreaterThan(lookup);
     expect(retry).toBeGreaterThan(create);
-    expect(fn).toContain("canonicalSpeakerName({ sent, directoryName: person.name, inviteeName }, email)");
-    expect(fn).toContain('canonicalSpeakerName({ sent, inviteeName }, email)');
-    expect(fn).toContain('canonicalSpeakerName({ sent, directoryName: now.name, inviteeName }, email)');
-  });
-
-  test('a label without an email passes through; a malformed one is dropped, not stored', () => {
-    const fn = src.slice(src.indexOf('export async function resolveLabelIdentities('), src.indexOf('\nasync function canonicalNameFor('));
-    expect(fn).toContain('if (!email || !isEmailShape(email)) {');
-    expect(fn).toContain('out.push({ ...l, customName: name, email });');
+    expect(fn).toContain('canonicalSpeakerName({ ...input, directoryName: person.name, inviteeName }, email)');
+    expect(fn).toContain('canonicalSpeakerName({ ...input, inviteeName }, email)');
+    expect(fn).toContain('canonicalSpeakerName({ ...input, directoryName: now.name, inviteeName }, email)');
   });
 });
 

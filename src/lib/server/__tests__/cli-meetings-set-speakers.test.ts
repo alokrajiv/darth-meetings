@@ -87,10 +87,15 @@ function api(_base: string, p: string, init?: RequestInit): Promise<Response> {
       return Promise.resolve(Response.json({ error: 'Invalid speakerLabels' }, { status: 400 }));
     }
   }
-  // The route's resolution: an email makes the canonical name win.
-  const stored = body.speakerLabels.map((l) =>
-    l.email ? { ...l, email: l.email.toLowerCase(), customName: DIRECTORY[l.email.toLowerCase()] ?? l.customName ?? l.email.split('@')[0] } : l
-  );
+  // The route's resolution: a sent name is KEPT (the email never renames); a
+  // nameless `A=email` takes the same-email suggestion, else the directory.
+  const stored = body.speakerLabels.map((l) => {
+    if (!l.email) return l;
+    const email = l.email.toLowerCase();
+    const sameEmailGuess = suggestions[l.originalSpeaker]?.email === email ? suggestions[l.originalSpeaker]!.name : null;
+    const customName = l.customName?.trim() || sameEmailGuess || DIRECTORY[email] || email.split('@')[0]!;
+    return { ...l, email, customName };
+  });
   puts.push(body.speakerLabels);
   labels = stored;
   return Promise.resolve(Response.json({ speakerLabels: stored }));
@@ -148,16 +153,21 @@ describe('the three assignment forms', () => {
     expect(out()).toContain('A          = Interviewer #1');
   });
 
-  test('A=email sends the person; the server fills the name and the CLI prints name <email>', async () => {
+  test('A=email sends the person; the server fills the name (same-email guess first) and the CLI prints name <email>', async () => {
     expect(await run(['m-x', 'A=Test-A@Example.com'])).toBe(0);
     expect(puts[0]!.find((l) => l.originalSpeaker === 'A')).toEqual({ originalSpeaker: 'A', customName: '', description: '', email: 'test-a@example.com' });
     expect(out()).toContain('A          = Test Person A <test-a@example.com>');
+    // No guess for that email on this speaker → the directory spelling.
+    suggestions = {};
+    expect(await run(['m-x', 'B=test-b@example.com'])).toBe(0);
+    expect(out()).toContain('B          = Test Person B <test-b@example.com>');
   });
 
-  test('A="Name <email>" sends both; the server\'s canonical name still wins in the print', async () => {
+  test('A="Name <email>" sends both; the SENT name is what is stored — the email never renames', async () => {
     expect(await run(['m-x', 'B=Someone Typed <test-b@example.com>'])).toBe(0);
     expect(puts[0]!.find((l) => l.originalSpeaker === 'B')).toEqual({ originalSpeaker: 'B', customName: 'Someone Typed', description: '', email: 'test-b@example.com' });
-    expect(out()).toContain('B          = Test Person B <test-b@example.com>');
+    expect(out()).toContain('B          = Someone Typed <test-b@example.com>');
+    expect(out()).not.toContain('Test Person B <test-b@example.com>');
   });
 
   test('an unknown email with no directory row keeps the typed name', async () => {

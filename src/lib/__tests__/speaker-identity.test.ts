@@ -77,13 +77,20 @@ describe('matchEmailByName — one person or nobody', () => {
   });
 });
 
-describe('canonicalSpeakerName — directory → invitee → sent → local part', () => {
-  test('precedence', () => {
-    const email = 'test-a@example.com';
-    expect(canonicalSpeakerName({ sent: 'A Sent', directoryName: 'Directory A', inviteeName: 'Invitee A' }, email)).toBe('Directory A');
-    expect(canonicalSpeakerName({ sent: 'A Sent', directoryName: null, inviteeName: 'Invitee A' }, email)).toBe('Invitee A');
-    expect(canonicalSpeakerName({ sent: 'A Sent', directoryName: '  ', inviteeName: '' }, email)).toBe('A Sent');
-    expect(canonicalSpeakerName({ sent: '' }, email)).toBe('test-a');
+describe('canonicalSpeakerName — the email never renames', () => {
+  const email = 'test-a@example.com';
+
+  test('a sent name is kept even when the directory spells it differently (name-keyed prints must not split)', () => {
+    expect(
+      canonicalSpeakerName({ sent: 'Test A', suggestionName: 'Test Person A', directoryName: 'Test Person A Middle', inviteeName: 'Invitee A' }, email)
+    ).toBe('Test A');
+  });
+
+  test('no sent name: the same-email suggestion → directory → invitee → local part', () => {
+    expect(canonicalSpeakerName({ sent: '', suggestionName: 'Test Person A', directoryName: 'Directory A', inviteeName: 'Invitee A' }, email)).toBe('Test Person A');
+    expect(canonicalSpeakerName({ sent: '  ', suggestionName: null, directoryName: 'Directory A', inviteeName: 'Invitee A' }, email)).toBe('Directory A');
+    expect(canonicalSpeakerName({ sent: '', directoryName: null, inviteeName: 'Invitee A' }, email)).toBe('Invitee A');
+    expect(canonicalSpeakerName({ sent: '', directoryName: '  ', inviteeName: '' }, email)).toBe('test-a');
   });
 });
 
