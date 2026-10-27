@@ -99,6 +99,19 @@ export function canonicalSpeakerName(input: CanonicalNameInput, email: string): 
   return normalizeEmail(email).split('@')[0] ?? '';
 }
 
+/**
+ * Where a suggestion's identity came from, for the UI and the CLI: "on the
+ * invite" / "in the directory", or "no email match" when the guess names
+ * nobody in particular (two candidates, or none). Null for no suggestion.
+ */
+export function identitySource(
+  s: { email?: string | null; emailSource?: 'invite' | 'directory' | null } | null | undefined
+): 'on the invite' | 'in the directory' | 'no email match' | null {
+  if (!s) return null;
+  if (!s.email) return 'no email match';
+  return s.emailSource === 'directory' ? 'in the directory' : 'on the invite';
+}
+
 /** The invitees as match candidates, names filled from the directory when the invite had none. */
 export function inviteeCandidates(
   attendees: ReadonlyArray<{ email: string; name?: string | null }> | null | undefined,

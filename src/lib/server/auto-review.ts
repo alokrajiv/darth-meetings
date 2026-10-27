@@ -265,7 +265,10 @@ export async function autoProceedAfterGrace(
 
   const after = await getForUser(ownerUserId, assemblyaiId);
   if (owner && after?.auto_report_status === 'completed') {
-    const names = ev.merged.map((l) => l.customName.trim()).filter(Boolean);
+    // Who the summary names — as PEOPLE where the identity is known.
+    const names = ev.merged
+      .filter((l) => l.customName.trim())
+      .map((l) => (l.email ? `${l.customName.trim()} (${l.email})` : l.customName.trim()));
     void notifyUser({
       kind: 'report_ready',
       toEmail: owner.email,

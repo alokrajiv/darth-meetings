@@ -2003,7 +2003,10 @@ function printSpeakers(id: string, t: any, sp: { speakerLabels: any[]; suggestio
   for (const orig of [...names].sort()) {
     const l = labels.get(orig); const g = sp.suggestions?.[orig];
     const confirmed = l?.customName?.trim();
-    const guess = g ? `${fmtPerson(g.name, g.email)} (${Math.round((g.confidence ?? 0) * 100)}%${g.source ? `, ${g.source}` : ""}${g.via === "id" ? ", id-pass" : ""})` : null;
+    // "(90%, voice, id-pass, on the invite)": confidence, how the guess was
+    // made, and — when it names ONE person — where the identity came from.
+    const where = g?.emailSource === "invite" ? ", on the invite" : g?.emailSource === "directory" ? ", in the directory" : g?.email ? "" : g ? ", no email match" : "";
+    const guess = g ? `${fmtPerson(g.name, g.email)} (${Math.round((g.confidence ?? 0) * 100)}%${g.source ? `, ${g.source}` : ""}${g.via === "id" ? ", id-pass" : ""}${where})` : null;
     let line = `  ${orig.padEnd(10)} `;
     if (confirmed) line += `= ${fmtPerson(confirmed, l?.email)}   [confirmed${guess ? `; guess was ${guess}` : ""}]`;
     else if (guess) line += `? ${guess}${g.evidence ? `  — ${oneLine(String(g.evidence), 140)}` : ""}`;

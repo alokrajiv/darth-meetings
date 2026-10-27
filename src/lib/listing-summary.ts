@@ -122,9 +122,27 @@ export function summaryBadgeText(badge: SummaryBadge, clock: (iso: string) => st
   return badge.label;
 }
 
-/** The detail page's line under "No notes yet" while an automatic start is scheduled. */
-export function autoProceedLine(autoProceedAt: string, clock: (iso: string) => string = clockOf): string {
-  return `Summary starts automatically at ${clock(autoProceedAt)} with the suggested names.`;
+/** "Name <email>" when the person is known, else the name. */
+export function personLabel(name: string, email?: string | null): string {
+  const n = name.trim();
+  return email ? `${n} <${email}>` : n;
+}
+
+/**
+ * The detail page's line under "No notes yet" while an automatic start is
+ * scheduled. With `people` (what the pass would apply — the client runs the
+ * same pure evaluator over the loaded suggestions) it says WHO, as people
+ * where the identity is known, so nothing lands unseen when the grace ends.
+ */
+export function autoProceedLine(
+  autoProceedAt: string,
+  clock: (iso: string) => string = clockOf,
+  people: ReadonlyArray<{ name: string; email?: string | null }> = []
+): string {
+  const who = people.map((p) => personLabel(p.name, p.email)).filter(Boolean);
+  return who.length > 0
+    ? `Summary starts automatically at ${clock(autoProceedAt)} naming ${who.join(', ')}.`
+    : `Summary starts automatically at ${clock(autoProceedAt)} with the suggested names.`;
 }
 
 /** Where the action navigates: the meeting, carrying the intent. */

@@ -980,6 +980,9 @@ export interface SpeakerSuggestion {
    * suggestion saves `{customName, email}`.
    */
   email?: string;
+  /** Where `email` came from: the meeting's invite, or the people directory.
+   * Set together with `email`; the UI says "on the invite" / "in the directory". */
+  emailSource?: 'invite' | 'directory';
 }
 
 export type SpeakerSuggestionMap = Record<string, SpeakerSuggestion>;

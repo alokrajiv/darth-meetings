@@ -87,7 +87,10 @@ describe('suggestions carry the person', () => {
     const fn = src.slice(src.indexOf('export async function attachSuggestionEmails('), src.indexOf('export async function setSuggestionsWithIdentity('));
     expect(fn).toContain("filter(([, s]) => s?.name?.trim() && !s.email)");
     expect(fn.indexOf('matchEmailByName(s.name, invitees)')).toBeLessThan(fn.indexOf('await searchPeople(s.name, 10)'));
+    // …and records where the identity came from, together with the email.
+    expect(fn).toContain("let emailSource: 'invite' | 'directory' = 'invite';");
+    expect(fn).toContain("emailSource = 'directory';");
+    expect(fn).toContain('if (email) out[speaker] = { ...s, email, emailSource };');
     expect(fn).toContain('matchEmailByName(s.name, people)');
-    expect(fn).toContain('if (email) out[speaker] = { ...s, email };');
   });
 });

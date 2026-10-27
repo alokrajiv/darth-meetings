@@ -6,6 +6,7 @@
 import { describe, expect, test } from 'bun:test';
 import {
   canonicalSpeakerName,
+  identitySource,
   inviteeCandidates,
   isEmailShape,
   matchEmailByName,
@@ -110,5 +111,16 @@ describe('inviteeCandidates', () => {
       { email: 'test-c@example.com', name: null },
     ]);
     expect(inviteeCandidates(null)).toEqual([]);
+  });
+});
+
+describe('identitySource — what the UI and CLI say about a guess', () => {
+  test('invite / directory / no match / nothing', () => {
+    expect(identitySource({ email: 'test-a@example.com', emailSource: 'invite' })).toBe('on the invite');
+    expect(identitySource({ email: 'test-a@example.com', emailSource: 'directory' })).toBe('in the directory');
+    // An email stored before emailSource existed reads as the invite (the first thing the matcher tries).
+    expect(identitySource({ email: 'test-a@example.com' })).toBe('on the invite');
+    expect(identitySource({ email: undefined })).toBe('no email match');
+    expect(identitySource(null)).toBeNull();
   });
 });

@@ -66,7 +66,7 @@ const DIRECTORY: Record<string, string> = {
 };
 
 let labels: Label[];
-let suggestions: Record<string, { name: string; confidence: number; source?: string; email?: string }>;
+let suggestions: Record<string, { name: string; confidence: number; source?: string; email?: string; emailSource?: 'invite' | 'directory' }>;
 let puts: Label[][];
 let stdout: string[];
 let stderr: string[];
@@ -126,8 +126,8 @@ const run = (argv: string[]) => meetings.run(ctx(), ['set-speakers', ...argv]);
 beforeEach(() => {
   labels = [{ originalSpeaker: 'C', customName: 'Confirmed Person C', description: 'the host', email: 'test-c@example.com' }];
   suggestions = {
-    A: { name: 'Test Person A', confidence: 0.9, source: 'voice', email: 'test-a@example.com' },
-    B: { name: 'Test Person B', confidence: 0.88, source: 'voice', email: 'test-b@example.com' },
+    A: { name: 'Test Person A', confidence: 0.9, source: 'voice', email: 'test-a@example.com', emailSource: 'invite' },
+    B: { name: 'Test Person B', confidence: 0.88, source: 'voice', email: 'test-b@example.com', emailSource: 'directory' },
     D: { name: 'Nobody Known', confidence: 0.7, source: 'voice' }, // no email: ambiguous / not on the invite
   };
   puts = [];
@@ -243,11 +243,12 @@ describe('--from-invite', () => {
 });
 
 describe('speakers <id> shows the person', () => {
-  test('confirmed and guessed lines carry <email> when known, and hint at --from-invite', async () => {
+  test('confirmed and guessed lines carry <email> and where the identity came from, and hint at --from-invite', async () => {
     expect(await meetings.run(ctx(), ['speakers', 'm-x'])).toBe(0);
     expect(out()).toContain('C          = Confirmed Person C <test-c@example.com>   [confirmed]');
-    expect(out()).toContain('A          ? Test Person A <test-a@example.com> (90%, voice)');
-    expect(out()).toContain('D          ? Nobody Known (70%, voice)');
+    expect(out()).toContain('A          ? Test Person A <test-a@example.com> (90%, voice, on the invite)');
+    expect(out()).toContain('B          ? Test Person B <test-b@example.com> (88%, voice, in the directory)');
+    expect(out()).toContain('D          ? Nobody Known (70%, voice, no email match)');
     expect(out()).toContain('set-speakers m-x --from-invite');
   });
 });

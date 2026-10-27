@@ -109,6 +109,8 @@ describe('autoProceedAfterGrace — the manual-row path', () => {
     expect(fn).toContain('dedupeKey: `mw-auto-proceed:${assemblyaiId}:${owner.email}`');
     expect(fn).toContain('*Summary written automatically*');
     expect(fn).toContain('Fix any name');
+    // The DM names PEOPLE where the identity is known: "Name (email)".
+    expect(fn).toContain('(l.email ? `${l.customName.trim()} (${l.email})` : l.customName.trim())');
     expect(fn.match(/notifyUser\(/g)?.length).toBe(1);
   });
 });

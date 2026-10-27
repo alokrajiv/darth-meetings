@@ -129,6 +129,14 @@ describe('summaryBadgeFor — one badge, at most one action', () => {
     // The default clock renders a local HH:MM.
     expect(summaryBadgeText(badge)).toMatch(/^Summary at \d{1,2}:\d{2}/);
     expect(autoProceedLine(at, clock)).toBe(`Summary starts automatically at T(${at}) with the suggested names.`);
+    // With the people the pass would apply, the line says WHO — as people where known.
+    expect(
+      autoProceedLine(at, clock, [
+        { name: 'Test Person A', email: 'test-a@example.com' },
+        { name: 'Test Person B', email: null },
+        { name: '  ', email: null },
+      ])
+    ).toBe(`Summary starts automatically at T(${at}) naming Test Person A <test-a@example.com>, Test Person B.`);
   });
 
   test('a viewer sees the badge and no action', () => {

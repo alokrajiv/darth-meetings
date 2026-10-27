@@ -115,15 +115,17 @@ export async function attachSuggestionEmails(
   const out: SpeakerSuggestionMap = { ...suggestions };
   for (const [speaker, s] of pending) {
     let email = matchEmailByName(s.name, invitees);
+    let emailSource: 'invite' | 'directory' = 'invite';
     if (!email) {
       try {
         const people = await searchPeople(s.name, 10);
         email = matchEmailByName(s.name, people);
+        emailSource = 'directory';
       } catch (err) {
         console.warn(`[speaker-identity] directory search failed for a suggestion:`, err);
       }
     }
-    if (email) out[speaker] = { ...s, email };
+    if (email) out[speaker] = { ...s, email, emailSource };
   }
   return out;
 }
