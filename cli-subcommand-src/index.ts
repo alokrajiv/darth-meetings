@@ -41,8 +41,11 @@ READ
                                   owner and a 'shared with:' line (--json:
                                   "shared_with": [{email,name,access,source,
                                   shared_at,shared_by}])
-  text <id>                       Full transcript as "[mm:ss] Speaker: …" lines
-                                  (confirmed speaker names applied; grep/regex this)
+  text <id> [--index]             Full transcript as "[mm:ss] Speaker: …" lines
+                                  (confirmed speaker names applied; grep/regex this).
+                                  --index prefixes each line with its 0-based
+                                  utterance index, "[12] [mm:ss] Speaker: …" —
+                                  the address 'edit-line <id> <n>' takes
   text <id> --version <tid>       The same for a version that is NOT active (see
                                   TRANSCRIPTION VERSIONS); lines whose words came
                                   from a merge's fill pass end with ⟨merged⟩
@@ -92,12 +95,25 @@ READ
   frame <id> <ts> [--out <file>]  Grab a video frame at a timestamp (ms, mm:ss or
                                   hh:mm:ss) as jpeg — only transcripts imported
                                   from a video recording have frames
-  speakers <id>                   Diarized speakers of a transcript: confirmed
+  speakers <id> [--guess]         Diarized speakers of a transcript: confirmed
                                   name (if a human set one) + the machine's
                                   guess (name, confidence, voice|context) +
-                                  the speaker-ID pass status
+                                  the speaker-ID pass status. --guess = the
+                                  page's "Guess names" first: a voiceprint match
+                                  now (no LLM), and the server restarts the
+                                  speaker-ID pass when it errored or never ran
+                                  (needs edit access; completed + stored audio)
   attachments <id>                List attached context files
   attachment-get <id> <attId> [--out <file>]   Download one attachment
+  activity <id> [--limit N]       The meeting's activity feed, newest first: when
+                                  (your tz), who, what (view, edit_meta,
+                                  find_replace, share_add, …) + details; and
+                                  who viewed it in the last 30 days. N 1-200,
+                                  default 50
+  ai-runs <id>                    The server's AI runs on this meeting (summary,
+                                  report, speaker-ID, …): when, kind, status,
+                                  model, cost, duration, tokens, who started it;
+                                  plus lifetime totals
   labels                          Org-wide label tree with visible-to-you counts
                                   (subtree-inclusive) and #ids; --json = flat rows
   series                          The curated series YOU can see (you own, edit
@@ -287,7 +303,10 @@ WRITE (needs read+write for meetings)
                                   one of your recordings and you can already
                                   open a meeting of that occurrence, it is
                                   FOLDED into that meeting (this one goes
-                                  to your trash); --separate keeps it apart
+                                  to your trash); --separate keeps it apart.
+                                  link <id> --dismiss = the suggested-event
+                                  strip's "Not this": the guessed event is
+                                  no longer offered (409 when there is none)
   set-date <id> <when>            Set the meeting date/time of a transcript
                                   (ISO 8601, 'YYYY-MM-DD HH:mm' in your tz,
                                   or 'YYYY-MM-DD' = noon). For recordings
@@ -430,15 +449,65 @@ WRITE (needs read+write for meetings)
                                   {id,title,url,your_access,owner,
                                   shared_with[],changes[]} (an array for
                                   several ids). Ownership transfer stays in
-                                  the web dialog ('Make owner…')
+                                  the web dialog ('Make owner…').
+                                  share <id> --suggestions = the dialog's
+                                  "Suggested from this meeting" (named
+                                  speakers + Trames invitees not shared yet,
+                                  with why); --add-suggested [--access read]
+                                  adds each of them through --add (edit by
+                                  default; same directory check + Slack DM).
+                                  Readers get no suggestions
   set-title <id> <title>          Update the title
   set-notes <id> --file <md|->    Replace the notes markdown ('-' = stdin)
   set-report <id> --file <md|->   Replace the report markdown ('-' = stdin)
-  trash <id>                      Move a transcript you OWN to the trash (soft
+  set-description <id> --file <md|->
+                                  Replace the description under the title
+                                  ('-' = stdin; trimmed; an empty file clears it)
+  keep <id>[,<id>…]               The web UI's Keep on a temporary (scratch)
+                                  row: it becomes permanent (no 30-day trash).
+                                  One line per id; carries on past a failure,
+                                  exit 1 if any failed
+  unlink <id>                     Detach the calendar event ("Unlink from
+                                  event"): its keys + attendees come off, the
+                                  shares the link created are removed (printed);
+                                  recording, title, date and notes stay. 409
+                                  when it is not linked
+  fetch-recording <id>            Pull the meeting's recording from Google Drive
+                                  (your Google link) or Microsoft 365 and store
+                                  it — for a transcript-only import. 'already'
+                                  when it is stored; 422 = no recording known.
+                                  Can take minutes for a long call
+  retry <id>                      "Retry now" on a failed hand-off to
+                                  transcription (status error, bytes stored):
+                                  202 = back to 'uploading'; 409 = not a failed
+                                  hand-off
+  attach <id> <file> [--title "…"]
+                                  Attach context (agenda, deck, pdf/docx/pptx/
+                                  xlsx/text; max 25 MB) — text is extracted at
+                                  upload and the summary run reads it.
+                                  --text <file|-> instead of a file attaches
+                                  pasted text (title default "Pasted notes").
+                                  Prints the attachment id
+  attachment-rm <id> <attId>      Remove one attachment ('attachments <id>' ids)
+  edit-line <id> <n> --text "…"   Correct utterance n (from 'text <id> --index'):
+                                  the edit is a layer over the raw words, like
+                                  the page's inline edit. Prints before/after
+  replace <id> <find> <with> [--case] [--dry-run]
+                                  The Find & Replace panel's "Replace all" over
+                                  the edited text: case-insensitive unless
+                                  --case; --dry-run lists the lines it would
+                                  change (before/after) and writes nothing —
+                                  run it first. '' as <with> deletes. Put the
+                                  flags after the three arguments
+  trash <id> [--cancel-queued]    Move a transcript you OWN to the trash (soft
                                   delete: gone from listings/search/series for
                                   everyone, transcript + audio + notes kept).
                                   Reversible with 'restore'; permanent
-                                  deletion is web-only (Trash tab)
+                                  deletion is web-only (Trash tab).
+                                  --cancel-queued = the listing's "Cancel
+                                  queued import": deletes a 'waiting'
+                                  placeholder for good (an 'uploading' one
+                                  stays refused)
   restore <id>                    Bring a trashed transcript back (owner only)
   label / unlabel / label-create / label-rename / label-mv / label-rm
                                   (label/unlabel also need owner or edit access
@@ -810,6 +879,25 @@ auditors can see it), series-follower shares are the series' followers. 'get
 <id>' prints the same people on one line. Recordings are never shared; share
 the meeting. Ownership transfer stays in the web dialog.
 
+## Fixing the text, adding context, retrying
+
+A misheard name or term is fixed in the transcript's EDIT layer (the raw
+words are kept), exactly like the page's inline edit / Find & Replace:
+
+    darth-cli meetings text <id> --index                 # "[12] [mm:ss] Speaker: …"
+    darth-cli meetings edit-line <id> 12 --text "We ship on Monday."
+    darth-cli meetings replace <id> "Tramies" "Trames" --dry-run   # always look first
+    darth-cli meetings replace <id> "Tramies" "Trames"             # then write
+
+Today the edit layer is what the web PAGE shows; 'text' / 'export' and the
+server's summary run still read the raw words, so for your own summary apply
+the fix in your reading as well.
+
+An agenda, deck or pasted brief the summary should know about goes in as an
+attachment ('attach <id> agenda.pdf --title "Agenda"', or 'attach <id> --text
+brief.md'); 'attachments <id>' lists them. An upload whose hand-off to
+transcription failed (status error) is re-run with 'retry <id>'.
+
 ## Report markdown conventions
 
 The web UI's report tab renders two special link protocols:
@@ -911,6 +999,8 @@ const MEETING_URL_RE = /^(?:https?:\/\/)?([^\/\s?#]*)\/(m|transcript)\/([^\/?#\s
 const MEETING_ID_VERBS = new Set([
   "get", "text", "notes", "report", "audio", "frame", "attachments", "attachment-get", "link", "set-date",
   "speakers", "set-speakers", "set-title", "set-notes", "set-report", "trash", "restore", "label", "unlabel", "share",
+  "set-description", "keep", "unlink", "fetch-recording", "retry", "activity", "ai-runs", "attach", "attachment-rm",
+  "edit-line", "replace",
 ]);
 
 /** The transcript id behind a /m/<uuid> permalink. `status` 404 = the caller
@@ -2123,6 +2213,164 @@ function helpForVerb(verb: string): string | null {
     return out.join("\n");
   }
   return null;
+}
+
+// ---------------------------------------------------------------------------
+// CLI ↔ UI parity, batch A (task 05) — the transcript page's remaining
+// actions: description, Keep, unlink / "Not this", fetch the recording, retry
+// a failed hand-off, activity + AI runs, attach / remove context, share
+// suggestions, the voiceprint guess, and utterance edits (edit-line, the Find
+// & Replace panel's "Replace all").
+// ---------------------------------------------------------------------------
+
+type JsonRec = Record<string, unknown>;
+type EditEntry = { text?: string; speaker?: string };
+type EditMap = Record<string, EditEntry>;
+
+/** One meetings request → {ok, status, data}; a JSON body is sent with its content-type. */
+async function meetingsCall(ctx: Ctx, path: string, method: string, body?: unknown): Promise<{ ok: boolean; status: number; data: JsonRec | null }> {
+  const init: RequestInit = { method };
+  if (body !== undefined) { init.body = JSON.stringify(body); init.headers = { "content-type": "application/json" }; }
+  const res = await ctx.api("meetings", path, init);
+  return { ok: res.ok, status: res.status, data: (await readJsonSafe(res)) as JsonRec | null };
+}
+
+const asStr = (v: unknown): string | null => (typeof v === "string" && v ? v : null);
+
+/** A file's text, or stdin for '-'. Null (with the reason on stderr) when unreadable. */
+function readTextSource(flag: string, v: string | undefined): string | null {
+  if (!v) { console.error(`--${flag} needs a file ('-' reads stdin)`); return null; }
+  try { return v === "-" ? readFileSync(0, "utf8") : readFileSync(v, "utf8"); }
+  catch (e) { console.error(`--${flag}: ${e instanceof Error ? e.message : String(e)}`); return null; }
+}
+
+/** Activity `details` → "k=v, k=v" on one line. */
+function fmtDetails(d: unknown): string {
+  if (!d || typeof d !== "object") return "";
+  const parts = Object.entries(d as JsonRec)
+    .filter(([, v]) => v !== undefined && v !== null && v !== false)
+    .map(([k, v]) => (v === true ? k : `${k}=${typeof v === "string" ? v : JSON.stringify(v)}`));
+  return oneLine(parts.join(", "), 160);
+}
+
+/** "$0.1234" from the numeric-as-string cost column; "" when absent. */
+function fmtCost(v: unknown): string {
+  const n = typeof v === "number" ? v : typeof v === "string" ? Number(v) : NaN;
+  return Number.isFinite(n) ? `$${n.toFixed(4)}` : "";
+}
+
+/** The page's effective text of utterance i: the edit layer over the raw words. */
+const effectiveText = (raw: string, edits: EditMap, i: number): string => edits[String(i)]?.text ?? raw;
+
+/** One match of the Find & Replace panel: utterance + [start,end) in its effective text. */
+type FindMatch = { utteranceIndex: number; start: number; end: number };
+
+/**
+ * The transcript page's `findMatches` (app/transcript/[id]/page.tsx), verbatim:
+ * non-overlapping indexOf over the EFFECTIVE text of every utterance,
+ * case-insensitive unless `caseSensitive`.
+ */
+function findMatchesIn(rawTexts: string[], edits: EditMap, query: string, caseSensitive: boolean): FindMatch[] {
+  const out: FindMatch[] = [];
+  const needleLen = query.length;
+  if (!needleLen) return out;
+  const cmpQuery = caseSensitive ? query : query.toLowerCase();
+  for (let i = 0; i < rawTexts.length; i++) {
+    const text = effectiveText(rawTexts[i]!, edits, i);
+    const haystack = caseSensitive ? text : text.toLowerCase();
+    let from = 0;
+    while (from <= haystack.length - needleLen) {
+      const idx = haystack.indexOf(cmpQuery, from);
+      if (idx === -1) break;
+      out.push({ utteranceIndex: i, start: idx, end: idx + needleLen });
+      from = idx + needleLen;
+    }
+  }
+  return out;
+}
+
+/**
+ * The page's `handleReplaceAll`: splice right-to-left per utterance; a line
+ * that ends up equal to the raw words drops its text override (keeping a
+ * speaker override). Returns the next edit map and the changed lines.
+ */
+function replaceAllEdits(rawTexts: string[], edits: EditMap, matches: FindMatch[], replaceWith: string): { next: EditMap; changed: Array<{ i: number; before: string; after: string; n: number }> } {
+  const next: EditMap = { ...edits };
+  const grouped = new Map<number, FindMatch[]>();
+  for (const m of matches) grouped.set(m.utteranceIndex, [...(grouped.get(m.utteranceIndex) ?? []), m]);
+  const changed: Array<{ i: number; before: string; after: string; n: number }> = [];
+  for (const [i, ms] of grouped) {
+    const raw = rawTexts[i]!;
+    const before = effectiveText(raw, edits, i);
+    let text = before;
+    for (const m of [...ms].sort((a, b) => b.start - a.start)) text = text.substring(0, m.start) + replaceWith + text.substring(m.end);
+    const key = String(i);
+    if (text === raw) {
+      if (next[key]) {
+        const rest: EditEntry = { ...next[key] };
+        delete rest.text;
+        if (rest.speaker !== undefined) next[key] = rest;
+        else delete next[key];
+      }
+    } else {
+      next[key] = { ...(next[key] ?? {}), text };
+    }
+    changed.push({ i, before, after: text, n: ms.length });
+  }
+  return { next, changed };
+}
+
+/** Raw utterances (text + rendered "[mm:ss] Speaker") and the edit layer of one meeting. */
+async function fetchLinesAndEdits(ctx: Ctx, id: string): Promise<{ ok: true; lines: TranscriptText["lines"]; edits: EditMap } | { ok: false; code: number }> {
+  const [rendered, ed] = await Promise.all([
+    fetchTranscriptText(ctx, id, (p) => getJsonOrThrow(ctx, p)).catch((e: unknown) => e instanceof Error ? e : new Error(String(e))),
+    meetingsCall(ctx, `/api/transcripts/${id}/edits`, "GET"),
+  ]);
+  if (!ed.ok) return { ok: false, code: writeError("read edits", ed.status, ed.data, id) };
+  if (rendered instanceof Error) {
+    const m = /^HTTP (\d+): (.*)$/s.exec(rendered.message);
+    return { ok: false, code: writeError("read text", m ? Number(m[1]) : 0, { error: m ? m[2] : rendered.message }, id) };
+  }
+  return { ok: true, lines: rendered.lines, edits: ((ed.data?.edits ?? {}) as EditMap) };
+}
+
+/** The share dialog's "Suggested from this meeting". */
+type ShareSuggestion = { name: string; email: string; reason: string | null };
+
+async function shareSuggestionsCmd(ctx: Ctx, flags: Record<string, string | boolean>, argv: string[], args: string[]): Promise<number> {
+  const ids = [...new Set(args.flatMap(a => a.split(",")).map(s => s.trim()).filter(Boolean))];
+  const adding = flags["add-suggested"] === true;
+  if (ids.length !== 1) { console.error("usage: darth-cli meetings share <id> --suggestions | --add-suggested [--access edit|read]   (one meeting)"); return 1; }
+  const id = ids[0]!;
+  if (adding) ctx.requireWrite();
+  const r = await meetingsCall(ctx, `/api/transcripts/${id}/share-suggestions`, "GET");
+  if (!r.ok) return shareRequestError(id, r.status, r.data);
+  const list: ShareSuggestion[] = (Array.isArray(r.data?.suggestions) ? (r.data.suggestions as JsonRec[]) : [])
+    .filter((s) => typeof s.email === "string")
+    .map((s) => ({ name: asStr(s.name) ?? String(s.email), email: String(s.email).toLowerCase(), reason: asStr(s.reason) }));
+  if (!list.length) {
+    // The route answers a reader with [] (not 403): say which case this is.
+    const row = await meetingsCall(ctx, `/api/transcripts/${id}`, "GET");
+    const access = asStr((row.data?.transcript as JsonRec | undefined)?.access);
+    const reader = access === "read";
+    ctx.print({ id, suggestions: [], your_access: access }, () =>
+      console.log(reader
+        ? `no share suggestions for ${id} — you have read access; only the owner or an editor gets suggestions (and can share).`
+        : `no share suggestions for ${id} — everyone the meeting points at (named speakers, Trames invitees) already has access.`));
+    return reader && adding ? 1 : 0;
+  }
+  if (!adding) {
+    ctx.print({ id, suggestions: list }, () => {
+      console.log(`share suggestions for ${id} (from the meeting — not shared yet):`);
+      for (const s of list) console.log(`  ${fmtPerson(s.name, s.email)}${s.reason ? `  — ${s.reason}` : ""}`);
+      console.log(`share them all: darth-cli meetings share ${id} --add-suggested [--access read]   (one: share ${id} --add <email>)`);
+    });
+    return 0;
+  }
+  // Each suggestion through the ordinary 'share --add' path (directory check,
+  // default edit, Slack DM on a new share) — exactly as if typed.
+  const synthetic = [...argv, ...list.flatMap((s) => ["--add", s.email])];
+  return shareCmd(ctx, flags, synthetic, [id]);
 }
 
 /** One line per diarized speaker: confirmed name, else the guess. */
@@ -3759,7 +4007,8 @@ const meetings: Subcommand = {
   help: HELP,
   async run(ctx, argv) {
     const { pos: rawPos, flags } = parseArgs(argv);
-    liftBoolFlags(rawPos, flags, ["cascade", "exact", "cached", "details", "wait", "clear", "scratch", "resume", "separate", "keep-in-both", RETIRED_CONSENT_FLAG]);
+    liftBoolFlags(rawPos, flags, ["cascade", "exact", "cached", "details", "wait", "clear", "scratch", "resume", "separate", "keep-in-both", RETIRED_CONSENT_FLAG,
+      "index", "case", "dry-run", "guess", "dismiss", "suggestions", "add-suggested", "cancel-queued"]);
     const pos = flags.help === true ? rawPos : await resolveMeetingRefs(ctx, rawPos);
     const [, cmd, ...args] = pos.length && pos[0] === "meetings" ? pos : ["", ...pos];
     if (cmd === "recordings") return recordingsCmd(ctx, flags, args);
@@ -4107,6 +4356,7 @@ const meetings: Subcommand = {
       }
 
       case "share":
+        if (flags.suggestions === true || flags["add-suggested"] === true) return shareSuggestionsCmd(ctx, flags, argv, args);
         return shareCmd(ctx, flags, argv, args);
 
       case "get": {
@@ -4136,8 +4386,14 @@ const meetings: Subcommand = {
       }
 
       case "text": {
-        if (!args[0]) { console.error("usage: darth-cli meetings text <id>"); return 1; }
+        if (!args[0]) { console.error("usage: darth-cli meetings text <id> [--index]"); return 1; }
         const rendered = await fetchTranscriptText(ctx, args[0], p => ctx.expectJson<any>(ctx.api("meetings", p)));
+        if (flags.index === true) {
+          // 0-based utterance index = the address 'edit-line <id> <n>' takes.
+          if (!rendered.lines.length) console.error(`${args[0]} has no diarized utterances — nothing to index; printing the flat text.`);
+          console.log(rendered.lines.length ? rendered.lines.map((l, i) => `[${i}] [${l.ts}] ${l.speaker}: ${l.text}`).join("\n") : rendered.text);
+          return 0;
+        }
         console.log(rendered.text);
         return 0;
       }
@@ -4745,7 +5001,17 @@ const meetings: Subcommand = {
 
       case "link": {
         const [id, ref] = args;
-        if (!id || !ref) { console.error("usage: darth-cli meetings link <id> <meeting-code|event-key> [--separate]   (key = the 'key' field of 'calendar --view all --json' / --details)"); return 1; }
+        if (flags.dismiss === true) {
+          // The suggested-event strip's "Not this": the suggestion stays on the
+          // row, stamped as refused, and is no longer offered.
+          if (!id || ref) { console.error("usage: darth-cli meetings link <id> --dismiss   (no event ref: it refuses the SUGGESTED event)"); return 1; }
+          ctx.requireWrite();
+          const r = await meetingsCall(ctx, `/api/transcripts/${id}`, "PATCH", { dismissSuggestedEvent: true });
+          if (!r.ok) return writeError("link --dismiss", r.status, r.data, id);
+          ctx.print({ ...r.data, id, dismissed: true }, () => console.log(`dismissed the suggested event on ${id} — it is not offered again; link the right one with 'link ${id} <ref>'.`));
+          return 0;
+        }
+        if (!id || !ref) { console.error("usage: darth-cli meetings link <id> <meeting-code|event-key> [--separate]   (key = the 'key' field of 'calendar --view all --json' / --details)   |   link <id> --dismiss"); return 1; }
         ctx.requireWrite();
         const linkBody = { ...eventRefBody(ref), ...(flags.separate === true ? { mode: "separate" } : {}) };
         const res = await ctx.api("meetings", `/api/transcripts/${id}/link-event`, { method: "POST", body: JSON.stringify(linkBody) });
@@ -4786,9 +5052,21 @@ const meetings: Subcommand = {
 
       case "speakers": {
         const id = args[0];
-        if (!id) { console.error("usage: darth-cli meetings speakers <id>"); return 1; }
+        if (!id) { console.error("usage: darth-cli meetings speakers <id> [--guess]"); return 1; }
+        let guess: JsonRec | null = null;
+        if (flags.guess === true) {
+          // The page's "Guess names": voiceprint match now (synchronous); the
+          // server also restarts the speaker-ID pass when it errored / never ran.
+          ctx.requireWrite();
+          const r = await meetingsCall(ctx, `/api/transcripts/${id}/speakers/suggest`, "POST");
+          if (!r.ok) return writeError("speakers --guess", r.status, r.data, id);
+          guess = r.data ?? {};
+        }
         const { t, sp } = await fetchSpeakers(ctx, id);
-        ctx.print({ speaker_id_status: t?.speaker_id_status ?? null, speaker_count: t?.speaker_count ?? null, ...sp }, () => printSpeakers(id, t, sp));
+        ctx.print({ speaker_id_status: t?.speaker_id_status ?? null, speaker_count: t?.speaker_count ?? null, ...sp, ...(guess ? { guess } : {}) }, () => {
+          if (guess) console.log(`voiceprint match ran on ${id}${guess.speakerIdStatus === "running" ? " — the speaker-ID pass is running too; guesses may still change" : ""}`);
+          printSpeakers(id, t, sp);
+        });
         return 0;
       }
 
@@ -4894,6 +5172,241 @@ const meetings: Subcommand = {
         return 0;
       }
 
+      case "set-description": {
+        const id = args[0];
+        if (!id || args.length > 1) { console.error("usage: darth-cli meetings set-description <id> --file <md|->   ('-' = stdin; an empty file clears it)"); return 1; }
+        ctx.requireWrite();
+        const raw = readTextSource("file", str(flags.file));
+        if (raw === null) return 1;
+        const description = raw.trim(); // the page trims on save too
+        const r = await meetingsCall(ctx, `/api/transcripts/${id}`, "PATCH", { description });
+        if (!r.ok) return writeError("set-description", r.status, r.data, id);
+        ctx.print({ ...r.data, id, description_chars: description.length }, () =>
+          console.log(description ? `description set (${description.length} chars)` : "description cleared"));
+        return 0;
+      }
+
+      case "keep": {
+        const ids = [...new Set(args.flatMap(a => a.split(",")).map(s => s.trim()).filter(Boolean))];
+        if (!ids.length) { console.error("usage: darth-cli meetings keep <id>[,<id>…]   (a temporary row → a permanent one, the web UI's Keep)"); return 1; }
+        ctx.requireWrite();
+        let exit = 0;
+        const results: JsonRec[] = [];
+        for (const id of ids) {
+          const r = await meetingsCall(ctx, `/api/transcripts/${id}`, "PATCH", { scratch: false });
+          if (!r.ok) {
+            const code = writeError("keep", r.status, r.data, id);
+            if (code === 3 || exit === 0) exit = code;
+            results.push({ id, kept: false, status: r.status, error: r.data?.error ?? null });
+            continue;
+          }
+          results.push({ id, kept: true });
+          if (!ctx.json) console.log(`kept ${id} — permanent now (not temporary; no 30-day trash)`);
+        }
+        if (ctx.json) console.log(JSON.stringify(ids.length === 1 ? results[0] : results));
+        return exit;
+      }
+
+      case "unlink": {
+        const id = args[0];
+        if (!id || args.length > 1) { console.error("usage: darth-cli meetings unlink <id>   (detach its calendar event; the recording, title, date and notes stay)"); return 1; }
+        ctx.requireWrite();
+        const r = await meetingsCall(ctx, `/api/transcripts/${id}`, "PATCH", { unlinkEvent: true });
+        if (!r.ok) return writeError("unlink", r.status, r.data, id);
+        const removed = Array.isArray(r.data?.sharesRemoved) ? (r.data.sharesRemoved as unknown[]).map(String) : [];
+        ctx.print({ ...r.data, id, sharesRemoved: removed }, () =>
+          console.log(`unlinked ${id} from its calendar event — ${removed.length} share(s) the link had created removed${removed.length ? `: ${removed.join(", ")}` : ""}. Link the right event with 'link ${id} <ref>'.`));
+        return 0;
+      }
+
+      case "fetch-recording": {
+        const id = args[0];
+        if (!id || args.length > 1) { console.error("usage: darth-cli meetings fetch-recording <id>   (pull the recording from Google Drive / Microsoft 365)"); return 1; }
+        ctx.requireWrite();
+        if (!ctx.json) console.error(`fetching the recording of ${id} from the provider — a long call can take minutes…`);
+        const r = await meetingsCall(ctx, `/api/transcripts/${id}/fetch-audio`, "POST", {});
+        // 401 here is the caller's GOOGLE link, not the darth token.
+        if (r.status === 401 && /google/i.test(String(r.data?.error ?? ""))) { console.error(`fetch-recording failed: ${String(r.data?.error)}`); return 1; }
+        if (!r.ok) return writeError("fetch-recording", r.status, r.data, id);
+        ctx.print({ ...r.data, id }, () => {
+          if (r.data?.already === true) console.log(`${id} already has its recording stored — nothing fetched.`);
+          else console.log(`fetched the recording of ${id}${typeof r.data?.bytes === "number" ? ` (${fmtMB(r.data.bytes)} MB)` : ""} — 'audio ${id}' / 'frame ${id} <ts>' work now.`);
+        });
+        return 0;
+      }
+
+      case "retry": {
+        const id = args[0];
+        if (!id || args.length > 1) { console.error("usage: darth-cli meetings retry <id>   (retry a failed hand-off to transcription)"); return 1; }
+        ctx.requireWrite();
+        const r = await meetingsCall(ctx, `/api/transcripts/${id}/retry-ingest`, "POST");
+        if (!r.ok) return writeError("retry", r.status, r.data, id);
+        ctx.print({ ...r.data, id, status: r.status }, () => console.log(`retrying ${id} (HTTP ${r.status}) — the row is back to 'uploading'; 'get ${id}' shows the status.`));
+        return 0;
+      }
+
+      case "activity": {
+        const id = args[0];
+        if (!id || args.length > 1) { console.error("usage: darth-cli meetings activity <id> [--limit N]   (N 1-200, default 50)"); return 1; }
+        let limit: number | null = null;
+        if (flags.limit !== undefined) {
+          const raw = str(flags.limit) ?? "";
+          limit = /^\d+$/.test(raw) ? Number(raw) : NaN;
+          if (!Number.isInteger(limit) || limit < 1 || limit > 200) { console.error(`--limit must be a whole number 1-200 (got '${raw}')`); return 1; }
+        }
+        const r = await meetingsCall(ctx, `/api/transcripts/${id}/activity${limit ? `?limit=${limit}` : ""}`, "GET");
+        if (!r.ok) return writeError("activity", r.status, r.data, id);
+        const events = Array.isArray(r.data?.events) ? (r.data.events as JsonRec[]) : [];
+        ctx.print(r.data, () => {
+          if (!events.length) { console.log(`no activity recorded on ${id}`); return; }
+          const tz = localTz(ctx);
+          for (const e of events) {
+            const who = asStr(e.user_name) ? `${String(e.user_name)} <${String(e.user_email ?? "")}>` : String(e.user_email ?? "?");
+            const d = fmtDetails(e.details);
+            console.log(`${asStr(e.at) ? fmtLocalDateTime(String(e.at), tz) : "?"}  ${who}  ${String(e.action ?? "?")}${d ? `  — ${d}` : ""}`);
+          }
+          const viewers = Array.isArray(r.data?.recentViewers) ? (r.data.recentViewers as JsonRec[]) : [];
+          console.log(`\n${events.length} event(s), newest first${viewers.length ? ` · viewed in the last 30 days by ${viewers.map((v) => String(v.user_email ?? "?")).join(", ")}` : ""}`);
+        });
+        return 0;
+      }
+
+      case "ai-runs": {
+        const id = args[0];
+        if (!id || args.length > 1) { console.error("usage: darth-cli meetings ai-runs <id>"); return 1; }
+        const r = await meetingsCall(ctx, `/api/transcripts/${id}/ai-runs`, "GET");
+        if (!r.ok) return writeError("ai-runs", r.status, r.data, id);
+        const runs = Array.isArray(r.data?.runs) ? (r.data.runs as JsonRec[]) : [];
+        const totals = (r.data?.totals ?? {}) as JsonRec;
+        ctx.print(r.data, () => {
+          if (!runs.length) { console.log(`no AI runs on ${id}`); return; }
+          const tz = localTz(ctx);
+          for (const x of runs) {
+            const dur = typeof x.duration_ms === "number" ? `${Math.round(x.duration_ms / 1000)}s` : "";
+            const tok = x.input_tokens != null || x.output_tokens != null ? `${String(x.input_tokens ?? "?")} in / ${String(x.output_tokens ?? "?")} out` : "";
+            const cols = [String(x.kind ?? "?"), String(x.status ?? "?"), asStr(x.model) ?? "", fmtCost(x.cost_usd), dur, tok, asStr(x.triggered_by_email) ? `by ${String(x.triggered_by_email)}` : ""].filter(Boolean);
+            console.log(`${asStr(x.created_at) ? fmtLocalDateTime(String(x.created_at), tz) : "?"}  ${cols.join("  ")}${asStr(x.error) ? `  — ${oneLine(String(x.error), 140)}` : ""}`);
+          }
+          console.log(`\n${String(totals.runs ?? runs.length)} run(s), ${String(totals.errors ?? 0)} error(s)${fmtCost(totals.cost_usd) ? `, ${fmtCost(totals.cost_usd)} in total` : ""}${runs.length < Number(totals.runs ?? 0) ? ` (newest ${runs.length} shown)` : ""}`);
+        });
+        return 0;
+      }
+
+      case "attach": {
+        const [id, file, ...extra] = args;
+        const textFlag = flags.text;
+        const usage = "usage: darth-cli meetings attach <id> <file> [--title \"…\"]   |   attach <id> --text <file|-> [--title \"…\"]";
+        if (!id || extra.length || (file && textFlag !== undefined) || (!file && textFlag === undefined)) { console.error(usage); return 1; }
+        const title = str(flags.title)?.trim() || undefined;
+        if (textFlag !== undefined) {
+          const text = readTextSource("text", str(textFlag));
+          if (text === null) return 1;
+          if (!text.trim()) { console.error("--text: the text is empty"); return 1; }
+          ctx.requireWrite();
+          const r = await meetingsCall(ctx, `/api/transcripts/${id}/attachments`, "POST", { kind: "text", ...(title ? { title } : {}), text });
+          if (!r.ok) return writeError("attach", r.status, r.data, id);
+          const a = (r.data?.attachment ?? {}) as JsonRec;
+          ctx.print(r.data, () => console.log(`attached #${String(a.id ?? "?")} "${String(a.title ?? title ?? "Pasted notes")}" (text, ${text.trim().length} chars) to ${id} — the next summary run reads it.`));
+          return 0;
+        }
+        if (!existsSync(file!) || !statSync(file!).isFile()) { console.error(`No such file: ${file}`); return 1; }
+        const size = statSync(file!).size;
+        if (size === 0) { console.error("File is empty"); return 1; }
+        if (size > 25 * 1024 * 1024) { console.error(`File is ${fmtMB(size)} MB — attachments are capped at 25 MB`); return 1; }
+        ctx.requireWrite();
+        const name = basename(file!);
+        // Never application/json: that is the server's {kind:'text'} branch.
+        const mime = mimeFor(name);
+        const res = await ctx.api("meetings", `/api/transcripts/${id}/attachments`, {
+          method: "POST",
+          body: new Blob([readFileSync(file!)]),
+          headers: {
+            "content-type": mime === "application/json" ? "application/octet-stream" : mime,
+            "x-filename": encodeURIComponent(name),
+            ...(title ? { "x-title": encodeURIComponent(title) } : {}),
+          },
+        });
+        const data = await readJsonSafe(res);
+        if (!res.ok) return writeError("attach", res.status, data, id);
+        const a = (data?.attachment ?? {}) as JsonRec;
+        const ext = asStr(a.extraction_status);
+        ctx.print(data, () => console.log(`attached #${String(a.id ?? "?")} "${String(a.title ?? title ?? name)}" (${name}, ${fmtMB(size)} MB${ext === "ok" ? ", text extracted" : ext === "failed" ? ", text extraction FAILED — the summary cannot read it" : ext === "none" ? ", no text in it" : ""}) to ${id}.`));
+        return 0;
+      }
+
+      case "attachment-rm": {
+        const [id, attId] = args;
+        if (!id || !attId || args.length > 2 || !/^\d+$/.test(attId)) { console.error("usage: darth-cli meetings attachment-rm <id> <attachmentId>   (ids from 'attachments <id>')"); return 1; }
+        ctx.requireWrite();
+        const r = await meetingsCall(ctx, `/api/transcripts/${id}/attachments/${attId}`, "DELETE");
+        if (r.status === 404) { console.error(`attachment-rm failed: not found — no attachment #${attId} on a meeting ${id} visible to you ('attachments ${id}' lists them).`); return 1; }
+        if (!r.ok) return writeError("attachment-rm", r.status, r.data, id);
+        ctx.print({ ...r.data, id, attachmentId: Number(attId) }, () => console.log(`removed attachment #${attId} from ${id}`));
+        return 0;
+      }
+
+      case "edit-line": {
+        const [id, nRaw, ...extra] = args;
+        const text = str(flags.text);
+        if (!id || !nRaw || extra.length || text === undefined || !/^\d+$/.test(nRaw)) { console.error("usage: darth-cli meetings edit-line <id> <n> --text \"…\"   (n = the [n] of 'text <id> --index')"); return 1; }
+        ctx.requireWrite();
+        const n = Number(nRaw);
+        const cur = await fetchLinesAndEdits(ctx, id);
+        if (!cur.ok) return cur.code;
+        const line = cur.lines[n];
+        if (!line) { console.error(`${id} has ${cur.lines.length} utterance(s) (0-${Math.max(0, cur.lines.length - 1)}) — no line ${n}. 'text ${id} --index' shows the addresses.`); return 1; }
+        const before = effectiveText(line.text, cur.edits, n);
+        const r = await meetingsCall(ctx, `/api/transcripts/${id}/edits`, "PATCH", { utteranceIndex: n, text });
+        if (!r.ok) return writeError("edit-line", r.status, r.data, id);
+        ctx.print({ ...r.data, id, utteranceIndex: n, before, after: text }, () => {
+          console.log(`[${n}] [${line.ts}] ${line.speaker}`);
+          console.log(`  before: ${oneLine(before, 200)}`);
+          console.log(`  after:  ${oneLine(text, 200)}`);
+        });
+        return 0;
+      }
+
+      case "replace": {
+        const [id, find, replaceWith, ...extra] = args;
+        if (!id || find === undefined || replaceWith === undefined || extra.length) { console.error("usage: darth-cli meetings replace <id> <find> <with> [--case] [--dry-run]   (flags after the arguments; '' as <with> deletes)"); return 1; }
+        if (!find) { console.error("<find> is empty"); return 1; }
+        const dryRun = flags["dry-run"] === true;
+        const caseSensitive = flags.case === true;
+        if (!dryRun) ctx.requireWrite();
+        const cur = await fetchLinesAndEdits(ctx, id);
+        if (!cur.ok) return cur.code;
+        const raws = cur.lines.map((l) => l.text);
+        const matches = findMatchesIn(raws, cur.edits, find, caseSensitive);
+        const { next, changed } = replaceAllEdits(raws, cur.edits, matches, replaceWith);
+        const summary = { id, find, with: replaceWith, caseSensitive, matches: matches.length, lines: changed.map((c) => ({ index: c.i, count: c.n, before: c.before, after: c.after })) };
+        if (!matches.length) {
+          ctx.print({ ...summary, written: false }, () => console.log(`no ${caseSensitive ? "case-sensitive " : ""}match for ${JSON.stringify(find)} in ${id} — nothing to replace.`));
+          return 0;
+        }
+        const show = () => {
+          for (const c of changed) {
+            const l = cur.lines[c.i]!;
+            console.log(`[${c.i}] [${l.ts}] ${l.speaker}${c.n > 1 ? `  (${c.n}×)` : ""}`);
+            console.log(`  before: ${oneLine(c.before, 200)}`);
+            console.log(`  after:  ${oneLine(c.after, 200)}`);
+          }
+        };
+        if (dryRun) {
+          ctx.print({ ...summary, written: false, dryRun: true }, () => {
+            show();
+            console.log(`dry run — nothing written. ${matches.length} match(es) in ${changed.length} line(s); re-run without --dry-run to replace them all.`);
+          });
+          return 0;
+        }
+        const r = await meetingsCall(ctx, `/api/transcripts/${id}/edits`, "PUT", { edits: next });
+        if (!r.ok) return writeError("replace", r.status, r.data, id);
+        ctx.print({ ...summary, written: true }, () => {
+          show();
+          console.log(`replaced ${matches.length} match(es) in ${changed.length} line(s) of ${id} (the raw words are kept; edits are a layer the page shows).`);
+        });
+        return 0;
+      }
+
       case "set-title": {
         if (!args[0] || !args[1]) { console.error("usage: darth-cli meetings set-title <id> <title>"); return 1; }
         ctx.requireWrite();
@@ -4923,7 +5436,9 @@ const meetings: Subcommand = {
       case "trash":
       case "restore": {
         const id = args[0];
-        if (!id || args.length > 1) { console.error(`usage: darth-cli meetings ${cmd} <id>`); return 1; }
+        if (!id || args.length > 1) { console.error(`usage: darth-cli meetings ${cmd} <id>${cmd === "trash" ? " [--cancel-queued]" : ""}`); return 1; }
+        const cancelQueued = flags["cancel-queued"] === true;
+        if (cancelQueued && cmd !== "trash") { console.error("--cancel-queued goes with 'trash' (it cancels a queued import)"); return 1; }
         ctx.requireWrite();
         // DELETE /api/transcripts/:id is a SOFT delete for a live row (the
         // server only deletes for good on ?permanent=1, on a row already in
@@ -4936,7 +5451,18 @@ const meetings: Subcommand = {
           const t = cur.transcript;
           if (t?.access !== "owner") { console.error(`Only the owner can trash ${id} (your access: ${t?.access ?? "?"}).`); return 1; }
           if (t?.deleted_at) { console.error(`${id} is already in the trash — 'darth-cli meetings restore ${id}' brings it back; permanent delete is web-only.`); return 1; }
-          if (t?.status === "uploading" || t?.status === "waiting") { console.error(`${id} is a placeholder (status ${t.status}) — the server would delete it for good, not trash it. Use the web UI if that is what you want.`); return 1; }
+          if (cancelQueued) {
+            // The listing's "Cancel queued import": a 'waiting' placeholder has
+            // nothing transcribed yet — the server deletes it for good. An
+            // 'uploading' one is mid-flight and stays refused.
+            if (t?.status !== "waiting") { console.error(`--cancel-queued only cancels a queued import (status waiting); ${id} is ${t?.status ?? "?"}${t?.status === "uploading" ? " — still uploading, nothing to cancel from here" : " — drop the flag to move it to the trash"}.`); return 1; }
+            const res = await ctx.api("meetings", `/api/transcripts/${id}`, { method: "DELETE" });
+            const data = await readJsonSafe(res);
+            if (!res.ok) return writeError("trash --cancel-queued", res.status, data, id);
+            ctx.print({ ...data, id, action: "cancel-queued" }, () => console.log(`cancelled the queued import ${id} — the placeholder is deleted (nothing had been transcribed).`));
+            return 0;
+          }
+          if (t?.status === "uploading" || t?.status === "waiting") { console.error(`${id} is a placeholder (status ${t.status}) — the server would delete it for good, not trash it.${t.status === "waiting" ? ` To cancel the queued import: 'darth-cli meetings trash ${id} --cancel-queued'.` : " Use the web UI if that is what you want."}`); return 1; }
         }
         const res = await ctx.api("meetings", cmd === "trash" ? `/api/transcripts/${id}` : `/api/transcripts/${id}/restore`, { method: cmd === "trash" ? "DELETE" : "POST" });
         const data: any = await res.json().catch(() => null);
