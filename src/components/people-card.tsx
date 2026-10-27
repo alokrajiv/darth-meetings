@@ -10,6 +10,7 @@ import { Check, ChevronDown, ChevronUp, Fingerprint, MicOff, Pencil, Sparkles, U
 import type { GmeetAttendee, SpeakerLabel, SpeakerSuggestionMap } from '@/lib/format';
 import { personDisplay } from '@/lib/person-display';
 import { speakerColorVar } from '@/lib/speaker-display';
+import { identitySource } from '@/lib/speaker-identity';
 import { countVoices, speakerNameStates, voiceMatchCaveat, voiceMatchLabel, type SpeakerNameState } from '@/lib/speaker-name-state';
 
 interface Utterance {
@@ -460,6 +461,24 @@ function VoiceRow({
               </>
             )}
           </span>
+        )}
+        {s.status === 'guess' && s.suggestion && (
+          // The guess is a PERSON when it carries an email — say whose, and
+          // where the email came from, so Confirm is not a blind click.
+          s.suggestion.email ? (
+            <span
+              className="min-w-0 truncate text-[11px] text-muted-foreground"
+              title={s.suggestion.email}
+              data-suggestion-email={s.suggestion.email}
+              data-suggestion-source={s.suggestion.emailSource ?? 'invite'}
+            >
+              {s.suggestion.email} · {identitySource(s.suggestion)}
+            </span>
+          ) : (
+            <span className="min-w-0 truncate text-[11px] text-muted-foreground/70" data-suggestion-email="">
+              {identitySource(s.suggestion)}
+            </span>
+          )
         )}
         {canEdit && s.status === 'guess' && (
           <>

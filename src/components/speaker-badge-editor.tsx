@@ -6,6 +6,7 @@ import { UserPicker, type PickerPerson } from '@/components/user-picker';
 import type { SpeakerLabel, SpeakerSuggestionMap } from '@/lib/format';
 import { defaultSpeakerLabel, speakerColorVar } from '@/lib/speaker-display';
 import { speakerNameState } from '@/lib/speaker-name-state';
+import { identitySource } from '@/lib/speaker-identity';
 
 interface SpeakerBadgeEditorProps {
   originalSpeaker: string;
@@ -92,6 +93,13 @@ export function SpeakerBadgeEditor({
     );
   }
 
+  // The guess as a person in the tooltip: whose email, and where it came from.
+  const guessPerson = state.suggestion
+    ? state.suggestion.email
+      ? ` · ${state.suggestion.email} · ${identitySource(state.suggestion)}`
+      : ` · ${identitySource(state.suggestion)}`
+    : '';
+
   return (
     <span
       className="inline-flex min-w-0 items-center gap-1.5"
@@ -105,7 +113,13 @@ export function SpeakerBadgeEditor({
       <span
         className="truncate text-xs font-semibold"
         style={{ color: speakerColorVar(originalSpeaker) }}
-        title={state.status === 'guess' ? `Guessed — ${state.caption}` : state.status === 'group' ? `Labelled “${state.name}”` : undefined}
+        title={
+          state.status === 'guess'
+            ? `Guessed — ${state.caption}${guessPerson}`
+            : state.status === 'group'
+              ? `Labelled “${state.name}”`
+              : undefined
+        }
         data-speaker-state={state.status}
       >
         {currentDisplay}

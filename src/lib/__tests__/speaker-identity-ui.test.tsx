@@ -11,7 +11,11 @@
  *  - "+ Person" dialog: opens with the invitee's email prefilled and says
  *    "From the invite" while the field still holds it — pinned from source
  *    (the Radix dialog portals, so a static render is empty);
- *  - the detail page: saves keep / drop / attach the email by the rules.
+ *  - the guess row shows the PERSON: the suggestion's email and where it came
+ *    from (`identitySource`), or "no email match"; the review dialog caption
+ *    and the transcript badge tooltip say the same (pinned from source);
+ *  - the detail page: saves keep / drop / attach the email by the rules, and
+ *    the auto-proceed line names the people the pass would apply.
  */
 import { describe, expect, test } from 'bun:test';
 import { readFileSync } from 'node:fs';
@@ -65,6 +69,81 @@ describe('People card — the ✓ email marker', () => {
     expect(html).toContain('data-speaker-state="guess"');
     expect(html).toContain('data-speaker-state="group"');
     expect(html).not.toContain('data-speaker-email');
+  });
+});
+
+describe('People card — the guess row shows the person', () => {
+  /** The span carrying `data-suggestion-email="<email>"`, as markup. */
+  const personSpan = (html: string, email: string) => {
+    const m = html.match(new RegExp(`<span[^>]*data-suggestion-email="${email}"[^>]*>([^<]*)</span>`));
+    return m ? { tag: m[0], text: m[1]! } : null;
+  };
+
+  test('an invite email: the email · "on the invite", titled with the email', () => {
+    const html = render([], {
+      A: { name: 'Test Person A', confidence: 0.9, source: 'context', email: 'test-a@example.com', emailSource: 'invite' },
+    });
+    const span = personSpan(html, 'test-a@example.com');
+    expect(span).not.toBeNull();
+    expect(span!.text).toContain('test-a@example.com');
+    expect(span!.text).toContain('on the invite');
+    expect(span!.tag).toContain('data-suggestion-source="invite"');
+    expect(span!.tag).toContain('title="test-a@example.com"');
+  });
+
+  test('a directory email: "in the directory"', () => {
+    const html = render([], {
+      B: { name: 'Test Person B', confidence: 0.9, source: 'voice', email: 'test-b@example.com', emailSource: 'directory' },
+    });
+    const span = personSpan(html, 'test-b@example.com');
+    expect(span).not.toBeNull();
+    expect(span!.text).toContain('in the directory');
+    expect(span!.tag).toContain('data-suggestion-source="directory"');
+  });
+
+  test('an email without a source reads as the invite (the older suggestions)', () => {
+    const html = render([], {
+      A: { name: 'Test Person A', confidence: 0.9, source: 'context', email: 'test-a@example.com' },
+    });
+    expect(personSpan(html, 'test-a@example.com')!.text).toContain('on the invite');
+  });
+
+  test('a guess without an email: "no email match"', () => {
+    const html = render([], { C: { name: 'Test Person C', confidence: 0.9, source: 'context' } });
+    const span = personSpan(html, '');
+    expect(span).not.toBeNull();
+    expect(span!.text).toBe('no email match');
+  });
+
+  test('confirmed labels show no suggestion line', () => {
+    const html = render(
+      [{ originalSpeaker: 'A', customName: 'Test Person A', description: '' }],
+      { A: { name: 'Test Person A', confidence: 0.9, source: 'context', email: 'test-a@example.com' } }
+    );
+    expect(html).not.toContain('data-suggestion-email');
+  });
+});
+
+describe('review dialog, transcript badge, detail page — the person wording', () => {
+  test('the review dialog caption uses identitySource and marks the email', () => {
+    const src = read('components/speaker-review-dialog.tsx');
+    expect(src).toContain("import { identitySource } from '@/lib/speaker-identity';");
+    expect(src).toContain('identitySource(suggestion)');
+    expect(src).toContain("data-suggestion-email={suggestion.email ?? ''}");
+  });
+
+  test('the transcript badge tooltip names the person via identitySource', () => {
+    const src = read('components/speaker-badge-editor.tsx');
+    expect(src).toContain('identitySource(state.suggestion)');
+    expect(src).toContain('`Guessed — ${state.caption}${guessPerson}`');
+  });
+
+  test('the auto-proceed line names who the pass would apply', () => {
+    const src = read('app/transcript/[id]/page.tsx');
+    expect(src).toContain("import { evaluateAutoReview } from '@/lib/auto-review-eval';");
+    expect(src).toContain('evaluateAutoReview(');
+    expect(src).toContain('if (!evaluation.passed) return [];');
+    expect(src).toContain('autoProceedLine(row.autoProceedAt, undefined, autoProceedPeople)');
   });
 });
 

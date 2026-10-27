@@ -180,7 +180,7 @@ describe('the UI reads the server, never the rule', () => {
   test('the detail page shows the line + Hold from row.autoProceedAt and posts to notes/hold', () => {
     const page = read('app/transcript/[id]/page.tsx');
     expect(page).toContain('{row.autoProceedAt && (');
-    expect(page).toContain('autoProceedLine(row.autoProceedAt)');
+    expect(page).toContain('autoProceedLine(row.autoProceedAt, undefined, autoProceedPeople)');
     expect(page).toContain("fetch(`/api/transcripts/${transcriptId}/notes/hold`, { method: 'POST' })");
     expect(page).toContain('setRow((prev) => (prev ? { ...prev, autoProceedAt: null } : prev))');
     // The page never imports the rule itself.

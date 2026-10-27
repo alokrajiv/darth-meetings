@@ -14,6 +14,7 @@ import { Input } from '@/components/ui/input';
 import { Check, Mic, RefreshCw, Sparkles } from 'lucide-react';
 import type { SpeakerLabel, SpeakerSuggestionMap } from '@/lib/format';
 import { defaultSpeakerLabel, speakerColorVar } from '@/lib/speaker-display';
+import { identitySource } from '@/lib/speaker-identity';
 import { speakerNameState, voiceMatchCaveat, voiceMatchLabel } from '@/lib/speaker-name-state';
 
 interface SpeakerReviewDialogProps {
@@ -168,6 +169,20 @@ export function SpeakerReviewDialog({
                     <span className="italic">no guess — name them if you can</span>
                   )}
                 </div>
+                {!confirmed && suggestion && (
+                  // Whose voice the guess is: the person's email and where it
+                  // came from — or that the name matched nobody's email.
+                  <div
+                    className="mt-0.5 min-w-0 truncate pl-[18px] text-[11px] text-muted-foreground"
+                    title={suggestion.email || undefined}
+                    data-suggestion-email={suggestion.email ?? ''}
+                    data-suggestion-source={suggestion.email ? (suggestion.emailSource ?? 'invite') : undefined}
+                  >
+                    {suggestion.email
+                      ? `${suggestion.email} · ${identitySource(suggestion)}`
+                      : identitySource(suggestion)}
+                  </div>
+                )}
               </div>
             );
           })}

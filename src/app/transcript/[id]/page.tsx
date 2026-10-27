@@ -12,6 +12,7 @@ import {
   withoutDoParam,
   type SummaryIntent,
 } from '@/lib/listing-summary';
+import { evaluateAutoReview } from '@/lib/auto-review-eval';
 import { formatDistanceToNow } from 'date-fns';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
@@ -1018,6 +1019,24 @@ function TranscriptDetailInner({
       ),
     [reviewSpeakers, speakerLabels]
   );
+  // The people the scheduled automatic summary would name (confirmed + the
+  // names the pass would apply), so the "No notes yet" line says WHO before
+  // the grace ends. Same pure evaluator the server's sweeper runs; a blocked
+  // evaluation names nobody (the line keeps its generic wording).
+  const autoProceedAt = row?.autoProceedAt;
+  const autoProceedUtterances = content?.utterances;
+  const autoProceedPeople = useMemo(() => {
+    if (!autoProceedAt || !autoProceedUtterances) return [];
+    const evaluation = evaluateAutoReview({
+      utterances: autoProceedUtterances,
+      labels: speakerLabels,
+      suggestions: speakerSuggestions,
+    });
+    if (!evaluation.passed) return [];
+    return evaluation.merged
+      .filter((l) => l.customName.trim())
+      .map((l) => ({ name: l.customName, email: l.email }));
+  }, [autoProceedAt, autoProceedUtterances, speakerLabels, speakerSuggestions]);
   // ?do= (captured on mount above): once the row, speaker labels and content
   // are in (`loading` clears after all three), open the same dialog the
   // "No notes yet" block would — the review while speakers are still being
@@ -3757,7 +3776,7 @@ function TranscriptDetailInner({
                                 className="mt-2 flex flex-wrap items-center justify-center gap-x-1.5 text-xs text-muted-foreground"
                                 data-auto-proceed-at={row.autoProceedAt}
                               >
-                                <span>{autoProceedLine(row.autoProceedAt)}</span>
+                                <span>{autoProceedLine(row.autoProceedAt, undefined, autoProceedPeople)}</span>
                                 <button
                                   type="button"
                                   className="font-medium text-primary hover:underline disabled:opacity-50"
