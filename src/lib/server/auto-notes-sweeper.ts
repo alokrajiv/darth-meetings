@@ -6,6 +6,7 @@ import {
   listExpiredScratch,
   listNotesBacklog,
   listSpeakerIdBacklog,
+  listAutoProceedBacklog,
   listStaleUploads,
   listStuckAtAai,
   mergeGmeetContextForUser,
@@ -39,6 +40,8 @@ import type { BlobCopyIntent } from '@/lib/server/upload-pipeline';
 import { uploadsStore } from '@/lib/server/darth-uploads-store';
 import { deleteAudioFile, deleteAudioFilesByPrefix } from '@/lib/server/audio-storage';
 import { generateAutoNotes, identifySpeakers } from '@/lib/server/auto-notes';
+import { autoProceedAfterGrace } from '@/lib/server/auto-review';
+import { AUTO_PROCEED_GRACE_MIN, AUTO_PROCEED_WINDOW_HOURS } from '@/lib/auto-proceed';
 import { sendDarthDm } from '@/lib/server/darth-notify';
 import { scratchTrashedDm } from '@/lib/server/dm-copy';
 import { SCRATCH_TTL_DAYS } from '@/lib/format';
@@ -393,6 +396,29 @@ async function sweep(): Promise<void> {
     }
   } catch (err) {
     console.warn('[notes-sweeper] speaker-id backlog query failed:', err);
+  }
+
+  // Manual rows whose speaker pass finished AUTO_PROCEED_GRACE_MIN ago with
+  // nobody acting since (lib/auto-proceed.ts): evaluate once with the series
+  // path's thresholds and write the summary when every voice is confidently
+  // identified. Same cap as the other model-calling passes.
+  try {
+    const due = await listAutoProceedBacklog(AUTO_PROCEED_GRACE_MIN, AUTO_PROCEED_WINDOW_HOURS, MAX_PER_SWEEP);
+    if (due.length > 0) {
+      console.log(
+        `[notes-sweeper] auto-proceed ${due.length} transcript(s) past the ${AUTO_PROCEED_GRACE_MIN} min grace:`,
+        due.map((b) => b.assemblyai_id).join(', ')
+      );
+      for (const b of due) {
+        try {
+          await autoProceedAfterGrace(b.user_id, b.assemblyai_id);
+        } catch (err) {
+          console.warn(`[notes-sweeper] auto-proceed ${b.assemblyai_id} failed:`, err);
+        }
+      }
+    }
+  } catch (err) {
+    console.warn('[notes-sweeper] auto-proceed backlog query failed:', err);
   }
 
   try {

@@ -702,6 +702,14 @@ export interface GmeetContext {
     /** What was generated unattended (mirrors uploadPrefs.report). Rows
      * from before 2026-09-21 may carry the retired 'summary'. */
     generated?: ReportPref | 'summary' | null;
+    /**
+     * Absent = the series / account path at completion. 'grace' = the
+     * sweeper's auto-proceed for a manual row after AUTO_PROCEED_GRACE_MIN
+     * (lib/auto-proceed.ts); 'held' = a person pressed Hold on the detail
+     * page (passed=false, `by` says who) — the human gate stays.
+     */
+    mode?: 'grace' | 'held';
+    by?: { userId: string; email: string };
   } | null;
   /** D2: the calendar occurrence this recording MIGHT be of. A suggestion
    * and nothing else — see `SuggestedEvent`. */
@@ -737,6 +745,11 @@ export interface TranscriptWithAccess extends StoredTranscript {
   access: TranscriptAccess;
   owner_email: string | null;
   owner_name: string | null;
+  /** Detail endpoint only: when the summary will be written automatically
+   * (lib/auto-proceed.ts `autoProceedAt`), or null. The page's "Summary
+   * starts automatically at HH:MM — Hold" line reads this, never a
+   * client-side re-derivation of the rule. */
+  autoProceedAt?: string | null;
 }
 
 /** Minimal label reference carried on listing rows / chips (mirror of
@@ -781,6 +794,10 @@ export interface TranscriptListRow {
    * The text itself is never selected into a listing. Drives the row's
    * summary badge (lib/listing-summary.ts). Absent from the legacy listing. */
   has_notes?: boolean | null;
+  /** v2 listing only: when the summary will be written automatically
+   * (lib/auto-proceed.ts `autoProceedAt`), or null. The badge then reads
+   * "Summary at HH:MM" instead of "No summary yet". */
+  auto_proceed_at?: string | null;
   upload_bytes_received: number | null;
   upload_bytes_total: number | null;
   /** Multi-file upload in flight (v2 listing only): parts fully received so

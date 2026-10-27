@@ -3,7 +3,6 @@ import { getForUser, mergeGmeetContextForUser } from '@/db-ops/transcripts';
 import {
   getForUser as getMappingsForUser,
   upsertForUser as upsertMappingsForUser,
-  type SpeakerLabel,
 } from '@/db-ops/speaker-mappings';
 import { getContentCached, generateAutoReport } from '@/lib/server/auto-notes';
 import { enrollFromTranscript } from '@/lib/server/voiceprint';
@@ -12,7 +11,9 @@ import { notifyUser, APP_URL } from '@/lib/server/darth-notify';
 import { dm, headlines, meetingLine, runKey } from '@/lib/server/dm-copy';
 import { autoMarkerOf, autoRecipients, autoSourceLabel } from '@/lib/auto-marker';
 import { storedReportPref } from '@/lib/report-pref';
-import { splitSpeakerLabel } from '@/lib/recording-clips';
+import { evaluateAutoReview } from '@/lib/auto-review-eval';
+import { AUTO_PROCEED_GRACE_MIN, autoProceedDue, autoProceedFactsOf } from '@/lib/auto-proceed';
+import { identityForUser } from '@/db-ops/transcript-activity';
 
 /**
  * Automatic speaker-review for series-auto-imported rows: the human review
@@ -21,37 +22,17 @@ import { splitSpeakerLabel } from '@/lib/recording-clips';
  * names and fire the configured generation unattended. Anything short of
  * that leaves the gate in place and DMs the owner to come review.
  *
- * Confidence sources (speaker_mappings.suggestions):
- *  - voiceprint match (source 'voice', cosine similarity) ≥ VOICE_MIN
- *  - the dedicated speaker-ID pass (via 'id', model-reported) ≥ ID_MIN
- * Speakers whose transcript label is already a real name (Meet Doc / Teams
- * VTT imports) need no resolution at all, and speakers with a single
- * utterance are noise the human reviewer routinely skips too.
+ * The DECISION (thresholds, noise speakers, real-name labels, what to
+ * enrol) is `evaluateAutoReview` in lib/auto-review-eval.ts — pure, shared
+ * with `autoProceedAfterGrace` below. This module is the side effects.
  *
- * Only rows carrying an automation marker (lib/auto-marker: gmeet_context
- * .autoImport or .autoSync) are touched — manual imports and uploads keep
- * the human gate unconditionally.
+ * `maybeAutoReview` touches only rows carrying an automation marker
+ * (lib/auto-marker: gmeet_context.autoImport or .autoSync) — manual imports
+ * and uploads keep the human gate at completion. Since 2026-10-27 those
+ * manual rows get a second chance through `autoProceedAfterGrace`: the
+ * sweeper evaluates them once, AUTO_PROCEED_GRACE_MIN after the speaker pass
+ * finished, if nobody acted (lib/auto-proceed.ts has the eligibility rule).
  */
-
-const VOICE_MIN = 0.62;
-const ID_MIN = 0.85;
-/** Speakers with fewer utterances than this may stay unnamed without
- * blocking the jump-through (matches what human reviewers do). */
-const MIN_UTTERANCES = 2;
-
-/**
- * AAI diarization labels look like "A" / "B" / "Speaker 1" — anything else is
- * already a real name (transcript-mode imports).
- *
- * A COMBINED meeting's labels carry the recording namespace
- * (`<recordingId>:A`, Phase 3b), so the prefix comes off first: without that
- * every speaker of a combined meeting reads as "already a real name" and the
- * automatic review would jump the gate having named nobody.
- */
-function isDiarizationLabel(speaker: string): boolean {
-  const bare = splitSpeakerLabel(speaker.trim()).speaker.trim();
-  return /^[A-Z]{1,2}$/.test(bare) || /^speaker\s*\d+$/i.test(bare);
-}
 
 export async function maybeAutoReview(
   ownerUserId: string,
@@ -96,35 +77,12 @@ export async function maybeAutoReview(
   const utterances = content?.utterances ?? [];
   if (utterances.length === 0) return; // not evaluable yet — retried on next completion hook
 
-  const counts = new Map<string, number>();
-  for (const u of utterances) counts.set(u.speaker, (counts.get(u.speaker) ?? 0) + 1);
-
   const mappings = await getMappingsForUser(ownerUserId, assemblyaiId);
-  const existing = mappings?.speaker_labels ?? [];
-  const suggestions = mappings?.suggestions ?? {};
-  const named = new Map(
-    existing.filter((l) => l.customName.trim()).map((l) => [l.originalSpeaker, l])
-  );
-
-  const applied: SpeakerLabel[] = [];
-  let blocker: string | null = null;
-  for (const [speaker, n] of counts) {
-    if (named.has(speaker)) continue; // human (or a prior pass) already named it
-    if (!isDiarizationLabel(speaker)) continue; // already a real name
-    if (n < MIN_UTTERANCES) continue; // noise speaker — reviewers skip these too
-    const s = suggestions[speaker];
-    const confident =
-      !!s?.name?.trim() &&
-      ((s.source === 'voice' && s.confidence >= VOICE_MIN) ||
-        (s.via === 'id' && s.confidence >= ID_MIN));
-    if (!confident) {
-      blocker = s?.name
-        ? `"${speaker}" → ${s.name} only at ${(s.confidence * 100).toFixed(0)}% (${s.via === 'id' ? 'AI pass' : (s.source ?? 'context')})`
-        : `no confident identification for speaker "${speaker}"`;
-      break;
-    }
-    applied.push({ originalSpeaker: speaker, customName: s!.name.trim(), description: '' });
-  }
+  const { blocker, applied, merged } = evaluateAutoReview({
+    utterances,
+    labels: mappings?.speaker_labels ?? [],
+    suggestions: mappings?.suggestions,
+  });
 
   if (blocker) {
     await mergeGmeetContextForUser(ownerUserId, assemblyaiId, {
@@ -148,14 +106,9 @@ export async function maybeAutoReview(
 
   // ---- Jump through the gate: apply names, enroll, generate, notify -------
   if (applied.length > 0) {
-    const merged = [...existing];
-    for (const l of applied) {
-      const i = merged.findIndex((e) => e.originalSpeaker === l.originalSpeaker);
-      if (i >= 0) merged[i] = { ...merged[i]!, customName: l.customName };
-      else merged.push(l);
-    }
     await upsertMappingsForUser(ownerUserId, assemblyaiId, merged);
-    // Same free-enrollment rule as a human confirm.
+    // Same free-enrollment rule as a human confirm (every name — the series
+    // path enrols as it always has; the grace path below is the strict one).
     void (async () => {
       const resolved = await resolveMeetingContent(row);
       await enrollFromTranscript(resolved.media /* every file: a combined meeting embeds each recording's voices from ITS OWN file (mediaForSpeaker) */, content, merged);
@@ -202,4 +155,93 @@ export async function maybeAutoReview(
       });
     }
   }
+}
+
+/**
+ * The sweeper's grace-window pass for a MANUAL row (no automation marker):
+ * a tray upload / make-meeting / split half whose speaker pass finished
+ * AUTO_PROCEED_GRACE_MIN ago with nobody acting since. Same decision as the
+ * series path (`evaluateAutoReview`), evaluated once, ever
+ * (`gmeet_context.autoReview`, mode 'grace'):
+ *
+ *  - passed  → apply the names, enrol ONLY the strong matches
+ *              (ENROLL_VOICE_MIN / ENROLL_ID_MIN — a 0.65 guess is named but
+ *              never fed into a voiceprint), generate with the row's pref,
+ *              DM the owner once ("written automatically — fix any name").
+ *  - blocked → store the reason, send NO DM (the ready DM already went out
+ *              at completion; the human gate stays).
+ *
+ * `listAutoProceedBacklog` (db-ops) picks candidates; `autoProceedDue` is
+ * re-checked here on the fresh row because a person may have clicked
+ * Generate, Hold or named someone since the query ran.
+ */
+export async function autoProceedAfterGrace(
+  ownerUserId: string,
+  assemblyaiId: string
+): Promise<'proceeded' | 'blocked' | 'skipped'> {
+  const row = await getForUser(ownerUserId, assemblyaiId);
+  if (!row || !autoProceedDue(autoProceedFactsOf(row))) return 'skipped';
+
+  const pref = storedReportPref(row.gmeet_context?.uploadPrefs?.report);
+  const url = `${APP_URL}/transcript/${assemblyaiId}`;
+  const title = row.title?.trim() || row.original_filename?.trim() || 'Untitled meeting';
+  const nowIso = new Date().toISOString();
+
+  const content = await getContentCached(ownerUserId, row);
+  const utterances = content?.utterances ?? [];
+  if (utterances.length === 0) return 'skipped'; // nothing to evaluate yet; stays pickable inside the window
+
+  const mappings = await getMappingsForUser(ownerUserId, assemblyaiId);
+  const ev = evaluateAutoReview({
+    utterances,
+    labels: mappings?.speaker_labels ?? [],
+    suggestions: mappings?.suggestions,
+  });
+
+  if (!ev.passed) {
+    await mergeGmeetContextForUser(ownerUserId, assemblyaiId, {
+      autoReview: { evaluatedAt: nowIso, passed: false, mode: 'grace', reason: ev.blocker ?? 'blocked' },
+    });
+    console.log(`[auto-proceed] ${assemblyaiId}: blocked — ${ev.blocker}`);
+    return 'blocked';
+  }
+
+  if (ev.applied.length > 0) {
+    await upsertMappingsForUser(ownerUserId, assemblyaiId, ev.merged);
+    if (ev.enroll.length > 0) {
+      void (async () => {
+        const resolved = await resolveMeetingContent(row);
+        await enrollFromTranscript(resolved.media /* every file: a combined meeting embeds each recording's voices from ITS OWN file (mediaForSpeaker) */, content, ev.enroll);
+      })().catch((err) => console.warn('[auto-proceed] voiceprint enroll failed:', err));
+    }
+  }
+
+  await mergeGmeetContextForUser(ownerUserId, assemblyaiId, {
+    autoReview: { evaluatedAt: nowIso, passed: true, mode: 'grace', generated: pref },
+  });
+  const owner = await identityForUser(ownerUserId);
+  console.log(
+    `[auto-proceed] ${assemblyaiId}: passed after ${AUTO_PROCEED_GRACE_MIN} min (${ev.applied.length} auto-named, ${ev.enroll.length} enrolled) — generating summary + ${pref}`
+  );
+  await generateAutoReport(ownerUserId, assemblyaiId, {
+    triggeredBy: owner ? { userId: owner.userId, email: owner.email } : undefined,
+    useVideo: pref === 'detailed-video',
+  });
+
+  const after = await getForUser(ownerUserId, assemblyaiId);
+  if (owner && after?.auto_report_status === 'completed') {
+    const names = ev.merged.map((l) => l.customName.trim()).filter(Boolean);
+    void notifyUser({
+      kind: 'report_ready',
+      toEmail: owner.email,
+      text: dm(
+        `📝 *Summary written automatically*`,
+        meetingLine({ title, when: row.recorded_at ?? row.created_at, duration: row.duration, speakerCount: row.speaker_count }),
+        ...headlines(after.auto_notes, 2),
+        `Nobody reviewed the speakers within ${AUTO_PROCEED_GRACE_MIN} min of the AI pass and every voice was identified confidently — ${names.length > 0 ? `speakers: ${names.join(', ')}` : 'speakers already named'}. Fix any name → <${url}|Open the meeting>`
+      ),
+      dedupeKey: `mw-auto-proceed:${assemblyaiId}:${owner.email}`,
+    });
+  }
+  return 'proceeded';
 }

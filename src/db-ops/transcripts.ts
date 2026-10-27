@@ -16,6 +16,7 @@ import {
   archiveParticipantsExpr,
 } from '@/db-ops/meeting-filter-sql';
 import { EMPTY_MEETING_FILTERS, type MeetingFilters } from '@/lib/server/meeting-filters';
+import { autoProceedAt } from '@/lib/auto-proceed';
 import { recordingCountExpr } from '@/db-ops/recordings';
 import { clearNotesStaleIfRegenerated } from '@/db-ops/transcriptions';
 import { recordingsEnabled } from '@/lib/server/recordings';
@@ -361,6 +362,12 @@ type PagedRawRow = Omit<TranscriptListRow, 'access' | 'owner_email' | 'owner_nam
   /** Organizer + attendee emails (lower-cased, de-duplicated) — the optional
    * `participants` field of v2 rows. */
   participants: string[];
+  /** lib/auto-proceed inputs, folded into `auto_proceed_at`. */
+  speaker_id_at: string | null;
+  auto_report_status: string | null;
+  __auto_reviewed: boolean;
+  __report_pref: string | null;
+  __auto_marked: boolean;
   __access: 'owner' | 'edit' | 'read' | null;
   day_key: string;
   __total_days: number;
@@ -431,6 +438,14 @@ export async function listPagedForUser(
              -- notes text, which would bloat every page by its summaries.
              t.speaker_id_status,
              (t.auto_notes IS NOT NULL AND t.auto_notes <> '') AS has_notes,
+             -- Inputs of lib/auto-proceed autoProceedAt (the row's
+             -- "Summary at HH:MM"); folded into auto_proceed_at below and
+             -- not exposed as columns of their own.
+             t.speaker_id_at, t.auto_report_status,
+             jsonb_typeof(t.gmeet_context->'autoReview') = 'object' AS __auto_reviewed,
+             t.gmeet_context->'uploadPrefs'->>'report' AS __report_pref,
+             (jsonb_typeof(t.gmeet_context->'autoImport') = 'object'
+              OR jsonb_typeof(t.gmeet_context->'autoSync') = 'object') AS __auto_marked,
              t.upload_bytes_received::float8 AS upload_bytes_received,
              t.upload_bytes_total::float8 AS upload_bytes_total,
              -- Multi-part upload in flight: parts landed / parts expected,
@@ -585,6 +600,7 @@ export async function listPagedForUser(
            b.language_code, b.title, b.description, b.last_accessed,
            b.source, b.speech_model, b.recorded_at, b.auto_notes_status,
            b.speaker_id_status, b.has_notes,
+           b.speaker_id_at, b.auto_report_status, b.__auto_reviewed, b.__report_pref, b.__auto_marked,
            b.upload_bytes_received, b.upload_bytes_total,
            b.upload_parts_done, b.upload_parts_total, b.recorder_recording_id,
            b.split_off,
@@ -667,16 +683,37 @@ export async function listPagedForUser(
   `;
 
   const [raw, countsRows] = await Promise.all([pagePromise, countsPromise]);
+  const listedAt = new Date();
 
   const dayGroups: TranscriptDayGroup[] = [];
   let current: TranscriptDayGroup | null = null;
   for (const r of raw) {
     // __total_days/__page_days are window metadata stamped on every row, not row fields.
-    // eslint-disable-next-line @typescript-eslint/no-unused-vars
-    const { day_key, __access, __total_days: _t, __page_days: _p, matched_in, snippet, deleted_at, ...rest } = r;
+    const {
+      // eslint-disable-next-line @typescript-eslint/no-unused-vars
+      day_key, __access, __total_days: _t, __page_days: _p, matched_in, snippet, deleted_at,
+      speaker_id_at, auto_report_status, __auto_reviewed, __report_pref, __auto_marked,
+      ...rest
+    } = r;
     const row: TranscriptListRow = {
       ...rest,
       ...(isTrash ? { deleted_at } : {}),
+      // The one eligibility rule (lib/auto-proceed), fed the columns above.
+      auto_proceed_at: autoProceedAt(
+        {
+          status: r.status,
+          deleted_at,
+          speaker_id_status: r.speaker_id_status ?? null,
+          speaker_id_at,
+          hasNotes: !!r.has_notes,
+          auto_notes_status: r.auto_notes_status,
+          auto_report_status,
+          autoReviewed: __auto_reviewed,
+          reportPref: __report_pref,
+          autoMarked: __auto_marked,
+        },
+        listedAt
+      ),
       scratch: !!r.scratch,
       ...(q ? { matched_in, snippet } : {}),
       access: __access ?? 'read',
@@ -1537,6 +1574,41 @@ export async function listNotesBacklog(
       AND auto_notes_status = 'running'
       AND auto_notes_at < now() - make_interval(mins => ${stuckMinutes})
     ORDER BY COALESCE(completed_at, created_at) DESC
+    LIMIT ${limit}
+  `;
+}
+
+/**
+ * Manual rows due for the grace-window auto-proceed (lib/auto-proceed.ts —
+ * this is the SQL twin of `autoProceedAt`; a test pins both predicate lists
+ * to each other): completed, live, speaker pass finished between
+ * `graceMinutes` and `windowHours` ago, no notes and no run, never
+ * evaluated or held (`autoReview` absent), upload pref not 'later', and no
+ * automation marker (those rows were evaluated at completion). Temporary
+ * (scratch) rows are included — they are real meetings too. Oldest first,
+ * so a backlog drains in order.
+ */
+export async function listAutoProceedBacklog(
+  graceMinutes: number,
+  windowHours: number,
+  limit: number
+): Promise<Array<{ user_id: string; assemblyai_id: string; speaker_id_at: string }>> {
+  return sql<Array<{ user_id: string; assemblyai_id: string; speaker_id_at: string }>>`
+    SELECT user_id, assemblyai_id, speaker_id_at
+    FROM ${sql(SCHEMA)}.transcripts
+    WHERE status = 'completed'
+      AND deleted_at IS NULL
+      AND speaker_id_status = 'completed'
+      AND speaker_id_at < now() - make_interval(mins => ${graceMinutes})
+      AND speaker_id_at > now() - make_interval(hours => ${windowHours})
+      AND (auto_notes IS NULL OR auto_notes = '')
+      AND auto_notes_status IS NULL
+      AND auto_report_status IS NULL
+      AND jsonb_typeof(gmeet_context->'autoReview') IS DISTINCT FROM 'object'
+      AND COALESCE(gmeet_context->'uploadPrefs'->>'report', '') <> 'later'
+      AND jsonb_typeof(gmeet_context->'autoImport') IS DISTINCT FROM 'object'
+      AND jsonb_typeof(gmeet_context->'autoSync') IS DISTINCT FROM 'object'
+    ORDER BY speaker_id_at ASC
     LIMIT ${limit}
   `;
 }

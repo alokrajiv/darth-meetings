@@ -28,6 +28,7 @@ import { removeRecordingGraphForMeeting } from '@/lib/server/recording-sync';
 import { deleteAnnotationsForMeeting } from '@/db-ops/transcriptions';
 import { mayDeleteRecordingFiles } from '@/lib/clips';
 import { redactForReader } from '@/lib/reader-redaction';
+import { autoProceedAt, autoProceedFactsOf } from '@/lib/auto-proceed';
 
 export const runtime = 'nodejs';
 
@@ -88,6 +89,10 @@ export const GET = withAuth(async ({ user, request }, { params }) => {
       access: access.access,
       owner_email: owner?.email ?? null,
       owner_name: owner?.name ?? null,
+      // When the summary will be written automatically (lib/auto-proceed),
+      // or null — the page shows the line + Hold from this, never from a
+      // client-side re-derivation of the rule.
+      autoProceedAt: autoProceedAt(autoProceedFactsOf(refreshed)),
     }),
   });
 });
