@@ -7,9 +7,11 @@ import { describe, expect, test } from 'bun:test';
 import {
   SUMMARY_ACTION,
   SUMMARY_BADGE_LABEL,
+  autoProceedLine,
   readDoIntent,
   resolveDoIntent,
   summaryBadgeFor,
+  summaryBadgeText,
   summaryStateOf,
   transcriptIntentHref,
   withoutDoParam,
@@ -89,22 +91,44 @@ describe('summaryBadgeFor — one badge, at most one action', () => {
       state: 'missing',
       label: 'No summary yet',
       action: { label: 'Generate', intent: 'generate' },
+      autoProceedAt: null,
     });
     expect(summaryBadgeFor({ ...done, auto_notes_status: 'error' }, true)).toEqual({
       state: 'failed',
       label: 'Summary failed',
       action: { label: 'Retry', intent: 'generate' },
+      autoProceedAt: null,
     });
     expect(summaryBadgeFor({ ...missing, speaker_id_status: 'running' }, true)).toEqual({
       state: 'speakers',
       label: 'Identifying speakers…',
       action: { label: 'Review speakers', intent: 'review' },
+      autoProceedAt: null,
     });
     expect(summaryBadgeFor({ ...missing, auto_notes_status: 'running' }, true)).toEqual({
       state: 'running',
       label: 'Writing summary…',
       action: null,
+      autoProceedAt: null,
     });
+  });
+
+  test('a scheduled automatic start: the missing badge says when, the action stays Generate', () => {
+    const at = '2026-10-27T02:42:00.000Z';
+    const clock = (iso: string) => `T(${iso})`;
+    const badge = summaryBadgeFor({ ...missing, auto_proceed_at: at }, true)!;
+    expect(badge.state).toBe('missing');
+    expect(badge.autoProceedAt).toBe(at);
+    expect(badge.action).toEqual({ label: 'Generate', intent: 'generate' });
+    expect(summaryBadgeText(badge, clock)).toBe(`Summary at T(${at})`);
+    // Viewers see the same text, no action.
+    expect(summaryBadgeText(summaryBadgeFor({ ...missing, auto_proceed_at: at }, false)!, clock)).toBe(`Summary at T(${at})`);
+    // Other states ignore it — a failed or running row has no scheduled start.
+    expect(summaryBadgeFor({ ...done, auto_notes_status: 'error', auto_proceed_at: at }, true)!.autoProceedAt).toBeNull();
+    expect(summaryBadgeText(summaryBadgeFor(missing, true)!, clock)).toBe('No summary yet');
+    // The default clock renders a local HH:MM.
+    expect(summaryBadgeText(badge)).toMatch(/^Summary at \d{1,2}:\d{2}/);
+    expect(autoProceedLine(at, clock)).toBe(`Summary starts automatically at T(${at}) with the suggested names.`);
   });
 
   test('a viewer sees the badge and no action', () => {

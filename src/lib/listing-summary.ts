@@ -38,6 +38,9 @@ export interface SummaryRowInput {
    * renders its own amber "Review speakers" chip, so no summary badge joins
    * it — one signal per row. */
   auto_state?: 'passed' | 'gated' | 'auto' | null;
+  /** When the summary will be written automatically (lib/auto-proceed.ts),
+   * or null. A `missing` row that carries it reads "Summary at HH:MM". */
+  auto_proceed_at?: string | null;
 }
 
 export interface SummaryAction {
@@ -50,6 +53,8 @@ export interface SummaryBadge {
   label: string;
   /** Null for viewers and for states nobody can act on. */
   action: SummaryAction | null;
+  /** `missing` only: the automatic start, when one is scheduled. */
+  autoProceedAt: string | null;
 }
 
 export const SUMMARY_BADGE_LABEL: Record<SummaryState, string> = {
@@ -98,7 +103,28 @@ export function summaryBadgeFor(row: SummaryRowInput, canEdit: boolean): Summary
     state,
     label: SUMMARY_BADGE_LABEL[state],
     action: canEdit ? SUMMARY_ACTION[state] : null,
+    autoProceedAt: state === 'missing' ? (row.auto_proceed_at ?? null) : null,
   };
+}
+
+/** HH:MM in the viewer's local time. */
+export function clockOf(iso: string): string {
+  return new Date(iso).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+}
+
+/**
+ * The chip's text: the state's label, except a `missing` row with an
+ * automatic start scheduled, which says when ("Summary at 10:42"). The
+ * action stays Generate — a person may still go first.
+ */
+export function summaryBadgeText(badge: SummaryBadge, clock: (iso: string) => string = clockOf): string {
+  if (badge.state === 'missing' && badge.autoProceedAt) return `Summary at ${clock(badge.autoProceedAt)}`;
+  return badge.label;
+}
+
+/** The detail page's line under "No notes yet" while an automatic start is scheduled. */
+export function autoProceedLine(autoProceedAt: string, clock: (iso: string) => string = clockOf): string {
+  return `Summary starts automatically at ${clock(autoProceedAt)} with the suggested names.`;
 }
 
 /** Where the action navigates: the meeting, carrying the intent. */

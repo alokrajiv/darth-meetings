@@ -81,7 +81,7 @@ import { BulkLabelBar } from '@/components/bulk-label-bar';
 import { refreshLabelCatalog, useLabelCatalog } from '@/hooks/use-label-catalog';
 import { isNetworkFailure, networkErrorMessage, NETWORK_ERROR_MESSAGE } from '@/lib/fetch-errors';
 import { labelFilterToParams, type LabelFilter } from '@/lib/labels';
-import { summaryBadgeFor, transcriptIntentHref } from '@/lib/listing-summary';
+import { summaryBadgeFor, summaryBadgeText, transcriptIntentHref } from '@/lib/listing-summary';
 import type { LabelRef } from '@/lib/format';
 import {
   PeopleFilterChips,
@@ -2163,7 +2163,7 @@ export function TranscriptTable({
                     {(badge.state === 'running' || badge.state === 'speakers') && (
                       <RefreshCw className="h-2.5 w-2.5 animate-spin" />
                     )}
-                    {badge.label}
+                    {summaryBadgeText(badge)}
                   </span>
                 )}
                 {badgeAction && (

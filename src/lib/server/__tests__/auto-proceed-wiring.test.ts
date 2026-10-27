@@ -141,6 +141,26 @@ describe('the sweeper pick is the SQL twin of the TS rule', () => {
   });
 });
 
+describe('the UI reads the server, never the rule', () => {
+  test('the detail page shows the line + Hold from row.autoProceedAt and posts to notes/hold', () => {
+    const page = read('app/transcript/[id]/page.tsx');
+    expect(page).toContain('{row.autoProceedAt && (');
+    expect(page).toContain('autoProceedLine(row.autoProceedAt)');
+    expect(page).toContain("fetch(`/api/transcripts/${transcriptId}/notes/hold`, { method: 'POST' })");
+    expect(page).toContain('setRow((prev) => (prev ? { ...prev, autoProceedAt: null } : prev))');
+    // The page never imports the rule itself.
+    expect(page).not.toContain('@/lib/auto-proceed');
+    // Opening the review dialog does not hold: the only hold request is the button's.
+    expect(page.match(/fetch\(`\/api\/transcripts\/\$\{transcriptId\}\/notes\/hold`/g)?.length).toBe(1);
+  });
+
+  test('the listing chip says "Summary at HH:MM" from auto_proceed_at', () => {
+    const table = read('components/transcript-table.tsx');
+    expect(table).toContain('{summaryBadgeText(badge)}');
+    expect(table).not.toContain('@/lib/auto-proceed');
+  });
+});
+
 describe('the API: autoProceedAt on GET, the hold route', () => {
   test('GET …/transcripts/:id answers autoProceedAt from the shared helper', () => {
     const src = read('app/api/transcripts/[id]/route.ts');

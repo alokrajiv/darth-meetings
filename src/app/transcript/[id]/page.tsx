@@ -5,7 +5,13 @@ import { useRouter } from 'next/navigation';
 import { useLiveEvents } from '@/hooks/use-live-events';
 import { useTranscriptions } from '@/hooks/use-transcriptions';
 import { NOTES_FROM_PREVIOUS_TRANSCRIPTION } from '@/lib/transcription-copy';
-import { readDoIntent, resolveDoIntent, withoutDoParam, type SummaryIntent } from '@/lib/listing-summary';
+import {
+  autoProceedLine,
+  readDoIntent,
+  resolveDoIntent,
+  withoutDoParam,
+  type SummaryIntent,
+} from '@/lib/listing-summary';
 import { formatDistanceToNow } from 'date-fns';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
@@ -129,7 +135,13 @@ import {
 const VIDEO_EXT_RE = /\.(mp4|webm|mov|mkv|m4v)$/i;
 /** The detail row: a StoredTranscript plus the owner's identity on shared
  * rows (GET /api/transcripts/:id fills it) — "Recorded on Atira's Mac". */
-type DetailRow = StoredTranscript & { owner_email?: string | null; owner_name?: string | null };
+type DetailRow = StoredTranscript & {
+  owner_email?: string | null;
+  owner_name?: string | null;
+  /** When the summary will be written automatically (lib/auto-proceed.ts),
+   * or null — the server decides; the page only shows the line + Hold. */
+  autoProceedAt?: string | null;
+};
 
 /**
  * Find the index of the utterance whose [start, end) interval contains the
@@ -1017,6 +1029,24 @@ function TranscriptDetailInner({
     if (resolveDoIntent(intent, unconfirmedSpeakers.length) === 'review') setReviewOpen(true);
     else openGenerateDialog();
   }, [loading, row, canEdit, unconfirmedSpeakers, row?.speaker_id_status]);
+
+  // "Don't write it on your own": stamps the row held (POST …/notes/hold), and
+  // the line under "No notes yet" goes away. Opening the review dialog does
+  // NOT hold — only this does. Best-effort; a failure leaves the line, and
+  // the next poll reconciles either way.
+  const [holding, setHolding] = useState(false);
+  const holdAutoSummary = useCallback(async () => {
+    if (holding) return;
+    setHolding(true);
+    try {
+      const res = await fetch(`/api/transcripts/${transcriptId}/notes/hold`, { method: 'POST' });
+      if (res.ok) setRow((prev) => (prev ? { ...prev, autoProceedAt: null } : prev));
+    } catch {
+      // the line stays; the next poll reconciles
+    } finally {
+      setHolding(false);
+    }
+  }, [holding, transcriptId]);
 
   const handleGenerateReport = useCallback(async (instructions?: string, useVideo = true, runAt?: string) => {
     if (generatingReport) return;
@@ -3696,6 +3726,26 @@ function TranscriptDetailInner({
                               Tip: attach an agenda or deck in the right panel too; it sharpens
                               the output.
                             </p>
+                            {/* lib/auto-proceed: a manual row whose speakers the AI identified
+                                confidently gets its summary written after a grace period
+                                unless someone acts. The server says when; Hold stops it. */}
+                            {row.autoProceedAt && (
+                              <p
+                                className="mt-2 flex flex-wrap items-center justify-center gap-x-1.5 text-xs text-muted-foreground"
+                                data-auto-proceed-at={row.autoProceedAt}
+                              >
+                                <span>{autoProceedLine(row.autoProceedAt)}</span>
+                                <button
+                                  type="button"
+                                  className="font-medium text-primary hover:underline disabled:opacity-50"
+                                  disabled={holding}
+                                  onClick={() => void holdAutoSummary()}
+                                  data-auto-proceed-hold
+                                >
+                                  Hold
+                                </button>
+                              </p>
+                            )}
                           </>
                         )}
                       </div>
