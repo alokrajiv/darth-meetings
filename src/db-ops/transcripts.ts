@@ -426,6 +426,11 @@ export async function listPagedForUser(
              t.created_at, t.completed_at, t.duration, t.speaker_count,
              t.language_code, t.title, t.description, t.last_accessed,
              t.source, t.speech_model, t.recorded_at, t.auto_notes_status,
+             -- The row's summary badge (lib/listing-summary.ts): the speaker
+             -- pass that gates Generate, and WHETHER notes exist — never the
+             -- notes text, which would bloat every page by its summaries.
+             t.speaker_id_status,
+             (t.auto_notes IS NOT NULL AND t.auto_notes <> '') AS has_notes,
              t.upload_bytes_received::float8 AS upload_bytes_received,
              t.upload_bytes_total::float8 AS upload_bytes_total,
              -- Multi-part upload in flight: parts landed / parts expected,
@@ -579,6 +584,7 @@ export async function listPagedForUser(
            b.created_at, b.completed_at, b.duration, b.speaker_count,
            b.language_code, b.title, b.description, b.last_accessed,
            b.source, b.speech_model, b.recorded_at, b.auto_notes_status,
+           b.speaker_id_status, b.has_notes,
            b.upload_bytes_received, b.upload_bytes_total,
            b.upload_parts_done, b.upload_parts_total, b.recorder_recording_id,
            b.split_off,

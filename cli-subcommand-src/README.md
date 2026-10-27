@@ -15,7 +15,7 @@ back) and the calling agent brings the intelligence with its own tokens.
 | command | endpoint(s) |
 | --- | --- |
 | `list` (no flags) | `GET /api/transcripts` — legacy full array, **byte-identical output, never change** |
-| `list [FILTERS]` | `GET /api/transcripts?v=2&tab=all&days=60&minRows=200&tz=…&<filters>` paged via `cursor=nextCursor` until `hasMore=false`, flattened to one row list, same columns as legacy |
+| `list [FILTERS]` | `GET /api/transcripts?v=2&tab=all&days=60&minRows=200&tz=…&<filters>` paged via `cursor=nextCursor` until `hasMore=false`, flattened to one row list, same columns as legacy. Filters = the shared contract (`lib/server/meeting-filters.ts`): `participant` / `organizer` / `provider` / `speaker` / `q` / `from` / `to` / `label` and, since 2026-10-27, `summary=missing\|failed` (`--summary`, or `--no-summary` = `--summary missing`: completed meetings with no summary text and no run in flight or failed; `failed` = the last run errored). v2 rows also carry `speaker_id_status` + `has_notes` (legacy rows do not) |
 | `search <q> [people filters]` | `GET /api/transcripts/search?q=…&participant=…&organizer=…&provider=…&speaker=…` |
 | `export --out-dir <dir> [FILTERS]` | list v2 drain (as above) → per row `GET /api/transcripts/:id/content` + `/speakers` |
 | `calendar [--view unimported\|norec] [FILTERS]` | `GET /api/calendar-meetings?view=…&<filters>` paged the same way |

@@ -80,6 +80,7 @@ describe('parseMeetingFilters', () => {
       organizer: ['swaralee'],
       provider: ['teams', 'gmeet'],
       speaker: ['rita'],
+      summary: [],
       q: 'LP weekly',
     });
     expect(hasPeopleFilters(r.filters)).toBe(true);
@@ -97,6 +98,31 @@ describe('parseMeetingFilters', () => {
     expect(r.error).toContain('bogus');
     // One bad value poisons the whole list — no silent partial filter.
     expect(parseMeetingFilters(qs('provider=teams,zoom')).ok).toBe(false);
+  });
+
+  test('summary=missing / summary=missing,failed parse; case-insensitive, de-duplicated', () => {
+    const one = parseMeetingFilters(qs('summary=missing'));
+    expect(one.ok && one.filters.summary).toEqual(['missing']);
+    const both = parseMeetingFilters(qs('summary=Missing,FAILED,missing'));
+    expect(both.ok && both.filters.summary).toEqual(['missing', 'failed']);
+    expect(both.ok && hasPeopleFilters(both.filters)).toBe(true);
+  });
+
+  test('summary=bogus → not ok (route answers 400), like provider', () => {
+    const r = parseMeetingFilters(qs('summary=bogus'));
+    expect(r.ok).toBe(false);
+    if (r.ok) throw new Error('unreachable');
+    expect(r.error).toContain('bogus');
+    expect(r.error).toContain('missing|failed');
+    expect(parseMeetingFilters(qs('summary=missing,none')).ok).toBe(false);
+  });
+
+  test('empty summary value is "not filtering"', () => {
+    const r = parseMeetingFilters(qs('summary=&summary=,'));
+    expect(r.ok && r.filters.summary).toEqual([]);
+    const absent = parseMeetingFilters(qs('q=hello'));
+    expect(absent.ok && absent.filters.summary).toEqual([]);
+    expect(EMPTY_MEETING_FILTERS.summary).toEqual([]);
   });
 
   test('empty provider list is "not filtering", not an error', () => {

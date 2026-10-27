@@ -6,6 +6,7 @@ import {
   toLikePatterns,
   type MeetingFilters,
   type MeetingProvider,
+  type MeetingSummaryState,
 } from '@/lib/server/meeting-filters';
 
 // SQL twins of the shared people/provider filters (lib/server/meeting-filters)
@@ -104,6 +105,29 @@ function archiveSpeakerMatch(terms: readonly string[]): Fragment {
 }
 
 /**
+ * The `summary=` filter, one predicate per state, OR-ed. The SQL twin of
+ * `summaryStateOf` in lib/listing-summary.ts (the row badge): a row the badge
+ * calls "No summary yet" is a row `missing` selects, and "Summary failed" is
+ * `failed`. Only `t.auto_notes` emptiness is tested — the text itself is
+ * never selected into a listing.
+ *
+ *   missing  completed, no notes text, and no run in flight or failed
+ *   failed   the last notes run errored (`auto_notes_status = 'error'`)
+ */
+export function archiveSummaryExpr(states: readonly MeetingSummaryState[]): Fragment {
+  const parts: Fragment[] = [];
+  if (states.includes('missing')) {
+    parts.push(sql`(t.status = 'completed'
+      AND (t.auto_notes IS NULL OR t.auto_notes = '')
+      AND t.auto_notes_status IS DISTINCT FROM 'running'
+      AND t.auto_notes_status IS DISTINCT FROM 'error')`);
+  }
+  if (states.includes('failed')) parts.push(sql`t.auto_notes_status = 'error'`);
+  if (parts.length === 0) return sql`FALSE`;
+  return parts.reduce((acc, p) => sql`${acc} OR ${p}`);
+}
+
+/**
  * `AND (…)` clauses for a transcripts query aliased `t` (listing v2 page +
  * counts, deep search). Empty fragment when nothing is set. `q` is NOT
  * applied here — the archive queries already have their own q search with
@@ -131,6 +155,7 @@ export function archiveFilterSql(f: MeetingFilters): Fragment {
         : sql``
     }
     ${f.speaker.length > 0 ? sql`AND ${archiveSpeakerMatch(f.speaker)}` : sql``}
+    ${f.summary.length > 0 ? sql`AND (${archiveSummaryExpr(f.summary)})` : sql``}
   `;
 }
 

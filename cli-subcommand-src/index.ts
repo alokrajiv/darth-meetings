@@ -437,6 +437,10 @@ inside one value = OR; matching is case-insensitive substring)
   --provider <p>      teams | gmeet | upload (comma = OR; 'upload' never matches
                       calendar rows). Anything else is rejected
   --speaker <s>       speaker names only (archive: list / search / export)
+  --summary <s>       missing | failed (comma = OR; archive: list / search /
+                      export). missing = completed, no summary, no run in
+                      flight or failed; failed = the last run errored.
+                      --no-summary is shorthand for --summary missing
   --q <s>             text search, 2+ chars — list/export: title, filename,
                       description, notes, full text; calendar: title, organizer,
                       attendees. ('search' takes the query as its argument.)
@@ -937,10 +941,12 @@ async function resolveMeetingRefs(ctx: Ctx, pos: string[]): Promise<string[]> {
 
 /** Server-side filter params — names are the API contract of
  * GET /api/transcripts?v=2, /api/transcripts/search, /api/calendar-meetings. */
-const PEOPLE_FLAGS = ["participant", "organizer", "provider", "speaker"] as const;
+const PEOPLE_FLAGS = ["participant", "organizer", "provider", "speaker", "summary"] as const;
 const RANGE_FLAGS = ["from", "to"] as const;
 const ALL_FILTER_FLAGS = [...PEOPLE_FLAGS, ...RANGE_FLAGS, "q"] as const;
 const PROVIDERS = ["teams", "gmeet", "upload"];
+/** `--summary` values (server: lib/server/meeting-filters.ts). `--no-summary` = `--summary missing`. */
+const SUMMARY_STATES = ["missing", "failed"];
 const DAY_RE = /^\d{4}-\d{2}-\d{2}$/;
 
 type FilterRead =
@@ -1040,6 +1046,15 @@ function readFilterFlags(ctx: Ctx, flags: Record<string, string | boolean>, allo
     if (flags[name] !== undefined && !allow.includes(name)) return { ok: false, error: `--${name} is not supported by this command` };
   }
   if (flags.exact !== undefined && flags.label === undefined) return { ok: false, error: "--exact only makes sense together with --label" };
+  // --no-summary is sugar for --summary missing (the common ask: "which
+  // meetings still have no summary?"). A boolean flag: a swallowed next token
+  // is an error, never a silently dropped positional.
+  if (flags["no-summary"] !== undefined) {
+    if (!allow.includes("summary")) return { ok: false, error: "--no-summary is not supported by this command" };
+    if (typeof flags["no-summary"] === "string") return { ok: false, error: `--no-summary takes no value (got '${flags["no-summary"]}') — put it last, or use --summary missing` };
+    if (flags.summary !== undefined && String(flags.summary).trim().toLowerCase() !== "missing") return { ok: false, error: "--no-summary means --summary missing; drop one of the two" };
+    flags = { ...flags, summary: "missing" };
+  }
   for (const name of ALL_FILTER_FLAGS) {
     const v = flags[name];
     if (v === undefined) continue;
@@ -1049,6 +1064,10 @@ function readFilterFlags(ctx: Ctx, flags: Record<string, string | boolean>, allo
     if (name === "provider") {
       const bad = val.split(",").map(x => x.trim().toLowerCase()).filter(x => x && !PROVIDERS.includes(x));
       if (bad.length) return { ok: false, error: `--provider: unknown value(s) ${bad.join(", ")} — use ${PROVIDERS.join("|")} (comma = OR)` };
+    }
+    if (name === "summary") {
+      const bad = val.split(",").map(x => x.trim().toLowerCase()).filter(x => x && !SUMMARY_STATES.includes(x));
+      if (bad.length) return { ok: false, error: `--summary: unknown value(s) ${bad.join(", ")} — use ${SUMMARY_STATES.join("|")} (comma = OR), or --no-summary` };
     }
     if ((name === "from" || name === "to") && !DAY_RE.test(val))
       return { ok: false, error: `--${name} must be YYYY-MM-DD` };
@@ -3753,7 +3772,7 @@ const meetings: Subcommand = {
           // Temporary rows only — legacy shape like ?trash=1, nothing else
           // composes (the server ignores filters on this path, so refuse
           // them here instead of silently listing everything).
-          const other = [...ALL_FILTER_FLAGS, "label", "exact"].filter(f => flags[f] !== undefined);
+          const other = [...ALL_FILTER_FLAGS, "no-summary", "label", "exact"].filter(f => flags[f] !== undefined);
           if (other.length) { console.error(`--scratch lists your temporary transcripts only — it does not combine with ${other.map(f => `--${f}`).join(", ")}`); return 1; }
           const data = await ctx.expectJson<{ transcripts: any[] }>(ctx.api("meetings", "/api/transcripts?scratch=1"));
           const rows = data.transcripts;

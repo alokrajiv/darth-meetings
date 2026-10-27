@@ -1,38 +1,48 @@
 'use client';
 
 /**
- * People / provider filter control for the meeting listing.
+ * People / provider / summary filter control for the meeting listing.
  *
  * Owns nothing server-side: it only edits a `PeopleFilters` value that the
- * listing turns into the shared `participant` / `organizer` / `provider`
- * query params (see src/lib/server/meeting-filters.ts for THE contract —
- * every listing layer accepts exactly those names, comma = OR, AND across
- * params; counts come back already filtered).
+ * listing turns into the shared `participant` / `organizer` / `provider` /
+ * `summary` query params (see src/lib/server/meeting-filters.ts for THE
+ * contract — every listing layer accepts exactly those names, comma = OR,
+ * AND across params; counts come back already filtered).
  *
- * State lives in the URL (?participant=&organizer=&provider=) so a filtered
- * view is a shareable link; `readPeopleFiltersFromUrl` / `writePeopleFiltersToUrl`
- * are the two sides of that sync and `appendPeopleFilterParams` is what
- * every fetch calls.
+ * State lives in the URL (?participant=&organizer=&provider=&summary=) so a
+ * filtered view is a shareable link; `readPeopleFiltersFromUrl` /
+ * `writePeopleFiltersToUrl` are the two sides of that sync and
+ * `appendPeopleFilterParams` is what every fetch calls.
  */
 
 import { useEffect, useRef, useState } from 'react';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { Check, X } from 'lucide-react';
-import type { MeetingProvider } from '@/lib/server/meeting-filters';
+import type { MeetingProvider, MeetingSummaryState } from '@/lib/server/meeting-filters';
+import { SUMMARY_FILTER_LABEL } from '@/lib/listing-summary';
 
 export interface PeopleFilters {
   /** OR terms, already trimmed + de-duplicated (case preserved for display). */
   participant: string[];
   organizer: string[];
   provider: MeetingProvider[];
+  /** `summary=missing|failed` — archive rows without a usable summary. */
+  summary: MeetingSummaryState[];
 }
 
 export const EMPTY_PEOPLE_FILTERS: PeopleFilters = {
   participant: [],
   organizer: [],
   provider: [],
+  summary: [],
 };
+
+const SUMMARY_OPTIONS: { key: MeetingSummaryState; label: string; title: string }[] = [
+  { key: 'missing', label: SUMMARY_FILTER_LABEL.missing, title: 'Completed meetings that have no summary and no run in flight' },
+  { key: 'failed', label: SUMMARY_FILTER_LABEL.failed, title: 'Meetings whose last summary run errored' },
+];
+const SUMMARY_KEYS = SUMMARY_OPTIONS.map((s) => s.key);
 
 const PROVIDER_OPTIONS: { key: MeetingProvider; label: string; title: string }[] = [
   { key: 'teams', label: 'Teams', title: 'Microsoft Teams meetings' },
@@ -62,11 +72,17 @@ export function splitTerms(raw: string): string[] {
 }
 
 export function hasPeopleFilters(f: PeopleFilters): boolean {
-  return f.participant.length > 0 || f.organizer.length > 0 || f.provider.length > 0;
+  return (
+    f.participant.length > 0 ||
+    f.organizer.length > 0 ||
+    f.provider.length > 0 ||
+    f.summary.length > 0
+  );
 }
 
+/** Every active term counts once in the Filter button's badge. */
 export function countPeopleFilters(f: PeopleFilters): number {
-  return f.participant.length + f.organizer.length + f.provider.length;
+  return f.participant.length + f.organizer.length + f.provider.length + f.summary.length;
 }
 
 /** Stable identity key — handy as an effect dependency. */
@@ -75,6 +91,7 @@ export function peopleFiltersKey(f: PeopleFilters): string {
     f.participant.map((s) => s.toLowerCase()),
     f.organizer.map((s) => s.toLowerCase()),
     f.provider,
+    f.summary,
   ]);
 }
 
@@ -83,6 +100,7 @@ export function appendPeopleFilterParams(params: URLSearchParams, f: PeopleFilte
   if (f.participant.length) params.set('participant', f.participant.join(','));
   if (f.organizer.length) params.set('organizer', f.organizer.join(','));
   if (f.provider.length) params.set('provider', f.provider.join(','));
+  if (f.summary.length) params.set('summary', f.summary.join(','));
 }
 
 export function readPeopleFiltersFromUrl(search: string): PeopleFilters {
@@ -91,10 +109,14 @@ export function readPeopleFiltersFromUrl(search: string): PeopleFilters {
   const provider = read('provider')
     .map((p) => p.toLowerCase())
     .filter((p): p is MeetingProvider => (PROVIDER_KEYS as string[]).includes(p));
+  const summary = read('summary')
+    .map((s) => s.toLowerCase())
+    .filter((s): s is MeetingSummaryState => (SUMMARY_KEYS as string[]).includes(s));
   return {
     participant: read('participant'),
     organizer: read('organizer'),
     provider: Array.from(new Set(provider)),
+    summary: Array.from(new Set(summary)),
   };
 }
 
@@ -106,6 +128,7 @@ export function writePeopleFiltersToUrl(f: PeopleFilters): void {
   sp.delete('participant');
   sp.delete('organizer');
   sp.delete('provider');
+  sp.delete('summary');
   appendPeopleFilterParams(sp, f);
   const qs = sp.toString();
   const next = `${window.location.pathname}${qs ? `?${qs}` : ''}${window.location.hash}`;
@@ -233,6 +256,50 @@ export function PeopleFilterFields({ value, onChange }: PeopleFilterProps) {
   );
 }
 
+/**
+ * The "Summary" section of the Filter popover: two toggles, "No summary yet"
+ * and "Summary failed" (both on = either). Same toggle styling as the
+ * provider group; commits immediately, like the provider toggles.
+ */
+export function SummaryFilterFields({ value, onChange }: PeopleFilterProps) {
+  const toggle = (key: MeetingSummaryState) => {
+    const on = value.summary.includes(key);
+    const summary = on
+      ? value.summary.filter((s) => s !== key)
+      : SUMMARY_KEYS.filter((s) => s === key || value.summary.includes(s));
+    onChange({ ...value, summary });
+  };
+  return (
+    <div className="px-1" data-summary-filter>
+      <div className="flex items-center gap-0.5 rounded-lg border bg-muted/40 p-0.5">
+        {SUMMARY_OPTIONS.map((s) => {
+          const on = value.summary.includes(s.key);
+          return (
+            <button
+              key={s.key}
+              type="button"
+              onClick={() => toggle(s.key)}
+              aria-pressed={on}
+              title={s.title}
+              className={`flex flex-1 items-center justify-center gap-1 rounded-md px-2 py-1 text-xs transition-colors ${
+                on
+                  ? 'bg-background font-medium text-foreground shadow-sm'
+                  : 'text-muted-foreground hover:text-foreground'
+              }`}
+            >
+              <Check className={`h-3 w-3 ${on ? 'text-primary' : 'invisible'}`} aria-hidden />
+              {s.label}
+            </button>
+          );
+        })}
+      </div>
+      <span className="mt-1 block text-[10px] text-muted-foreground">
+        Completed meetings only. None selected = any.
+      </span>
+    </div>
+  );
+}
+
 /** Removable chips for every active filter term. Renders nothing when no
  * filter is set. */
 export function PeopleFilterChips({ value, onChange }: PeopleFilterProps) {
@@ -270,6 +337,11 @@ export function PeopleFilterChips({ value, onChange }: PeopleFilterProps) {
       {value.provider.map((p) =>
         chip(`v:${p}`, 'Provider', PROVIDER_LABEL[p], () =>
           onChange({ ...value, provider: value.provider.filter((x) => x !== p) })
+        )
+      )}
+      {value.summary.map((s) =>
+        chip(`s:${s}`, 'Summary', SUMMARY_FILTER_LABEL[s], () =>
+          onChange({ ...value, summary: value.summary.filter((x) => x !== s) })
         )
       )}
       {countPeopleFilters(value) > 1 && (

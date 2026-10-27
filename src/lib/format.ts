@@ -773,6 +773,14 @@ export interface TranscriptListRow {
   speech_model?: string | null;
   recorded_at: string | null;
   auto_notes_status: string | null;
+  /** v2 listing only: the speaker-identification pass ('running' is what
+   * gates Generate on the detail page). Absent from the legacy listing, so
+   * darth-cli's payload is unchanged. */
+  speaker_id_status?: string | null;
+  /** v2 listing only: whether notes TEXT exists (`auto_notes` non-empty).
+   * The text itself is never selected into a listing. Drives the row's
+   * summary badge (lib/listing-summary.ts). Absent from the legacy listing. */
+  has_notes?: boolean | null;
   upload_bytes_received: number | null;
   upload_bytes_total: number | null;
   /** Multi-file upload in flight (v2 listing only): parts fully received so

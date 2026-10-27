@@ -18,6 +18,11 @@
  *                      Calendar layers never have 'upload' rows.
  *   speaker=<csv>      archive only — substring on speaker names (the
  *                      calendar layers ignore it; they have no speakers).
+ *   summary=<csv>      archive only — missing | failed (anything else → 400),
+ *                      comma = OR. `missing` = a completed meeting with no
+ *                      notes text and no run in flight or failed; `failed` =
+ *                      the last notes run errored. The calendar layers ignore
+ *                      it (they have no notes), like `speaker`.
  *   q=<string>         free text (>= 2 chars, shorter is ignored — same rule
  *                      the listing v2 always had).
  *
@@ -32,12 +37,18 @@
 export const MEETING_PROVIDERS = ['teams', 'gmeet', 'upload'] as const;
 export type MeetingProvider = (typeof MEETING_PROVIDERS)[number];
 
+/** `summary=` values: the two states of "this meeting has no usable summary". */
+export const MEETING_SUMMARY_STATES = ['missing', 'failed'] as const;
+export type MeetingSummaryState = (typeof MEETING_SUMMARY_STATES)[number];
+
 export interface MeetingFilters {
   /** Lower-cased, trimmed, de-duplicated OR terms (empty = not filtering). */
   participant: string[];
   organizer: string[];
   provider: MeetingProvider[];
   speaker: string[];
+  /** Archive only: rows whose summary is missing and/or failed (OR). */
+  summary: MeetingSummaryState[];
   /** Trimmed free-text query, or null when absent / shorter than 2 chars. */
   q: string | null;
 }
@@ -47,6 +58,7 @@ export const EMPTY_MEETING_FILTERS: MeetingFilters = Object.freeze({
   organizer: [],
   provider: [],
   speaker: [],
+  summary: [],
   q: null,
 }) as MeetingFilters;
 
@@ -118,11 +130,16 @@ function isProvider(v: string): v is MeetingProvider {
   return (MEETING_PROVIDERS as readonly string[]).includes(v);
 }
 
+function isSummaryState(v: string): v is MeetingSummaryState {
+  return (MEETING_SUMMARY_STATES as readonly string[]).includes(v);
+}
+
 /**
  * Parse the shared filter params off a query string. Rejections (→ 400 at
- * the route): unknown provider values, more than MAX_FILTER_TERMS OR-terms
- * in one list, a term longer than MAX_FILTER_TERM_LEN. Everything else
- * degrades to "not filtering". `q` shorter than MIN_Q_LEN is null (ignored).
+ * the route): unknown provider or summary values, more than MAX_FILTER_TERMS
+ * OR-terms in one list, a term longer than MAX_FILTER_TERM_LEN. Everything
+ * else degrades to "not filtering". `q` shorter than MIN_Q_LEN is null
+ * (ignored).
  */
 export function parseMeetingFilters(src: ParamSource): ParsedMeetingFilters {
   const providerTerms = splitFilterList(readParam(src, 'provider'));
@@ -131,6 +148,14 @@ export function parseMeetingFilters(src: ParamSource): ParsedMeetingFilters {
     return {
       ok: false,
       error: `Invalid provider value(s): ${bad.join(', ')} — expected ${MEETING_PROVIDERS.join('|')} (comma-separated for OR)`,
+    };
+  }
+  const summaryTerms = splitFilterList(readParam(src, 'summary'));
+  const badSummary = summaryTerms.filter((s) => !isSummaryState(s));
+  if (badSummary.length > 0) {
+    return {
+      ok: false,
+      error: `Invalid summary value(s): ${badSummary.join(', ')} — expected ${MEETING_SUMMARY_STATES.join('|')} (comma-separated for OR)`,
     };
   }
   const participant = splitFilterList(readParam(src, 'participant'));
@@ -149,19 +174,22 @@ export function parseMeetingFilters(src: ParamSource): ParsedMeetingFilters {
       organizer,
       provider: providerTerms.filter(isProvider),
       speaker,
+      summary: summaryTerms.filter(isSummaryState),
       q: qRaw.length >= MIN_Q_LEN ? qRaw : null,
     },
   };
 }
 
-/** True when any people/provider filter is set (q excluded — callers that
- * already handle q separately use this to short-circuit the extra joins). */
+/** True when any people/provider/summary filter is set (q excluded — callers
+ * that already handle q separately use this to short-circuit the extra
+ * joins). */
 export function hasPeopleFilters(f: MeetingFilters): boolean {
   return (
     f.participant.length > 0 ||
     f.organizer.length > 0 ||
     f.provider.length > 0 ||
-    f.speaker.length > 0
+    f.speaker.length > 0 ||
+    f.summary.length > 0
   );
 }
 
