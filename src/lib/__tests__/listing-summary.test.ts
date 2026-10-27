@@ -62,6 +62,17 @@ describe('summaryStateOf — the table, in order', () => {
     expect(summaryStateOf({ ...done, deleted_at: '2026-10-27T00:00:00Z', has_notes: false, auto_notes_status: null })).toBeNull();
   });
 
+  test('an auto-imported row gated by the automatic review gets no summary badge — its amber chip is the one signal', () => {
+    const gated: SummaryRowInput = { ...done, auto_notes_status: null, has_notes: false, auto_state: 'gated' };
+    expect(summaryStateOf(gated)).toBeNull();
+    expect(summaryBadgeFor(gated, true)).toBeNull();
+    // Other outcomes change nothing.
+    expect(summaryStateOf({ ...gated, auto_state: 'passed' })).toBe('missing');
+    expect(summaryStateOf({ ...gated, auto_state: null })).toBe('missing');
+    // A failed run on a gated row still has no badge: one signal per row.
+    expect(summaryStateOf({ ...gated, auto_notes_status: 'error' })).toBeNull();
+  });
+
   test('a row that does not say whether notes exist claims nothing', () => {
     expect(summaryStateOf({ status: 'completed', auto_notes_status: null })).toBeNull();
     expect(summaryStateOf({ status: 'completed', auto_notes_status: null, has_notes: null })).toBeNull();

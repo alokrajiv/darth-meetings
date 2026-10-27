@@ -105,11 +105,14 @@ function archiveSpeakerMatch(terms: readonly string[]): Fragment {
 }
 
 /**
- * The `summary=` filter, one predicate per state, OR-ed. The SQL twin of
- * `summaryStateOf` in lib/listing-summary.ts (the row badge): a row the badge
- * calls "No summary yet" is a row `missing` selects, and "Summary failed" is
- * `failed`. Only `t.auto_notes` emptiness is tested — the text itself is
- * never selected into a listing.
+ * The `summary=` filter, one predicate per state, OR-ed. Close to, but NOT
+ * an exact twin of, the row badge (`summaryStateOf` in lib/listing-summary.ts):
+ * every "No summary yet" row is `missing` and every "Summary failed" row is
+ * `failed`, but `missing` ALSO matches a completed row whose speaker pass is
+ * still running (badge "Identifying speakers…") and a gated auto-imported row
+ * (no badge, the amber "Review speakers" chip) — they do lack a summary, which
+ * is what the filter asks. Only `t.auto_notes` emptiness is tested — the text
+ * itself is never selected into a listing.
  *
  *   missing  completed, no notes text, and no run in flight or failed
  *   failed   the last notes run errored (`auto_notes_status = 'error'`)

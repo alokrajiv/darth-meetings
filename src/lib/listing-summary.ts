@@ -12,9 +12,15 @@ import type { MeetingSummaryState } from '@/lib/server/meeting-filters';
  *
  * Pure: the table hands it the v2 listing row (`has_notes` and
  * `speaker_id_status` come from `listPagedForUser`; the notes TEXT is never in
- * a listing) and whether the viewer may act. `archiveSummaryExpr` in
- * db-ops/meeting-filter-sql.ts is the SQL twin of `summaryStateOf` for the
- * `summary=missing|failed` filter.
+ * a listing) and whether the viewer may act.
+ *
+ * The `summary=missing|failed` FILTER (`archiveSummaryExpr` in
+ * db-ops/meeting-filter-sql.ts) is deliberately NOT an exact twin of the
+ * badge: `missing` matches every completed row without notes and without a
+ * run in flight or failed — including one whose speaker pass is still
+ * running (badge: "Identifying speakers…") and an auto-imported row that is
+ * gated (badge: none, the amber "Review speakers" chip already says it).
+ * Both do lack a summary, which is what the filter asks.
  */
 
 export type SummaryState = 'running' | 'speakers' | 'failed' | 'missing';
@@ -28,6 +34,10 @@ export interface SummaryRowInput {
   /** Undefined on rows older than the field (an offline replica synced
    * before it existed, the legacy listing): then nothing is claimed. */
   has_notes?: boolean | null;
+  /** The automatic-review outcome of an auto-imported row. 'gated' already
+   * renders its own amber "Review speakers" chip, so no summary badge joins
+   * it — one signal per row. */
+  auto_state?: 'passed' | 'gated' | 'auto' | null;
 }
 
 export interface SummaryAction {
@@ -65,12 +75,14 @@ export const SUMMARY_FILTER_LABEL: Record<MeetingSummaryState, string> = {
 
 /**
  * One state per row, first true condition wins; null = no badge (the row
- * has notes, is not a completed archive row, is trashed, or the listing did
- * not say whether notes exist). Rows still transcribing keep their existing
- * status UI, so they are null here too.
+ * has notes, is not a completed archive row, is trashed, is gated by the
+ * automatic review — that chip speaks for it — or the listing did not say
+ * whether notes exist). Rows still transcribing keep their existing status
+ * UI, so they are null here too.
  */
 export function summaryStateOf(row: SummaryRowInput): SummaryState | null {
   if (row.status !== 'completed' || row.deleted_at) return null;
+  if (row.auto_state === 'gated') return null;
   if (row.auto_notes_status === 'running') return 'running';
   if (row.speaker_id_status === 'running') return 'speakers';
   if (row.auto_notes_status === 'error') return 'failed';

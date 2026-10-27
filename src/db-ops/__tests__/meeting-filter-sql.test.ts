@@ -2,8 +2,10 @@
  * `summary=missing|failed` — the SQL the archive filter emits (2026-10-27),
  * over the fake postgres tag (helpers/fake-sql). The fragment is what both
  * the listing's rows query and its tab-count query splice in, so what is
- * asserted here is what keeps rows and counts in agreement; the predicate
- * text is the SQL twin of `summaryStateOf` (lib/listing-summary.ts).
+ * asserted here is what keeps rows and counts in agreement. The predicate is
+ * close to, not identical to, the badge rule (`summaryStateOf` in
+ * lib/listing-summary.ts): `missing` also matches a speakers-running row and
+ * a gated auto-import — both lack a summary, which is what the filter asks.
  */
 import { beforeAll, describe, expect, mock, test } from 'bun:test';
 import { createFakeSql, type FakeSql } from './helpers/fake-sql';
