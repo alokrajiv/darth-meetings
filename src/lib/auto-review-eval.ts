@@ -73,9 +73,11 @@ export interface AutoReviewEvaluation {
  * a real name) — nothing to apply, nothing in the way.
  *
  * One more blocker after the merge: two diarized speakers of this meeting
- * ending up with the SAME name (case-insensitive) — the AI putting one person
- * on two voices, or a guess colliding with a confirmed name. That is a
- * question for a human, on both paths.
+ * ending up with the SAME name (case-insensitive) where at least one of the
+ * pair is an AI-applied name — the AI putting one person on two voices, or a
+ * guess colliding with a confirmed name. That is a question for a human, on
+ * both paths. Two HUMAN-confirmed speakers sharing a name never block: that
+ * is a person saying diarization split one voice in two.
  */
 export function evaluateAutoReview(input: AutoReviewInput): AutoReviewEvaluation {
   const suggestions = input.suggestions ?? {};
@@ -120,24 +122,27 @@ export function evaluateAutoReview(input: AutoReviewInput): AutoReviewEvaluation
   }
 
   // Duplicate names among the speakers of THIS meeting (a stale label for a
-  // speaker with no utterances here does not count).
-  const firstSpelling = new Map<string, string>();
+  // speaker with no utterances here does not count), when the AI applied at
+  // least one of the pair.
+  const appliedSpeakers = new Set(applied.map((l) => l.originalSpeaker));
+  const firstOf = new Map<string, { name: string; applied: boolean }>();
   for (const l of merged) {
     if (!counts.has(l.originalSpeaker)) continue;
     const name = l.customName.trim();
     if (!name) continue;
     const key = name.toLowerCase();
-    const seen = firstSpelling.get(key);
-    if (seen !== undefined) {
+    const isApplied = appliedSpeakers.has(l.originalSpeaker);
+    const seen = firstOf.get(key);
+    if (seen !== undefined && (seen.applied || isApplied)) {
       return {
         passed: false,
-        blocker: `two speakers both identified as ${seen}`,
+        blocker: `two speakers both identified as ${seen.name}`,
         applied: [],
         merged: existing,
         enroll: [],
       };
     }
-    firstSpelling.set(key, name);
+    if (seen === undefined) firstOf.set(key, { name, applied: isApplied });
   }
 
   const enroll = applied.filter((l) => strong.has(l.originalSpeaker));

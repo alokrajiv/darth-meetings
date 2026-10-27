@@ -516,14 +516,21 @@ export async function listPagedForUser(
                          WHERE c.transcript_id = t.id)::int`
                  : sql`1::int`
              } AS clip_recording_count,
-             -- Series auto-import lifecycle: 'passed' = imported AND speaker
+             -- Automation lifecycle, for rows WITH an automation marker only
+             -- (autoImport / autoSync object): 'passed' = imported AND speaker
              -- review jumped through automatically (report generated
              -- unattended — the blue dot), 'gated' = auto-imported but held
              -- for human review, 'auto' = auto-imported, not yet evaluated.
+             -- A MANUAL row's autoReview (the grace-window pass: mode grace /
+             -- held / a pending claim, lib/auto-proceed) is not this
+             -- lifecycle: NULL, so the row keeps its normal summary badge
+             -- instead of the amber "Review speakers" chip.
              CASE
+               WHEN jsonb_typeof(t.gmeet_context->'autoImport') IS DISTINCT FROM 'object'
+                    AND jsonb_typeof(t.gmeet_context->'autoSync') IS DISTINCT FROM 'object' THEN NULL
                WHEN (t.gmeet_context->'autoReview'->>'passed')::boolean THEN 'passed'
                WHEN t.gmeet_context ? 'autoReview' THEN 'gated'
-               WHEN t.gmeet_context ? 'autoImport' THEN 'auto'
+               ELSE 'auto'
              END AS auto_state,
              ${isTrash ? sql`t.deleted_at::text` : sql`NULL::text`} AS deleted_at,
              t.scratch,

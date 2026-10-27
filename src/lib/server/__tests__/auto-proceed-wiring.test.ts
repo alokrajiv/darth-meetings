@@ -143,6 +143,17 @@ describe('the sweeper pick is the SQL twin of the TS rule', () => {
     expect(rule).not.toContain('scratch');
   });
 
+  test("the listing's auto_state is the automation lifecycle of MARKER rows only — a manual row's grace/held/pending autoReview is NULL", () => {
+    const listing = fnBody(dbops, 'export async function listPagedForUser(');
+    const state = listing.slice(listing.indexOf('CASE\n               WHEN jsonb_typeof(t.gmeet_context->\'autoImport\')'), listing.indexOf('END AS auto_state'));
+    expect(state).toContain("jsonb_typeof(t.gmeet_context->'autoImport') IS DISTINCT FROM 'object'");
+    expect(state).toContain("jsonb_typeof(t.gmeet_context->'autoSync') IS DISTINCT FROM 'object' THEN NULL");
+    // The marker test comes FIRST, so no autoReview value can reach 'gated' without one.
+    expect(state.indexOf('THEN NULL')).toBeLessThan(state.indexOf("THEN 'passed'"));
+    expect(state.indexOf("THEN 'passed'")).toBeLessThan(state.indexOf("THEN 'gated'"));
+    expect(state).toContain("ELSE 'auto'");
+  });
+
   test('the listing feeds the same helper the same columns', () => {
     const listing = fnBody(dbops, 'export async function listPagedForUser(');
     expect(listing).toContain("jsonb_typeof(t.gmeet_context->'autoReview') = 'object' AS __auto_reviewed");

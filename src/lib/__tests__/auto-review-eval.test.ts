@@ -125,11 +125,19 @@ describe('evaluateAutoReview', () => {
     expect(ev.merged).toEqual(labels); // nothing applied
   });
 
-  test('two human-confirmed speakers sharing a name block as well — the rule reads the merged set', () => {
-    const labels = [label('A', 'Test Person A'), label('B', 'Test Person A')];
+  test('two HUMAN-confirmed speakers sharing a name never block — diarization split one voice, a person said so', () => {
+    const labels = [label('A', 'Test Person A'), label('B', 'test person a')];
     const ev = evaluateAutoReview({ utterances: utt(['A', 3], ['B', 3]), labels, suggestions: {} });
-    expect(ev.passed).toBe(false);
-    expect(ev.blocker).toBe('two speakers both identified as Test Person A');
+    expect(ev.passed).toBe(true);
+    expect(ev.blocker).toBeNull();
+    // …but a THIRD voice the AI would also call that name does block.
+    const three = evaluateAutoReview({
+      utterances: utt(['A', 3], ['B', 3], ['C', 3]),
+      labels,
+      suggestions: { C: voice('Test Person A', 0.95) },
+    });
+    expect(three.passed).toBe(false);
+    expect(three.blocker).toBe('two speakers both identified as Test Person A');
   });
 
   test('a stale label for a speaker with no utterances in this meeting does not count as a duplicate', () => {
