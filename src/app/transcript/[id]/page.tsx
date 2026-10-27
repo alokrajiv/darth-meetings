@@ -5,6 +5,7 @@ import { useRouter } from 'next/navigation';
 import { useLiveEvents } from '@/hooks/use-live-events';
 import { useTranscriptions } from '@/hooks/use-transcriptions';
 import { NOTES_FROM_PREVIOUS_TRANSCRIPTION } from '@/lib/transcription-copy';
+import { readDoIntent, resolveDoIntent, withoutDoParam, type SummaryIntent } from '@/lib/listing-summary';
 import { formatDistanceToNow } from 'date-fns';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
@@ -316,6 +317,17 @@ function TranscriptDetailInner({
     const url = new URL(window.location.href);
     url.searchParams.delete('link');
     window.history.replaceState({}, '', url.toString());
+  }, []);
+  // The listing's summary action (lib/listing-summary) lands here with
+  // ?do=generate|review. Read and stripped on mount (a reload must not
+  // reopen the dialog); acted on once the meeting has loaded — see the
+  // effect after `unconfirmedSpeakers`.
+  const doIntentRef = useRef<SummaryIntent | null>(null);
+  useEffect(() => {
+    const intent = readDoIntent(window.location.search);
+    if (!intent) return;
+    doIntentRef.current = intent;
+    window.history.replaceState({}, '', withoutDoParam(window.location.href));
   }, []);
 
   const selectSummaryTab = useCallback((tab: 'summary' | 'report') => {
@@ -988,6 +1000,23 @@ function TranscriptDetailInner({
       ),
     [reviewSpeakers, speakerLabels]
   );
+  // ?do= (captured on mount above): once the row, speaker labels and content
+  // are in (`loading` clears after all three), open the same dialog the
+  // "No notes yet" block would — the review while speakers are still being
+  // identified, else review-first when anyone is unconfirmed. Once only.
+  // Viewers cannot generate, so their intent is dropped silently.
+  useEffect(() => {
+    const intent = doIntentRef.current;
+    if (!intent || loading || !row) return;
+    doIntentRef.current = null;
+    if (!canEdit || row.status !== 'completed') return;
+    if (row.speaker_id_status === 'running') {
+      setReviewOpen(true);
+      return;
+    }
+    if (resolveDoIntent(intent, unconfirmedSpeakers.length) === 'review') setReviewOpen(true);
+    else openGenerateDialog();
+  }, [loading, row, canEdit, unconfirmedSpeakers, row?.speaker_id_status]);
 
   const handleGenerateReport = useCallback(async (instructions?: string, useVideo = true, runAt?: string) => {
     if (generatingReport) return;

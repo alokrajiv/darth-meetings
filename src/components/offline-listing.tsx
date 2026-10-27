@@ -13,6 +13,7 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import { LabelChip } from '@/components/label-chips';
 import { formatDuration, type TranscriptListRow } from '@/lib/format';
 import { meetingTitleOf } from '@/lib/meeting-title';
+import { summaryBadgeFor } from '@/lib/listing-summary';
 import { loadStoredListing } from '@/lib/offline/replica-client';
 import { meetingAt, type StoredListing } from '@/lib/offline/replica';
 import {
@@ -50,6 +51,10 @@ function OfflineRow({ row, saved, onOpen, now }: { row: TranscriptListRow; saved
     .filter(Boolean)
     .join(' · ');
   const labels = row.labels ?? [];
+  // The summary badge as it was saved — label only: offline there is no
+  // server to generate against (lib/listing-summary). Rows saved before
+  // `has_notes` existed claim nothing.
+  const badge = summaryBadgeFor(row, false);
   const inner = (
     <>
       <span className="w-12 shrink-0 text-xs tabular-nums text-muted-foreground">{timeOf(meetingAt(row))}</span>
@@ -62,6 +67,18 @@ function OfflineRow({ row, saved, onOpen, now }: { row: TranscriptListRow; saved
             <LabelChip key={l.id} label={l} color={l.color ?? null} />
           ))}
           {labels.length > 2 && <span className="shrink-0 text-[11px] text-muted-foreground">+{labels.length - 2}</span>}
+          {badge && (
+            <span
+              className={`inline-flex shrink-0 items-center gap-1 rounded-full border px-1.5 py-px text-[10px] ${
+                badge.state === 'failed'
+                  ? 'border-amber-400/50 bg-amber-50 text-amber-800 dark:bg-amber-950/30 dark:text-amber-300'
+                  : 'border-border bg-muted/50 text-muted-foreground'
+              }`}
+              data-summary-badge={badge.state}
+            >
+              {badge.label}
+            </span>
+          )}
         </span>
         {meta && <span className="truncate text-xs text-muted-foreground">{meta}</span>}
       </span>

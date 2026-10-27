@@ -81,10 +81,12 @@ import { BulkLabelBar } from '@/components/bulk-label-bar';
 import { refreshLabelCatalog, useLabelCatalog } from '@/hooks/use-label-catalog';
 import { isNetworkFailure, networkErrorMessage, NETWORK_ERROR_MESSAGE } from '@/lib/fetch-errors';
 import { labelFilterToParams, type LabelFilter } from '@/lib/labels';
+import { summaryBadgeFor, transcriptIntentHref } from '@/lib/listing-summary';
 import type { LabelRef } from '@/lib/format';
 import {
   PeopleFilterChips,
   PeopleFilterFields,
+  SummaryFilterFields,
   EMPTY_PEOPLE_FILTERS,
   countPeopleFilters,
   appendPeopleFilterParams,
@@ -1845,6 +1847,12 @@ export function TranscriptTable({
                 <PeopleFilterFields value={peopleFilters} onChange={setPeopleFilters} />
               </ToolbarSection>
             );
+          case 'summary':
+            return (
+              <ToolbarSection key={section} id={section} title="Summary" first={i === 0}>
+                <SummaryFilterFields value={peopleFilters} onChange={setPeopleFilters} />
+              </ToolbarSection>
+            );
           case 'hidden':
             return (
               <ToolbarSection
@@ -2028,6 +2036,10 @@ export function TranscriptTable({
     const selectable = !placeholder && !trashed;
     const isSelected = selected.has(t.assemblyai_id);
     const strip = trashed ? null : rowStrip(t);
+    // The summary badge (lib/listing-summary): one state, at most one action
+    // — which only navigates; the detail page opens its own dialog.
+    const badge = !trashed && summaryBadgeFor(t, canEditRow(t));
+    const badgeAction = badge ? badge.action : null;
     return (
       <TableRow
         key={t.id}
@@ -2138,6 +2150,35 @@ export function TranscriptTable({
                   >
                     Review speakers
                   </span>
+                )}
+                {badge && (
+                  <span
+                    className={`inline-flex shrink-0 items-center gap-1 rounded-full border px-1.5 py-px text-[10px] ${
+                      badge.state === 'failed'
+                        ? 'border-amber-400/50 bg-amber-50 text-amber-800 dark:bg-amber-950/30 dark:text-amber-300'
+                        : 'border-border bg-muted/50 text-muted-foreground'
+                    }`}
+                    data-summary-badge={badge.state}
+                  >
+                    {(badge.state === 'running' || badge.state === 'speakers') && (
+                      <RefreshCw className="h-2.5 w-2.5 animate-spin" />
+                    )}
+                    {badge.label}
+                  </span>
+                )}
+                {badgeAction && (
+                  <button
+                    type="button"
+                    className="shrink-0 text-[10px] font-medium text-primary hover:underline"
+                    data-summary-action={badgeAction.intent}
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      e.preventDefault();
+                      router.push(transcriptIntentHref(t.assemblyai_id, badgeAction.intent));
+                    }}
+                  >
+                    {badgeAction.label}
+                  </button>
                 )}
                 {scratch && (
                   <span

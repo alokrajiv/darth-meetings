@@ -51,12 +51,13 @@ export function searchShortcutEnabled(inDesktopShell: boolean): boolean {
   return !inDesktopShell;
 }
 
-export type FilterSection = 'layers' | 'labels' | 'range' | 'people' | 'hidden';
+export type FilterSection = 'layers' | 'labels' | 'range' | 'people' | 'summary' | 'hidden';
 
-/** The Filter popover's sections, top to bottom. "Hidden" only appears when
- * something is hidden. */
+/** The Filter popover's sections, top to bottom. "Summary" (no summary yet /
+ * summary failed) sits under People; "Hidden" only appears when something is
+ * hidden. */
 export function filterSections(opts: { hiddenCount: number }): FilterSection[] {
-  const out: FilterSection[] = ['layers', 'labels', 'range', 'people'];
+  const out: FilterSection[] = ['layers', 'labels', 'range', 'people', 'summary'];
   if (opts.hiddenCount > 0) out.push('hidden');
   return out;
 }

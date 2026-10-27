@@ -48,8 +48,8 @@ describe('toolbar composition', () => {
     }
   });
   test('Filter popover sections; Hidden only when something is hidden', () => {
-    expect(filterSections({ hiddenCount: 0 })).toEqual(['layers', 'labels', 'range', 'people']);
-    expect(filterSections({ hiddenCount: 2 })).toEqual(['layers', 'labels', 'range', 'people', 'hidden']);
+    expect(filterSections({ hiddenCount: 0 })).toEqual(['layers', 'labels', 'range', 'people', 'summary']);
+    expect(filterSections({ hiddenCount: 2 })).toEqual(['layers', 'labels', 'range', 'people', 'summary', 'hidden']);
   });
   test('⋯ menu: sync only with the calendar timeline on; refresh + columns always', () => {
     expect(moreMenuItems({ calendarSync: true })).toEqual(['sync', 'refresh', 'columns']);
@@ -281,5 +281,14 @@ describe('table: row action + columns', () => {
     expect(table).toContain('<ListingToolbar');
     expect(table).not.toContain('mb-3 flex flex-wrap items-center gap-x-3');
     expect(table).not.toContain('toolbarExtra');
+  });
+  test('summary: Filter section + row badge whose action only navigates; the page consumes ?do=', () => {
+    expect(table).toContain("case 'summary':");
+    expect(table).toContain('<SummaryFilterFields value={peopleFilters} onChange={setPeopleFilters} />');
+    expect(table).toContain('summaryBadgeFor(t, canEditRow(t))');
+    expect(table).toContain('router.push(transcriptIntentHref(t.assemblyai_id, badgeAction.intent))');
+    const page = readFileSync(join(import.meta.dir, '../../app/transcript/[id]/page.tsx'), 'utf8');
+    expect(page).toMatch(/readDoIntent\(window\.location\.search\)[^]*?withoutDoParam\(window\.location\.href\)/);
+    expect(page).toContain('resolveDoIntent(intent, unconfirmedSpeakers.length)');
   });
 });

@@ -74,6 +74,28 @@ describe('OfflineListingView', () => {
     expect(html).not.toContain('Try again'); // offline: nothing to retry
   });
 
+  test('summary badge: label only; nothing claimed for rows with notes or saved before has_notes', () => {
+    const html = renderToStaticMarkup(
+      <OfflineListingView
+        listing={{
+          rows: [
+            listRow('x', new Date(2026, 9, 22, 9), { has_notes: false, auto_notes_status: null }),
+            listRow('y', new Date(2026, 9, 22, 10), { has_notes: true }),
+            listRow('z', new Date(2026, 9, 22, 11)),
+          ],
+          saved: new Set(['x', 'y', 'z']),
+          savedAt: new Date(2026, 9, 22, 14, 2).getTime(),
+        }}
+        online={false}
+        onOpen={() => {}}
+        now={NOW}
+      />
+    );
+    expect(html.match(/data-summary-badge="/g)?.length).toBe(1);
+    expect(html).toMatch(/data-summary-badge="missing">No summary yet</);
+    expect(html).not.toContain('data-summary-action'); // offline: no action
+  });
+
   test('online after a failed read: "Try again"; empty store explains itself', () => {
     const html = renderToStaticMarkup(
       <OfflineListingView listing={{ rows: [], saved: new Set(), savedAt: null }} online onOpen={() => {}} onRetry={() => {}} now={NOW} />
