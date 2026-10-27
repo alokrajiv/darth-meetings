@@ -292,11 +292,17 @@ WRITE (needs read+write for meetings)
                                   (ISO 8601, 'YYYY-MM-DD HH:mm' in your tz,
                                   or 'YYYY-MM-DD' = noon). For recordings
                                   that match no calendar event
-  set-speakers <id> <Speaker>=<Name> ...
-                                  Confirm speaker names ('A="Jane Doe"'); the
-                                  names apply to 'text' output and enrol the
-                                  person's voiceprint. Others keep their
-                                  current label; '--clear' unsets all first
+  set-speakers <id> <Speaker>=<Name|email|"Name <email>"> ... [--clear] [--from-invite [--yes]]
+                                  Confirm who each speaker IS. 'A="Jane Doe"'
+                                  = a name; 'A=jane@x.com' = the PERSON (the
+                                  server fills the canonical name from the
+                                  directory / invite); 'A="Jane Doe <jane@x>"'
+                                  = both. Names apply to 'text' output and
+                                  enrol the person's voiceprint. Others keep
+                                  their current label; '--clear' unsets all
+                                  first. --from-invite confirms every guess
+                                  that names ONE invitee (table first; --yes
+                                  writes). Prints 'name <email>' as stored
   import <meeting-code|event-key> [--mode transcript|video|both] [--wait]
                                   [--timeout <mins>]
                                   Import a meeting from your calendar by the
@@ -597,8 +603,12 @@ colleagues) — nothing is re-run.
 
     # 5. Settle the speakers when you're confident (confirmed names flow
     #    into 'text', notes and the person's voiceprint — so only confirm what
-    #    the human agreed to, and leave the rest as guesses):
-    darth-cli meetings set-speakers <id> A="Wei Lin" B="Alok Rajiv"
+    #    the human agreed to, and leave the rest as guesses). A speaker is a
+    #    PERSON: pass the email when you have it (the invite usually has it;
+    #    the server fills the canonical name), a bare name only when you don't:
+    darth-cli meetings set-speakers <id> A=wei@partner.example B="Alok Rajiv <alok@trames.sg>" C="Interviewer #1"
+    darth-cli meetings set-speakers <id> --from-invite          # table of guesses that name one invitee
+    darth-cli meetings set-speakers <id> --from-invite --yes    # …confirm them all
     # 6. Then the normal loop: read 'text <id>', write notes with your model,
     #    'set-notes <id> --file notes.md'; 'label' it; and if the human asked,
     #    'share <id> --add <email>' (see "Sharing a meeting" below).
@@ -1936,6 +1946,53 @@ function parseWhen(raw: string): Date | null {
   return Number.isNaN(d.getTime()) ? null : d;
 }
 
+// A speaker is a PERSON (lib/speaker-identity, 2026-10-27): labels and
+// guesses may carry the person's email; the server stores the canonical name
+// for an email and attaches emails to guesses that name exactly one invitee.
+const EMAIL_SHAPE = /^[^\s@<>]+@[^\s@<>]+\.[^\s@<>]+$/;
+interface SpeakerAssignment { originalSpeaker: string; customName: string; email?: string }
+
+/** `A=Name` · `A=email@x` (name resolved server-side) · `A="Name <email@x>"`. Null = not an assignment. */
+function parseSpeakerAssignment(p: string): SpeakerAssignment | null {
+  const eq = p.indexOf("=");
+  if (eq <= 0) return null;
+  const originalSpeaker = p.slice(0, eq).trim();
+  const value = p.slice(eq + 1).trim();
+  if (!originalSpeaker) return null;
+  // "Name <…>": whatever is in the brackets must be an address, else the
+  // whole assignment is refused (never stored as a name with brackets in it).
+  const angled = /^(.*?)\s*<([^<>]*)>$/.exec(value);
+  if (angled) {
+    const email = angled[2]!.trim().toLowerCase();
+    if (!EMAIL_SHAPE.test(email)) return null;
+    return { originalSpeaker, customName: angled[1]!.trim(), email };
+  }
+  if (EMAIL_SHAPE.test(value)) return { originalSpeaker, customName: "", email: value.toLowerCase() };
+  return { originalSpeaker, customName: value };
+}
+
+/** "Name <email>" when the email is known, else the name. */
+function fmtPerson(name: string | null | undefined, email?: string | null): string {
+  const n = (name ?? "").trim();
+  return email ? (n ? `${n} <${email}>` : `<${email}>`) : n;
+}
+
+/** --from-invite: unconfirmed speakers whose guess names one person (has an email). */
+type SpeakersReply = {
+  speakerLabels?: Array<{ originalSpeaker: string; customName?: string; description?: string; email?: string }>;
+  suggestions?: Record<string, { name?: unknown; email?: unknown } | undefined>;
+};
+function fromInvitePicks(cur: SpeakersReply): SpeakerAssignment[] {
+  const labels = new Map((cur.speakerLabels || []).map((l) => [l.originalSpeaker, l]));
+  const out: SpeakerAssignment[] = [];
+  for (const [sp, g] of Object.entries(cur.suggestions || {})) {
+    if (!g?.email || !String(g?.name ?? "").trim()) continue;
+    if (labels.get(sp)?.customName?.trim()) continue;
+    out.push({ originalSpeaker: sp, customName: String(g.name).trim(), email: String(g.email).toLowerCase() });
+  }
+  return out.sort((a, b) => a.originalSpeaker.localeCompare(b.originalSpeaker));
+}
+
 /** One line per diarized speaker: confirmed name, else the guess. */
 function printSpeakers(id: string, t: any, sp: { speakerLabels: any[]; suggestions: Record<string, any> }): void {
   const labels = new Map<string, any>((sp.speakerLabels || []).map((l: any) => [l.originalSpeaker, l]));
@@ -1946,15 +2003,17 @@ function printSpeakers(id: string, t: any, sp: { speakerLabels: any[]; suggestio
   for (const orig of [...names].sort()) {
     const l = labels.get(orig); const g = sp.suggestions?.[orig];
     const confirmed = l?.customName?.trim();
-    const guess = g ? `${g.name} (${Math.round((g.confidence ?? 0) * 100)}%${g.source ? `, ${g.source}` : ""}${g.via === "id" ? ", id-pass" : ""})` : null;
+    const guess = g ? `${fmtPerson(g.name, g.email)} (${Math.round((g.confidence ?? 0) * 100)}%${g.source ? `, ${g.source}` : ""}${g.via === "id" ? ", id-pass" : ""})` : null;
     let line = `  ${orig.padEnd(10)} `;
-    if (confirmed) line += `= ${confirmed}   [confirmed${guess ? `; guess was ${guess}` : ""}]`;
+    if (confirmed) line += `= ${fmtPerson(confirmed, l?.email)}   [confirmed${guess ? `; guess was ${guess}` : ""}]`;
     else if (guess) line += `? ${guess}${g.evidence ? `  — ${oneLine(String(g.evidence), 140)}` : ""}`;
     else line += "? (no guess)";
     console.log(line);
   }
   if (![...labels.values()].some((l: any) => l?.customName?.trim()))
-    console.log("  confirm with: darth-cli meetings set-speakers <id> A=\"Full Name\" B=\"Full Name\"");
+    console.log("  confirm with: darth-cli meetings set-speakers <id> A=\"Full Name\" B=bea@trames.sg   (or A=\"Name <email>\")");
+  if (fromInvitePicks(sp).length)
+    console.log(`  guesses that name one invitee can be confirmed in one go: darth-cli meetings set-speakers ${id} --from-invite   (table first; --yes writes)`);
 }
 
 async function fetchSpeakers(ctx: Ctx, id: string): Promise<{ t: any; sp: any }> {
@@ -4599,23 +4658,60 @@ const meetings: Subcommand = {
       }
 
       case "set-speakers": {
-        const [id, ...pairs] = args;
-        if (!id || (!pairs.length && flags.clear !== true)) { console.error("usage: darth-cli meetings set-speakers <id> <Speaker>=<Name> [...]  [--clear]   e.g. A=\"Jane Doe\" B=\"Wei Lin\""); return 1; }
-        ctx.requireWrite();
-        const parsed: Array<{ originalSpeaker: string; customName: string }> = [];
-        for (const p of pairs) {
-          const eq = p.indexOf("=");
-          if (eq <= 0) { console.error(`bad assignment '${p}' — expected <Speaker>=<Name>`); return 1; }
-          parsed.push({ originalSpeaker: p.slice(0, eq).trim(), customName: p.slice(eq + 1).trim() });
+        // --from-invite / --yes are booleans; parseArgs may have swallowed the
+        // next token (the id, or an assignment) as their value — hand it back.
+        const local = [...args];
+        for (const name of ["from-invite", "yes"]) {
+          const v = flags[name];
+          if (typeof v === "string") { flags[name] = true; if (local.length === 0) local.unshift(v); else local.push(v); }
         }
-        const cur = await ctx.expectJson<any>(ctx.api("meetings", `/api/transcripts/${id}/speakers`));
-        const byOrig = new Map<string, any>();
-        if (flags.clear !== true) for (const l of cur.speakerLabels || []) byOrig.set(l.originalSpeaker, { ...l });
-        for (const a of parsed) byOrig.set(a.originalSpeaker, { originalSpeaker: a.originalSpeaker, customName: a.customName, description: byOrig.get(a.originalSpeaker)?.description ?? "" });
-        const speakerLabels = [...byOrig.values()].filter((l) => l.customName || l.description);
+        const [id, ...pairs] = local;
+        const fromInvite = flags["from-invite"] === true;
+        const usage = "usage: darth-cli meetings set-speakers <id> <Speaker>=<Name|email|\"Name <email>\"> [...]  [--clear] [--from-invite [--yes]]   e.g. A=\"Jane Doe\" B=bea@trames.sg C=\"Wei Lin <wei@partner.example>\"";
+        if (!id || (!pairs.length && flags.clear !== true && !fromInvite)) { console.error(usage); return 1; }
+        ctx.requireWrite();
+        const parsed: SpeakerAssignment[] = [];
+        for (const p of pairs) {
+          const a = parseSpeakerAssignment(p);
+          if (!a) { console.error(`bad assignment '${p}' — expected <Speaker>=<Name>, <Speaker>=<email> or <Speaker>="Name <email>"`); return 1; }
+          parsed.push(a);
+        }
+        const cur = await ctx.expectJson<SpeakersReply>(ctx.api("meetings", `/api/transcripts/${id}/speakers`));
+        const current = new Map((cur.speakerLabels || []).map((l) => [l.originalSpeaker, l]));
+
+        // --from-invite: every unconfirmed speaker whose guess names ONE person
+        // (the server attached the email) is confirmed as that person. A table
+        // first; nothing is written without --yes. Explicit assignments on
+        // the same command win over the invite picks.
+        const picks: SpeakerAssignment[] = fromInvite ? fromInvitePicks(cur) : [];
+        if (fromInvite) {
+          if (!picks.length && !parsed.length) { console.log(`nothing to confirm from the invite on ${id} — no unconfirmed speaker has a guess that names one invitee (see 'speakers ${id}')`); return 0; }
+          if (flags.yes !== true) {
+            console.log(`would confirm from the invite on ${id}:`);
+            for (const p of picks) console.log(`  ${p.originalSpeaker.padEnd(10)} = ${fmtPerson(p.customName, p.email)}`);
+            if (parsed.length) for (const a of parsed) console.log(`  ${a.originalSpeaker.padEnd(10)} = ${fmtPerson(a.customName, a.email)}   (from the command line)`);
+            console.log("dry run — nothing written. Re-run with --yes to confirm.");
+            return 0;
+          }
+        }
+
+        const byOrig = new Map<string, SpeakerAssignment & { description: string }>();
+        if (flags.clear !== true) for (const l of cur.speakerLabels || []) byOrig.set(l.originalSpeaker, { ...l, customName: l.customName ?? "", description: l.description ?? "" });
+        for (const a of [...picks, ...parsed]) {
+          // A new assignment replaces the whole identity: a name-only one
+          // drops a previous email (the person changed), an email-bearing one
+          // lets the server resolve the canonical name.
+          byOrig.set(a.originalSpeaker, {
+            originalSpeaker: a.originalSpeaker,
+            customName: a.customName,
+            description: byOrig.get(a.originalSpeaker)?.description ?? current.get(a.originalSpeaker)?.description ?? "",
+            ...(a.email ? { email: a.email } : {}),
+          });
+        }
+        const speakerLabels = [...byOrig.values()].filter((l) => l.customName || l.description || l.email);
         const data = await ctx.expectJson<any>(ctx.api("meetings", `/api/transcripts/${id}/speakers`, { method: "PUT", body: JSON.stringify({ speakerLabels }) }));
         ctx.print(data, () => {
-          for (const l of data.speakerLabels || []) if (l.customName) console.log(`  ${String(l.originalSpeaker).padEnd(10)} = ${l.customName}`);
+          for (const l of data.speakerLabels || []) if (l.customName) console.log(`  ${String(l.originalSpeaker).padEnd(10)} = ${fmtPerson(l.customName, l.email)}`);
           console.log(`${(data.speakerLabels || []).filter((l: any) => l.customName).length} speaker(s) confirmed — 'text ${id}' now uses these names; voiceprints enrol in the background.`);
         });
         return 0;
