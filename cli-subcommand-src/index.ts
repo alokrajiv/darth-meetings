@@ -91,6 +91,10 @@ READ
                                   comma list, max 5); the person's email is
                                   the id; needs at least free/busy sharing.
                                   Their rows are tagged cal:<name>
+  calendar hidden                 The calendar rows you hid (the listing's
+                                  "Hidden (n)"): kind (occurrence | series),
+                                  when you hid it, title, and the value
+                                  'calendar unhide' takes
   audio <id> [--out <file>]       Download the recording (default ./<id>.<ext>)
   frame <id> <ts> [--out <file>]  Grab a video frame at a timestamp (ms, mm:ss or
                                   hh:mm:ss) as jpeg — only transcripts imported
@@ -129,8 +133,27 @@ READ
                                   meetings YOU can open — or, with --series of
                                   a series you own/edit, among the meetings
                                   its OWNER can open. Changes nothing
+  series occurrences <id> [--refresh]
+                                  The series dialog's occurrence list: every
+                                  occurrence on YOUR calendar, newest first,
+                                  in your tz — imported → <meeting id> (or
+                                  "no access" / queued / failed), importable
+                                  (recording / transcript at the provider),
+                                  nothing recorded, or upcoming. The Google /
+                                  Microsoft sweep is cached ~6 h; --refresh
+                                  re-sweeps now (can take a minute)
   notify                          Your Slack DM notification switches, one
                                   line per kind (opt-out: on unless turned off)
+  reminders                       The home page's reminders card: id, when,
+                                  provider, why (not imported / colleagues
+                                  need your import / auto-record is off),
+                                  title [meeting-code]. With account auto-
+                                  sync on, "not imported" rows are not shown
+  vocab [--org]                   Your transcription vocabulary (--org = the
+                                  company-wide one): one term per line, then
+                                  one custom spelling per line as
+                                  'To <- from, from'. The output is exactly
+                                  what 'vocab --set' reads back
   offline plan [<id,…>]           What the web app keeps offline for you under
                                   the auto-pin counts (newest N: transcript
                                   → audio → video ladder) with the stored
@@ -140,7 +163,7 @@ READ
                                   audio / video) with defaults and caps
 
 RECORDINGS (yours only, never shared — see 'darth-cli meetings recordings')
-  recordings list|get|text|audio|link|make-meeting|keep|rm
+  recordings list|get|text|audio|link|make-meeting|keep|dismiss|rm
   recordings transcriptions|transcribe-again|merge-transcriptions|use-transcription
                                   Your private recordings that belong to no
                                   meeting (unlinked uploads, temporary ones,
@@ -242,6 +265,11 @@ LABELS (org-wide, hierarchical 'Customers/LP Global/QBR', many per transcript;
                                   labels lands N times (by design)
   label-create <path> [--color #rrggbb]
                                   Create a label (whole chain; 0 created = existed)
+  label-color <label> <#rrggbb|none>
+                                  Change a label's color (the rail's color
+                                  dot); none = "No color (inherit parent)".
+                                  Quote '#…' or drop the # (the shell reads
+                                  an unquoted # as a comment)
   label-rename <label> <newName>  Rename one segment (sub-label paths follow)
   label-mv <label> <newParent|/>  Move a label (and its subtree) under another
                                   label, or '/' = top level
@@ -416,6 +444,41 @@ WRITE (needs read+write for meetings)
                                   Google connected
   notify <kind> on|off            Flip one Slack DM notification kind (see
                                   'notify' for the kinds)
+  vocab [--org] --set --file <path|->
+                                  REPLACE your vocabulary (--org: the company
+                                  one, versioned) — read it first, edit,
+                                  write it back. The file is the text
+                                  'vocab' prints (one term per line; 'To <-
+                                  from, from' = a spelling; # lines skipped)
+                                  or JSON {keyterms_prompt:[…],
+                                  custom_spelling:[{to,from:[…]}]}. A
+                                  settings write: needs --consent (below)
+  reminders dismiss <id>          The card's ✕: this occurrence only
+  reminders mute <id>             The card's bell: never remind about this
+                                  meeting again (the sync dialog's mute)
+  calendar hide <event-key> [--series] [--title "<t>"]
+                                  The calendar row's "Hide this occurrence";
+                                  --series = "Hide all occurrences + future
+                                  ones" (recurring events only). Hides it in
+                                  both calendar views, for you only.
+                                  <event-key> = the key: line of 'calendar
+                                  --view all --details'; --title overrides
+                                  the stored title
+  calendar unhide <event-key|value> [--series]
+                                  Unhide — an occurrence by its key, a series
+                                  by any of its keys or by the value
+                                  'calendar hidden' prints
+  calendar check <event-key> [--teams]
+                                  The row's "At Google / Microsoft — check":
+                                  asks the provider (your own Google link;
+                                  Teams: app-only Graph + the meeting chat)
+                                  whether the call left a recording or
+                                  transcript, writes the answer back, and
+                                  prints it (importable → the 'import'
+                                  command). Teams rows are told apart by
+                                  the row's provider; --teams forces the
+                                  Teams check. Exit 1 when the provider did
+                                  not answer
   offline prefs --set <k>=<n>[,<k>=<n>…]
                                   Change the offline auto-pin counts
                                   (transcripts / audio / video; capped
@@ -515,7 +578,8 @@ WRITE (needs read+write for meetings)
   skill                           Print the agent workflow guide
 
 ACCOUNT-SETTINGS writes ('auto-sync off|mine|all', 'notify <kind> on|off',
-'offline prefs --set') need a consent the human approved on darth-auth:
+'offline prefs --set', 'vocab --set') need a consent the human approved on
+darth-auth:
   --consent '<dcon_id>: <approved text>'   (ONE argument, the sentence verbatim)
 Without it the verb prints the request command and exits 6:
   darth-cli consent request --service meetings --action settings --target - \\
@@ -1106,7 +1170,7 @@ const RETIRED_CONSENT_FLAG = "i-have-got-consent-from-human-user";
 /** Family-wide exit code for "a human-approved consent is needed" (CONTRACT §0). */
 const CONSENT_EXIT = 6;
 
-type SettingsArea = "auto-sync" | "notifications" | "offline prefs";
+type SettingsArea = "auto-sync" | "notifications" | "offline prefs" | "vocabulary" | "company vocabulary";
 
 /** `ctx.consent` — set by darth-cli core (≥0.77.0) from `--consent '<id>: <text>'`;
  * read defensively so this file still builds against an older core. */
@@ -2656,6 +2720,9 @@ WRITE (needs read+write for meetings)
                                   A meeting of its own (no calendar event)
   recordings keep <rid>           Remove the expiry of a temporary recording
                                   (it stays a private recording)
+  recordings dismiss <rid>        "Not this" on the suggested calendar event:
+                                  it is no longer offered (link any event by
+                                  hand with 'recordings link')
   recordings rm <rid>             Delete it (refused while a meeting uses it)
 
 TRANSCRIPTION VERSIONS of a recording that is in no meeting (same verbs and
@@ -3984,6 +4051,20 @@ async function recordingsCmd(ctx: Ctx, flags: Record<string, string | boolean>, 
       return 0;
     }
 
+    case "dismiss": {
+      const rid = needRid("dismiss <rid>");
+      if (!rid) return 1;
+      ctx.requireWrite();
+      const r = await recordingRequest(ctx, `/api/recordings/${rid}`, { method: "PATCH", body: JSON.stringify({ dismissSuggestedEvent: true }) });
+      if (!r.ok) return recordingWriteError("dismiss", r.status, r.data);
+      const next = r.data?.recording?.suggested_event;
+      ctx.print(r.data, () => {
+        console.log(`dismissed the suggested event on ${rid} — it is no longer offered ('recordings link ${rid} <ref>' still links any event by hand)`);
+        if (next) console.log(`next suggestion: ${next.title || "(untitled)"} · ${fmtLocalDateTime(String(next.startIso), tz)}`);
+      });
+      return 0;
+    }
+
     case "rm": {
       const rid = needRid("rm <rid>");
       if (!rid) return 1;
@@ -4001,6 +4082,513 @@ async function recordingsCmd(ctx: Ctx, flags: Record<string, string | boolean>, 
   }
 }
 
+// ---------------------------------------------------------------------------
+// CLI ↔ UI parity, batch B (task 05) — the remaining list-page / settings
+// actions: a label's color, the calendar rows' Hide / Unhide / "check at
+// Google / Microsoft", the home reminders card, a series' occurrences, and
+// the vocabulary editor (a settings-class write behind --consent).
+// ---------------------------------------------------------------------------
+
+/** Non-2xx on a batch-B call → one readable line; returns the exit code (3 on a 401). */
+function apiError(verb: string, status: number, data: JsonRec | null): number {
+  const msg = typeof data?.error === "string" ? data.error : `HTTP ${status}`;
+  if (status === 401) console.error(`Unauthorized: ${msg}\nYour token may be expired/revoked — run: darth-cli login`);
+  else if (status === 403 || status === 409) console.error(`${verb} refused: ${msg}`);
+  else if (status === 404) console.error(`${verb} failed: not found (${msg}).`);
+  else console.error(`${verb} failed (HTTP ${status}): ${msg}`);
+  return status === 401 ? 3 : 1;
+}
+
+/** `<label> <color>`: '#rrggbb' / 'rrggbb' (shells eat an unquoted '#…' as a
+ * comment) → '#rrggbb'; 'none' → null = the rail's "No color (inherit
+ * parent)"; anything else → undefined (usage error). */
+function parseLabelColor(raw: string): string | null | undefined {
+  const v = raw.trim();
+  if (/^none$/i.test(v)) return null;
+  const m = /^#?([0-9a-f]{6})$/i.exec(v);
+  return m ? `#${m[1]!.toLowerCase()}` : undefined;
+}
+
+const MEET_CODE_RE = /^[a-z]{3}-[a-z]{4}-[a-z]{3}$/;
+const TEAMS_CODE_RE = /^teams-[0-9a-f]{12}$/;
+
+/** '<eventId|meeting-code>|<start>' → its parts; null when it is not one. */
+function parseEventKey(raw: string): { head: string; startMs: number } | null {
+  const k = raw.trim();
+  const bar = k.lastIndexOf("|");
+  if (bar <= 0 || bar === k.length - 1) return null;
+  const startMs = Date.parse(k.slice(bar + 1));
+  return Number.isNaN(startMs) ? null : { head: k.slice(0, bar), startMs };
+}
+
+/** The `GET /api/calendar/events` row fields the batch-B verbs read. */
+interface CalRow {
+  key: string;
+  eventId: string | null;
+  recurringEventId: string | null;
+  title: string | null;
+  start: string;
+  end: string | null;
+  meetingCode: string | null;
+  provider: "gmeet" | "teams" | null;
+  organizerEmail: string | null;
+}
+
+function dayShift(day: string, n: number): string {
+  const d = new Date(`${day}T00:00:00Z`);
+  d.setUTCDate(d.getUTCDate() + n);
+  return d.toISOString().slice(0, 10);
+}
+
+const EVENT_KEY_HINT = "'darth-cli meetings calendar --view all --details' prints each row's key: line (--json: \"key\")";
+
+/** The calendar row behind an event key: `GET /api/calendar/events` (cache
+ * only, the key's local day ±1, hidden rows included). The exact key wins;
+ * else the same instant with the key's head as event id or meeting code
+ * (unimported-layer rows are keyed '<meeting-code>|<start>'). */
+async function findCalendarRow(ctx: Ctx, verb: string, key: string): Promise<{ row: CalRow | null } | { code: number }> {
+  const k = parseEventKey(key);
+  if (!k) return { row: null };
+  const tz = localTz(ctx);
+  const day = fmtLocalDateTime(new Date(k.startMs).toISOString(), tz).slice(0, 10);
+  const q = new URLSearchParams({ from: dayShift(day, -1), to: dayShift(day, 1), tz, sync: "0" });
+  const r = await meetingsCall(ctx, `/api/calendar/events?${q}`, "GET");
+  if (!r.ok) return { code: apiError(verb, r.status, r.data) };
+  const events = (Array.isArray(r.data?.events) ? r.data.events : []) as CalRow[];
+  const want = key.trim();
+  const row = events.find((e) => e.key === want)
+    ?? events.find((e) => Date.parse(e.start) === k.startMs && (e.eventId === k.head || e.meetingCode === k.head))
+    ?? null;
+  return { row };
+}
+
+/** The calendar row's "At Google / Microsoft — check" request, exactly the
+ * body calendar-meeting-rows.tsx sends. */
+function evidenceRequest(row: CalRow, teams: boolean): { path: string; body: JsonRec } | { error: string } {
+  const name = `"${row.title || "(untitled)"}"`;
+  if (teams) {
+    if (!row.meetingCode && !row.eventId) return { error: `${name} has no Teams meeting code or calendar event id — nothing to check at Microsoft` };
+    return {
+      path: "/api/teams/evidence",
+      body: {
+        meetingCode: row.meetingCode,
+        eventId: row.eventId,
+        startTime: row.start,
+        endTime: row.end,
+        event: { recurringEventId: row.recurringEventId, organizerEmail: row.organizerEmail },
+      },
+    };
+  }
+  if (!row.meetingCode || !MEET_CODE_RE.test(row.meetingCode)) {
+    return { error: `${name} has no Google Meet link — nothing to check at Google${row.eventId ? " (a Teams call? add --teams)" : ""}` };
+  }
+  return {
+    path: "/api/meet/evidence",
+    body: { meetingCode: row.meetingCode, startTime: row.start, event: { id: row.eventId, recurringEventId: row.recurringEventId } },
+  };
+}
+
+interface ChatVerdictLike {
+  held?: boolean; recorded?: boolean; transcribed?: boolean;
+  callStart?: string | null; callEnd?: string | null; durationMs?: number | null; reason?: string | null;
+}
+interface EvidenceReply {
+  checkFailed?: boolean;
+  error?: string;
+  recording?: { state?: string; listed?: number; ready?: number };
+  transcript?: { state?: string; listed?: number; source?: string | null };
+  verdict?: { hasRecording?: boolean; hasTranscript?: boolean; pending?: boolean; importable?: boolean };
+  external?: boolean;
+  tenantId?: string;
+  resolved?: boolean;
+  imported?: { assemblyaiId: string | null; title: string | null; ownerEmail: string | null; accessible: boolean } | null;
+  chat?: ChatVerdictLike | null;
+}
+
+/** The Teams chat verdict (was the call held / recorded) in words. */
+function chatLine(c: ChatVerdictLike | null | undefined, tz: string): string | null {
+  if (!c) return null;
+  if (c.reason) return `chat:       not readable (${c.reason})`;
+  if (!c.held) return "chat:       no call was held in the meeting chat";
+  const span = c.callStart ? ` ${fmtLocalDateTime(c.callStart, tz)}${c.callEnd ? `–${fmtLocalDateTime(c.callEnd, tz).slice(11)}` : ""}` : "";
+  const mins = typeof c.durationMs === "number" ? ` (${fmtMins(c.durationMs / 1000)})` : "";
+  return `chat:       call held${span}${mins}${c.recorded ? ", recorded" : ", not recorded"}${c.transcribed ? ", transcribed" : ""}`;
+}
+
+/** An evidence answer in the handler's words → lines + exit code (1 = the
+ * provider did not answer, nothing concluded). */
+function evidenceLines(teams: boolean, d: EvidenceReply, importRef: string, tz: string): { lines: string[]; code: number } {
+  const lines: string[] = [];
+  const importHint = `import it: darth-cli meetings import '${importRef}'`;
+  if (teams) {
+    const chat = chatLine(d.chat, tz);
+    if (d.external) {
+      lines.push(`organized outside our tenant${d.tenantId ? ` (${d.tenantId})` : ""} — app-only access can't see its recording/transcript; import it from the web import dialog's manual panel`);
+      if (chat) lines.push(chat);
+      return { lines, code: 0 };
+    }
+    if (d.checkFailed) {
+      lines.push(`Microsoft didn't answer — ${d.error ?? "try again"} (nothing concluded)`);
+      if (chat) lines.push(chat);
+      return { lines, code: 1 };
+    }
+    if (d.resolved === false) lines.push("Microsoft has no record of this meeting");
+    else {
+      lines.push(`recording:  ${d.verdict?.hasRecording ? "yes" : "no"}`);
+      lines.push(`transcript: ${d.verdict?.hasTranscript ? "yes" : "no"}`);
+    }
+    if (chat) lines.push(chat);
+    const imp = d.imported;
+    if (imp) {
+      lines.push(imp.accessible && imp.assemblyaiId
+        ? `already imported → ${imp.assemblyaiId}${imp.title ? ` "${imp.title}"` : ""}`
+        : `already imported by ${imp.ownerEmail ?? "someone else"} (you can't open it — ask them to share it)`);
+    } else if (d.verdict?.importable) lines.push(`importable now — ${importHint}`);
+    else lines.push("nothing at Microsoft to import");
+    return { lines, code: 0 };
+  }
+  if (d.checkFailed) return { lines: ["Google didn't answer — try again (nothing concluded)"], code: 1 };
+  const rec = d.recording ?? {};
+  const tr = d.transcript ?? {};
+  lines.push(`recording:  ${rec.state ?? "?"}${rec.listed ? ` (${rec.ready ?? 0} of ${rec.listed} file(s) ready)` : ""}`);
+  lines.push(`transcript: ${tr.state ?? "?"}${tr.source && tr.state !== "none" ? ` (${tr.source})` : ""}`);
+  const v = d.verdict ?? {};
+  if (v.importable && v.pending) lines.push(`listed at Google, still being generated — importable once it lands ('import' queues it): ${importHint}`);
+  else if (v.importable) lines.push(`importable now — ${importHint}`);
+  else lines.push("nothing at Google — never recorded");
+  return { lines, code: 0 };
+}
+
+interface MuteEntry { kind: string; value: string; title: string | null; createdAt: string }
+
+async function fetchMutes(ctx: Ctx, verb: string): Promise<{ mutes: MuteEntry[]; data: JsonRec | null } | { code: number }> {
+  const r = await meetingsCall(ctx, "/api/calendar-mutes", "GET");
+  if (!r.ok) return { code: apiError(verb, r.status, r.data) };
+  return { mutes: (Array.isArray(r.data?.mutes) ? r.data.mutes : []) as MuteEntry[], data: r.data };
+}
+
+const CALENDAR_SUBS = ["hidden", "hide", "unhide", "check"];
+
+/** calendar hidden | hide <key> [--series] [--title t] | unhide <key|value> [--series] | check <key> [--teams] */
+async function calendarSubCmd(ctx: Ctx, flags: Record<string, string | boolean>, sub: string, args: string[]): Promise<number> {
+  // Local lifts: --series / --teams take values elsewhere (series preview --series <id>, auto-sync --teams on).
+  liftBoolFlags(args, flags, ["series", "teams"]);
+  const tz = localTz(ctx);
+  const key = args[0]?.trim() ?? "";
+  const series = flags.series === true;
+
+  if (sub === "hidden") {
+    if (args.length) { console.error("usage: darth-cli meetings calendar hidden"); return 1; }
+    const got = await fetchMutes(ctx, "calendar hidden");
+    if ("code" in got) return got.code;
+    ctx.print(got.data, () => {
+      if (!got.mutes.length) { console.log("Nothing hidden — 'calendar hide <event-key>' hides a row."); return; }
+      for (const m of got.mutes) {
+        console.log(`${m.kind.padEnd(10)}  ${fmtLocalDateTime(m.createdAt, tz)}  ${m.title || "(untitled)"}  ${m.value}`);
+      }
+      console.log(`\n${got.mutes.length} hidden (hidden at, tz ${tz}) — unhide: darth-cli meetings calendar unhide '<value>' (add --series for a series row)`);
+    });
+    return 0;
+  }
+
+  if (sub === "hide") {
+    if (!key || args.length > 1) { console.error('usage: darth-cli meetings calendar hide <event-key> [--series] [--title "<t>"]'); return 1; }
+    if (!parseEventKey(key)) { console.error(`'${key}' is not an event key ('<eventId>|<start>') — ${EVENT_KEY_HINT}`); return 1; }
+    if (flags.title === true) { console.error("--title needs a value"); return 1; }
+    ctx.requireWrite();
+    const found = await findCalendarRow(ctx, "calendar hide", key);
+    if ("code" in found) return found.code;
+    const row = found.row;
+    if (!row) { console.error(`No calendar event with key '${key}' in your calendar cache — ${EVENT_KEY_HINT}`); return 1; }
+    if (series && !row.recurringEventId) { console.error(`"${row.title || "(untitled)"}" is not a recurring event — drop --series to hide just this occurrence`); return 1; }
+    const kind = series ? "series" : "occurrence";
+    const value = series ? row.recurringEventId! : key;
+    const title = str(flags.title)?.trim() || row.title || undefined;
+    const r = await meetingsCall(ctx, "/api/calendar-mutes", "POST", { kind, value, ...(title ? { title } : {}) });
+    if (!r.ok) return apiError("calendar hide", r.status, r.data);
+    ctx.print({ ...(r.data ?? {}), kind, value, title: title ?? null }, () => {
+      console.log(series
+        ? `hidden: "${title || "(untitled)"}" — every occurrence of the series, future ones too`
+        : `hidden: "${title || "(untitled)"}" ${fmtLocalDateTime(row.start, tz)} (this occurrence)`);
+      console.log(`undo: darth-cli meetings calendar unhide '${value}'${series ? " --series" : ""}`);
+    });
+    return 0;
+  }
+
+  if (sub === "unhide") {
+    if (!key || args.length > 1) { console.error("usage: darth-cli meetings calendar unhide <event-key | value from 'calendar hidden'> [--series]"); return 1; }
+    ctx.requireWrite();
+    let value = key;
+    if (series && parseEventKey(key)) {
+      const found = await findCalendarRow(ctx, "calendar unhide", key);
+      if ("code" in found) return found.code;
+      if (!found.row) { console.error(`No calendar event with key '${key}' in your calendar cache — pass the series value 'calendar hidden' prints instead`); return 1; }
+      if (!found.row.recurringEventId) { console.error(`"${found.row.title || "(untitled)"}" is not a recurring event — drop --series`); return 1; }
+      value = found.row.recurringEventId;
+    }
+    const kind = series ? "series" : "occurrence";
+    const got = await fetchMutes(ctx, "calendar unhide");
+    if ("code" in got) return got.code;
+    const hit = got.mutes.find((m) => m.kind === kind && m.value === value);
+    if (!hit) {
+      const other = got.mutes.find((m) => m.value === value);
+      console.error(`Nothing is hidden as ${kind} '${value}'${other ? ` — it is hidden as ${other.kind}: ${other.kind === "series" ? "add" : "drop"} --series` : ""} ('calendar hidden' lists what is hidden).`);
+      return 1;
+    }
+    const r = await meetingsCall(ctx, `/api/calendar-mutes?${new URLSearchParams({ kind, value })}`, "DELETE");
+    if (!r.ok) return apiError("calendar unhide", r.status, r.data);
+    ctx.print({ ...(r.data ?? {}), kind, value }, () =>
+      console.log(`unhidden: "${hit.title || "(untitled)"}" (${kind}) — back in the calendar listings`));
+    return 0;
+  }
+
+  // check
+  if (!key || args.length > 1) { console.error("usage: darth-cli meetings calendar check <event-key> [--teams]"); return 1; }
+  const k = parseEventKey(key);
+  if (!k) { console.error(`'${key}' is not an event key ('<eventId>|<start>') — ${EVENT_KEY_HINT}`); return 1; }
+  ctx.requireWrite();
+  const found = await findCalendarRow(ctx, "calendar check", key);
+  if ("code" in found) return found.code;
+  let row = found.row;
+  if (!row) {
+    // Not in the cache, but the key itself names the meeting ('<code>|<start>').
+    const isTeamsCode = TEAMS_CODE_RE.test(k.head);
+    if (!isTeamsCode && !MEET_CODE_RE.test(k.head)) { console.error(`No calendar event with key '${key}' in your calendar cache — ${EVENT_KEY_HINT}`); return 1; }
+    row = { key, eventId: null, recurringEventId: null, title: null, start: new Date(k.startMs).toISOString(), end: null,
+      meetingCode: k.head, provider: isTeamsCode ? "teams" : "gmeet", organizerEmail: null };
+  }
+  const teams = flags.teams === true || row.provider === "teams" || !!row.meetingCode?.startsWith("teams-");
+  const req = evidenceRequest(row, teams);
+  if ("error" in req) { console.error(req.error); return 1; }
+  const r = await meetingsCall(ctx, req.path, "POST", req.body);
+  if (!r.ok) {
+    if (r.status === 404 && !teams) {
+      console.error(`calendar check: Google is not connected (${typeof r.data?.error === "string" ? r.data.error : "HTTP 404"}) — connect it in the web app Settings (${webBase(ctx)}/settings), then re-run.`);
+      return 1;
+    }
+    return apiError("calendar check", r.status, r.data);
+  }
+  const d = (r.data ?? {}) as EvidenceReply;
+  const importRef = found.row ? found.row.key : (row.meetingCode ?? key);
+  const out = evidenceLines(teams, d, importRef, tz);
+  const shown = row;
+  ctx.print(r.data, () => {
+    console.log(`${teams ? "Microsoft" : "Google"} — "${shown.title || "(untitled)"}" ${fmtLocalDateTime(shown.start, tz)}${shown.meetingCode ? `  [${shown.meetingCode}]` : ""}`);
+    for (const l of out.lines) console.log(`  ${l}`);
+  });
+  return out.code;
+}
+
+interface ReminderRow {
+  id: number;
+  kind: string;
+  meetingCode: string | null;
+  title: string | null;
+  eventStart: string | null;
+  hasRecording?: boolean;
+  hasTranscript?: boolean;
+}
+
+/** The reminders card's words for one row's kind. */
+function reminderKindWords(r: ReminderRow): string {
+  if (r.kind === "unimported") {
+    const has = [r.hasRecording ? "recording" : null, r.hasTranscript ? "transcript" : null].filter(Boolean).join("+");
+    return `not imported${has ? ` (${has})` : ""}`;
+  }
+  if (r.kind === "sync_requested") return "colleagues need your import";
+  if (r.kind === "autorec_off") return "auto-record is off — enable it in Meet before it starts";
+  return r.kind;
+}
+
+/** reminders | reminders dismiss|mute <id> */
+async function remindersCmd(ctx: Ctx, args: string[]): Promise<number> {
+  const [sub, raw, ...extra] = args;
+  const usage = "usage: darth-cli meetings reminders [dismiss|mute <id>]";
+  if (sub !== undefined && ((sub !== "dismiss" && sub !== "mute") || !raw || !/^\d+$/.test(raw) || extra.length)) { console.error(usage); return 1; }
+  if (sub) ctx.requireWrite();
+  const tz = localTz(ctx);
+  const got = await meetingsCall(ctx, "/api/gmeet/reminders", "GET");
+  if (!got.ok) return apiError("reminders", got.status, got.data);
+  const rows = (Array.isArray(got.data?.reminders) ? got.data.reminders : []) as ReminderRow[];
+  const when = (r: ReminderRow) => (r.eventStart ? fmtLocalDateTime(r.eventStart, tz) : "?");
+  const name = (r: ReminderRow) => r.title || r.meetingCode || "Untitled meeting";
+
+  if (!sub) {
+    ctx.print(got.data, () => {
+      if (got.data?.connected === false) console.error("note: Google is not connected — the reminder poller can't look at your meetings (connect it in the web app Settings).");
+      if (!rows.length) { console.log("No open reminders."); return; }
+      for (const r of rows) {
+        const prov = r.meetingCode?.startsWith("teams-") ? "teams" : "gmeet";
+        console.log(`${String(r.id).padStart(6)}  ${when(r)}  ${prov}  ${reminderKindWords(r).padEnd(30)}  ${name(r)}${r.meetingCode ? `  [${r.meetingCode}]` : ""}`);
+      }
+      const poll = typeof got.data?.lastPollAt === "string" ? ` · last poll ${fmtLocalDateTime(got.data.lastPollAt, tz)}` : "";
+      console.log(`\n${rows.length} open reminder(s) (tz ${tz})${poll} — 'reminders dismiss <id>' = this occurrence only, 'reminders mute <id>' = never remind about this meeting again`);
+    });
+    return 0;
+  }
+
+  const id = Number(raw);
+  const r = rows.find((x) => x.id === id);
+  if (!r) { console.error(`No open reminder ${id} — 'darth-cli meetings reminders' lists them (it may be resolved already).`); return 1; }
+  const res = await meetingsCall(ctx, "/api/gmeet/reminders", "PATCH", { id, action: sub, meetingCode: r.meetingCode, title: r.title, eventStart: r.eventStart });
+  if (!res.ok) return apiError(`reminders ${sub}`, res.status, res.data);
+  ctx.print({ ...(res.data ?? {}), id, action: sub }, () =>
+    console.log(sub === "mute"
+      ? `muted reminder ${id}: "${name(r)}" — never reminded about this meeting again`
+      : `dismissed reminder ${id}: "${name(r)}" ${when(r)} — this occurrence only`));
+  return 0;
+}
+
+interface OccurrenceRow {
+  startIso: string;
+  title: string | null;
+  source: string;
+  upcoming: boolean;
+  meetingCode: string | null;
+  hasRecording: boolean;
+  hasTranscript: boolean;
+  emptyTranscript?: boolean;
+  meet?: { videoPending?: boolean; transcriptPending?: boolean } | null;
+  imported: Array<{ assemblyai_id: string; title: string | null; accessible: boolean; queued?: boolean; failed?: boolean }>;
+}
+
+/** One occurrence's state, the series dialog's way: imported (with the
+ * meeting id when you can open it) › upcoming › importable › nothing. */
+function occurrenceStatus(o: OccurrenceRow): string {
+  if (o.imported?.length) {
+    const open = o.imported.filter((i) => i.accessible);
+    const tag = o.imported.some((i) => i.failed) ? " (import failed)" : o.imported.some((i) => i.queued) ? " (queued)" : "";
+    return open.length ? `imported → ${open.map((i) => i.assemblyai_id).join(", ")}${tag}` : `imported (no access)${tag}`;
+  }
+  if (o.upcoming) return "upcoming";
+  const has = [o.hasRecording ? "recording" : null, o.hasTranscript ? "transcript" : null].filter(Boolean).join("+");
+  const pending = o.meet?.videoPending || o.meet?.transcriptPending ? ", generating" : "";
+  if (has) return `importable (${has}${pending})`;
+  if (o.emptyTranscript) return "empty transcript (no speech)";
+  return "nothing recorded";
+}
+
+/** series occurrences <id> [--refresh] */
+async function seriesOccurrencesCmd(ctx: Ctx, flags: Record<string, string | boolean>, raw: string | undefined): Promise<number> {
+  if (!raw || !/^\d+$/.test(raw)) { console.error("usage: darth-cli meetings series occurrences <id> [--refresh]"); return 1; }
+  const tz = localTz(ctx);
+  const r = await meetingsCall(ctx, `/api/series/${raw}/occurrences${flags.refresh === true ? "?refresh=1" : ""}`, "GET");
+  if (!r.ok) {
+    if (r.status === 404) { console.error(`series occurrences: no series #${raw} visible to you (owner, editor, follower or auditor only).`); return 1; }
+    return apiError("series occurrences", r.status, r.data);
+  }
+  const d = r.data ?? {};
+  const occ = (Array.isArray(d.occurrences) ? d.occurrences : []) as OccurrenceRow[];
+  const c = (d.counts ?? {}) as Record<string, number | undefined>;
+  ctx.print(d, () => {
+    console.log(`series #${raw} "${String(d.seriesTitle ?? "")}" — ${c.total ?? occ.length} occurrence(s) on your calendar: ${c.imported ?? 0} imported · ${c.importable ?? 0} importable · ${c.bare ?? 0} nothing recorded · ${c.upcoming ?? 0} upcoming`);
+    if (d.googleConnected === false) console.error("note: Google is not connected — only Teams / already-imported occurrences can show (connect it in the web app Settings).");
+    if (!occ.length) console.log("No occurrences on your calendar (this meeting may not be on it).");
+    for (const o of occ) {
+      const src = o.source === "meet" ? "  (Meet record only)" : o.source === "imported" ? "  (member, not on your calendar)" : "";
+      console.log(`  ${fmtLocalDateTime(o.startIso, tz)}  ${occurrenceStatus(o).padEnd(34)}  ${o.title || "(untitled)"}${o.meetingCode ? `  [${o.meetingCode}]` : ""}${src}`);
+    }
+    const swept = typeof d.sweptAt === "string" ? fmtLocalDateTime(d.sweptAt, tz) : "?";
+    console.log(`\nswept ${swept} (tz ${tz}) — ${d.fromCache ? "cached; --refresh re-sweeps Google/Microsoft" : "fresh"}`);
+  });
+  return 0;
+}
+
+interface VocabShape { keyterms_prompt: string[]; custom_spelling: Array<{ to: string; from: string[] }> }
+
+/** A vocab object (or `{vocab: …}`) checked with the route's own rules. */
+function vocabFromJson(v: unknown): VocabShape | null {
+  if (!v || typeof v !== "object") return null;
+  const o = ("vocab" in (v as JsonRec) ? (v as JsonRec).vocab : v) as JsonRec | null;
+  if (!o || typeof o !== "object" || !Array.isArray(o.keyterms_prompt) || !Array.isArray(o.custom_spelling)) return null;
+  const keyterms_prompt: string[] = [];
+  for (const t of o.keyterms_prompt as unknown[]) {
+    if (typeof t !== "string") return null;
+    if (t.trim()) keyterms_prompt.push(t.trim());
+  }
+  const custom_spelling: VocabShape["custom_spelling"] = [];
+  for (const it of o.custom_spelling as unknown[]) {
+    const e = it as JsonRec | null;
+    if (!e || typeof e !== "object" || typeof e.to !== "string" || !Array.isArray(e.from) || !e.from.every((s) => typeof s === "string")) return null;
+    custom_spelling.push({ to: e.to, from: e.from as string[] });
+  }
+  return { keyterms_prompt, custom_spelling };
+}
+
+/** `vocab --set` input: JSON (`{keyterms_prompt, custom_spelling}` or
+ * `{vocab: …}`), or the text `vocab` prints — one term per line, `To <- from,
+ * from` = a custom spelling, blank lines and '#' lines skipped. */
+function parseVocabSource(text: string): { ok: true; vocab: VocabShape } | { ok: false; error: string } {
+  const t = text.trim();
+  if (t.startsWith("{")) {
+    let parsed: unknown;
+    try { parsed = JSON.parse(t); } catch (e) { return { ok: false, error: `not valid JSON: ${e instanceof Error ? e.message : String(e)}` }; }
+    const v = vocabFromJson(parsed);
+    return v ? { ok: true, vocab: v } : { ok: false, error: "expected { keyterms_prompt: string[], custom_spelling: [{to, from: string[]}] } (or that under \"vocab\")" };
+  }
+  const vocab: VocabShape = { keyterms_prompt: [], custom_spelling: [] };
+  for (const [i, raw] of text.split(/\r?\n/).entries()) {
+    const line = raw.trim();
+    if (!line || line.startsWith("#")) continue;
+    const arrow = line.indexOf("<-");
+    if (arrow < 0) { vocab.keyterms_prompt.push(line); continue; }
+    const to = line.slice(0, arrow).trim();
+    const from = line.slice(arrow + 2).split(",").map((s) => s.trim()).filter(Boolean);
+    if (!to || !from.length) return { ok: false, error: `line ${i + 1}: a spelling is 'To <- from, from' (got '${line}')` };
+    vocab.custom_spelling.push({ to, from });
+  }
+  return { ok: true, vocab };
+}
+
+/** The vocab as text: one term per line, then 'To <- from, from' per spelling. */
+function vocabLines(v: VocabShape): string[] {
+  return [...v.keyterms_prompt, ...v.custom_spelling.map((s) => `${s.to} <- ${s.from.join(", ")}`)];
+}
+
+/** vocab [--org] | vocab [--org] --set --file <path|-> */
+async function vocabCmd(ctx: Ctx, flags: Record<string, string | boolean>, args: string[]): Promise<number> {
+  liftBoolFlags(args, flags, ["set"]); // offline prefs --set takes a value; here it is a switch
+  const org = flags.org === true;
+  const path = org ? "/api/vocab/org" : "/api/vocab/user";
+  const which = org ? "company vocabulary" : "my vocabulary";
+  const usage = "usage: darth-cli meetings vocab [--org]   |   vocab [--org] --set --file <path|->";
+  if (args.length) { console.error(usage); return 1; }
+  const empty: VocabShape = { keyterms_prompt: [], custom_spelling: [] };
+
+  if (flags.set !== true) {
+    if (flags.file !== undefined) { console.error(`--file only goes with --set\n${usage}`); return 1; }
+    const r = await meetingsCall(ctx, path, "GET");
+    if (!r.ok) return apiError("vocab", r.status, r.data);
+    const d = r.data ?? {};
+    const v = vocabFromJson(d.vocab) ?? empty;
+    ctx.print(d, () => {
+      const meta = org && d.version !== undefined
+        ? ` v${String(d.version)}${typeof d.updated_at === "string" ? `, updated ${fmtLocalDateTime(d.updated_at, localTz(ctx))}` : ""}`
+        : "";
+      console.log(`# ${which}${meta}: ${v.keyterms_prompt.length} term(s), ${v.custom_spelling.length} spelling(s) — 'To <- from, from' = a custom spelling`);
+      for (const l of vocabLines(v)) console.log(l);
+    });
+    return 0;
+  }
+
+  ctx.requireWrite();
+  const src = readTextSource("file", str(flags.file));
+  if (src === null) return 1;
+  const parsed = parseVocabSource(src);
+  if (!parsed.ok) { console.error(`--file: ${parsed.error}`); return 1; }
+  if (!requireConsent(ctx, flags, org ? "company vocabulary" : "vocabulary")) return CONSENT_EXIT;
+  const r = await meetingsCall(ctx, path, "PUT", { vocab: parsed.vocab });
+  if (!r.ok) return apiError("vocab --set", r.status, r.data);
+  const d = r.data ?? {};
+  const v = vocabFromJson(d.vocab) ?? parsed.vocab;
+  ctx.print(d, () =>
+    console.log(`saved ${which}${org && d.version !== undefined ? ` v${String(d.version)}` : ""}: ${v.keyterms_prompt.length} term(s), ${v.custom_spelling.length} spelling(s) — it REPLACED the previous list`));
+  return 0;
+}
+
+/** Pure helpers, exported for the tests. */
+export const PARITY_B = { parseLabelColor, parseEventKey, evidenceRequest, evidenceLines, parseVocabSource, vocabLines, occurrenceStatus, reminderKindWords };
+
 const meetings: Subcommand = {
   name: "meetings",
   summary: "Meeting transcripts, notes & recordings (darth-meetings)",
@@ -4008,7 +4596,7 @@ const meetings: Subcommand = {
   async run(ctx, argv) {
     const { pos: rawPos, flags } = parseArgs(argv);
     liftBoolFlags(rawPos, flags, ["cascade", "exact", "cached", "details", "wait", "clear", "scratch", "resume", "separate", "keep-in-both", RETIRED_CONSENT_FLAG,
-      "index", "case", "dry-run", "guess", "dismiss", "suggestions", "add-suggested", "cancel-queued"]);
+      "index", "case", "dry-run", "guess", "dismiss", "suggestions", "add-suggested", "cancel-queued", "refresh", "org"]);
     const pos = flags.help === true ? rawPos : await resolveMeetingRefs(ctx, rawPos);
     const [, cmd, ...args] = pos.length && pos[0] === "meetings" ? pos : ["", ...pos];
     if (cmd === "recordings") return recordingsCmd(ctx, flags, args);
@@ -4337,6 +4925,29 @@ const meetings: Subcommand = {
         return 0;
       }
 
+      case "label-color": {
+        const [target, rawColor] = args;
+        const usage = "usage: darth-cli meetings label-color <label path|#id> <#rrggbb|none>   (quote '#…' — the shell reads an unquoted # as a comment; bare rrggbb works too)";
+        if (!target || !rawColor || args.length > 2) { console.error(usage); return 1; }
+        const color = parseLabelColor(rawColor);
+        if (color === undefined) { console.error(`'${rawColor}' is not a color — #rrggbb (6 hex digits) or none\n${usage}`); return 1; }
+        ctx.requireWrite();
+        const { label } = await requireLabel(ctx, target);
+        const r = await meetingsCall(ctx, `/api/labels/${label.id}`, "PATCH", { color });
+        if (!r.ok) return apiError("label-color", r.status, r.data);
+        const after = (r.data?.label ?? null) as LabelRow | null;
+        ctx.print(r.data, () => console.log(color
+          ? `${label.path} (#${label.id}) color ${label.color ?? "(none)"} → ${after?.color ?? color}`
+          : `${label.path} (#${label.id}) color cleared — it inherits its parent's`));
+        return 0;
+      }
+
+      case "reminders":
+        return remindersCmd(ctx, args);
+
+      case "vocab":
+        return vocabCmd(ctx, flags, args);
+
       case "label-rm": {
         const target = args.join(" ").trim();
         if (!target) { console.error("usage: darth-cli meetings label-rm <label path|#id> [--cascade]"); return 1; }
@@ -4503,6 +5114,8 @@ const meetings: Subcommand = {
           });
           return 0;
         }
+        // -- occurrences (read-only) ---------------------------------------
+        if (sub === "occurrences") return seriesOccurrencesCmd(ctx, flags, args[1]);
         // -- mutations ----------------------------------------------------
         ctx.requireWrite();
         if (sub === "create") {
@@ -4793,6 +5406,7 @@ const meetings: Subcommand = {
       }
 
       case "calendar": {
+        if (args[0] && CALENDAR_SUBS.includes(args[0])) return calendarSubCmd(ctx, flags, args[0], args.slice(1));
         const view = str(flags.view) || "unimported";
         if (view === "all" || view === "full") return calendarAll(ctx, flags, allFlagValues(argv, "calendar"));
         for (const f of ["cached", "details", "calendar"]) if (flags[f] !== undefined) { console.error(`--${f} only applies to --view all`); return 1; }
@@ -5133,7 +5747,8 @@ const meetings: Subcommand = {
       case "help": {
         const verb = args[0];
         if (!verb) { console.log(HELP); return 0; }
-        const lines = helpForVerb(verb);
+        // "help calendar hide" → that sub-verb's lines; else the first word's.
+        const lines = (args.length > 1 ? helpForVerb(args.join(" ")) : null) ?? helpForVerb(verb);
         if (!lines) { console.error(`no verb '${verb}' — 'darth-cli meetings --help' lists them`); return 1; }
         console.log(lines);
         return 0;
