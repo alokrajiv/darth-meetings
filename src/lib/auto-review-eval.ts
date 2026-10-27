@@ -105,7 +105,14 @@ export function evaluateAutoReview(input: AutoReviewInput): AutoReviewEvaluation
         : `no confident identification for speaker "${speaker}"`;
       break;
     }
-    applied.push({ originalSpeaker: speaker, customName: s!.name.trim(), description: '' });
+    // The suggestion's person (lib/speaker-identity) rides onto the label, so
+    // an auto-applied name is an email-backed speaker like a confirmed one.
+    applied.push({
+      originalSpeaker: speaker,
+      customName: s!.name.trim(),
+      description: '',
+      ...(s!.email ? { email: s!.email } : {}),
+    });
     const strongEnough =
       (s!.source === 'voice' && s!.confidence >= ENROLL_VOICE_MIN) ||
       (s!.via === 'id' && s!.confidence >= ENROLL_ID_MIN);

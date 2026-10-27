@@ -937,6 +937,14 @@ export interface SpeakerLabel {
   originalSpeaker: string;
   customName: string;
   description: string;
+  /**
+   * The PERSON behind the name (2026-10-27, lib/speaker-identity): the
+   * directory / invitee email, lower-cased. Optional and back-compatible —
+   * older labels and "Use as label only" have none. When a label arrives
+   * with one, the server makes `customName` the canonical display name
+   * (directory → invitee → what was sent).
+   */
+  email?: string;
 }
 
 /**
@@ -965,6 +973,13 @@ export interface SpeakerSuggestion {
    * OFF_ROSTER_MIN_SCORE). The UI says "not on the invite".
    */
   offRoster?: boolean;
+  /**
+   * The person's email when the guessed name matches exactly ONE invitee or
+   * directory person (lib/speaker-identity `matchEmailByName`); absent when
+   * nothing or more than one matches — never a guess. Confirming such a
+   * suggestion saves `{customName, email}`.
+   */
+  email?: string;
 }
 
 export type SpeakerSuggestionMap = Record<string, SpeakerSuggestion>;

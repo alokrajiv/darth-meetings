@@ -33,10 +33,8 @@ import {
   updateMetaForUser,
   type TranscriptRow,
 } from '@/db-ops/transcripts';
-import {
-  getForUser as getMappingsForUser,
-  setSuggestionsForUser,
-} from '@/db-ops/speaker-mappings';
+import { getForUser as getMappingsForUser } from '@/db-ops/speaker-mappings';
+import { setSuggestionsWithIdentity as setSuggestionsForUser } from '@/lib/server/speaker-identity';
 import { listByTranscript as listAttachments } from '@/db-ops/transcript-attachments';
 import type {
   SpeakerLabel,

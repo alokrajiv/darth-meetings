@@ -11,20 +11,31 @@ import { enrollFromTranscript } from '@/lib/server/voiceprint';
 import { getContentCached } from '@/lib/server/auto-notes';
 import { resolveMeetingContent } from '@/lib/server/recordings';
 import { settleSpeakerIdAfterNaming } from '@/lib/server/speaker-id-settle';
+import { resolveLabelIdentities } from '@/lib/server/speaker-identity';
+import { isEmailShape, normalizeEmail } from '@/lib/speaker-identity';
 
 export const runtime = 'nodejs';
 
+/**
+ * The wire shape: `{originalSpeaker, customName?, description?, email?}`.
+ * `email` (lib/speaker-identity) is optional; when present it has to look
+ * like an address — anything else is a 400, never silently dropped.
+ */
 function validateLabels(value: unknown): SpeakerLabel[] | null {
   if (!Array.isArray(value)) return null;
   const out: SpeakerLabel[] = [];
   for (const item of value) {
     if (typeof item !== 'object' || item === null) return null;
-    const { originalSpeaker, customName, description } = item as Record<string, unknown>;
+    const { originalSpeaker, customName, description, email } = item as Record<string, unknown>;
     if (typeof originalSpeaker !== 'string') return null;
+    if (email !== undefined && email !== null && email !== '') {
+      if (typeof email !== 'string' || !isEmailShape(email)) return null;
+    }
     out.push({
       originalSpeaker,
       customName: typeof customName === 'string' ? customName : '',
       description: typeof description === 'string' ? description : '',
+      ...(typeof email === 'string' && email.trim() ? { email: normalizeEmail(email) } : {}),
     });
   }
   return out;
@@ -73,14 +84,24 @@ export const PUT = withAuth(async ({ user, request }, { params }) => {
     return NextResponse.json({ error: 'Invalid JSON body' }, { status: 400 });
   }
 
-  const labels = validateLabels((body as { speakerLabels?: unknown })?.speakerLabels);
-  if (!labels) {
+  const sent = validateLabels((body as { speakerLabels?: unknown })?.speakerLabels);
+  if (!sent) {
     return NextResponse.json(
-      { error: 'Invalid speakerLabels (expected array of {originalSpeaker, customName, description})' },
+      {
+        error:
+          'Invalid speakerLabels (expected array of {originalSpeaker, customName, description, email?} — email, when given, must be an address)',
+      },
       { status: 400 }
     );
   }
 
+  // A label with an email names a PERSON: the stored name is the canonical
+  // one (directory → invitee → sent) and a missing directory row is created
+  // — the same as "+ Person". The reply carries what was stored.
+  const labels = await resolveLabelIdentities(sent, {
+    attendees: access.row.gmeet_context?.attendees,
+    createdBy: user.userId,
+  });
   const row = await upsertMappingsForUser(access.ownerUserId, id, labels);
 
   // One content read serves both of the follow-ups below.

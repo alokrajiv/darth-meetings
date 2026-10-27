@@ -46,6 +46,24 @@ describe('evaluateAutoReview', () => {
     expect(ev.merged).toEqual(ev.applied);
   });
 
+  test("a suggestion's email rides onto the applied and merged label; none → no email key", () => {
+    const ev = evaluateAutoReview({
+      utterances: utt(['A', 3], ['B', 3]),
+      labels: [],
+      suggestions: {
+        A: { ...voice('Test Person A', 0.9), email: 'test-a@example.com' },
+        B: voice('Test Person B', 0.9),
+      },
+    });
+    expect(ev.passed).toBe(true);
+    expect(ev.applied).toEqual([
+      { originalSpeaker: 'A', customName: 'Test Person A', description: '', email: 'test-a@example.com' },
+      { originalSpeaker: 'B', customName: 'Test Person B', description: '' },
+    ]);
+    expect(ev.merged.find((l) => l.originalSpeaker === 'A')?.email).toBe('test-a@example.com');
+    expect('email' in ev.merged.find((l) => l.originalSpeaker === 'B')!).toBe(false);
+  });
+
   test('one weak voice match (0.55) → blocked, with the reason, nothing applied', () => {
     const suggestions: SpeakerSuggestionMap = { A: voice('Test Person A', 0.87), B: voice('Test Person B', 0.55) };
     const ev = evaluateAutoReview({ utterances: utt(['A', 5], ['B', 4]), labels: [], suggestions });

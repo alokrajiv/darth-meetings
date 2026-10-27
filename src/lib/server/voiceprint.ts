@@ -3,10 +3,10 @@ import { resolveAudioPath } from '@/lib/server/audio-storage';
 import { canonicalMedia, localMsIn, type ResolvedMedia } from '@/lib/server/recordings';
 import { splitSpeakerLabel } from '@/lib/recording-clips';
 import { listAll, enrollSample } from '@/db-ops/voiceprints';
-import {
-  getForUser as getMappingsForUser,
-  setSuggestionsForUser,
-} from '@/db-ops/speaker-mappings';
+import { getForUser as getMappingsForUser } from '@/db-ops/speaker-mappings';
+// Every stored suggestion carries its person's email when unambiguous
+// (lib/server/speaker-identity) — the same write path the ID pass uses.
+import { setSuggestionsWithIdentity as setSuggestionsForUser } from '@/lib/server/speaker-identity';
 import type {
   SpeakerLabel,
   SpeakerSuggestionMap,
