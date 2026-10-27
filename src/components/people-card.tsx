@@ -6,7 +6,7 @@ import { PersonChip } from '@/components/person-chip';
 import { type PickerPerson } from '@/components/user-picker';
 import { SpeakerPreviewDialog } from '@/components/speaker-preview-dialog';
 import type { ServedPlayback } from '@/lib/clip-window';
-import { ChevronDown, ChevronUp, Fingerprint, MicOff, Pencil, Sparkles, Users } from 'lucide-react';
+import { Check, ChevronDown, ChevronUp, Fingerprint, MicOff, Pencil, Sparkles, Users } from 'lucide-react';
 import type { GmeetAttendee, SpeakerLabel, SpeakerSuggestionMap } from '@/lib/format';
 import { personDisplay } from '@/lib/person-display';
 import { speakerColorVar } from '@/lib/speaker-display';
@@ -24,7 +24,9 @@ interface PeopleCardProps {
   speakerLabels: SpeakerLabel[];
   /** Voiceprint / Meet-align / speaker-ID guesses keyed by original speaker. */
   suggestions?: SpeakerSuggestionMap;
-  onSave: (originalSpeaker: string, patch: { customName?: string; description?: string }) => void;
+  /** `email` (lib/speaker-identity) ties the name to a person; the server
+   * stores the canonical display name for it. */
+  onSave: (originalSpeaker: string, patch: { customName?: string; description?: string; email?: string }) => void;
   /** Disables editing when false (pencils hidden, no Confirm). */
   canEdit: boolean;
   onPickPerson: (person: PickerPerson) => void;
@@ -247,6 +249,11 @@ export function PeopleCard({
                   state={s}
                   count={utteranceCounts[s.speaker] ?? 0}
                   sourceTag={sourceTagOf?.(s.speaker) ?? null}
+                  labelEmail={
+                    s.status === 'confirmed'
+                      ? speakerLabels.find((l) => l.originalSpeaker === s.speaker)?.email ?? null
+                      : null
+                  }
                   canEdit={canEdit}
                   offerCreatePerson={
                     s.status === 'guess' &&
@@ -254,7 +261,14 @@ export function PeopleCard({
                     !knownNames.has(s.name.toLowerCase())
                   }
                   onEdit={() => setEditSpeaker(s.speaker)}
-                  onConfirm={() => onSave(s.speaker, { customName: s.name })}
+                  onConfirm={() =>
+                    // A guess that names exactly one invitee / directory
+                    // person carries its email — confirming saves the person.
+                    onSave(
+                      s.speaker,
+                      s.suggestion?.email ? { customName: s.name, email: s.suggestion.email } : { customName: s.name }
+                    )
+                  }
                   onCreatePerson={() => onRequestCreatePerson(s.speaker, s.name)}
                 />
               ))}
@@ -347,6 +361,7 @@ function VoiceRow({
   state: s,
   count,
   sourceTag,
+  labelEmail,
   canEdit,
   offerCreatePerson,
   onEdit,
@@ -357,6 +372,9 @@ function VoiceRow({
   count: number;
   /** Which recording this voice was heard on — Phase 3b, null otherwise. */
   sourceTag?: string | null;
+  /** The confirmed label's email — the name is tied to a person. Null for
+   * name-only labels, guesses, groups and unknown voices. */
+  labelEmail?: string | null;
   canEdit: boolean;
   offerCreatePerson: boolean;
   onEdit: () => void;
@@ -403,6 +421,16 @@ function VoiceRow({
           >
             {s.display}
             {s.status === 'guess' ? '?' : ''}
+          </span>
+        )}
+        {labelEmail && (
+          <span
+            className="inline-flex shrink-0 items-center text-muted-foreground"
+            title={labelEmail}
+            aria-label={`Linked to ${labelEmail}`}
+            data-speaker-email={labelEmail}
+          >
+            <Check className="h-3 w-3" />
           </span>
         )}
         {sourceTag && (

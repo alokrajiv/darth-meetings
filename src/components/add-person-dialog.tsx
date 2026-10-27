@@ -20,6 +20,11 @@ interface AddPersonDialogProps {
   open: boolean;
   /** Pre-filled name when the dialog opens (the custom text from the picker). */
   initialName: string;
+  /**
+   * Pre-filled email — the one invitee the name matches (lib/speaker-identity
+   * `matchEmailByName`). Null / absent = the field opens empty. Still editable.
+   */
+  initialEmail?: string | null;
   /** The user committed a person (either newly created or matched to an existing record). */
   onCreated: (person: PickerPerson) => void;
   /**
@@ -47,12 +52,13 @@ interface AddPersonDialogProps {
 export function AddPersonDialog({
   open,
   initialName,
+  initialEmail,
   onCreated,
   onUseAsLabel,
   onCancel,
 }: AddPersonDialogProps) {
   const [name, setName] = useState(initialName);
-  const [email, setEmail] = useState('');
+  const [email, setEmail] = useState(initialEmail ?? '');
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [existing, setExisting] = useState<PickerPerson | null>(null);
@@ -61,12 +67,12 @@ export function AddPersonDialog({
   useEffect(() => {
     if (open) {
       setName(initialName);
-      setEmail('');
+      setEmail(initialEmail ?? '');
       setError(null);
       setExisting(null);
       setLoading(false);
     }
-  }, [open, initialName]);
+  }, [open, initialName, initialEmail]);
 
   const handleSubmit = async () => {
     setError(null);
@@ -189,6 +195,11 @@ export function AddPersonDialog({
                     }
                   }}
                 />
+                {initialEmail && email === initialEmail && (
+                  <p className="text-[11px] text-muted-foreground" data-email-from-invite>
+                    From the invite
+                  </p>
+                )}
               </div>
               {error && <p className="text-xs text-destructive">{error}</p>}
             </div>

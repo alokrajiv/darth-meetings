@@ -80,6 +80,7 @@ import {
 import { PersonChip } from '@/components/person-chip';
 import { safeDate, usesEventRange, whenLine } from '@/lib/when';
 import { countVoices, speakerNameStates } from '@/lib/speaker-name-state';
+import { inviteeCandidates, matchEmailByName } from '@/lib/speaker-identity';
 import { isNetworkFailure, networkErrorMessage } from '@/lib/fetch-errors';
 import { OfflineMeeting } from '@/components/offline-meeting';
 import { rememberOpenedMeeting, useReplicaAvailable } from '@/lib/offline/replica-client';
@@ -142,6 +143,11 @@ type DetailRow = StoredTranscript & {
    * or null — the server decides; the page only shows the line + Hold. */
   autoProceedAt?: string | null;
 };
+
+/** Same speaker name for the email rules: trimmed, case-insensitive. */
+function sameSpeakerName(a: string | null | undefined, b: string | null | undefined): boolean {
+  return (a ?? '').trim().toLowerCase() === (b ?? '').trim().toLowerCase();
+}
 
 /**
  * Find the index of the utterance whose [start, end) interval contains the
@@ -1311,8 +1317,16 @@ function TranscriptDetailInner({
         const i = next.findIndex((l) => l.originalSpeaker === sp);
         if ((i >= 0 ? next[i]!.customName.trim() : '') === name) continue;
         changed = true;
-        if (i >= 0) next[i] = { ...next[i]!, customName: name };
-        else next.push({ originalSpeaker: sp, customName: name, description: '' });
+        // Accepting the suggested name as-is accepts its person too; a typed
+        // different name is a name only (a stale email would make the server
+        // put the old person's name back).
+        const suggestion = speakerSuggestions[sp];
+        const email =
+          suggestion?.email && sameSpeakerName(suggestion.name, name) ? suggestion.email : undefined;
+        if (i >= 0) {
+          const { email: _old, ...rest } = next[i]!; // eslint-disable-line @typescript-eslint/no-unused-vars
+          next[i] = { ...rest, customName: name, ...(email ? { email } : {}) };
+        } else next.push({ originalSpeaker: sp, customName: name, description: '', ...(email ? { email } : {}) });
       }
       if (changed) {
         setSpeakerLabels(next);
@@ -1338,7 +1352,7 @@ function TranscriptDetailInner({
       setReviewOpen(false);
       await runPostReviewGeneration();
     },
-    [speakerLabels, transcriptId, bumpActivity, loadAll, runPostReviewGeneration]
+    [speakerLabels, speakerSuggestions, transcriptId, bumpActivity, loadAll, runPostReviewGeneration]
   );
 
   // Safety net for the report status: live events normally push the refresh,
@@ -1708,20 +1722,29 @@ function TranscriptDetailInner({
   );
 
   /**
-   * Save a partial update for one speaker (name and/or description). Merges
-   * with the existing entry, optimistically updates local state, and PUTs the
-   * full label set.
+   * Save a partial update for one speaker (name, description and/or the
+   * person's email). Merges with the existing entry, optimistically updates
+   * local state, and PUTs the full label set — the reply (canonical names
+   * for labels with an email) replaces local state.
    */
   const handleSaveSpeaker = useCallback(
     async (
       originalSpeaker: string,
-      patch: { customName?: string; description?: string }
+      patch: { customName?: string; description?: string; email?: string }
     ) => {
       const existing = speakerLabels.find((m) => m.originalSpeaker === originalSpeaker);
+      const customName = patch.customName ?? existing?.customName ?? '';
+      // The existing email survives a description edit or the same name; a
+      // rename without a new email drops it — the server would otherwise
+      // store the old person's canonical name over the typed one.
+      const email =
+        patch.email ??
+        (existing?.email && sameSpeakerName(existing.customName, customName) ? existing.email : undefined);
       const merged: SpeakerLabel = {
         originalSpeaker,
-        customName: patch.customName ?? existing?.customName ?? '',
+        customName,
         description: patch.description ?? existing?.description ?? '',
+        ...(email ? { email } : {}),
       };
       const without = speakerLabels.filter((m) => m.originalSpeaker !== originalSpeaker);
       const next = [...without, merged];
@@ -1977,7 +2000,7 @@ function TranscriptDetailInner({
       if (!pendingCreate) return;
       const original = pendingCreate.originalSpeaker;
       setPendingCreate(null);
-      handleSaveSpeaker(original, { customName: person.name });
+      handleSaveSpeaker(original, { customName: person.name, ...(person.email ? { email: person.email } : {}) });
       handlePickPerson(person);
     },
     // handleSaveSpeaker and handlePickPerson are declared later — ref via closure.
@@ -4346,6 +4369,9 @@ function TranscriptDetailInner({
         <AddPersonDialog
           open={!!pendingCreate}
           initialName={pendingCreate?.name ?? ''}
+          initialEmail={
+            pendingCreate ? matchEmailByName(pendingCreate.name, inviteeCandidates(row?.gmeet_context?.attendees)) : null
+          }
           onCreated={handlePersonCreated}
           onUseAsLabel={handleUsePersonAsLabel}
           onCancel={() => setPendingCreate(null)}

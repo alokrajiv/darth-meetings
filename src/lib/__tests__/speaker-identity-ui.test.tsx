@@ -1,0 +1,136 @@
+/**
+ * Speaker identity (phase 1, 2026-10-27) — the UI half. The pure rules live
+ * in lib/speaker-identity (speaker-identity.test.ts); what these tests hold:
+ *
+ *  - People card: a confirmed label with an email shows the ✓ marker
+ *    (`data-speaker-email`), rendered statically (no DOM); a name-only label,
+ *    a guess and a group label show none;
+ *  - Confirm on a suggestion that carries an email saves `{customName, email}`
+ *    — pinned from source (the row is not exported, a static render can't
+ *    click);
+ *  - "+ Person" dialog: opens with the invitee's email prefilled and says
+ *    "From the invite" while the field still holds it — pinned from source
+ *    (the Radix dialog portals, so a static render is empty);
+ *  - the detail page: saves keep / drop / attach the email by the rules.
+ */
+import { describe, expect, test } from 'bun:test';
+import { readFileSync } from 'node:fs';
+import { join } from 'node:path';
+import { renderToStaticMarkup } from 'react-dom/server';
+import { PeopleCard } from '@/components/people-card';
+import type { SpeakerLabel, SpeakerSuggestionMap } from '@/lib/format';
+
+const root = join(import.meta.dir, '..', '..');
+const read = (p: string) => readFileSync(join(root, p), 'utf8');
+
+const utterances = [
+  { text: 'Hello.', start: 0, end: 1000, speaker: 'A' },
+  { text: 'Hi.', start: 1000, end: 2000, speaker: 'B' },
+  { text: 'Morning.', start: 2000, end: 3000, speaker: 'C' },
+];
+
+const render = (speakerLabels: SpeakerLabel[], suggestions: SpeakerSuggestionMap = {}) =>
+  renderToStaticMarkup(
+    <PeopleCard
+      utterances={utterances}
+      speakerLabels={speakerLabels}
+      suggestions={suggestions}
+      onSave={() => {}}
+      canEdit
+      onPickPerson={() => {}}
+      onRequestCreatePerson={() => {}}
+      audioSrc={null}
+    />
+  );
+
+describe('People card — the ✓ email marker', () => {
+  test('a confirmed label with an email renders the marker, titled with the email', () => {
+    const html = render([
+      { originalSpeaker: 'A', customName: 'Test Person A', description: '', email: 'test-a@example.com' },
+      { originalSpeaker: 'B', customName: 'Test Person B', description: '' },
+    ]);
+    expect(html).toContain('data-speaker-email="test-a@example.com"');
+    expect(html).toContain('title="test-a@example.com"');
+    expect(html.match(/data-speaker-email=/g)?.length).toBe(1);
+  });
+
+  test('name-only labels, guesses and group labels render none', () => {
+    const html = render(
+      [
+        { originalSpeaker: 'A', customName: 'Test Person A', description: '' },
+        { originalSpeaker: 'C', customName: 'mixed', description: '', email: 'test-c@example.com' },
+      ],
+      { B: { name: 'Test Person B', confidence: 0.9, source: 'context', email: 'test-b@example.com' } }
+    );
+    expect(html).toContain('data-speaker-state="guess"');
+    expect(html).toContain('data-speaker-state="group"');
+    expect(html).not.toContain('data-speaker-email');
+  });
+});
+
+describe('People card — Confirm saves the person', () => {
+  const src = read('components/people-card.tsx');
+
+  test('onSave takes an email in its patch', () => {
+    expect(src).toContain(
+      'onSave: (originalSpeaker: string, patch: { customName?: string; description?: string; email?: string }) => void;'
+    );
+  });
+
+  test('a suggestion with an email confirms {customName, email}; without, the name only', () => {
+    expect(src).toContain(
+      's.suggestion?.email ? { customName: s.name, email: s.suggestion.email } : { customName: s.name }'
+    );
+  });
+
+  test('the marker reads the CONFIRMED label only', () => {
+    expect(src).toContain("s.status === 'confirmed'");
+    expect(src).toContain('speakerLabels.find((l) => l.originalSpeaker === s.speaker)?.email ?? null');
+    expect(src).toContain('data-speaker-email={labelEmail}');
+  });
+});
+
+describe('"+ Person" dialog — the invitee email prefill', () => {
+  const src = read('components/add-person-dialog.tsx');
+
+  test('opens with initialEmail (still editable), reset on every open', () => {
+    expect(src).toContain('initialEmail?: string | null;');
+    expect(src).toContain("useState(initialEmail ?? '')");
+    expect(src).toContain("setEmail(initialEmail ?? '');");
+    expect(src).toContain('}, [open, initialName, initialEmail]);');
+  });
+
+  test('"From the invite" shows only while the field still holds the prefill', () => {
+    expect(src).toContain('{initialEmail && email === initialEmail && (');
+    expect(src).toContain('From the invite');
+  });
+});
+
+describe('detail page — saves carry the email by the rules', () => {
+  const src = read('app/transcript/[id]/page.tsx');
+
+  test('handleSaveSpeaker: patch email, else the existing one only for the same name', () => {
+    expect(src).toContain('patch: { customName?: string; description?: string; email?: string }');
+    expect(src).toContain(
+      '(existing?.email && sameSpeakerName(existing.customName, customName) ? existing.email : undefined);'
+    );
+    expect(src).toContain('...(email ? { email } : {}),');
+  });
+
+  test('"+ Person" saves the created person\'s email; "Use as label only" the name only', () => {
+    expect(src).toContain(
+      'handleSaveSpeaker(original, { customName: person.name, ...(person.email ? { email: person.email } : {}) });'
+    );
+    expect(src).toContain('handleSaveSpeaker(original, { customName: name });');
+  });
+
+  test('review confirm attaches the suggestion email only when the name is the suggested one', () => {
+    expect(src).toContain('suggestion?.email && sameSpeakerName(suggestion.name, name) ? suggestion.email : undefined;');
+  });
+
+  test('the dialog prefill is the one invitee the pending name matches', () => {
+    expect(src).toContain(
+      'pendingCreate ? matchEmailByName(pendingCreate.name, inviteeCandidates(row?.gmeet_context?.attendees)) : null'
+    );
+  });
+});
