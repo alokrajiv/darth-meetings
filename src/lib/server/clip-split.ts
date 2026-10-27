@@ -111,19 +111,12 @@ export interface SplitInput {
 
 export type ClipOpResult<T> =
   | { ok: true; body: T }
-  | { ok: false; status: number; body: { error: string; code?: string; message?: string } };
+  | { ok: false; status: number; body: { error: string; code?: string } };
 
-/**
- * `error` is the sentence (what the dialog and the CLI's generic error line
- * print), `code` the key a client branches on; `message` repeats the sentence
- * under the name the 2026-10-27 split brief gave it.
- */
+/** `error` is the sentence (what the dialog and the CLI's generic error line
+ * print), `code` the key a client branches on. */
 function refuse<T>(refusal: SplitRefusal, status = 409): ClipOpResult<T> {
-  return {
-    ok: false,
-    status,
-    body: { error: refusal.message, code: refusal.code, message: refusal.message },
-  };
+  return { ok: false, status, body: { error: refusal.message, code: refusal.code } };
 }
 
 // ---------------------------------------------------------------------------

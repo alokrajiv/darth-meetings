@@ -2658,7 +2658,7 @@ export const SPLIT_RETRY = { intervalMs: 10_000, maxMs: 180_000 };
 type SplitReply = { ok: boolean; status: number; data: { code?: unknown; error?: unknown } | null };
 
 const isSpeakerCheckRunning = (r: SplitReply): boolean =>
-  r.status === 409 && (r.data?.code === "speaker_check_running" || r.data?.error === "speaker_check_running");
+  r.status === 409 && r.data?.code === "speaker_check_running";
 
 /**
  * Sends the split; on 409 speaker_check_running waits and re-sends until the

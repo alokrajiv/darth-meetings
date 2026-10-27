@@ -62,7 +62,6 @@ afterAll(() => rmSync(tree, { recursive: true, force: true }));
 const RUNNING = {
   error: 'Speaker identification is still running on this meeting — retry in about a minute.',
   code: 'speaker_check_running',
-  message: 'Speaker identification is still running on this meeting — retry in about a minute.',
 };
 const OK = {
   meeting: { id: 'split-x1', title: 'Meeting X, part 2', fromMs: 600_000, toMs: 1_800_000, durationMs: 1_200_000, url: '/transcript/split-x1' },
@@ -178,10 +177,10 @@ describe('split waits out a running speaker pass', () => {
     expect(err()).not.toContain('retrying in');
   });
 
-  test('a server that puts the code in `error` (the brief’s shape) is waited on too', async () => {
-    replies = [{ status: 409, body: { error: 'speaker_check_running', message: 'still running' } }, { status: 201, body: OK }];
-    expect(await run([])).toBe(0);
-    expect(posts.length).toBe(2);
+  test('only the `code` field decides — a 409 whose sentence merely mentions the pass is final', async () => {
+    replies = [{ status: 409, body: { error: 'speaker_check_running', code: 'no-clip' } }, { status: 201, body: OK }];
+    expect(await run([])).toBe(1);
+    expect(posts.length).toBe(1);
   });
 
   test('the shipped clock is 10 s between tries and 3 min in all', () => {

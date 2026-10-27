@@ -54,11 +54,11 @@ describe('POST …/split refuses while the speaker pass runs — before anything
     }
   });
 
-  test('the refusal carries the code the CLI waits on, plus the sentence under both names', () => {
+  test('the refusal is {error: sentence, code} like every other split refusal', () => {
     const refuse = between(src, 'function refuse<T>(', '\n}\n');
     expect(refuse).toContain('error: refusal.message');
     expect(refuse).toContain('code: refusal.code');
-    expect(refuse).toContain('message: refusal.message');
+    expect(refuse).not.toContain('message:');
     const clips = read('lib/clips.ts');
     expect(clips).toContain("if (input.speakerIdRunning) return splitRefusal('speaker_check_running')");
   });
