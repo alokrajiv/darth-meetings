@@ -263,7 +263,7 @@ WRITE (needs read+write for meetings)
                                   guess finish, then prints 'speakers'.
                                   Uploads generate nothing by themselves — a
                                   run (summary + detailed report, always both)
-                                  is requested by a human in the web UI.
+                                  is started with 'generate' or in the web UI.
                                   Media over 8 MB goes up RESUMABLE: the file
                                   is hashed, then sent as parallel verified
                                   pieces (through the VM, or straight to
@@ -292,6 +292,28 @@ WRITE (needs read+write for meetings)
                                   (ISO 8601, 'YYYY-MM-DD HH:mm' in your tz,
                                   or 'YYYY-MM-DD' = noon). For recordings
                                   that match no calendar event
+  generate <id> [--instructions "…"] [--no-video] [--run-at <iso|tonight>] [--yes]
+                                  The web UI's "Generate / Regenerate summary &
+                                  report" — ONE run writes both tiers (quick
+                                  summary + detailed report), like the dialog.
+                                  Without --yes it only prints the plan (what
+                                  would run, with which options). --no-video
+                                  = text-only report even when the recording
+                                  has video; --run-at schedules it ('tonight'
+                                  = the next 02:00 local, or an ISO instant,
+                                  max 30 days out). 'regenerate' is an alias.
+                                  generate <id> --cancel drops a scheduled or
+                                  queued run (a run in flight is not touched)
+  hold <id>                       Stop the AUTOMATIC summary of a manual upload
+                                  (the "Summary starts automatically at HH:MM"
+                                  line): the review gate stays until a human
+                                  generates. 409 once it already ran
+  add-person "<Name>" <email>     The "+ Person" dialog: add someone to the
+                                  people directory so they can be a speaker
+                                  with an identity. An email that already
+                                  belongs to someone prints that record
+                                  instead (nothing is forked)
+  help [<verb>]                   This text, or just one verb's lines
   set-speakers <id> <Speaker>=<Name|email|"Name <email>"> ... [--clear] [--from-invite [--yes]]
                                   Confirm who each speaker IS. 'A="Jane Doe"'
                                   = a name; 'A=jane@x.com' = the PERSON (the
@@ -609,7 +631,12 @@ colleagues) — nothing is re-run.
     darth-cli meetings set-speakers <id> A=wei@partner.example B="Alok Rajiv <alok@trames.sg>" C="Interviewer #1"
     darth-cli meetings set-speakers <id> --from-invite          # table of guesses that name one invitee
     darth-cli meetings set-speakers <id> --from-invite --yes    # …confirm them all
-    # 6. Then the normal loop: read 'text <id>', write notes with your model,
+    # 6. Two ways to the summary. (a) The server's own run — exactly the web
+    #    UI's "Generate summary & report", both tiers, with the dialog's options
+    #    (plan first, --yes starts it; 'generate <id> --cancel' drops a
+    #    scheduled one; 'hold <id>' stops the automatic one of a manual upload):
+    darth-cli meetings generate <id> --yes [--instructions "focus on decisions"] [--no-video] [--run-at tonight]
+    #    (b) Or the normal loop: read 'text <id>', write notes with your model,
     #    'set-notes <id> --file notes.md'; 'label' it; and if the human asked,
     #    'share <id> --add <email>' (see "Sharing a meeting" below).
 
@@ -1991,6 +2018,111 @@ function fromInvitePicks(cur: SpeakersReply): SpeakerAssignment[] {
     out.push({ originalSpeaker: sp, customName: String(g.name).trim(), email: String(g.email).toLowerCase() });
   }
   return out.sort((a, b) => a.originalSpeaker.localeCompare(b.originalSpeaker));
+}
+
+// ---------------------------------------------------------------------------
+// generate / hold / add-person — the web UI's write actions over the same
+// routes (task 05 CLI↔UI parity: an agent must not have to tell the human
+// "click Generate"). One run writes both tiers, like the dialog.
+// ---------------------------------------------------------------------------
+
+/** Non-2xx on one of the parity writes → a readable line; returns the exit code. */
+function writeError(verb: string, status: number, data: { error?: unknown } | null, id?: string): number {
+  const msg = typeof data?.error === "string" ? data.error : `HTTP ${status}`;
+  if (status === 401) console.error(`Unauthorized: ${msg}\nYour token may be expired/revoked — run: darth-cli login`);
+  else if (status === 403) console.error(`Forbidden: ${msg}\nYou need EDIT access${id ? ` to ${id}` : ""} and a read+write token (re-run 'darth-cli login' and pick Read + write).`);
+  else if (status === 404) console.error(`${verb} failed: not found (${msg})${id ? ` — no meeting ${id} visible to you` : ""}.`);
+  else if (status === 409) console.error(`${verb} refused: ${msg}`);
+  else console.error(`${verb} failed (HTTP ${status}): ${msg}`);
+  return status === 401 ? 3 : 1;
+}
+
+/** 'tonight' = the next 02:00 local (what the dialog offers), else an ISO instant. Null = unreadable. */
+function runAtFlag(raw: string | undefined, now = new Date()): string | null | undefined {
+  if (raw === undefined) return undefined;
+  const v = raw.trim().toLowerCase();
+  if (v === "now") return undefined;
+  if (v === "tonight") {
+    const t = new Date(now);
+    t.setHours(2, 0, 0, 0);
+    if (t.getTime() <= now.getTime()) t.setDate(t.getDate() + 1);
+    return t.toISOString();
+  }
+  const t = new Date(raw.trim());
+  return Number.isNaN(t.getTime()) ? null : t.toISOString();
+}
+
+/** darth-cli meetings generate <id> [--instructions …] [--no-video] [--run-at …] [--yes] | --cancel */
+async function generateCmd(ctx: Ctx, flags: Record<string, string | boolean>, args: string[]): Promise<number> {
+  const id = args[0];
+  const usage = "usage: darth-cli meetings generate <id> [--instructions \"…\"] [--no-video] [--run-at <iso|tonight>] --yes   |   generate <id> --cancel";
+  if (!id) { console.error(usage); return 1; }
+  ctx.requireWrite();
+
+  if (flags.cancel === true) {
+    const res = await ctx.api("meetings", `/api/transcripts/${id}/report`, { method: "DELETE" });
+    const data = await readJsonSafe(res);
+    if (!res.ok) return writeError("generate --cancel", res.status, data, id);
+    ctx.print(data, () => console.log(`cancelled the scheduled/queued run on ${id} — a run already in flight is not touched.`));
+    return 0;
+  }
+
+  const instructions = str(flags.instructions)?.trim() || undefined;
+  if (instructions && instructions.length > 2000) { console.error("--instructions is capped at 2000 characters (the server truncates there)"); return 1; }
+  const runAt = runAtFlag(str(flags["run-at"]));
+  if (runAt === null) { console.error(`--run-at: '${String(flags["run-at"])}' is not 'tonight' or an ISO instant`); return 1; }
+  const useVideo = flags["no-video"] !== true;
+  const body: Record<string, unknown> = { useVideo };
+  if (instructions) body.instructions = instructions;
+  if (runAt) body.runAt = runAt;
+
+  // The dialog is the UI's confirm step; here the plan is printed unless --yes.
+  const rowRes = await ctx.api("meetings", `/api/transcripts/${id}`);
+  const rowData = await readJsonSafe(rowRes);
+  if (!rowRes.ok) return writeError("generate", rowRes.status, rowData, id);
+  const t = (rowData?.transcript ?? {}) as Record<string, unknown>;
+  const has = !!(t.auto_notes || t.auto_report);
+  const plan = [
+    `${has ? "REGENERATE" : "generate"} summary + detailed report for ${id} ${t.title ? `"${t.title}"` : ""}`.trim(),
+    `  report: ${useVideo ? "with screenshots when the recording has video" : "text only (--no-video)"}`,
+    `  instructions: ${instructions ? JSON.stringify(instructions) : "(none)"}`,
+    `  when: ${runAt ? `scheduled for ${fmtLocalDateTime(runAt, localTz(ctx))} (${runAt})` : "now"}`,
+    ...(has ? ["  the existing notes/report are replaced when the run lands"] : []),
+  ];
+  if (flags.yes !== true) {
+    for (const l of plan) console.log(l);
+    console.log("dry run — nothing started. Re-run with --yes to start it.");
+    return 0;
+  }
+  if (t.status !== "completed") { console.error(`${id} is not completed yet (status ${String(t.status)}) — nothing to summarise`); return 1; }
+
+  const res = await ctx.api("meetings", `/api/transcripts/${id}/report`, { method: "POST", body: JSON.stringify(body) });
+  const data = await readJsonSafe(res);
+  if (!res.ok) return writeError("generate", res.status, data, id);
+  ctx.print({ ...data, id, regenerate: has, useVideo, ...(instructions ? { instructions } : {}), ...(runAt ? { runAt } : {}) }, () => {
+    const s = String(data?.status ?? "running");
+    if (s === "scheduled") console.log(`scheduled: summary + detailed report for ${id} run at ${fmtLocalDateTime(String(data.runAt ?? runAt), localTz(ctx))} — 'generate ${id} --cancel' drops it.`);
+    else if (s === "queued") console.log(`queued: ${id} waits for its recording to land, then the run starts (video report).`);
+    else console.log(`${has ? "regenerating" : "generating"} summary + detailed report for ${id} — 'get ${id}' shows auto_notes_status / auto_report_status; 'notes ${id}' / 'report ${id}' once completed.`);
+  });
+  return 0;
+}
+
+/** The HELP lines of one verb: from its line to the next verb's. Null when unknown. */
+function helpForVerb(verb: string): string | null {
+  for (const text of [HELP, SEGMENTS_HELP, RECORDINGS_HELP]) {
+    const lines = text.split("\n");
+    const start = lines.findIndex((l) => new RegExp(`^  ${verb.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}( |$)`).test(l));
+    if (start < 0) continue;
+    const out = [lines[start]!];
+    for (let i = start + 1; i < lines.length; i++) {
+      const l = lines[i]!;
+      if (!l.trim() || /^\S/.test(l) || /^  \S/.test(l)) break;
+      out.push(l);
+    }
+    return out.join("\n");
+  }
+  return null;
 }
 
 /** One line per diarized speaker: confirmed name, else the guess. */
@@ -4717,6 +4849,48 @@ const meetings: Subcommand = {
           for (const l of data.speakerLabels || []) if (l.customName) console.log(`  ${String(l.originalSpeaker).padEnd(10)} = ${fmtPerson(l.customName, l.email)}`);
           console.log(`${(data.speakerLabels || []).filter((l: any) => l.customName).length} speaker(s) confirmed — 'text ${id}' now uses these names; voiceprints enrol in the background.`);
         });
+        return 0;
+      }
+
+      case "help": {
+        const verb = args[0];
+        if (!verb) { console.log(HELP); return 0; }
+        const lines = helpForVerb(verb);
+        if (!lines) { console.error(`no verb '${verb}' — 'darth-cli meetings --help' lists them`); return 1; }
+        console.log(lines);
+        return 0;
+      }
+
+      case "generate":
+      case "regenerate":
+        return generateCmd(ctx, flags, args);
+
+      case "hold": {
+        const id = args[0];
+        if (!id) { console.error("usage: darth-cli meetings hold <id>   (stops the automatic summary of a manual upload; the review gate stays)"); return 1; }
+        ctx.requireWrite();
+        const res = await ctx.api("meetings", `/api/transcripts/${id}/notes/hold`, { method: "POST" });
+        const data = await readJsonSafe(res);
+        if (!res.ok) return writeError("hold", res.status, data, id);
+        ctx.print(data, () => console.log(`held ${id} — the summary will not be written automatically; generate it with 'darth-cli meetings generate ${id} --yes' or in the web UI.`));
+        return 0;
+      }
+
+      case "add-person": {
+        const [name, email] = args;
+        if (!name || !email) { console.error("usage: darth-cli meetings add-person \"<Full Name>\" <email>"); return 1; }
+        if (!EMAIL_SHAPE.test(email.trim().toLowerCase())) { console.error(`'${email}' is not an email address`); return 1; }
+        ctx.requireWrite();
+        const res = await ctx.api("meetings", "/api/people", { method: "POST", body: JSON.stringify({ name: name.trim(), email: email.trim().toLowerCase() }) });
+        const data = await readJsonSafe(res);
+        if (res.status === 409 && data?.person) {
+          // The dialog's "already belongs to X" step: the existing record is
+          // the answer, nothing is forked.
+          ctx.print({ ...data, created: false }, () => console.log(`${data.person.email} already belongs to ${data.person.name} (${data.person.source === "trames" ? "Trames directory" : "custom"}) — use that name; nothing created.`));
+          return 0;
+        }
+        if (!res.ok) return writeError("add-person", res.status, data);
+        ctx.print({ ...data, created: true }, () => console.log(`added ${data.person?.name ?? name} <${data.person?.email ?? email}> to the people directory — 'set-speakers <id> A=${data.person?.email ?? email}' names a speaker as them.`));
         return 0;
       }
 

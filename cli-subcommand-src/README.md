@@ -4,11 +4,15 @@ This folder is copied into `darth-cli/src/subcommands/meetings/` **at darth-cli
 build time**. Editing files here does NOT ship anything by itself — installed
 CLIs keep running the old bundle until darth-cli is rebuilt and deployed.
 
-Design rule for this subcommand: **no AI commands.** The CLI is used mostly by
+Design rule for this subcommand: **the CLI can do everything the web UI can**
+(Alok, 2026-10-27, task 05 — `UI-PARITY.md` is the audit). It is used mostly by
 people's AI agents; it exposes deterministic primitives (list/get/text/search/
 audio/frame/attachments/labels + set-notes/set-report/set-title/label write-
-back) and the calling agent brings the intelligence with its own tokens.
-`skill` prints the agent workflow guide.
+back) so the calling agent can bring its own intelligence, AND the server's
+own runs where the UI has them (`generate` = the "Generate summary & report"
+dialog, both tiers). The earlier "no AI commands" rule is retired: an agent
+must not have to tell the human "click Generate". `skill` prints the agent
+workflow guide.
 
 ## Commands (quick map → endpoints)
 
@@ -33,7 +37,11 @@ back) and the calling agent brings the intelligence with its own tokens.
 | `offline prefs` / `offline prefs --set k=n[,k=n]` | `GET /api/offline/prefs` → `{prefs,defaults,max}`; `PUT /api/offline/prefs {transcripts?,audio?,video?}` (partial; server clamps to `max`). The write needs read+write AND `--consent '<dcon_id>: <text>'` (`meetings:settings`, verified server-side on darth-auth; same as `notify` / `auto-sync`) |
 | `link <id> <ref> [--separate]` | `POST /api/transcripts/:id/link-event {meetingCode}` or `{eventKey}` (`--separate` → `mode:'separate'`). Default `join`: when `<id>` is nothing but one of the caller's recordings (one clip, theirs, no notes) and the caller can already open a meeting of that occurrence, the reply is `{joined:true, meetingId, foldedMeetingId, …}` — the recording was added to that meeting and `<id>` moved to the caller's trash; the CLI prints `Joined → meeting <id> …`. Otherwise — server resolves the event, merges it into `gmeet_context`, sets `recorded_at`, fills an empty title, registers people, mints the backend Google token for the Meet-actuals enrichment, and re-runs the speaker-ID pass with the attendees unless names are confirmed / a pass is running (`reguessing` in the reply) |
 | `set-date <id> <when>` | `PATCH /api/transcripts/:id {recordedAt}` — ISO / `YYYY-MM-DD HH:mm` (machine-local) / `YYYY-MM-DD` (local noon) |
-| `speakers <id>` | `GET /api/transcripts/:id` + `GET /api/transcripts/:id/speakers` → one line per diarized speaker: confirmed name or guess (name, confidence, source, id-pass) + the pass status |
+| `speakers <id>` | `GET /api/transcripts/:id` + `GET /api/transcripts/:id/speakers` → one line per diarized speaker: confirmed name or guess (name `<email>`, confidence, source, id-pass, and where the identity came from: `on the invite` / `in the directory` / `no email match` — `suggestions[sp].emailSource`) + the pass status |
+| `generate <id> [--instructions …] [--no-video] [--run-at <iso\|tonight>] --yes` (alias `regenerate`) | `GET /api/transcripts/:id` for the plan, then `POST /api/transcripts/:id/report {useVideo, instructions?, runAt?}` — the web UI's "Generate / Regenerate summary & report" dialog: ONE run writes both tiers. Without `--yes` prints the plan only (the dialog is the UI's confirm step). Reply `{status:'running'\|'queued'\|'scheduled', runAt?}` printed as such; 403 reader / 404 / 409 not-completed surfaced. `--run-at tonight` = the next 02:00 local (the dialog's option), else an ISO instant (server cap 30 days). `generate <id> --cancel` → `DELETE /api/transcripts/:id/report` → `{cancelled:true}` (drops a scheduled/queued run; a run in flight is not touched) |
+| `hold <id>` | `POST /api/transcripts/:id/notes/hold` → `{ok, held, autoProceedAt:null}` — the detail page's Hold: stops the automatic summary of a manual upload (`lib/auto-proceed`), the review gate stays; 409 once it already ran (`being written right now` / `already written` / `already evaluated`) |
+| `add-person "<Name>" <email>` | `POST /api/people {name, email}` — the "+ Person" dialog → 201 `{person}`; 409 `{error:'exists', person}` = the email already belongs to someone: printed as the answer, exit 0, nothing forked |
+| `help [<verb>]` | local — the whole help, or one verb's lines (also finds `segments` / `recordings` sub-verbs) |
 | `set-speakers <id> A=<Name\|email\|"Name <email>"> …  [--clear] [--from-invite [--yes]]` | `GET` then `PUT /api/transcripts/:id/speakers {speakerLabels}` — merges into the existing labels (`--clear` drops them first); the server enrols voiceprints from confirmed names. **A speaker is a person** (2026-10-27, `lib/speaker-identity`): `A=jane@x.com` sends `{customName:'', email}` and the server stores the canonical name (directory → this meeting's invitee → sent) and creates the directory row if missing; `A="Name <email>"` sends both; `A="Name"` sends a name only and DROPS a previous email on that speaker (the person changed). The reply is what was STORED; the CLI prints `name <email>` per speaker. `--from-invite` = every unconfirmed speaker whose `suggestions[sp].email` is set (the server attaches it when the guess names exactly one invitee / directory person) becomes `{customName: guess, email}` — a dry-run table unless `--yes`; explicit assignments on the same command win. When the saved labels name EVERY diarized speaker, the server also marks a null / running / errored `speaker_id_status` `completed` (`lib/server/speaker-id-settle.ts`), so the detail page stops waiting on the pass and `split` is accepted at once |
 | `notify` / `notify <kind> on\|off` | `GET` / `PUT /api/notify-prefs` — settings writes (this and `auto-sync off\|mine\|all`) require `--consent '<dcon_id>: <text>'` — a `meetings:settings` consent; missing → the request command + exit 6; the retired bare flag → exit 6 |
 | `series` / `series <id>` | `GET /api/series` / `GET /api/series/:id` — v2 (a series runs as its OWNER): only series the caller owns, edits, follows or (auditor) oversees; any other id is a 404. Rows carry `owner{email,name,isAuditor}`, `editors[]`, `followers[]`, `permissions{role,edit,manageEditors,manageFollowers,transfer,delete}`; members listed only when the caller can open them |
